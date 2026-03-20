@@ -6,9 +6,18 @@ use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
-/// LLaMA model configuration, read from GGUF metadata.
+/// Model architecture type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelArch {
+    Llama,
+    Qwen3,
+}
+
+/// Model configuration, read from GGUF metadata.
+/// Supports LLaMA-family and Qwen3 architectures.
 #[derive(Debug, Clone)]
 pub struct LlamaConfig {
+    pub arch: ModelArch,
     pub dim: usize,        // model dimension (embedding size)
     pub hidden_dim: usize, // FFN hidden dimension
     pub n_layers: usize,
@@ -18,32 +27,59 @@ pub struct LlamaConfig {
     pub head_dim: usize,
     pub norm_eps: f32,
     pub max_seq_len: usize,
+    pub rope_freq_base: f32,
+    pub bos_token: u32,
+    pub eos_token: u32,
+    pub has_qk_norm: bool, // Qwen3 feature
 }
 
 impl LlamaConfig {
     pub fn from_gguf(gguf: &GgufFile) -> Option<Self> {
-        let dim = gguf.meta_u32("llama.embedding_length")? as usize;
-        let n_layers = gguf.meta_u32("llama.block_count")? as usize;
-        let n_heads = gguf.meta_u32("llama.attention.head_count")? as usize;
+        let arch_str = gguf.meta_str("general.architecture")?;
+
+        // Determine architecture and metadata prefix
+        let (arch, prefix) = match arch_str {
+            "llama" => (ModelArch::Llama, "llama"),
+            "qwen3" => (ModelArch::Qwen3, "qwen3"),
+            other => {
+                eprintln!("Warning: unknown architecture '{other}', attempting LLaMA-compatible");
+                (ModelArch::Llama, other)
+            }
+        };
+
+        let dim = gguf.meta_u32(&format!("{prefix}.embedding_length"))? as usize;
+        let n_layers = gguf.meta_u32(&format!("{prefix}.block_count"))? as usize;
+        let n_heads = gguf.meta_u32(&format!("{prefix}.attention.head_count"))? as usize;
         let n_kv_heads = gguf
-            .meta_u32("llama.attention.head_count_kv")
+            .meta_u32(&format!("{prefix}.attention.head_count_kv"))
             .unwrap_or(n_heads as u32) as usize;
-        let hidden_dim = gguf.meta_u32("llama.feed_forward_length")? as usize;
+        let hidden_dim = gguf.meta_u32(&format!("{prefix}.feed_forward_length"))? as usize;
         let vocab_size = gguf
-            .meta_u32("llama.vocab_size")
+            .meta_u32(&format!("{prefix}.vocab_size"))
             .or_else(|| {
-                // Infer from token_embd tensor
                 gguf.find_tensor("token_embd.weight")
                     .map(|t| t.shape[1] as u32)
             })?
             as usize;
-        let head_dim = dim / n_heads;
-        let norm_eps = gguf.meta_f32("llama.attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+        let head_dim = gguf
+            .meta_u32(&format!("{prefix}.attention.key_length"))
+            .map(|v| v as usize)
+            .unwrap_or(dim / n_heads);
+        let norm_eps = gguf.meta_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
         let max_seq_len = gguf
-            .meta_u32("llama.context_length")
+            .meta_u32(&format!("{prefix}.context_length"))
             .unwrap_or(2048) as usize;
+        let rope_freq_base = gguf
+            .meta_f32(&format!("{prefix}.rope.freq_base"))
+            .unwrap_or(10000.0);
+        let bos_token = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
+        let eos_token = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
+
+        // Check for QK normalization (Qwen3 feature)
+        let has_qk_norm = gguf.find_tensor("blk.0.attn_q_norm.weight").is_some();
 
         Some(LlamaConfig {
+            arch,
             dim,
             hidden_dim,
             n_layers,
@@ -53,6 +89,10 @@ impl LlamaConfig {
             head_dim,
             norm_eps,
             max_seq_len,
+            rope_freq_base,
+            bos_token,
+            eos_token,
+            has_qk_norm,
         })
     }
 }
@@ -304,6 +344,8 @@ pub struct LayerWeights {
     pub wk: GpuTensor,
     pub wv: GpuTensor,
     pub wo: GpuTensor,
+    pub q_norm: Option<GpuTensor>, // Qwen3: per-head Q normalization
+    pub k_norm: Option<GpuTensor>, // Qwen3: per-head K normalization
     pub ffn_norm: GpuTensor,
     pub w_gate: GpuTensor,
     pub w_up: GpuTensor,
@@ -346,18 +388,32 @@ pub fn load_weights(
         let p = format!("blk.{i}");
         let kv_dim = config.n_kv_heads * config.head_dim;
 
+        // Qwen3: Q/K output dim may differ from dim if head_dim != dim/n_heads
+        let q_out_dim = config.n_heads * config.head_dim;
+        let k_out_dim = config.n_kv_heads * config.head_dim;
+
         let layer = LayerWeights {
             attn_norm: upload(&format!("{p}.attn_norm.weight"), &[config.dim])?,
             wq: upload(
                 &format!("{p}.attn_q.weight"),
-                &[config.dim, config.dim],
+                &[q_out_dim, config.dim],
             )?,
             wk: upload(&format!("{p}.attn_k.weight"), &[kv_dim, config.dim])?,
             wv: upload(&format!("{p}.attn_v.weight"), &[kv_dim, config.dim])?,
             wo: upload(
                 &format!("{p}.attn_output.weight"),
-                &[config.dim, config.dim],
+                &[config.dim, q_out_dim],
             )?,
+            q_norm: if config.has_qk_norm {
+                Some(upload(&format!("{p}.attn_q_norm.weight"), &[config.head_dim])?)
+            } else {
+                None
+            },
+            k_norm: if config.has_qk_norm {
+                Some(upload(&format!("{p}.attn_k_norm.weight"), &[config.head_dim])?)
+            } else {
+                None
+            },
             ffn_norm: upload(&format!("{p}.ffn_norm.weight"), &[config.dim])?,
             w_gate: upload(
                 &format!("{p}.ffn_gate.weight"),
@@ -414,7 +470,8 @@ pub fn forward(
         gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
 
         // Q, K, V projections
-        let q = gpu.zeros(&[dim], DType::F32)?;
+        let q_dim = n_heads * head_dim;
+        let q = gpu.zeros(&[q_dim], DType::F32)?;
         let k = gpu.zeros(&[kv_dim], DType::F32)?;
         let v = gpu.zeros(&[kv_dim], DType::F32)?;
 
@@ -422,14 +479,26 @@ pub fn forward(
         gpu.gemv_f32(&layer.wk, &tmp, &k)?;
         gpu.gemv_f32(&layer.wv, &tmp, &v)?;
 
-        // RoPE (CPU for now — simple and correct)
+        // QK normalization (Qwen3: RMSNorm per-head before RoPE)
         let mut q_data = gpu.download_f32(&q)?;
         let mut k_data = gpu.download_f32(&k)?;
-        apply_rope_cpu(&mut q_data, n_heads, head_dim, pos);
-        apply_rope_cpu(&mut k_data, n_kv_heads, head_dim, pos);
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                let qn_w = gpu.download_f32(qn)?;
+                per_head_rmsnorm_cpu(&mut q_data, &qn_w, n_heads, head_dim, config.norm_eps);
+            }
+            if let Some(ref kn) = layer.k_norm {
+                let kn_w = gpu.download_f32(kn)?;
+                per_head_rmsnorm_cpu(&mut k_data, &kn_w, n_kv_heads, head_dim, config.norm_eps);
+            }
+        }
+
+        // RoPE (CPU for now — simple and correct)
+        apply_rope_cpu(&mut q_data, n_heads, head_dim, pos, config.rope_freq_base);
+        apply_rope_cpu(&mut k_data, n_kv_heads, head_dim, pos, config.rope_freq_base);
 
         // Upload RoPE'd Q, re-upload K
-        let q_rope = gpu.upload_f32(&q_data, &[dim])?;
+        let q_rope = gpu.upload_f32(&q_data, &[q_dim])?;
         gpu.free_tensor(q)?;
 
         // Store K, V in cache
@@ -447,7 +516,7 @@ pub fn forward(
             config,
         );
 
-        let attn_gpu = gpu.upload_f32(&attn_out, &[dim])?;
+        let attn_gpu = gpu.upload_f32(&attn_out, &[q_dim])?;
         gpu.free_tensor(q_rope)?;
 
         // Output projection: o = Wo * attn_out
@@ -509,15 +578,15 @@ pub fn forward(
 }
 
 pub fn apply_rope_cpu_pub(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize) {
-    apply_rope_cpu(data, n_heads, head_dim, pos);
+    apply_rope_cpu(data, n_heads, head_dim, pos, 10000.0);
 }
 
-fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize) {
+fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, freq_base: f32) {
     let half = head_dim / 2;
     for h in 0..n_heads {
         let base = h * head_dim;
         for i in 0..half {
-            let freq = 1.0 / (10000.0f32.powf((2 * i) as f32 / head_dim as f32));
+            let freq = 1.0 / (freq_base.powf((2 * i) as f32 / head_dim as f32));
             let val = pos as f32 * freq;
             let cos_val = val.cos();
             let sin_val = val.sin();
@@ -525,6 +594,19 @@ fn apply_rope_cpu(data: &mut [f32], n_heads: usize, head_dim: usize, pos: usize)
             let v1 = data[base + i + half];
             data[base + i] = v0 * cos_val - v1 * sin_val;
             data[base + i + half] = v0 * sin_val + v1 * cos_val;
+        }
+    }
+}
+
+/// Apply per-head RMSNorm (for Qwen3 QK normalization).
+fn per_head_rmsnorm_cpu(data: &mut [f32], weight: &[f32], n_heads: usize, head_dim: usize, eps: f32) {
+    for h in 0..n_heads {
+        let base = h * head_dim;
+        let head = &data[base..base + head_dim];
+        let ss: f32 = head.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+        let rms = 1.0 / (ss + eps).sqrt();
+        for d in 0..head_dim {
+            data[base + d] = data[base + d] * rms * weight[d];
         }
     }
 }
@@ -578,7 +660,8 @@ fn attention_cpu(
     let kv_group = n_heads / n_kv_heads;
     let seq_len = pos + 1;
 
-    let mut out = vec![0.0f32; config.dim];
+    let q_dim = n_heads * head_dim;
+    let mut out = vec![0.0f32; q_dim];
 
     for h in 0..n_heads {
         let kv_h = h / kv_group;

@@ -78,8 +78,8 @@ fn main() {
             .expect("forward pass failed");
         next_token = llama::argmax(&logits);
 
-        // Stop on EOS (token 2 in LLaMA)
-        if next_token == 2 {
+        // Stop on EOS
+        if next_token == config.eos_token {
             break;
         }
     }
