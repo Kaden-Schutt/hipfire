@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hip-bridge",
+    "crates/rdna-compute",
+    "crates/engine",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

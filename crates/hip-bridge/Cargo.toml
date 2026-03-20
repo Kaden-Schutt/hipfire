@@ -1,0 +1,10 @@
+[package]
+name = "hip-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe Rust FFI to AMD HIP/HSA runtime via dlopen"
+
+[dependencies]
+libloading = "0.8"
+thiserror = "2"

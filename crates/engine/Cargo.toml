@@ -1,0 +1,10 @@
+[package]
+name = "engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inference orchestrator for RDNA GPUs"
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
