@@ -1,5 +1,4 @@
-//! engine: Model loading, tensor ops, inference loop for RDNA GPUs
+//! engine: GGUF model loading and LLaMA inference on RDNA GPUs.
 
-pub fn init() {
-    todo!("Phase 4: implement inference engine")
-}
+pub mod gguf;
+pub mod llama;

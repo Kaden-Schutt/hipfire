@@ -8,3 +8,5 @@ description = "Inference orchestrator for RDNA GPUs"
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+memmap2 = "0.9"
+byteorder = "1"
