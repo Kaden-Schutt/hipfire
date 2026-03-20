@@ -14,7 +14,7 @@ pub struct KernelCompiler {
 
 impl KernelCompiler {
     pub fn new(arch: &str) -> HipResult<Self> {
-        let cache_dir = std::env::temp_dir().join("rx_rustane_kernels");
+        let cache_dir = std::env::temp_dir().join("hipfire_kernels");
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;

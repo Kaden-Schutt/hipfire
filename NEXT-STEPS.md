@@ -1,4 +1,4 @@
-# Next Steps for rx-rustane
+# Next Steps for hipfire
 
 ## Current State (2026-03-20)
 

@@ -1,4 +1,4 @@
-# RX-Rustane: RDNA GPU Unlock & Rust-Native Inference Engine
+# HipFire: RDNA GPU Unlock & Rust-Native Inference Engine
 
 ## Mission
 
@@ -9,7 +9,7 @@ a portable method that works across ANY RDNA generation (RDNA1→RDNA4), not jus
 This project combines three efforts into one pipeline:
 1. **autorocm** — Map and unlock ROCm on consumer RDNA hardware
 2. **autokernel** — Optimize HIP/compute kernels for the specific hardware
-3. **rx-rustane** — Rust-native inference engine (no Python in the hot path)
+3. **hipfire** — Rust-native inference engine (no Python in the hot path)
 
 ## Reference Projects (READ THESE FIRST)
 
@@ -163,7 +163,7 @@ Using the validated approach from Phase 3, start building the actual Rust infere
 
 Target architecture (adapt based on what works):
 ```
-rx-rustane/
+hipfire/
 ├── crates/
 │   ├── hip-bridge/      # (or vulkan-bridge, or kmd-bridge — whatever won)
 │   │   └── src/lib.rs   # Safe Rust FFI to AMD compute runtime

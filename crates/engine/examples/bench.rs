@@ -10,7 +10,7 @@ fn main() {
         "/home/kaden/llama.cpp/models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf".to_string()
     });
 
-    eprintln!("=== rx-rustane baseline benchmark ===");
+    eprintln!("=== hipfire baseline benchmark ===");
     let gguf = GgufFile::open(Path::new(&model_path)).unwrap();
     let config = LlamaConfig::from_gguf(&gguf).unwrap();
     eprintln!("Model: {} (dim={}, layers={}, heads={}, kv_heads={}, vocab={})",

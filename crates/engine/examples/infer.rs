@@ -22,7 +22,7 @@ fn main() {
         "Hello".to_string()
     };
 
-    eprintln!("=== rx-rustane inference engine ===");
+    eprintln!("=== hipfire inference engine ===");
     eprintln!("Model: {model_path}");
 
     // Parse GGUF

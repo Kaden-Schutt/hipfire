@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RX-Rustane Tiered Validation Harness
+# HipFire Tiered Validation Harness
 # Run after each approach attempt. Records which tiers pass.
 # Usage: ./harness.sh [approach_name]
 

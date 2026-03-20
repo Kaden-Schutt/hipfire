@@ -35,7 +35,7 @@ Training validated to 5B params, forward to 30B on M4 Max 128GB. Key findings:
 - dim must be divisible by 128, hidden divisible by 16 (ANE alignment constraints)
 - Per-ANE-dispatch overhead: ~0.095ms (XPC + IOKit round-trip)
 
-Our rx-rustane independently converged on the same 3-crate pattern:
+Our hipfire independently converged on the same 3-crate pattern:
   ane-bridge → hip-bridge | metal-decode → rdna-compute | engine → engine
 
 ## Rust HIP Ecosystem

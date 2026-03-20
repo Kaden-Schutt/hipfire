@@ -7,7 +7,7 @@ fn main() {
     hip.set_device(0).unwrap();
 
     // Write kernel source to temp file
-    let tmp = std::env::temp_dir().join("rx_rustane_test");
+    let tmp = std::env::temp_dir().join("hipfire_test");
     std::fs::create_dir_all(&tmp).unwrap();
     let src_path = tmp.join("vadd.hip");
     let obj_path = tmp.join("vadd.hsaco");
