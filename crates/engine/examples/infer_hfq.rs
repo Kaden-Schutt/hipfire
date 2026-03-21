@@ -89,39 +89,30 @@ fn main() {
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
     ).unwrap();
 
-    // Allocate sample result buffer (8 bytes: token_id + rng_state)
-    let sample_buf = gpu.alloc_tensor(&[2], rdna_compute::DType::F32).unwrap();
+    // Persistent scratch buffers — zero allocations in the hot loop
+    let scratch = llama::ForwardScratch::new(&mut gpu, &config).unwrap();
     let mut rng_state = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos();
     if rng_state == 0 { rng_state = 1; }
 
-    // Process prompt (still uses forward() — need logits for first sample)
+    // Process prompt
     let t1 = Instant::now();
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        if pos < prompt_tokens.len() - 1 {
-            // Prefill: don't need logits, just fill KV cache
-            llama::forward(&mut gpu, &weights, &config, token, pos, &mut kv_cache)
-                .expect("forward pass failed");
-        } else {
-            // Last prompt token: sample on GPU
-            let (tok, rng) = llama::forward_sample(
-                &mut gpu, &weights, &config, token, pos, &mut kv_cache,
-                &sample_buf, 0.7, 0.8, rng_state,
-            ).expect("forward_sample failed");
-            rng_state = rng;
-            // Store first generated token
-        }
+        let (_, rng) = llama::forward_scratch(
+            &mut gpu, &weights, &config, token, pos, &mut kv_cache,
+            &scratch, 0.7, 0.8, rng_state,
+        ).expect("forward_scratch failed");
+        rng_state = rng;
     }
     let prompt_ms = t1.elapsed().as_millis();
     eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s)",
         prompt_ms, prompt_tokens.len(),
         prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
 
-    // Get first token from last prompt forward_sample
+    // Get first token from last prompt sample
     let mut out_bytes = [0u8; 8];
-    gpu.hip.memcpy_dtoh(&mut out_bytes, &sample_buf.buf).unwrap();
+    gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
     let mut next_token = u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
-    rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
 
     // Generate
     let max_gen = 2048;
@@ -140,10 +131,10 @@ fn main() {
         }
 
         let pos = prompt_tokens.len() + generated.len() - 1;
-        let (tok, rng) = llama::forward_sample(
+        let (tok, rng) = llama::forward_scratch(
             &mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
-            &sample_buf, 0.7, 0.8, rng_state,
-        ).expect("forward_sample failed");
+            &scratch, 0.7, 0.8, rng_state,
+        ).expect("forward_scratch failed");
         next_token = tok;
         rng_state = rng;
     }
