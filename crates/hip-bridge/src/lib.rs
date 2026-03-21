@@ -32,6 +32,15 @@ impl DeviceBuffer {
     pub fn size(&self) -> usize {
         self.size
     }
+
+    /// Create a non-owning alias to the same GPU memory.
+    /// The alias must not outlive the original buffer.
+    /// Used for reshaping tensors without reallocating.
+    /// # Safety
+    /// Caller must ensure the alias doesn't outlive the original.
+    pub unsafe fn alias(&self) -> DeviceBuffer {
+        DeviceBuffer { ptr: self.ptr, size: self.size }
+    }
 }
 
 // DeviceBuffer is Send — GPU pointers can be sent between threads.

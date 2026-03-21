@@ -712,26 +712,15 @@ pub fn forward(
             weight_gemv(gpu, &layer.wv, &tmp, &v)?;
         }
 
-        // QK normalization (Qwen3: still CPU-side for now)
+        // QK normalization (Qwen3) — GPU-side per-head RMSNorm.
+        // Launches n_heads blocks, each normalizing head_dim elements.
         if config.has_qk_norm {
-            let mut q_data = gpu.download_f32(&q)?;
-            let mut k_data = gpu.download_f32(&k)?;
             if let Some(ref qn) = layer.q_norm {
-                let qn_w = gpu.download_f32(qn)?;
-                per_head_rmsnorm_cpu(&mut q_data, &qn_w, n_heads, head_dim, config.norm_eps);
+                gpu.rmsnorm_batched(&q, qn, &q, n_heads, head_dim, config.norm_eps)?;
             }
             if let Some(ref kn) = layer.k_norm {
-                let kn_w = gpu.download_f32(kn)?;
-                per_head_rmsnorm_cpu(&mut k_data, &kn_w, n_kv_heads, head_dim, config.norm_eps);
+                gpu.rmsnorm_batched(&k, kn, &k, n_kv_heads, head_dim, config.norm_eps)?;
             }
-            // Re-upload normalized Q and K
-            let q2 = gpu.upload_f32(&q_data, &[q_dim])?;
-            let k2 = gpu.upload_f32(&k_data, &[kv_dim])?;
-            // Copy back into q and k buffers using D2D
-            gpu.hip.memcpy_dtod(&q.buf, &q2.buf, q_dim * 4)?;
-            gpu.hip.memcpy_dtod(&k.buf, &k2.buf, kv_dim * 4)?;
-            gpu.free_tensor(q2)?;
-            gpu.free_tensor(k2)?;
         }
 
         // RoPE — GPU-side, no CPU round-trip

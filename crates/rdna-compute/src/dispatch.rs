@@ -710,6 +710,37 @@ impl Gpu {
         }
     }
 
+    /// Batched RMSNorm: normalize `batch` vectors of length `n` independently.
+    /// x and out can be the same buffer (in-place). Weight is [n], applied per vector.
+    pub fn rmsnorm_batched(
+        &mut self,
+        x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor,
+        batch: usize, n: usize, eps: f32,
+    ) -> HipResult<()> {
+        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "rmsnorm_f32")?;
+        let func = &self.functions["rmsnorm_f32"];
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut w_ptr = weight.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n as i32;
+        let mut eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut w_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut eps_val as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32.min(n as u32);
+        let shared_mem = block_size * 4;
+        unsafe {
+            self.hip.launch_kernel(func, [batch as u32, 1, 1], [block_size, 1, 1], shared_mem, None, &mut params)
+        }
+    }
+
     /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
