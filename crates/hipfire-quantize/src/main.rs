@@ -545,6 +545,8 @@ fn main() {
     let use_mixed = format == "q8-mixed" || format == "mixed";
     let use_fast = format == "q8-fast" || format == "fast";
     let use_q8hfq = format == "q8hfq";
+    let use_q4k_all = format == "q4k";
+    let use_q4k_q8embed = format == "q4k-q8embed";
 
     let input_dir = Path::new(input_dir);
     let output_path = Path::new(output_path);
@@ -661,12 +663,17 @@ fn main() {
                 });
             } else {
             // Choose quant format per tensor
-            let this_q8 = if use_mixed || use_fast {
+            let this_q8 = if use_q4k_all {
+                false // everything Q4_K
+            } else if use_q4k_q8embed {
+                name.contains("embed") || name.contains("lm_head") // only embed/output Q8
+            } else if use_mixed || use_fast {
                 is_q8_tensor(name)
             } else {
                 use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
             };
             let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
+            let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
             let (quantized, qt, gs, label) = if this_q8 {
                 let q = quantize_q8f16(&f32_data);
@@ -674,8 +681,7 @@ fn main() {
             } else if this_q4as8 {
                 let q = quantize_q4_as_q8(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q4asQ8")
-            } else if use_mixed {
-                // Mixed mode: FFN uses Q4_K (42% peak) instead of Q4_F16 (32% peak)
+            } else if this_q4k {
                 let q = quantize_q4k(&f32_data);
                 (q, QuantType::Q4K, 256u32, "Q4_K")
             } else {

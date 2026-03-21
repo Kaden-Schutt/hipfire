@@ -11,6 +11,9 @@ pub struct Tokenizer {
     token_to_id: HashMap<String, u32>,
     /// BPE merge rules: (left, right) → merged token
     merges: Vec<(String, String)>,
+    /// Special tokens: strings like "<|im_start|>" → their token ID
+    /// Sorted longest-first for greedy matching
+    special_tokens: Vec<(String, u32)>,
     /// Special tokens
     pub bos_id: u32,
     pub eos_id: u32,
@@ -66,10 +69,24 @@ impl Tokenizer {
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
         let is_gpt2_bpe = model_type == "gpt2";
 
+        // Build special tokens list: vocab entries matching <|...|> or </...> patterns
+        let mut special_tokens: Vec<(String, u32)> = Vec::new();
+        for (i, tok) in vocab.iter().enumerate() {
+            if (tok.starts_with("<|") && tok.ends_with("|>"))
+                || (tok.starts_with("</") && tok.ends_with(">") && tok.len() > 3)
+                || (tok.starts_with("<") && tok.ends_with(">") && tok.contains("0x"))
+            {
+                special_tokens.push((tok.clone(), i as u32));
+            }
+        }
+        // Sort longest-first for greedy matching
+        special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
         Some(Tokenizer {
             vocab,
             token_to_id,
             merges,
+            special_tokens,
             bos_id,
             eos_id,
             is_gpt2_bpe,
@@ -116,7 +133,51 @@ impl Tokenizer {
     }
 
     /// Encode text to token IDs.
+    /// Special tokens (e.g. <|im_start|>) are matched first, then remaining
+    /// segments are encoded via BPE or SentencePiece.
     pub fn encode(&self, text: &str) -> Vec<u32> {
+        if self.special_tokens.is_empty() {
+            return self.encode_raw(text);
+        }
+
+        // Split text at special token boundaries (greedy longest match)
+        let mut result = Vec::new();
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            // Try to match a special token at current position
+            let mut matched = false;
+            for (st, id) in &self.special_tokens {
+                if remaining.starts_with(st.as_str()) {
+                    result.push(*id);
+                    remaining = &remaining[st.len()..];
+                    matched = true;
+                    break;
+                }
+            }
+            if matched {
+                continue;
+            }
+            // Find the next special token occurrence
+            let mut next_special = remaining.len();
+            for (st, _) in &self.special_tokens {
+                if let Some(pos) = remaining.find(st.as_str()) {
+                    if pos < next_special {
+                        next_special = pos;
+                    }
+                }
+            }
+            // Encode the segment before the next special token
+            let segment = &remaining[..next_special];
+            if !segment.is_empty() {
+                result.extend(self.encode_raw(segment));
+            }
+            remaining = &remaining[next_special..];
+        }
+        result
+    }
+
+    /// Encode without special token handling.
+    fn encode_raw(&self, text: &str) -> Vec<u32> {
         if !self.is_gpt2_bpe {
             return self.encode_sentencepiece(text);
         }

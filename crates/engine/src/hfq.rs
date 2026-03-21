@@ -302,14 +302,17 @@ pub fn load_weights_hfq(
     eprintln!("  loading token_embd...");
     let embd_info = hfq.tensor_data("model.embed_tokens.weight")
         .expect("embed_tokens not found");
-    let (token_embd, token_embd_is_q4k) = if embd_info.0.quant_type == 3 {
+    let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
+        // Q4_K: upload raw, use Q4K embedding lookup at inference
+        eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q4K)
+    } else if embd_info.0.quant_type == 3 {
         // Q8F16: upload raw, use Q8 embedding lookup at inference
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        // Store as "q4k=true" flag — we'll add proper Q8 dispatch below
-        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, true)
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
     } else {
         (load_f16_tensor(hfq, gpu, "model.embed_tokens.weight",
-            &[config.vocab_size, config.dim])?, false)
+            &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
     };
 
     eprintln!("  loading output_norm...");
@@ -369,6 +372,5 @@ pub fn load_weights_hfq(
         layers.push(layer);
     }
 
-    let embd_fmt = if token_embd_is_q4k { EmbeddingFormat::Q8_0 } else { EmbeddingFormat::F32 };
     Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
 }
