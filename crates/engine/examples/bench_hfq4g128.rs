@@ -1,70 +1,76 @@
-//! Benchmark HFQ4-G256 vs Q4K at 12288×4096 (Qwen3-8B ffn_gate).
+//! Benchmark HFQ4-G256 vs Q4K at multiple matrix sizes.
+//! Tests whether HFQ4-G256's 2x occupancy advantage shows at small matrices.
 
 fn main() {
     let mut gpu = rdna_compute::Gpu::init().unwrap();
+    let peak_bw = 448.0f64; // RX 5700 XT theoretical peak GB/s
 
-    let m = 12288usize;
-    let k = 4096usize;
+    let sizes: &[(usize, usize, &str)] = &[
+        (1024, 1024, "Qwen3-0.6B attn"),
+        (2048, 2048, "TinyLlama attn"),
+        (4096, 4096, "Qwen3-8B attn"),
+        (12288, 4096, "Qwen3-8B FFN"),
+    ];
 
-    // HFQ4-G256: 136 bytes per 256 weights
-    let groups_per_row = k / 256;
-    let row_bytes_hfq4 = groups_per_row * 136;
-    let total_hfq4 = m * row_bytes_hfq4;
-    let fake_hfq4 = vec![0x55u8; total_hfq4];
-    let d_hfq4 = gpu.upload_raw(&fake_hfq4, &[total_hfq4]).unwrap();
+    eprintln!("{:<20} {:>6} {:>6}  {:>9} {:>8} {:>6}  {:>9} {:>8} {:>6}  {:>7}",
+        "Name", "M", "K", "HFQ4 us", "GB/s", "%peak", "Q4K us", "GB/s", "%peak", "speedup");
+    eprintln!("{}", "-".repeat(110));
 
-    // Q4K: 144 bytes per 256 weights
-    let row_bytes_q4k = groups_per_row * 144;
-    let total_q4k = m * row_bytes_q4k;
-    let fake_q4k = vec![0x55u8; total_q4k];
-    let d_q4k = gpu.upload_raw(&fake_q4k, &[total_q4k]).unwrap();
+    let n = 200;
 
-    let x_data: Vec<f32> = vec![0.01; k];
-    let d_x = gpu.upload_f32(&x_data, &[k]).unwrap();
-    let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
+    for &(m, k, name) in sizes {
+        // HFQ4-G256: 136 bytes per 256 weights
+        let groups = k / 256;
+        let row_hfq4 = groups * 136;
+        let total_hfq4 = m * row_hfq4;
+        let d_hfq4 = gpu.upload_raw(&vec![0x55u8; total_hfq4], &[total_hfq4]).unwrap();
 
-    let n = 100;
+        // Q4K: 144 bytes per 256 weights
+        let row_q4k = groups * 144;
+        let total_q4k = m * row_q4k;
+        let d_q4k = gpu.upload_raw(&vec![0x55u8; total_q4k], &[total_q4k]).unwrap();
 
-    // Warmup
-    gpu.gemv_hfq4g256(&d_hfq4, &d_x, &d_y, m, k).unwrap();
-    gpu.gemv_q4k(&d_q4k, &d_x, &d_y, m, k).unwrap();
+        let d_x = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
+        let d_y = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
 
-    // Benchmark HFQ4-G256
-    let start = gpu.hip.event_create().unwrap();
-    let stop = gpu.hip.event_create().unwrap();
-    gpu.hip.event_record(&start, None).unwrap();
-    for _ in 0..n {
-        gpu.gemv_hfq4g256(&d_hfq4, &d_x, &d_y, m, k).unwrap();
+        // Warmup
+        for _ in 0..10 {
+            gpu.gemv_hfq4g256(&d_hfq4, &d_x, &d_y, m, k).unwrap();
+            gpu.gemv_q4k(&d_q4k, &d_x, &d_y, m, k).unwrap();
+        }
+
+        let start = gpu.hip.event_create().unwrap();
+        let stop = gpu.hip.event_create().unwrap();
+
+        // HFQ4-G256
+        gpu.hip.event_record(&start, None).unwrap();
+        for _ in 0..n { gpu.gemv_hfq4g256(&d_hfq4, &d_x, &d_y, m, k).unwrap(); }
+        gpu.hip.event_record(&stop, None).unwrap();
+        gpu.hip.event_synchronize(&stop).unwrap();
+        let ms_hfq4 = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
+        let us_hfq4 = ms_hfq4 * 1000.0 / n as f32;
+        let bw_hfq4 = (total_hfq4 + k * 4) as f64 * n as f64 / (ms_hfq4 as f64 / 1000.0) / 1e9;
+
+        // Q4K
+        gpu.hip.event_record(&start, None).unwrap();
+        for _ in 0..n { gpu.gemv_q4k(&d_q4k, &d_x, &d_y, m, k).unwrap(); }
+        gpu.hip.event_record(&stop, None).unwrap();
+        gpu.hip.event_synchronize(&stop).unwrap();
+        let ms_q4k = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
+        let us_q4k = ms_q4k * 1000.0 / n as f32;
+        let bw_q4k = (total_q4k + k * 4) as f64 * n as f64 / (ms_q4k as f64 / 1000.0) / 1e9;
+
+        let pct_hfq4 = bw_hfq4 / peak_bw * 100.0;
+        let pct_q4k = bw_q4k / peak_bw * 100.0;
+
+        eprintln!("{:<20} {:>6} {:>6}  {:>9.1} {:>8.1} {:>5.1}%  {:>9.1} {:>8.1} {:>5.1}%  {:>6.2}x",
+            name, m, k, us_hfq4, bw_hfq4, pct_hfq4, us_q4k, bw_q4k, pct_q4k, us_q4k as f64 / us_hfq4 as f64);
+
+        gpu.free_tensor(d_hfq4).unwrap();
+        gpu.free_tensor(d_q4k).unwrap();
+        gpu.free_tensor(d_x).unwrap();
+        gpu.free_tensor(d_y).unwrap();
+        gpu.hip.event_destroy(start).unwrap();
+        gpu.hip.event_destroy(stop).unwrap();
     }
-    gpu.hip.event_record(&stop, None).unwrap();
-    gpu.hip.event_synchronize(&stop).unwrap();
-    let ms_hfq4 = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
-    let us_hfq4 = ms_hfq4 * 1000.0 / n as f32;
-    let bytes_hfq4 = (total_hfq4 + k * 4) as f64;
-    let bw_hfq4 = bytes_hfq4 * n as f64 / (ms_hfq4 as f64 / 1000.0) / 1e9;
-
-    // Benchmark Q4K
-    gpu.hip.event_record(&start, None).unwrap();
-    for _ in 0..n {
-        gpu.gemv_q4k(&d_q4k, &d_x, &d_y, m, k).unwrap();
-    }
-    gpu.hip.event_record(&stop, None).unwrap();
-    gpu.hip.event_synchronize(&stop).unwrap();
-    let ms_q4k = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
-    let us_q4k = ms_q4k * 1000.0 / n as f32;
-    let bytes_q4k = (total_q4k + k * 4) as f64;
-    let bw_q4k = bytes_q4k * n as f64 / (ms_q4k as f64 / 1000.0) / 1e9;
-
-    eprintln!("=== HFQ4-G256 vs Q4K at {}x{} ===", m, k);
-    eprintln!("HFQ4-G256: {:.1} us/call, {:.1} GB/s  (136B per 256w, 0.531 B/w)", us_hfq4, bw_hfq4);
-    eprintln!("Q4K:       {:.1} us/call, {:.1} GB/s  (144B per 256w, 0.563 B/w)", us_q4k, bw_q4k);
-    eprintln!("Speedup:   {:.2}x wall-clock", us_q4k / us_hfq4);
-    eprintln!("BW ratio:  {:.2}x", bw_hfq4 / bw_q4k);
-
-    gpu.free_tensor(d_hfq4).unwrap();
-    gpu.free_tensor(d_q4k).unwrap();
-    gpu.free_tensor(d_x).unwrap();
-    gpu.free_tensor(d_y).unwrap();
-    gpu.hip.event_destroy(start).unwrap();
-    gpu.hip.event_destroy(stop).unwrap();
 }
