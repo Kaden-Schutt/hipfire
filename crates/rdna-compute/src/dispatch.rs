@@ -1540,6 +1540,53 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [total_rows, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// Write KV vector to Q8_0 quantized cache (same format as GGML Q8_0).
+    pub fn kv_cache_write_q8_0(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
+        let func = &self.functions["kv_cache_write_q8_0"];
+        let mut d = dst.buf.as_ptr();
+        let mut s = src.buf.as_ptr();
+        let mut p = pos_buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Attention with Q8_0 quantized KV cache.
+    pub fn attention_q8_0_kv(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, pos_buf: &DeviceBuffer, seq_len_hint: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8_0_kv", kernels::ATTENTION_Q8_0_KV_SRC, "attention_q8_0_kv")?;
+        let func = &self.functions["attention_q8_0_kv"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        let shared_mem = ((seq_len_hint + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+
     /// Write KV vector to Q8 (int8 symmetric) quantized cache.
     pub fn kv_cache_write_q8(
         &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,

@@ -36,7 +36,8 @@ fn main() {
     for (_i, a) in args.iter().enumerate().skip(2) {
         if skip_next { skip_next = false; continue; }
         if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--repeat-penalty" || a == "--repeat-window" {
-            if a != "--debug" { skip_next = true; } continue;
+            if a == "--temp" || a == "--repeat-penalty" || a == "--repeat-window" { skip_next = true; }
+            continue;
         }
         prompt_parts.push(a.as_str());
     }

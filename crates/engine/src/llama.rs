@@ -669,15 +669,27 @@ pub fn prefill_forward(
             // Copy position i's K, V from batch buffers into KV cache
             gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
             gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
+            if kv_cache.quantized && kv_cache.quant_q8 {
+                gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
+                gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
+            } else {
+                gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
+                gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
+            }
 
             // Attention (causal: position i sees 0..=i)
             gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
-            gpu.attention_f32(
-                &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-            )?;
+            if kv_cache.quantized && kv_cache.quant_q8 {
+                gpu.attention_q8_0_kv(
+                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+                )?;
+            } else {
+                gpu.attention_f32(
+                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
+                )?;
+            }
             gpu.hip.memcpy_dtod_at(&attn_out_batch.buf, i * q_dim * 4, &attn_slice.buf, 0, q_dim * 4)?;
         }
 
@@ -1003,9 +1015,9 @@ pub fn forward_scratch_layers(
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
         if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_q8(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_q8kv(
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q8_0_kv(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
@@ -1098,9 +1110,9 @@ pub fn forward_scratch_compute(
         gpu.rope_f32(&scratch.q, &scratch.k, &scratch.pos_buf, n_heads, n_kv_heads, head_dim, config.rope_freq_base)?;
 
         if kv_cache.quantized && kv_cache.quant_q8 {
-            gpu.kv_cache_write_q8(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.kv_cache_write_q8(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
-            gpu.attention_q8kv(
+            gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &scratch.k, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &scratch.v, &scratch.pos_buf, n_kv_heads, head_dim)?;
+            gpu.attention_q8_0_kv(
                 &scratch.q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                 &scratch.attn_out, &scratch.pos_buf, pos + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
             )?;
@@ -1531,14 +1543,16 @@ impl KvCache {
         Ok(Self { k_gpu, v_gpu, kv_dim, max_seq: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false })
     }
 
-    /// Create Q8 (int8 symmetric) quantized KV cache. 3.88x smaller than FP32.
+    /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
+    /// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
+    /// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
     pub fn new_gpu_q8(
         gpu: &mut Gpu, n_layers: usize, n_kv_heads: usize, head_dim: usize, max_seq_len: usize,
     ) -> HipResult<Self> {
         let kv_dim = n_kv_heads * head_dim;
-        let bytes_per_head = 4 + head_dim; // f32 scale + int8 values
-        let bytes_per_pos = n_kv_heads * bytes_per_head;
-        let cache_bytes = max_seq_len * bytes_per_pos;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let cache_bytes = max_seq_len * total_blocks * 34;
         let cache_elems = (cache_bytes + 3) / 4;
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);

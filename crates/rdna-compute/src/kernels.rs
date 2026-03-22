@@ -1747,6 +1747,158 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
 }
 "#;
 
+/// Quantize KV vector to Q8_0 format (same as GGML Q8_0 / existing GEMV kernels).
+/// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
+/// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
+/// Layout: [max_seq × n_kv_heads × blocks_per_head × 34].
+pub const KV_CACHE_WRITE_Q8_0_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q8_0(
+    unsigned char* __restrict__ dst,     // quantized cache
+    const float* __restrict__ src,       // [kv_dim] FP32 KV vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    // Grid: [n_kv_heads × blocks_per_head, 1, 1]. Block: [32, 1, 1].
+    // Each threadblock quantizes one Q8_0 block (32 elements).
+    const int gid = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    const int pos = pos_buf[0];
+
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks = n_kv_heads * blocks_per_head;
+    if (gid >= total_blocks) return;
+
+    const int head_idx = gid / blocks_per_head;
+    const int block_idx = gid % blocks_per_head;
+    const int elem_offset = head_idx * head_dim + block_idx * 32 + tid;
+
+    float val = src[elem_offset];
+
+    // Warp reduction for max absolute value
+    float amax = fabsf(val);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    float scale = amax / 127.0f;
+    float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    int q = __float2int_rn(val * inv_scale);
+    q = max(-127, min(127, q));
+
+    // Output: pos * total_blocks * 34 + gid * 34
+    unsigned char* out = dst + (size_t)pos * total_blocks * 34 + gid * 34;
+
+    // Thread 0 writes the f16 scale
+    if (tid == 0) {
+        *((_Float16*)(out)) = (_Float16)scale;
+    }
+    // All threads write their int8 value
+    out[2 + tid] = (unsigned char)(signed char)q;
+}
+"#;
+
+/// Attention with Q8_0 quantized KV cache — same format as GGML Q8_0.
+/// K and V caches stored as [max_seq × n_kv_heads × blocks_per_head × 34].
+pub const ATTENTION_Q8_0_KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q8_0_kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
+    const int kv_head_block_start = kv_h * blocks_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with Q8_0 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float dot = 0.0f;
+        for (int bi = 0; bi < blocks_per_head; bi++) {
+            const unsigned char* block = k_cache + (size_t)t * total_blocks_per_pos * 34
+                                        + (kv_head_block_start + bi) * 34;
+            float d = (float)*((const _Float16*)block);
+            for (int j = 0; j < 32; j++) {
+                signed char qval = (signed char)block[2 + j];
+                dot += q_head[bi * 32 + j] * (d * (float)qval);
+            }
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with Q8_0 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int bi = d / 32;
+        int bj = d % 32;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* block = v_cache + (size_t)t * total_blocks_per_pos * 34
+                                        + (kv_head_block_start + bi) * 34;
+            float vd = (float)*((const _Float16*)block) * (float)(signed char)block[2 + bj];
+            val += scores[t] * vd;
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
 /// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
 /// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
 /// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
