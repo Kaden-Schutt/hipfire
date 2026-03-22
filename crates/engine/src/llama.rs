@@ -876,6 +876,7 @@ pub struct ForwardScratch {
     pub logits: GpuTensor,
     pub sample_buf: GpuTensor,
     pub repeat_buf: GpuTensor,
+    pub attn_partials: GpuTensor,  // flash-decoding partial results
     pub pos_buf: hip_bridge::DeviceBuffer,
 }
 
@@ -884,6 +885,11 @@ impl ForwardScratch {
         let dim = config.dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
+        // Flash-decoding partials: n_heads × max_chunks × (2 + head_dim) floats
+        // max_chunks = ceil(2048 / 128) = 16
+        let max_chunks = 16;
+        let partial_stride = 2 + config.head_dim;
+        let partials_size = config.n_heads * max_chunks * partial_stride;
         Ok(Self {
             x: gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
@@ -899,6 +905,7 @@ impl ForwardScratch {
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
+            attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
             pos_buf: gpu.hip.malloc(4)?,  // single i32
         })
     }

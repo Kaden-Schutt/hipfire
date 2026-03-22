@@ -23,6 +23,7 @@ dependencies = [
  "libc",
  "memmap2",
  "rdna-compute",
+ "serde",
  "serde_json",
 ]
 

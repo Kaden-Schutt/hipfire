@@ -1414,6 +1414,102 @@ impl Gpu {
         }
     }
 
+    /// Flash-decoding attention: split KV scan for long sequences.
+    /// Automatically chooses single-block or multi-block based on seq_len.
+    pub fn attention_flash(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        partials: &GpuTensor,
+        seq_len: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> HipResult<()> {
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Choose chunk size: aim for 4-16 chunks
+        let chunk_size = if seq_len <= 128 { seq_len } else { 128 };
+        let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+        // Phase 1: compute partial attention per chunk
+        self.ensure_kernel("attention_flash_partial", kernels::ATTENTION_FLASH_SRC, "attention_flash_partial")?;
+        let func1 = &self.functions["attention_flash_partial"];
+
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut p_ptr = partials.buf.as_ptr();
+        let mut sl = seq_len as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut cs = chunk_size as i32;
+
+        let mut params1: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut cs as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
+        let shared_mem = ((chunk_size + block_size as usize) * 4) as u32;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func1,
+                [n_heads as u32, n_chunks as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params1,
+            )?;
+        }
+
+        // Phase 2: reduce partials
+        self.ensure_kernel("attention_flash_reduce", kernels::ATTENTION_FLASH_SRC, "attention_flash_reduce")?;
+        let func2 = &self.functions["attention_flash_reduce"];
+
+        let mut p_ptr2 = partials.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut nh2 = n_heads as i32;
+        let mut nc = n_chunks as i32;
+        let mut hd2 = head_dim as i32;
+
+        let mut params2: Vec<*mut c_void> = vec![
+            &mut p_ptr2 as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut nh2 as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut hd2 as *mut _ as *mut c_void,
+        ];
+
+        let reduce_block = head_dim.min(256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func2,
+                [n_heads as u32, 1, 1],
+                [reduce_block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params2,
+            )
+        }
+    }
+
     /// GPU-side KV cache write. Copies kv_dim floats from src to dst[pos_buf[0] * kv_dim].
     pub fn kv_cache_write(
         &mut self,
