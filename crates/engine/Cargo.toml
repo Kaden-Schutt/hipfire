@@ -10,5 +10,6 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 memmap2 = "0.9"
 byteorder = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"

@@ -1,0 +1,10 @@
+ggml_cuda_init: GGML_CUDA_FORCE_MMQ:    no
+ggml_cuda_init: GGML_CUDA_FORCE_CUBLAS: no
+ggml_cuda_init: found 1 ROCm devices:
+  Device 0: AMD Radeon RX 5700 XT, gfx1010:xnack- (0x1010), VMM: no, Wave Size: 32
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| qwen3 0.6B Q8_0                | 604.15 MiB |   596.05 M | ROCm       |  99 |            pp26 |       1711.62 ± 4.79 |
+| qwen3 0.6B Q8_0                | 604.15 MiB |   596.05 M | ROCm       |  99 |            tg20 |        193.18 ± 0.23 |
+
+build: 7f8ef50cc (7209)
