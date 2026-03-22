@@ -27,13 +27,15 @@ fn main() {
         .map(|i| args[i + 1].parse().unwrap_or(1.1)).unwrap_or(1.1);
     let repeat_window: usize = args.iter().position(|a| a == "--repeat-window")
         .map(|i| args[i + 1].parse().unwrap_or(64)).unwrap_or(64);
+    let use_q4kv = args.iter().any(|a| a == "--q4kv");
+    let use_q8kv = args.iter().any(|a| a == "--q8kv");
 
     // Collect prompt text (skip flags)
     let mut prompt_parts = Vec::new();
     let mut skip_next = false;
     for (_i, a) in args.iter().enumerate().skip(2) {
         if skip_next { skip_next = false; continue; }
-        if a == "--temp" || a == "--debug" || a == "--repeat-penalty" || a == "--repeat-window" {
+        if a == "--temp" || a == "--debug" || a == "--q4kv" || a == "--q8kv" || a == "--repeat-penalty" || a == "--repeat-window" {
             if a != "--debug" { skip_next = true; } continue;
         }
         prompt_parts.push(a.as_str());
@@ -100,9 +102,15 @@ fn main() {
 
     // KV cache
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = KvCache::new_gpu(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len,
-    ).unwrap();
+    let mut kv_cache = if use_q8kv {
+        eprintln!("KV cache: Q8 quantized (3.88x compression)");
+        KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else if use_q4kv {
+        eprintln!("KV cache: HFQ4 quantized (3.56x compression)");
+        KvCache::new_gpu_q4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    } else {
+        KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap()
+    };
 
     // Persistent scratch buffers
     let scratch = llama::ForwardScratch::new(&mut gpu, &config).unwrap();

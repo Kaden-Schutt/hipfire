@@ -1747,6 +1747,332 @@ extern "C" __global__ void fused_gate_up_hfq4g256(
 }
 "#;
 
+/// Quantize KV vector to Q8 (int8 symmetric) and write to quantized KV cache.
+/// Per head: [4B f32 scale][head_dim × int8 values] = head_dim + 4 bytes.
+/// For head_dim=128: 132 bytes vs 512 bytes FP32 = 3.88x compression.
+pub const KV_CACHE_WRITE_Q8_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q8(
+    unsigned char* __restrict__ dst,
+    const float* __restrict__ src,
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Find max absolute value for symmetric quantization
+    extern __shared__ float smem[];
+    float local_max = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        local_max = fmaxf(local_max, fabsf(head_src[i]));
+    }
+    smem[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        __syncthreads();
+    }
+    float amax = smem[0];
+    float scale = amax / 127.0f;
+    float inv_scale = (scale > 0.0f) ? (127.0f / amax) : 0.0f;
+
+    int bytes_per_head = 4 + head_dim;  // f32 scale + int8 values
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    if (tid == 0) *(float*)(out) = scale;
+    __syncthreads();
+
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = head_src[i];
+        int q = __float2int_rn(v * inv_scale);
+        q = max(-127, min(127, q));
+        out[4 + i] = (unsigned char)(signed char)q;
+    }
+}
+"#;
+
+/// Attention with Q8 quantized KV cache — symmetric int8, dequant on read.
+pub const ATTENTION_Q8KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q8kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache_q8,
+    const unsigned char* __restrict__ v_cache_q8,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    int bytes_per_head = 4 + head_dim;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with int8 dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* k_packed = k_cache_q8 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+        float k_scale = *(const float*)(k_packed);
+        const signed char* k_vals = (const signed char*)(k_packed + 4);
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += q_head[d] * (k_scale * (float)k_vals[d]);
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with int8 dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* v_packed = v_cache_q8 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+            float v_scale = *(const float*)(v_packed);
+            signed char v_q = (signed char)v_packed[4 + d];
+            val += scores[t] * (v_scale * (float)v_q);
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
+/// Quantize KV vector to HFQ4-G128 and write to quantized KV cache.
+/// Input: kv_dim floats at kv_src. Output: packed HFQ4 at dst[pos * bytes_per_pos].
+/// Each group of 128 floats → 72 bytes (4B scale + 4B zero + 64B nibbles).
+/// For head_dim=128, one head = exactly one group = 72 bytes.
+pub const KV_CACHE_WRITE_Q4_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void kv_cache_write_q4(
+    unsigned char* __restrict__ dst,     // quantized cache
+    const float* __restrict__ src,       // [kv_dim] FP32 KV vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;  // one block per KV head
+    if (h >= n_kv_heads) return;
+    const int tid = threadIdx.x;
+    const int pos = pos_buf[0];
+
+    const float* head_src = src + h * head_dim;
+
+    // Shared memory for min/max reduction
+    extern __shared__ float smem[];
+    float* s_min = smem;
+    float* s_max = smem + blockDim.x;
+
+    // Find min/max across head_dim elements
+    float local_min = 1e30f, local_max = -1e30f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        float v = head_src[i];
+        local_min = fminf(local_min, v);
+        local_max = fmaxf(local_max, v);
+    }
+    s_min[tid] = local_min;
+    s_max[tid] = local_max;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            s_min[tid] = fminf(s_min[tid], s_min[tid + s]);
+            s_max[tid] = fmaxf(s_max[tid], s_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    float vmin = s_min[0];
+    float vmax = s_max[0];
+
+    float scale = (vmax - vmin) / 15.0f;
+    float zero = vmin;
+    float inv_scale = (scale > 0.0f) ? (1.0f / scale) : 0.0f;
+
+    // Output layout per head: [4B scale][4B zero][head_dim/2 nibbles]
+    int bytes_per_head = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+    unsigned char* out = dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+
+    // Write scale and zero (thread 0 only)
+    if (tid == 0) {
+        *(float*)(out) = scale;
+        *(float*)(out + 4) = zero;
+    }
+    __syncthreads();
+
+    // Quantize and pack nibbles (2 elements per byte)
+    for (int i = tid; i < head_dim / 2; i += blockDim.x) {
+        int e0 = i * 2;
+        int e1 = i * 2 + 1;
+        float v0 = head_src[e0];
+        float v1 = head_src[e1];
+        int q0 = __float2int_rn((v0 - zero) * inv_scale);
+        int q1 = __float2int_rn((v1 - zero) * inv_scale);
+        q0 = max(0, min(15, q0));
+        q1 = max(0, min(15, q1));
+        out[8 + i] = (unsigned char)((q1 << 4) | q0);
+    }
+}
+"#;
+
+/// Attention with quantized HFQ4 KV cache.
+/// Same structure as attention_f32 but dequantizes K and V on the fly.
+pub const ATTENTION_Q4KV_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ void attention_q4kv(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache_q4,
+    const unsigned char* __restrict__ v_cache_q4,
+    float* __restrict__ out,
+    const int* __restrict__ pos_buf,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn
+) {
+    int seq_len = pos_buf[0] + 1;
+    extern __shared__ float sdata[];
+
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const float* q_head = q + h * head_dim;
+    int bytes_per_head = 8 + head_dim / 2;
+    int bytes_per_pos = n_kv_heads * bytes_per_head;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+
+    // Phase 1: Q @ K^T with on-the-fly dequant
+    float local_max = -1e30f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        const unsigned char* k_packed = k_cache_q4 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+        float k_scale = *(const float*)(k_packed);
+        float k_zero  = *(const float*)(k_packed + 4);
+        const unsigned char* k_nib = k_packed + 8;
+
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d += 2) {
+            unsigned char byte_val = k_nib[d / 2];
+            float k0 = k_scale * (float)(byte_val & 0xF) + k_zero;
+            float k1 = k_scale * (float)(byte_val >> 4) + k_zero;
+            dot += q_head[d] * k0 + q_head[d + 1] * k1;
+        }
+        float s = dot * scale_attn;
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted sum of V with on-the-fly dequant
+    float* out_head = out + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        int d_byte = d / 2;
+        int d_nib_shift = (d & 1) * 4;
+        for (int t = 0; t < seq_len; t++) {
+            const unsigned char* v_packed = v_cache_q4 + (size_t)t * bytes_per_pos + kv_h * bytes_per_head;
+            float v_scale = *(const float*)(v_packed);
+            float v_zero  = *(const float*)(v_packed + 4);
+            unsigned char byte_val = v_packed[8 + d_byte];
+            float v_val = v_scale * (float)((byte_val >> d_nib_shift) & 0xF) + v_zero;
+            val += scores[t] * v_val;
+        }
+        out_head[d] = val;
+    }
+}
+"#;
+
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
 pub const KV_CACHE_WRITE_SRC: &str = r#"
