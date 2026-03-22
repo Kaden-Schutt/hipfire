@@ -9,12 +9,12 @@
 
 | Metric | hipfire Before | hipfire After | llama.cpp | Ratio | Winner |
 |--------|---------------|--------------|-----------|-------|--------|
-| **8B short gen** (tok/s) | 55.5 | **55.3** | 44.3 | **1.25x** | hipfire |
-| **8B long gen** (tok/s) | 36.1 | **37.9** | 42.8 | 0.89x | llama.cpp |
-| **8B prefill** (tok/s) | 56 | **89** | 189.2 | 0.47x | llama.cpp |
-| **0.6B short gen** (tok/s) | 221 | **230.8** | 193.6 | **1.19x** | hipfire |
-| **0.6B long gen** (tok/s) | 105.9 | **~106** | 181.3 | 0.58x | llama.cpp |
-| **0.6B prefill** (tok/s) | 215 | **392** | 1534 | 0.26x | llama.cpp |
+| **8B short gen** (tok/s) | 55.5 | **59.5** | 44.3 | **1.34x** | hipfire |
+| **8B long gen** (tok/s) | 36.1 | **52.7** | 42.8 | **1.23x** | hipfire |
+| **8B prefill** (tok/s) | 56 | **91** | 189.2 | 0.48x | llama.cpp |
+| **0.6B short gen** (tok/s) | 221 | **250.5** | 193.6 | **1.29x** | hipfire |
+| **0.6B long gen** (tok/s) | 105.9 | **~130** | 181.3 | 0.72x | llama.cpp |
+| **0.6B prefill** (tok/s) | 215 | **370** | 1534 | 0.24x | llama.cpp |
 
 ## What We Tried
 
