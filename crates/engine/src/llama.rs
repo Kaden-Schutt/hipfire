@@ -661,41 +661,27 @@ pub fn prefill_forward(
         gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
             n_heads, n_kv_heads, head_dim, config.rope_freq_base, batch)?;
 
-        // KV cache + Attention: still sequential per position
-        for i in 0..batch {
-            let pos_i32 = i as i32;
-            gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
-
-            // Copy position i's K, V from batch buffers into KV cache
-            gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            if kv_cache.quant_hfq4 {
-                gpu.kv_cache_write_hfq4(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
-                gpu.kv_cache_write_hfq4(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
-            } else if kv_cache.quant_int8 {
-                gpu.kv_cache_write_int8c_f16(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
-                gpu.kv_cache_write_int8c_f16(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
-            } else if kv_cache.quantized && kv_cache.quant_q8 {
-                gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, n_kv_heads, head_dim)?;
-                gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, n_kv_heads, head_dim)?;
-            } else {
+        // Batched KV cache write: all positions in 2 kernel launches (K + V)
+        if kv_cache.quantized && kv_cache.quant_q8 {
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.k_gpu[layer_idx], &k_batch, &pos_array, n_kv_heads, head_dim, batch)?;
+            gpu.kv_cache_write_q8_0_batched(&kv_cache.v_gpu[layer_idx], &v_batch, &pos_array, n_kv_heads, head_dim, batch)?;
+        } else {
+            for i in 0..batch {
+                let pos_i32 = i as i32;
+                gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
+                gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
+                gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
                 gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &k_slice, &pos_buf, kv_dim)?;
                 gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &v_slice, &pos_buf, kv_dim)?;
             }
+        }
 
-            // Attention
+        // Attention: sequential per position (causal dependency)
+        for i in 0..batch {
+            let pos_i32 = i as i32;
+            gpu.hip.memcpy_htod(&pos_buf, &pos_i32.to_ne_bytes())?;
             gpu.hip.memcpy_dtod_at(&q_slice.buf, 0, &q_batch.buf, i * q_dim * 4, q_dim * 4)?;
-            if kv_cache.quant_hfq4 {
-                gpu.attention_hfq4_kv(
-                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-                )?;
-            } else if kv_cache.quant_int8 {
-                gpu.attention_int8c_f16_kv(
-                    &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
-                )?;
-            } else if kv_cache.quantized && kv_cache.quant_q8 {
+            if kv_cache.quantized && kv_cache.quant_q8 {
                 gpu.attention_q8_0_kv(
                     &q_slice, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                     &attn_slice, &pos_buf, i + 1, n_heads, n_kv_heads, head_dim, kv_cache.max_seq,
