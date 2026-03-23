@@ -567,13 +567,24 @@ pub fn forward(
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
+
+        // Per-layer norm tracking (last prompt token only)
+        if pos == 19 {
+            let hid = gpu.download_f32(&x)?;
+            let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let lt = match config.layer_types[layer_idx] { LayerType::LinearAttention => "D", LayerType::FullAttention => "F" };
+            eprintln!("  L{layer_idx:>2}({lt}) norm={norm:.2}");
+        }
     }
 
-    // Debug: dump hidden state before final norm
+    // Debug: dump hidden state before and after final norm
     {
         let hid = gpu.download_f32(&x)?;
         let norm: f32 = hid.iter().map(|v| v * v).sum::<f32>().sqrt();
-        eprintln!("DEBUG final hidden: first8={:?} norm={:.4}", &hid[..8], norm);
+        eprintln!("DEBUG pre-norm: first8={:?} norm={:.4}", &hid[..8], norm);
+        let norm_w = gpu.download_f32(&weights.output_norm)?;
+        eprintln!("DEBUG norm_weight: first8={:?} norm={:.4}", &norm_w[..8],
+            norm_w.iter().map(|v| v * v).sum::<f32>().sqrt());
     }
 
     // Final norm + output projection
