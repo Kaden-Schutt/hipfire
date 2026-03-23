@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 description = "Inference orchestrator for RDNA GPUs"
 
+[features]
+deltanet = ["rdna-compute/deltanet"]
+
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

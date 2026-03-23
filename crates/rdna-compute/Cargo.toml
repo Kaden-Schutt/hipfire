@@ -5,5 +5,8 @@ edition.workspace = true
 license.workspace = true
 description = "Compute kernel dispatch for RDNA GPUs"
 
+[features]
+deltanet = []
+
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }

@@ -3035,6 +3035,219 @@ extern "C" __global__ void attention_q4kv(
 }
 "#;
 
+// ═══════════════════════════════════════════════════════════════════════
+// DeltaNet ops (Qwen3.5 linear attention)
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Sigmoid: σ(x) = 1 / (1 + exp(-x)). Element-wise, in-place.
+#[cfg(feature = "deltanet")]
+pub const SIGMOID_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void sigmoid_f32(float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+"#;
+
+/// Softplus: log(1 + exp(x)), numerically stable. Element-wise, in-place.
+#[cfg(feature = "deltanet")]
+pub const SOFTPLUS_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void softplus_f32(float* __restrict__ x, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        x[i] = (v > 20.0f) ? v : ((v < -20.0f) ? expf(v) : logf(1.0f + expf(v)));
+    }
+}
+"#;
+
+/// L2 normalization per head: out[i] = x[i] / sqrt(sum(x²) + eps).
+/// Grid: [n_heads]. Block: [32]. Each warp normalizes one head of head_dim elements.
+#[cfg(feature = "deltanet")]
+pub const L2_NORM_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void l2_norm_f32(
+    float* __restrict__ x, int n_heads, int head_dim, float eps
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+    float* head = x + h * head_dim;
+
+    float sq_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += 32)
+        sq_sum += head[i] * head[i];
+    for (int o = 16; o > 0; o >>= 1)
+        sq_sum += __shfl_xor(sq_sum, o);
+
+    float inv_norm = rsqrtf(sq_sum + eps);
+    for (int i = tid; i < head_dim; i += 32)
+        head[i] *= inv_norm;
+}
+"#;
+
+/// 1D causal depthwise convolution (kernel_size=4) with persistent ring buffer state.
+/// For decode: one token at a time. conv_state: [n_channels × 3] ring buffer.
+/// out[c] = w[0]*x[c] + w[1]*state[c][0] + w[2]*state[c][1] + w[3]*state[c][2]
+/// Then shift state: state = [x, state[0], state[1]].
+#[cfg(feature = "deltanet")]
+pub const CONV1D_DECODE_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void conv1d_decode_f32(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    const float* __restrict__ weight,   // [4 × n_channels]
+    float* __restrict__ state,          // [n_channels × 3]
+    int n_channels
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n_channels) return;
+
+    float x = input[c];
+    float s0 = state[c * 3];
+    float s1 = state[c * 3 + 1];
+    float s2 = state[c * 3 + 2];
+
+    output[c] = weight[c] * x + weight[n_channels + c] * s0
+              + weight[2 * n_channels + c] * s1 + weight[3 * n_channels + c] * s2;
+
+    state[c * 3 + 2] = s1;
+    state[c * 3 + 1] = s0;
+    state[c * 3]     = x;
+}
+"#;
+
+/// Gated output norm: rmsnorm(x) * silu(z). Fused single kernel.
+/// x and z are [n_heads × head_dim]. weight is [head_dim] (shared across heads).
+#[cfg(feature = "deltanet")]
+pub const GATED_NORM_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+extern "C" __global__ void gated_norm_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ z,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int n_heads, int head_dim, float eps
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+
+    const float* xh = x + h * head_dim;
+    const float* zh = z + h * head_dim;
+    float* oh = out + h * head_dim;
+
+    float sq_sum = 0.0f;
+    for (int i = tid; i < head_dim; i += 32)
+        sq_sum += xh[i] * xh[i];
+    for (int o = 16; o > 0; o >>= 1)
+        sq_sum += __shfl_xor(sq_sum, o);
+    float inv_rms = rsqrtf(sq_sum / (float)head_dim + eps);
+
+    for (int i = tid; i < head_dim; i += 32) {
+        float normed = xh[i] * inv_rms * weight[i];
+        float z_val = zh[i];
+        float silu_z = z_val / (1.0f + expf(-z_val));
+        oh[i] = normed * silu_z;
+    }
+}
+"#;
+
+/// Gated Delta Net recurrence — THE CORE OP.
+/// S matrix lives in LDS (128×128×4 = 64KB = full CU LDS).
+/// Per token: S = alpha * S + beta * outer(k, v), output = S @ q.
+/// Grid: [n_heads]. Block: [32, 4] (32 lanes × 4 warps = 128 threads).
+/// Each thread handles one row of S (128 elements).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+// 128 threads = 4 warps × 32 lanes. Each thread owns one row of S.
+extern "C" __global__ void gated_delta_net_f32(
+    const float* __restrict__ q,       // [n_tokens × n_heads × head_dim]
+    const float* __restrict__ k,       // [n_tokens × n_heads × head_dim]
+    const float* __restrict__ v,       // [n_tokens × n_heads × head_dim]
+    const float* __restrict__ gate,    // [n_tokens × n_heads] (scalar alpha per head per token)
+    const float* __restrict__ beta,    // [n_tokens × n_heads] (scalar beta per head per token)
+    float* __restrict__ state,         // [n_heads × head_dim × head_dim] persistent S matrix
+    float* __restrict__ output,        // [n_tokens × n_heads × head_dim]
+    int n_tokens,
+    int n_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int row = threadIdx.y * blockDim.x + threadIdx.x;  // 0..127
+    if (row >= head_dim) return;
+
+    // Load S[row][:] into LDS
+    __shared__ float lds_S[128][128];  // 64KB — full CU LDS
+    float* state_row = state + h * head_dim * head_dim + row * head_dim;
+    for (int j = 0; j < head_dim; j++)
+        lds_S[row][j] = state_row[j];
+    __syncthreads();
+
+    const int stride = n_heads * head_dim;
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float* q_t = q + t * stride + h * head_dim;
+        const float* k_t = k + t * stride + h * head_dim;
+        const float* v_t = v + t * stride + h * head_dim;
+        float alpha_val = expf(gate[t * n_heads + h]);
+        float beta_val = beta[t * n_heads + h];
+
+        // kv = S^T @ k (dot product of column `row` with k)
+        // But S is stored row-major, so kv[row] = sum_j S[j][row] * k[j]
+        // Each thread has row `row`, needs column-wise access — expensive.
+        // Instead: compute delta = (v[row] - alpha * kv[row]) * beta
+        // Then S[row][j] = alpha * S[row][j] + k[j] * delta
+
+        // Step 1: kv[row] = sum_j S[j][row] * k[j]
+        // This requires reading column `row` from all rows.
+        // With 128 threads each owning a row, thread `j` has S[j][row].
+        // Use shared memory to collect S[j][row] * k[j] from all threads.
+        __shared__ float kv_partial[128];
+        kv_partial[row] = lds_S[row][row];  // placeholder — wrong, need column access
+
+        // Actually: each thread `row` can compute its contribution to kv for ALL columns.
+        // But kv is per-column. Let's use the llama.cpp approach:
+        // Each warp owns one column, reduces across rows.
+        // Our layout: thread `row` owns S[row][:].
+        // For kv[col] = sum_row S[row][col] * k[row]:
+        //   Each thread contributes S[row][col] * k[row] for its row.
+        //   Need warp reduction across threads for each col.
+
+        // Simpler: since we have 128 threads and 128 columns,
+        // assign thread `row` to compute kv[row]:
+        // kv[row] = sum_j S[j][row] * k[j]
+        // This requires reading S[j][row] for all j — column access in LDS.
+        float kv_val = 0.0f;
+        for (int j = 0; j < head_dim; j++)
+            kv_val += lds_S[j][row] * k_t[j];
+
+        float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
+
+        // Update S[row][j] = alpha * S[row][j] + k[j] * delta
+        for (int j = 0; j < head_dim; j++)
+            lds_S[row][j] = alpha_val * lds_S[row][j] + k_t[j] * delta;
+        __syncthreads();
+
+        // Output: o[row] = sum_j S[row][j] * q[j]
+        float out_val = 0.0f;
+        for (int j = 0; j < head_dim; j++)
+            out_val += lds_S[row][j] * q_t[j];
+
+        output[t * stride + h * head_dim + row] = out_val;
+        __syncthreads();
+    }
+
+    // Write S back to VRAM
+    for (int j = 0; j < head_dim; j++)
+        state_row[j] = lds_S[row][j];
+}
+"#;
+
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
 pub const KV_CACHE_WRITE_SRC: &str = r#"
