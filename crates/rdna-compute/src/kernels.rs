@@ -3428,6 +3428,111 @@ extern "C" __global__ void gated_delta_net_q8(
 }
 "#;
 
+/// GDN recurrence with Q4-quantized S state in VRAM.
+/// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
+/// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
+/// 8x compression vs FP32 (8KB + 512B scales per head vs 64KB).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q4_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+
+#define HD 128
+
+extern "C" __global__ void gated_delta_net_q4(
+    const float* __restrict__ q,
+    const float* __restrict__ k,
+    const float* __restrict__ v,
+    const float* __restrict__ gate,
+    const float* __restrict__ beta,
+    unsigned char* __restrict__ s_q4,   // [n_heads × HD × HD/2] nibble-packed
+    float* __restrict__ s_scales,       // [n_heads × HD] per-row scale
+    float* __restrict__ output,
+    int n_tokens,
+    int n_heads,
+    int head_dim
+) {
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int row = threadIdx.x;  // 0..127
+
+    const int stride = n_heads * HD;
+    const int half_hd = HD / 2;  // 64 bytes per row (nibble packed)
+    unsigned char* S_q4_row = s_q4 + h * HD * half_hd + row * half_hd;
+    float row_scale = s_scales[h * HD + row];
+
+    // Dequantize S row from Q4 to FP32 in registers
+    // Nibble pack: byte[j/2] = low_nibble(j even) | high_nibble(j odd)
+    // Signed 4-bit: -8..+7 stored as unsigned 0..15, subtract 8
+    float S_local[HD];
+    for (int j = 0; j < HD; j += 2) {
+        unsigned char byte = S_q4_row[j / 2];
+        S_local[j]   = row_scale * (float)((int)(byte & 0xF) - 8);
+        S_local[j+1] = row_scale * (float)((int)(byte >> 4) - 8);
+    }
+
+    __shared__ float k_lds[HD];
+    __shared__ float q_lds[HD];
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float* q_t = q + t * stride + h * HD;
+        const float* k_t = k + t * stride + h * HD;
+        const float* v_t = v + t * stride + h * HD;
+        float alpha_val = expf(gate[t * n_heads + h]);
+        float beta_val = beta[t * n_heads + h];
+
+        k_lds[row] = k_t[row];
+        q_lds[row] = q_t[row];
+        __syncthreads();
+
+        // Phase 1: kv = S^T @ k (column access into global Q4 state)
+        float kv_val = 0.0f;
+        for (int j = 0; j < HD; j++) {
+            float sc_j = s_scales[h*HD + j];
+            unsigned char byte = s_q4[h*HD*half_hd + j*half_hd + row/2];
+            int nibble = (row % 2 == 0) ? (byte & 0xF) : (byte >> 4);
+            kv_val += sc_j * (float)(nibble - 8) * k_lds[j];
+        }
+
+        float delta = (v_t[row] - alpha_val * kv_val) * beta_val;
+
+        // Phase 2+3 fused: update S in registers and compute output
+        float out_val = 0.0f;
+        for (int j = 0; j < HD; j += 4) {
+            float s0 = alpha_val * S_local[j]   + k_lds[j]   * delta;
+            float s1 = alpha_val * S_local[j+1] + k_lds[j+1] * delta;
+            float s2 = alpha_val * S_local[j+2] + k_lds[j+2] * delta;
+            float s3 = alpha_val * S_local[j+3] + k_lds[j+3] * delta;
+            S_local[j]   = s0;
+            S_local[j+1] = s1;
+            S_local[j+2] = s2;
+            S_local[j+3] = s3;
+            out_val += s0 * q_lds[j] + s1 * q_lds[j+1] + s2 * q_lds[j+2] + s3 * q_lds[j+3];
+        }
+        output[t * stride + h * HD + row] = out_val;
+        __syncthreads();
+    }
+
+    // Quantize S row back to Q4: per-row absmax, symmetric -8..+7
+    float amax = 0.0f;
+    for (int j = 0; j < HD; j++) {
+        float a = fabsf(S_local[j]);
+        if (a > amax) amax = a;
+    }
+
+    float new_scale = (amax > 0.0f) ? (amax / 7.0f) : 1.0f;
+    float inv_scale = (amax > 0.0f) ? (7.0f / amax) : 0.0f;
+
+    for (int j = 0; j < HD; j += 2) {
+        int v0 = (int)roundf(S_local[j] * inv_scale) + 8;
+        int v1 = (int)roundf(S_local[j+1] * inv_scale) + 8;
+        v0 = v0 < 0 ? 0 : (v0 > 15 ? 15 : v0);
+        v1 = v1 < 0 ? 0 : (v1 > 15 ? 15 : v1);
+        S_q4_row[j / 2] = (unsigned char)(v0 | (v1 << 4));
+    }
+    s_scales[h * HD + row] = new_scale;
+}
+"#;
+
 /// Alpha gate compute on GPU: out[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
 /// Eliminates 85µs CPU roundtrip per DeltaNet layer.
 #[cfg(feature = "deltanet")]

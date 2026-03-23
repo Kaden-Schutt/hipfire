@@ -145,6 +145,7 @@ pub struct Qwen35Weights {
 pub enum StateQuant {
     FP32,
     Q8,
+    Q4,
 }
 
 pub struct DeltaNetState {
@@ -187,7 +188,14 @@ impl DeltaNetState {
                     let buf = gpu.hip.malloc(s_size)?;
                     gpu.hip.memset(&buf, 0, s_size)?;
                     s_matrices.push(GpuTensor { buf, shape: vec![s_size], dtype: DType::F32 });
-                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?); // per-row scale
+                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
+                }
+                StateQuant::Q4 => {
+                    // 4-bit nibble-packed: s_size/2 bytes, per-row scales
+                    let buf = gpu.hip.malloc(s_size / 2)?;
+                    gpu.hip.memset(&buf, 0, s_size / 2)?;
+                    s_matrices.push(GpuTensor { buf, shape: vec![s_size / 2], dtype: DType::F32 });
+                    s_scales.push(gpu.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
             conv_states.push(gpu.zeros(&[conv_state_size], DType::F32)?);
@@ -469,6 +477,12 @@ pub fn forward(
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                     StateQuant::Q8 => gpu.gated_delta_net_q8(
+                        &q_part, &k_part, &v_part, &alpha_out, &beta_out,
+                        &dn_state.s_matrices[delta_layer_idx],
+                        &dn_state.s_scales[delta_layer_idx], &attn_out,
+                        1, n_v_heads, config.linear_value_head_dim,
+                    )?,
+                    StateQuant::Q4 => gpu.gated_delta_net_q4(
                         &q_part, &k_part, &v_part, &alpha_out, &beta_out,
                         &dn_state.s_matrices[delta_layer_idx],
                         &dn_state.s_scales[delta_layer_idx], &attn_out,

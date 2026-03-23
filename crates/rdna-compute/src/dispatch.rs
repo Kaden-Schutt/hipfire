@@ -2295,6 +2295,38 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [128, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// GDN recurrence with Q4-quantized S state.
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q4(
+        &mut self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor,
+        gate: &GpuTensor, beta: &GpuTensor,
+        s_q4: &GpuTensor, s_scales: &GpuTensor, output: &GpuTensor,
+        n_tokens: usize, n_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gated_delta_net_q4", kernels::GATED_DELTA_NET_Q4_SRC, "gated_delta_net_q4")?;
+        let func = &self.functions["gated_delta_net_q4"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut bp = beta.buf.as_ptr();
+        let mut sp = s_q4.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void, &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [128, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Alpha gate compute: alpha[i] = softplus(alpha[i] + dt_bias[i]) * (-exp(a_log[i])).
     /// Replaces 85µs CPU roundtrip with ~3µs GPU kernel.
     #[cfg(feature = "deltanet")]
