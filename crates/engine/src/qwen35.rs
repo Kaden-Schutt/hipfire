@@ -170,21 +170,6 @@ impl DeltaNetState {
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
-fn load_f16_tensor(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    // Try with VLM prefix first, then without
-    let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data(&full_name)
-        .or_else(|| hfq.tensor_data(name))
-        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
-
-    let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
-    };
-    gpu.upload_f32(&f32_data, shape)
-}
-
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
@@ -395,8 +380,6 @@ pub fn forward(
 
     let mut delta_layer_idx = 0usize;
 
-    // (embedding debug removed)
-
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
@@ -602,7 +585,6 @@ pub fn forward(
             _ => panic!("layer type mismatch at layer {layer_idx}"),
         }
 
-        // (per-layer debug removed)
     }
 
     // Final norm + output projection
