@@ -5293,35 +5293,15 @@ extern "C" __global__ void attention_turbo2_kv(
     const int dpt = head_dim / nthreads;
     const int d0 = tid * dpt;
 
-    float* scores = sdata;
-    float* q_rot = sdata + seq_len;
+    float* scores = sdata;  // only scores in shared memory now
 
-    // Parallel FWHT on Q
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] = q[h * head_dim + d];
-    __syncthreads();
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs1[d];
-    __syncthreads();
-    // FWHT butterfly: strides 1-2 are thread-local (no sync needed)
-    for (int stride = 1; stride <= 2; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-    }
-    __syncthreads();
-    for (int stride = 4; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    const float inv_sqrt = 0.08838834764831845f;
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs2[d];
-    __syncthreads();
-
-    float mq[4];
-    for (int i = 0; i < dpt; i++) mq[i] = q_rot[d0 + i];
+    // Register-only FWHT on Q (zero shared memory, zero barriers)
+    float mq0 = q[h * head_dim + d0];
+    float mq1 = q[h * head_dim + d0 + 1];
+    float mq2 = q[h * head_dim + d0 + 2];
+    float mq3 = q[h * head_dim + d0 + 3];
+    fwht_shfl_forward(mq0, mq1, mq2, mq3, signs1, signs2, tid);
+    float mq[4] = {mq0, mq1, mq2, mq3};
 
     // K dot products — 2-bit: 4 values per byte, trivial extraction
     for (int t = 0; t < seq_len; t++) {
@@ -5368,31 +5348,11 @@ extern "C" __global__ void attention_turbo2_kv(
         mv[3] += wn * TURBO_C2[(packed >> 6) & 0x3];
     }
 
-    // Parallel inverse FWHT
-    for (int i = 0; i < dpt; i++) q_rot[d0 + i] = mv[i];
-    __syncthreads();
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= signs2[d];
-    __syncthreads();
-    // FWHT butterfly: strides 1-2 are thread-local (no sync needed)
-    for (int stride = 1; stride <= 2; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-    }
-    __syncthreads();
-    for (int stride = 4; stride < head_dim; stride <<= 1) {
-        for (int base = tid; base < head_dim / 2; base += nthreads) {
-            int blk = base / stride, j = base % stride, i = blk * stride * 2 + j;
-            float a = q_rot[i], b = q_rot[i + stride]; q_rot[i] = a + b; q_rot[i + stride] = a - b;
-        }
-        __syncthreads();
-    }
-    for (int d = tid; d < head_dim; d += nthreads) q_rot[d] *= inv_sqrt * signs1[d];
-    __syncthreads();
+    // Register-only inverse FWHT (zero shared memory, zero barriers)
+    fwht_shfl_inverse(mv[0], mv[1], mv[2], mv[3], signs1, signs2, tid);
 
     float* oh = out + h * head_dim;
-    for (int d = tid; d < head_dim; d += nthreads) oh[d] = q_rot[d];
+    oh[d0] = mv[0]; oh[d0+1] = mv[1]; oh[d0+2] = mv[2]; oh[d0+3] = mv[3];
 }
 "#;
 
