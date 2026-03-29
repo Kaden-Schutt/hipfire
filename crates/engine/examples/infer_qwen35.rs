@@ -73,6 +73,9 @@ fn main() {
         chat.extend_from_slice(&im_start); chat.extend_from_slice(&user); chat.extend_from_slice(&nl);
         chat.extend_from_slice(&prompt_tokens); chat.extend_from_slice(&im_end); chat.extend_from_slice(&nl);
         chat.extend_from_slice(&im_start); chat.extend_from_slice(&asst); chat.extend_from_slice(&nl);
+        // Qwen3.5 thinking mode: add <think> tag to trigger reasoning
+        let think_tag = tokenizer.encode("<think>");
+        chat.extend_from_slice(&think_tag); chat.extend_from_slice(&nl);
         prompt_tokens = chat;
     }
     eprintln!("Prompt: \"{}\" → {} tokens: {:?}", prompt_text, prompt_tokens.len(), &prompt_tokens[..prompt_tokens.len().min(10)]);
