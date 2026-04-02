@@ -2878,4 +2878,66 @@ impl Gpu {
         let shared_mem = ((n + block_size as usize) * 4) as u32;
         unsafe { self.hip.launch_kernel(func, [num_heads as u32, n as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
+
+    // ═══ Asymmetric turbo: Q8 K + turbo4 V for head_dim=256 ═══
+
+    /// Write V as turbo4 (FWHT-256 + 4-bit quantize). K written separately as Q8.
+    pub fn kv_cache_write_turbo4_v256(
+        &mut self, v_dst: &GpuTensor, v_src: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("kv_cache_write_turbo4_v256", kernels::KV_CACHE_WRITE_TURBO4_V256_SRC, "kv_cache_write_turbo4_v256")?;
+        let func = &self.functions["kv_cache_write_turbo4_v256"];
+        let mut vd = v_dst.buf.as_ptr();
+        let mut vs = v_src.buf.as_ptr();
+        let mut pb = pos_buf.as_ptr();
+        let mut s1 = signs1.buf.as_ptr();
+        let mut s2 = signs2.buf.as_ptr();
+        let mut nh = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut vd as *mut _ as *mut c_void, &mut vs as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void, &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared = (head_dim + 32) * 4; // x[head_dim] + scratch[32]
+        unsafe { self.hip.launch_kernel(func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared as u32, self.stream_ref(), &mut params) }
+    }
+
+    /// Asymmetric attention: Q8 K cache + turbo4 V cache, head_dim=256.
+    pub fn attention_q8k_turbo4v_256(
+        &mut self, q: &GpuTensor, k_q8: &GpuTensor, v_t4: &GpuTensor,
+        out: &GpuTensor, pos_buf: &hip_bridge::DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        seq_len: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_q8k_turbo4v_256", kernels::ATTENTION_Q8K_TURBO4V_256_SRC, "attention_q8k_turbo4v_256")?;
+        let func = &self.functions["attention_q8k_turbo4v_256"];
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_q8.buf.as_ptr();
+        let mut vp = v_t4.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut pb = pos_buf.as_ptr();
+        let mut s1 = signs1.buf.as_ptr();
+        let mut s2 = signs2.buf.as_ptr();
+        let mut sl = seq_len as i32;
+        let mut nh = n_heads as i32;
+        let mut nk = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut pb as *mut _ as *mut c_void, &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void, &mut sl as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void,
+        ];
+        let block_size = std::cmp::min(256, std::cmp::max(seq_len, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        let shared = ((seq_len + block_size as usize) * 4) as u32;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared, self.stream_ref(), &mut params) }
+    }
 }
