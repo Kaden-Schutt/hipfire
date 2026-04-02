@@ -46,6 +46,13 @@ pub struct Qwen35Config {
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config")?;
+
+    // Only match Qwen3.5 models (DeltaNet), not Qwen3/LLaMA
+    let model_type = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
+    if model_type != "qwen3_5" && model_type != "qwen3_5_text" {
+        return None;
+    }
+
     let tc = config.get("text_config").unwrap_or(config);
 
     let dim = tc.get("hidden_size")?.as_u64()? as usize;
