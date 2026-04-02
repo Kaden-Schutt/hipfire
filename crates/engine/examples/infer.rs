@@ -87,10 +87,12 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer not found in HFQ");
 
-    let temp = temp_override.unwrap_or(0.3);
-    let top_p: f32 = 0.8;
-    let repeat_penalty: f32 = 1.3;
-    let repeat_window: usize = 128;
+    let sc = llama::SamplingConfig::vl_thinking(); // think=0.3, answer=0.3, top_p=0.8
+    let think_temp = sc.think_temp;
+    let answer_temp = temp_override.unwrap_or(sc.answer_temp);
+    let top_p = sc.top_p;
+    let repeat_penalty = sc.repeat_penalty;
+    let repeat_window = sc.repeat_window;
 
     // ChatML prompt
     let mut prompt_tokens = tokenizer.encode(prompt_text);
@@ -114,7 +116,7 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
         chat.extend_from_slice(&nl);
         prompt_tokens = chat;
     }
-    eprintln!("Prompt: {} tokens, temp={temp}", prompt_tokens.len());
+    eprintln!("Prompt: {} tokens, think_temp={think_temp}, answer_temp={answer_temp}", prompt_tokens.len());
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
@@ -131,7 +133,7 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
         // Sequential fallback
         for (pos, &token) in prompt_tokens.iter().enumerate() {
             llama::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv_cache,
-                &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
+                &scratch, think_temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
         }
     }
     let ms = t_pf.elapsed().as_millis();
@@ -144,7 +146,7 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
         let think_tokens = tokenizer.encode("<think>\n");
         for (i, &t) in think_tokens.iter().enumerate() {
             llama::forward_scratch(&mut gpu, &weights, &config, t, prompt_tokens.len() + i, &mut kv_cache,
-                &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
+                &scratch, think_temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
         }
         prefill_len = prompt_tokens.len() + think_tokens.len();
         in_thinking = true;
@@ -158,7 +160,8 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     llama::apply_ngram_block(&mut logits, &prompt_tokens);
     llama::apply_repeat_penalty(&mut logits, &prompt_tokens, repeat_window, repeat_penalty);
-    let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+    let t = if in_thinking { think_temp } else { answer_temp };
+    let mut next_token = llama::sample_top_p(&logits, t, top_p);
 
     let t_gen = Instant::now();
     let mut token_history: Vec<u32> = prompt_tokens.clone();
@@ -187,13 +190,15 @@ fn run_llama(hfq: &HfqFile, prompt_text: &str, no_think: bool, temp_override: Op
         let pos = prefill_len + generated.len() - 1;
 
         // Forward pass (GPU), then download logits for CPU sampling with n-gram block
+        let t = if in_thinking { think_temp } else { answer_temp };
+
         llama::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache,
-            &scratch, temp.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
+            &scratch, t.max(0.01), top_p, 42, 0, 1.0).expect("forward failed");
 
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &token_history);
         llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
-        next_token = llama::sample_top_p(&logits, temp, top_p);
+        next_token = llama::sample_top_p(&logits, t, top_p);
     }
 
     let ms = t_gen.elapsed().as_millis();
