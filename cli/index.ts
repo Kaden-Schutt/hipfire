@@ -23,8 +23,9 @@ mkdirSync(MODELS_DIR, { recursive: true });
 // Default tag (no quant suffix) = HFQ4
 
 const HF_BASE = "https://huggingface.co";
-const REPO_MAIN = "schuttdev/hipfire-models";
-const REPO_27B = "schuttdev/Qwen3.5-27B-hipfire";
+
+// Per-model HuggingFace repos: schuttdev/hipfire-{family}-{size}
+function hfRepo(family: string, size: string) { return `schuttdev/hipfire-${family}-${size}`; }
 
 interface ModelEntry {
   repo: string;
@@ -36,25 +37,30 @@ interface ModelEntry {
 
 const REGISTRY: Record<string, ModelEntry> = {
   // Qwen3.5 HFQ4 (default)
-  "qwen3.5:0.8b":  { repo: REPO_MAIN, file: "qwen3.5-0.8b.q4.hfq",  size_gb: 0.5,  min_vram_gb: 1,  desc: "222 tok/s, tiny & fast" },
-  "qwen3.5:2b":    { repo: REPO_MAIN, file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
-  "qwen3.5:4b":    { repo: REPO_MAIN, file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
-  "qwen3.5:9b":    { repo: REPO_MAIN, file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
-  "qwen3.5:27b":   { repo: REPO_27B,  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "best quality, needs 16GB+" },
+  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.q4.hfq",  size_gb: 0.5,  min_vram_gb: 1,  desc: "222 tok/s, tiny & fast" },
+  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
+  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
+  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
+  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "best quality, needs 16GB+" },
 
   // Qwen3.5 HFQ6
-  "qwen3.5:0.8b-hfq6": { repo: REPO_MAIN, file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
-  "qwen3.5:2b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-2b.hfq6.hfq",   size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
-  "qwen3.5:4b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-4b.hfq6.hfq",   size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
-  "qwen3.5:9b-hfq6":   { repo: REPO_MAIN, file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
-  "qwen3.5:27b-hfq6":  { repo: REPO_27B,  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+  "qwen3.5:0.8b-hfq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
+  "qwen3.5:2b-hfq6":   { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hfq6.hfq",   size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
+  "qwen3.5:4b-hfq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hfq6.hfq",   size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
+  "qwen3.5:9b-hfq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
+  "qwen3.5:27b-hfq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+
+  // Qwen3 HFQ4
+  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b-hfq4.hfq",  size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
+  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.q4.hfq",       size_gb: 4.1,  min_vram_gb: 6,  desc: "59.9 tok/s, standard attention" },
 };
 
 // Aliases
 const ALIASES: Record<string, string> = {
-  "qwen3.5": "qwen3.5:4b",     // default size
+  "qwen3.5": "qwen3.5:4b",
   "qwen3.5:latest": "qwen3.5:9b",
   "qwen3.5:small": "qwen3.5:0.8b",
+  "qwen3": "qwen3:8b",
   "qwen3.5:large": "qwen3.5:27b",
 };
 
