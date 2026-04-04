@@ -82,7 +82,7 @@ if (-not $HipDllFound -and $env:HIP_PATH) {
     foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
         $candidate = Join-Path $env:HIP_PATH "bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
@@ -99,7 +99,7 @@ if (-not $HipDllFound) {
             foreach ($verDir in (Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
                 $candidate = Join-Path $verDir.FullName "bin\$dllName"
                 if (Test-Path $candidate) {
-                    Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+                    Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
                     Copy-Item $candidate $HipDllDest -Force
                     $HipDllFound = $true
                     break
@@ -110,7 +110,7 @@ if (-not $HipDllFound) {
         # Also check flat layout
         $candidate = "C:\Program Files\AMD\ROCm\bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
