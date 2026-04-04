@@ -224,7 +224,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: path });
+  await e.send({ type: "load", model: path, turbo: 4 });
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -289,7 +289,7 @@ async function serve(port: number) {
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path }); await e.recv();
+          await e.send({ type: "load", model: path, turbo: 4 }); await e.recv();
           current = path;
         }
 

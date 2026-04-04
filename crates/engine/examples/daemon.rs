@@ -80,8 +80,9 @@ fn main() {
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 let max_seq = msg.get("params").and_then(|p| p.get("max_seq")).and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                let turbo_bits = msg.get("turbo").and_then(|v| v.as_u64()).unwrap_or(4) as u8;
 
-                match load_model(path, max_seq, &mut gpu) {
+                match load_model(path, max_seq, turbo_bits, &mut gpu) {
                     Ok(m) => {
                         let arch = if m.arch_id == 5 { "qwen3_5" } else { "qwen3" };
                         let vl = m.vision_config.is_some();
@@ -150,7 +151,7 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
@@ -176,7 +177,13 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
-        let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
+        let kv = if turbo_bits >= 2 && turbo_bits <= 4 {
+            eprintln!("  KV cache: turbo{turbo_bits}");
+            llama::KvCache::new_gpu_turbo(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).map_err(|e| format!("{e}"))?
+        } else {
+            eprintln!("  KV cache: Q8");
+            llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+        };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
         let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
@@ -191,7 +198,13 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         // Qwen3 / LLaMA
         let config = engine::hfq::config_from_hfq(&hfq).ok_or("failed to read LLaMA config")?;
         let weights = engine::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
-        let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
+        let kv = if turbo_bits >= 2 && turbo_bits <= 4 {
+            eprintln!("  KV cache: turbo{turbo_bits}");
+            llama::KvCache::new_gpu_turbo(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).map_err(|e| format!("{e}"))?
+        } else {
+            eprintln!("  KV cache: Q8");
+            llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+        };
         let scratch = llama::ForwardScratch::new(gpu, &config).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
