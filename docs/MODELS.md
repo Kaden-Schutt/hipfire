@@ -15,8 +15,8 @@ The primary model family for hipfire alpha. Uses DeltaNet hybrid architecture wi
 | `qwen3.5:4b-hfq6` | qwen3.5-4b.hfq6.hfq | 3.3GB | 5GB | 53 tok/s |
 | `qwen3.5:9b` | qwen3.5-9b.q4.hfq | 4.5GB | 6GB | Best quality on 8GB, 45 tok/s |
 | `qwen3.5:9b-hfq6` | qwen3.5-9b.hfq6.hfq | 6.8GB | 8GB | 37 tok/s, near-FP16 quality |
-| `qwen3.5:27b` | qwen3.5-27b.q4.hfq | 14.3GB | 16GB | Needs 6800 XT / 7900 XTX / 9070 |
-| `qwen3.5:27b-hfq6` | qwen3.5-27b.hfq6.hfq | 21.4GB | 24GB | Needs 7900 XTX |
+| `qwen3.5:27b` | qwen3.5-27b.q4.hfq | 14.3GB | 16GB | 25-27 tok/s. Good for simple tasks, degrades on coding |
+| `qwen3.5:27b-hfq6` | qwen3.5-27b.hfq6.hfq | 21.4GB | 24GB | 16-20 tok/s. Use this for complex/coding tasks |
 
 ### Qwen3 (standard LLaMA attention)
 Earlier architecture with standard multi-head attention. head_dim=128. Supported but not the primary focus.

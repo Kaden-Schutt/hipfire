@@ -34,6 +34,9 @@ fn main() {
     let no_think = args.iter().any(|a| a == "--no-think");
     let debug_cmp = args.iter().any(|a| a == "--debug-compare");
     let use_asym = args.iter().any(|a| a == "--asym");
+    let max_tokens: usize = args.iter().position(|a| a == "--max-tokens")
+        .and_then(|i| args.get(i + 1).and_then(|v| v.parse().ok()))
+        .unwrap_or(2048);
     let turbo_bits: u8 = if args.iter().any(|a| a == "--turbo2") { 2 }
         else if args.iter().any(|a| a == "--turbo3") { 3 }
         else if args.iter().any(|a| a == "--turbo4") { 4 }
@@ -47,7 +50,7 @@ fn main() {
     for a in args.iter().skip(1) {
         if skip_next { skip_next = false; continue; }
         if a == "--no-think" || a == "--debug-compare" || a == "--turbo2" || a == "--turbo3" || a == "--turbo4" || a == "--asym" { continue; }
-        if a == "--image" { skip_next = true; continue; }
+        if a == "--image" || a == "--max-tokens" { skip_next = true; continue; }
         positional.push(a.as_str());
     }
     let model_path = positional.first().unwrap_or_else(|| {
@@ -224,7 +227,7 @@ fn main() {
     // Thinking mode
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let think_end_seq = tokenizer.encode("</think>");
-    let max_gen = 2048;
+    let max_gen = max_tokens;
     let max_think = 512;
 
     // First token

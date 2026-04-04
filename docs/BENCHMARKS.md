@@ -68,15 +68,28 @@ From earlier benchmarks (2026-03-27):
 | turbo3 (3-bit) | 50.8 | 44.5 | 9.85x |
 | turbo4 (4-bit) | 53.6 | 51.0 | 7.5x |
 
-## Qwen3.5-27B — Awaiting Tester Benchmarks
+## Qwen3.5-27B (RX 7900 XTX, 24GB, gfx1100)
 
-27B does not fit on 8GB cards. Needs 16GB+ VRAM.
+Benchmarks by [DomKo](https://github.com/Kaden-Schutt/hipfire/issues/2). Runtime-compiled kernels, ROCm 6.4.
+
+| Model | Quant | KV Mode | tok/s | Quality |
+|-------|-------|---------|-------|---------|
+| 27B | HFQ4 | Q8 | **25.8** | Broken on coding/complex tasks |
+| 27B | HFQ4 | Turbo4 | **25.2** | Meta-reasoning loops, gibberish |
+| 27B | HFQ6 | Q8 | **16.5** | Correct |
+| 27B | HFQ6 | Turbo4 | **19.9** | Correct |
+| 9B | HFQ4 | Q8 | **62.3** | Correct |
+
+Notes:
+- **27B HFQ4 is not recommended for complex tasks.** Output degrades to gibberish on coding prompts. Use HFQ6.
+- HFQ6 + Turbo4 is faster than HFQ6 + Q8 (19.9 vs 16.5) — Turbo4 KV recommended for 27B.
+- 27B HFQ4 needs 16GB+ VRAM, HFQ6 needs 24GB.
 
 | GPU | VRAM | HFQ4 (14.3GB) | HFQ6 (21.1GB) |
 |-----|------|----------------|----------------|
 | RX 5700 XT | 8GB | Does not fit | Does not fit |
-| RX 6800 XT | 16GB | Fits — benchmark wanted | Does not fit |
-| RX 7900 XTX | 24GB | Fits — benchmark wanted | Fits — benchmark wanted |
+| RX 6800 XT | 16GB | Fits (benchmark wanted) | Does not fit |
+| RX 7900 XTX | 24GB | 25-27 tok/s | 16-20 tok/s |
 | RX 9070 | 16GB | Fits — benchmark wanted | Does not fit |
 
 To submit benchmarks, see [CONTRIBUTING.md](../CONTRIBUTING.md).

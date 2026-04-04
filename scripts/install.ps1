@@ -77,23 +77,44 @@ if (Test-Path $HipDllDest) {
     $HipDllFound = $true
 }
 
-# Check %HIP_PATH%\bin
+# Check %HIP_PATH%\bin (unversioned and versioned)
 if (-not $HipDllFound -and $env:HIP_PATH) {
-    $candidate = Join-Path $env:HIP_PATH "bin\amdhip64.dll"
-    if (Test-Path $candidate) {
-        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
-        Copy-Item $candidate $HipDllDest -Force
-        $HipDllFound = $true
+    foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
+        $candidate = Join-Path $env:HIP_PATH "bin\$dllName"
+        if (Test-Path $candidate) {
+            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Copy-Item $candidate $HipDllDest -Force
+            $HipDllFound = $true
+            break
+        }
     }
 }
 
-# Check standard ROCm install location
+# Check standard ROCm install locations (unversioned and versioned)
 if (-not $HipDllFound) {
-    $candidate = "C:\Program Files\AMD\ROCm\bin\amdhip64.dll"
-    if (Test-Path $candidate) {
-        Write-Host "  amdhip64.dll: found at $candidate ✓" -ForegroundColor Green
-        Copy-Item $candidate $HipDllDest -Force
-        $HipDllFound = $true
+    foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
+        # Check versioned ROCm dirs (e.g. C:\Program Files\AMD\ROCm\7.1\bin\)
+        $rocmBase = "C:\Program Files\AMD\ROCm"
+        if (Test-Path $rocmBase) {
+            foreach ($verDir in (Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
+                $candidate = Join-Path $verDir.FullName "bin\$dllName"
+                if (Test-Path $candidate) {
+                    Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+                    Copy-Item $candidate $HipDllDest -Force
+                    $HipDllFound = $true
+                    break
+                }
+            }
+            if ($HipDllFound) { break }
+        }
+        # Also check flat layout
+        $candidate = "C:\Program Files\AMD\ROCm\bin\$dllName"
+        if (Test-Path $candidate) {
+            Write-Host "  $dllName: found at $candidate ✓" -ForegroundColor Green
+            Copy-Item $candidate $HipDllDest -Force
+            $HipDllFound = $true
+            break
+        }
     }
 }
 
@@ -376,16 +397,29 @@ if (-not (Test-Path $ConfigFile)) {
 
 # ─── PATH ────────────────────────────────────────────────
 Write-Host ""
+$NoPath = $args -contains "--no-path"
 $CurrentUserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
-if ($CurrentUserPath -notlike "*$BinDir*") {
+if ($null -eq $CurrentUserPath) { $CurrentUserPath = "" }
+
+if ($NoPath) {
+    Write-Host "Skipping PATH modification (--no-path)" -ForegroundColor Yellow
+    Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
+} elseif ($CurrentUserPath -notlike "*$BinDir*") {
     Write-Host "hipfire bin dir is not in your user PATH." -ForegroundColor Yellow
     Write-Host "  $BinDir"
     $reply = Read-Host "Add to user PATH permanently? [Y/n]"
     if ($reply -notmatch "^[Nn]$") {
         $NewPath = "$BinDir;$CurrentUserPath"
-        [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
-        $env:PATH = "$BinDir;$env:PATH"
-        Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+        # Safety: warn if PATH would exceed Windows limit (2047 chars)
+        if ($NewPath.Length -gt 2040) {
+            Write-Host "  WARNING: User PATH would be $($NewPath.Length) chars (limit ~2047)." -ForegroundColor Red
+            Write-Host "  Skipping to avoid PATH truncation. Add manually:" -ForegroundColor Red
+            Write-Host "    $BinDir" -ForegroundColor Yellow
+        } else {
+            [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
+            $env:PATH = "$BinDir;$env:PATH"
+            Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+        }
     } else {
         Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
     }

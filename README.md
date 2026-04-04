@@ -19,7 +19,9 @@ hipfire run qwen3.5:9b "What is the capital of France?"
 hipfire run qwen3.5:4b "Hello"
 ```
 
-## Performance (RX 5700 XT, 8GB)
+## Performance
+
+**RX 5700 XT (8GB, gfx1010):**
 
 | Model | Quant | tok/s | Notes |
 |-------|-------|-------|-------|
@@ -30,15 +32,23 @@ hipfire run qwen3.5:4b "Hello"
 | Qwen3.5-4B | HFQ6 | **53** | |
 | Qwen3.5-9B | HFQ4 | **45** | Best quality, fits 8GB |
 | Qwen3.5-9B | HFQ6 | **37** | Near-FP16 quality |
-| Qwen3.5-27B | HFQ4 | TBD | 14.3GB, needs 16GB+ VRAM |
 | Qwen3-8B | HFQ4 | **59.9** | Standard attention |
 | ollama Qwen3.5-9B | — | 4.93 | llama.cpp + ROCm (same GPU) |
+
+**RX 7900 XTX (24GB, gfx1100):** ([benchmarks by DomKo](https://github.com/Kaden-Schutt/hipfire/issues/2))
+
+| Model | Quant | tok/s | Notes |
+|-------|-------|-------|-------|
+| Qwen3.5-9B | HFQ4 | **62** | |
+| Qwen3.5-27B | HFQ4 | **25-27** | Good for simple tasks, degrades on coding |
+| Qwen3.5-27B | HFQ6 | **16-20** | Use this for complex/coding tasks |
 
 Recommended picks:
 - **Speed**: 0.8B HFQ4 (222 tok/s) — fast drafting, coding assistants
 - **Balance**: 4B HFQ4 (63 tok/s) — best quality-per-token for 8GB
 - **Quality (8GB)**: 9B HFQ4 (45 tok/s) — strongest reasoning on 8GB cards
-- **Quality (16GB+)**: 27B HFQ4 — best quality, needs 6800 XT / 7900 XTX / 9070. Benchmarks wanted!
+- **Quality (16GB)**: 27B HFQ4 (`hipfire pull qwen3.5:27b`) — good for simple tasks, degrades on coding/complex output
+- **Quality (24GB)**: 27B HFQ6 (`hipfire pull qwen3.5:27b-hfq6`) — best quality, needs 7900 XTX or similar
 
 Full benchmarks: [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
 
@@ -89,9 +99,16 @@ hipfire list -r                              # Show local + available models
 hipfire rm qwen3.5:9b                        # Delete model
 ```
 
-## API
+## API (Server Mode)
+
+`hipfire serve` starts an OpenAI-compatible HTTP server. Works with Open WebUI, SillyTavern, and any OpenAI-compatible frontend.
+
+> **Status:** Server mode works but is less tested than `hipfire run`. Multi-arch stability is the current priority. If you hit issues, try `hipfire run` first to isolate whether the problem is the server or the model.
 
 ```bash
+hipfire serve                          # Default port 11435
+hipfire serve 8080                     # Custom port
+
 curl http://localhost:11435/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"qwen3.5-4b","messages":[{"role":"user","content":"Hello"}],"stream":true}'

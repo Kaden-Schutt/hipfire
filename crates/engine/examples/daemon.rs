@@ -80,8 +80,9 @@ fn main() {
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
                 let max_seq = msg.get("params").and_then(|p| p.get("max_seq")).and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                let turbo_bits = msg.get("turbo").and_then(|v| v.as_u64()).unwrap_or(4) as u8;
 
-                match load_model(path, max_seq, &mut gpu) {
+                match load_model(path, max_seq, turbo_bits, &mut gpu) {
                     Ok(m) => {
                         let arch = if m.arch_id == 5 { "qwen3_5" } else { "qwen3" };
                         let vl = m.vision_config.is_some();
@@ -94,7 +95,10 @@ fn main() {
                         model = Some(m);
                     }
                     Err(e) => {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}"}}"#, e);
+                        let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+                        let free_mb = vram_free / (1024 * 1024);
+                        let total_mb = vram_total / (1024 * 1024);
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}. GPU: {} ({} MB free / {} MB total)"}}"#, e, gpu.arch, free_mb, total_mb);
                     }
                 }
                 let _ = stdout.flush();
@@ -115,11 +119,14 @@ fn main() {
                 let image = msg.get("image").and_then(|v| v.as_str());
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
+                let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
 
                 if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, max_tokens);
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, max_tokens);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 }
             }
 
@@ -144,7 +151,7 @@ fn main() {
     }
 }
 
-fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, turbo_bits: u8, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
@@ -170,7 +177,13 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
-        let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
+        let kv = if turbo_bits >= 2 && turbo_bits <= 4 {
+            eprintln!("  KV cache: turbo{turbo_bits}");
+            llama::KvCache::new_gpu_turbo(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).map_err(|e| format!("{e}"))?
+        } else {
+            eprintln!("  KV cache: Q8");
+            llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+        };
         let dn = DeltaNetState::new(gpu, &config).map_err(|e| format!("{e}"))?;
         let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 128).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
@@ -185,7 +198,13 @@ fn load_model(path: &str, max_seq: usize, gpu: &mut rdna_compute::Gpu) -> Result
         // Qwen3 / LLaMA
         let config = engine::hfq::config_from_hfq(&hfq).ok_or("failed to read LLaMA config")?;
         let weights = engine::hfq::load_weights_hfq(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
-        let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
+        let kv = if turbo_bits >= 2 && turbo_bits <= 4 {
+            eprintln!("  KV cache: turbo{turbo_bits}");
+            llama::KvCache::new_gpu_turbo(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).map_err(|e| format!("{e}"))?
+        } else {
+            eprintln!("  KV cache: Q8");
+            llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
+        };
         let scratch = llama::ForwardScratch::new(gpu, &config).map_err(|e| format!("{e}"))?;
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
@@ -208,7 +227,7 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, max_tokens: usize) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // Build ChatML prompt
@@ -248,7 +267,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         // Generate
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, 0.8);
+        let mut next_token = llama::sample_top_p(&logits, temp, top_p);
         let mut generated = 0;
         let mut token_history = prompt_tokens.clone();
 
@@ -265,8 +284,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let pos = prompt_tokens.len() + generated - 1;
             qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_repeat_penalty(&mut logits, &token_history, 128, 1.3);
-            next_token = llama::sample_top_p(&logits, temp, 0.8);
+            llama::apply_ngram_block(&mut logits, &token_history);
+            llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
+            next_token = llama::sample_top_p(&logits, temp, top_p);
         }
 
         let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
@@ -281,7 +301,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
         let mut rng_state = 42u32;
         for (pos, &tok) in prompt_tokens.iter().enumerate() {
-            let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, 0.8, rng_state, 0, 1.0).unwrap();
+            let (_, rng) = llama::forward_scratch(gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0).unwrap();
             rng_state = rng;
         }
 
@@ -303,13 +323,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
 
-            let hist_start = token_history.len().saturating_sub(64);
+            // Qwen3/LLaMA scratch repeat_buf is 64 slots — clamp window to fit
+            let rw = repeat_window.min(64);
+            let hist_start = token_history.len().saturating_sub(rw);
             let hist_slice = &token_history[hist_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
 
             let pos = prompt_tokens.len() + generated - 1;
-            let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, 0.8, rng_state, hist_slice.len(), 1.3).unwrap();
+            let (tok, rng) = llama::forward_scratch(gpu, weights, config, next_token, pos, kv, scratch, temp, top_p, rng_state, hist_slice.len(), repeat_penalty).unwrap();
             next_token = tok;
             rng_state = rng;
         }
@@ -320,7 +342,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, max_tokens: usize) {
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.q35_config.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -389,7 +411,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // Generate
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-    let mut next_token = llama::sample_top_p(&logits, temp, 0.8);
+    let mut next_token = llama::sample_top_p(&logits, temp, top_p);
     let mut generated = 0;
     let mut token_history = prompt_tokens.clone();
 
@@ -406,8 +428,9 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         let pos = prompt_tokens.len() + generated - 1;
         qwen35::forward_scratch(gpu, weights, config, next_token, pos, kv, dn, scratch).unwrap();
         logits = gpu.download_f32(&scratch.logits).unwrap();
-        llama::apply_repeat_penalty(&mut logits, &token_history, 128, 1.3);
-        next_token = llama::sample_top_p(&logits, temp, 0.8);
+        llama::apply_ngram_block(&mut logits, &token_history);
+        llama::apply_repeat_penalty(&mut logits, &token_history, repeat_window, repeat_penalty);
+        next_token = llama::sample_top_p(&logits, temp, top_p);
     }
 
     let tok_s = generated as f64 / t0.elapsed().as_secs_f64();

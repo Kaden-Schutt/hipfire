@@ -110,15 +110,27 @@ impl HipRuntime {
             let hip_path = std::env::var("HIP_PATH").unwrap_or_default();
             let p1 = format!(r"{userprofile}\.hipfire\runtime\amdhip64.dll");
             let p2 = format!(r"{hip_path}\bin\amdhip64.dll");
+            // Try unversioned first, then versioned names (HIP SDK 7.x installs amdhip64_7.dll)
             Library::new(&p1)
                 .or_else(|_| Library::new(&p2))
                 .or_else(|_| Library::new("amdhip64.dll"))
+                .or_else(|_| Library::new("amdhip64_7.dll"))
+                .or_else(|_| Library::new("amdhip64_6.dll"))
+                .or_else(|_| {
+                    // Try versioned names in explicit paths (runtime dir + HIP_PATH)
+                    let rt = format!(r"{userprofile}\.hipfire\runtime");
+                    let hp = format!(r"{hip_path}\bin");
+                    Library::new(&format!(r"{rt}\amdhip64_7.dll"))
+                        .or_else(|_| Library::new(&format!(r"{rt}\amdhip64_6.dll")))
+                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_7.dll")))
+                        .or_else(|_| Library::new(&format!(r"{hp}\amdhip64_6.dll")))
+                })
                 .map_err(|e| {
                     HipError::new(
                         0,
                         &format!(
                             "failed to load amdhip64.dll: {e}. \
-                             Searched: {p1}, {p2}, amdhip64.dll (PATH). \
+                             Searched: {p1}, {p2}, amdhip64.dll, amdhip64_7.dll, amdhip64_6.dll (PATH). \
                              Is ROCm/HIP installed?"
                         ),
                     )
