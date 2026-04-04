@@ -274,6 +274,7 @@ async function serve(port: number) {
 
   Bun.serve({
     port,
+    idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/health") return Response.json({ status: "ok", model: current });
@@ -293,35 +294,55 @@ async function serve(port: number) {
           current = path;
         }
 
+        const reqId = `chatcmpl-${Date.now().toString(36)}`;
+        const modelName = body.model || "hipfire";
+        const genParams = {
+          type: "generate", id: "api", prompt,
+          temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
+          max_tokens: body.max_tokens ?? 512,
+          repeat_penalty: body.repeat_penalty ?? body.frequency_penalty ? 1.0 + (body.frequency_penalty ?? 0) : 1.3,
+          top_p: body.top_p ?? 0.8,
+        };
+
         if (body.stream) {
           const enc = new TextEncoder();
           return new Response(new ReadableStream({
             async start(ctrl) {
-              for await (const msg of e.generate({
-                type: "generate", id: "api", prompt,
-                temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
-                max_tokens: body.max_tokens ?? 512,
-              })) {
-                if (msg.type === "token") {
-                  ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: msg.text } }] })}\n\n`));
-                } else if (msg.type === "done") {
-                  ctrl.enqueue(enc.encode(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\n`));
-                  ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
-                  ctrl.close();
+              try {
+                let tokens = 0;
+                for await (const msg of e.generate(genParams)) {
+                  if (msg.type === "token") {
+                    tokens++;
+                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
+                      choices: [{ index: 0, delta: { content: msg.text }, finish_reason: null }]
+                    })}\n\n`));
+                  } else if (msg.type === "done") {
+                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
+                      choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                    })}\n\n`));
+                    ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                    ctrl.close();
+                  }
                 }
-              }
+              } finally { releaseLock(); }
             }
-          }), { headers: { "Content-Type": "text/event-stream" } });
+          }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
         let content = "";
-        for await (const msg of e.generate({
-          type: "generate", id: "api", prompt,
-          temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
-          max_tokens: body.max_tokens ?? 512,
-        })) { if (msg.type === "token") content += msg.text; }
-        releaseLock();
-        return Response.json({ choices: [{ message: { role: "assistant", content } }] });
+        let promptTokens = 0;
+        let completionTokens = 0;
+        for await (const msg of e.generate(genParams)) {
+          if (msg.type === "token") { content += msg.text; completionTokens++; }
+          else if (msg.type === "done") { promptTokens = msg.prompt_tokens ?? 0; }
+        }
+        return Response.json({
+          id: reqId, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelName,
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+        });
         } finally { releaseLock(); }
       }
       return Response.json({ error: "not found" }, { status: 404 });
@@ -465,9 +486,10 @@ switch (cmd) {
     }
     // Recopy CLI
     copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
-    // Recopy kernels
-    const arch = Bun.spawnSync(["cat", "/sys/class/kfd/kfd/topology/nodes/1/properties"], { stdout: "pipe" });
-    const archOut = arch.stdout?.toString() || "";
+    // Detect GPU arch from sysfs (cross-platform, no external commands)
+    let archOut = "";
+    try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/1/properties").text(); } catch {}
+    if (!archOut) try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/0/properties").text(); } catch {}
     const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
     let gpuArch = "unknown";
     if (verMatch) {
