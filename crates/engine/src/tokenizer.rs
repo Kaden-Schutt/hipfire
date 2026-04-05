@@ -189,12 +189,49 @@ impl Tokenizer {
     /// Decode a sequence of token IDs to text.
     /// Handles both GPT-2 BPE (Ġ=space, Ċ=newline) and SentencePiece (▁=space).
     pub fn decode(&self, tokens: &[u32]) -> String {
-        let mut result = String::new();
+        if self.is_gpt2_bpe {
+            let mut all_bytes = Vec::new();
+            for &id in tokens {
+                if let Some(tok) = self.vocab.get(id as usize) {
+                    for ch in tok.chars() {
+                        match ch {
+                            'Ġ' => all_bytes.push(b' '),
+                            'Ċ' => all_bytes.push(b'\n'),
+                            'ĉ' => all_bytes.push(b'\t'),
+                            c if c.is_ascii() => all_bytes.push(c as u8),
+                            c => {
+                                if let Some(b) = gpt2_char_to_byte(c) {
+                                    all_bytes.push(b);
+                                } else {
+                                    let mut buf = [0u8; 4];
+                                    let s = c.encode_utf8(&mut buf);
+                                    all_bytes.extend_from_slice(s.as_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            String::from_utf8_lossy(&all_bytes).into_owned()
+        } else {
+            let mut result = String::new();
+            for &id in tokens {
+                if let Some(tok) = self.vocab.get(id as usize) {
+                    let decoded = tok.replace('▁', " ");
+                    let decoded = decode_hex_escapes(&decoded);
+                    result.push_str(&decoded);
+                }
+            }
+            result
+        }
+    }
+
+    /// Decode tokens to raw bytes (for incremental streaming).
+    pub fn decode_bytes(&self, tokens: &[u32]) -> Vec<u8> {
+        let mut bytes = Vec::new();
         for &id in tokens {
             if let Some(tok) = self.vocab.get(id as usize) {
                 if self.is_gpt2_bpe {
-                    // GPT-2 BPE byte-level decoding
-                    let mut bytes = Vec::new();
                     for ch in tok.chars() {
                         match ch {
                             'Ġ' => bytes.push(b' '),
@@ -212,17 +249,14 @@ impl Tokenizer {
                             }
                         }
                     }
-                    result.push_str(&String::from_utf8_lossy(&bytes));
                 } else {
-                    // SentencePiece decoding: ▁ = space, tokens are raw text
                     let decoded = tok.replace('▁', " ");
-                    // Handle hex escapes like <0x0A> = newline
                     let decoded = decode_hex_escapes(&decoded);
-                    result.push_str(&decoded);
+                    bytes.extend_from_slice(decoded.as_bytes());
                 }
             }
         }
-        result
+        bytes
     }
 
     /// Encode text to token IDs.
@@ -378,18 +412,18 @@ impl Tokenizer {
     }
 }
 
-/// GPT-2 byte-to-char mapping.
-/// Bytes 33-126, 161-172, 174-255 map to themselves as Unicode chars.
-/// Bytes 0-32, 127-160, 173 map to chars 256-288, 289-322, 323.
+/// GPT-2 byte-to-char mapping (matches OpenAI's bytes_to_unicode() exactly).
+/// Printable bytes map to themselves. Non-printable bytes get sequential
+/// codepoints starting from U+0100, in order of byte value.
 fn byte_to_gpt2_char(b: u8) -> char {
-    let b = b as u32;
-    let c = match b {
-        0x21..=0x7E => b,        // '!' to '~'
-        0xA1..=0xAC => b,        // '¡' to '¬'
-        0xAE..=0xFF => b,        // '®' to 'ÿ'
-        _ => b + 256,            // control chars and special
-    };
-    char::from_u32(c).unwrap_or('?')
+    let b32 = b as u32;
+    match b32 {
+        0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => char::from_u32(b32).unwrap_or('?'),
+        _ => {
+            let offset = GPT2_BYTE_TO_OFFSET[b as usize];
+            char::from_u32(256 + offset as u32).unwrap_or('?')
+        }
+    }
 }
 
 /// Reverse of byte_to_gpt2_char.
@@ -400,12 +434,46 @@ fn gpt2_char_to_byte(c: char) -> Option<u8> {
         || (0xAE..=0xFF).contains(&c)
     {
         Some(c as u8)
-    } else if c >= 256 && c < 256 + 256 {
-        Some((c - 256) as u8)
+    } else if c >= 256 && c < 256 + 68 {
+        GPT2_OFFSET_TO_BYTE.get((c - 256) as usize).copied()
     } else {
         None
     }
 }
+
+static GPT2_BYTE_TO_OFFSET: [u8; 256] = {
+    let mut table = [0xFFu8; 256];
+    let mut n = 0u8;
+    let mut b = 0u16;
+    while b < 256 {
+        let is_printable = (b >= 0x21 && b <= 0x7E)
+            || (b >= 0xA1 && b <= 0xAC)
+            || (b >= 0xAE && b <= 0xFF);
+        if !is_printable {
+            table[b as usize] = n;
+            n += 1;
+        }
+        b += 1;
+    }
+    table
+};
+
+static GPT2_OFFSET_TO_BYTE: [u8; 68] = {
+    let mut table = [0u8; 68];
+    let mut n = 0usize;
+    let mut b = 0u16;
+    while b < 256 {
+        let is_printable = (b >= 0x21 && b <= 0x7E)
+            || (b >= 0xA1 && b <= 0xAC)
+            || (b >= 0xAE && b <= 0xFF);
+        if !is_printable {
+            table[n] = b as u8;
+            n += 1;
+        }
+        b += 1;
+    }
+    table
+};
 
 /// Decode SentencePiece hex escapes like <0x0A> to actual bytes.
 fn decode_hex_escapes(s: &str) -> String {

@@ -37,30 +37,22 @@ interface ModelEntry {
 
 const REGISTRY: Record<string, ModelEntry> = {
   // Qwen3.5 HFQ4 (default)
-  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf4",     size_gb: 0.5,  min_vram_gb: 1,  desc: "190 tok/s, tiny & fast" },
-  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf4",       size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
-  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf4",       size_gb: 2.1,  min_vram_gb: 4,  desc: "61 tok/s, best balance" },
-  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf4",       size_gb: 4.5,  min_vram_gb: 6,  desc: "43 tok/s, best quality 8GB" },
-  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf4",      size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, use -hf6 for coding" },
+  "qwen3.5:0.8b":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.q4.hfq",  size_gb: 0.5,  min_vram_gb: 1,  desc: "222 tok/s, tiny & fast" },
+  "qwen3.5:2b":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.q4.hfq",    size_gb: 1.2,  min_vram_gb: 2,  desc: "141 tok/s" },
+  "qwen3.5:4b":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.q4.hfq",    size_gb: 2.1,  min_vram_gb: 4,  desc: "63 tok/s, best balance" },
+  "qwen3.5:9b":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.q4.hfq",    size_gb: 4.5,  min_vram_gb: 6,  desc: "45 tok/s, best quality 8GB" },
+  "qwen3.5:27b":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.q4.hfq",   size_gb: 14.3, min_vram_gb: 16, desc: "16GB+, good for simple tasks (use -hfq6 for coding)" },
 
   // Qwen3.5 HFQ6
-  "qwen3.5:0.8b-hf6":  { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hf6",     size_gb: 0.6,  min_vram_gb: 1,  desc: "180 tok/s, higher quality" },
-  "qwen3.5:2b-hf6":    { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hf6",       size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
-  "qwen3.5:4b-hf6":    { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hf6",       size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
-  "qwen3.5:9b-hf6":    { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hf6",       size_gb: 6.8,  min_vram_gb: 8,  desc: "34 tok/s, near-FP16" },
-  "qwen3.5:27b-hf6":   { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hf6",      size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
+  "qwen3.5:0.8b-hfq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.hfq6.hfq", size_gb: 0.6,  min_vram_gb: 1,  desc: "210 tok/s, higher quality" },
+  "qwen3.5:2b-hfq6":   { repo: hfRepo("qwen3.5","2b"),   file: "qwen3.5-2b.hfq6.hfq",   size_gb: 1.6,  min_vram_gb: 3,  desc: "127 tok/s" },
+  "qwen3.5:4b-hfq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.hfq6.hfq",   size_gb: 3.3,  min_vram_gb: 5,  desc: "53 tok/s" },
+  "qwen3.5:9b-hfq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.hfq6.hfq",   size_gb: 6.8,  min_vram_gb: 8,  desc: "37 tok/s, near-FP16" },
+  "qwen3.5:27b-hfq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.hfq6.hfq",  size_gb: 21.4, min_vram_gb: 24, desc: "needs 24GB (7900 XTX)" },
 
-  // Qwen3 (standard attention)
-  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",          size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
-  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",            size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
-
-  // Community finetunes (Qwen3.5 architecture, same engine)
-  "carnice:9b":      { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf4",     size_gb: 4.5, min_vram_gb: 6, desc: "Hermes tool-use finetune" },
-  "carnice:9b-hf6":  { repo: "schuttdev/hipfire-carnice-9b",   file: "carnice-9b.hf6",     size_gb: 6.8, min_vram_gb: 8, desc: "Hermes tool-use, higher quality" },
-  "qwopus:9b":       { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf4",      size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3 finetune" },
-  "qwopus:9b-hf6":   { repo: "schuttdev/hipfire-qwopus-9b",    file: "qwopus-9b.hf6",      size_gb: 6.8, min_vram_gb: 8, desc: "Qwopus3.5 v3, higher quality" },
-  "qwopus:4b":       { repo: "schuttdev/hipfire-qwopus-4b",    file: "qwopus-4b.hf4",      size_gb: 2.1, min_vram_gb: 4, desc: "Qwopus3.5 v3, 4B" },
-  "qwopus:27b":      { repo: "schuttdev/hipfire-qwopus-27b",   file: "qwopus-27b.hf4",     size_gb: 14.3, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B" },
+  // Qwen3 HFQ4 (original quantizer filenames — see docs/MODELS.md for naming notes)
+  "qwen3:0.6b":    { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b-hfq4.hfq",    size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
+  "qwen3:8b":      { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.q4.hfq",         size_gb: 4.1,  min_vram_gb: 6,  desc: "59.9 tok/s, standard attention" },
 };
 
 // Aliases
@@ -73,15 +65,13 @@ const ALIASES: Record<string, string> = {
 };
 
 function resolveModelTag(input: string): string {
-  // Backward compat: old hfq4/hfq6 tags → hf4/hf6
-  const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
   // Direct registry match
-  if (REGISTRY[normalized]) return normalized;
+  if (REGISTRY[input]) return input;
   // Alias
-  if (ALIASES[normalized]) return ALIASES[normalized];
+  if (ALIASES[input]) return ALIASES[input];
   // Try adding "qwen3.5:" prefix
-  if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
-  return normalized;
+  if (REGISTRY[`qwen3.5:${input}`]) return `qwen3.5:${input}`;
+  return input;
 }
 
 function downloadUrl(entry: ModelEntry): string {
@@ -97,10 +87,9 @@ class Engine {
   private buffer = "";
 
   async start() {
-    const exe = process.platform === "win32" ? ".exe" : "";
     const bins = [
-      resolve(__dirname, `../target/release/examples/daemon${exe}`),
-      join(HIPFIRE_DIR, "bin", `daemon${exe}`),
+      resolve(__dirname, "../target/release/examples/daemon"),
+      join(HIPFIRE_DIR, "bin", "daemon"),
     ];
     const bin = bins.find(p => existsSync(p));
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
@@ -167,7 +156,7 @@ async function pull(tag: string): Promise<string> {
 
   // Hint for 27B HFQ4: recommend HFQ6 for complex tasks
   if (resolved === "qwen3.5:27b") {
-    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hf6 (needs 24GB VRAM)`);
+    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hfq6 (needs 24GB VRAM)`);
   }
 
   const url = downloadUrl(entry);
@@ -234,8 +223,9 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 
   const e = new Engine();
   await e.start();
+  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : 0;
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: path, turbo: 4 });
+  await e.send({ type: "load", model: path, turbo: turboMode });
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -256,18 +246,52 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     console.error(`[VL: ${image}]`);
   }
 
+  let output = "";
+  let inThink = false;
+  let thinkDone = false;
   for await (const msg of e.generate(genMsg)) {
-    if (msg.type === "token") process.stdout.write(msg.text);
+    if (msg.type === "token") {
+      let text = msg.text as string;
+      // Filter <think>...</think> block
+      if (!thinkDone) {
+        if (text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+        if (inThink) {
+          if (text.includes("</think>")) {
+            text = text.split("</think>").slice(1).join("</think>");
+            inThink = false; thinkDone = true;
+          } else { continue; }
+        }
+        text = text.replace(/^\n+/, "");
+        if (!text) continue;
+      }
+      text = text.replace(/<\|im_end\|>/g, "");
+      if (text) process.stdout.write(text);
+    }
     else if (msg.type === "done") console.error(`\n[${msg.tokens} tok, ${msg.tok_s} tok/s]`);
   }
   await e.stop();
 }
 
 async function serve(port: number) {
+  const turboMode = process.env.TURBO ? Number(process.env.TURBO) : 0;
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
+
+  // Pre-warm: load default model and compile kernels before accepting requests
+  const defaultModel = process.env.HIPFIRE_MODEL || "qwen3.5:9b";
+  const warmPath = findModel(defaultModel);
+  if (warmPath) {
+    console.error(`[hipfire] pre-warming ${defaultModel}...`);
+    await e.send({ type: "load", model: warmPath, turbo: turboMode }); await e.recv();
+    for await (const msg of e.generate({ type: "generate", id: "warmup", prompt: "Hi", temperature: 0, max_tokens: 1 })) {
+      if (msg.type === "done") break;
+    }
+    await e.send({ type: "reset" }); await e.recv();
+    current = warmPath;
+    console.error(`[hipfire] warm-up complete`);
+  }
 
   let busy = false;
   const queue: Array<{ resolve: () => void }> = [];
@@ -285,158 +309,115 @@ async function serve(port: number) {
 
   Bun.serve({
     port,
-    idleTimeout: 255, // max allowed — model loading can take 30s+
+    idleTimeout: 255,
     async fetch(req) {
       const url = new URL(req.url);
       if (url.pathname === "/health") return Response.json({ status: "ok", model: current });
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
-      if (url.pathname === "/v1/chat/completions" && req.method === "POST") {
-        await acquireLock();
-        try {
+      if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
+        return Response.json({ error: "not found" }, { status: 404 });
+
+      await acquireLock();
+      let lockReleased = false;
+      const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
+
+      try {
         const body = await req.json();
-        const messages: any[] = body.messages || [];
-        const tools: any[] = body.tools || [];
+        const modelName = body.model || "hipfire";
 
-        // OpenAI API is stateless: each request has the full conversation.
-        // Reset daemon state so prior requests don't bleed into this one.
-        await e.send({ type: "reset" }); await e.recv();
-
-        // Build prompt from messages with proper role handling
-        let systemPrompt = "";
-        let userPrompt = "";
-
-        // Extract system message
-        const sysMsg = messages.find((m: any) => m.role === "system");
-        if (sysMsg) systemPrompt = sysMsg.content;
-
-        // Format tools into system prompt (Hermes format)
-        if (tools.length > 0) {
-          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
-            + tools.map((t: any) => JSON.stringify(t)).join("\n")
-            + "\n</tools>\n\n"
-            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        // Build ChatML prompt
+        let prompt = "";
+        for (const m of body.messages || []) {
+          prompt += `<|im_start|>${m.role}\n${m.content}<|im_end|>\n`;
         }
+        prompt += `<|im_start|>assistant\n`;
 
-        // Build conversation as a single prompt preserving message order.
-        // Skip the system message (handled separately), render everything else in order.
-        const convParts: string[] = [];
-        for (const m of messages) {
-          if (m.role === "system") continue;
-          if (m.role === "tool") {
-            convParts.push(`<tool_response>\n${m.content}\n</tool_response>`);
-          } else if (m.role === "assistant" && m.tool_calls) {
-            // Re-emit assistant tool calls so the model sees them in context
-            let text = m.content || "";
-            for (const tc of m.tool_calls) {
-              const fn = tc.function || tc;
-              text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
-            }
-            convParts.push(text);
-          } else {
-            convParts.push(m.content || "");
-          }
-        }
-        userPrompt = convParts.join("\n");
-
-        const path = findModel(body.model || "default");
-        if (!path) { releaseLock(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        const path = findModel(modelName);
+        if (!path) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path, turbo: 4 }); await e.recv();
+          await e.send({ type: "load", model: path, turbo: turboMode }); await e.recv();
           current = path;
         }
 
+        // Reset daemon state before each request
+        await e.send({ type: "reset" }); await e.recv();
+
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
-        const modelName = body.model || "hipfire";
-        const genParams: any = {
-          type: "generate", id: "api", prompt: userPrompt,
+        const created = Math.floor(Date.now() / 1000);
+        const genParams = {
+          type: "generate", id: reqId, prompt,
           temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
           max_tokens: body.max_tokens ?? 512,
-          repeat_penalty: body.repeat_penalty ?? body.frequency_penalty ? 1.0 + (body.frequency_penalty ?? 0) : 1.3,
           top_p: body.top_p ?? 0.8,
+          repeat_penalty: body.repeat_penalty ?? 1.3,
         };
-        if (systemPrompt) genParams.system = systemPrompt;
-
-        // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
-        function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
-          if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
-          const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
-          const matches = [...text.matchAll(pattern)];
-          if (!matches.length) return { content: text, tool_calls: null };
-          const tool_calls: any[] = [];
-          for (const m of matches) {
-            const raw = (m[1] || m[2] || "").trim();
-            if (!raw) continue;
-            try {
-              const tc = JSON.parse(raw);
-              tool_calls.push({
-                id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-                type: "function",
-                function: { name: tc.name, arguments: JSON.stringify(tc.arguments || {}) }
-              });
-            } catch {}
-          }
-          if (!tool_calls.length) return { content: text, tool_calls: null };
-          const before = text.slice(0, text.indexOf("<tool_call>")).trim();
-          return { content: before || null, tool_calls };
-        }
 
         if (body.stream) {
           const enc = new TextEncoder();
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
-                let fullText = "";
+                let tokens = 0;
+                let inThink = false;
+                let thinkDone = false;
                 for await (const msg of e.generate(genParams)) {
                   if (msg.type === "token") {
-                    fullText += msg.text;
+                    tokens++;
+                    let text = msg.text as string;
+                    // Filter out <think>...</think> block and <|im_end|>
+                    if (!thinkDone) {
+                      if (text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+                      if (inThink) {
+                        if (text.includes("</think>")) {
+                          text = text.split("</think>").slice(1).join("</think>");
+                          inThink = false; thinkDone = true;
+                        } else { continue; }
+                      }
+                      text = text.replace(/^\n+/, "");
+                      if (!text) continue;
+                    }
+                    text = text.replace(/<\|im_end\|>/g, "");
+                    if (!text) continue;
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
-                      choices: [{ index: 0, delta: { content: msg.text }, finish_reason: null }]
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                      choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                     })}\n\n`));
                   } else if (msg.type === "done") {
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created: Math.floor(Date.now()/1000), model: modelName,
+                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
                       choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
                     })}\n\n`));
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
                   }
                 }
-              } finally { releaseLock(); }
-            }
+              } finally { safeRelease(); }
+            },
+            cancel() { safeRelease(); }
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
         }
 
+        // Non-streaming
         let content = "";
-        let promptTokens = 0;
         let completionTokens = 0;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prompt_tokens ?? 0; }
         }
-
-        // Check for tool calls in response
-        const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
-        if (parsed.tool_calls) {
-          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
-        } else {
-          choice.message = { role: "assistant", content };
-        }
-
+        // Strip think tags and special tokens
+        content = content.replace(/^<think>[\s\S]*?<\/think>\s*/m, "").replace(/<\|im_end\|>/g, "").trim();
+        safeRelease();
         return Response.json({
-          id: reqId, object: "chat.completion", created: Math.floor(Date.now()/1000), model: modelName,
-          choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          id: reqId, object: "chat.completion", created, model: modelName,
+          choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 0, completion_tokens: completionTokens, total_tokens: completionTokens }
         });
-        } finally { releaseLock(); }
+      } catch (err: any) {
+        safeRelease();
+        return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
-      return Response.json({ error: "not found" }, { status: 404 });
     }
   });
 }
@@ -453,23 +434,13 @@ function findModel(name: string): string | null {
   if (entry) {
     const p = join(MODELS_DIR, entry.file);
     if (existsSync(p)) return p;
-    // Backward compat: try old .hfq naming for the SAME quant level only
-    const base = entry.file.replace(/\.(hf4|hf6)$/, "");
-    const isHf6 = entry.file.endsWith(".hf6");
-    const oldNames = isHf6
-      ? [base + ".hfq6.hfq"]                              // HF6 → only try old hfq6
-      : [base + ".q4.hfq", base + "-hfq4.hfq", base + ".hfq"];  // HF4 → only try old q4/hfq4
-    for (const old of oldNames) {
-      const op = join(MODELS_DIR, old);
-      if (existsSync(op)) return op;
-    }
   }
 
   // Fuzzy search local dirs
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
   for (const dir of dirs) {
     try { for (const f of readdirSync(dir)) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
+      if (f.endsWith(".hfq") && (f.includes(name) || f.includes(name.replace(":", "-")))) return join(dir, f);
     }} catch {}
   }
   return null;
@@ -480,12 +451,11 @@ function listLocal() {
   const seen = new Set<string>();
   for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
     try { for (const f of readdirSync(dir)) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq")) && !seen.has(f)) {
+      if (f.endsWith(".hfq") && !seen.has(f)) {
         seen.add(f);
         const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-        // Find matching registry tag (check new and old naming)
-        const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
-        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
+        // Find matching registry tag
+        const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f)?.[0] || "";
         models.push({ name: f, tag, size: `${sz}GB` });
       }
     }} catch {}
@@ -539,7 +509,7 @@ switch (cmd) {
   }
   case "pull": {
     const tag = rest[0];
-    if (!tag) { console.error("Usage: hipfire pull <model>\n\nExamples:\n  hipfire pull qwen3.5:9b\n  hipfire pull qwen3.5:4b-hf6\n  hipfire pull qwen3.5:27b\n\nAvailable:\n" + Object.entries(REGISTRY).map(([t, e]) => `  ${t.padEnd(22)} ${e.size_gb.toString().padStart(5)}GB  ${e.desc}`).join("\n")); process.exit(1); }
+    if (!tag) { console.error("Usage: hipfire pull <model>\n\nExamples:\n  hipfire pull qwen3.5:9b\n  hipfire pull qwen3.5:4b-hfq6\n  hipfire pull qwen3.5:27b\n\nAvailable:\n" + Object.entries(REGISTRY).map(([t, e]) => `  ${t.padEnd(22)} ${e.size_gb.toString().padStart(5)}GB  ${e.desc}`).join("\n")); process.exit(1); }
     await pull(tag);
     break;
   }
@@ -575,36 +545,31 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding...");
     const build = Bun.spawnSync(
-      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
+      ["cargo", "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "-p", "engine"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
     // Recopy binaries
     const binDir = join(HIPFIRE_DIR, "bin");
     const { copyFileSync } = await import("fs");
-    const exe = process.platform === "win32" ? ".exe" : "";
-    for (const bin of ["daemon", "infer", "run"]) {
-      const src = join(repoDir, `target/release/examples/${bin}${exe}`);
-      const dst = join(binDir, `${bin}${exe}`);
-      if (existsSync(src)) { copyFileSync(src, dst); }
+    for (const bin of ["daemon", "infer"]) {
+      const src = join(repoDir, "target/release/examples", bin);
+      if (existsSync(src)) { copyFileSync(src, join(binDir, bin)); }
     }
     // Recopy CLI
     copyFileSync(join(repoDir, "cli/index.ts"), join(HIPFIRE_DIR, "cli/index.ts"));
-    // Detect GPU arch from sysfs (cross-platform, no external commands)
-    let archOut = "";
-    try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/1/properties").text(); } catch {}
-    if (!archOut) try { archOut = await Bun.file("/sys/class/kfd/kfd/topology/nodes/0/properties").text(); } catch {}
+    // Recopy kernels
+    const arch = Bun.spawnSync(["cat", "/sys/class/kfd/kfd/topology/nodes/1/properties"], { stdout: "pipe" });
+    const archOut = arch.stdout?.toString() || "";
     const verMatch = archOut.match(/gfx_target_version\s+(\d+)/);
     let gpuArch = "unknown";
     if (verMatch) {
-      // Derive gfx arch from version number: e.g. 100100→gfx1010, 110001→gfx1100, 115100→gfx1151
-      const ver = parseInt(verMatch[1]);
-      const major = Math.floor(ver / 10000);
-      const minor = Math.floor((ver % 10000) / 100);
-      const step = ver % 100;
-      gpuArch = `gfx${major}${minor.toString().padStart(2, '0')}${step || '0'}`;
-      // Normalize: gfx10010 → gfx1010, gfx110000 stays gfx1100
-      gpuArch = gpuArch.replace(/^(gfx\d{4})0$/, '$1');
+      const v = verMatch[1];
+      if (v === "100100") gpuArch = "gfx1010";
+      else if (v === "100300" || v === "100302") gpuArch = "gfx1030";
+      else if (v === "110000" || v === "110001") gpuArch = "gfx1100";
+      else if (v === "120000") gpuArch = "gfx1200";
+      else if (v === "120001") gpuArch = "gfx1201";
     }
     if (gpuArch !== "unknown") {
       const kernelSrc = join(repoDir, "kernels/compiled", gpuArch);
@@ -617,23 +582,6 @@ switch (cmd) {
         console.error(`  Updated ${gpuArch} kernels ✓`);
       }
     }
-    // Rename legacy .hfq model files to .hf4/.hf6
-    const { renameSync } = await import("fs");
-    try {
-      for (const f of readdirSync(MODELS_DIR)) {
-        if (!f.endsWith(".hfq")) continue;
-        let newName = "";
-        if (f.endsWith(".q4.hfq")) newName = f.replace(/\.q4\.hfq$/, ".hf4");
-        else if (f.endsWith(".hfq6.hfq")) newName = f.replace(/\.hfq6\.hfq$/, ".hf6");
-        else if (f.match(/-hfq4\.hfq$/)) newName = f.replace(/-hfq4\.hfq$/, ".hf4");
-        else if (f.match(/-hfq4g\d+\.hfq$/)) continue; // skip experimental variants
-        else newName = f.replace(/\.hfq$/, ".hf4"); // bare .hfq → assume hf4
-        if (newName && newName !== f && !existsSync(join(MODELS_DIR, newName))) {
-          renameSync(join(MODELS_DIR, f), join(MODELS_DIR, newName));
-          console.error(`  Renamed ${f} → ${newName}`);
-        }
-      }
-    } catch {}
     console.error("hipfire updated ✓");
     break;
   }
@@ -641,10 +589,9 @@ switch (cmd) {
     console.log("hipfire diagnostics\n");
 
     // 1. Check daemon binary
-    const exe2 = process.platform === "win32" ? ".exe" : "";
     const bins = [
-      resolve(__dirname, `../target/release/examples/daemon${exe2}`),
-      join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
+      resolve(__dirname, "../target/release/examples/daemon"),
+      join(HIPFIRE_DIR, "bin", "daemon"),
     ];
     const daemonBin = bins.find(p => existsSync(p));
     console.log(`daemon binary: ${daemonBin ? "found" : "NOT FOUND"}`);
@@ -700,10 +647,10 @@ switch (cmd) {
         } else if (vram < 24000) {
           console.log("TIP: 16-24GB VRAM — qwen3.5:27b HFQ4 (14.3GB). Note: HFQ4 degrades on complex tasks");
         } else {
-          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hf6 (21.4GB) for best quality");
+          console.log("TIP: 24GB+ VRAM — qwen3.5:27b-hfq6 (21.4GB) for best quality");
         }
         if (models.length === 0) {
-          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hf6";
+          const rec = vram < 4000 ? "qwen3.5:0.8b" : vram < 6000 ? "qwen3.5:4b" : vram < 16000 ? "qwen3.5:9b" : vram < 24000 ? "qwen3.5:27b" : "qwen3.5:27b-hfq6";
           console.log(`TIP: No models downloaded. Run: hipfire pull ${rec}`);
         }
       } else {
@@ -746,7 +693,7 @@ Models:
   hipfire pull qwen3.5:9b            # 4.5GB, best quality for 8GB cards
   hipfire pull qwen3.5:4b            # 2.1GB, best speed/quality balance
   hipfire pull qwen3.5:27b           # 14.3GB, needs 16GB+ VRAM
-  hipfire pull qwen3.5:9b-hf6      # 6.8GB, higher quality (6-bit)
+  hipfire pull qwen3.5:9b-hfq6      # 6.8GB, higher quality (6-bit)
 
 Quick start:
   hipfire pull qwen3.5:4b

@@ -159,6 +159,28 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "reset" => {
+                if let Some(m) = model.as_mut() {
+                    if let Some(ref dn) = m.dn_state {
+                        for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                        for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                        for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    }
+                    for kv in [&m.kv_cache, &m.llama_kv] {
+                        if let Some(kv) = kv {
+                            for t in &kv.k_gpu { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+                            for t in &kv.v_gpu { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+                            for t in &kv.k_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+                            for t in &kv.v_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+                        }
+                    }
+                    let _ = writeln!(stdout, r#"{{"type":"reset","ok":true}}"#);
+                } else {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                }
+                let _ = stdout.flush();
+            }
+
             "unload" => {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
@@ -355,13 +377,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
         let mut next_token = llama::sample_top_p(&logits, temp, top_p);
         let mut generated = 0;
+        let mut streamed_tokens: Vec<u32> = Vec::new();
+        let mut emitted_bytes = 0usize;
 
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            let text = tokenizer.decode(&[next_token]);
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
+            streamed_tokens.push(next_token);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            if vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += vl;
+            }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
@@ -410,13 +441,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
 
         let mut generated = 0;
+        let mut streamed_tokens: Vec<u32> = Vec::new();
+        let mut emitted_bytes = 0usize;
 
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            let text = tokenizer.decode(&[next_token]);
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
+            streamed_tokens.push(next_token);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[emitted_bytes..];
+            let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+            if vl > 0 {
+                let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+                emitted_bytes += vl;
+            }
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
@@ -556,13 +596,22 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::sample_top_p(&logits, temp, top_p);
     let mut generated = 0;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
 
     for _ in 0..max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
-        let text = tokenizer.decode(&[next_token]);
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-        let _ = stdout.flush();
+        streamed_tokens.push(next_token);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let vl = match std::str::from_utf8(new_bytes) { Ok(_) => new_bytes.len(), Err(e) => e.valid_up_to() };
+        if vl > 0 {
+            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += vl;
+        }
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
