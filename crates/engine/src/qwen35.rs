@@ -961,6 +961,7 @@ fn forward_scratch_layers(
     let hd = config.linear_key_head_dim;
 
     let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -1055,8 +1056,16 @@ fn forward_scratch_layers(
                 gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
                     config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
 
-                if kv_cache.quant_asym {
-                    // Asymmetric: Q8 K + turbo4 V (V compression is free)
+                if kv_cache.quant_asym && kv_cache.is_boundary(kv_layer_idx) {
+                    // Boundary layer (LA-V7): Q8 for both K and V (full quality)
+                    gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+                    gpu.attention_q8_0_kv(
+                        &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &s.fa_attn_out, &s.pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+                    )?;
+                } else if kv_cache.quant_asym {
+                    // Middle layer: Q8 K + turbo4 V (V compression is free)
                     let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
                     let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
@@ -1123,6 +1132,7 @@ fn forward_scratch_layers(
                 gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
                 weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.ffn_out)?;
                 gpu.add_inplace_f32(&s.x, &s.ffn_out)?;
+                kv_layer_idx += 1;
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),

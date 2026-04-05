@@ -24,6 +24,7 @@ fn main() {
     let mut system_prompt: Option<String> = None;
     let mut turbo_bits: u8 = 0;
     let mut asym_kv = false;
+    let mut boundary: u8 = 0;
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
     let mut i = 2;
@@ -32,6 +33,7 @@ fn main() {
             "--system" | "-s" => { i += 1; system_prompt = Some(args[i].clone()); }
             "--turbo" => { i += 1; turbo_bits = args[i].parse().unwrap_or(4); }
             "--asym" => { asym_kv = true; }
+            "--boundary" => { i += 1; boundary = args[i].parse().unwrap_or(2); }
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
             _ => {}
@@ -47,9 +49,10 @@ fn main() {
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
     let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
 
+    let n_kv_layers = config.layer_types.iter().filter(|t| **t == engine::qwen35::LayerType::FullAttention).count();
     let kv_cache = if asym_kv {
-        eprintln!("KV cache: asymmetric q8-K + turbo4-V");
-        llama::KvCache::new_gpu_asym_q8k_turbo4v(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap()
+        eprintln!("KV cache: asymmetric q8-K + turbo4-V (boundary={})", boundary);
+        llama::KvCache::new_gpu_asym_q8k_turbo4v_boundary(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, boundary, n_kv_layers).unwrap()
     } else if turbo_bits >= 2 && turbo_bits <= 4 {
         eprintln!("KV cache: turbo{}", turbo_bits);
         llama::KvCache::new_gpu_turbo(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).unwrap()
