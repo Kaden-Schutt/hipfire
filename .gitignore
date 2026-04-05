@@ -1,26 +1,43 @@
+# Build
 /target
+*.o
+*.so
+*.exe
+*.dll
+
+# Editor
 *.swp
 *.swo
 *~
 .DS_Store
+.vscode/
+.idea/
 
-# Dev assets (test models, bench results, test images)
+# Dev / dist
 /dev/
 /dist/
 
-# Model files (large binaries)
+# Models (large binaries)
 /models/
 *.gguf
 *.safetensors
+*.hfq
 
-# Pre-compiled kernels are tracked (small .hsaco blobs)
-# but source .hip files are also tracked
+# JIT-compiled kernel cache
+kernels/compiled/
 
-# Tool configs
+# Agent / tool state
 .serena/
 .remember/
+.codex
+docs/superpowers/
+.worktrees/
 
-# Claude Code orchestration
-CLAUDE.md
-harness.sh
-kernels/compiled/
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Logs / temp
+*.log
+/tmp/
