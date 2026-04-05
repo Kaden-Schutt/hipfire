@@ -818,9 +818,13 @@ switch (cmd) {
     console.log(`/dev/dri/:     ${driNodes ? driNodes.replace(/\n/g, ", ") : "NOT FOUND"}`);
     if (hasDxg) console.log(`/dev/dxg:      present (DirectX GPU paravirtualization)`);
 
-    // 2c. DRM driver backing the render node (sysfs-based)
-    if (hasRenderNode) {
-      const drmDriver = sh("for c in /sys/class/drm/card[0-9]; do d=$(basename $(readlink -f $c/device/driver) 2>/dev/null); [ -n \"$d\" ] && echo $d && break; done")
+    // 2c. Find the AMD GPU card in sysfs (skip iGPUs / non-AMD cards)
+    // Prefer card with vendor 0x1002 (AMD); fall back to first card if none match
+    const amdCard = sh("for c in /sys/class/drm/card[0-9]; do [ \"$(cat $c/device/vendor 2>/dev/null)\" = '0x1002' ] && echo $c && break; done")
+      || sh("for c in /sys/class/drm/card[0-9]; do [ -e $c/device/vendor ] && echo $c && break; done");
+
+    if (hasRenderNode && amdCard) {
+      const drmDriver = sh(`basename $(readlink -f ${amdCard}/device/driver) 2>/dev/null`)
         || (hasDxg ? "dxg" : "unknown");
       console.log(`  DRM driver:  ${drmDriver}`);
       if (drmDriver === "amdgpu") {
@@ -835,9 +839,9 @@ switch (cmd) {
     const kfdReadable = hasKfd && sh("test -r /dev/kfd && echo yes") === "yes";
     console.log(`/dev/kfd:      ${hasKfd ? (kfdReadable ? "present, readable" : "present, NOT READABLE (permission denied)") : "NOT FOUND"}`);
 
-    // 2f. sysfs GPU info
-    const vendor = sh("for c in /sys/class/drm/card[0-9]; do v=$(cat $c/device/vendor 2>/dev/null); [ -n \"$v\" ] && echo $v && break; done");
-    const device = sh("for c in /sys/class/drm/card[0-9]; do d=$(cat $c/device/device 2>/dev/null); [ -n \"$d\" ] && echo $d && break; done");
+    // 2f. sysfs GPU info (from the AMD card we found, not just the first)
+    const vendor = amdCard ? sh(`cat ${amdCard}/device/vendor 2>/dev/null`) : "";
+    const device = amdCard ? sh(`cat ${amdCard}/device/device 2>/dev/null`) : "";
     if (vendor) console.log(`  vendor:      ${vendor}${vendor === "0x1002" ? " (AMD)" : vendor === "0x10de" ? " (NVIDIA — not supported)" : ""}`);
     if (device) console.log(`  device:      ${device}`);
 
