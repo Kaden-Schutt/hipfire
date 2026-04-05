@@ -4,9 +4,9 @@
 // No FWHT rotation. No centroid LUT. Direct quantization designed for
 // cache-line-friendly access during attention.
 //
-// Format per head per position: Q8-compatible block layout
-//   [f32 scale (4B)] [f32 min (4B)] [128 × 4-bit nibbles (64B)] = 72 bytes
-//   (vs turbo4: 132B, vs Q8: 272B → 3.8x compression vs Q8)
+// Format per head per position:
+//   [f32 norm (4B)] [f16 scale (2B)] [f16 min (2B)] [128 nibbles (128B)] = 136 bytes
+//   (vs turbo4: 132B, vs Q8: 272B → 2.0x compression vs Q8)
 //
 // Quantization: affine 4-bit with per-head min/scale
 //   nibble = clamp(round((val - min) / scale), 0, 15)
@@ -29,7 +29,7 @@ __global__ void kv_cache_write_hf4v_256(
     if (h >= n_kv_heads) return;
     const int tid = threadIdx.x;
     const int pos = pos_buf[0];
-    const int bytes_per_head = 72;  // 4(norm) + 4(scale) + head_dim/2
+    const int bytes_per_head = 8 + head_dim / 2;  // 4(norm) + 2(scale_f16) + 2(min_f16) + 128 nibbles = 136
     const int bytes_per_pos = n_kv_heads * bytes_per_head;
 
     const float* src = v_src + h * head_dim + tid * 8;

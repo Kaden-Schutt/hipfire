@@ -31,10 +31,7 @@ __global__ void attention_q8k_hf4v_256(
     const int blk_byte_off = kv_h * q8_bph + (d0 / 32) * 34;
     const int blk_off = d0 % 32;
 
-    // HF4 V layout: 8 header bytes + head_dim/2 nibble bytes = 8 + 128 = 136 bytes per head
-    // Wait — write kernel uses 72B (4+4+64). Let me match that.
-    // Actually: 4(norm) + 2(scale_f16) + 2(min_f16) + 128(nibbles) = 136 bytes
-    // Hmm, header is 8 bytes, nibbles = head_dim/2 = 128 bytes. Total = 136.
+    // HF4 V layout: [f32 norm (4B)] [f16 scale (2B)] [f16 min (2B)] [128 nibbles] = 136B/head
     const int hf4_bph = 8 + head_dim / 2;  // 136
     const int hf4_bpp = n_kv_heads * hf4_bph;
     const int hf4_head_off = kv_h * hf4_bph;
