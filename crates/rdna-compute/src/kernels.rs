@@ -70,6 +70,48 @@ pub const GEMV_HFQ4G1024_SRC: &str = include_str!("../../../kernels/src/gemv_hfq
 /// Same coalesced width as Q4_K, 14 VGPRs instead of 39.
 pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.hip");
 
+// ── RDNA2 (gfx1030) HFQ4-G256 variants ──
+// 5 kernel variants exploring the occupancy/unroll/cache tradeoff space.
+// Select via HIPFIRE_RDNA2_VARIANT=N env var (default: 1).
+// v1: baseline-rdna2 — launch_bounds(32,16), 2x unroll, ~64 VGPRs
+// v2: high-occupancy — launch_bounds(32,20), 2x unroll, ~51 VGPRs (scoped vars)
+// v3: wide-unroll    — launch_bounds(32,12), 4x unroll, ~85 VGPRs
+// v4: dp4a-packed    — launch_bounds(32,16), dp4a intrinsics, factored scale/zero
+// v5: cache-aggressive — launch_bounds(32,16), 2x unroll, packed loads, factored math
+pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
+pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");
+pub const GEMV_HFQ4G256_GFX1030_V3_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v3.hip");
+pub const GEMV_HFQ4G256_GFX1030_V4_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v4.hip");
+pub const GEMV_HFQ4G256_GFX1030_V5_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v5.hip");
+
+/// Returns the HFQ4-G256 GEMV kernel source AND module name for the given arch.
+/// On gfx1030/gfx1031 (RDNA2), selects variant via HIPFIRE_RDNA2_VARIANT env var.
+/// Module name is variant-specific so each variant gets its own precompiled .hsaco blob.
+/// The function name inside the .hsaco is always "gemv_hfq4g256" (the extern "C" symbol).
+pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1030" | "gfx1031" => {
+            let variant: u32 = std::env::var("HIPFIRE_RDNA2_VARIANT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let names = ["", "baseline-rdna2", "high-occupancy", "wide-unroll", "dp4a-packed", "cache-aggressive"];
+            let name = names.get(variant as usize).unwrap_or(&"baseline-rdna2");
+            eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
+            match variant {
+                2 => (GEMV_HFQ4G256_GFX1030_V2_SRC, "gemv_hfq4g256_rdna2v2"),
+                3 => (GEMV_HFQ4G256_GFX1030_V3_SRC, "gemv_hfq4g256_rdna2v3"),
+                4 => (GEMV_HFQ4G256_GFX1030_V4_SRC, "gemv_hfq4g256_rdna2v4"),
+                5 => (GEMV_HFQ4G256_GFX1030_V5_SRC, "gemv_hfq4g256_rdna2v5"),
+                _ => (GEMV_HFQ4G256_GFX1030_V1_SRC, "gemv_hfq4g256_rdna2v1"),
+            }
+        }
+        // RDNA4 variants (existing)
+        // "gfx1200" | "gfx1201" => ...,
+        _ => (GEMV_HFQ4G256_SRC, "gemv_hfq4g256"), // gfx1010 baseline
+    }
+}
+
 
 
 /// HFQ2-G128: flat 2-bit with 128-weight groups. Finer granularity than G256.

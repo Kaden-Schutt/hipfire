@@ -684,7 +684,8 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC, "gemv_hfq4g256")?;
+        let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+        self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
         let func = &self.functions["gemv_hfq4g256"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -701,8 +702,12 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        // Use wide kernel (2 rows/block) for large M, narrow for small
-        if m >= 64 {
+        // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
+        // The RDNA2 variants have 2x+ unroll which compensates for 1-row-per-block,
+        // and Infinity Cache makes launch overhead negligible vs compute.
+        // Other archs: use wide kernel (2 rows/block) for large M.
+        let use_wide = m >= 64 && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031");
+        if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
             let wfunc = &self.functions["gemv_hfq4g256_wide"];
             let grid = ((m + 1) / 2) as u32;
@@ -3231,7 +3236,8 @@ impl Gpu {
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
             }
             "hfq4" => {
-                specs.push(("gemv_hfq4g256", kernels::GEMV_HFQ4G256_SRC.to_string()));
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+                specs.push((module, src.to_string()));
                 specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
             }
             "q8" => {
@@ -3291,6 +3297,8 @@ impl Gpu {
                 "rope_partial_interleaved" => "rope_partial_interleaved_f32",
                 "deinterleave" => "deinterleave_f32",
                 "gated_delta_net_q8" => "gated_delta_net_q8",
+                // RDNA2 variant module names → common function symbol
+                n if n.starts_with("gemv_hfq4g256_rdna2") => "gemv_hfq4g256",
                 other => other,
             };
             if self.functions.contains_key(func_name) {
