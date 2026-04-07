@@ -654,10 +654,11 @@ function findModel(name: string): string | null {
   const isModel = (f: string) => {
     if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq"))) return false;
     if (!(f.includes(name) || f.includes(searchName))) return false;
+    // Exact filename match — user typed the specific file they want
+    if (f === name || f === searchName) return true;
     // If user didn't specify a quant, only match the default (4-bit) variant.
     // For .hf4: always OK. For .hf6: reject. For legacy .hfq: only accept
     // canonical defaults ({base}.q4.hfq, {base}-hfq4.hfq, {base}.hfq).
-    // Reject non-default variants like hfq4g256, q8q4k, hfq6, etc.
     if (!hasQuantHint) {
       if (f.endsWith(".hf6")) return false;
       if (f.endsWith(".hfq")) {
