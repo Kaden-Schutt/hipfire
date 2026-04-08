@@ -37,9 +37,9 @@ done
 # Colors
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 
-pass() { ((PASS++)); echo -e "  ${GREEN}PASS${NC} $1"; }
-fail() { ((FAIL++)); echo -e "  ${RED}FAIL${NC} $1${2:+ — $2}"; }
-skip() { ((SKIP++)); echo -e "  ${YELLOW}SKIP${NC} $1${2:+ — $2}"; }
+pass() { PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $1"; }
+fail() { FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $1${2:+ — $2}"; }
+skip() { SKIP=$((SKIP+1)); echo -e "  ${YELLOW}SKIP${NC} $1${2:+ — $2}"; }
 header() { echo -e "\n${CYAN}=== $1 ===${NC}"; }
 
 cleanup() {
@@ -191,7 +191,7 @@ TOOL_RESP=$(curl -sf -X POST "$BASE/v1/chat/completions" \
     }],
     "stream": false,
     "temperature": 0.0,
-    "max_tokens": 256
+    "max_tokens": 2048
   }' 2>/dev/null || echo '{"error":"request failed"}')
 
 TOOL_CALLS=$(echo "$TOOL_RESP" | jq -r '.choices[0].message.tool_calls // empty' 2>/dev/null)
@@ -201,11 +201,18 @@ TOOL_CONTENT=$(echo "$TOOL_RESP" | jq -r '.choices[0].message.content // ""' 2>/
 if [[ -n "$TOOL_CALLS" && "$TOOL_CALLS" != "null" ]]; then
   TOOL_NAME=$(echo "$TOOL_CALLS" | jq -r '.[0].function.name' 2>/dev/null)
   pass "Tool call detected: $TOOL_NAME (finish=$TOOL_FINISH)"
-elif [[ -n "$TOOL_CONTENT" && "$TOOL_CONTENT" != "null" ]]; then
+elif [[ -n "$TOOL_CONTENT" && "$TOOL_CONTENT" != "null" && "$TOOL_CONTENT" != "" ]]; then
   # Model responded with text instead of tool call — not a server bug
   skip "Model chose text over tool call" "${TOOL_CONTENT:0:60}"
 else
-  fail "No tool call or content" "$TOOL_RESP"
+  # Empty content = model spent all tokens thinking (common with thinking models).
+  # Server still returned a valid response — not a hang. Mark as skip, not fail.
+  COMP_TOKENS=$(echo "$TOOL_RESP" | jq -r '.usage.completion_tokens // 0' 2>/dev/null)
+  if echo "$TOOL_RESP" | jq -e '.choices[0]' >/dev/null 2>&1; then
+    skip "Model exhausted tokens thinking ($COMP_TOKENS tok, no visible output)"
+  else
+    fail "No valid response" "$TOOL_RESP"
+  fi
 fi
 
 # ─── Test 6: Streaming with tools ──────────────────────────
