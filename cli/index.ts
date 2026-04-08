@@ -474,25 +474,44 @@ async function serve(port: number) {
           systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
         }
 
-        // Build conversation as a single prompt preserving message order.
-        // Skip the system message (handled separately), render everything else in order.
+        // Build conversation as multi-turn ChatML prompt.
+        // The daemon wraps the prompt as: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
+        // We embed ChatML turn boundaries inside the prompt so multi-turn conversations
+        // (especially tool-calling flows) have proper role structure instead of being
+        // collapsed into a single user turn.
+        const nonSystem = messages.filter((m: any) => m.role !== "system");
         const convParts: string[] = [];
-        for (const m of messages) {
-          if (m.role === "system") continue;
-          if (m.role === "tool") {
-            convParts.push(`<tool_response>\n${m.content}\n</tool_response>`);
-          } else if (m.role === "assistant" && m.tool_calls) {
-            let text = m.content || "";
+        for (let i = 0; i < nonSystem.length; i++) {
+          const m = nonSystem[i];
+          const role = m.role;
+          let text = "";
+
+          if (role === "tool") {
+            text = `<tool_response>\n${m.content}\n</tool_response>`;
+          } else if (role === "assistant" && m.tool_calls) {
+            text = m.content || "";
             for (const tc of m.tool_calls) {
               const fn = tc.function || tc;
               text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
             }
-            convParts.push(text);
           } else {
-            convParts.push(m.content || "");
+            text = m.content || "";
+          }
+
+          if (i === 0) {
+            // First message: daemon provides <|im_start|>user\n wrapper,
+            // but if it's not a user message, close the user turn and start the right role
+            if (role === "user") {
+              convParts.push(text);
+            } else {
+              convParts.push(`<|im_end|>\n<|im_start|>${role}\n${text}`);
+            }
+          } else {
+            // Subsequent messages: close previous turn, start new one
+            convParts.push(`<|im_end|>\n<|im_start|>${role}\n${text}`);
           }
         }
-        userPrompt = convParts.join("\n");
+        userPrompt = convParts.join("");
 
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
@@ -501,7 +520,13 @@ async function serve(port: number) {
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path, turbo: turboMode }); await e.recv();
+          await e.send({ type: "load", model: path, turbo: turboMode });
+          const loadResult = await e.recv();
+          if (loadResult.type === "error") {
+            current = null;
+            safeRelease();
+            return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
+          }
           current = path;
         }
 
@@ -545,11 +570,14 @@ async function serve(port: number) {
           const enc = new TextEncoder();
           let streamCancelled = false;
           e.generating = true;
+          const hasTool = tools.length > 0;
           return new Response(new ReadableStream({
             async start(ctrl) {
               try {
                 let inThink = false;
                 let stripNextLeadingNl = false;
+                // When tools are present, accumulate full output for tool-call parsing
+                let accumulated = hasTool ? "" : null;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
@@ -565,21 +593,73 @@ async function serve(port: number) {
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
                     if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
-                    ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
-                      id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                      choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-                    })}\n\n`));
+                    if (accumulated !== null) {
+                      accumulated += text; // buffer for tool-call parsing at end
+                    } else {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+                      })}\n\n`));
+                    }
                   } else if (msg.type === "done") {
+                    // When tools are present, parse accumulated text for tool calls
+                    if (accumulated !== null) {
+                      const parsed = parseToolCalls(accumulated);
+                      if (parsed.tool_calls) {
+                        if (parsed.content) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { content: parsed.content }, finish_reason: null }]
+                          })}\n\n`));
+                        }
+                        for (let ti = 0; ti < parsed.tool_calls.length; ti++) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { tool_calls: [{ index: ti, ...parsed.tool_calls[ti] }] }, finish_reason: null }]
+                          })}\n\n`));
+                        }
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+                        })}\n\n`));
+                      } else {
+                        // No tool calls — flush accumulated content
+                        if (accumulated) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { content: accumulated }, finish_reason: null }]
+                          })}\n\n`));
+                        }
+                        ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                          id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                        })}\n\n`));
+                      }
+                    } else {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                      })}\n\n`));
+                    }
+                    ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                    ctrl.close();
+                    return;
+                  } else if (msg.type === "error") {
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                       id: reqId, object: "chat.completion.chunk", created, model: modelName,
                       choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
                     })}\n\n`));
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
+                    return;
                   }
                 }
+                // Safety: if loop exits without done/error (shouldn't happen), close stream
+                try { ctrl.close(); } catch {}
+              } finally {
                 e.generating = false;
-              } finally { safeRelease(); }
+                safeRelease();
+              }
             },
             cancel() { streamCancelled = true; } // lock released in finally after generation drains
           }), { headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } });
