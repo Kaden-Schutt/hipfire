@@ -349,32 +349,43 @@ if $HERMES_TEST; then
     # Backup and modify Hermes config to point at hipfire
     cp ~/.hermes/config.yaml ~/.hermes/config.yaml.bak
 
-    # Patch config to use hipfire serve as custom endpoint
+    # Patch config: use named custom provider (custom:hipfire) — the only
+    # reliable way to bypass hermes' provider auto-detection which would
+    # otherwise route to nous/openrouter despite base_url being set.
     python3 -c "
 import yaml, sys
 with open('$HOME/.hermes/config.yaml') as f:
     cfg = yaml.safe_load(f)
 cfg['model']['default'] = '$MODEL'
-cfg['model']['provider'] = 'custom'
-cfg['model']['base_url'] = '$BASE/v1'
-cfg['model']['api_key'] = 'hipfire-local'
+cfg['model']['provider'] = 'custom:hipfire'
+cfg['model']['context_length'] = 4096
+cfg['custom_providers'] = [{
+    'name': 'hipfire',
+    'base_url': '$BASE/v1',
+    'api_key': 'hipfire-local'
+}]
 cfg['streaming']['enabled'] = False
-cfg['agent']['max_turns'] = 3
+cfg['agent']['max_turns'] = 1
 with open('$HOME/.hermes/config.yaml', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False)
-print('Hermes config patched to use hipfire serve')
+print('Hermes config patched to use hipfire serve (custom:hipfire)')
 " 2>/dev/null
 
     if [[ $? -eq 0 ]]; then
-      # Run a simple one-shot query
-      echo "  Running: hermes -1 'Say hello world'"
-      HERMES_OUT=$(timeout 60 hermes -1 "Say exactly: hello from hermes" 2>&1 || echo "HERMES_TIMEOUT")
+      # Run a simple one-shot query via hermes chat -q (non-interactive)
+      # Use -t terminal for minimal tools (fewer tokens = model can think + respond)
+      echo "  Running: hermes chat -q 'What is 2+2?' -Q -t terminal --max-turns 1"
+      HERMES_OUT=$(timeout 120 hermes chat -q "What is 2+2? Reply with just the number." -Q -t terminal --max-turns 1 2>&1 || echo "HERMES_TIMEOUT")
+      HERMES_EXIT=$?
 
       if [[ "$HERMES_OUT" == *"HERMES_TIMEOUT"* ]]; then
-        fail "Hermes timed out (60s)"
-      elif [[ ${#HERMES_OUT} -gt 5 ]]; then
+        fail "Hermes timed out (120s)"
+      elif [[ "$HERMES_OUT" == *"daemon closed"* ]]; then
+        fail "Hermes: daemon crashed" "${HERMES_OUT:0:200}"
+      elif [[ ${#HERMES_OUT} -gt 3 ]]; then
         pass "Hermes got response (${#HERMES_OUT} chars)"
-        echo "       Output: ${HERMES_OUT:0:120}"
+        # Show last few meaningful lines (skip banners/spinners)
+        echo "       Output: $(echo "$HERMES_OUT" | tail -5 | head -3)"
       else
         fail "Hermes: empty response" "$HERMES_OUT"
       fi
