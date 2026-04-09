@@ -7,5 +7,7 @@ pub mod llama;
 pub mod qwen35;
 #[cfg(feature = "deltanet")]
 pub mod qwen35_vl;
+#[cfg(feature = "deltanet")]
+pub mod speculative;
 pub mod image;
 pub mod tokenizer;

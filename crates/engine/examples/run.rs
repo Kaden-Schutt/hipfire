@@ -15,7 +15,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: run <model.hfq> [--system \"prompt\"] [--turbo N] [--temp F] [--max-seq N]");
+        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--turbo N] [--temp F] [--max-seq N]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -29,6 +29,7 @@ fn main() {
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
     let mut q4_state = false;
+    let mut draft_model: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -40,6 +41,7 @@ fn main() {
             "--boundary" => { i += 1; boundary = args[i].parse().unwrap_or(2); }
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
+            "--draft-model" => { i += 1; draft_model = Some(args[i].clone()); }
             _ => {}
         }
         i += 1;
@@ -71,6 +73,60 @@ fn main() {
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("failed to load tokenizer");
+
+    // Optional draft model slot (Phase 1 of speculative decode). Validated for
+    // tokenizer compatibility, smoke-tested, then parked. The REPL still runs
+    // the target model alone until Phase 2 wires in the verify-and-accept loop.
+    let mut draft_slot: Option<engine::speculative::ModelSlot> = None;
+    if let Some(ref dpath) = draft_model {
+        use engine::speculative::{KvMode, ModelSlot, ModelSlotConfig};
+        let vram_before = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
+
+        let draft_cfg = ModelSlotConfig {
+            max_seq,
+            kv_mode: if hf4_kv { KvMode::Q8kHf4v }
+                else if asym_kv { KvMode::AsymQ8Turbo4 { boundary } }
+                else if turbo_bits >= 2 && turbo_bits <= 4 { KvMode::Turbo(turbo_bits) }
+                else { KvMode::Q8 },
+            repeat_window: 128,
+            state_quant,
+        };
+
+        eprintln!("Loading draft {}...", dpath);
+        let mut slot = ModelSlot::load(&mut gpu, Path::new(dpath), "draft", draft_cfg)
+            .expect("failed to load draft model");
+
+        // Tokenizer compatibility check (vocab size + probe round-trip).
+        let draft_tok = slot.load_tokenizer().expect("draft has no tokenizer in HFQ metadata");
+        assert_eq!(
+            tokenizer.vocab_size(), draft_tok.vocab_size(),
+            "tokenizer mismatch: target vocab={} draft vocab={} — speculative decode requires identical vocabularies",
+            tokenizer.vocab_size(), draft_tok.vocab_size()
+        );
+        let probe = "<|im_start|>user\nHello world\n<|im_end|>";
+        assert_eq!(
+            tokenizer.encode(probe), draft_tok.encode(probe),
+            "tokenizer merge rules diverge between target and draft"
+        );
+
+        // Smoke test: 8 forward passes with a placeholder token. Must produce finite logits.
+        for pos in 0..8 {
+            slot.forward(&mut gpu, 1u32, pos).expect("draft smoke-test forward failed");
+        }
+        let draft_logits = gpu.download_f32(&slot.scratch.logits).unwrap();
+        let draft_ok = draft_logits.iter().take(1024).all(|x| x.is_finite());
+        assert!(draft_ok, "draft smoke test produced non-finite logits");
+        slot.reset_state(&mut gpu);
+
+        let vram_after = gpu.hip.get_vram_info().map(|(f, _)| f).unwrap_or(0);
+        let draft_mb = (vram_before.saturating_sub(vram_after)) as f64 / 1e6;
+        eprintln!(
+            "Draft: {} layers, dim={}, vocab={} — VRAM {:.0} MB, smoke test OK",
+            slot.config.n_layers, slot.config.dim, slot.config.vocab_size, draft_mb
+        );
+        draft_slot = Some(slot);
+    }
+    let _draft_slot = draft_slot; // parked until Phase 2
 
     eprintln!("Model: {} layers, dim={}, vocab={}", config.n_layers, config.dim, config.vocab_size);
     eprintln!("GPU: {} ({:.1} GB VRAM)", gpu.arch, gpu.hip.get_vram_info().map(|(_, t)| t as f64 / 1e9).unwrap_or(0.0));
