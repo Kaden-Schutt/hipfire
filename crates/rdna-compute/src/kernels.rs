@@ -91,6 +91,7 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kern
 // x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points
 // from one source file. See kernel header for VGPR budget details.
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
+pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
 pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");

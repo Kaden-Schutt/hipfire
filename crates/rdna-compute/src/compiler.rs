@@ -145,15 +145,24 @@ impl KernelCompiler {
         })?;
         let _ = std::fs::remove_file(obj_path);
 
+        // Optional extra hipcc flags via HIPFIRE_HIPCC_EXTRA_FLAGS. Used for
+        // one-off experiments like `-mcumode` vs `-mno-cumode` on RDNA1
+        // without having to rebuild every call site.
+        let extra = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
+        let mut args: Vec<String> = vec![
+            "--genco".into(),
+            format!("--offload-arch={arch}"),
+            "-O3".into(),
+        ];
+        for flag in extra.split_whitespace() {
+            args.push(flag.to_string());
+        }
+        args.push("-o".into());
+        args.push(obj_path.to_str().unwrap().into());
+        args.push(src_path.to_str().unwrap().into());
+
         let output = Command::new("hipcc")
-            .args([
-                "--genco",
-                &format!("--offload-arch={arch}"),
-                "-O3",
-                "-o",
-                obj_path.to_str().unwrap(),
-                src_path.to_str().unwrap(),
-            ])
+            .args(&args)
             .output()
             .map_err(|e| {
                 hip_bridge::HipError::new(0, &format!("failed to run hipcc: {e}"))

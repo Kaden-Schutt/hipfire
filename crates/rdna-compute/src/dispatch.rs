@@ -1021,11 +1021,21 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
-        // RDNA3 multi-row path: one warp computes R rows, sharing x register state.
-        // Controlled by HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8} (default 1 = legacy path).
+        // Multi-row GEMV: one warp computes R output rows, sharing x register
+        // state across rows. Controlled by HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}
+        // (default 1 = legacy single-row path).
+        //
+        // The RDNA3 (gfx1100) variant was introduced first as a negative-result
+        // experiment: on a 960 GiB/s bandwidth ceiling the single-row kernel is
+        // already near-peak BW-bound and multi-row under-subscribes the wave
+        // scheduler. On the lower-bandwidth RDNA1 targets (gfx1010 baseline /
+        // gfx1013 Cyan Skillfish / BC-250), R=2 is actually a small win
+        // (+2.7% on 0.8B MQ4 — the x-hoist amortization pays for the minor
+        // occupancy drop from 20 → 18 waves/SIMD). R=4/R=8 hurt on RDNA1 too
+        // (drop too far in occupancy).
         let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
-        let rows = if rdna3 { gemv_rows_override() } else { 1 };
-        let use_multirow = rdna3 && rows > 1;
+        let rows = gemv_rows_override();
+        let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
@@ -1042,11 +1052,12 @@ impl Gpu {
                 8 => ("gemv_hfq4g256_multirow_r8", 8u32),
                 _ => unreachable!(),
             };
-            self.ensure_kernel(
-                "gemv_hfq4g256_multirow_rdna3",
-                kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC,
-                func_name,
-            )?;
+            let (mr_name, mr_src) = if rdna3 {
+                ("gemv_hfq4g256_multirow_rdna3", kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC)
+            } else {
+                ("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC)
+            };
+            self.ensure_kernel(mr_name, mr_src, func_name)?;
             let mrfunc = &self.functions[func_name];
             let grid = ((m as u32) + grid_div - 1) / grid_div;
             unsafe {
