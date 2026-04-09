@@ -30,6 +30,9 @@ fn main() {
     let mut max_seq: usize = 4096;
     let mut q4_state = false;
     let mut draft_model: Option<String> = None;
+    let mut speculative = false;
+    let mut spec_k: usize = 4;
+    let mut no_penalty = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -42,6 +45,9 @@ fn main() {
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
             "--draft-model" => { i += 1; draft_model = Some(args[i].clone()); }
+            "--speculative" => { speculative = true; }
+            "--spec-k" => { i += 1; spec_k = args[i].parse().unwrap_or(4).max(1); }
+            "--no-penalty" => { no_penalty = true; }
             _ => {}
         }
         i += 1;
@@ -51,28 +57,19 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("failed to read config");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
-
-    let n_kv_layers = config.layer_types.iter().filter(|t| **t == engine::qwen35::LayerType::FullAttention).count();
-    let kv_cache = if hf4_kv {
-        llama::KvCache::new_gpu_q8k_hf4v(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap()
-    } else if asym_kv {
-        eprintln!("KV cache: asymmetric q8-K + turbo4-V (boundary={})", boundary);
-        llama::KvCache::new_gpu_asym_q8k_turbo4v_boundary(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, boundary, n_kv_layers).unwrap()
-    } else if turbo_bits >= 2 && turbo_bits <= 4 {
-        eprintln!("KV cache: turbo{}", turbo_bits);
-        llama::KvCache::new_gpu_turbo(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, turbo_bits).unwrap()
-    } else {
-        llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).unwrap()
-    };
+    use engine::speculative::{KvMode, ModelSlot, ModelSlotConfig};
     let state_quant = if q4_state { qwen35::StateQuant::Q4 } else { qwen35::StateQuant::Q8 };
     if q4_state { eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"); }
-    let dn_state = DeltaNetState::new_with_quant(&mut gpu, &config, state_quant).unwrap();
-    let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
-    let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("failed to load tokenizer");
+    let target_kv_mode = if hf4_kv { KvMode::Q8kHf4v }
+        else if asym_kv { eprintln!("KV cache: asymmetric q8-K + turbo4-V (boundary={})", boundary); KvMode::AsymQ8Turbo4 { boundary } }
+        else if turbo_bits >= 2 && turbo_bits <= 4 { eprintln!("KV cache: turbo{}", turbo_bits); KvMode::Turbo(turbo_bits) }
+        else { KvMode::Q8 };
+    let target_cfg = ModelSlotConfig {
+        max_seq, kv_mode: target_kv_mode, repeat_window: 128, state_quant,
+    };
+    let mut target_slot = ModelSlot::load(&mut gpu, Path::new(model_path), "target", target_cfg)
+        .expect("failed to load target model");
+    let tokenizer = target_slot.load_tokenizer().expect("failed to load tokenizer");
 
     // Optional draft model slot (Phase 1 of speculative decode). Validated for
     // tokenizer compatibility, smoke-tested, then parked. The REPL still runs
@@ -126,9 +123,30 @@ fn main() {
         );
         draft_slot = Some(slot);
     }
-    let _draft_slot = draft_slot; // parked until Phase 2
 
-    eprintln!("Model: {} layers, dim={}, vocab={}", config.n_layers, config.dim, config.vocab_size);
+    // Speculative decode mode requires a draft model.
+    let mut spec_active = speculative && draft_slot.is_some();
+    if speculative && draft_slot.is_none() {
+        eprintln!("--speculative ignored: no --draft-model provided");
+    }
+    // Snapshots for DeltaNet state rollback during verify-and-accept. Allocated
+    // once and reused across REPL turns. Only materialized in spec mode.
+    let mut target_snap: Option<engine::speculative::DeltaNetSnapshot> = None;
+    let mut draft_snap: Option<engine::speculative::DeltaNetSnapshot> = None;
+    if spec_active {
+        use engine::speculative::DeltaNetSnapshot;
+        target_snap = Some(DeltaNetSnapshot::new_for(&mut gpu, &target_slot.dn_state).unwrap());
+        if let Some(ref d) = draft_slot {
+            draft_snap = Some(DeltaNetSnapshot::new_for(&mut gpu, &d.dn_state).unwrap());
+        }
+        eprintln!(
+            "Speculative decode: greedy, K={}, draft={}",
+            spec_k,
+            draft_slot.as_ref().map(|d| d.name.as_str()).unwrap_or("?")
+        );
+    }
+
+    eprintln!("Model: {} layers, dim={}, vocab={}", target_slot.config.n_layers, target_slot.config.dim, target_slot.config.vocab_size);
     eprintln!("GPU: {} ({:.1} GB VRAM)", gpu.arch, gpu.hip.get_vram_info().map(|(_, t)| t as f64 / 1e9).unwrap_or(0.0));
     if let Some(ref s) = system_prompt {
         eprintln!("System: {}", if s.len() > 60 { format!("{}...", &s[..60]) } else { s.clone() });
@@ -146,9 +164,10 @@ fn main() {
 
     let mut seq_pos: usize = 0;
     let mut conversation_tokens: Vec<u32> = Vec::new();
-    let mut kv_cache = kv_cache;
-    let mut dn_state = dn_state;
     let mut total_tokens: usize = 0;
+    // Aggregate speculative decode stats across REPL turns (only populated when
+    // --speculative is active). Shown via /stats.
+    let mut spec_stats = engine::speculative::SpecStats::new(spec_k);
 
     // REPL
     let stdin = std::io::stdin();
@@ -169,9 +188,8 @@ fn main() {
                 seq_pos = 0;
                 conversation_tokens.clear();
                 total_tokens = 0;
-                for s in &dn_state.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                for s in &dn_state.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-                for s in &dn_state.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                target_slot.reset_state(&mut gpu);
+                if let Some(ref mut d) = draft_slot { d.reset_state(&mut gpu); }
                 eprintln!("Conversation reset.\n");
                 continue;
             }
@@ -185,7 +203,19 @@ fn main() {
             }
             "/stats" => {
                 eprintln!("Position: {}/{} tokens used", seq_pos, max_seq);
-                eprintln!("Total generated: {} tokens\n", total_tokens);
+                eprintln!("Total generated: {} tokens", total_tokens);
+                if spec_active && spec_stats.cycles > 0 {
+                    eprintln!(
+                        "Speculative: {} cycles, tau={:.2} (accepted/cycle), committed/cycle={:.2}",
+                        spec_stats.cycles, spec_stats.tau(), spec_stats.mean_committed()
+                    );
+                    eprint!("  acceptance histogram: ");
+                    for (i, &c) in spec_stats.acceptance_hist.iter().enumerate() {
+                        eprint!("a{}={} ", i, c);
+                    }
+                    eprintln!();
+                }
+                eprintln!();
                 continue;
             }
             _ => {}
@@ -197,9 +227,8 @@ fn main() {
             eprintln!("[context full — auto-resetting]\n");
             seq_pos = 0;
             conversation_tokens.clear();
-            for s in &dn_state.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn_state.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-            for s in &dn_state.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            target_slot.reset_state(&mut gpu);
+            if let Some(ref mut d) = draft_slot { d.reset_state(&mut gpu); }
         }
 
         // Build ChatML tokens for this turn
@@ -229,57 +258,109 @@ fn main() {
         new_tokens.extend_from_slice(&asst_tok);
         new_tokens.extend_from_slice(&nl);
 
-        // Prefill
+        // Prefill: run the prompt through BOTH models so their state is
+        // aligned at the same position. In non-spec mode the draft model is
+        // still fed the prompt so that /toggle-mid-session works cleanly,
+        // though the draft's state is unused until speculative is enabled.
         let t0 = Instant::now();
         for (i, &tok) in new_tokens.iter().enumerate() {
-            qwen35::forward_scratch(&mut gpu, &weights, &config, tok, seq_pos + i, &mut kv_cache, &mut dn_state, &scratch).unwrap();
+            target_slot.forward(&mut gpu, tok, seq_pos + i).unwrap();
+            if spec_active {
+                if let Some(ref mut d) = draft_slot {
+                    d.forward(&mut gpu, tok, seq_pos + i).unwrap();
+                }
+            }
         }
         seq_pos += new_tokens.len();
         conversation_tokens.extend_from_slice(&new_tokens);
 
-        // Generate
-        let mut logits = gpu.download_f32(&scratch.logits).unwrap();
-        let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
-        let mut generated = 0;
+        let mut generated = 0usize;
         let mut in_thinking = false;
         let mut thinking_shown = false;
+        // Capture EOS token IDs as plain values so the emit_token closure
+        // doesn't borrow from `target_slot` (which would conflict with the
+        // later &mut target_slot passed into spec_step_greedy).
+        let eos_token = target_slot.config.eos_token;
+        let im_end_token_val = im_end_token;
 
-        loop {
-            generated += 1;
-            conversation_tokens.push(next_token);
-            let text = tokenizer.decode(&[next_token]);
-
-            // Handle <think>...</think> blocks
+        // Helper closure: prints a token and returns true if generation should stop.
+        let mut emit_token = |tok: u32,
+                              conversation_tokens: &mut Vec<u32>,
+                              in_thinking: &mut bool,
+                              thinking_shown: &mut bool,
+                              generated: &mut usize| -> bool {
+            *generated += 1;
+            conversation_tokens.push(tok);
+            let text = tokenizer.decode(&[tok]);
             if text.contains("<think>") {
-                in_thinking = true;
-                if !thinking_shown {
-                    eprint!("\x1b[2m"); // dim
-                    thinking_shown = true;
+                *in_thinking = true;
+                if !*thinking_shown {
+                    eprint!("\x1b[2m");
+                    *thinking_shown = true;
                 }
             }
-            if in_thinking {
+            if *in_thinking {
                 eprint!("{}", text);
                 if text.contains("</think>") {
-                    in_thinking = false;
-                    eprint!("\x1b[0m\n"); // reset
+                    *in_thinking = false;
+                    eprint!("\x1b[0m\n");
                 }
             } else {
                 print!("{}", text);
                 std::io::stdout().flush().unwrap();
             }
+            tok == eos_token || im_end_token_val == Some(tok)
+        };
 
-            if next_token == config.eos_token { break; }
-            if im_end_token == Some(next_token) { break; }
-            if generated >= 2048 { break; } // safety limit
+        if spec_active {
+            // Speculative decode loop. Each cycle drafts spec_k tokens, the
+            // target verifies them sequentially (Phase 2 naive path), and the
+            // accepted prefix + bonus is committed to both models.
+            let ts = target_snap.as_mut().unwrap();
+            let ds = draft_snap.as_mut().unwrap();
+            let draft_ref = draft_slot.as_mut().unwrap();
+            'outer: loop {
+                let pos = seq_pos + generated;
+                if pos + spec_k + 1 >= max_seq { break; }
 
-            let pos = seq_pos + generated - 1;
-            if pos >= max_seq { break; } // KV capacity
-            qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch).unwrap();
-            logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_ngram_block(&mut logits, &conversation_tokens);
-            llama::apply_repeat_penalty(&mut logits, &conversation_tokens, sc.repeat_window, sc.repeat_penalty);
-            next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+                let step = engine::speculative::spec_step_greedy(
+                    &mut gpu, &mut target_slot, draft_ref, pos, spec_k, ts, ds,
+                ).unwrap();
+                spec_stats.record(&step);
+
+                for tok in &step.committed {
+                    let stop = emit_token(
+                        *tok, &mut conversation_tokens,
+                        &mut in_thinking, &mut thinking_shown, &mut generated,
+                    );
+                    if stop { break 'outer; }
+                    if generated >= 2048 { break 'outer; }
+                }
+            }
+        } else {
+            // Target-only generation path (baseline, unchanged behavior).
+            let mut logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
+            let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+            loop {
+                let stop = emit_token(
+                    next_token, &mut conversation_tokens,
+                    &mut in_thinking, &mut thinking_shown, &mut generated,
+                );
+                if stop { break; }
+                if generated >= 2048 { break; }
+
+                let pos = seq_pos + generated - 1;
+                if pos >= max_seq { break; }
+                target_slot.forward(&mut gpu, next_token, pos).unwrap();
+                logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
+                if !no_penalty {
+                    llama::apply_ngram_block(&mut logits, &conversation_tokens);
+                    llama::apply_repeat_penalty(&mut logits, &conversation_tokens, sc.repeat_window, sc.repeat_penalty);
+                }
+                next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+            }
         }
+
         seq_pos += generated;
         total_tokens += generated;
         conversation_tokens.extend_from_slice(&im_end);
@@ -287,7 +368,14 @@ fn main() {
 
         let elapsed = t0.elapsed();
         let tok_s = generated as f64 / elapsed.as_secs_f64();
-        eprintln!("\n\x1b[2m({} tokens, {:.1} tok/s)\x1b[0m\n", generated, tok_s);
+        if spec_active && spec_stats.cycles > 0 {
+            eprintln!(
+                "\n\x1b[2m({} tokens, {:.1} tok/s | spec: {} cycles, tau={:.2})\x1b[0m\n",
+                generated, tok_s, spec_stats.cycles, spec_stats.tau()
+            );
+        } else {
+            eprintln!("\n\x1b[2m({} tokens, {:.1} tok/s)\x1b[0m\n", generated, tok_s);
+        }
     }
 
     eprintln!("Bye!");

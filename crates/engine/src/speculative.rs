@@ -16,7 +16,7 @@ use crate::hfq::HfqFile;
 use crate::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::tokenizer::Tokenizer;
-use hip_bridge::HipResult;
+use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::Gpu;
 use std::path::Path;
 
@@ -276,4 +276,257 @@ impl SpecPair {
 
         Ok((target_ok, draft_ok))
     }
+}
+
+/// Result of one speculative decode step.
+#[derive(Debug, Clone)]
+pub struct SpecStepResult {
+    /// Number of draft tokens accepted (0..=k).
+    pub accepted: usize,
+    /// Target's next-token prediction at the first rejection point (or after
+    /// all drafted tokens if accepted == k). Appended to `committed`.
+    pub bonus_token: u32,
+    /// The full sequence of tokens the draft proposed this cycle.
+    pub drafted: Vec<u32>,
+    /// The tokens actually committed to both models: `drafted[..accepted]`
+    /// followed by `bonus_token`. Always non-empty (length = accepted + 1).
+    pub committed: Vec<u32>,
+}
+
+/// Backing storage for a DeltaNetState snapshot. Holds device buffers sized
+/// to match the source state's tensors. Allocate once per slot, reuse across
+/// all speculative cycles.
+pub struct DeltaNetSnapshot {
+    s_matrix_bufs: Vec<DeviceBuffer>,
+    s_scale_bufs: Vec<DeviceBuffer>,
+    conv_state_bufs: Vec<DeviceBuffer>,
+}
+
+impl DeltaNetSnapshot {
+    /// Allocate backup buffers matching `state`'s shapes.
+    pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
+        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
+        for t in &state.s_matrices {
+            s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        }
+        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
+        for t in &state.s_scales {
+            s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        }
+        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
+        for t in &state.conv_states {
+            conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
+        }
+        Ok(Self {
+            s_matrix_bufs,
+            s_scale_bufs,
+            conv_state_bufs,
+        })
+    }
+
+    /// Copy live state → backup.
+    pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        Ok(())
+    }
+
+    /// Copy backup → live state (rewinds the recurrent state to the snapshot point).
+    pub fn restore_to(&self, state: &mut DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
+        for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+        }
+        Ok(())
+    }
+}
+
+/// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
+/// vector is downloaded once per verify step so the CPU scan cost is
+/// negligible relative to GEMV work.
+#[inline]
+fn argmax_u32(logits: &[f32]) -> u32 {
+    let mut best = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best = i;
+        }
+    }
+    best as u32
+}
+
+/// Aggregated metrics for a sequence of speculative decode steps.
+#[derive(Debug, Default, Clone)]
+pub struct SpecStats {
+    /// Total number of speculative cycles run.
+    pub cycles: usize,
+    /// Total number of tokens committed (sum of committed.len() across cycles).
+    pub committed_tokens: usize,
+    /// Total number of draft tokens accepted (sum of `accepted`).
+    pub accepted_tokens: usize,
+    /// Per-cycle acceptance count histogram, indexed by accepted count
+    /// (0..=k). `acceptance_hist[i]` = number of cycles where exactly `i`
+    /// draft tokens were accepted.
+    pub acceptance_hist: Vec<usize>,
+}
+
+impl SpecStats {
+    pub fn new(k: usize) -> Self {
+        Self {
+            cycles: 0,
+            committed_tokens: 0,
+            accepted_tokens: 0,
+            acceptance_hist: vec![0; k + 1],
+        }
+    }
+
+    pub fn record(&mut self, step: &SpecStepResult) {
+        self.cycles += 1;
+        self.committed_tokens += step.committed.len();
+        self.accepted_tokens += step.accepted;
+        if step.accepted < self.acceptance_hist.len() {
+            self.acceptance_hist[step.accepted] += 1;
+        }
+    }
+
+    /// Mean accepted draft tokens per cycle. This is τ from the Leviathan paper.
+    pub fn tau(&self) -> f32 {
+        if self.cycles == 0 {
+            0.0
+        } else {
+            self.accepted_tokens as f32 / self.cycles as f32
+        }
+    }
+
+    /// Mean committed tokens per cycle (tau + 1 on average, since each
+    /// cycle always commits one bonus token).
+    pub fn mean_committed(&self) -> f32 {
+        if self.cycles == 0 {
+            0.0
+        } else {
+            self.committed_tokens as f32 / self.cycles as f32
+        }
+    }
+}
+
+/// One speculative decode step (greedy, Leviathan verify-and-accept).
+/// Operates on separate `target` and `draft` `ModelSlot` handles so the
+/// caller can keep them owned in top-level variables.
+///
+/// Preconditions:
+/// - Both `target.scratch.logits` and `draft.scratch.logits` contain the
+///   logits for position `pos` (from the previous commit or prompt prefill).
+/// - `target_snap` / `draft_snap` are preallocated via `DeltaNetSnapshot::new_for`.
+/// - `k >= 1` is the speculation count.
+///
+/// Postconditions:
+/// - Both slots' state advances to `pos + committed.len()`, and their
+///   `scratch.logits` contain logits at the new position.
+/// - Returns a `SpecStepResult` describing how many draft tokens were
+///   accepted, the bonus token, and the full committed sequence.
+///
+/// Naive sequential verification: runs the target on each drafted token one
+/// at a time. Phase 5 replaces the inner loop with a single batched prefill.
+pub fn spec_step_greedy(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft: &mut ModelSlot,
+    pos: usize,
+    k: usize,
+    target_snap: &mut DeltaNetSnapshot,
+    draft_snap: &mut DeltaNetSnapshot,
+) -> HipResult<SpecStepResult> {
+    assert!(k >= 1, "speculation count k must be ≥ 1");
+
+    // Snapshot both models' recurrent state at position `pos` so we can
+    // rewind after verification and commit the final accepted prefix.
+    target_snap.save_from(&target.dn_state, gpu)?;
+    draft_snap.save_from(&draft.dn_state, gpu)?;
+
+    // Target's current logits (at position `pos`) are used to verify
+    // drafted[0]. Capture before anything trashes them.
+    let target_logits_at_pos: Vec<f32> = gpu.download_f32(&target.scratch.logits)?;
+
+    // Draft k tokens. drafted[0] samples from draft's current logits (which
+    // are also for position `pos`). drafted[i] samples from the logits
+    // produced by draft.forward(drafted[i-1], pos+i-1).
+    let mut drafted: Vec<u32> = Vec::with_capacity(k);
+    {
+        let first_logits = gpu.download_f32(&draft.scratch.logits)?;
+        drafted.push(argmax_u32(&first_logits));
+    }
+    for i in 0..k {
+        draft.forward(gpu, drafted[i], pos + i)?;
+        if i + 1 < k {
+            let logits = gpu.download_f32(&draft.scratch.logits)?;
+            drafted.push(argmax_u32(&logits));
+        }
+    }
+
+    // Verification: run the target on each drafted token, collect logits.
+    // target_mid_logits[i] = target's prediction at position pos+i+1.
+    let mut target_mid_logits: Vec<Vec<f32>> = Vec::with_capacity(k);
+    for i in 0..k {
+        target.forward(gpu, drafted[i], pos + i)?;
+        target_mid_logits.push(gpu.download_f32(&target.scratch.logits)?);
+    }
+    // Acceptance:
+    //   drafted[0] verified by target_logits_at_pos  (logits at pos)
+    //   drafted[i] (i >= 1) verified by target_mid_logits[i-1] (logits at pos+i)
+    let mut accepted: usize = 0;
+    if !target_logits_at_pos.is_empty()
+        && argmax_u32(&target_logits_at_pos) == drafted[0]
+    {
+        accepted = 1;
+        for i in 1..k {
+            if argmax_u32(&target_mid_logits[i - 1]) == drafted[i] {
+                accepted += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Bonus token = target's prediction at position pos+accepted.
+    let bonus_logits: &[f32] = if accepted == 0 {
+        &target_logits_at_pos
+    } else {
+        &target_mid_logits[accepted - 1]
+    };
+    let bonus_token = argmax_u32(bonus_logits);
+
+    // Commit = accepted draft prefix + bonus.
+    let mut committed: Vec<u32> = Vec::with_capacity(accepted + 1);
+    committed.extend_from_slice(&drafted[..accepted]);
+    committed.push(bonus_token);
+
+    // Restore both models' state and replay the committed sequence so both
+    // slots end at `pos + committed.len()` with correct logits.
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    draft_snap.restore_to(&mut draft.dn_state, gpu)?;
+    for (i, &tok) in committed.iter().enumerate() {
+        target.forward(gpu, tok, pos + i)?;
+        draft.forward(gpu, tok, pos + i)?;
+    }
+
+    Ok(SpecStepResult {
+        accepted,
+        bonus_token,
+        drafted,
+        committed,
+    })
 }
