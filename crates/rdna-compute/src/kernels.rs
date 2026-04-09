@@ -86,6 +86,12 @@ pub const GEMV_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4
 pub const GEMV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
+
+// Multi-row GEMV variants: one warp computes R output rows at a time, sharing
+// x register state across rows. Exposes R=2, R=4, R=8 extern "C" entry points
+// from one source file. See kernel header for VGPR budget details.
+pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
 pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");
 pub const GEMV_HFQ4G256_GFX1030_V3_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v3.hip");

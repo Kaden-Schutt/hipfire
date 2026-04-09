@@ -6,6 +6,21 @@ use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime};
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::OnceLock;
+
+/// gfx1100 multi-row GEMV tile selector.
+/// HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}. Default 1 = single-row kernel (legacy).
+/// Cached in a OnceLock — the env var is read exactly once per process.
+fn gemv_rows_override() -> u32 {
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMV_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|r| match r { 1 | 2 | 4 | 8 => r, _ => 1 })
+            .unwrap_or(1)
+    })
+}
 
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
@@ -991,7 +1006,6 @@ impl Gpu {
     ) -> HipResult<()> {
         let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
         self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
-        let func = &self.functions["gemv_hfq4g256"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -1007,14 +1021,38 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        // RDNA3 multi-row path: one warp computes R rows, sharing x register state.
+        // Controlled by HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8} (default 1 = legacy path).
+        let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+        let rows = if rdna3 { gemv_rows_override() } else { 1 };
+        let use_multirow = rdna3 && rows > 1;
+
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
-        // The RDNA2 variants have 2x+ unroll which compensates for 1-row-per-block,
-        // and Infinity Cache makes launch overhead negligible vs compute.
-        // Other archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = m >= 64 && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
+        // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
+        let use_wide = !use_multirow
+            && m >= 64
+            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
+
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
-        let result = if use_wide {
+        let result = if use_multirow {
+            let (func_name, grid_div) = match rows {
+                2 => ("gemv_hfq4g256_multirow_r2", 2u32),
+                4 => ("gemv_hfq4g256_multirow_r4", 4u32),
+                8 => ("gemv_hfq4g256_multirow_r8", 8u32),
+                _ => unreachable!(),
+            };
+            self.ensure_kernel(
+                "gemv_hfq4g256_multirow_rdna3",
+                kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC,
+                func_name,
+            )?;
+            let mrfunc = &self.functions[func_name];
+            let grid = ((m as u32) + grid_div - 1) / grid_div;
+            unsafe {
+                self.hip.launch_kernel(mrfunc, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            }
+        } else if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
             let wfunc = &self.functions["gemv_hfq4g256_wide"];
             let grid = ((m + 1) / 2) as u32;
@@ -1022,6 +1060,7 @@ impl Gpu {
                 self.hip.launch_kernel(wfunc, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
             }
         } else {
+            let func = &self.functions["gemv_hfq4g256"];
             unsafe {
                 self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
             }
@@ -1046,7 +1085,6 @@ impl Gpu {
     ) -> HipResult<()> {
         let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
-        let func = &self.functions["gemv_hfq4g256_residual"];
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
@@ -1062,12 +1100,36 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
 
+        // RDNA3 multi-row override path (same selector as the non-residual variant).
+        let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+        let rows = if rdna3 { gemv_rows_override() } else { 1 };
+        let use_multirow = rdna3 && rows > 1;
+
         // Bandwidth: weight + x + y_read (for residual) + y_write.
-        // Extra y read vs plain gemv_hfq4g256 adds m*4 bytes but that's negligible.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+        let result = if use_multirow {
+            let (func_name, grid_div) = match rows {
+                2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
+                4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
+                8 => ("gemv_hfq4g256_residual_multirow_r8", 8u32),
+                _ => unreachable!(),
+            };
+            self.ensure_kernel(
+                "gemv_hfq4g256_residual_multirow_rdna3",
+                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
+                func_name,
+            )?;
+            let mrfunc = &self.functions[func_name];
+            let grid = ((m as u32) + grid_div - 1) / grid_div;
+            unsafe {
+                self.hip.launch_kernel(mrfunc, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            }
+        } else {
+            let func = &self.functions["gemv_hfq4g256_residual"];
+            unsafe {
+                self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
+            }
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
@@ -3706,6 +3768,18 @@ impl Gpu {
                 let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
+                // gfx1100 multi-row GEMV is opt-in via HIPFIRE_GEMV_ROWS={2,4,8}.
+                // Empirically slower than the single-row kernel on gfx1100 at all
+                // tested matrix sizes (see commit log / multi-row kernel header),
+                // so we only precompile when the env var explicitly requests it.
+                if matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102")
+                    && gemv_rows_override() > 1
+                {
+                    specs.push(("gemv_hfq4g256_multirow_rdna3",
+                                kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string()));
+                    specs.push(("gemv_hfq4g256_residual_multirow_rdna3",
+                                kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC.to_string()));
+                }
             }
             "q8" => {
                 specs.push(("gemv_q8_0", kernels::GEMV_Q8_0_SRC.to_string()));
@@ -3757,29 +3831,39 @@ impl Gpu {
 
         // Now load all modules + functions sequentially (GPU API)
         for (name, src) in &specs {
-            // Map module name → function name (most are identical, a few differ)
-            let func_name = match *name {
-                "rmsnorm" => "rmsnorm_f32",
-                "add_inplace" => "add_inplace_f32",
-                "mul" => "mul_f32",
-                "silu_mul" => "silu_mul_f32",
-                "sigmoid" => "sigmoid_f32",
-                "alpha_gate" => "alpha_gate_f32",
-                "conv1d_silu" => "conv1d_silu_f32",
-                "l2_norm" => "l2_norm_f32",
-                "scale_f32" => "scale_f32",
-                "gated_norm" => "gated_norm_f32",
-                "rope_partial_interleaved" => "rope_partial_interleaved_f32",
-                "deinterleave" => "deinterleave_f32",
-                "repeat_interleave_qk" => "repeat_interleave_qk_f32",
-                "gated_delta_net_q8" => "gated_delta_net_q8",
+            // Map module name → function name(s). Most modules expose exactly one
+            // function; multirow modules expose three (r2/r4/r8).
+            let func_names: Vec<&str> = match *name {
+                "rmsnorm" => vec!["rmsnorm_f32"],
+                "add_inplace" => vec!["add_inplace_f32"],
+                "mul" => vec!["mul_f32"],
+                "silu_mul" => vec!["silu_mul_f32"],
+                "sigmoid" => vec!["sigmoid_f32"],
+                "alpha_gate" => vec!["alpha_gate_f32"],
+                "conv1d_silu" => vec!["conv1d_silu_f32"],
+                "l2_norm" => vec!["l2_norm_f32"],
+                "scale_f32" => vec!["scale_f32"],
+                "gated_norm" => vec!["gated_norm_f32"],
+                "rope_partial_interleaved" => vec!["rope_partial_interleaved_f32"],
+                "deinterleave" => vec!["deinterleave_f32"],
+                "repeat_interleave_qk" => vec!["repeat_interleave_qk_f32"],
+                "gated_delta_net_q8" => vec!["gated_delta_net_q8"],
                 // RDNA2 variant module names → common function symbol
-                n if n.starts_with("gemv_hfq4g256_rdna2") => "gemv_hfq4g256",
-                other => other,
+                n if n.starts_with("gemv_hfq4g256_rdna2") => vec!["gemv_hfq4g256"],
+                // Multi-row RDNA3 modules expose three entry points per .hsaco
+                "gemv_hfq4g256_multirow_rdna3" => vec![
+                    "gemv_hfq4g256_multirow_r2",
+                    "gemv_hfq4g256_multirow_r4",
+                    "gemv_hfq4g256_multirow_r8",
+                ],
+                "gemv_hfq4g256_residual_multirow_rdna3" => vec![
+                    "gemv_hfq4g256_residual_multirow_r2",
+                    "gemv_hfq4g256_residual_multirow_r4",
+                    "gemv_hfq4g256_residual_multirow_r8",
+                ],
+                other => vec![other],
             };
-            if self.functions.contains_key(func_name) {
-                continue;
-            }
+            // Compile and ensure the module is loaded once.
             let obj_path = self.compiler.compile(name, src)?;
             let obj_path_str = obj_path.to_str().unwrap().to_string();
             if !self.modules.contains_key(*name) {
@@ -3787,8 +3871,13 @@ impl Gpu {
                 self.modules.insert(name.to_string(), module);
             }
             let module = &self.modules[*name];
-            let func = self.hip.module_get_function(module, func_name)?;
-            self.functions.insert(func_name.to_string(), func);
+            for func_name in &func_names {
+                if self.functions.contains_key(*func_name) {
+                    continue;
+                }
+                let func = self.hip.module_get_function(module, func_name)?;
+                self.functions.insert(func_name.to_string(), func);
+            }
         }
 
         Ok(())
