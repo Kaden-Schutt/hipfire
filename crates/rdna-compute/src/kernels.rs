@@ -99,6 +99,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../.
 // loop as gemv_hfq4g256.gfx1100.hip; grid = sum of the four projections'
 // output row counts. Used for MQ4 weights on gfx1100 only.
 pub const FUSED_QKVZA_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256.gfx1100.hip");
+
+// 3-way fused HFQ4-G256 projection for Qwen3.5 FullAttention preamble:
+// wq + wk + wv in a single launch. Same 4x-unroll inner loop as the LA
+// variant; grid = q_m + k_m + v_m.
+pub const FUSED_QKV_HFQ4G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256.gfx1100.hip");
 pub const GEMV_HFQ4G256_GFX1030_V1_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v1.hip");
 pub const GEMV_HFQ4G256_GFX1030_V2_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v2.hip");
 pub const GEMV_HFQ4G256_GFX1030_V3_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256.gfx1030.v3.hip");

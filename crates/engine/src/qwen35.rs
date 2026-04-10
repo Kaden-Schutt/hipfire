@@ -1315,7 +1315,29 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                // gfx1100 MQ4 fast path: fused 3-way projection for wq+wk+wv.
+                // Saves 2 launches per FA layer. Note: wq outputs into fa_q_full
+                // (Q+gate interleaved, M = n_heads*head_dim*2), so the fused
+                // kernel has to run BEFORE the deinterleave split.
+                let fused_fa3_ok = x_rot.is_some()
+                    && layer.wq.gpu_dtype == DType::MQ4G256
+                    && layer.wk.gpu_dtype == DType::MQ4G256
+                    && layer.wv.gpu_dtype == DType::MQ4G256
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
+                if fused_fa3_ok {
+                    let xr = x_rot.unwrap();
+                    gpu.fused_qkv_hfq4g256(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        xr,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else {
+                    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+                    weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
+                }
 
                 // Split interleaved Q+gate (single kernel instead of per-head memcpy loop)
                 gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
@@ -1323,8 +1345,6 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
 
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
-                weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
