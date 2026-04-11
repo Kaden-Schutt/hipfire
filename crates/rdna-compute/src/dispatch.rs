@@ -3897,6 +3897,99 @@ impl Gpu {
         result
     }
 
+    /// Batched sequential `gated_delta_net_q8` for prefill.
+    ///
+    /// Launches the single-token kernel N times with offset pointers into
+    /// [N × stride]-laid-out Q/K/V/gate/beta/output buffers. This preserves
+    /// bit-exact semantics with N × `gated_delta_net_q8(n_tokens=1)` calls
+    /// (i.e., dequant→update→requant per token, with stochastic rounding
+    /// applied each step) — critical for byte-exact quality gate compliance.
+    ///
+    /// Why not just call the kernel once with `n_tokens=N`? The existing
+    /// kernel dequants S_q8 once at start, runs N updates in FP32 inside
+    /// LDS, and requants once at end. That collapses N rounding steps into
+    /// one, producing numerically different output from sequential calls —
+    /// diverges from the decode-path baseline.
+    ///
+    /// Q/K/V/output are [N × n_heads × head_dim] row-major.
+    /// gate/beta are [N × n_heads] row-major.
+    /// S_q8 / s_scales are the shared state (advanced N steps).
+    #[cfg(feature = "deltanet")]
+    pub fn gated_delta_net_q8_batch_seq(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gated_delta_net_q8", kernels::GATED_DELTA_NET_Q8_SRC, "gated_delta_net_q8")?;
+        let func = &self.functions["gated_delta_net_q8"];
+
+        let stride_qkv_bytes = n_heads * head_dim * 4;
+        let stride_ab_bytes = n_heads * 4;
+        let n_tiles = (128 / 4) as u32;
+
+        let q_base = q_batch.buf.as_ptr() as *mut u8;
+        let k_base = k_batch.buf.as_ptr() as *mut u8;
+        let v_base = v_batch.buf.as_ptr() as *mut u8;
+        let g_base = gate_batch.buf.as_ptr() as *mut u8;
+        let b_base = beta_batch.buf.as_ptr() as *mut u8;
+        let o_base = output_batch.buf.as_ptr() as *mut u8;
+        let s_ptr_raw = s_q8.buf.as_ptr();
+        let sc_ptr_raw = s_scales.buf.as_ptr();
+
+        let bytes = crate::profile::gated_delta_net_q8_bytes(1, n_heads, head_dim) * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "gated_delta_net_q8_batch_seq", bytes);
+
+        for i in 0..n_tokens {
+            let off_qkv = i * stride_qkv_bytes;
+            let off_ab = i * stride_ab_bytes;
+            let mut qp: *mut c_void = unsafe { q_base.add(off_qkv) as *mut c_void };
+            let mut kp: *mut c_void = unsafe { k_base.add(off_qkv) as *mut c_void };
+            let mut vp: *mut c_void = unsafe { v_base.add(off_qkv) as *mut c_void };
+            let mut gp: *mut c_void = unsafe { g_base.add(off_ab) as *mut c_void };
+            let mut bp: *mut c_void = unsafe { b_base.add(off_ab) as *mut c_void };
+            let mut op: *mut c_void = unsafe { o_base.add(off_qkv) as *mut c_void };
+            let mut sp = s_ptr_raw;
+            let mut scp = sc_ptr_raw;
+            let mut nt = 1i32;
+            let mut nh = n_heads as i32;
+            let mut hd = head_dim as i32;
+            let mut params: Vec<*mut c_void> = vec![
+                &mut qp as *mut _ as *mut c_void,
+                &mut kp as *mut _ as *mut c_void,
+                &mut vp as *mut _ as *mut c_void,
+                &mut gp as *mut _ as *mut c_void,
+                &mut bp as *mut _ as *mut c_void,
+                &mut sp as *mut _ as *mut c_void,
+                &mut scp as *mut _ as *mut c_void,
+                &mut op as *mut _ as *mut c_void,
+                &mut nt as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+            ];
+            unsafe {
+                self.hip.launch_kernel(
+                    func,
+                    [n_heads as u32, n_tiles, 1],
+                    [32, 1, 1],
+                    0,
+                    self.stream_ref(),
+                    &mut params,
+                )?;
+            }
+        }
+        if let Some(t) = timer { t.finish(&self.hip); }
+        Ok(())
+    }
+
     /// GDN recurrence with Q4-quantized S state.
     #[cfg(feature = "deltanet")]
     pub fn gated_delta_net_q4(

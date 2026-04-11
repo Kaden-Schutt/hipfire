@@ -59,9 +59,25 @@ fn main() {
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
-    let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
-    ).unwrap();
+    // KV cache mode via HIPFIRE_KV_MODE env var:
+    //   q8 (default) | turbo4 | turbo4_adaptive | asym (Q8 K + turbo4 V)
+    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    eprintln!("KV mode: {kv_mode}");
+    let mut kv_cache = match kv_mode.as_str() {
+        "q8" => KvCache::new_gpu_q8(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap(),
+        "turbo4" => KvCache::new_gpu_turbo_adaptive(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, 4, false
+        ).unwrap(),
+        "turbo4_adaptive" => KvCache::new_gpu_turbo_adaptive(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq, 4, true
+        ).unwrap(),
+        "asym" => KvCache::new_gpu_asym_q8k_turbo4v(
+            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq
+        ).unwrap(),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|turbo4|turbo4_adaptive|asym)"),
+    };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
@@ -70,14 +86,16 @@ fn main() {
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
 
     // === PREFILL ===
+    // Route through forward_prefill_batch so the bench measures the production
+    // prefill path (daemon + greedy_dump both go through it). Inside, this
+    // takes the batched LA kernel path for MQ4 models and the FA gather/scatter
+    // fallback for FA layers.
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
     let t_prefill = Instant::now();
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(
-            &mut gpu, &weights, &config, token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("prefill forward failed");
-    }
+    qwen35::forward_prefill_batch(
+        &mut gpu, &weights, &config, &prompt_tokens, 0,
+        &mut kv_cache, &mut dn_state, &scratch,
+    ).expect("prefill forward failed");
     let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
     eprintln!("  total: {prefill_ms:.1}ms");

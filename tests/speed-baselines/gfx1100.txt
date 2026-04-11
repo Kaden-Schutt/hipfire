@@ -1,5 +1,5 @@
 # hipfire speed-gate baseline — gfx1100
-# Captured 2026-04-11T09:36:36Z from HEAD 5c5e3c6
+# Captured 2026-04-11T10:48:17Z from HEAD 5c6c8e4
 # Tolerance: 0.05 (fail if any metric drops below baseline * (1 - tolerance))
-0.8b_mq4_prefill_tok_s=434.7
-0.8b_mq4_gen_tok_s=382.0
+0.8b_mq4_prefill_tok_s=932.9
+0.8b_mq4_gen_tok_s=384.2

@@ -1104,19 +1104,106 @@ pub fn forward_scratch(
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
+/// Per-layer batched intermediates used by `forward_prefill_batch`. Each
+/// row is one token in the batch; rows are contiguous [N × K] blocks so
+/// all kernels can treat them as row-major matrices.
+///
+/// Allocated lazily on the first batched prefill call that takes the MQ4
+/// fast path — models that never hit that path (HF4 weights, FA-only
+/// models, short prompts) never pay the VRAM cost. Sized to `max_batch`;
+/// longer prompts are processed in chunks of `max_batch`.
+pub struct PrefillBatchScratch {
+    pub max_batch: usize,
+
+    // Residual stream and rotation scratch — both [N × dim]
+    pub x_batch: GpuTensor,
+    pub x_rot_batch: GpuTensor,
+
+    // LA-layer projection outputs
+    pub dn_qkv_batch: GpuTensor,         // [N × qkv_dim]
+    pub dn_z_batch: GpuTensor,           // [N × v_dim]
+    pub dn_alpha_batch: GpuTensor,       // [N × n_v_heads]
+    pub dn_beta_batch: GpuTensor,        // [N × n_v_heads]
+    pub dn_q_raw_batch: GpuTensor,       // [N × k_dim] (pre repeat-interleave)
+    pub dn_k_raw_batch: GpuTensor,       // [N × k_dim]
+    pub dn_v_batch: GpuTensor,           // [N × v_dim]
+    pub dn_q_batch: GpuTensor,           // [N × v_dim] (post repeat-interleave)
+    pub dn_k_batch: GpuTensor,           // [N × v_dim]
+    pub dn_attn_out_batch: GpuTensor,    // [N × v_dim]
+    pub dn_normed_batch: GpuTensor,      // [N × v_dim]
+
+    // FFN intermediates [N × hidden_dim]
+    pub gate_ffn_batch: GpuTensor,
+    pub up_batch: GpuTensor,
+    // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
+    pub ffn_hidden_batch: GpuTensor,
+
+    // FWHT-rotated dn_normed [N × v_dim] feeding wo for MQ4 weights.
+    // Decode path handles this via an internal mq_x_rot scratch inside
+    // weight_gemv_residual; we need an explicit batched equivalent.
+    pub dn_normed_rot_batch: GpuTensor,
+}
+
+impl PrefillBatchScratch {
+    pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
+        let dim = config.dim;
+        let hidden_dim = config.hidden_dim;
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let n_v_heads = config.linear_num_value_heads;
+
+        Ok(Self {
+            max_batch,
+            x_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            x_rot_batch:       gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            dn_qkv_batch:      gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
+            dn_z_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_alpha_batch:    gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_beta_batch:     gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
+            dn_q_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
+            dn_k_raw_batch:    gpu.alloc_tensor(&[max_batch * k_dim],   DType::F32)?,
+            dn_v_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_q_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_k_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_attn_out_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            dn_normed_batch:   gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+            gate_ffn_batch:    gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            up_batch:          gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            ffn_hidden_batch:  gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            dn_normed_rot_batch: gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.x_batch, self.x_rot_batch,
+            self.dn_qkv_batch, self.dn_z_batch,
+            self.dn_alpha_batch, self.dn_beta_batch,
+            self.dn_q_raw_batch, self.dn_k_raw_batch, self.dn_v_batch,
+            self.dn_q_batch, self.dn_k_batch,
+            self.dn_attn_out_batch, self.dn_normed_batch,
+            self.gate_ffn_batch, self.up_batch, self.ffn_hidden_batch,
+            self.dn_normed_rot_batch,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
 /// the KV cache + DeltaNet state advanced by N positions.
 ///
-/// This is the sole public API the daemon uses for the prompt-processing
-/// phase of a turn. The implementation starts as a trivial loop over
-/// `forward_scratch` (byte-identical to the daemon's old per-token loop)
-/// so the API shape, quality gate, and speed-gate baseline can be locked
-/// in. Subsequent commits replace the body with actually-batched kernel
-/// paths (using the batched GEMMs + element-wise kernels + batched
-/// `gated_delta_net_q8` / `conv1d_silu_split_f32_n` that landed in
-/// 0b7be7f / bd3da2c / 8bb8b6f / 5c5e3c6) to produce the prefill
-/// throughput win.
+/// Takes the batched kernel path when ALL linear-attention layer weights
+/// are MQ4G256 (the batched element-wise kernels are MQ-specific).
+/// Otherwise falls back to a per-token loop over `forward_scratch` that's
+/// byte-identical to decode. FA layers always use a per-token gather/scatter
+/// fallback — the FA causal attention kernel can't yet be batched (task #71).
+///
+/// `gated_delta_net_q8` is called N times per LA layer (once per token)
+/// using `gated_delta_net_q8_batch_seq`, preserving the byte-exact
+/// stochastic-rounding trajectory vs decode.
 ///
 /// `tokens`: slice of prompt tokens to prefill in order.
 /// `start_pos`: first KV cache / DeltaNet position to write. Positions
@@ -1133,10 +1220,426 @@ pub fn forward_prefill_batch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
-    for (i, &tok) in tokens.iter().enumerate() {
-        let pos = start_pos + i;
-        forward_scratch(gpu, weights, config, tok, pos, kv_cache, dn_state, scratch)?;
+    // Threshold below which the batching overhead isn't worth the alloc +
+    // per-layer dispatch. Single-token prefill obviously should not take
+    // the batched path.
+    const MIN_BATCH: usize = 2;
+    // Upper bound on the PrefillBatchScratch — large prompts get split
+    // into chunks of this size and processed in a loop.
+    const MAX_BATCH: usize = 64;
+
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
     }
+
+    // Fast path requires (a) all LA weights are MQ4G256 and (b) Q8 S-state.
+    // The batched element-wise kernels hardcode the MQ4 FWHT rotation, and
+    // the batched GDN path uses `gated_delta_net_q8_batch_seq`.
+    // `HIPFIRE_PREFILL_BATCHED=0` forces the per-token fallback (escape
+    // hatch for regression bisecting or diagnosing hardware-specific issues).
+    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let eligible = !force_fallback
+        && n >= MIN_BATCH
+        && dn_state.quant == StateQuant::Q8
+        && weights.layers.iter().any(|lw| matches!(lw, LayerWeights::DeltaNet(_)))
+        && weights.layers.iter().all(|lw| match lw {
+            LayerWeights::DeltaNet(l) =>
+                l.wqkv.gpu_dtype  == DType::MQ4G256 &&
+                l.wz.gpu_dtype    == DType::MQ4G256 &&
+                l.w_beta.gpu_dtype == DType::MQ4G256 &&
+                l.w_alpha.gpu_dtype == DType::MQ4G256 &&
+                l.wo.gpu_dtype    == DType::MQ4G256 &&
+                l.w_gate.gpu_dtype == DType::MQ4G256 &&
+                l.w_up.gpu_dtype   == DType::MQ4G256 &&
+                l.w_down.gpu_dtype == DType::MQ4G256,
+            LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
+        });
+
+    if !eligible {
+        // Fallback: per-token loop, byte-identical to decode.
+        for (i, &tok) in tokens.iter().enumerate() {
+            forward_scratch(gpu, weights, config, tok, start_pos + i, kv_cache, dn_state, scratch)?;
+        }
+        return Ok(());
+    }
+
+    // Allocate the batch scratch once, reuse across chunks. Scope with an
+    // inner closure so the explicit free runs even on error.
+    let pbs = PrefillBatchScratch::new(gpu, config, MAX_BATCH)?;
+    let result = (|| -> HipResult<()> {
+        let mut chunk_start = 0usize;
+        while chunk_start < n {
+            let chunk_end = (chunk_start + MAX_BATCH).min(n);
+            let chunk = &tokens[chunk_start..chunk_end];
+            forward_prefill_chunk(
+                gpu, weights, config, chunk, start_pos + chunk_start,
+                kv_cache, dn_state, scratch, &pbs,
+            )?;
+            chunk_start = chunk_end;
+        }
+        Ok(())
+    })();
+    pbs.free_gpu(gpu);
+    result
+}
+
+/// Process one chunk of up to `pbs.max_batch` tokens through the batched
+/// prefill path. All LA layers go through batched kernels; all FA layers
+/// go through a per-token gather/scatter loop with the inline FA body.
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_chunk(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    debug_assert!(n > 0);
+    debug_assert!(n <= pbs.max_batch);
+
+    let dim = config.dim;
+    let hidden_dim = config.hidden_dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let dim_row_bytes = dim * 4;
+
+    // ── 1. Embed each token into s.x, then copy into pbs.x_batch row ──────
+    for (i, &tok) in tokens.iter().enumerate() {
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &s.x, tok, dim)?,
+            EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
+            EmbeddingFormat::Q8_0     => gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?,
+            EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
+            _ => panic!("unsupported embedding format"),
+        }
+        gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+    }
+
+    // ── 2. Per-layer loop ────────────────────────────────────────────────
+    let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
+
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                // Batched rmsnorm + FWHT rotation for the LA preamble.
+                // x_batch / x_rot_batch are [N × dim] contiguous.
+                gpu.fused_rmsnorm_rotate_mq_batched(
+                    &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                )?;
+
+                // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
+                gpu.gemm_qkvza_hfq4g256(
+                    &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                    layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                    layer.wqkv.k, n,
+                )?;
+
+                // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
+                gpu.fused_sigmoid_alpha_gate_f32_batched(
+                    &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                    &layer.dt_bias, &layer.a_log,
+                    n_v_heads, n,
+                )?;
+
+                // Conv1d + SiLU + Q/K/V split, advancing state N steps.
+                // State advance is byte-identical to N single-token calls.
+                gpu.conv1d_silu_split_f32_n(
+                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+                    &pbs.dn_qkv_batch, &layer.conv_weight,
+                    &dn_state.conv_states[delta_layer_idx],
+                    k_dim, v_dim, n,
+                )?;
+
+                // Batched L2-norm(Q) + L2-norm(K) + scale(Q).
+                gpu.fused_qk_l2_norm_scale_f32_batched(
+                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
+                    config.linear_num_key_heads, hd,
+                    1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+                )?;
+
+                // Repeat-interleave Q/K if n_key_heads < n_v_heads.
+                // 0.8B has n_key=n_value=16 so the memcpy path runs.
+                if config.linear_num_key_heads < n_v_heads {
+                    let ratio = n_v_heads / config.linear_num_key_heads;
+                    // repeat_interleave_qk_f32 takes single-token tensors, so
+                    // loop per row using scratch.dn_q_raw/dn_k_raw as staging.
+                    // Cheap vs. the GEMM + GDN work.
+                    for i in 0..n {
+                        gpu.hip.memcpy_dtod_at(&s.dn_q_raw.buf, 0, &pbs.dn_q_raw_batch.buf, i * k_dim * 4, k_dim * 4)?;
+                        gpu.hip.memcpy_dtod_at(&s.dn_k_raw.buf, 0, &pbs.dn_k_raw_batch.buf, i * k_dim * 4, k_dim * 4)?;
+                        gpu.repeat_interleave_qk_f32(
+                            &s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k,
+                            config.linear_num_key_heads, ratio, hd,
+                        )?;
+                        gpu.hip.memcpy_dtod_at(&pbs.dn_q_batch.buf, i * v_dim * 4, &s.dn_q.buf, 0, v_dim * 4)?;
+                        gpu.hip.memcpy_dtod_at(&pbs.dn_k_batch.buf, i * v_dim * 4, &s.dn_k.buf, 0, v_dim * 4)?;
+                    }
+                } else {
+                    // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
+                    gpu.hip.memcpy_dtod(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+                    gpu.hip.memcpy_dtod(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+                }
+
+                // Gated Delta Net — N sequential calls with offset pointers.
+                // Byte-exact with decode because each call rounds S_q8 after
+                // its single-token update.
+                gpu.gated_delta_net_q8_batch_seq(
+                    &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+                    &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+                    &dn_state.s_matrices[delta_layer_idx],
+                    &dn_state.s_scales[delta_layer_idx],
+                    &pbs.dn_attn_out_batch,
+                    n, n_v_heads, config.linear_value_head_dim,
+                )?;
+
+                // Batched gated output norm.
+                gpu.gated_norm_f32_batched(
+                    &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight,
+                    &pbs.dn_normed_batch,
+                    n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
+                )?;
+
+                // Batched wo + residual: x_batch += wo · FWHT(dn_normed_batch).
+                // CRITICAL: For MQ4 weights, the decode path's weight_gemv_residual
+                // internally FWHT-rotates dn_normed into mq_x_rot before calling
+                // gemv_hfq4g256_residual. The batched gemm_hfq4g256_residual kernel
+                // does plain HFQ4 math, so we must apply the rotation ourselves
+                // (MQ4 weights are pre-rotated at quant time; math requires
+                // dot(rot(W), rot(x)) = dot(W, x)).
+                gpu.rotate_x_mq_batched(
+                    &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
+                )?;
+                gpu.gemm_hfq4g256_residual(
+                    &layer.wo.buf, &pbs.dn_normed_rot_batch, &pbs.x_batch,
+                    layer.wo.m, layer.wo.k, n,
+                )?;
+
+                // FFN: fused rmsnorm + rotate.
+                gpu.fused_rmsnorm_rotate_mq_batched(
+                    &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                )?;
+
+                // Batched gate+up projection.
+                gpu.gemm_gate_up_hfq4g256(
+                    &layer.w_gate.buf, &layer.w_up.buf,
+                    &pbs.x_rot_batch,
+                    &pbs.gate_ffn_batch, &pbs.up_batch,
+                    layer.w_gate.m, layer.w_up.m,
+                    layer.w_gate.k, n,
+                )?;
+
+                // Batched fused SwiGLU + FWHT rotation for w_down input.
+                gpu.fused_silu_mul_rotate_mq_batched(
+                    &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                    hidden_dim, n,
+                )?;
+
+                // Batched w_down + residual.
+                gpu.gemm_hfq4g256_residual(
+                    &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                    layer.w_down.m, layer.w_down.k, n,
+                )?;
+
+                delta_layer_idx += 1;
+            }
+
+            (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
+                // FA path: gather each row of pbs.x_batch into s.x, run the
+                // inline FA layer body, scatter back. Byte-identical to the
+                // decode path for each token.
+                for i in 0..n {
+                    let pos = start_pos + i;
+                    // Gather: x_batch row i → s.x.
+                    gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, i * dim_row_bytes, dim_row_bytes)?;
+
+                    // Write pos_buf for this token.
+                    let pos_i32 = pos as i32;
+                    gpu.hip.memcpy_htod(&s.pos_buf, &pos_i32.to_ne_bytes())?;
+
+                    // Run ONE FA layer body using existing per-token helper.
+                    run_fa_layer_body(gpu, weights, config, layer_idx, kv_layer_idx, pos, kv_cache, s)?;
+
+                    // Scatter: s.x → x_batch row i.
+                    gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+                }
+                kv_layer_idx += 1;
+            }
+
+            _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+    }
+
+    // ── 3. Final logits from the last token only ─────────────────────────
+    // Copy last row of x_batch into s.x, run output rmsnorm + lm_head.
+    let last = n - 1;
+    gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
+    gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
+
+    Ok(())
+}
+
+/// Run a single FullAttn layer body on s.x at position `pos`. Extracted
+/// for use from the batched prefill path's FA-layer fallback. Byte-exact
+/// with the FA branch of forward_scratch_layers.
+#[allow(clippy::too_many_arguments)]
+fn run_fa_layer_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    _kv_layer_idx: usize,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => l,
+        _ => unreachable!(),
+    };
+
+    // Fused rmsnorm + FWHT rotation for wq/wk/wv.
+    let x_rot = fused_rmsnorm_rotate_for_mq(
+        gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+    )?;
+
+    // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
+    let dt = layer.wq.gpu_dtype;
+    let fused_fa3_ok = (dt == DType::MQ4G256 || dt == DType::HFQ4G256)
+        && layer.wk.gpu_dtype == dt
+        && layer.wv.gpu_dtype == dt;
+    if fused_fa3_ok {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_qkv_hfq4g256(
+            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+            eff_x,
+            &s.fa_q_full, &s.fa_k, &s.fa_v,
+            layer.wq.m, layer.wk.m, layer.wv.m,
+            layer.wq.k,
+        )?;
+    } else {
+        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+        weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+        weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
+    }
+
+    gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+    gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, pos as i32,
+        config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+
+    if kv_cache.quant_hf4v {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_hf4v_256(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_q8k_hf4v_256(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+        )?;
+    } else if kv_cache.quant_asym && kv_cache.is_boundary(_kv_layer_idx) {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_q8_0_kv(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+        )?;
+    } else if kv_cache.quant_asym {
+        let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
+        let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_turbo4_v256(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_q8k_turbo4v_256(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+        )?;
+    } else if kv_cache.quant_turbo > 0 {
+        let s1 = kv_cache.turbo_signs1.as_ref().unwrap();
+        let s2 = kv_cache.turbo_signs2.as_ref().unwrap();
+        match kv_cache.quant_turbo {
+            4 => {
+                gpu.kv_cache_write_turbo4_fused(
+                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                gpu.attention_turbo4_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+            }
+            3 => {
+                gpu.kv_cache_write_turbo3_fused(
+                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                gpu.attention_turbo3_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+            }
+            2 => {
+                gpu.kv_cache_write_turbo2_fused(
+                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_k, &s.fa_v, &s.pos_buf, s1, s2, config.n_kv_heads, config.head_dim)?;
+                gpu.attention_turbo2_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &s.fa_attn_out, &s.pos_buf, s1, s2, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq)?;
+            }
+            _ => {}
+        }
+    } else if kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.attention_q8_0_kv(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+        )?;
+    } else {
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
+        gpu.attention_f32(
+            &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, pos + 1,
+            config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.max_seq,
+        )?;
+    }
+
+    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+
+    // FFN: fused rmsnorm + rotate for w_gate/w_up.
+    let x_rot = fused_rmsnorm_rotate_for_mq(
+        gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+    )?;
+    let dt_g = layer.w_gate.gpu_dtype;
+    let fused_gu_ok = (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256)
+        && layer.w_up.gpu_dtype == dt_g;
+    if fused_gu_ok {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_gate_up_hfq4g256(
+            &layer.w_gate.buf, &layer.w_up.buf,
+            eff_x,
+            &s.gate_ffn, &s.up,
+            layer.w_gate.m, layer.w_up.m,
+            layer.w_gate.k,
+        )?;
+    } else {
+        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+    }
+    weight_gemv_swiglu_residual(
+        gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+    )?;
+
     Ok(())
 }
 
