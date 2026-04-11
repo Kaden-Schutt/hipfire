@@ -1266,7 +1266,58 @@ switch (cmd) {
     const srcDir = join(HIPFIRE_DIR, "src");
     const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
     const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] });
-    git(["pull", "origin", "master"]);
+    const gitOut = (args: string[]) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });
+      return { code: r.exitCode ?? 1, out: (r.stdout?.toString() ?? "").trim() };
+    };
+    const must = (code: number | null | undefined, msg: string) => {
+      if ((code ?? 1) !== 0) {
+        console.error(`  ${msg}`);
+        console.error(`  Repo: ${repoDir}`);
+        process.exit(1);
+      }
+    };
+    // Refuse to auto-reset when on a feature branch: `hipfire update` is for
+    // end-users syncing master, not for developers working off a dev branch.
+    const branch = gitOut(["rev-parse", "--abbrev-ref", "HEAD"]);
+    if (branch.code === 0 && branch.out && branch.out !== "master" && branch.out !== "HEAD") {
+      console.error(`  Current branch is '${branch.out}', not master.`);
+      console.error(`  'hipfire update' only updates master. Run 'git pull' manually for other branches.`);
+      process.exit(1);
+    }
+    // Fetch upstream master. Works on shallow clones (extends depth as needed).
+    must(git(["fetch", "origin", "master"]).exitCode, "git fetch origin master failed (check network / remote access)");
+    // Refuse to silently drop unpushed local commits on master. Developers
+    // working directly on master need to push (or rebase) before updating.
+    const ahead = gitOut(["rev-list", "--count", "origin/master..HEAD"]);
+    if (ahead.code === 0 && parseInt(ahead.out || "0", 10) > 0) {
+      console.error(`  Local master has ${ahead.out} unpushed commit(s) — refusing to reset.`);
+      console.error(`  Push or rebase your commits, then re-run 'hipfire update'.`);
+      process.exit(1);
+    }
+    // If the working tree is dirty (e.g. Cargo.lock rewritten by a different
+    // cargo version, line-ending drift on Windows, or genuine edits), stash
+    // everything under a named entry so the user can recover via `git stash pop`.
+    // This replaces the old `git pull` which aborted with
+    //   "Your local changes to the following files would be overwritten by merge"
+    // whenever any tracked file was modified.
+    const status = gitOut(["status", "--porcelain"]);
+    if (status.code === 0 && status.out.length > 0) {
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const stashMsg = `hipfire-update-${stamp}`;
+      console.error(`  Local modifications detected — stashing as '${stashMsg}'`);
+      must(
+        git(["stash", "push", "--include-untracked", "-m", stashMsg]).exitCode,
+        "git stash failed — aborting so your changes aren't lost",
+      );
+      console.error(`  Recover later with: git -C ${repoDir} stash pop`);
+    }
+    // Hard-reset to upstream. After the stash (or on a clean tree) this is a
+    // guaranteed fast-forward-or-force to origin/master — no merge to abort.
+    must(
+      git(["reset", "--hard", "origin/master"]).exitCode,
+      "git reset --hard origin/master failed — repo may be in an inconsistent state",
+    );
     // Rebuild
     console.error("Rebuilding...");
     const build = Bun.spawnSync(

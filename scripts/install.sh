@@ -287,25 +287,27 @@ else
         echo "  Cloned ✓"
     else
         echo "  Existing clone found at $SRC_DIR"
+        # Stash any local modifications (Cargo.lock rewritten by cargo build,
+        # autocrlf line-ending drift, user edits, etc.) so that the subsequent
+        # reset can't abort with "local changes would be overwritten by merge".
+        # The stash is named so the user can recover via `git stash pop`.
         if [ -n "$(git -C "$SRC_DIR" status --porcelain 2>/dev/null)" ]; then
-            echo "  WARNING: local modifications detected in $SRC_DIR"
-            reply=$(ask "  Overwrite local changes and update? [y/N] " "N")
-            if [ "$reply" != "y" ] && [ "$reply" != "Y" ]; then
-                echo "  Keeping existing checkout as-is."
+            stamp=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+            stash_msg="hipfire-install-${stamp}"
+            echo "  Local modifications detected — stashing as '$stash_msg'"
+            if git -C "$SRC_DIR" stash push --include-untracked -m "$stash_msg" >/dev/null 2>&1; then
+                echo "  Recover later with: git -C $SRC_DIR stash pop"
             else
-                echo "  Updating..."
-                git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
-                git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null || {
-                    echo "  Update failed (non-fatal). Using existing checkout."
-                }
+                echo "  WARNING: git stash failed; reset may drop local changes."
             fi
-        else
-            echo "  Updating..."
-            git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
-            git -C "$SRC_DIR" pull --ff-only origin "$GITHUB_BRANCH" 2>/dev/null || {
-                echo "  Update failed (non-fatal). Using existing checkout."
-            }
         fi
+        echo "  Updating..."
+        # Fetch + hard-reset is safe now (tree is clean post-stash). Reset
+        # handles both fast-forward and diverged-history cases uniformly.
+        git -C "$SRC_DIR" fetch origin "$GITHUB_BRANCH" --depth 1 2>/dev/null && \
+        git -C "$SRC_DIR" reset --hard "origin/$GITHUB_BRANCH" 2>/dev/null || {
+            echo "  Update failed (non-fatal). Using existing checkout."
+        }
     fi
     REPO_DIR="$SRC_DIR"
 fi
