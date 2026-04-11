@@ -1265,9 +1265,11 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
-    // Fast path requires (a) all LA weights are MQ4G256 and (b) Q8 S-state.
-    // The batched element-wise kernels hardcode the MQ4 FWHT rotation, and
-    // the batched GDN path uses `gated_delta_net_q8_batch_seq`.
+    // Fast path requires (a) every LA layer's weights to be either MQ4G256
+    // or HFQ4G256 (the batched GEMM kernels are dtype-agnostic but the LA
+    // preamble's rmsnorm+rotate and SwiGLU+rotate kernels differ per dtype),
+    // and (b) Q8 S-state for the GDN recurrence. Mixed-dtype layers are
+    // allowed; each layer is routed to its own path. HFQ6/others fall back.
     // `HIPFIRE_PREFILL_BATCHED=0` forces the per-token fallback (escape
     // hatch for regression bisecting or diagnosing hardware-specific issues).
     let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
@@ -1277,14 +1279,14 @@ pub fn forward_prefill_batch(
         && weights.layers.iter().any(|lw| matches!(lw, LayerWeights::DeltaNet(_)))
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) =>
-                l.wqkv.gpu_dtype  == DType::MQ4G256 &&
-                l.wz.gpu_dtype    == DType::MQ4G256 &&
-                l.w_beta.gpu_dtype == DType::MQ4G256 &&
-                l.w_alpha.gpu_dtype == DType::MQ4G256 &&
-                l.wo.gpu_dtype    == DType::MQ4G256 &&
-                l.w_gate.gpu_dtype == DType::MQ4G256 &&
-                l.w_up.gpu_dtype   == DType::MQ4G256 &&
-                l.w_down.gpu_dtype == DType::MQ4G256,
+                is_batchable_la(l.wqkv.gpu_dtype)
+                    && is_batchable_la(l.wz.gpu_dtype)
+                    && is_batchable_la(l.w_beta.gpu_dtype)
+                    && is_batchable_la(l.w_alpha.gpu_dtype)
+                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.w_gate.gpu_dtype)
+                    && is_batchable_la(l.w_up.gpu_dtype)
+                    && is_batchable_la(l.w_down.gpu_dtype),
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
         });
 
@@ -1314,6 +1316,14 @@ pub fn forward_prefill_batch(
     })();
     pbs.free_gpu(gpu);
     result
+}
+
+/// Accepts the dtypes the batched prefill path can handle (shared by the
+/// eligibility check in `forward_prefill_batch` and the per-layer dtype
+/// branches in `forward_prefill_chunk`).
+#[inline]
+fn is_batchable_la(dt: DType) -> bool {
+    matches!(dt, DType::MQ4G256 | DType::HFQ4G256)
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -1364,23 +1374,24 @@ fn forward_prefill_chunk(
     gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
 
     // Decide whether the FA layers can take the batched path. Requires
-    // (a) all FA weights to be MQ4G256 (batched gemm_qkv + wo rotation work
-    // for MQ4/HFQ4 GEMMs) and (b) a plain Q8_0 KV cache (not hf4v/turbo/asym).
-    // If the check fails for any FA layer, that layer falls back to the
-    // per-token gather/scatter path via run_fa_layer_body.
+    // (a) all FA weights to be MQ4G256 or HFQ4G256 (the batched gemm_qkv
+    // + wo GEMMs are dtype-agnostic; the rmsnorm+rotate / silu_mul kernels
+    // differ by dtype and we branch on that at each layer) and (b) a plain
+    // Q8_0 KV cache (not hf4v/turbo/asym). If the check fails, FA layers
+    // fall back to per-token gather/scatter via run_fa_layer_body.
     let fa_batched_ok = kv_cache.quant_q8
         && !kv_cache.quant_hf4v
         && !kv_cache.quant_asym
         && kv_cache.quant_turbo == 0
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
-                l.wq.gpu_dtype == DType::MQ4G256 &&
-                l.wk.gpu_dtype == DType::MQ4G256 &&
-                l.wv.gpu_dtype == DType::MQ4G256 &&
-                l.wo.gpu_dtype == DType::MQ4G256 &&
-                l.w_gate.gpu_dtype == DType::MQ4G256 &&
-                l.w_up.gpu_dtype == DType::MQ4G256 &&
-                l.w_down.gpu_dtype == DType::MQ4G256,
+                is_batchable_la(l.wq.gpu_dtype) &&
+                is_batchable_la(l.wk.gpu_dtype) &&
+                is_batchable_la(l.wv.gpu_dtype) &&
+                is_batchable_la(l.wo.gpu_dtype) &&
+                is_batchable_la(l.w_gate.gpu_dtype) &&
+                is_batchable_la(l.w_up.gpu_dtype) &&
+                is_batchable_la(l.w_down.gpu_dtype),
             _ => true, // LA layers don't gate this check
         });
     let max_ctx_len = start_pos + n;
@@ -1392,11 +1403,27 @@ fn forward_prefill_chunk(
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                // Batched rmsnorm + FWHT rotation for the LA preamble.
-                // x_batch / x_rot_batch are [N × dim] contiguous.
-                gpu.fused_rmsnorm_rotate_mq_batched(
-                    &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
-                )?;
+                // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
+                // activation to match its pre-rotated weights; HFQ4 uses
+                // plain rmsnormed activations. The GEMM kernels themselves
+                // are dtype-agnostic — they just consume whatever [N × K]
+                // activation buffer we point them at.
+                let is_mq4 = layer.wqkv.gpu_dtype == DType::MQ4G256;
+
+                // Batched rmsnorm (+ FWHT for MQ4) for the LA preamble.
+                // x_batch / x_rot_batch are [N × dim] contiguous. For HF4
+                // we reuse x_rot_batch as the "normed, unrotated" output
+                // so the subsequent GEMM can read it the same way.
+                if is_mq4 {
+                    gpu.fused_rmsnorm_rotate_mq_batched(
+                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
+                        n, dim, config.norm_eps,
+                    )?;
+                }
 
                 // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
                 gpu.gemm_qkvza_hfq4g256(
@@ -1472,25 +1499,40 @@ fn forward_prefill_chunk(
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
 
-                // Batched wo + residual: x_batch += wo · FWHT(dn_normed_batch).
-                // CRITICAL: For MQ4 weights, the decode path's weight_gemv_residual
-                // internally FWHT-rotates dn_normed into mq_x_rot before calling
-                // gemv_hfq4g256_residual. The batched gemm_hfq4g256_residual kernel
-                // does plain HFQ4 math, so we must apply the rotation ourselves
-                // (MQ4 weights are pre-rotated at quant time; math requires
-                // dot(rot(W), rot(x)) = dot(W, x)).
-                gpu.rotate_x_mq_batched(
-                    &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
-                )?;
+                // Batched wo + residual.
+                //
+                // For MQ4 weights, the decode path's weight_gemv_residual
+                // internally FWHT-rotates dn_normed into mq_x_rot before
+                // calling gemv_hfq4g256_residual (MQ4 weights are pre-rotated
+                // at quant time; math requires dot(rot(W), rot(x)) = dot(W,x)).
+                // For HFQ4 weights no rotation is needed — the activation
+                // feeds gemm_hfq4g256_residual directly.
+                let wo_is_mq4 = layer.wo.gpu_dtype == DType::MQ4G256;
+                let wo_input = if wo_is_mq4 {
+                    gpu.rotate_x_mq_batched(
+                        &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
+                    )?;
+                    &pbs.dn_normed_rot_batch
+                } else {
+                    &pbs.dn_normed_batch
+                };
                 gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.dn_normed_rot_batch, &pbs.x_batch,
+                    &layer.wo.buf, wo_input, &pbs.x_batch,
                     layer.wo.m, layer.wo.k, n,
                 )?;
 
-                // FFN: fused rmsnorm + rotate.
-                gpu.fused_rmsnorm_rotate_mq_batched(
-                    &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
-                )?;
+                // FFN: rmsnorm (+ rotate for MQ4).
+                let ffn_is_mq4 = layer.w_gate.gpu_dtype == DType::MQ4G256;
+                if ffn_is_mq4 {
+                    gpu.fused_rmsnorm_rotate_mq_batched(
+                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch,
+                        n, dim, config.norm_eps,
+                    )?;
+                }
 
                 // Batched gate+up projection.
                 gpu.gemm_gate_up_hfq4g256(
@@ -1501,11 +1543,23 @@ fn forward_prefill_chunk(
                     layer.w_gate.k, n,
                 )?;
 
-                // Batched fused SwiGLU + FWHT rotation for w_down input.
-                gpu.fused_silu_mul_rotate_mq_batched(
-                    &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                    hidden_dim, n,
-                )?;
+                // SwiGLU activation feeding w_down. For MQ4, we need the
+                // output FWHT-rotated so it matches the pre-rotated w_down
+                // weights. For HF4, plain silu_mul is enough. silu_mul_f32
+                // is purely element-wise and uses numel() as its length,
+                // so a [N × hidden_dim] tensor processes all rows in one
+                // launch with no batch offset needed.
+                let w_down_is_mq4 = layer.w_down.gpu_dtype == DType::MQ4G256;
+                if w_down_is_mq4 {
+                    gpu.fused_silu_mul_rotate_mq_batched(
+                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                        hidden_dim, n,
+                    )?;
+                } else {
+                    gpu.silu_mul_f32(
+                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                    )?;
+                }
 
                 // Batched w_down + residual.
                 gpu.gemm_hfq4g256_residual(
@@ -1513,6 +1567,7 @@ fn forward_prefill_chunk(
                     layer.w_down.m, layer.w_down.k, n,
                 )?;
 
+                let _ = is_mq4; // retained above for potential future use
                 delta_layer_idx += 1;
             }
 
@@ -1522,11 +1577,19 @@ fn forward_prefill_chunk(
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 let q_dim = config.n_heads * config.head_dim;
+                let qkv_is_mq4 = layer.wq.gpu_dtype == DType::MQ4G256;
 
-                // 1. Fused rmsnorm + FWHT rotation (attn preamble).
-                gpu.fused_rmsnorm_rotate_mq_batched(
-                    &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
-                )?;
+                // 1. rmsnorm (+ rotate for MQ4) for the attn preamble.
+                if qkv_is_mq4 {
+                    gpu.fused_rmsnorm_rotate_mq_batched(
+                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
+                        n, dim, config.norm_eps,
+                    )?;
+                }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
                 gpu.gemm_qkv_hfq4g256(
@@ -1610,21 +1673,35 @@ fn forward_prefill_chunk(
                 // full [N × q_dim] tensor.
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
 
-                // 9. wo residual: x_batch += wo · FWHT(fa_attn_out_batch).
+                // 9. wo residual: x_batch += wo · (optional rotate)(fa_attn_out_batch).
                 // Same MQ4 rotation requirement as the LA wo path.
-                gpu.rotate_x_mq_batched(
-                    &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
-                )?;
+                let fa_wo_is_mq4 = layer.wo.gpu_dtype == DType::MQ4G256;
+                let fa_wo_input = if fa_wo_is_mq4 {
+                    gpu.rotate_x_mq_batched(
+                        &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
+                    )?;
+                    &pbs.fa_attn_out_rot_batch
+                } else {
+                    &pbs.fa_attn_out_batch
+                };
                 gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.fa_attn_out_rot_batch, &pbs.x_batch,
+                    &layer.wo.buf, fa_wo_input, &pbs.x_batch,
                     layer.wo.m, layer.wo.k, n,
                 )?;
 
-                // 10. FFN: same pattern as the LA FFN (rmsnorm+rotate,
-                // gate+up, silu_mul_rotate, w_down_residual).
-                gpu.fused_rmsnorm_rotate_mq_batched(
-                    &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
-                )?;
+                // 10. FFN: rmsnorm (+ rotate for MQ4), gate+up, silu_mul
+                // (+ rotate for MQ4), w_down residual.
+                let fa_ffn_is_mq4 = layer.w_gate.gpu_dtype == DType::MQ4G256;
+                if fa_ffn_is_mq4 {
+                    gpu.fused_rmsnorm_rotate_mq_batched(
+                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+                    )?;
+                } else {
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch,
+                        n, dim, config.norm_eps,
+                    )?;
+                }
                 gpu.gemm_gate_up_hfq4g256(
                     &layer.w_gate.buf, &layer.w_up.buf,
                     &pbs.x_rot_batch,
@@ -1632,10 +1709,17 @@ fn forward_prefill_chunk(
                     layer.w_gate.m, layer.w_up.m,
                     layer.w_gate.k, n,
                 )?;
-                gpu.fused_silu_mul_rotate_mq_batched(
-                    &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
-                    hidden_dim, n,
-                )?;
+                let fa_w_down_is_mq4 = layer.w_down.gpu_dtype == DType::MQ4G256;
+                if fa_w_down_is_mq4 {
+                    gpu.fused_silu_mul_rotate_mq_batched(
+                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                        hidden_dim, n,
+                    )?;
+                } else {
+                    gpu.silu_mul_f32(
+                        &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                    )?;
+                }
                 gpu.gemm_hfq4g256_residual(
                     &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
                     layer.w_down.m, layer.w_down.k, n,
