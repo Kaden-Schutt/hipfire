@@ -11,9 +11,11 @@
 // layers = 36-48 launches per forward, each costing ~9 µs of dispatch
 // latency on gfx1100 → ~300 µs shaved off forward time.
 //
-// Grid: n_heads blocks × 32 threads. Each block handles one head's Q
-// then one head's K. Q gets normalized AND scaled (scale folded into
-// the inv_norm multiplier for free). K gets normalized only.
+// Grid: [n_heads, batch, 1]. Each block handles one head's Q then one
+// head's K for a single batch row. Q gets normalized AND scaled. For
+// decode grid.y=1 and blockIdx.y=0 (byte-identical to pre-batching);
+// for prefill grid.y=N and q/k are laid out as [N × (n_heads*head_dim)]
+// row-major.
 //
 // Uses wave-reduction over head_dim, same pattern as the single l2_norm
 // kernel. head_dim must fit "reasonable" sizes (≤ 4096, easily).
@@ -30,8 +32,9 @@ extern "C" __global__ void fused_qk_l2_norm_scale_f32(
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
 
-    float* q_head = q + h * head_dim;
-    float* k_head = k + h * head_dim;
+    const long long batch_off = (long long)blockIdx.y * n_heads * head_dim;
+    float* q_head = q + batch_off + h * head_dim;
+    float* k_head = k + batch_off + h * head_dim;
 
     // ── Q: l2-normalize, then scale ──
     // IMPORTANT: the legacy un-fused path applied l2_norm and scale as two

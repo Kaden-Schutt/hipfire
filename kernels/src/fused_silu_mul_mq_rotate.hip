@@ -29,20 +29,28 @@ __global__ void fused_silu_mul_mq_rotate(
     const int groups_total = K / 256;
     if (group >= groups_total) return;
 
+    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
+    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
+    // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
+    const long long batch_off = (long long)blockIdx.y * K;
+    const float* gate_b  = gate  + batch_off;
+    const float* up_b    = up    + batch_off;
+          float* x_rot_b = x_rot + batch_off;
+
     int d0 = tid * 8;
     int base = group * 256 + d0;
 
     // Phase 1: read gate + up, compute silu(gate)*up, apply signs1.
     // silu(z) = z / (1 + exp(-z)).
     #define SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
-    float g0 = gate[base];     float u0 = up[base];
-    float g1 = gate[base + 1]; float u1 = up[base + 1];
-    float g2 = gate[base + 2]; float u2 = up[base + 2];
-    float g3 = gate[base + 3]; float u3 = up[base + 3];
-    float g4 = gate[base + 4]; float u4 = up[base + 4];
-    float g5 = gate[base + 5]; float u5 = up[base + 5];
-    float g6 = gate[base + 6]; float u6 = up[base + 6];
-    float g7 = gate[base + 7]; float u7 = up[base + 7];
+    float g0 = gate_b[base];     float u0 = up_b[base];
+    float g1 = gate_b[base + 1]; float u1 = up_b[base + 1];
+    float g2 = gate_b[base + 2]; float u2 = up_b[base + 2];
+    float g3 = gate_b[base + 3]; float u3 = up_b[base + 3];
+    float g4 = gate_b[base + 4]; float u4 = up_b[base + 4];
+    float g5 = gate_b[base + 5]; float u5 = up_b[base + 5];
+    float g6 = gate_b[base + 6]; float u6 = up_b[base + 6];
+    float g7 = gate_b[base + 7]; float u7 = up_b[base + 7];
 
     float v0 = SILU_MUL(g0, u0) * signs1[d0];
     float v1 = SILU_MUL(g1, u1) * signs1[d0 + 1];
@@ -90,12 +98,12 @@ __global__ void fused_silu_mul_mq_rotate(
     #undef HBFLY
 
     const float s = 0.0625f;
-    x_rot[base]     = v0 * s * signs2[d0];
-    x_rot[base + 1] = v1 * s * signs2[d0 + 1];
-    x_rot[base + 2] = v2 * s * signs2[d0 + 2];
-    x_rot[base + 3] = v3 * s * signs2[d0 + 3];
-    x_rot[base + 4] = v4 * s * signs2[d0 + 4];
-    x_rot[base + 5] = v5 * s * signs2[d0 + 5];
-    x_rot[base + 6] = v6 * s * signs2[d0 + 6];
-    x_rot[base + 7] = v7 * s * signs2[d0 + 7];
+    x_rot_b[base]     = v0 * s * signs2[d0];
+    x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
+    x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
+    x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
+    x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
+    x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
+    x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
+    x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
 }

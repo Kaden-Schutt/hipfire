@@ -4,7 +4,10 @@
 // Replaces the rmsnorm_f32 + mq_rotate_x kernel pair with a single launch.
 //
 // Layout:
-// - 1 workgroup of 256 threads = 8 waves of 32 threads.
+// - 1 workgroup of 256 threads = 8 waves of 32 threads *per batch element*.
+// - Grid.x is the batch dimension — grid=[1,1,1] for decode, grid=[N,1,1]
+//   for batched prefill. Each block picks row blockIdx.x out of the [N × K]
+//   x and x_rot tensors. LDS is per-block, so batches don't interfere.
 // - The whole K-length input vector is processed within that workgroup.
 // - LDS holds `x_shared[K] + reduce[256]` (K<=12288 fits in 64 KB).
 //
@@ -46,10 +49,18 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     const int warp_id = tid >> 5;      // 0..7
     const int num_warps = block_size >> 5;
 
+    // Batch row: this block processes x[blockIdx.x * K .. (blockIdx.x+1) * K].
+    // For decode (grid.x == 1), offset is 0 and the behaviour is identical
+    // to the pre-batching version. weight/signs1/signs2 are shared across
+    // the batch (same per-feature scalars for every token).
+    const long long batch_off = (long long)blockIdx.x * K;
+    const float* x_b     = x     + batch_off;
+          float* x_rot_b = x_rot + batch_off;
+
     // Phase 1a: gather → cache to LDS and accumulate sum-of-squares.
     float local_sum = 0.0f;
     for (int i = tid; i < K; i += block_size) {
-        float v = x[i];
+        float v = x_b[i];
         x_shared[i] = v;
         local_sum += v * v;
     }
@@ -130,13 +141,13 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         #undef HBFLY
 
         const float s = 0.0625f;
-        x_rot[base]     = v0 * s * signs2[d0];
-        x_rot[base + 1] = v1 * s * signs2[d0 + 1];
-        x_rot[base + 2] = v2 * s * signs2[d0 + 2];
-        x_rot[base + 3] = v3 * s * signs2[d0 + 3];
-        x_rot[base + 4] = v4 * s * signs2[d0 + 4];
-        x_rot[base + 5] = v5 * s * signs2[d0 + 5];
-        x_rot[base + 6] = v6 * s * signs2[d0 + 6];
-        x_rot[base + 7] = v7 * s * signs2[d0 + 7];
+        x_rot_b[base]     = v0 * s * signs2[d0];
+        x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
+        x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
+        x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
+        x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
+        x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
+        x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
+        x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
     }
 }

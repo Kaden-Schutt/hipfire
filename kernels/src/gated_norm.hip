@@ -1,4 +1,7 @@
 #include <hip/hip_runtime.h>
+// Grid: [n_heads, batch, 1]. For decode grid.y=1 and the offset below is 0
+// (byte-identical to pre-batching). For prefill grid.y=N; x/z/out are laid
+// out as [N × (n_heads * head_dim)] row-major.
 extern "C" __global__ void gated_norm_f32(
     const float* __restrict__ x,
     const float* __restrict__ z,
@@ -10,9 +13,10 @@ extern "C" __global__ void gated_norm_f32(
     if (h >= n_heads) return;
     const int tid = threadIdx.x;
 
-    const float* xh = x + h * head_dim;
-    const float* zh = z + h * head_dim;
-    float* oh = out + h * head_dim;
+    const long long batch_off = (long long)blockIdx.y * n_heads * head_dim;
+    const float* xh = x + batch_off + h * head_dim;
+    const float* zh = z + batch_off + h * head_dim;
+    float* oh = out + batch_off + h * head_dim;
 
     float sq_sum = 0.0f;
     for (int i = tid; i < head_dim; i += 32)

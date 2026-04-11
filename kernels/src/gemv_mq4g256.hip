@@ -54,6 +54,11 @@ extern "C" __global__ void gemv_mq4g256(
 // Rotate x in-place: applies FWHT to each 256-element group.
 // Called ONCE before the GEMV, not per-row.
 // 32 threads per group, 8 elements per thread, ds_swizzle butterfly.
+//
+// Grid: [groups_total, batch, 1]. For decode the caller passes batch=1 and
+// blockIdx.y is always 0 (byte-identical to the pre-batching version).
+// For prefill, batch=N; each block processes one group × one batch row.
+// x_in / x_out are laid out as [batch × K] row-major.
 extern "C" __launch_bounds__(32, 16)
 __global__ void mq_rotate_x(
     const float* __restrict__ x_in,
@@ -67,17 +72,21 @@ __global__ void mq_rotate_x(
     const int groups_total = K / 256;
     if (group >= groups_total) return;
 
+    const long long batch_off = (long long)blockIdx.y * K;
+    const float* x_in_b  = x_in  + batch_off;
+          float* x_out_b = x_out + batch_off;
+
     int d0 = tid * 8;
     int base = group * 256 + d0;
 
-    float v0 = x_in[base]     * signs1[d0];
-    float v1 = x_in[base + 1] * signs1[d0 + 1];
-    float v2 = x_in[base + 2] * signs1[d0 + 2];
-    float v3 = x_in[base + 3] * signs1[d0 + 3];
-    float v4 = x_in[base + 4] * signs1[d0 + 4];
-    float v5 = x_in[base + 5] * signs1[d0 + 5];
-    float v6 = x_in[base + 6] * signs1[d0 + 6];
-    float v7 = x_in[base + 7] * signs1[d0 + 7];
+    float v0 = x_in_b[base]     * signs1[d0];
+    float v1 = x_in_b[base + 1] * signs1[d0 + 1];
+    float v2 = x_in_b[base + 2] * signs1[d0 + 2];
+    float v3 = x_in_b[base + 3] * signs1[d0 + 3];
+    float v4 = x_in_b[base + 4] * signs1[d0 + 4];
+    float v5 = x_in_b[base + 5] * signs1[d0 + 5];
+    float v6 = x_in_b[base + 6] * signs1[d0 + 6];
+    float v7 = x_in_b[base + 7] * signs1[d0 + 7];
 
     // Local butterfly: strides 1, 2, 4
     float t;
@@ -115,12 +124,12 @@ __global__ void mq_rotate_x(
     #undef HBFLY
 
     const float s = 0.0625f;
-    x_out[base]     = v0 * s * signs2[d0];
-    x_out[base + 1] = v1 * s * signs2[d0 + 1];
-    x_out[base + 2] = v2 * s * signs2[d0 + 2];
-    x_out[base + 3] = v3 * s * signs2[d0 + 3];
-    x_out[base + 4] = v4 * s * signs2[d0 + 4];
-    x_out[base + 5] = v5 * s * signs2[d0 + 5];
-    x_out[base + 6] = v6 * s * signs2[d0 + 6];
-    x_out[base + 7] = v7 * s * signs2[d0 + 7];
+    x_out_b[base]     = v0 * s * signs2[d0];
+    x_out_b[base + 1] = v1 * s * signs2[d0 + 1];
+    x_out_b[base + 2] = v2 * s * signs2[d0 + 2];
+    x_out_b[base + 3] = v3 * s * signs2[d0 + 3];
+    x_out_b[base + 4] = v4 * s * signs2[d0 + 4];
+    x_out_b[base + 5] = v5 * s * signs2[d0 + 5];
+    x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
+    x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
 }
