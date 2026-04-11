@@ -4019,6 +4019,26 @@ impl Gpu {
         k_dim: usize,
         v_dim: usize,
     ) -> HipResult<()> {
+        self.conv1d_silu_split_f32_n(q_out, k_out, v_out, input, weight, state, k_dim, v_dim, 1)
+    }
+
+    /// Batched conv1d + silu + Q/K/V split. Processes `n_tokens` tokens in
+    /// order through the conv, advancing the ring-buffer state N times
+    /// (identical state trajectory to calling the single-token variant N
+    /// times). `input` / `q_out` / `k_out` / `v_out` are all [N × stride]
+    /// row-major.
+    pub fn conv1d_silu_split_f32_n(
+        &mut self,
+        q_out: &GpuTensor,
+        k_out: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
         self.ensure_kernel(
             "conv1d_silu_split",
             kernels::CONV1D_SILU_SPLIT_SRC,
@@ -4033,6 +4053,7 @@ impl Gpu {
         let mut sp = state.buf.as_ptr();
         let mut kd = k_dim as i32;
         let mut vd = v_dim as i32;
+        let mut nt = n_tokens as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -4042,12 +4063,13 @@ impl Gpu {
             &mut sp as *mut _ as *mut c_void,
             &mut kd as *mut _ as *mut c_void,
             &mut vd as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
         ];
         let n_channels = 2 * k_dim + v_dim;
         let block = 256u32;
         let grid = ((n_channels as u32) + block - 1) / block;
-        let bytes = crate::profile::conv1d_silu_bytes(n_channels);
-        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32", bytes);
+        let bytes = crate::profile::conv1d_silu_bytes(n_channels) * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", "conv1d_silu_split_f32_n", bytes);
         let result = unsafe {
             self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params)
         };
