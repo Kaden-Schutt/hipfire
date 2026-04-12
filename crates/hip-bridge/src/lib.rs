@@ -36,6 +36,13 @@ impl DeviceBuffer {
         self.size
     }
 
+    /// Create a non-owning DeviceBuffer from a raw pointer and size.
+    /// The caller must ensure the pointer is valid GPU memory.
+    /// The resulting buffer must NOT be freed (it doesn't own the memory).
+    pub unsafe fn from_raw(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {
+        DeviceBuffer { ptr, size }
+    }
+
     /// Create a non-owning alias to the same GPU memory.
     /// The alias must not outlive the original buffer.
     /// Used for reshaping tensors without reallocating.

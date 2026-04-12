@@ -1681,13 +1681,41 @@ fn forward_prefill_chunk(
                 )?;
 
                 // 7. Batched causal attention with Q8_0 KV.
-                gpu.attention_q8_0_kv_batched(
-                    &pbs.fa_q_batch,
-                    &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &pbs.fa_attn_out_batch, &pbs.positions,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    kv_cache.max_seq, max_ctx_len, n,
-                )?;
+                // The baseline batched kernel stores scores[max_ctx_len] in
+                // LDS which overflows at ~16K ctx (64 KB limit). When context
+                // is long, fall back to per-position flash tile+reduce which
+                // uses fixed 1 KB LDS regardless of context length.
+                const LDS_CTX_LIMIT: usize = 15000;
+                if max_ctx_len > LDS_CTX_LIMIT {
+                    // Per-position flash attention for long-context prefill.
+                    // Loop over batch positions, calling flash for each.
+                    let q_dim = config.n_heads * config.head_dim;
+                    let pos_host = gpu.download_f32(&pbs.positions)?;
+                    let pos_buf_tmp = gpu.hip.malloc(4)?;
+                    for b in 0..n {
+                        let seq_len_b = pos_host[b] as usize + 1;
+                        let pos_i32 = pos_host[b] as i32;
+                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                        // Create sub-tensor views via offset
+                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                        gpu.attention_flash_q8_0(
+                            &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                            &out_b, &pos_buf_tmp, seq_len_b,
+                            config.n_heads, config.n_kv_heads, config.head_dim,
+                            kv_cache.max_seq, &s.flash_partials,
+                        )?;
+                    }
+                    let _ = gpu.hip.free(pos_buf_tmp);
+                } else {
+                    gpu.attention_q8_0_kv_batched(
+                        &pbs.fa_q_batch,
+                        &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch, &pbs.positions,
+                        config.n_heads, config.n_kv_heads, config.head_dim,
+                        kv_cache.max_seq, max_ctx_len, n,
+                    )?;
+                }
 
                 // 8. Fused sigmoid(gate) * attn_out, element-wise over the
                 // full [N × q_dim] tensor.
@@ -2262,7 +2290,7 @@ fn forward_scratch_layers(
                 } else if kv_cache.quant_q8 {
                     gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
                     gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
-                    if s.use_flash_attn && pos + 1 >= 2048 {
+                    if (s.use_flash_attn && pos + 1 >= 2048) || pos + 1 > 15000 {
                         gpu.attention_flash_q8_0(
                             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                             &s.fa_attn_out, &s.pos_buf, pos + 1,

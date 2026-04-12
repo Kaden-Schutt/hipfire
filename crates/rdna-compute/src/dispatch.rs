@@ -57,6 +57,19 @@ impl GpuTensor {
     pub fn byte_size(&self) -> usize {
         self.numel() * self.dtype.size()
     }
+
+    /// Create a non-owning sub-view at a byte offset. For F32 tensors,
+    /// `offset_elems` is the number of f32 elements to skip.
+    /// The returned tensor is a view — do NOT free it.
+    pub fn sub_offset(&self, offset_elems: usize, len_elems: usize) -> GpuTensor {
+        let byte_off = offset_elems * self.dtype.size();
+        let ptr = unsafe { (self.buf.as_ptr() as *mut u8).add(byte_off) as *mut std::ffi::c_void };
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len_elems * self.dtype.size()) },
+            shape: vec![len_elems],
+            dtype: self.dtype,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
