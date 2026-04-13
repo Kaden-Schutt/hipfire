@@ -21,13 +21,18 @@ mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
 interface HipfireConfig {
-  kv_cache: string;       // "auto" (per-arch default), "q8", "givens4", or "givens2"
+  kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
+  flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
   temperature: number;    // default temperature for run
   top_p: number;
   repeat_penalty: number;
-  max_tokens: number;
+  max_tokens: number;     // per-turn generation cap
+  max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
+  thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
+  max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
   port: number;           // default serve port
+  idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
 }
 
 // Detect GPU at import time for smart defaults
@@ -36,22 +41,36 @@ const ARCH_DEFAULTS = archDefaults(DETECTED_ARCH);
 
 const CONFIG_DEFAULTS: HipfireConfig = {
   kv_cache: ARCH_DEFAULTS.kv_cache,
+  flash_mode: "auto",
   default_model: "qwen3.5:9b",
   temperature: 0.3,
   top_p: 0.8,
-  repeat_penalty: 1.3,
+  // 1.05 is the minimum penalty that prevents short-range loops without
+  // pushing greedy/low-temperature outputs off-manifold. 1.3 (Ollama-ish)
+  // causes MQ4/MQ6 models to emit gibberish at temp=0 because the penalty
+  // applies uniformly even in greedy mode. 1.05 is user-validated.
+  repeat_penalty: 1.05,
   max_tokens: 512,
+  max_seq: 32768,
+  thinking: "on",
+  max_think_tokens: 0,
   port: DEFAULT_PORT,
+  idle_timeout: 300,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "givens4", "givens2", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
     case "repeat_penalty": return typeof value === "number" && value >= 1 && value <= 3;
-    case "max_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 32768;
+    case "max_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 131072;
+    case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
+    case "thinking": return ["on", "off"].includes(value);
+    case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
+    case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     default: return false;
   }
@@ -81,9 +100,86 @@ function saveConfig(cfg: HipfireConfig) {
 
 const cfg = loadConfig();
 
+// ─── Per-model config overlays ──────────────────────────
+// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
+// Resolution order: --flag > per-model > global > engine fallback.
+
+const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
+
+// Fields that make sense to override per-model. port + idle_timeout + default_model
+// are serve-wide so they stay global-only.
+const PER_MODEL_KEYS = [
+  "kv_cache", "flash_mode", "temperature", "top_p",
+  "repeat_penalty", "max_tokens", "max_seq", "thinking", "max_think_tokens",
+] as const;
+type PerModelKey = typeof PER_MODEL_KEYS[number];
+
+type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
+type PerModelConfigs = Record<string, PerModelOverride>;
+
+function loadPerModelConfigs(): PerModelConfigs {
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
+    const out: PerModelConfigs = {};
+    for (const [tag, ov] of Object.entries(raw ?? {})) {
+      const clean: PerModelOverride = {};
+      for (const k of PER_MODEL_KEYS) {
+        const v = (ov as any)?.[k];
+        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+      }
+      if (Object.keys(clean).length > 0) out[tag] = clean;
+    }
+    return out;
+  } catch { return {}; }
+}
+
+function savePerModelConfigs(all: PerModelConfigs) {
+  // Drop empty entries so the file stays minimal
+  const clean: PerModelConfigs = {};
+  for (const [tag, ov] of Object.entries(all)) {
+    if (Object.keys(ov).length > 0) clean[tag] = ov;
+  }
+  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
+}
+
+// Return the effective config for a given model tag. Per-model overrides
+// win over global. If tag is null/undefined, returns the global config.
+function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
+  if (!tag) return { ...cfg };
+  const resolved = resolveModelTag(tag);
+  const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
+  return { ...cfg, ...overrides };
+}
+
+// thinking: "off" prepends a directive to the system prompt asking the model
+// to skip <think> reasoning. Effective on instruction-tuned models (Qwen 3.5
+// in particular honors this); advisory-only — for hard suppression we'd need
+// a daemon-side <think></think> bypass injection.
+function applyThinkingMode(systemPrompt: string | undefined, thinking: string): string | undefined {
+  if (thinking !== "off") return systemPrompt;
+  const directive = "Respond directly without using <think>...</think> reasoning blocks. Give the final answer only.";
+  return systemPrompt ? `${directive}\n\n${systemPrompt}` : directive;
+}
+
+// Build the {type: "load", ...} message for the daemon, carrying per-model
+// params (max_seq). The tag is optional — pass it from the caller when known,
+// else we fall back to global cfg.
+function buildLoadMessage(path: string, tag?: string | null): any {
+  const resolved = resolveModelConfig(tag);
+  // Guard: the KV cache must be big enough to hold at least one max_tokens
+  // response plus a little prompt headroom; otherwise the daemon panics mid-
+  // generation. Auto-bump rather than crash.
+  const minViable = resolved.max_tokens + 1024;
+  const max_seq = Math.max(resolved.max_seq, minViable);
+  if (max_seq > resolved.max_seq) {
+    console.error(`[hipfire] note: max_seq (${resolved.max_seq}) < max_tokens (${resolved.max_tokens}) + 1024 — bumping to ${max_seq} for this load`);
+  }
+  return { type: "load", model: path, params: { max_seq } };
+}
+
 // ─── Model Registry ─────────────────────────────────────
 // Maps "name:tag" → { repo, file, size_gb, min_vram_gb }
-// Default tag (no quant suffix) = HFQ4
+// Default tag (no quant suffix) = MQ4 (FWHT-rotated 4-bit, WMMA-accelerated on RDNA3+)
 
 const HF_BASE = "https://huggingface.co";
 
@@ -107,15 +203,28 @@ const REGISTRY: Record<string, ModelEntry> = {
   "qwen3.5:9b":       { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq4",     size_gb: 5.3,  min_vram_gb: 6,  desc: "125 / 1720 tok/s" },
   "qwen3.5:27b":      { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq4",    size_gb: 15.0, min_vram_gb: 16, desc: "45 / 489 tok/s, 16GB+" },
 
+  // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
+  "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
+  "qwen3.5:4b-mq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq6",     size_gb: 3.5,  min_vram_gb: 5,  desc: "MQ6, higher quality" },
+  "qwen3.5:9b-mq6":   { repo: hfRepo("qwen3.5","9b"),   file: "qwen3.5-9b.mq6",     size_gb: 7.3,  min_vram_gb: 8,  desc: "MQ6, higher quality" },
+  "qwen3.5:27b-mq6":  { repo: hfRepo("qwen3.5","27b"),  file: "qwen3.5-27b.mq6",    size_gb: 21.4, min_vram_gb: 24, desc: "MQ6, higher quality" },
+
   // Qwen3 (standard attention, not DeltaNet)
   "qwen3:0.6b":       { repo: hfRepo("qwen3","0.6b"),   file: "qwen3-0.6b.hf4",     size_gb: 0.4,  min_vram_gb: 1,  desc: "standard attention" },
   "qwen3:8b":         { repo: hfRepo("qwen3","8b"),     file: "qwen3-8b.hf4",       size_gb: 4.1,  min_vram_gb: 6,  desc: "60 tok/s, standard attention" },
 
   // Community finetunes (Qwen3.5 architecture)
-  "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b", file: "carnice-9b.mq4", size_gb: 5.0, min_vram_gb: 6, desc: "Hermes tool-use, MQ4" },
-  "qwopus:9b":         { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.hf4",  size_gb: 4.5, min_vram_gb: 6, desc: "Qwopus3.5 v3" },
-  "qwopus:4b":         { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.hf4",  size_gb: 2.1, min_vram_gb: 4, desc: "Qwopus3.5 v3, 4B" },
-  "qwopus:27b":        { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.hf4", size_gb: 14.3, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B" },
+  "carnice:9b":        { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq4",  size_gb: 5.0, min_vram_gb: 6,  desc: "Hermes tool-use, MQ4" },
+  "carnice:27b":       { repo: "schuttdev/hipfire-carnice-27b", file: "carnice-27b.mq4", size_gb: 15.0, min_vram_gb: 16, desc: "Hermes 27B tool-use, MQ4" },
+  "carnice:9b-mq6":    { repo: "schuttdev/hipfire-carnice-9b",  file: "carnice-9b.mq6",  size_gb: 7.3, min_vram_gb: 8,  desc: "Hermes tool-use, MQ6 higher quality" },
+  "carnice:27b-mq6":   { repo: "schuttdev/hipfire-carnice-27b", file: "carnice-27b.mq6", size_gb: 21.4, min_vram_gb: 24, desc: "Hermes 27B, MQ6 higher quality" },
+  // Qwopus 3.5 v3 — Jackrong fine-tune (reasoning, CoT, competitive programming)
+  "qwopus:9b":         { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.mq4",  size_gb: 5.3, min_vram_gb: 6,  desc: "Qwopus3.5 v3, MQ4" },
+  "qwopus:4b":         { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.mq4",  size_gb: 2.6, min_vram_gb: 4,  desc: "Qwopus3.5 v3, 4B MQ4" },
+  "qwopus:27b":        { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.mq4", size_gb: 15.0, min_vram_gb: 16, desc: "Qwopus3.5 v3, 27B MQ4" },
+  "qwopus:9b-mq6":     { repo: "schuttdev/hipfire-qwopus-9b", file: "qwopus-9b.mq6",  size_gb: 7.3, min_vram_gb: 8,  desc: "Qwopus3.5 v3, MQ6 higher quality" },
+  "qwopus:4b-mq6":     { repo: "schuttdev/hipfire-qwopus-4b", file: "qwopus-4b.mq6",  size_gb: 3.8, min_vram_gb: 5,  desc: "Qwopus3.5 v3, 4B MQ6" },
+  "qwopus:27b-mq6":    { repo: "schuttdev/hipfire-qwopus-27b", file: "qwopus-27b.mq6", size_gb: 21.4, min_vram_gb: 24, desc: "Qwopus3.5 v3, 27B MQ6" },
 };
 
 // Aliases (also map retired hf4/hf6/mq4 tags to current names)
@@ -126,15 +235,19 @@ const ALIASES: Record<string, string> = {
   "qwen3.5:large": "qwen3.5:27b",
   "qwen3": "qwen3:8b",
   "carnice": "carnice:9b",
+  "qwopus": "qwopus:9b",
   // Retired format tags → current MQ4
   "qwen3.5:0.8b-mq4": "qwen3.5:0.8b", "qwen3.5:4b-mq4": "qwen3.5:4b",
   "qwen3.5:9b-mq4": "qwen3.5:9b", "qwen3.5:27b-mq4": "qwen3.5:27b",
   "qwen3.5:0.8b-hf4": "qwen3.5:0.8b", "qwen3.5:2b-hf4": "qwen3.5:4b",
   "qwen3.5:4b-hf4": "qwen3.5:4b", "qwen3.5:9b-hf4": "qwen3.5:9b",
   "qwen3.5:27b-hf4": "qwen3.5:27b",
-  "qwen3.5:0.8b-hf6": "qwen3.5:0.8b", "qwen3.5:2b-hf6": "qwen3.5:4b",
-  "qwen3.5:4b-hf6": "qwen3.5:4b", "qwen3.5:9b-hf6": "qwen3.5:9b",
-  "qwen3.5:27b-hf6": "qwen3.5:27b",
+  "qwen3.5:0.8b-hf6": "qwen3.5:0.8b-mq6", "qwen3.5:2b-hf6": "qwen3.5:4b-mq6",
+  "qwen3.5:4b-hf6": "qwen3.5:4b-mq6", "qwen3.5:9b-hf6": "qwen3.5:9b-mq6",
+  "qwen3.5:27b-hf6": "qwen3.5:27b-mq6",
+  // Qwopus: old hf4 tags → new mq4
+  "qwopus:9b-hf4": "qwopus:9b", "qwopus:4b-hf4": "qwopus:4b", "qwopus:27b-hf4": "qwopus:27b",
+  "qwopus:9b-mq4": "qwopus:9b", "qwopus:4b-mq4": "qwopus:4b", "qwopus:27b-mq4": "qwopus:27b",
 };
 
 function resolveModelTag(input: string): string {
@@ -179,34 +292,167 @@ interface ArchDefaults {
 }
 
 function archDefaults(arch: string): ArchDefaults {
+  // Default KV cache policy (RotorQuant asymmetric):
+  //   asym3 (K 3-bit rotated + V Q8) is the default across arches — 5.5×
+  //   compression vs fp32 with verbatim rare-token recall on head_dim=256
+  //   models (Qwen 3.5 family). Memory-tight cards get asym2 (6.0×, still
+  //   recall-safe for common tokens). Users can override to `q8` for
+  //   maximum quality or `asym4` for extra K precision headroom.
   switch (arch) {
-    // RDNA3 — givens4: always-flash, 2× KV headroom, WMMA prefill
-    case "gfx1100": return { kv_cache: "givens4", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "givens4", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "givens4", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "givens2", vram_gb: 16 };  // Strix Halo APU (shared mem)
+    // RDNA3 — asym3 everywhere; 24 GB cards fit full context easily.
+    case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
     // RDNA4
     case "gfx1200": case "gfx1201":
-      return { kv_cache: "givens4", vram_gb: 16 };  // 9070 XT
+      return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
     // RDNA2
-    case "gfx1030": return { kv_cache: "givens2", vram_gb: 32 };  // V620
-    case "gfx1031": return { kv_cache: "givens4", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "givens2", vram_gb: 8 };   // 6600 XT
+    case "gfx1030": return { kv_cache: "asym3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
+    case "gfx1031": return { kv_cache: "asym3", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "asym2", vram_gb: 8 };   // 6600 XT (8 GB — asym2 for headroom)
     // RDNA1
-    case "gfx1010": return { kv_cache: "givens2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "givens2", vram_gb: 14 };  // BC-250
-    // Fallback
-    default: return { kv_cache: "givens4", vram_gb: 8 };
+    case "gfx1010": return { kv_cache: "asym2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "asym2", vram_gb: 14 };  // BC-250 APU
+    // Fallback — unknown arch, asym3 is the new safe default.
+    default: return { kv_cache: "asym3", vram_gb: 8 };
   }
 }
 
-// ─── KV cache mode (turbo aliases → givens) ──────────────
+// ─── KV cache mode resolver ──────────────────────────────
+// Canonical modes: q8, asym4, asym3, asym2.
+// Legacy aliases: turbo→asym3, turbo2→asym2, turbo3→asym3, turbo4→asym4
+// (plus "auto" → arch default).
 function resolveKvMode(cfg: HipfireConfig): string {
   const raw = process.env.HIPFIRE_KV_MODE || cfg.kv_cache;
   if (raw === "auto") return ARCH_DEFAULTS.kv_cache;
-  if (raw === "turbo4") return "givens4";
-  if (raw === "turbo3" || raw === "turbo2") return "givens2";
+  if (raw === "turbo" || raw === "turbo3") return "asym3";
+  if (raw === "turbo2") return "asym2";
+  if (raw === "turbo4") return "asym4";
   return raw;
+}
+
+// Set all config-driven env vars in one place so every daemon-spawning
+// codepath picks up the user's current settings consistently.
+// Called before `new Engine().start()`.
+function applyConfigEnv(cfg: HipfireConfig): void {
+  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  // Only set HIPFIRE_ATTN_FLASH if the user hasn't already set it in their
+  // shell (env overrides config). `auto` is the engine default — skip the
+  // env var in that case so the engine's own default applies.
+  if (!process.env.HIPFIRE_ATTN_FLASH) {
+    if (cfg.flash_mode === "always" || cfg.flash_mode === "never") {
+      process.env.HIPFIRE_ATTN_FLASH = cfg.flash_mode;
+    }
+  }
+}
+
+// ─── Background serve lifecycle ─────────────────────────
+// `hipfire serve -d` forks to background; `hipfire stop` kills it.
+// `hipfire run` auto-detects and uses a running serve via HTTP.
+
+const SERVE_PID_FILE = join(HIPFIRE_DIR, "serve.pid");
+const SERVE_LOG_FILE = join(HIPFIRE_DIR, "serve.log");
+
+function isPidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+function readServePid(): number | null {
+  try {
+    const raw = require("fs").readFileSync(SERVE_PID_FILE, "utf-8").trim();
+    const pid = parseInt(raw, 10);
+    if (!pid || !isPidAlive(pid)) return null;
+    return pid;
+  } catch { return null; }
+}
+
+// Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
+async function isServeUp(port: number): Promise<boolean> {
+  try {
+    const ctl = AbortSignal.timeout(500);
+    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctl });
+    return r.ok;
+  } catch { return false; }
+}
+
+// Drive `hipfire run` through an existing serve's /v1/chat/completions stream.
+// Returns false if it couldn't connect (caller falls back to local spawn).
+async function runViaHttp(
+  port: number, model: string, prompt: string,
+  image: string | undefined,
+  temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+): Promise<boolean> {
+  // VL flows go through the image-base64 path on the daemon which the HTTP
+  // wrapper doesn't expose — fall back to local spawn.
+  if (image) return false;
+
+  const body: any = {
+    model, stream: true,
+    messages: [{ role: "user", content: prompt }],
+    temperature: temp, max_tokens: maxTokens,
+    repeat_penalty: repeatPenalty, top_p: topP,
+  };
+
+  let resp: Response;
+  try {
+    resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch (err: any) {
+    console.error(`[hipfire] serve connection failed: ${err?.message ?? err} — falling back to local daemon`);
+    return false;
+  }
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "");
+    console.error(`[hipfire] serve returned HTTP ${resp.status}: ${txt.slice(0, 200)}`);
+    return false;
+  }
+  if (!resp.body) { console.error("[hipfire] serve returned no body"); return false; }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let inThink = false;
+  let stripNextLeadingNl = false;
+  let tokens = 0;
+  const t0 = Date.now();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (!line.startsWith("data: ")) continue;
+      const data = line.slice(6);
+      if (data === "[DONE]") { buffer = ""; break; }
+      try {
+        const chunk = JSON.parse(data);
+        const delta = chunk.choices?.[0]?.delta ?? {};
+        let text: string = delta.content ?? "";
+        if (!text) continue;
+        if (!inThink && text.includes("<think>")) { inThink = true; text = text.replace(/<think>/g, ""); }
+        if (inThink) {
+          if (text.includes("</think>")) {
+            text = text.split("</think>").slice(1).join("</think>");
+            inThink = false;
+            stripNextLeadingNl = true;
+          } else { continue; }
+        }
+        text = text.replace(/<\|im_end\|>/g, "");
+        if (!text) continue;
+        if (stripNextLeadingNl) { text = text.replace(/^\n+/, ""); stripNextLeadingNl = false; if (!text) continue; }
+        process.stdout.write(text);
+        tokens++;
+      } catch {}
+    }
+  }
+  const secs = (Date.now() - t0) / 1000;
+  if (tokens > 0) console.error(`\n[${tokens} tok, ${(tokens / secs).toFixed(1)} tok/s via serve]`);
+  return true;
 }
 
 // ─── Daemon IPC ─────────────────────────────────────────
@@ -321,9 +567,9 @@ async function pull(tag: string): Promise<string> {
     return dest;
   }
 
-  // Hint for 27B HFQ4: recommend HFQ6 for complex tasks
-  if (resolved === "qwen3.5:27b") {
-    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-hf6 (needs 24GB VRAM)`);
+  // Hint for 27B MQ4: suggest MQ6 for complex reasoning / coding when available
+  if (resolved === "qwen3.5:27b" && REGISTRY["qwen3.5:27b-mq6"]) {
+    console.error(`TIP: For coding/complex tasks, use: hipfire pull qwen3.5:27b-mq6 (needs 24GB VRAM)`);
   }
 
   const url = downloadUrl(entry);
@@ -388,11 +634,21 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 
   if (image && !existsSync(image)) { console.error(`Image not found: ${image}`); process.exit(1); }
 
-  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  // If a serve daemon is already running on this port, proxy through its HTTP
+  // API — saves the 2-5s cold-start cost of loading the model every invocation.
+  // Local spawn falls through only when no serve is present (or HTTP errors out).
+  const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
+  if (!useLocal && await isServeUp(cfg.port)) {
+    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    if (ok) return;
+    // runViaHttp logged its own failure reason; fall back to local spawn.
+  }
+
+  applyConfigEnv(cfg);
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: path });
+  await e.send(buildLoadMessage(path, model));
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
   const vlTag = loaded.vl ? " VL" : "";
@@ -403,11 +659,15 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     image = undefined;
   }
 
+  const modelCfg = resolveModelConfig(model);
+  const thinkingDirective = applyThinkingMode(undefined, modelCfg.thinking);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
+  if (thinkingDirective) genMsg.system = thinkingDirective;
+  if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
   if (image) {
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
@@ -437,11 +697,40 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
 }
 
 async function serve(port: number) {
-  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  applyConfigEnv(cfg);
+  // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
+  // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
+  try {
+    require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
+  } catch {}
+  const cleanupPid = () => { try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {} };
+  process.on("exit", cleanupPid);
+  process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
+  process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
+
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
   let current: string | null = null;
+
+  // Idle eviction: after `idle_timeout` seconds of no requests, unload the
+  // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
+  let lastRequestTime = Date.now();
+  const idleTimeoutMs = cfg.idle_timeout * 1000;
+  const evictionInterval = idleTimeoutMs > 0 ? setInterval(async () => {
+    if (!current) return;                              // nothing to unload
+    if (Date.now() - lastRequestTime < idleTimeoutMs) return;
+    try {
+      console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
+      await e.send({ type: "unload" });
+      await e.recv();
+      current = null;
+    } catch (err: any) {
+      console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+    }
+  }, Math.min(60_000, idleTimeoutMs)) : null;
+  // Keep process alive irrespective of the interval; clean up on exit.
+  if (evictionInterval) process.on("exit", () => clearInterval(evictionInterval));
 
   // Pre-warm: load default model and compile kernels before accepting requests
   const defaultModel = process.env.HIPFIRE_MODEL || cfg.default_model;
@@ -450,7 +739,7 @@ async function serve(port: number) {
   if (warmPath) {
     try {
       console.error(`[hipfire] pre-warming ${defaultModel}...`);
-      await e.send({ type: "load", model: warmPath });
+      await e.send(buildLoadMessage(warmPath, defaultModel));
       const loadResult = await e.recv();
       if (loadResult.type === "error") {
         console.error(`[hipfire] pre-warm load failed: ${loadResult.message} (will load on first request)`);
@@ -490,11 +779,21 @@ async function serve(port: number) {
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
       const url = new URL(req.url);
-      if (url.pathname === "/health") return Response.json({ status: "ok", model: current });
+      if (url.pathname === "/health") {
+        return Response.json({
+          status: "ok",
+          model: current,
+          idle_timeout_sec: cfg.idle_timeout,
+          pid: process.pid,
+        });
+      }
       if (url.pathname === "/v1/models") return Response.json({ data: listLocal().map(m => ({ id: m.name })) });
 
       if (url.pathname !== "/v1/chat/completions" || req.method !== "POST")
         return Response.json({ error: "not found" }, { status: 404 });
+
+      // Update idle timer on every real request (eviction loop checks against this).
+      lastRequestTime = Date.now();
 
       await acquireLock();
       let lockReleased = false;
@@ -541,6 +840,17 @@ async function serve(port: number) {
         // We embed ChatML turn boundaries inside the prompt so multi-turn conversations
         // (especially tool-calling flows) have proper role structure instead of being
         // collapsed into a single user turn.
+        //
+        // CRITICAL: the Qwen 3.5 chat template strips <think>...</think> from
+        // HISTORICAL assistant messages (anything before the last user query).
+        // Passing them through verbatim drags stale reasoning into the KV cache
+        // and wrecks recall — the model treats the past thinking as current
+        // context and drifts away from the user's actual facts. Strip thinking
+        // blocks from every assistant message in the conversation history.
+        const stripThinking = (s: string): string =>
+          s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+           .replace(/<think>[\s\S]*$/, "");
+
         const nonSystem = messages.filter((m: any) => m.role !== "system");
         const convParts: string[] = [];
         for (let i = 0; i < nonSystem.length; i++) {
@@ -550,11 +860,13 @@ async function serve(port: number) {
 
           if (role === "tool") {
             text = `<tool_response>\n${m.content}\n</tool_response>`;
-          } else if (role === "assistant" && m.tool_calls) {
-            text = m.content || "";
-            for (const tc of m.tool_calls) {
-              const fn = tc.function || tc;
-              text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+          } else if (role === "assistant") {
+            text = stripThinking(m.content || "");
+            if (m.tool_calls) {
+              for (const tc of m.tool_calls) {
+                const fn = tc.function || tc;
+                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+              }
             }
           } else {
             text = m.content || "";
@@ -582,7 +894,7 @@ async function serve(port: number) {
 
         if (current !== path) {
           if (current) { await e.send({ type: "unload" }); await e.recv(); }
-          await e.send({ type: "load", model: path });
+          await e.send(buildLoadMessage(path, body.model));
           const loadResult = await e.recv();
           if (loadResult.type === "error") {
             current = null;
@@ -599,10 +911,14 @@ async function serve(port: number) {
           type: "generate", id: reqId, prompt: userPrompt,
           temperature: (body.temperature ?? 0.3) * TEMP_CORRECTION,
           max_tokens: body.max_tokens ?? 512,
-          repeat_penalty: body.repeat_penalty ?? body.frequency_penalty ? 1.0 + (body.frequency_penalty ?? 0) : 1.3,
+          repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : 1.05),
           top_p: body.top_p ?? 0.8,
         };
-        if (systemPrompt) genParams.system = systemPrompt;
+        // Per-model thinking mode: prepend the "no-think" directive when
+        // this model's override (or the global config) sets thinking=off.
+        const thinkModel = resolveModelConfig(body.model).thinking;
+        const resolvedSystem = applyThinkingMode(systemPrompt || undefined, thinkModel);
+        if (resolvedSystem) genParams.system = resolvedSystem;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
@@ -765,11 +1081,206 @@ async function serve(port: number) {
   });
 }
 
+// ─── Quantize ───────────────────────────────────────────
+// `hipfire quantize <hf-id|local-dir> [--format mq4|mq6|q8] [-o out]`
+//
+// Wraps the `hipfire-quantize` binary. Accepts either an HF model ID
+// (e.g. `Qwen/Qwen3-0.6B`) — downloaded via the `hf` CLI — or a local
+// directory of safetensors. Produces a single file readable by the
+// engine loader.
+
+function findQuantizeBinary(): string | null {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  const candidates = [
+    resolve(__dirname, `../target/release/hipfire-quantize${exe}`),
+    join(HIPFIRE_DIR, "bin", `hipfire-quantize${exe}`),
+  ];
+  return candidates.find(p => existsSync(p)) || null;
+}
+
+interface QuantizeOpts {
+  formats: string[];                 // one or more of mq4/mq6/q8
+  output?: string;                   // explicit path (only valid with single format)
+  outputDir?: string;                // directory for multi-format outputs
+  stem?: string;                     // override output basename (default: inferred from input)
+  uploadRepo?: string;               // schuttdev/hipfire-... — upload after quantize
+  createRepo?: boolean;              // pass --create-repo to `hf upload`
+  installLocal?: boolean;            // copy result into ~/.hipfire/models
+  register?: string;                 // tag to add to registry (e.g., "qwopus:4b")
+}
+
+async function hfDownloadModel(hfId: string): Promise<string> {
+  const cacheDir = join(HIPFIRE_DIR, "hf-cache", hfId.replace(/\//g, "_"));
+  mkdirSync(cacheDir, { recursive: true });
+  console.error(`Downloading ${hfId} from HuggingFace to ${cacheDir} ...`);
+  const dl = Bun.spawnSync(
+    [
+      "hf", "download", hfId, "--local-dir", cacheDir,
+      "--include", "*.safetensors",
+      "--include", "*.safetensors.index.json",
+      "--include", "config.json",
+      "--include", "tokenizer.json",
+      "--include", "tokenizer_config.json",
+      "--include", "special_tokens_map.json",
+      "--include", "generation_config.json",
+    ],
+    { stdio: ["inherit", "inherit", "inherit"] },
+  );
+  if ((dl.exitCode ?? 1) !== 0) {
+    console.error(`hf download failed.`);
+    console.error(`  Check: hf auth whoami  (run 'hf auth login' if not authed)`);
+    console.error(`  Or install: pip install -U huggingface_hub`);
+    process.exit(1);
+  }
+  return cacheDir;
+}
+
+async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
+  const bin = findQuantizeBinary();
+  if (!bin) {
+    console.error("hipfire-quantize binary not found.");
+    console.error("  Build: cargo build --release -p hipfire-quantize");
+    console.error("  Or:    hipfire update");
+    process.exit(1);
+  }
+
+  // HF ID = exactly one `/`, HF-valid chars, and no such directory exists.
+  const looksLikeHfId = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9._-]+$/.test(input)
+    && !existsSync(input);
+  const inputDir = looksLikeHfId ? await hfDownloadModel(input) : resolve(input);
+  if (!looksLikeHfId && !existsSync(inputDir)) {
+    console.error(`Input not found: ${inputDir}`);
+    process.exit(1);
+  }
+
+  const baseName = opts.stem ?? (looksLikeHfId ? input.split("/").pop()! : basename(inputDir));
+
+  // Sanity: --output is only meaningful with a single format
+  if (opts.output && opts.formats.length > 1) {
+    console.error("--output conflicts with multiple --format values. Use --output-dir instead.");
+    process.exit(1);
+  }
+  const outDir = opts.outputDir ? resolve(opts.outputDir) : resolve(".");
+  if (opts.outputDir) mkdirSync(outDir, { recursive: true });
+
+  const produced: { format: string; path: string }[] = [];
+
+  for (const format of opts.formats) {
+    const out = opts.output
+      ? resolve(opts.output)
+      : join(outDir, `${baseName}.${format}`);
+
+    console.error(`\nQuantizing ${inputDir}`);
+    console.error(`  → ${out} (${format})`);
+    const t0 = Date.now();
+    const proc = Bun.spawnSync(
+      [bin, "--input", inputDir, "--output", out, "--format", format],
+      { stdio: ["inherit", "inherit", "inherit"] },
+    );
+    if ((proc.exitCode ?? 1) !== 0) {
+      console.error(`Quantization failed (exit ${proc.exitCode})`);
+      process.exit(1);
+    }
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    try {
+      const sz = (statSync(out).size / 1e9).toFixed(2);
+      console.error(`Done: ${out} (${sz} GB, ${secs}s)`);
+    } catch {
+      console.error(`Done: ${out} (${secs}s)`);
+    }
+    produced.push({ format, path: out });
+  }
+
+  // Optional: drop the produced artifacts into ~/.hipfire/models so
+  // `hipfire list` + `hipfire run` find them without any extra steps.
+  if (opts.installLocal) {
+    mkdirSync(MODELS_DIR, { recursive: true });
+    for (const p of produced) {
+      const dest = join(MODELS_DIR, basename(p.path));
+      if (resolve(dest) !== resolve(p.path)) {
+        require("fs").copyFileSync(p.path, dest);
+        console.error(`Installed → ${dest}`);
+      }
+    }
+  }
+
+  // Optional: push the artifacts to a schuttdev-style HF repo. We upload
+  // each produced file individually so partial failures don't wipe state.
+  if (opts.uploadRepo) {
+    // `hf upload` does not create the repo itself — if --create-repo is set,
+    // use `hf repos create --exist-ok` which is idempotent.
+    if (opts.createRepo) {
+      console.error(`Ensuring HF repo ${opts.uploadRepo} exists ...`);
+      const mk = Bun.spawnSync(
+        ["hf", "repos", "create", opts.uploadRepo, "--type", "model", "--exist-ok"],
+        { stdio: ["inherit", "inherit", "inherit"] },
+      );
+      if ((mk.exitCode ?? 1) !== 0) {
+        console.error(`hf repos create failed. Check: hf auth whoami`);
+        process.exit(1);
+      }
+    }
+    for (const p of produced) {
+      console.error(`\nUploading ${p.path} → ${opts.uploadRepo}:${basename(p.path)} ...`);
+      const up = Bun.spawnSync(
+        ["hf", "upload", opts.uploadRepo, p.path, basename(p.path)],
+        { stdio: ["inherit", "inherit", "inherit"] },
+      );
+      if ((up.exitCode ?? 1) !== 0) {
+        console.error(`Upload failed for ${p.path} (exit ${up.exitCode}).`);
+        console.error(`  Check: hf auth whoami   |   If repo missing, pass --create-repo.`);
+        process.exit(1);
+      }
+    }
+    console.error(`\nUploaded ${produced.length} file(s) to ${opts.uploadRepo}.`);
+  }
+
+  // Optional: append a local user-alias so the custom tag is addressable.
+  if (opts.register) {
+    const aliasPath = join(HIPFIRE_DIR, "models.json");
+    let aliases: Record<string, any> = {};
+    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
+    const primary = produced.find(p => p.format === "mq4") ?? produced[0];
+    aliases[opts.register] = {
+      repo: opts.uploadRepo ?? "",
+      file: basename(primary.path),
+      local_path: primary.path,
+      registered_at: new Date().toISOString(),
+    };
+    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
+    console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
+    console.error(`  Try: hipfire run ${opts.register} "hello"`);
+  }
+}
+
 // ─── Helpers ────────────────────────────────────────────
+
+interface UserAlias {
+  repo?: string;
+  file: string;
+  local_path?: string;
+  registered_at?: string;
+}
+
+function loadUserAliases(): Record<string, UserAlias> {
+  try {
+    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
+  } catch { return {}; }
+}
 
 function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
+
+  // User aliases (from `hipfire quantize ... --register`) take precedence
+  // over the built-in REGISTRY so custom tags always resolve.
+  const userAliases = loadUserAliases();
+  const alias = userAliases[name] || userAliases[resolveModelTag(name)];
+  if (alias) {
+    if (alias.local_path && existsSync(alias.local_path)) return resolve(alias.local_path);
+    const p = join(MODELS_DIR, alias.file);
+    if (existsSync(p)) return p;
+  }
 
   // Resolve tag → filename
   const resolved = resolveModelTag(name);
@@ -793,47 +1304,69 @@ function findModel(name: string): string | null {
   }
 
   // Fuzzy search local dirs (top-level + one level of subdirectories)
-  // If the name includes a quant hint (hf4/hf6/mq4), match exactly. Otherwise prefer .hf4 (default quant).
+  // If the name includes a quant hint (hf4/hf6/mq4/mq6), match exactly.
+  // Otherwise prefer .mq4 (default quant: FWHT-rotated 4-bit, quality-gated,
+  // WMMA-accelerated on RDNA3+). Fall back to .hf4 only if no .mq4 is found
+  // so Qwen3 (which currently ships only .hf4) still resolves.
   const searchName = name.replace(":", "-");
-  const hasQuantHint = /\.(hf[46]|mq4)$|-(hf[46]|mq4)$/.test(name);
+  const hasQuantHint = /\.(hf[46]|mq[46])$|-(hf[46]|mq[46])$/.test(name);
+  const matchesName = (f: string) => f === name || f === searchName
+    || f.includes(name) || f.includes(searchName);
+  const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
+    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq");
+
+  // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
+  // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
+  const extPriority = (f: string): number => {
+    if (f.endsWith(".mq4")) return 0;
+    if (f.endsWith(".hf4")) return 1;
+    if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
+    if (f.endsWith(".mq6")) return 3;
+    if (f.endsWith(".hf6")) return 4;
+    return 99;
+  };
+
   const isModel = (f: string) => {
-    if (!(f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4"))) return false;
-    if (!(f.includes(name) || f.includes(searchName))) return false;
-    // Exact filename match — user typed the specific file they want
+    if (!hasValidExt(f)) return false;
+    if (!matchesName(f)) return false;
     if (f === name || f === searchName) return true;
-    // If user didn't specify a quant, only match the default (4-bit HF) variant.
-    // HF4 is still the default because it's the fastest; MQ4 is explicit opt-in
-    // for quality-gated workloads. .hf6 and .mq4 both require an explicit tag.
-    if (!hasQuantHint) {
-      if (f.endsWith(".hf6")) return false;
-      if (f.endsWith(".mq4")) return false;
-      if (f.endsWith(".hfq")) {
-        const stem = f.slice(0, -4); // strip .hfq
-        const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
-          || stem === searchName || stem === name;
-        if (!isDefaultQ4) return false;
-      }
+    // With a quant hint in the name, caller is explicit — any matching file is fine.
+    if (hasQuantHint) return true;
+    // No hint: accept any valid extension; extPriority picks the best one.
+    // Still filter .hfq to default-q4 flavor (.q4.hfq / -hfq4.hfq stems) so
+    // we don't return an experimental -hfq4g128.hfq instead of a proper .mq4.
+    if (f.endsWith(".hfq")) {
+      const stem = f.slice(0, -4);
+      const isDefaultQ4 = stem.endsWith(".q4") || stem.endsWith("-hfq4")
+        || stem === searchName || stem === name;
+      if (!isDefaultQ4) return false;
     }
     return true;
   };
+
   const dirs = [resolve(__dirname, "../models"), MODELS_DIR];
+  const candidates: string[] = [];
   for (const dir of dirs) {
     try {
       for (const f of readdirSync(dir)) {
         const full = join(dir, f);
-        if (isModel(f)) return full;
-        // Check one level of subdirectories (e.g., models/community/)
+        if (isModel(f)) candidates.push(full);
+        // One level of subdirectories (e.g. models/community/)
         try {
           if (statSync(full).isDirectory()) {
             for (const sf of readdirSync(full)) {
-              if (isModel(sf)) return join(full, sf);
+              if (isModel(sf)) candidates.push(join(full, sf));
             }
           }
         } catch {}
       }
     } catch {}
   }
-  return null;
+  if (candidates.length === 0) return null;
+  // When the user had an explicit hint, any match is fine — return the first
+  // (same behavior as before). Otherwise pick by preference order.
+  candidates.sort((a, b) => extPriority(basename(a)) - extPriority(basename(b)));
+  return candidates[0];
 }
 
 function listLocal() {
@@ -937,13 +1470,13 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     }
   }
 
-  process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
+  applyConfigEnv(cfg);
 
   // Start daemon
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send({ type: "load", model: modelPath});
+  await e.send(buildLoadMessage(modelPath, model));
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
 
@@ -996,7 +1529,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       try {
         await ve.start();
         await withTimeout(ve.send({ type: "ping" }).then(() => ve.recv()), 10_000, "ping");
-        await ve.send({ type: "load", model: modelPath});
+        await ve.send(buildLoadMessage(modelPath, model));
         const vloaded = await withTimeout(ve.recv(), LOAD_TIMEOUT, `v${v.n} load`);
         if (vloaded.type === "error") {
           console.error(`  v${v.n} ${v.name}: LOAD FAIL — ${vloaded.message}`);
@@ -1151,8 +1684,8 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
       }
     }
     if (modelPath) {
-      process.env.HIPFIRE_KV_MODE = resolveKvMode(cfg);
-      await e.send({ type: "load", model: modelPath});
+      applyConfigEnv(cfg);
+      await e.send(buildLoadMessage(modelPath, modelTag));
       const loaded = await e.recv();
       if (loaded.type === "error") {
         console.error(`Load failed: ${loaded.message}`);
@@ -1230,18 +1763,664 @@ async function profile(modelTag: string | undefined, jsonOutput: boolean, kernel
   console.log(`\n${fullOcc}/${filtered.length} kernels at max occupancy`);
 }
 
+// ─── Config TUI ─────────────────────────────────────────
+// Keyboard-driven settings editor. Raw ANSI, no deps.
+//   ↑/↓     — move between rows
+//   ←/→/sp  — cycle enum values (kv_cache, default_model)
+//   -/+     — nudge numeric values by their step
+//   enter   — edit a text/number field directly
+//   r       — reset selected row to default
+//   s       — save (writes ~/.hipfire/config.json, keeps only non-defaults)
+//   q / Esc — save+quit
+//   Ctrl+C  — abort without saving
+
+interface FieldMeta {
+  label: string;
+  desc: string;
+  options?: string[];           // enum values — shown inline, cycle-able
+  range?: [number, number];     // numeric clamp
+  step?: number;                // +/- nudge amount
+  decimals?: number;            // display precision for floats
+}
+
+// TUI exit actions — the case "config" orchestrator uses these to decide
+// what screen to show next. "exit" = user is done. "open_picker" = user
+// pressed Enter on the "[per-model configs]" virtual row.
+type TuiExit = "exit" | "open_picker";
+
+// Scope = null → edit global config. Scope = tag string → edit per-model
+// overlay for that tag. Per-model mode shows inherited values dimmed and
+// highlights overrides in cyan; `r` removes an override.
+function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> {
+  const isPerModel = !!scope;
+  const resolvedTag = scope ? resolveModelTag(scope) : null;
+
+  // Per-model mode: base values come from global cfg; overrides are sparse.
+  let overrides: PerModelOverride = isPerModel
+    ? { ...(loadPerModelConfigs()[resolvedTag!] ?? {}) }
+    : {};
+
+  // In per-model mode only show keys that can actually be overridden.
+  const allKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  const keys = isPerModel
+    ? allKeys.filter(k => (PER_MODEL_KEYS as readonly string[]).includes(k))
+    : allKeys;
+  // Virtual rows (nav-only, not real config keys). Only in global mode.
+  const navKeys = isPerModel ? [] : ["__per_model__"];
+  const totalRows = keys.length + navKeys.length;
+
+  // Effective value for a key: override wins in per-model mode, else cfg.
+  const effective = (k: keyof HipfireConfig): any =>
+    isPerModel && (overrides as any)[k] !== undefined ? (overrides as any)[k] : cfg[k];
+  const isOverridden = (k: keyof HipfireConfig): boolean =>
+    isPerModel && (overrides as any)[k] !== undefined;
+
+  // Build default_model options from REGISTRY so users can cycle through
+  // known tags without typing. "custom" lets them fall back to free text.
+  const modelOptions = Object.keys(REGISTRY).sort();
+
+  const meta: Record<string, FieldMeta> = {
+    kv_cache: {
+      label: "kv_cache",
+      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
+      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+    },
+    flash_mode: {
+      label: "flash_mode",
+      desc: "Flash attention (Q8: auto=ctx≥2048, always=force, never=disable; asym always flash)",
+      options: ["auto", "always", "never"],
+    },
+    default_model: {
+      label: "default_model",
+      desc: "model pre-warmed when `hipfire serve` starts",
+      options: modelOptions,
+    },
+    temperature: {
+      label: "temperature",
+      desc: "sampling randomness — 0 = greedy, higher = more diverse",
+      range: [0, 2], step: 0.05, decimals: 2,
+    },
+    top_p: {
+      label: "top_p",
+      desc: "nucleus sampling — only consider tokens covering this probability mass",
+      range: [0, 1], step: 0.05, decimals: 2,
+    },
+    repeat_penalty: {
+      label: "repeat_penalty",
+      desc: "discourage repeats — 1.05 is safe for MQ4/MQ6, 1.3 causes gibberish",
+      range: [1, 3], step: 0.05, decimals: 2,
+    },
+    max_tokens: {
+      label: "max_tokens",
+      desc: "default generation cap per `hipfire run` invocation (per-turn stop)",
+      range: [1, 131072], step: 64,
+    },
+    max_seq: {
+      label: "max_seq",
+      desc: "KV cache capacity (tokens). Allocated at model load — bigger = longer context",
+      range: [512, 524288], step: 4096,
+    },
+    thinking: {
+      label: "thinking",
+      desc: "Reasoning mode. on = model uses <think>...</think> (stripped from display); off = suppress thinking, answer directly",
+      options: ["on", "off"],
+    },
+    max_think_tokens: {
+      label: "max_think_tokens",
+      desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
+      range: [0, 32768], step: 128,
+    },
+    port: {
+      label: "port",
+      desc: "HTTP port for `hipfire serve` (OpenAI-compatible API)",
+      range: [1, 65535], step: 1,
+    },
+    idle_timeout: {
+      label: "idle_timeout",
+      desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
+      range: [0, 86400], step: 30,
+    },
+  };
+
+  let selected = 0;
+  let dirty = false;
+  let editing = false;
+  let editBuffer = "";
+  let flash = "";                  // transient status message
+
+  const stdout = process.stdout;
+  const stdin = process.stdin;
+  const write = (s: string) => stdout.write(s);
+
+  // Colors
+  const C = {
+    reset: "\x1b[0m",
+    dim: "\x1b[2m",
+    bold: "\x1b[1m",
+    red: "\x1b[31m",
+    green: "\x1b[32m",
+    yellow: "\x1b[33m",
+    cyan: "\x1b[36m",
+    magenta: "\x1b[35m",
+    inv: "\x1b[7m",
+  };
+
+  const fmtValue = (k: keyof HipfireConfig): string => {
+    const v = effective(k);
+    const m = meta[k];
+    if (typeof v === "number" && m.decimals !== undefined) {
+      return v.toFixed(m.decimals);
+    }
+    return String(v);
+  };
+
+  const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+
+  const roundStep = (v: number, step: number, decimals?: number) => {
+    if (decimals !== undefined) return Number(v.toFixed(decimals));
+    if (Number.isInteger(step)) return Math.round(v);
+    return v;
+  };
+
+  // Write to whichever bag this scope is editing: overrides in per-model
+  // mode, the global cfg otherwise. Always marks dirty.
+  const setValue = (k: keyof HipfireConfig, v: any) => {
+    if (isPerModel) (overrides as any)[k] = v;
+    else (cfg as any)[k] = v;
+    dirty = true;
+  };
+
+  const cycleOption = (k: keyof HipfireConfig, dir: number) => {
+    const m = meta[k];
+    if (!m.options) return;
+    const cur = String(effective(k));
+    let idx = m.options.indexOf(cur);
+    if (idx < 0) idx = 0;
+    const next = m.options[(idx + dir + m.options.length) % m.options.length];
+    setValue(k, next);
+  };
+
+  const nudge = (k: keyof HipfireConfig, dir: number) => {
+    const m = meta[k];
+    if (!m.range || m.step === undefined) return;
+    const cur = Number(effective(k));
+    const raw = cur + dir * m.step;
+    const next = clamp(roundStep(raw, m.step, m.decimals), m.range[0], m.range[1]);
+    if (validateConfigValue(k as string, next)) {
+      setValue(k, next);
+    }
+  };
+
+  const commitEdit = () => {
+    const k = keys[selected];
+    const defaultVal = CONFIG_DEFAULTS[k];
+    const parsed = typeof defaultVal === "number" ? Number(editBuffer) : editBuffer;
+    if (editBuffer.length > 0 && validateConfigValue(k as string, parsed as any)) {
+      const m = meta[k];
+      const finalVal = typeof parsed === "number" && m.decimals !== undefined
+        ? Number((parsed as number).toFixed(m.decimals))
+        : parsed;
+      setValue(k, finalVal);
+      flash = `${C.green}${k} = ${fmtValue(k)}${C.reset}`;
+    } else {
+      flash = `${C.red}invalid value for ${k}${C.reset}`;
+    }
+    editing = false;
+    editBuffer = "";
+  };
+
+  const render = () => {
+    // Cursor home + clear screen
+    write("\x1b[H\x1b[2J");
+    if (isPerModel) {
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
+      write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n\n`);
+    } else {
+      write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
+      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${ARCH_DEFAULTS.kv_cache}${C.reset}\n\n`);
+    }
+
+    // Column widths
+    const labelW = Math.max(...keys.map(k => meta[k].label.length)) + 2;
+    const valueW = 14;
+
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const m = meta[k];
+      const v = effective(k);
+      const overridden = isOverridden(k);
+      const isDefault = !isPerModel && v === CONFIG_DEFAULTS[k];
+      const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
+
+      // Value (editing takes priority visually)
+      let valCell: string;
+      if (editing && i === selected) {
+        valCell = `${C.yellow}${editBuffer}${C.inv} ${C.reset}`.padEnd(valueW + 20);
+      } else {
+        let color: string;
+        if (isPerModel) {
+          color = overridden ? C.cyan : C.dim;  // overridden values pop; inherited dim
+        } else {
+          color = isDefault ? C.dim : C.green;
+        }
+        valCell = `${color}${fmtValue(k)}${C.reset}`;
+        const pad = Math.max(0, valueW - fmtValue(k).length);
+        valCell = valCell + " ".repeat(pad);
+      }
+
+      let optHint = "";
+      const flashModeIgnored = k === "flash_mode" &&
+        typeof effective("kv_cache") === "string" &&
+        effective("kv_cache").startsWith("asym");
+      if (m.options) {
+        if (m.options.length <= 6) {
+          optHint = m.options.map(o => {
+            if (o === String(v)) {
+              return flashModeIgnored ? `${C.dim}${o}${C.reset}` : `${C.cyan}${o}${C.reset}`;
+            }
+            return `${C.dim}${o}${C.reset}`;
+          }).join(" ");
+          if (flashModeIgnored) optHint += `  ${C.yellow}(ignored — asym is flash-only)${C.reset}`;
+        } else {
+          const idx = m.options.indexOf(String(v));
+          const pos = idx >= 0 ? `${idx + 1}/${m.options.length}` : `?/${m.options.length}`;
+          optHint = `${C.dim}←→ cycle (${pos})${C.reset}`;
+        }
+      } else if (m.range) {
+        optHint = `${C.dim}${m.range[0]}${m.step && !Number.isInteger(m.step) ? ".0" : ""}–${m.range[1]}${C.reset}`;
+      }
+
+      // Status chip on the right: "(default)" for global, "(overridden)" or
+      // "(inherited)" for per-model mode so the user sees which rows belong
+      // to this model vs pulled from global.
+      let chip: string;
+      if (isPerModel) {
+        chip = overridden
+          ? `${C.cyan}(overridden)${C.reset}`
+          : `${C.dim}(inherited)${C.reset}`;
+      } else {
+        chip = isDefault ? `${C.dim}(default)${C.reset}` : " ".repeat(9);
+      }
+      const rowHeader = `${caret} ${m.label.padEnd(labelW)} ${valCell} ${chip}`;
+      write(`${rowHeader}  ${optHint}\n`);
+      if (i === selected) {
+        write(`${" ".repeat(3 + labelW)}${C.dim}${m.desc}${C.reset}\n`);
+      }
+    }
+
+    // Virtual nav rows (global mode only). Shown as a distinct-looking row
+    // the user can Enter into.
+    for (let n = 0; n < navKeys.length; n++) {
+      const rowIdx = keys.length + n;
+      const nk = navKeys[n];
+      const caret = rowIdx === selected ? `${C.cyan}▸${C.reset}` : " ";
+      if (nk === "__per_model__") {
+        const pmAll = loadPerModelConfigs();
+        const count = Object.keys(pmAll).length;
+        const label = "per-model configs".padEnd(labelW);
+        const val = count > 0
+          ? `${C.magenta}${count} override set${count === 1 ? "" : "s"}${C.reset}`
+          : `${C.dim}no overrides${C.reset}`;
+        write(`\n${caret} ${C.bold}${label}${C.reset} ${val}  ${C.dim}→ enter to open model picker${C.reset}\n`);
+        if (rowIdx === selected) {
+          write(`${" ".repeat(3 + labelW)}${C.dim}Per-model overlays let you customize settings for a specific model (e.g. bigger max_seq for long ctx on 9B).${C.reset}\n`);
+        }
+      }
+    }
+
+    write("\n");
+    if (editing) {
+      write(`  ${C.dim}enter: save · esc: cancel · backspace: delete${C.reset}\n`);
+    } else {
+      const saveState = dirty ? `${C.yellow}●${C.reset} unsaved` : `${C.dim}saved${C.reset}`;
+      const resetHelp = isPerModel ? "r remove override" : "r reset";
+      write(`  ${C.dim}↑↓ nav · ←→/space cycle · -/+ tweak · enter edit · ${resetHelp} · s save · q quit${C.reset}   ${saveState}\n`);
+    }
+    if (flash) {
+      write(`\n  ${flash}\n`);
+      flash = "";
+    }
+  };
+
+  return new Promise<TuiExit>((resolve) => {
+    if (!stdout.isTTY || !stdin.isTTY) {
+      // Can't run a TUI without a real terminal — fall through to list view
+      listConfig(cfg);
+      resolve("exit");
+      return;
+    }
+
+    stdin.setRawMode!(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    write("\x1b[?25l"); // hide cursor
+
+    const cleanup = () => {
+      write("\x1b[?25h"); // show cursor
+      stdin.setRawMode!(false);
+      stdin.pause();
+      stdin.removeAllListeners("data");
+      write("\n");
+    };
+
+    const onData = (data: string) => {
+      if (editing) {
+        // Text/number edit mode
+        if (data === "\r" || data === "\n") {
+          commitEdit();
+        } else if (data === "\x1b" || data === "\x1b\x1b") {
+          editing = false;
+          editBuffer = "";
+          flash = `${C.dim}edit cancelled${C.reset}`;
+        } else if (data === "\x7f" || data === "\b") {
+          editBuffer = editBuffer.slice(0, -1);
+        } else if (data === "\x03") { // Ctrl+C
+          cleanup();
+          process.exit(130);
+        } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
+          editBuffer += data;
+        }
+        render();
+        return;
+      }
+
+      // Helpers for virtual-row awareness
+      const onNavRow = () => selected >= keys.length;
+      const currentNavKey = () => onNavRow() ? navKeys[selected - keys.length] : null;
+      const saveAndExit = (action: TuiExit) => {
+        if (dirty) {
+          if (isPerModel) {
+            const all = loadPerModelConfigs();
+            if (Object.keys(overrides).length === 0) delete all[resolvedTag!];
+            else all[resolvedTag!] = { ...overrides };
+            savePerModelConfigs(all);
+          } else {
+            saveConfig(cfg);
+          }
+        }
+        cleanup();
+        resolve(action);
+      };
+
+      // Navigation + mutation
+      switch (data) {
+        case "\x1b[A": // up
+          selected = (selected + totalRows - 1) % totalRows;
+          break;
+        case "\x1b[B": // down
+          selected = (selected + 1) % totalRows;
+          break;
+        case "\x1b[C": // right
+        case " ":
+          if (onNavRow()) break;
+          cycleOption(keys[selected], +1);
+          if (!meta[keys[selected]].options) nudge(keys[selected], +1);
+          break;
+        case "\x1b[D": // left
+          if (onNavRow()) break;
+          cycleOption(keys[selected], -1);
+          if (!meta[keys[selected]].options) nudge(keys[selected], -1);
+          break;
+        case "+": case "=":
+          if (onNavRow()) break;
+          nudge(keys[selected], +1);
+          break;
+        case "-": case "_":
+          if (onNavRow()) break;
+          nudge(keys[selected], -1);
+          break;
+        case "\r": case "\n": {
+          if (onNavRow()) {
+            if (currentNavKey() === "__per_model__") {
+              saveAndExit("open_picker");
+              return;
+            }
+            break;
+          }
+          const k = keys[selected];
+          const m = meta[k];
+          if (m.options) {
+            cycleOption(k, +1);
+          } else {
+            editing = true;
+            editBuffer = "";
+          }
+          break;
+        }
+        case "r": case "R":
+          if (onNavRow()) break;
+          if (isPerModel) {
+            const k = keys[selected];
+            if (isOverridden(k)) {
+              delete (overrides as any)[k];
+              dirty = true;
+              flash = `${C.dim}${k} override removed (inheriting global)${C.reset}`;
+            } else {
+              flash = `${C.dim}${keys[selected]} is already inherited${C.reset}`;
+            }
+          } else {
+            (cfg as any)[keys[selected]] = CONFIG_DEFAULTS[keys[selected]];
+            dirty = true;
+            flash = `${C.dim}${keys[selected]} reset${C.reset}`;
+          }
+          break;
+        case "s": case "S":
+          if (isPerModel) {
+            const all = loadPerModelConfigs();
+            if (Object.keys(overrides).length === 0) delete all[resolvedTag!];
+            else all[resolvedTag!] = { ...overrides };
+            savePerModelConfigs(all);
+          } else {
+            saveConfig(cfg);
+          }
+          dirty = false;
+          flash = `${C.green}saved${C.reset}`;
+          break;
+        case "q": case "Q": case "\x1b":
+          saveAndExit("exit");
+          return;
+        case "\x03": case "\x04": // Ctrl+C / Ctrl+D
+          cleanup();
+          process.exit(130);
+      }
+      render();
+    };
+
+    stdin.on("data", onData);
+    render();
+  });
+}
+
+// Sub-TUI launched from the global config TUI's "[per-model configs]" row.
+// Lists registered models (REGISTRY + any user-registered aliases), shows
+// which have overrides, and returns the selected tag or null if user escapes.
+function modelPickerTui(): Promise<string | null> {
+  const tags = [
+    ...Object.keys(REGISTRY),
+    ...Object.keys(loadUserAliases()),
+  ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
+
+  if (tags.length === 0) {
+    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
+    return Promise.resolve(null);
+  }
+
+  const overlays = loadPerModelConfigs();
+  let selected = 0;
+  const stdout = process.stdout;
+  const stdin = process.stdin;
+  const write = (s: string) => stdout.write(s);
+  const C = {
+    reset: "\x1b[0m", dim: "\x1b[2m", bold: "\x1b[1m",
+    cyan: "\x1b[36m", magenta: "\x1b[35m", yellow: "\x1b[33m",
+  };
+
+  const render = () => {
+    write("\x1b[H\x1b[2J");
+    write(`${C.bold}hipfire config — model picker${C.reset}\n`);
+    write(`${C.dim}Select a model to edit its per-model overrides. Esc to cancel.${C.reset}\n\n`);
+    for (let i = 0; i < tags.length; i++) {
+      const tag = tags[i];
+      const ov = overlays[tag];
+      const cnt = ov ? Object.keys(ov).length : 0;
+      const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
+      const entry = REGISTRY[tag];
+      const desc = entry?.desc ?? "(user-registered)";
+      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
+      const marker = cnt > 0
+        ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
+        : `${C.dim}(no overrides)${C.reset}`;
+      write(` ${caret} ${tag.padEnd(22)} ${size}  ${marker.padEnd(30)} ${C.dim}${desc}${C.reset}\n`);
+    }
+    write(`\n  ${C.dim}↑↓ nav · enter open · esc/q cancel${C.reset}\n`);
+  };
+
+  return new Promise<string | null>((resolve) => {
+    if (!stdout.isTTY || !stdin.isTTY) { resolve(null); return; }
+    stdin.setRawMode!(true);
+    stdin.resume();
+    stdin.setEncoding("utf8");
+    write("\x1b[?25l");
+
+    const cleanup = () => {
+      write("\x1b[?25h");
+      stdin.setRawMode!(false);
+      stdin.pause();
+      stdin.removeAllListeners("data");
+      write("\n");
+    };
+
+    stdin.on("data", (data: string) => {
+      switch (data) {
+        case "\x1b[A": selected = (selected + tags.length - 1) % tags.length; render(); return;
+        case "\x1b[B": selected = (selected + 1) % tags.length; render(); return;
+        case "\r": case "\n":
+          cleanup();
+          resolve(tags[selected]);
+          return;
+        case "q": case "Q": case "\x1b":
+          cleanup();
+          resolve(null);
+          return;
+        case "\x03": case "\x04":
+          cleanup();
+          process.exit(130);
+      }
+    });
+    render();
+  });
+}
+
+function listConfig(cfg: HipfireConfig): void {
+  const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
+  console.log(`Config: ${CONFIG_PATH}\n`);
+  for (const k of validKeys) {
+    const v = cfg[k];
+    const isDefault = v === CONFIG_DEFAULTS[k];
+    console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
+  }
+  console.log(`\nInteractive: hipfire config`);
+  console.log(`Set:         hipfire config set <key> <value>`);
+  console.log(`Reset:       hipfire config reset [key]`);
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
-  case "serve": await serve(parseInt(rest[0]) || cfg.port); break;
+  case "serve": {
+    // Parse flags: `hipfire serve [port] [-d|--detach]`. Port can be anywhere.
+    let port: number | null = null;
+    let detach = false;
+    for (const a of rest) {
+      if (a === "-d" || a === "--detach" || a === "--background") detach = true;
+      else if (/^\d+$/.test(a)) port = parseInt(a, 10);
+      else if (a === "-h" || a === "--help") {
+        console.error(`Usage: hipfire serve [port] [-d|--detach]\n\n`
+          + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
+          + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
+          + `Background daemon:\n`
+          + `  hipfire serve -d           # start in background\n`
+          + `  hipfire stop               # kill it\n`
+          + `  hipfire ps                 # check if running\n`
+          + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
+        process.exit(0);
+      } else { console.error(`Unknown serve arg: ${a}`); process.exit(1); }
+    }
+    port = port ?? cfg.port;
+
+    if (detach) {
+      // Refuse to start a second one.
+      const existing = readServePid();
+      if (existing) {
+        console.error(`hipfire serve already running (PID ${existing}) on port ${cfg.port}.`);
+        console.error(`  Stop it: hipfire stop`);
+        process.exit(1);
+      }
+      // Fork a detached child. `setsid` gives it its own session so Ctrl-C
+      // in the parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout
+      // + stderr go to the log file. HIPFIRE_DETACHED prevents infinite forking.
+      const self = process.argv[0];
+      const script = process.argv[1];
+      const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
+      const child = Bun.spawn(["setsid", "nohup", self, script, "serve", String(port)], {
+        stdin: "ignore",
+        stdout: logFd,
+        stderr: logFd,
+        env: { ...process.env, HIPFIRE_DETACHED: "1" },
+      });
+      child.unref();
+      // Poll until /health is reachable (up to ~30s for model pre-warm).
+      const deadline = Date.now() + 30_000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 250));
+        if (await isServeUp(port)) break;
+      }
+      if (await isServeUp(port)) {
+        console.log(`hipfire serve started in background (PID ${child.pid}, port ${port})`);
+        console.log(`  log:  ${SERVE_LOG_FILE}`);
+        console.log(`  stop: hipfire stop`);
+      } else {
+        console.error(`Serve started (PID ${child.pid}) but /health did not respond within 30s.`);
+        console.error(`Check the log: tail -f ${SERVE_LOG_FILE}`);
+      }
+      break;
+    }
+    await serve(port);
+    break;
+  }
+  case "stop": {
+    const pid = readServePid();
+    if (!pid) {
+      console.log("hipfire serve is not running.");
+      break;
+    }
+    try {
+      process.kill(pid, "SIGTERM");
+      // Wait up to 5s for graceful shutdown
+      for (let i = 0; i < 50; i++) {
+        await new Promise(r => setTimeout(r, 100));
+        if (!isPidAlive(pid)) break;
+      }
+      if (isPidAlive(pid)) {
+        console.error(`PID ${pid} did not exit within 5s — sending SIGKILL`);
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+      try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+      console.log(`hipfire serve stopped (PID ${pid})`);
+    } catch (err: any) {
+      console.error(`Failed to stop serve (PID ${pid}): ${err?.message ?? err}`);
+      process.exit(1);
+    }
+    break;
+  }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.3)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
-      "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.3 },
+      "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
       "--max-tokens": { default: 512 },
     };
     const flags: Record<string, string> = {};
@@ -1292,6 +2471,14 @@ switch (cmd) {
     } else {
       console.log("No local models. Pull one:\n  hipfire pull qwen3.5:9b\n");
     }
+    const userAliases = loadUserAliases();
+    if (Object.keys(userAliases).length > 0) {
+      console.log("\nUser aliases (hipfire quantize --register):\n");
+      for (const [tag, a] of Object.entries(userAliases)) {
+        const where = a.local_path ?? (a.repo ? `${a.repo}:${a.file}` : a.file);
+        console.log(`  ${tag.padEnd(22)} ${where}`);
+      }
+    }
     if (showRemote || local.length === 0) {
       console.log("\nAvailable models:\n");
       const localFiles = new Set(local.map(m => m.name));
@@ -1299,7 +2486,69 @@ switch (cmd) {
         const status = localFiles.has(entry.file) ? " [downloaded]" : "";
         console.log(`  ${tag.padEnd(22)} ${entry.size_gb.toString().padStart(5)}GB  ${entry.desc}${status}`);
       }
-      console.log("\nPull: hipfire pull <model>  (e.g. hipfire pull qwen3.5:9b)");
+      console.log("\nPull:     hipfire pull <model>      (e.g. hipfire pull qwen3.5:9b)");
+      console.log("Quantize: hipfire quantize <hf-id>   (registers a local alias)");
+    }
+    break;
+  }
+  case "ps": {
+    // List running hipfire-related processes: serve daemons, quantize jobs, uploads.
+    const sh = (cmd: string) => {
+      try { const r = Bun.spawnSync(["bash", "-c", cmd], { stdout: "pipe", stderr: "pipe" }); return r.stdout?.toString().trim() || ""; }
+      catch { return ""; }
+    };
+    const grepPatterns = [
+      "hipfire-quantize",        // quantizer binary
+      "target/release/examples/daemon",  // inference daemon
+      "target/release/examples/serve",   // http serve wrapper (if any)
+      "cli/index.ts.*serve",     // bun CLI running serve
+      "cli/index.ts.*quantize",  // bun CLI running quantize
+      "hf upload schuttdev",     // HF uploads
+    ];
+    const groups: { label: string; pattern: string; entries: string[] }[] = [
+      { label: "Inference daemon", pattern: "daemon", entries: [] },
+      { label: "Quantize jobs", pattern: "quantize", entries: [] },
+      { label: "HF uploads", pattern: "hf upload", entries: [] },
+    ];
+    const lines = sh(`ps -eo pid,etime,rss,args | grep -E '${grepPatterns.join("|")}' | grep -v grep`).split("\n").filter(Boolean);
+    for (const line of lines) {
+      const m = line.match(/^\s*(\d+)\s+(\S+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const [, pid, etime, rss, args] = m;
+      const rssMb = (parseInt(rss) / 1024).toFixed(0);
+      const shortArgs = args.length > 140 ? args.slice(0, 140) + "…" : args;
+      const entry = `  ${pid.padStart(7)}  ${etime.padStart(10)}  ${rssMb.padStart(6)}M  ${shortArgs}`;
+      if (/daemon/.test(args)) groups[0].entries.push(entry);
+      else if (/quantize/.test(args)) groups[1].entries.push(entry);
+      else if (/hf upload/.test(args)) groups[2].entries.push(entry);
+    }
+    let total = 0;
+    for (const g of groups) total += g.entries.length;
+    if (total === 0) {
+      console.log("No hipfire processes running.");
+      console.log("\nStart one:");
+      console.log("  hipfire serve                # inference daemon");
+      console.log("  hipfire quantize <hf-id>     # quantize a model");
+      break;
+    }
+    console.log(`${total} hipfire process${total === 1 ? "" : "es"} running:\n`);
+    console.log("  PID        ETIME       RSS     COMMAND");
+    for (const g of groups) {
+      if (g.entries.length === 0) continue;
+      console.log(`\n[${g.label}]`);
+      for (const e of g.entries) console.log(e);
+    }
+    // Show local serve port availability + detached PID (if any)
+    const port = cfg.port;
+    const portInUse = sh(`ss -tlnp 2>/dev/null | grep :${port}`);
+    const detachedPid = readServePid();
+    if (detachedPid) {
+      console.log(`\nserve port ${port}: ACTIVE (detached, PID ${detachedPid})`);
+      console.log(`  stop: hipfire stop    |    log: tail -f ${SERVE_LOG_FILE}`);
+    } else if (portInUse) {
+      console.log(`\nserve port ${port}: ACTIVE (foreground)`);
+    } else {
+      console.log(`\nserve port ${port}: free`);
     }
     break;
   }
@@ -1379,12 +2628,25 @@ switch (cmd) {
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
     );
     if (build.exitCode !== 0) { console.error("Build failed."); process.exit(1); }
+    // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
+    const buildQ = Bun.spawnSync(
+      ["cargo", "build", "--release", "-p", "hipfire-quantize"],
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
+    );
+    if (buildQ.exitCode !== 0) { console.error("Build (hipfire-quantize) failed."); process.exit(1); }
     // Recopy binaries
     const binDir = join(HIPFIRE_DIR, "bin");
     const { copyFileSync } = await import("fs");
     const exe = process.platform === "win32" ? ".exe" : "";
+    // Example binaries live under target/release/examples/
     for (const bin of ["daemon", "infer", "run"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
+      const dst = join(binDir, `${bin}${exe}`);
+      if (existsSync(src)) { copyFileSync(src, dst); }
+    }
+    // Workspace binaries (e.g. hipfire-quantize) live under target/release/
+    for (const bin of ["hipfire-quantize"]) {
+      const src = join(repoDir, `target/release/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
     }
@@ -1681,47 +2943,260 @@ Examples:
     }
     break;
   }
+  case "quantize": {
+    const input = rest[0];
+    if (!input || input === "-h" || input === "--help") {
+      console.error(`Usage: hipfire quantize <hf-model-id | local-dir> [flags]
+
+Flags:
+  --format <mq4|mq6|q8>      Quantization format (repeatable — default: mq4)
+  --both                     Shorthand for --format mq4 --format mq6
+  -o, --output <path>        Output file (single format only)
+  --output-dir <dir>         Directory for outputs (multi-format: required)
+  --stem <name>              Override the output basename (default: input basename)
+  --upload <owner/repo>      Push outputs to HuggingFace after quantize
+  --create-repo              Create the HF repo if it doesn't exist
+  --install                  Copy outputs into ~/.hipfire/models (so \`hipfire run\` finds them)
+  --register <tag>           Add a local alias (e.g. my-finetune:4b) to ~/.hipfire/models.json
+
+Formats:
+  mq4   FWHT-rotated 4-bit, quality-gated — recommended for production
+  mq6   FWHT-rotated 6-bit — higher quality, ~1.47x file size
+  q8    Symmetric Q8 — reference/debugging
+
+Examples:
+  # Quantize any Qwen 3.5 model from HF, both formats, upload + install:
+  hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both \\
+      --upload schuttdev/hipfire-qwopus-4b --create-repo \\
+      --install --register qwopus:4b
+
+  # Local fine-tune → MQ4:
+  hipfire quantize ./my-finetune --format mq4 -o finetune.mq4
+
+  # One-shot all formats from local dir:
+  hipfire quantize ./model --format mq4 --format mq6 --output-dir ./out
+
+The quantizer runs on CPU and takes minutes-to-tens-of-minutes
+depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
+      process.exit(input ? 0 : 1);
+    }
+    const formats: string[] = [];
+    let output: string | undefined;
+    let outputDir: string | undefined;
+    let stem: string | undefined;
+    let uploadRepo: string | undefined;
+    let createRepo = false;
+    let installLocal = false;
+    let register: string | undefined;
+    for (let i = 1; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--format") {
+        const f = rest[++i];
+        if (!f) { console.error("--format requires a value"); process.exit(1); }
+        formats.push(f);
+      } else if (a === "--both") {
+        formats.push("mq4", "mq6");
+      } else if (a === "-o" || a === "--output") {
+        output = rest[++i];
+        if (!output) { console.error("--output requires a value"); process.exit(1); }
+      } else if (a === "--output-dir") {
+        outputDir = rest[++i];
+        if (!outputDir) { console.error("--output-dir requires a value"); process.exit(1); }
+      } else if (a === "--stem") {
+        stem = rest[++i];
+        if (!stem) { console.error("--stem requires a value"); process.exit(1); }
+      } else if (a === "--upload") {
+        uploadRepo = rest[++i];
+        if (!uploadRepo || !/^[^/]+\/[^/]+$/.test(uploadRepo)) {
+          console.error("--upload requires owner/repo (e.g. schuttdev/hipfire-foo)"); process.exit(1);
+        }
+      } else if (a === "--create-repo") {
+        createRepo = true;
+      } else if (a === "--install") {
+        installLocal = true;
+      } else if (a === "--register") {
+        register = rest[++i];
+        if (!register) { console.error("--register requires a tag (e.g. my-finetune:4b)"); process.exit(1); }
+      } else {
+        console.error(`Unknown argument: ${a}\nRun 'hipfire quantize --help' for usage.`);
+        process.exit(1);
+      }
+    }
+    if (formats.length === 0) formats.push("mq4");
+    const validFormats = ["mq4", "mq6", "q8", "q8f16", "hfq4", "hfq4g256", "hfq6", "hfq6g256"];
+    for (const f of formats) {
+      if (!validFormats.includes(f)) {
+        console.error(`Unsupported format: ${f}\nSupported: mq4, mq6, q8`);
+        process.exit(1);
+      }
+    }
+    // Dedupe preserving order (e.g. --both --format mq4 shouldn't quantize twice)
+    const uniqFormats = Array.from(new Set(formats));
+    await quantize(input, {
+      formats: uniqFormats,
+      output, outputDir, stem,
+      uploadRepo, createRepo,
+      installLocal,
+      register,
+    });
+    break;
+  }
   case "config": {
-    const [action, key, value] = rest;
+    // `hipfire config`                                  → global TUI
+    // `hipfire config list|get|set|reset [...]`          → global scripting
+    // `hipfire config <model:tag>`                       → per-model TUI
+    // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
+    //
+    // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
+    // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
+    let [firstArg, maybeKey, ...valueArgs] = rest;
+    let modelScope: string | null = null;
+    if (firstArg && !["list", "get", "set", "reset"].includes(firstArg)) {
+      // If looks like a tag, scope to that model
+      const resolved = resolveModelTag(firstArg);
+      if (REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = resolved;
+        [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
+      }
+    }
+    const action = firstArg;
+    const key = maybeKey;
+    const value = valueArgs.join(" ") || undefined;
+
     const validKeys = Object.keys(CONFIG_DEFAULTS) as (keyof HipfireConfig)[];
 
-    if (!action || action === "list") {
-      // Show all config values, marking non-default ones
-      console.log(`Config: ${CONFIG_PATH}\n`);
-      for (const k of validKeys) {
-        const v = cfg[k];
-        const isDefault = v === CONFIG_DEFAULTS[k];
-        console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
+    // Per-model scripting helpers (shared between get/set/reset)
+    const writePerModel = (k: PerModelKey, v: any) => {
+      const all = loadPerModelConfigs();
+      const cur = all[modelScope!] ?? {};
+      (cur as any)[k] = v;
+      all[modelScope!] = cur;
+      savePerModelConfigs(all);
+    };
+    const unsetPerModel = (k: PerModelKey) => {
+      const all = loadPerModelConfigs();
+      const cur = all[modelScope!];
+      if (cur && k in cur) {
+        delete (cur as any)[k];
+        if (Object.keys(cur).length === 0) delete all[modelScope!];
+        savePerModelConfigs(all);
+        return true;
       }
-      console.log(`\nSet:   hipfire config set <key> <value>`);
-      console.log(`Reset: hipfire config reset [key]`);
+      return false;
+    };
+
+    if (!action) {
+      // Bare invocation → TUI. The global TUI can signal "open_picker" when
+      // the user selects [per-model configs]; we then loop between picker →
+      // per-model TUI → picker until the user cancels out.
+      if (modelScope) {
+        await configTui(cfg, modelScope);
+      } else {
+        let state: "global" | "picker" = "global";
+        let pendingTag: string | null = null;
+        while (true) {
+          if (state === "global") {
+            const act = await configTui(cfg, null);
+            if (act === "exit") break;
+            state = "picker";
+          } else {
+            const picked = pendingTag ?? await modelPickerTui();
+            pendingTag = null;
+            if (!picked) { state = "global"; continue; }
+            await configTui(cfg, picked);
+            // After the per-model editor exits, return to the picker so the
+            // user can tweak another model; Esc in the picker goes back to
+            // global.
+          }
+        }
+      }
+    } else if (action === "list") {
+      if (modelScope) {
+        const ov = loadPerModelConfigs()[modelScope] ?? {};
+        const merged = resolveModelConfig(modelScope);
+        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
+        for (const k of validKeys) {
+          if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
+          const v = (merged as any)[k];
+          const isOverridden = k in ov;
+          const marker = isOverridden ? "(overridden)" : "(inherited)";
+          console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${marker}`);
+        }
+        console.log(`\nInteractive: hipfire config ${modelScope}`);
+        console.log(`Set:         hipfire config ${modelScope} set <key> <value>`);
+        console.log(`Unset:       hipfire config ${modelScope} reset <key>`);
+      } else {
+        listConfig(cfg);
+      }
     } else if (action === "get") {
-      if (!key) { console.error("Usage: hipfire config get <key>"); process.exit(1); }
+      if (!key) { console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} get <key>`); process.exit(1); }
       if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
-      console.log(cfg[key as keyof HipfireConfig]);
+      if (modelScope) {
+        if (!(PER_MODEL_KEYS as readonly string[]).includes(key)) {
+          console.error(`${key} is not a per-model override (use global: hipfire config get ${key})`);
+          process.exit(1);
+        }
+        const v = (resolveModelConfig(modelScope) as any)[key];
+        console.log(v);
+      } else {
+        console.log(cfg[key as keyof HipfireConfig]);
+      }
     } else if (action === "set") {
-      if (!key || value === undefined) { console.error("Usage: hipfire config set <key> <value>\n\nKeys:\n" + validKeys.map(k => `  ${k.padEnd(18)} (default: ${CONFIG_DEFAULTS[k]})`).join("\n")); process.exit(1); }
+      if (!key || value === undefined) {
+        const validForScope = modelScope ? PER_MODEL_KEYS : validKeys;
+        console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} set <key> <value>\n\nKeys:\n` + (validForScope as readonly string[]).map((k: string) => `  ${k.padEnd(18)} (default: ${(CONFIG_DEFAULTS as any)[k]})`).join("\n"));
+        process.exit(1);
+      }
       if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}\nValid keys: ${validKeys.join(", ")}`); process.exit(1); }
+      if (modelScope && !(PER_MODEL_KEYS as readonly string[]).includes(key)) {
+        console.error(`${key} is global-only (set via: hipfire config set ${key} <value>)`);
+        process.exit(1);
+      }
       const defaultVal = CONFIG_DEFAULTS[key as keyof HipfireConfig];
       const parsed = typeof defaultVal === "number" ? Number(value) : value;
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: q8, givens4, givens2 (turbo2/3/4 also accepted)",
+          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
           repeat_penalty: "number between 1.0 and 3.0",
-          max_tokens: "integer between 1 and 32768",
+          max_tokens: "integer between 1 and 131072",
+          max_seq: "KV cache capacity (tokens). Integer 512-524288",
+          thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
+          max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
           port: "integer between 1 and 65535",
+          idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
         };
         console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
       }
-      (cfg as any)[key] = parsed;
-      saveConfig(cfg);
-      console.log(`${key} = ${parsed}`);
+      if (modelScope) {
+        writePerModel(key as PerModelKey, parsed);
+        console.log(`${modelScope}: ${key} = ${parsed} (overridden)`);
+      } else {
+        (cfg as any)[key] = parsed;
+        saveConfig(cfg);
+        console.log(`${key} = ${parsed}`);
+      }
     } else if (action === "reset") {
-      if (key) {
+      if (modelScope) {
+        // Per-model reset = remove the override so it falls back to global.
+        if (key) {
+          if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}`); process.exit(1); }
+          if (unsetPerModel(key as PerModelKey)) {
+            console.log(`${modelScope}: ${key} override removed (inheriting global)`);
+          } else {
+            console.log(`${modelScope}: ${key} was not overridden`);
+          }
+        } else {
+          const all = loadPerModelConfigs();
+          delete all[modelScope];
+          savePerModelConfigs(all);
+          console.log(`${modelScope}: all overrides cleared`);
+        }
+      } else if (key) {
         if (!validKeys.includes(key as any)) { console.error(`Unknown key: ${key}`); process.exit(1); }
         (cfg as any)[key] = CONFIG_DEFAULTS[key as keyof HipfireConfig];
         saveConfig(cfg);
@@ -1731,32 +3206,65 @@ Examples:
         console.log("All config reset to defaults");
       }
     } else {
-      console.error("Usage: hipfire config [list|get|set|reset]");
+      console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} [list|get|set|reset]`);
     }
     break;
   }
-  default:
+  default: {
+    // First-run hint: if no config, no models, show a friendly setup tip.
+    // (Only when invoked with no args — still show full help text below.)
+    if (!cmd) {
+      const hasModels = existsSync(MODELS_DIR) && readdirSync(MODELS_DIR).length > 0;
+      const hasConfig = existsSync(CONFIG_PATH);
+      const isFirstRun = !hasModels && !hasConfig;
+      if (isFirstRun) {
+        console.log(`\x1b[1mWelcome to hipfire — LLM inference for AMD GPUs\x1b[0m`);
+        console.log(`\nDetected GPU: \x1b[36m${DETECTED_ARCH || "unknown"}\x1b[0m · KV default: \x1b[36m${ARCH_DEFAULTS.kv_cache}\x1b[0m`);
+        console.log(`\nFirst-run setup:`);
+        console.log(`  1. Sanity-check your GPU:   \x1b[1mhipfire diag\x1b[0m`);
+        console.log(`  2. Pull a model:            \x1b[1mhipfire pull qwen3.5:4b\x1b[0m`);
+        console.log(`  3. Run your first prompt:   \x1b[1mhipfire run qwen3.5:4b "hello"\x1b[0m`);
+        console.log(`  4. Tweak settings:          \x1b[1mhipfire config\x1b[0m  (interactive)`);
+        console.log(`\nFull command list:\n`);
+      }
+    }
     console.log(`hipfire — LLM inference for AMD GPUs
 
   pull <model>          Download model from HuggingFace
-  run <model> [prompt]  Generate text (auto-pulls if needed)
-  serve [port]          Start OpenAI-compatible server (default: ${cfg.port})
+  run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
+  serve [port] [-d]     Start OpenAI-compatible server (-d = background daemon)
+  stop                  Stop the background serve daemon
+  quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
   profile [model]       Kernel efficiency profiler (--json, --kernel <name>)
   list [-r]             Show local models (-r: show available too)
-  config [list|set|get|reset]  Persistent settings (kv_cache, temperature, etc.)
+  config                Interactive settings editor (TUI); also: config [list|set|get|reset]
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
+  ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
   update                Pull latest code, rebuild, update kernels
 
-Models:
-  hipfire pull qwen3.5:9b            # 4.5GB, best quality for 8GB cards
-  hipfire pull qwen3.5:4b            # 2.1GB, best speed/quality balance
-  hipfire pull qwen3.5:27b           # 14.3GB, needs 16GB+ VRAM
-  hipfire pull qwen3.5:9b-hf6      # 6.8GB, higher quality (6-bit)
+Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
+  hipfire pull qwen3.5:4b            # 2.6GB, best speed/quality balance
+  hipfire pull qwen3.5:9b            # 5.3GB, best quality for 8GB cards
+  hipfire pull qwen3.5:27b           # 15GB, needs 16GB+ VRAM
+  hipfire pull qwen3.5:0.8b          # 0.55GB, tiny footprint
+
+MQ6 tags (higher quality, ~1.47× larger):
+  hipfire pull qwen3.5:9b-mq6        # 7.3GB, higher quality 9B
+  hipfire pull qwen3.5:27b-mq6       # 21GB, needs 24GB+ VRAM
 
 Quick start:
   hipfire pull qwen3.5:4b
   hipfire run qwen3.5:4b "What is the capital of France?"
-  hipfire serve`);
+  hipfire serve
+
+Quantize any Qwen 3.5 HF model (or local dir) — one-shot download + upload:
+  hipfire quantize Qwen/Qwen3.5-4B
+  hipfire quantize Jackrong/Qwopus3.5-4B-v3 --both \\
+        --upload schuttdev/hipfire-qwopus-4b --create-repo \\
+        --install --register qwopus:4b
+  hipfire quantize ./my-finetune --format mq6 -o my-finetune.mq6`);
+    break;
+  }
 }
