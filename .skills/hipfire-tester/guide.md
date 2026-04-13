@@ -1,270 +1,174 @@
 # hipfire-tester: Agent Guide
 
-You are a Claude Code agent helping an alpha tester run benchmarks, quantize models,
-and report results for the hipfire inference engine. hipfire runs LLMs on AMD RDNA GPUs
-via a Rust-native HIP path — no Python in the hot path.
+You are helping a tester bring up hipfire on an RDNA GPU, run the standard
+test matrix, and report results back upstream. Works for any agent framework.
 
-## Supported GPUs
+## Supported GPUs (v0.1.5 "redline")
 
-| Card | Arch | VRAM | Status |
-|------|------|------|--------|
-| RX 5700 XT | gfx1010 | 8GB | Primary dev target |
-| RX 6800 XT | gfx1030 | 16GB | Alpha target |
-| RX 7900 XTX | gfx1100 | 24GB | Alpha target |
-| RX 9060 | gfx1200 | 16GB | Alpha target |
-| RX 9070 XT | gfx1201 | 16GB | Alpha target, RDNA4-optimized kernels |
+| Card | Arch | VRAM | Status | Default KV |
+|---|---|---|---|---|
+| RX 5700 XT | gfx1010 | 8GB | smoke-test | asym2 |
+| BC-250 APU | gfx1013 | 14GB shared | tested | asym2 |
+| V620 Pro | gfx1030 | 32GB | tested ✓ | asym3 |
+| RX 6700 XT | gfx1031 | 12GB | expected to work | asym3 |
+| RX 6600 XT | gfx1032 | 8GB | expected to work | asym2 |
+| RX 7900 XTX | gfx1100 | 24GB | **primary target ✓** | asym3 |
+| RX 7900 XT | gfx1101 | 16GB | expected | asym3 |
+| RX 7800 XT | gfx1102 | 12GB | expected | asym3 |
+| Strix Halo | gfx1151 | 16GB APU | expected | asym2 |
+| RX 9070 XT | gfx1200/1201 | 16GB (RDNA4) | expected | asym3 |
 
-## Quantizing Models
-
-### Build the quantizer
-
-```bash
-cargo build --release -p hipfire-quantize
-```
-
-### Download and quantize from HuggingFace
+## Phase 1: Install + verify
 
 ```bash
-# HFQ4 — fastest, 0.53 B/w
-target/release/hipfire-quantize \
-  --input Qwen/Qwen3.5-27B \
-  --output models/qwen3.5-27b.q4.hfq \
-  --format hfq4
-
-# HFQ6 — best quality, 0.78 B/w
-target/release/hipfire-quantize \
-  --input Qwen/Qwen3.5-27B \
-  --output models/qwen3.5-27b.hfq6.hfq \
-  --format hfq6
+curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
+hipfire diag
 ```
 
-### Available formats
+`hipfire diag` should report:
+- Your arch (e.g. `GPU arch: gfx1030`)
+- VRAM free/total
+- Pre-compiled kernels count (>= 50 typically)
+- HIP probe OK
+
+If `diag` shows issues, chain to the `hipfire-diag` skill for interpretation.
+
+## Phase 2: Pull the reference model
+
+```bash
+hipfire pull qwen3.5:4b        # ~2.6 GB — standard test model
+```
+
+Other sizes:
+
+```bash
+hipfire pull qwen3.5:0.8b       # 0.55 GB  — tiny card
+hipfire pull qwen3.5:9b         # 5.3 GB   — 8GB cards OK
+hipfire pull qwen3.5:27b        # 15 GB    — needs 16GB+ VRAM
+```
+
+MQ6 variants for higher-quality tests:
+
+```bash
+hipfire pull qwen3.5:4b-mq6     # 3.5 GB
+hipfire pull qwen3.5:9b-mq6     # 7.3 GB
+```
+
+## Phase 3: Single-run sanity
+
+```bash
+hipfire run qwen3.5:4b "Explain WMMA in one paragraph."
+```
+
+Expected: a coherent paragraph ending with tok/s stats. First run incurs
+kernel JIT cost (2-5 min on slow hardware, cached at
+`/tmp/hipfire_kernels/`).
+
+## Phase 4: Multi-turn recall test
+
+This is the key v0.1.5 regression gate — ensures asym3 K kernel head_dim=256
+fix is intact:
+
+```bash
+hipfire stop 2>/dev/null
+hipfire serve -d
+sleep 30   # wait for warmup
+curl -s http://localhost:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.5:9b","messages":[
+    {"role":"user","content":"My name is Kaden."},
+    {"role":"assistant","content":"Hello Kaden!"},
+    {"role":"user","content":"What is my name? One word."}
+  ],"max_tokens":50,"temperature":0}' \
+  | python3 -c "import json,sys; r=json.load(sys.stdin); print(repr(r['choices'][0]['message']['content'].strip()))"
+hipfire stop
+```
+
+**Expected:** `'Kaden'` (after think-block strip) — exact word or with minor
+punctuation. Anything else is a regression.
+
+## Phase 5: Prefill + decode sweep
+
+```bash
+for size in 0.8b 4b 9b 27b; do
+  m=~/.hipfire/models/qwen3.5-${size}.mq4
+  [ -f "$m" ] || { echo "$size: MISSING"; continue; }
+  for pp in 32 128 512 2048; do
+    r=$(HIPFIRE_KV_MODE=asym3 ~/.hipfire/bin/bench_qwen35_mq4 "$m" \
+        --prefill $pp --gen 30 --warmup 10 2>&1 | grep -m1 "^SUMMARY")
+    p=$(echo "$r" | sed -nE 's/.*prefill_tok_s=([0-9.]+).*/\1/p')
+    d=$(echo "$r" | sed -nE 's/.*gen_tok_s=([0-9.]+).*/\1/p')
+    bw=$(echo "$r" | sed -nE 's/.*bw_gib_s=([0-9.]+).*/\1/p')
+    printf "%-5s pp%-5s prefill=%7s tok/s   decode=%6s tok/s  (%s GiB/s)\n" \
+           "$size" "$pp" "$p" "$d" "$bw"
+  done
+done
+```
+
+Report the resulting table — upstream uses these to update
+`docs/BENCHMARKS.md`.
+
+## Phase 6: CLI surface smoke
+
+```bash
+hipfire config list          # should show kv_cache, flash_mode, thinking, etc.
+hipfire config               # TUI — arrow keys should navigate
+hipfire ps                   # running daemons
+hipfire list                 # local models
+```
+
+If TUI doesn't render, report terminal + $TERM env var.
+
+## Phase 7: Quantize smoke (optional)
+
+```bash
+hipfire quantize Qwen/Qwen3.5-0.8B --format mq4 -o /tmp/test.mq4
+hipfire run /tmp/test.mq4 "Hi"
+```
+
+Should produce coherent output. Fresh quant → no cached kernels → slow first
+pass is normal.
+
+## Reporting results
+
+Submit via GitHub issue or PR with:
+
+```markdown
+## Tester report — {your GPU, gfx arch, VRAM}
+
+- hipfire version: `hipfire --version` → (paste)
+- diag output: (paste `hipfire diag`)
+- multi-turn Kaden: {pass/fail + actual answer}
+- bench sweep: (paste Phase 5 output)
+- CLI surface smoke: {all OK / list failures}
+- notes: any unusual behavior, hangs, etc.
+```
+
+## Quantization formats (v0.1.5)
 
 | Format | B/weight | Speed | Quality | Use case |
-|--------|----------|-------|---------|----------|
-| `hfq4` | 0.53 | Fastest | Good | Daily use, 8GB cards |
-| `hfq6` | 0.78 | Fast | Better | Quality-focused, 16GB+ |
-| `q8hfq` | 1.06 | Moderate | Reference | Correctness testing |
+|---|---|---|---|---|
+| `mq4` | 0.53 | Fastest | ~Q8 on quality gate | **Default** |
+| `mq6` | 0.78 | Fast | Near-FP16 | Quality-critical |
+| `hfq4` | 0.53 | Fastest | Good | Legacy — loads but not produced |
+| `hfq6` | 0.78 | Fast | Better | Legacy |
+| `q8` | 1.06 | Moderate | Reference | Correctness debug |
 
-### Model size rules of thumb
+MQ4 is the production default — FWHT-rotated 4-bit with a byte-exact quality
+gate on every change. HF4/HF6 are legacy formats that still load but aren't
+freshly produced.
 
-- HFQ4: params × 0.53 bytes (27B → ~14.3GB)
-- HFQ6: params × 0.78 bytes (27B → ~21.1GB)
-- Add ~1–2GB overhead for KV cache at 2K context
+## Known quirks
 
-### Which model fits which GPU
+- **BC-250:** daemon HTTP multi-turn hangs on specific request sequences.
+  Workaround: `pkill -9 daemon bun` between tests. See
+  `.skills/hipfire-autoheal/known-issues.md`.
+- **0.8B + hipGraph:** don't set `HIPFIRE_GRAPH=1` for 0.8B — known panic.
+  Other sizes are fine.
+- **Qwen 3 on asym:** use `HIPFIRE_KV_MODE=q8` for non-Qwen-3.5 models;
+  asym modes are flash-only and Qwen 3 falls back to per-token otherwise.
 
-| Model | HFQ4 size | HFQ6 size | Fits 8GB | Fits 16GB | Fits 24GB |
-|-------|-----------|-----------|----------|-----------|-----------|
-| 0.8B | ~430MB | ~625MB | Yes | Yes | Yes |
-| 2B | ~1.1GB | ~1.6GB | Yes | Yes | Yes |
-| 4B | ~2.1GB | ~3.1GB | Yes | Yes | Yes |
-| 9B | ~4.8GB | ~7.0GB | Yes | Yes | Yes |
-| 27B | ~14.3GB | ~21.1GB | No | HFQ4 only | Yes |
+## If stuck, chain to `hipfire-autoheal`
 
-**27B quality note:** HFQ4 produces degraded output on coding/complex tasks (gibberish).
-Use HFQ6 for 27B if you have 24GB VRAM. HFQ4 is OK for simple Q&A only.
-`hipfire pull qwen3.5:27b-hfq6` for the quality variant.
-
-## Running Inference
-
-### Build the inference binaries
-
-```bash
-cargo build --release --features deltanet --example infer --example daemon -p engine
-```
-
-### Basic run
-
-```bash
-target/release/examples/infer models/qwen3.5-9b.q4.hfq "Your prompt here"
-```
-
-### Options
-
-```bash
-# Disable thinking mode (faster, no <think> block)
-target/release/examples/infer models/qwen3.5-9b.q4.hfq --no-think "Your prompt"
-
-# TurboQuant KV — 7.8x KV compression, minimal quality loss
-target/release/examples/infer models/qwen3.5-9b.q4.hfq --turbo4 "Your prompt"
-
-# TurboQuant KV — 15.5x KV compression, good quality on <=4B
-target/release/examples/infer models/qwen3.5-9b.q4.hfq --turbo2 "Your prompt"
-
-# Vision-language mode
-target/release/examples/infer models/qwen3.5-4b.q4.hfq --image photo.png "Describe this"
-```
-
-### Via the CLI (ollama-style)
-
-```bash
-hipfire pull qwen3.5:9b         # Download model
-hipfire run qwen3.5:9b "Hello"  # Run (auto-pulls if needed)
-hipfire serve                   # OpenAI-compatible API on port 11435
-hipfire diag                    # GPU diagnostics — arch, VRAM, HIP version, kernels
-hipfire list -r                 # Show local + available models
-
-# Sampling flags (v0.1.2+)
-hipfire run qwen3.5:9b --temp 0.7 --top-p 0.95 "Write a poem"
-hipfire run qwen3.5:9b --repeat-penalty 1.5 --max-tokens 256 "Explain recursion"
-hipfire run qwen3.5:4b --image img.png "Describe this"
-```
-
-### CLI sampling flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--temp` | 0.3 | Temperature (0 = greedy) |
-| `--top-p` | 0.8 | Nucleus sampling threshold |
-| `--repeat-penalty` | 1.3 | Repeat penalty (1.0 = disabled) |
-| `--max-tokens` | 512 | Max tokens to generate |
-| `--image` | — | Image path for VL models |
-
-### KV mode summary
-
-| Flag | Compression | Relative speed | Quality | When to use |
-|------|-------------|----------------|---------|-------------|
-| (none) | 3.8x | baseline | best | Default |
-| `--turbo4` | 7.8x | ~97% | minimal loss | Long context, 8–16GB |
-| `--turbo2` | 15.5x | ~94% | good on <=4B | Very long context |
-
-## Running Benchmarks
-
-### Automated megabench (all models, all KV modes)
-
-```bash
-bash scripts/megabench-q35.sh
-```
-
-This runs every combination of model, quant, and KV mode. Takes 20–60 minutes depending
-on your GPU. Output goes to stdout — pipe to a file if you want to save it:
-
-```bash
-bash scripts/megabench-q35.sh 2>&1 | tee bench-results.txt
-```
-
-### Quick single-model bench
-
-```bash
-timeout 60 target/release/examples/infer models/MODEL.hfq --no-think \
-  "Explain the three laws of thermodynamics" 2>&1 | grep "Done"
-```
-
-Look for the `=== Done` line — it contains tok/s and total tokens.
-
-### What to capture
-
-Run at least two prompts per model to get stable numbers:
-1. Short prompt (~10 tokens input): `"Hello, who are you?"`
-2. Long prompt (~400 tokens input): use a multi-paragraph passage or the megabench script
-
-## Submitting Benchmark Results
-
-Paste the following template into a GitHub issue titled "Benchmarks: [GPU name]":
-
-```
-GPU: [card name] ([gfx ID], [VRAM]GB)
-OS: [Linux distro + kernel / Windows version]
-ROCm version: [output of: dpkg -l | grep rocm-core | awk '{print $3}']
-Model: [model name and quant, e.g. Qwen3.5-9B HFQ4]
-tok/s: [number from === Done line]
-Coherence: [OK / LOOP / REPET / SHORT]
-KV mode: [Q8 / turbo4 / turbo2]
-Context: [short (~10 tok input) / long (~400 tok input)]
-Notes: [anything unusual: thermal throttle, OOM, etc.]
-```
-
-### Coherence codes
-
-| Code | Meaning |
-|------|---------|
-| OK | Output is coherent and on-topic |
-| LOOP | Model repeats the same phrase in a loop |
-| REPET | Output degrades into repetition after N tokens |
-| SHORT | Output stops abnormally short (< 20 tokens) |
-
-If coherence is not OK, paste the first 100 characters of the output in Notes.
-
-## Compiling Kernels for New Arches
-
-If your GPU arch is not in `kernels/compiled/`, you need to compile kernels yourself.
-This requires the ROCm SDK (hipcc).
-
-```bash
-# Compile for a new arch
-scripts/compile-kernels.sh gfxNNNN
-
-# Verify — should print 102+ kernels
-ls kernels/compiled/gfxNNNN/*.hsaco | wc -l
-```
-
-If you don't have the ROCm SDK installed:
-
-```bash
-# Ubuntu/Debian
-sudo apt install rocm-hip-sdk
-
-# Check hipcc works
-hipcc --version
-```
-
-After compiling, share the `kernels/compiled/gfxNNNN/` directory in your GitHub issue
-so the maintainers can include it in the next release.
-
-## Troubleshooting
-
-For GPU detection, driver, and ROCm runtime issues:
-- Run `hipfire diag` and share the output
-- Or run `.skills/hipfire-diag/run-diagnostics.sh` for detailed JSON output
-
-### Common tester issues
-
-**OOM (out of memory)**
-Model is too large for available VRAM. Options:
-1. Use a smaller model (e.g., 4B instead of 9B)
-2. Use `--turbo4` to reduce KV cache VRAM usage
-3. Close other GPU-using applications
-
-**"daemon not found" error**
-The daemon binary wasn't built. Run:
-```bash
-cargo build --release --features deltanet --example daemon -p engine
-```
-
-**No kernels for my GPU**
-The installer should have copied pre-compiled kernels to `~/.hipfire/bin/kernels/compiled/{arch}/`.
-Check:
-```bash
-ls ~/.hipfire/bin/kernels/compiled/
-# Should show one directory per supported arch, e.g.: gfx1010  gfx1030  gfx1100  gfx1200
-```
-
-If your arch is missing, see "Compiling Kernels for New Arches" above.
-
-**Windows: runtime not found**
-Ensure `amdhip64.dll` is in `%USERPROFILE%\.hipfire\runtime\`. The PowerShell installer
-should place it there automatically. If not, copy it from your ROCm installation:
-```
-C:\Program Files\AMD\ROCm\bin\amdhip64.dll
-```
-
-**Low tok/s (well below expected)**
-Possible causes:
-- VRAM contention: check `radeontop` or Task Manager for GPU usage by other apps
-- Thermal throttling: check GPU temperature with `radeontop` or `sensors`
-- Wrong kernel arch: run diag to confirm the loaded arch matches your GPU
-- Cold start: first run compiles kernels (slow); subsequent runs use cache
-
-**Thinking mode loop / repetition**
-Add `--no-think` to disable the `<think>` block. This is faster and avoids loop issues
-on some prompt styles. If the issue persists without `--no-think`, report it with the
-Coherence code LOOP or REPET in your benchmark submission.
-
-## Asking for Help
-
-Open a GitHub issue at https://github.com/Kaden-Schutt/hipfire with:
-- The output of `.skills/hipfire-diag/run-diagnostics.sh`
-- Your GPU model and OS
-- The exact command you ran
-- The full error output (not just the last line)
+Runtime issues (hangs, kernel errors, port conflicts) are the autoheal
+skill's wheelhouse. This skill is for bring-up + the standard test matrix.

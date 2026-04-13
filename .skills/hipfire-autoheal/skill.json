@@ -1,0 +1,30 @@
+{
+  "name": "hipfire-autoheal",
+  "version": "0.1.5",
+  "description": "Triage and fix hipfire runtime issues: daemon hangs, kernel JIT failures, port conflicts, multi-turn recall breaks, VRAM OOM. Walks the standard fix catalog in order of likelihood, gathers diagnostics, and ships targeted repairs. Framework-agnostic — works with any AI agent that can read, run shell commands, and edit config.",
+  "triggers": [
+    "hipfire won't start",
+    "hipfire hangs",
+    "hipfire is broken",
+    "hipfire daemon not responding",
+    "fix hipfire",
+    "diagnose hipfire",
+    "what's wrong with hipfire",
+    "multi-turn broken",
+    "kernel compile failed",
+    "port 11435",
+    "kendall instead of kaden"
+  ],
+  "entry": "./triage.sh",
+  "interpret": "./playbook.md",
+  "references": {
+    "fix-catalog": "./playbook.md",
+    "hang-bisection": "./bisection.md",
+    "known-issues": "./known-issues.md"
+  },
+  "requires": {
+    "gpu": "AMD RDNA (gfx1010/gfx1013/gfx1030/gfx1100/gfx1101/gfx1102/gfx1151/gfx1200)",
+    "runtime": "ROCm 6+, amdgpu kernel driver",
+    "hipfire": "0.1.5+"
+  }
+}

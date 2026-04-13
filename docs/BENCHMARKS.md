@@ -1,113 +1,134 @@
-# hipfire Benchmarks
+# Benchmarks
 
-Hardware: AMD Radeon RX 5700 XT (8GB VRAM, RDNA1 gfx1010, 448 GB/s peak)
-Date: 2026-04-02
+Measured tok/s across the RDNA family. MQ4 weights throughout. Measured
+2026-04-13 against hipfire v0.1.5 "redline".
 
-## Qwen3.5 DeltaNet — Full Model Matrix
+Bench methodology:
 
-All models, Q8 KV (default), `--no-think`, averaged across 4 prompts:
+```
+bench_qwen35_mq4 <model> --prefill N --gen 30 --warmup 10
+```
 
-| Model | Quant | tok/s | Quality | VRAM |
-|-------|-------|-------|---------|------|
-| Qwen3.5-0.8B | HFQ4 | **222** | OK | ~600MB |
-| Qwen3.5-0.8B | HFQ6 | **210** | OK | ~750MB |
-| Qwen3.5-2B | HFQ4 | **141** | OK | ~1.5GB |
-| Qwen3.5-2B | HFQ6 | **127** | OK | ~2GB |
-| Qwen3.5-4B | HFQ4 | **63** | OK | ~2.5GB |
-| Qwen3.5-4B | HFQ6 | **53** | OK | ~3.5GB |
-| Qwen3.5-9B | HFQ4 | **45** | OK | ~5.5GB |
-| Qwen3.5-9B | HFQ6 | **37** | OK | ~7.5GB |
+- First prefill excluded (kernel JIT); best-of-one reported.
+- 7900 XTX numbers use Q8 KV + `HIPFIRE_GRAPH=1` (hipGraph decode, best case).
+- V620 + BC-250 use asym3 KV (5.5× compression), no hipGraph (not tuned there).
+- `BW` = model_bytes × gen_tok_s (effective weight-read bandwidth).
 
-Notes:
-- HFQ4 = 4-bit (0.53 B/w). Best speed, good quality.
-- HFQ6 = 6-bit (0.78 B/w). Better quality, ~15% slower.
-- All models: DeltaNet hybrid attention (linear + full attention layers).
-- 9B HFQ6 barely fits in 8GB — usable but tight.
+## RDNA3 — Radeon RX 7900 XTX (gfx1100, 24 GB, 960 GB/s peak)
 
-## TurboQuant KV Cache — Qwen3.5 (head_dim=256)
+Primary target. WMMA-accelerated MQ4 projections + hipGraph decode + Q8 KV cache.
 
-Tested on "Compare TCP/UDP protocols" prompt:
+| Model | pp32 | pp128 | pp512 | pp2048 | decode | BW | % of peak BW |
+|---|---:|---:|---:|---:|---:|---:|:---:|
+| 0.8B | 2072 | 4878 | 7059 | **7383** | **391** | 200 GiB/s | 22% |
+| 4B   | 1041 | 2062 | 2487 | 2467 | **180** | 433 GiB/s | 48% |
+| 9B   |  980 | 1509 | 1663 | 1624 | **132** | 654 GiB/s | **73%** |
+| 27B  |  398 |  478 |  477 |  455 |  **47** | 651 GiB/s | **73%** |
 
-| Model | KV Mode | tok/s | Compression | Quality |
-|-------|---------|-------|-------------|---------|
-| 4B-Q4 | Q8 (default) | **62.6** | 3.8x | OK |
-| 4B-Q4 | Turbo4 | **60.9** | 7.8x | OK |
-| 4B-Q4 | Turbo2 | **58.5** | 15.5x | OK |
-| 9B-Q4 | Q8 (default) | **43.4** | 3.8x | OK |
-| 9B-Q4 | Turbo4 | **42.3** | 7.8x | OK |
-| 9B-Q4 | Turbo2 | **35.9** | 15.5x | degraded |
+- Decode on 9B/27B saturates 73% of 7900 XTX's 960 GB/s peak memory
+  bandwidth — weight-read is the binding constraint.
+- Prefill on 4B reaches 2487 tok/s at pp512 (WMMA GEMM ceiling), holds flat
+  through pp2048.
+- 0.8B prefill keeps rising to pp2048 (7383 tok/s) because launch overhead
+  dominates at small prefill sizes; longer prompts amortize.
+- 0.8B is launch-count-bound on decode; a proposed multi-row GEMV experiment
+  pulled back on this arch (user memory: "DON'T multi-row GEMV on gfx1100").
 
-Notes:
-- Turbo4: FWHT-256 + 4-bit quantize. 7.8x compression, minimal quality loss. Recommended.
-- Turbo2: FWHT-256 + 2-bit quantize. 15.5x compression. Works on 4B, degrades on 9B.
-- New 256-dim kernels: `attention_turbo4_kv_256.hip`, `kv_cache_write_turbo4_256.hip` (and turbo2 variants).
-- 32 threads (one RDNA wavefront) × 8 dims/thread. FWHT-256 via warp shuffle. ~28 VGPRs.
+## RDNA2 — V620 Pro (gfx1030, 32 GB, 512 GB/s peak)
 
-## Long Context Stress Test
+Clean datacenter card. asym3 KV + batched flash attention. Full asym3 sweep
+across prefill lengths:
 
-~400 token input, 512 token generation:
+| Model | pp32 | pp128 | pp512 | pp1024 | pp2048 | pp4096 | decode | BW |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8B | 48 † | 3989 | 4303 | 4298 | 4179 | 3914 | 250 | 128 GiB/s |
+| 4B   | 803  |  952 |  909 |  894 |  872 |  834 |  96 | 230 GiB/s |
+| 9B   | 48 † |  547 |  527 |  520 |  512 |  498 |  65 | **322 GiB/s** |
+| 27B  | 151  |  149 |  147 |  146 |  144 |  141 |  22 | 303 GiB/s |
 
-| Model | KV Mode | tok/s | Quality |
-|-------|---------|-------|---------|
-| 4B-Q4 | Q8 | **59.8** | OK |
-| 4B-Q4 | Turbo4 | **50.4** | OK |
-| 4B-Q4 | Turbo2 | **48.0** | OK |
-| 9B-Q4 | Turbo4 | **38.0** | OK |
+† Includes kernel JIT cost; subsequent small prefills hit cache.
 
-Turbo4 enables ~2x longer context than Q8 in the same VRAM budget.
+- 9B decode at 322 GiB/s is ~63% of V620's 512 GB/s peak.
+- Prefill scales almost flat from pp128 → pp4096 (15-20% drop). asym3 + flash
+  attention keeps long-context prefill efficient.
+- 27B works out-of-the-box on the 32 GB card with plenty of VRAM headroom.
 
-## TurboQuant KV Cache — Qwen3-8B (head_dim=128)
+## APU — BC-250 (gfx1013 → gfx1010, 14 GB shared, DDR5)
 
-From earlier benchmarks (2026-03-27):
+Ryzen 5800X3D + 8-CU Navi 10 iGPU, shared DDR5 memory. 27B won't fit.
 
-| Config | Short (91 tok) | Hard (128 tok) | KV Compression |
-|--------|---------------|----------------|----------------|
-| Q8 KV (baseline) | **59.9 tok/s** | **58.8 tok/s** | 3.88x |
-| FP32 KV | 57.0 | — | 1.0x |
-| turbo2 (2-bit) | 54.1 | 51.8 | **14.2x** |
-| turbo3 (3-bit) | 50.8 | 44.5 | 9.85x |
-| turbo4 (4-bit) | 53.6 | 51.0 | 7.5x |
+| Model | pp32 | pp128 | pp512 | pp1024 | pp2048 | pp4096 | decode | BW |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0.8B | 685 | 764 | 1253 | 1366 | 1331 | 1282 | 207 | 106 GiB/s |
+| 4B   | 151 | 238 |  237 |  241 |  242 |  233 |  77 | 187 GiB/s |
+| 9B   |  30 | 104 |  144 |  154 |  154 |  150 |  47 | **236 GiB/s** |
 
-## Qwen3.5-27B (RX 7900 XTX, 24GB, gfx1100)
+- 9B decode 236 GiB/s on an **APU** running off DDR5. asym3's 5.5× compression
+  is what makes this viable.
+- Sub-100 tok/s prefill on 9B pp32 is APU launch-latency cost; amortizes by pp128.
+- 0.8B is the only size that keeps decode > 200 tok/s; 4B+ are weight-BW bound.
 
-Benchmarks by [DomKo](https://github.com/Kaden-Schutt/hipfire/issues/2). Runtime-compiled kernels, ROCm 6.4.
+## RDNA1 — RX 5700 XT (gfx1010, 8 GB, 448 GB/s peak)
 
-| Model | Quant | KV Mode | tok/s | Quality |
-|-------|-------|---------|-------|---------|
-| 27B | HFQ4 | Q8 | **25.8** | Broken on coding/complex tasks |
-| 27B | HFQ4 | Turbo4 | **25.2** | Meta-reasoning loops, gibberish |
-| 27B | HFQ6 | Q8 | **16.5** | Correct |
-| 27B | HFQ6 | Turbo4 | **19.9** | Correct |
-| 9B | HFQ4 | Q8 | **62.3** | Correct |
+Historical / smoke-test. Numbers from v0.1.3 era (HF4, pre-MQ4):
 
-Notes:
-- **27B HFQ4 is not recommended for complex tasks.** Output degrades to gibberish on coding prompts. Use HFQ6.
-- HFQ6 + Turbo4 is faster than HFQ6 + Q8 (19.9 vs 16.5) — Turbo4 KV recommended for 27B.
-- 27B HFQ4 needs 16GB+ VRAM, HFQ6 needs 24GB.
+| Model | Quant | tok/s | Notes |
+|---|---|---:|---|
+| Qwen3.5-0.8B | HF4 | 190 | DeltaNet |
+| Qwen3.5-4B  | HF4 |  61 | — |
+| Qwen3.5-9B  | HF4 |  43 | Best quality in 8 GB |
+| Qwen3-8B    | HF4 |  60 | Standard attention |
 
-| GPU | VRAM | HFQ4 (14.3GB) | HFQ6 (21.1GB) |
-|-----|------|----------------|----------------|
-| RX 5700 XT | 8GB | Does not fit | Does not fit |
-| RX 6800 XT | 16GB | Fits (benchmark wanted) | Does not fit |
-| RX 7900 XTX | 24GB | 25-27 tok/s | 16-20 tok/s |
-| RX 9070 | 16GB | Fits — benchmark wanted | Does not fit |
+Side-by-side on the same hardware:
 
-To submit benchmarks, see [CONTRIBUTING.md](../CONTRIBUTING.md).
+```
+ollama + llama.cpp + ROCm (HSA_OVERRIDE):  4.93 tok/s  (Qwen3.5-9B)
+hipfire HF4:                              43    tok/s  (same model)
+                                          ────────────
+                                          8.7× speedup
+```
 
-## Comparison vs llama.cpp + ROCm
+MQ4 + asym3 retest on gfx1010 is pending post-0.1.5 propagation.
 
-| Setup | Model | tok/s |
-|-------|-------|-------|
-| **hipfire** | Qwen3.5-9B HFQ4 | **45** |
-| **hipfire** | Qwen3.5-4B HFQ4 | **63** |
-| **hipfire** | Qwen3.5-0.8B HFQ4 | **222** |
-| ollama (llama.cpp) | Qwen3.5-9B Q4 | 4.93 |
+## KV cache format comparison (9B, gfx1030, ctx=4096)
 
-hipfire is **9x faster** than llama.cpp+ROCm on the same hardware for Qwen3.5 models.
+All three asym modes pass the multi-turn "Kaden" rare-token recall test.
 
-## Notes
+| KV mode | K bits | V type | Bytes/head/pos | Compression | Decode tok/s | Quality |
+|---|:---:|:---:|:---:|:---:|:---:|---|
+| q8 | 8 | Q8 | 544 | 3.76× | baseline | reference |
+| asym4 | 4 | Q8 | 404 | 5.1× | 116 | ✓ |
+| **asym3** | **3** | **Q8** | **372** | **5.5×** | **120** | **✓ default** |
+| asym2 | 2 | Q8 | 340 | 6.0× | 116 | ✓ |
 
-- All benchmarks use ChatML prompting, greedy decoding (temp=0.3), repeat penalty 1.3.
-- Kernel cache warm (first-run compilation excluded).
-- Turbo KV supports head_dim=128 (Qwen3) and head_dim=256 (Qwen3.5).
-- Quality rated by automated coherence check: repetition frequency + output length.
+asym3 is the sweet spot — best compression of the recall-safe options. See
+[KV_CACHE.md](KV_CACHE.md) for the design rationale.
+
+## Running benchmarks yourself
+
+```bash
+hipfire bench qwen3.5:4b                    # smoke test
+hipfire bench qwen3.5:9b --runs 3           # best-of-3
+./scripts/speed-gate.sh                     # full sweep (used in CI)
+./scripts/speed-gate.sh --update-baselines  # record new ground-floor
+```
+
+`scripts/speed-gate.sh` values are the **permanent regression floor** —
+commits may not ship numbers below them without a `--update-baselines`
+re-record + justification.
+
+## Comparison to alternatives
+
+Sorted by "works today on consumer RDNA":
+
+| Tool | RDNA1 | RDNA2 | RDNA3 | APU | Multi-turn recall | Setup |
+|---|:---:|:---:|:---:|:---:|:---:|---|
+| **hipfire** | ✅ | ✅ | ✅ | ✅ | ✅ asym3 | one command |
+| llama.cpp + ROCm | HSA hack | ✅ | ✅ | HSA hack | ✅ | fiddly |
+| Ollama | via llama.cpp | via llama.cpp | via llama.cpp | ✗ | ✅ | mostly works |
+| MLC | ✓ | ✓ | ✓ | ✗ | ✓ | Python stack |
+| vLLM | ✗ | ✓ | ✓ | ✗ | ✓ | datacenter only |
+
+The consistent hipfire win is **explicit RDNA-generation coverage** — per-arch
+defaults and per-model overlays take the "which knobs do I set for this card"
+problem off the user. Raw-speed deltas vary by card.
