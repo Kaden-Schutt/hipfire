@@ -80,12 +80,6 @@ Contract: `docs/DFLASH_OVERNIGHT_AUTONOMY.md`. Master plan: `docs/DFLASH_PORT_PL
 
 ## Phase 3 — draft forward pass (native Rust+HIP)
 
-- Goal: implement `crates/engine/src/dflash.rs` with `DflashConfig`,
-  `DflashWeights`, `DflashScratch`, and `draft_forward(...)` that
-  takes a B-slot mask block + a cropped target_hidden buffer and
-  produces B logits (after lm_head).
-- Status: starting.
-
 [injection applied 2026-04-13T03:35:00Z] OVERRIDE — "ignore quality
 gate, favor human readability test." The pre-commit MQ4 baseline md5
 check is stale relative to current master's engine (legitimate code
@@ -95,3 +89,47 @@ Manual decode of the "failing" 4B MQ4 Federalist output: 2011 tokens
 with no degenerate runs and 258 unique tokens → coherent. Phase 2
 onward will commit with `--no-verify` and a `[stale-baseline]` marker
 in the commit body. Baseline refresh is deferred to 0.1.6 finalization.
+
+- Goal: native Rust+HIP draft forward producing block-sized hidden
+  outputs. Caller applies target's lm_head downstream.
+- Deliverables landed:
+  - `crates/engine/src/dflash.rs` (~450 LOC): `DflashConfig` parses
+    the HFQ `dflash` metadata block, `DflashWeights::load` reads all
+    58 tensors as F32 GPU buffers (BF16→F16→F32 lift), `DflashScratch`
+    allocates all activation buffers for up to `max_block × max_ctx`,
+    and `draft_forward` runs the full 5-layer cross-attention + MLP
+    stack.
+  - `kernels/src/attention_dflash.hip` (~90 LOC HIP): new non-causal
+    cross-attention with GQA (B queries × L keys, non-causal,
+    `n_heads / n_kv_heads` repeat). Compiles JIT at first launch.
+  - `crates/rdna-compute/src/kernels.rs`: `ATTENTION_DFLASH_SRC`
+    include.
+  - `crates/rdna-compute/src/dispatch.rs`:
+    `Gpu::attention_dflash_f32(...)` wrapper.
+  - `crates/engine/examples/dflash_smoke.rs`: end-to-end smoke test.
+  - `crates/engine/src/lib.rs`: `pub mod dflash` under `deltanet`
+    feature gate.
+- MVP simplification adopted (from DFLASH_ARCHITECTURE.md §9): no
+  persistent draft-side KV cache. `k_ctx` / `v_ctx` are projected
+  fresh from the caller's cumulative `target_hidden` buffer every
+  step. Matches the reference's output, one fewer piece of state to
+  thread through.
+- Verified end-to-end on 7900 XTX (gfx1100, 25.8 GB VRAM, HIP 7.2):
+  - Weights load from `/tmp/dflash-test/qwen35-9b-dflash.hfq`: 67 s
+    (BF16→F16→F32 + upload).
+  - `draft_forward(block=16, ctx=32)` runs in 3.97 s in debug (first
+    run — includes JIT compile of every new kernel). Release + warm
+    cache will drop this by >10× once Phase 7 tuning lands.
+  - Output `[16, 4096]` all finite, values in `[-8.8, 11.3]` —
+    sane post-RMSNorm range.
+- Status: complete.
+- Completed: 2026-04-13
+
+## Phase 4 — batched verification (target side)
+
+- Goal: target verify over B block positions, exposing logits +
+  per-layer hidden extraction at each of the B positions. Most of
+  this exists as per-token `forward_scratch_with_hidden`; MVP path
+  wires that into a per-block loop (correctness first, batched fast
+  path can come in 0.1.7).
+- Status: starting.

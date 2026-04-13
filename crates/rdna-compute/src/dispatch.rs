@@ -7997,6 +7997,62 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [num_heads as u32, n as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 
+    /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
+    /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
+    /// a multiple of `n_kv_heads`. See `kernels/src/attention_dflash.hip`
+    /// for the full contract.
+    ///
+    /// Layouts:
+    ///   q : [B * n_heads    * head_dim]
+    ///   k : [L * n_kv_heads * head_dim]
+    ///   v : [L * n_kv_heads * head_dim]
+    ///   out: [B * n_heads    * head_dim]
+    pub fn attention_dflash_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("attention_dflash_f32", kernels::ATTENTION_DFLASH_SRC, "attention_dflash_f32")?;
+        let func = &self.functions["attention_dflash_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        // Shared: scores[L] + workspace[block_size]
+        let shared_mem = ((l + block_size as usize) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, b as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════

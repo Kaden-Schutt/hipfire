@@ -775,6 +775,11 @@ pub const TRANSPOSE_SRC: &str = include_str!("../../../kernels/src/transpose.hip
 /// Grid=[n_heads, N]. Each block computes one (head, query_pos) output row.
 pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_attention.hip");
 
+/// DFlash draft cross-attention (non-causal, GQA): B queries attend to L
+/// keys/values with no causal mask. Grid=[n_heads, B]. See
+/// `kernels/src/attention_dflash.hip` for the full contract.
+pub const ATTENTION_DFLASH_SRC: &str = include_str!("../../../kernels/src/attention_dflash.hip");
+
 
 /// Bias-add: X[batch, n] += bias[n] (broadcast over batch dim)
 pub const BIAS_ADD_SRC: &str = include_str!("../../../kernels/src/bias_add.hip");

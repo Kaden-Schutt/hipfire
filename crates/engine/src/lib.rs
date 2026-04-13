@@ -9,5 +9,7 @@ pub mod qwen35;
 pub mod qwen35_vl;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
+#[cfg(feature = "deltanet")]
+pub mod dflash;
 pub mod image;
 pub mod tokenizer;
