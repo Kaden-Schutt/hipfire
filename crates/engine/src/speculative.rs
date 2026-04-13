@@ -355,6 +355,55 @@ impl DeltaNetSnapshot {
     }
 }
 
+/// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
+/// rollback path. After each verify forward step writes its post-state into
+/// the next slot, `restore_from(accept_len + 1)` jumps the live DN state
+/// to exactly `start + accept_len + 1` positions of advance — no replay
+/// loop needed.
+///
+/// VRAM cost: `n_slots × (one DeltaNetSnapshot)`. For Qwen3.5-4B and
+/// `n_slots = B + 1 = 17`, that's roughly 100 MB; for 9B it scales with
+/// the hybrid layer count.
+pub struct DeltaNetTape {
+    pub slots: Vec<DeltaNetSnapshot>,
+}
+
+impl DeltaNetTape {
+    pub fn new_for(
+        gpu: &mut Gpu,
+        state: &DeltaNetState,
+        n_slots: usize,
+    ) -> HipResult<Self> {
+        let mut slots = Vec::with_capacity(n_slots);
+        for _ in 0..n_slots {
+            slots.push(DeltaNetSnapshot::new_for(gpu, state)?);
+        }
+        Ok(Self { slots })
+    }
+
+    pub fn n_slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn save_at(
+        &mut self,
+        slot: usize,
+        state: &DeltaNetState,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        self.slots[slot].save_from(state, gpu)
+    }
+
+    pub fn restore_from(
+        &self,
+        slot: usize,
+        state: &mut DeltaNetState,
+        gpu: &mut Gpu,
+    ) -> HipResult<()> {
+        self.slots[slot].restore_to(state, gpu)
+    }
+}
+
 /// Compute the DFlash target-layer extraction indices for a model of
 /// `num_target_layers` layers. Matches the `build_target_layer_ids` function in
 /// the DFlash reference implementation:
@@ -1161,20 +1210,23 @@ pub fn spec_step_dflash(
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
     target_snap.restore_to(&mut target.dn_state, gpu)?;
-    // Replay committed[0..accept_len+1] with forward_scratch (no hidden —
-    // already captured on the verify side; replaying would double-write).
-    for i in 0..accept_len + 1 {
-        qwen35::forward_scratch(
-            gpu,
-            &target.weights,
-            &target.config,
-            committed[i],
-            position + i,
-            &mut target.kv_cache,
-            &mut target.dn_state,
-            &target.scratch,
-        )?;
-    }
+    // Batched replay (0.1.7 perf): forward_prefill_batch over (accept+1)
+    // tokens in one call, instead of (accept+1) sequential forward_scratch
+    // calls. Same byte-exact effect on KV cache + DN state, but the per-layer
+    // launches collapse to a single batched dispatch. Drops the replay cost
+    // from ~10 ms (4 sequential decodes) to ~2-3 ms.
+    let replay_tokens = &committed[..accept_len + 1];
+    qwen35::forward_prefill_batch(
+        gpu,
+        &target.weights,
+        &target.config,
+        replay_tokens,
+        position,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        None, None,
+    )?;
     // Target state is now at position + accept_len + 1. KV cache has
     // written K/V at positions [position..position+accept_len]. The bonus
     // token's K/V will be written on the next iter's verify (at position
