@@ -17,8 +17,16 @@ pub struct Tokenizer {
     /// Special tokens
     pub bos_id: u32,
     pub eos_id: u32,
-    /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA)
+    /// True for GPT-2 BPE (Qwen3/3.5): spaces as `Ġ`, bytes via GPT-2 byte-char
+    /// encoding, merges run on byte-encoded symbols.
     is_gpt2_bpe: bool,
+    /// True for SPM-style BPE (Gemma 4): spaces normalized to `▁` (U+2581),
+    /// merges run on raw unicode chars (no byte encoding). Distinct from
+    /// plain SentencePiece (`is_gpt2_bpe=false && is_spm_bpe=false`) which
+    /// uses greedy longest-match on the full vocab. The tokenizer.json
+    /// metadata flags this as `model.type="BPE"` with a `Replace " " → ▁`
+    /// normalizer; we detect it by presence of ▁-prefixed common words.
+    is_spm_bpe: bool,
 }
 
 impl Tokenizer {
@@ -67,7 +75,11 @@ impl Tokenizer {
 
         // Detect tokenizer type
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
-        let is_gpt2_bpe = model_type == "gpt2";
+        // Prefer SPM-BPE detection (Gemma 4) when both flavours look plausible —
+        // Gemma 4 has "Ġ" in vocab as a byte-fallback slot, which would wrongly
+        // trigger GPT-2 detection.
+        let is_spm_bpe = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let is_gpt2_bpe = !is_spm_bpe && model_type == "gpt2";
 
         // Build special tokens list: vocab entries matching <|...|> or </...> patterns
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
@@ -89,6 +101,7 @@ impl Tokenizer {
             bos_id,
             eos_id,
             is_gpt2_bpe,
+            is_spm_bpe,
         })
     }
 
@@ -166,7 +179,12 @@ impl Tokenizer {
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
 
-        let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
+        // SPM-BPE (Gemma 4) uses ▁ for spaces. GPT-2 (Qwen) uses Ġ. Check SPM
+        // first — Gemma 4's vocab includes "Ġ" as a byte-fallback slot, which
+        // would otherwise mis-trigger GPT-2 detection and break encoding.
+        let is_spm_bpe = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let is_gpt2_bpe = !is_spm_bpe
+            && (token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ"));
 
         Some(Tokenizer {
             vocab,
@@ -176,6 +194,7 @@ impl Tokenizer {
             bos_id,
             eos_id,
             is_gpt2_bpe,
+            is_spm_bpe,
         })
     }
 
@@ -287,10 +306,70 @@ impl Tokenizer {
 
     /// Encode without special token handling.
     fn encode_raw(&self, text: &str) -> Vec<u32> {
+        if self.is_spm_bpe {
+            return self.encode_spm_bpe(text);
+        }
         if !self.is_gpt2_bpe {
             return self.encode_sentencepiece(text);
         }
         self.encode_gpt2_bpe(text)
+    }
+
+    /// SPM-style BPE (Gemma 4).
+    ///
+    /// Pipeline (matches `tokenizer.json`'s `normalizer` + `model.type="BPE"`
+    /// + the HF tokenizers library, and llama.cpp's `LLAMA_VOCAB_PRE_TYPE_GEMMA4`
+    /// post-PR #21343):
+    ///   1. Normalize: replace every ASCII space with ▁ (U+2581).
+    ///   2. Treat the normalized string as a sequence of raw unicode chars
+    ///      (no GPT-2 byte-to-char mapping — `byte_encode = false`).
+    ///   3. Apply BPE merges iteratively, picking the lowest-rank pair each
+    ///      round (same loop as `encode_gpt2_bpe` but on unicode chars).
+    ///   4. Map merged symbols to token IDs.
+    ///
+    /// Why this matters: Gemma 4's vocab includes the GPT-2 byte-fallback
+    /// slots (Ġ, Ĉ, etc. as `<0xNN>` stand-ins). The old detector treated
+    /// that as GPT-2 BPE and inserted a stray `Ġ` (token 245237) between
+    /// every word, which caused the Phase 3 smoke test to produce gibberish
+    /// like `"tech hack d facing"`.
+    fn encode_spm_bpe(&self, text: &str) -> Vec<u32> {
+        let normalized = text.replace(' ', "\u{2581}");
+        let mut symbols: Vec<String> = normalized.chars().map(|c| c.to_string()).collect();
+
+        let merge_rank: HashMap<(String, String), usize> = self
+            .merges
+            .iter()
+            .enumerate()
+            .map(|(i, (l, r))| ((l.clone(), r.clone()), i))
+            .collect();
+
+        loop {
+            if symbols.len() < 2 {
+                break;
+            }
+            let mut best_rank = usize::MAX;
+            let mut best_idx = 0;
+            for i in 0..symbols.len() - 1 {
+                let pair = (symbols[i].clone(), symbols[i + 1].clone());
+                if let Some(&rank) = merge_rank.get(&pair) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = i;
+                    }
+                }
+            }
+            if best_rank == usize::MAX {
+                break;
+            }
+            let merged = format!("{}{}", symbols[best_idx], symbols[best_idx + 1]);
+            symbols[best_idx] = merged;
+            symbols.remove(best_idx + 1);
+        }
+
+        symbols
+            .iter()
+            .filter_map(|s| self.token_to_id.get(s).copied())
+            .collect()
     }
 
     /// SentencePiece greedy encoding: prepend ▁ for spaces, longest-match lookup.

@@ -77,12 +77,16 @@ fn main() {
         .expect("scratch constants init");
 
     // Raw-prompt mode: no chat template yet (Phase 10). Just tokenize + forward.
+    // BOS is required — HF's Gemma 4 tokenizer always prepends `<bos>` (id=2).
     let user_prompt = std::env::var("HIPFIRE_SMOKE_PROMPT")
         .unwrap_or_else(|_| "Hello".to_string());
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
-    let prompt_tokens: Vec<u32> = tokenizer.encode(&user_prompt);
-    eprintln!("Prompt: {} tokens: {:?}", prompt_tokens.len(), &prompt_tokens[..prompt_tokens.len().min(16)]);
+    let mut prompt_tokens: Vec<u32> = vec![config.bos_token];
+    prompt_tokens.extend(tokenizer.encode(&user_prompt));
+    eprintln!("Prompt: {} tokens (inc. BOS): {:?}",
+        prompt_tokens.len(),
+        &prompt_tokens[..prompt_tokens.len().min(16)]);
 
     eprintln!("\n=== forward_scratch (per-token) ===");
     let t0 = std::time::Instant::now();
