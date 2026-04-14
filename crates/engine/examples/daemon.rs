@@ -2,6 +2,11 @@
 //! The Bun CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
 //!
+//! Exactly one daemon runs at a time per machine — enforced by an exclusive
+//! flock(2) on ~/.hipfire/daemon.pid. A second daemon invocation exits with
+//! `FATAL: hipfire daemon already running (PID N)` before touching the GPU,
+//! preventing orphan doubles from silently double-consuming VRAM.
+//!
 //! Protocol:
 //!   → {"type":"load","model":"path.hfq","params":{"max_seq":4096}}
 //!   ← {"type":"loaded","arch":"qwen3_5","dim":4096,"layers":32,"vocab":248320,"vl":true}
@@ -20,6 +25,56 @@ use engine::qwen35_vl;
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::time::Instant;
+
+/// Acquire a machine-wide exclusive lock on ~/.hipfire/daemon.pid via flock(2).
+/// Ensures only one hipfire daemon runs at a time; a second instance exits
+/// immediately with a clear error naming the running PID. The kernel releases
+/// the flock automatically on process death (including SIGKILL), so no manual
+/// cleanup is required — stale PID file contents are fine, the fd is what
+/// holds the lock.
+///
+/// Returns the File handle; caller MUST keep it alive for the process
+/// lifetime (dropping it closes the fd and releases the lock).
+fn acquire_daemon_lock() -> std::fs::File {
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let home = std::env::var("HOME").expect("HOME environment variable not set");
+    let hipfire_dir = std::path::PathBuf::from(home).join(".hipfire");
+    std::fs::create_dir_all(&hipfire_dir).expect("failed to create ~/.hipfire");
+    let pid_path = hipfire_dir.join("daemon.pid");
+
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&pid_path)
+        .expect("failed to open ~/.hipfire/daemon.pid");
+
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let mut existing = String::new();
+        let _ = f.read_to_string(&mut existing);
+        let pid = existing.trim();
+        let pid_display = if pid.is_empty() { "<unknown>" } else { pid };
+        let kill_arg = if pid.is_empty() { "<pid>" } else { pid };
+        eprintln!(
+            "FATAL: hipfire daemon already running (PID {}). Run `kill {}` and retry.",
+            pid_display, kill_arg
+        );
+        std::process::exit(1);
+    }
+
+    // Got the lock. Truncate any stale content and write our PID so tooling
+    // and the user-facing error above can both show a useful number.
+    f.set_len(0).ok();
+    f.seek(std::io::SeekFrom::Start(0)).ok();
+    writeln!(f, "{}", std::process::id()).ok();
+    f.flush().ok();
+    f
+}
 
 const IMAGE_SIZE: usize = 448;
 const IMAGE_PAD_ID: u32 = 248056;
@@ -91,6 +146,12 @@ fn main() {
         }
         return;
     }
+
+    // Machine-wide mutex — prevents orphan daemons from silently coexisting
+    // (observed 2026-04-13: two daemons at 100% CPU survived pkill -f rounds
+    // because they'd been reparented to PID 1 after their bun parent died).
+    // Kept in a binding so the fd lives for the full process lifetime.
+    let _daemon_lock = acquire_daemon_lock();
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     let mut model: Option<LoadedModel> = None;
