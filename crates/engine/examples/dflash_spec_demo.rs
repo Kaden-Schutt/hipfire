@@ -51,6 +51,9 @@ fn main() {
     let mut adaptive_b: bool = false;
     let mut ngram: bool = false;
     let mut ngram_min_count: u32 = 3;
+    // CACTUS bumped acceptance (Hao & Mou 2026). 0.0 = vanilla SpS;
+    // paper's strongest setting is 1.0. Only affects temp > 0 runs.
+    let mut cactus_delta: f32 = 0.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -105,6 +108,10 @@ fn main() {
             }
             "--ngram-min" => {
                 ngram_min_count = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--cactus-delta" => {
+                cactus_delta = args[i + 1].parse().unwrap();
                 i += 2;
             }
             other => {
@@ -257,6 +264,13 @@ fn main() {
     let mut rng_state: u64 = seed | 1; // xorshift state must be non-zero
     if temp > 0.0 {
         eprintln!("temp sampling: T={temp}, seed={seed}");
+        if cactus_delta > 0.0 {
+            eprintln!(
+                "cactus: δ={cactus_delta} (bumped acceptance γ* = min(q + √(2·δ·q·(1−q)), 1))"
+            );
+        }
+    } else if cactus_delta > 0.0 {
+        eprintln!("cactus_delta={cactus_delta} ignored at temp=0 (greedy path has no distribution)");
     }
     // N-gram cache: built incrementally from committed output each iter.
     // Seeded from the prompt so multi-turn repetitions in the prompt get
@@ -310,6 +324,7 @@ fn main() {
             block_override,
             ngram_cache.as_ref(),
             &emitted,
+            cactus_delta,
         )
         .expect("spec step");
 

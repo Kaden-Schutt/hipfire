@@ -1382,6 +1382,7 @@ pub fn spec_step_dflash(
     block_size_override: Option<usize>,
     ngram_cache: Option<&NgramCache>,
     prev_committed: &[u32],
+    cactus_delta: f32,
 ) -> HipResult<SpecStepResult> {
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
@@ -1668,16 +1669,47 @@ pub fn spec_step_dflash(
         debug_assert_eq!(draft_softmaxes.len(), b - 1);
         let mut target_probs = Vec::with_capacity(vocab);
         let mut rejected_bonus: Option<u32> = None;
+        // CACTUS (Hao & Mou 2026, arXiv:2604.04987 Corollary 5) relaxes the
+        // Leviathan acceptance ratio by a KL-bounded bump √(2δ·q·(1−q)),
+        // trading controlled divergence from the verifier for higher τ.
+        // δ==0 reduces to vanilla SpS. Paper's strongest setting is δ=1.0.
+        let use_cactus = cactus_delta > 0.0;
         for i in 0..b - 1 {
             softmax_temp_into(&tgt_logits[i * vocab..(i + 1) * vocab], temp, &mut target_probs);
             let t = block[i + 1] as usize;
             let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
             let p_t = target_probs[t];
+            // Bumped acceptance probability: γ* = min(p_t + √(2·δ·p_t·(1−p_t)), 1).
+            // When δ==0 → γ* = p_t (standard Leviathan & Chen 2023).
+            let accept_prob = if use_cactus {
+                let bump = (2.0 * cactus_delta * p_t * (1.0 - p_t)).max(0.0).sqrt();
+                (p_t + bump).min(1.0)
+            } else {
+                p_t
+            };
             let u = xorshift_next_unit(rng_state);
-            if u * p_d <= p_t {
+            if u * p_d <= accept_prob {
                 accept_len += 1;
             } else {
-                // Rejected — sample bonus from (p_target − p_draft)₊.
+                // Rejected — sample bonus from the CACTUS-revised target h
+                // (§2.3, Theorem 2), not raw q. h is built in-place over
+                // target_probs (loop breaks right after, so no reuse):
+                //   h(t)   = γ*
+                //   h(i≠t) = (1−γ*)/(1−q(t)) · q(i)
+                if use_cactus {
+                    let qn = p_t.clamp(0.0, 1.0);
+                    let gamma_star = accept_prob;
+                    if qn >= 1.0 - 1e-6 {
+                        // Degenerate: q is (near) one-hot on t; h is one-hot on t too.
+                        for v in target_probs.iter_mut() { *v = 0.0; }
+                        target_probs[t] = 1.0;
+                    } else {
+                        let scale = (1.0 - gamma_star) / (1.0 - qn);
+                        for (j, v) in target_probs.iter_mut().enumerate() {
+                            *v = if j == t { gamma_star } else { scale * *v };
+                        }
+                    }
+                }
                 let u2 = xorshift_next_unit(rng_state);
                 rejected_bonus = Some(sample_residual(
                     &target_probs, &draft_softmaxes[i], u2,
