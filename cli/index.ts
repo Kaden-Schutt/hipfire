@@ -2810,6 +2810,65 @@ switch (cmd) {
     console.error("Updating hipfire...");
     const srcDir = join(HIPFIRE_DIR, "src");
     const repoDir = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
+    // ── Dep autodetect ──────────────────────────────────────
+    // Tools we spawn during update aren't always in $PATH even when
+    // installed — rustup lives at ~/.cargo/bin, bun at ~/.bun/bin, ROCm
+    // at /opt/rocm/bin on most distros. Empirically the v620 update run
+    // failed because the login shell's PATH is minimal while the user's
+    // interactive shell loads those bindirs via profile snippets. We probe
+    // well-known locations, augment process.env.PATH with any found dirs,
+    // and error fast with an install hint if a required dep is missing.
+    const findDep = (binary: string, extraDirs: string[]): string | null => {
+      // 1. Already in PATH
+      const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
+      const found = (inPath.stdout?.toString() ?? "").trim();
+      if (inPath.exitCode === 0 && found) return found;
+      // 2. Distro-specific known locations
+      for (const dir of extraDirs) {
+        const path = join(dir, binary);
+        if (existsSync(path)) return path;
+      }
+      return null;
+    };
+    const depsNeeded = [
+      { name: "git",   dirs: ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"],
+        hint: "Install git via your distro's package manager." },
+      { name: "cargo", dirs: [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"],
+        hint: "Install rustup: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh" },
+      { name: "hipcc", dirs: ["/opt/rocm/bin", "/opt/rocm-6.0.0/bin", "/opt/rocm-5.7.0/bin", "/usr/bin"],
+        hint: "Install ROCm: https://rocm.docs.amd.com/projects/install-on-linux/en/latest/" },
+    ];
+    const missing: { name: string; hint: string }[] = [];
+    const augmentDirs = new Set<string>();
+    for (const d of depsNeeded) {
+      const p = findDep(d.name, d.dirs);
+      if (!p) { missing.push(d); continue; }
+      // Any found tool's directory goes onto PATH so spawned children see it.
+      const dir = p.substring(0, p.lastIndexOf("/"));
+      if (dir) augmentDirs.add(dir);
+    }
+    if (missing.length) {
+      console.error("\nMissing required dependencies:");
+      for (const d of missing) console.error(`  • ${d.name} — ${d.hint}`);
+      console.error("\nAborting update. Install the above and retry `hipfire update`.");
+      process.exit(1);
+    }
+    // bun is optional at update time (we're already running it), but if the
+    // update script spawns anything that needs bun as a subprocess we want
+    // its dir on PATH too. Finding via inPath probe also covers NVM-style
+    // layouts where bun lives under user home in a non-standard dir.
+    const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
+    if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
+    // Prepend (not append) so our detected paths beat any stale system
+    // shadows that may exist in the bare PATH.
+    if (augmentDirs.size) {
+      const curr = (process.env.PATH || "").split(":").filter(Boolean);
+      const fresh = [...augmentDirs].filter(d => !curr.includes(d));
+      if (fresh.length) {
+        process.env.PATH = [...fresh, ...curr].join(":");
+        console.error(`  PATH augmented with: ${fresh.join(", ")}`);
+      }
+    }
     const git = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] });
     const gitOut = (args: string[]) => {
       const r = Bun.spawnSync(["git", ...args], { cwd: repoDir, stdout: "pipe", stderr: "pipe" });

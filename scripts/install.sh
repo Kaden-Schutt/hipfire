@@ -352,10 +352,27 @@ mkdir -p "$HIPFIRE_DIR/cli"
 cp "$REPO_DIR/cli/index.ts" "$HIPFIRE_DIR/cli/index.ts"
 cp "$REPO_DIR/cli/package.json" "$HIPFIRE_DIR/cli/package.json"
 
-# Create hipfire wrapper
+# Create hipfire wrapper. The shim resolves `bun` even when it isn't on
+# $PATH — rustup and bun both install to under-home bindirs that shell
+# profiles load, but non-interactive SSH / cron / systemd sessions often
+# get a minimal PATH. Without this probe the first line that calls the
+# shim dies with "exec: bun: not found" before dep-autodetect inside the
+# TS CLI has a chance to run.
 cat > "$BIN_DIR/hipfire" << 'WRAPPER'
 #!/bin/bash
-exec bun run "$HOME/.hipfire/cli/index.ts" "$@"
+set -e
+if command -v bun >/dev/null 2>&1; then
+    BUN=bun
+elif [ -x "$HOME/.bun/bin/bun" ]; then
+    BUN="$HOME/.bun/bin/bun"
+elif [ -x "/usr/local/bin/bun" ]; then
+    BUN="/usr/local/bin/bun"
+else
+    echo "hipfire: 'bun' not found in PATH, ~/.bun/bin/, or /usr/local/bin/." >&2
+    echo "         Install it: curl -fsSL https://bun.sh/install | bash" >&2
+    exit 127
+fi
+exec "$BUN" run "$HOME/.hipfire/cli/index.ts" "$@"
 WRAPPER
 chmod +x "$BIN_DIR/hipfire"
 echo "  Binaries + CLI installed to $BIN_DIR/ ✓"

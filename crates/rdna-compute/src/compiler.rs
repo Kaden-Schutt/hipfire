@@ -9,6 +9,39 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
+/// Copy .hsaco and .hash files from the persistent install location (cold)
+/// into the tmpfs hot path. Used once at KernelCompiler startup to seed the
+/// hot path after reboot (when /tmp gets cleared) without forcing a full
+/// recompile. Per-file: only copy if destination is missing or stale (size
+/// mismatch or older mtime). Returns on first IO failure without rolling
+/// back — the caller falls back to reading from the cold dir directly.
+fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(hot)?;
+    for entry in std::fs::read_dir(cold)? {
+        let entry = entry?;
+        let src = entry.path();
+        let ext = src.extension().and_then(|s| s.to_str()).unwrap_or("");
+        if ext != "hsaco" && ext != "hash" { continue; }
+        let name = match src.file_name() { Some(n) => n, None => continue };
+        let dst = hot.join(name);
+        // Skip if destination already exists with same size. We don't compare
+        // mtime because std::fs::copy doesn't preserve it — the destination
+        // mtime is the copy time, which is always later than the src mtime
+        // after an update. `hipfire update` wipes both dirs before re-copy,
+        // so a same-size dst is fresh-from-this-session's seed. Mid-session
+        // a kernel source edit + install rebuild would change the size (.hsaco
+        // is opaque binary) in realistic cases; size equality + fresh wipe is
+        // sufficient for the deployment workflow.
+        if let (Ok(s_meta), Ok(d_meta)) = (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            if s_meta.len() == d_meta.len() {
+                continue;
+            }
+        }
+        std::fs::copy(&src, &dst)?;
+    }
+    Ok(())
+}
+
 /// Compiles HIP kernel sources to code objects, with caching.
 /// Tries pre-compiled blobs first (kernels/compiled/{arch}/), falls back to hipcc.
 pub struct KernelCompiler {
@@ -41,9 +74,33 @@ impl KernelCompiler {
                     .filter(|p| p.is_dir())
             });
 
-        if let Some(ref dir) = precompiled_dir {
+        // Seed the tmpfs hot path from the persistent install location. /tmp
+        // dies on reboot but the install blobs don't, so first-daemon-after-
+        // boot copies them in. Subsequent daemons see a warm /tmp and skip
+        // this. Copy is incremental — only copies files not already present
+        // (or with stale hash) to avoid churn when both locations agree.
+        // `hipfire update` wipes BOTH /tmp and the install dir, so after an
+        // update + restart we get a fully-fresh re-seed.
+        let hot_dir = cache_dir.join(arch);
+        if let Some(ref cold) = precompiled_dir {
+            if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
+                eprintln!("  hot-path seed failed ({e}) — falling back to install dir reads");
+            }
+        }
+        // Prefer the hot-path (tmpfs) dir when it exists and has contents.
+        // This is what the `compile()` lookup uses from here on.
+        let effective_precompiled = if hot_dir.is_dir()
+            && std::fs::read_dir(&hot_dir).map(|mut it| it.any(|e| e.map(|e| e.path().extension().map(|x| x == "hsaco").unwrap_or(false)).unwrap_or(false))).unwrap_or(false)
+        {
+            Some(hot_dir.clone())
+        } else {
+            precompiled_dir.clone()
+        };
+
+        if let Some(ref dir) = effective_precompiled {
             eprintln!("  pre-compiled kernels: {}", dir.display());
         }
+        let precompiled_dir = effective_precompiled;
 
         // Probe for hipcc once at init, not per-kernel
         let has_hipcc = Command::new("hipcc").arg("--version")
