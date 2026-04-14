@@ -8,7 +8,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d       # background daemon on port 11435 (OpenAI API compatible)
 ```
 
-Current release: **v0.1.5 "redline"** — see [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.1.6 "deltacut"** — Qwen3.5-35B-A3B MoE support. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Why
 
@@ -31,6 +31,24 @@ no ROCm userspace stack at runtime.
 9B and 27B decode saturate ~650 GiB/s of the 7900 XTX's 960 GB/s peak — 68%
 BW efficiency end-to-end (weights + KV + activations). Prefill is WMMA-bound
 on the MQ4 fused projections.
+
+### vs ollama (Q4_K_M GGUF via llama.cpp/ROCm) — 7900 XTX
+
+Same machine, same models. hipfire asym3 MQ4 vs ollama default Q4_K_M (llama.cpp
+ROCm backend). hipfire numbers from `hipfire bench <tag>`; ollama numbers from
+`/api/generate` with `num_predict=128` (uses ollama's own reported
+`prompt_eval_duration` / `eval_duration`).
+
+| Model | hipfire decode | ollama decode | hipfire pp128 | ollama pp | decode speedup |
+|---|---:|---:|---:|---:|---:|
+| Qwen 3.5 0.8B | **355 tok/s** | 162 tok/s | **11,287 tok/s** | 808 tok/s | **2.19×** |
+| Qwen 3.5 4B   | **166 tok/s** | 69 tok/s  | **1,937 tok/s**  | 629 tok/s | **2.42×** |
+| Qwen 3.5 9B   | **122 tok/s** | 56 tok/s  | **1,935 tok/s**  | 496 tok/s | **2.18×** |
+
+Prefill advantage is much wider (3–14×) because hipfire's batched MQ4
+projections saturate WMMA bandwidth where ollama takes the per-token
+GGUF dequant path. Decode is the user-visible number for interactive
+chat, and even there hipfire is ~2.2–2.4× on a fair `num_predict=128`.
 
 Other arches:
 
