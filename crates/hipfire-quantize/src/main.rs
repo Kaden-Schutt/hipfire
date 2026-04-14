@@ -1037,6 +1037,13 @@ fn is_q8_tensor(name: &str) -> bool {
         || name.contains("embed") || name.contains("lm_head")
         // Qwen3.5 DeltaNet attention
         || name.contains("linear_attn")
+        // Qwen3.5-MoE: the router (`mlp.gate.weight`, hidden_size × num_experts)
+        // is small but precision-sensitive — flat-routing on a quantized router
+        // shifts which experts a token sees. Same for the per-layer scalar
+        // `mlp.shared_expert_gate.weight` that scales the shared expert. Keep
+        // both at Q8 even in Q4-bulk modes.
+        || name.ends_with("mlp.gate.weight")
+        || name.ends_with("mlp.shared_expert_gate.weight")
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -1159,9 +1166,17 @@ fn main() {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" => 5,
+        // Qwen3.5 MoE (Qwen3.5-35B-A3B and friends): hybrid LA+FA attention identical
+        // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
+        // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
+        "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     eprintln!("Architecture: {arch_str} (id={arch_id})");
+    let is_moe = arch_id == 6;
+    if is_moe {
+        eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
+    }
 
     // Read tokenizer if present
     let tokenizer_json = input_dir.join("tokenizer.json");
@@ -1238,6 +1253,75 @@ fn main() {
         let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
+
+        // ── MoE 3D-stacked expert tensor split ─────────────────────────────────
+        // Qwen3.5-MoE stores routed experts as 3D tensors:
+        //   model.language_model.layers.{N}.mlp.experts.gate_up_proj
+        //     shape: [num_experts, 2 * moe_intermediate, hidden_size]
+        //   model.language_model.layers.{N}.mlp.experts.down_proj
+        //     shape: [num_experts, hidden_size, moe_intermediate]
+        // Note: no `.weight` suffix on these, so should_quantize() returns false
+        // and the standard path would store them as F16 — defeating the purpose.
+        // We split into per-expert 2D MQ4G256 quantized tensors named
+        //   model.language_model.layers.{N}.mlp.experts.{X}.{base}.weight
+        // so the engine loader can fish them out by expert index.
+        if is_moe
+            && name.contains("mlp.experts.")
+            && (name.ends_with("gate_up_proj") || name.ends_with("down_proj"))
+            && meta.shape.len() == 3
+        {
+            let n_experts = meta.shape[0];
+            let inner_n: usize = meta.shape[1..].iter().product();
+            let elem_size = match meta.dtype.as_str() {
+                "F32" => 4, "F16" | "BF16" => 2,
+                other => panic!("unsupported expert tensor dtype: {other}"),
+            };
+            let inner_bytes = inner_n * elem_size;
+            let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&s| s as u32).collect();
+            let base_name = if name.ends_with("gate_up_proj") { "gate_up_proj" } else { "down_proj" };
+            // Strip the trailing base; what remains is the parent path with `experts.` already on the end
+            let parent = &name[..name.len() - base_name.len()];
+
+            // Inner MQ4G256 quantization helpers — we know we want MQ4 for experts
+            // (router/shared_expert use the standard format-flag path below).
+            let signs1 = gen_fwht_signs(42, 256);
+            let signs2 = gen_fwht_signs(1042, 256);
+            let inner_k = inner_shape[1] as usize;
+            let supports_mq4 = inner_k % 256 == 0;
+
+            for x in 0..n_experts {
+                let slice_off = x * inner_bytes;
+                let slice = &raw_data[slice_off..slice_off + inner_bytes];
+                let f32_slice = to_f32(slice, &meta.dtype);
+
+                let slice_name = format!("{parent}{x}.{base_name}.weight");
+                quantized_params += inner_n as u64;
+
+                let (quantized, qt, gs, label) = if supports_mq4 {
+                    let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                } else {
+                    // Fallback: HFQ4G128 if K isn't 256-aligned (shouldn't happen for A3B which is 2048/512)
+                    let q = quantize_hfq4g128(&f32_slice);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                };
+
+                if x == 0 {
+                    eprintln!("  {label:>8}: {} {:?} (×{} experts, {:.1} KB/expert)",
+                        slice_name, inner_shape, n_experts,
+                        quantized.len() as f64 / 1024.0);
+                }
+
+                hfq_tensors.push(HfqTensor {
+                    name: slice_name,
+                    quant_type: qt,
+                    shape: inner_shape.clone(),
+                    group_size: gs,
+                    data: quantized,
+                });
+            }
+            continue;
+        }
 
         if should_quantize(name) && n_elements >= 32 {
             let f32_data = to_f32(raw_data, &meta.dtype);
