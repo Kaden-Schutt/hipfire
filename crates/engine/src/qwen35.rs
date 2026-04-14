@@ -1102,26 +1102,65 @@ fn moe_ffn_decode(
         gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, &ffn_out, &scalar_buf)?;
     }
 
-    // ── 4. Top-K routed experts: fused gate_up → split → silu_mul → down ──
-    // The routed expert's `gate_up` is [2*mi, hidden] fused; layout is
-    // [gate(mi); up(mi)] along the first dim (matches HF's
-    // torch.cat([gate_proj, up_proj], dim=0)).
-    let gate_view = slice_f32_view(&gate_up_buf, 0,  mi);
-    let up_view   = slice_f32_view(&gate_up_buf, mi, mi);
+    // ── 4. Top-K routed experts ──
+    // Phase 2c step 1: when top_k==8 and all selected experts' gate_up are
+    // MQ4G256 (true for A3B), fuse the 8 gate_up GEMVs into a single
+    // kernel launch via gemv_hfq4g256_moe_gate_up_k8 — grid.y selects the
+    // expert via a kernarg pointer array. Output is a [k × 2*mi] batch.
+    //
+    // The silu_mul+rotate and down+scaled_residual stages are still
+    // per-expert launches for now (Phase 2c step 2 will batch them too).
     let routed_mq4 = ffn.experts.first()
         .map(|e| e.down.gpu_dtype == DType::MQ4G256)
+        .unwrap_or(false);
+    let routed_gate_up_mq4 = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
     if routed_mq4 {
         gpu.ensure_mq_signs()?;
     }
-    for (&expert_idx, &weight) in topk_indices.iter().zip(topk_weights.iter()) {
+
+    // Scratch batch output for all k experts' gate_up results: [k × 2*mi].
+    let use_fused_gate_up = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
+    let gate_up_batch = if use_fused_gate_up {
+        Some(gpu.alloc_tensor(&[k * 2 * mi], DType::F32)?)
+    } else {
+        None
+    };
+    if let (Some(batch_out), Some(xr)) = (gate_up_batch.as_ref(), x_rot_local.as_ref()) {
+        // Single fused launch: 8 experts' gate_up GEMV in parallel.
+        let e0 = &ffn.experts[topk_indices[0]].gate_up;
+        let e1 = &ffn.experts[topk_indices[1]].gate_up;
+        let e2 = &ffn.experts[topk_indices[2]].gate_up;
+        let e3 = &ffn.experts[topk_indices[3]].gate_up;
+        let e4 = &ffn.experts[topk_indices[4]].gate_up;
+        let e5 = &ffn.experts[topk_indices[5]].gate_up;
+        let e6 = &ffn.experts[topk_indices[6]].gate_up;
+        let e7 = &ffn.experts[topk_indices[7]].gate_up;
+        gpu.gemv_hfq4g256_moe_gate_up_k8(
+            &e0.buf, &e1.buf, &e2.buf, &e3.buf,
+            &e4.buf, &e5.buf, &e6.buf, &e7.buf,
+            xr, batch_out,
+            2 * mi, e0.k,
+        )?;
+    }
+
+    for (krank, (&expert_idx, &weight)) in topk_indices.iter().zip(topk_weights.iter()).enumerate() {
         let expert = &ffn.experts[expert_idx];
-        if let Some(ref xr) = x_rot_local {
-            gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
-                expert.gate_up.m, expert.gate_up.k)?;
+        // Source buffer for silu_mul: either the fused batch output slice
+        // or a fresh per-expert scratch from an unfused gate_up GEMV.
+        let (gate_view, up_view) = if let Some(ref batch) = gate_up_batch {
+            let base = krank * 2 * mi;
+            (slice_f32_view(batch, base, mi), slice_f32_view(batch, base + mi, mi))
         } else {
-            weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
-        }
+            if let Some(ref xr) = x_rot_local {
+                gpu.gemv_mq4g256_prerotated(&expert.gate_up.buf, xr, &gate_up_buf,
+                    expert.gate_up.m, expert.gate_up.k)?;
+            } else {
+                weight_gemv(gpu, &expert.gate_up, x_norm, &gate_up_buf)?;
+            }
+            (slice_f32_view(&gate_up_buf, 0, mi), slice_f32_view(&gate_up_buf, mi, mi))
+        };
         if routed_mq4 {
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1147,6 +1186,9 @@ fn moe_ffn_decode(
         gpu.free_tensor(t)?;
     }
     if let Some(buf) = x_rot_local {
+        gpu.free_tensor(buf)?;
+    }
+    if let Some(buf) = gate_up_batch {
         gpu.free_tensor(buf)?;
     }
     Ok(())

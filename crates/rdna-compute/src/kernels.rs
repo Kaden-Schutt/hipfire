@@ -98,6 +98,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kern
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
+/// launch. Grid.y is the expert rank (0..7); each block selects its
+/// expert's weight base from the W0..W7 kernarg array and runs the
+/// standard HFQ4G256 body. Saves 7 launches per MoE layer.
+pub const GEMV_HFQ4G256_MOE_GATE_UP_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_moe_gate_up.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used

@@ -2630,6 +2630,66 @@ impl Gpu {
         result
     }
 
+    /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in a
+    /// single launch. Caller passes the 8 selected experts' weight
+    /// tensors (in top-K order); the kernel's grid.y picks which expert
+    /// each block uses. Output layout is [K_TOP × M] row-major.
+    ///
+    /// Bit-exact with running `gemv_hfq4g256` 8 times (same accumulator
+    /// layout and pairwise final combine). `k_top` is currently hardcoded
+    /// to 8 to match A3B; a generic path can follow alongside Phase 2b.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_gate_up_k8(
+        &mut self,
+        w0: &GpuTensor, w1: &GpuTensor, w2: &GpuTensor, w3: &GpuTensor,
+        w4: &GpuTensor, w5: &GpuTensor, w6: &GpuTensor, w7: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,   // [k_top × m] row-major
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_gate_up",
+            kernels::GEMV_HFQ4G256_MOE_GATE_UP_SRC,
+            "gemv_hfq4g256_moe_gate_up_k8",
+        )?;
+        let w0p = w0.buf.as_ptr(); let w1p = w1.buf.as_ptr();
+        let w2p = w2.buf.as_ptr(); let w3p = w3.buf.as_ptr();
+        let w4p = w4.buf.as_ptr(); let w5p = w5.buf.as_ptr();
+        let w6p = w6.buf.as_ptr(); let w7p = w7.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w0p as *const _ as *mut c_void, &w1p as *const _ as *mut c_void,
+            &w2p as *const _ as *mut c_void, &w3p as *const _ as *mut c_void,
+            &w4p as *const _ as *mut c_void, &w5p as *const _ as *mut c_void,
+            &w6p as *const _ as *mut c_void, &w7p as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // Bandwidth: 8× weight, x read 8× (cached in practice), 8×m writes.
+        let bytes = 8 * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g256_moe_gate_up_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_gate_up_k8", [m as u32, 8, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w0p); b.push_ptr(w1p); b.push_ptr(w2p); b.push_ptr(w3p);
+                b.push_ptr(w4p); b.push_ptr(w5p); b.push_ptr(w6p); b.push_ptr(w7p);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///
