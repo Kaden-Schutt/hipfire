@@ -295,6 +295,90 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "bench_prefill" => {
+                // Synthetic prefill benchmark — measures forward_prefill_batch on N
+                // deterministic tokens from a zeroed state. Used by `hipfire bench`
+                // to produce canonical pp128/pp512/pp1024 numbers that don't depend
+                // on the user's prompt tokenizing to a round number.
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                // Guard max_seq — reserve 32 slots of headroom so a subsequent
+                // generate request against the loaded model still has room.
+                if n + 32 > m.max_seq {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"error","message":"bench_prefill tokens={} exceeds loaded max_seq={}"}}"#,
+                        n, m.max_seq);
+                    let _ = stdout.flush();
+                    continue;
+                }
+                // Deterministic synthetic token IDs. Skip 0 (often <pad>) and the
+                // low specials by offsetting, and wrap in a 1000-wide window so the
+                // embedding lookup cost stays realistic rather than hitting one
+                // cache-hot row repeatedly.
+                let synthetic: Vec<u32> = (0..n as u32).map(|i| 10 + (i % 1000)).collect();
+
+                // Reset state BEFORE timing so we're measuring cold prefill, not
+                // prefill-on-top-of-prior-state.
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                if let Some(ref dn) = m.dn_state {
+                    for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                }
+
+                let t0 = Instant::now();
+                let run_ok = if m.arch_id == 5 {
+                    let config = m.q35_config.as_ref().unwrap();
+                    let weights = m.q35_weights.as_ref().unwrap();
+                    let scratch = m.q35_scratch.as_ref().unwrap();
+                    let kv = m.kv_cache.as_mut().unwrap();
+                    let dn = m.dn_state.as_mut().unwrap();
+                    qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch).is_ok()
+                } else {
+                    let config = m.llama_config.as_ref().unwrap();
+                    let weights = m.llama_weights.as_ref().unwrap();
+                    let scratch = m.llama_scratch.as_ref().unwrap();
+                    let kv = m.llama_kv.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if llama::forward_scratch(&mut gpu, weights, config, tok, i, kv, scratch, 0.0, 1.0, 42, 0, 1.0).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                };
+                let elapsed = t0.elapsed().as_secs_f64();
+
+                // Reset state AFTER measurement — we've written N KV slots and a
+                // DeltaNet state that the next real request must not inherit.
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                if let Some(ref dn) = m.dn_state {
+                    for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                    for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+                }
+
+                if run_ok {
+                    let tok_s = if elapsed > 0.0 { n as f64 / elapsed } else { 0.0 };
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
+                        n, elapsed * 1000.0, tok_s);
+                } else {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"bench_prefill forward failed"}}"#);
+                }
+                let _ = stdout.flush();
+            }
+
             "profile" => {
                 // Precompile kernels for common configurations so we have something to profile.
                 // If a model is loaded its kernels are already compiled; this fills in the rest.
@@ -496,6 +580,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
     if m.arch_id == 5 {
@@ -514,6 +599,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         qwen35::forward_prefill_batch(
             gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
         ).unwrap();
+        let t_prefill = Instant::now();
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
@@ -612,8 +698,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             }
         }
 
-        let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
-        let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
+        let t_end = Instant::now();
+        let total_s = t_end.duration_since(t0).as_secs_f64();
+        let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+        let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+        let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+        let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
+        let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+            id, generated, tok_s, prefill_tokens,
+            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+        );
         let _ = stdout.flush();
     } else {
         // Qwen3 / LLaMA path — multi-turn aware
@@ -637,6 +734,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         gpu.hip.memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf).unwrap();
         let mut next_token = u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]);
         rng_state = u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]);
+        // Prefill ends here: prompt is processed AND first token is ready (D2H
+        // sync is the user-observable "time to first token" boundary). Decode
+        // below measures the pure forward+sample steady-state.
+        let t_prefill = Instant::now();
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -689,8 +790,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             }
         }
 
-        let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
-        let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
+        let t_end = Instant::now();
+        let total_s = t_end.duration_since(t0).as_secs_f64();
+        let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+        let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+        let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+        let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
+        let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+            id, generated, tok_s, prefill_tokens,
+            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+        );
         let _ = stdout.flush();
     }
 }
@@ -790,6 +902,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
     // Prefill with vision token embedding for IMAGE_PAD positions
@@ -812,6 +925,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     // Generate
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::sample_top_p(&logits, temp, top_p);
+    let t_prefill = Instant::now();
     let mut generated = 0;
 
     for _ in 0..max_tokens {
@@ -842,7 +956,18 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
     }
 
-    let tok_s = generated as f64 / t0.elapsed().as_secs_f64();
-    let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1}}}"#, id, generated, tok_s);
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated, tok_s, prefill_tokens,
+        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+    );
     let _ = stdout.flush();
 }

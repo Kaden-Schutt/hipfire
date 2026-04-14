@@ -1470,6 +1470,7 @@ interface BenchResult {
   label: string;
   decode: number[];
   prefill: number[];
+  ttft: number[];
 }
 
 function stats(arr: number[]): { mean: number; min: number; max: number; stdev: number } {
@@ -1485,6 +1486,13 @@ function fmtNum(n: number, w = 7): string {
   return n.toFixed(1).padStart(w);
 }
 
+function fmtBytes(b: number): string {
+  if (b >= 1024 * 1024 * 1024) return (b / (1024 * 1024 * 1024)).toFixed(2) + " GB";
+  if (b >= 1024 * 1024) return (b / (1024 * 1024)).toFixed(1) + " MB";
+  if (b >= 1024) return (b / 1024).toFixed(1) + " KB";
+  return b + " B";
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout>;
   return Promise.race([
@@ -1495,11 +1503,23 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
-// benchRun result + flag indicating the engine is poisoned (timed out mid-stream)
-interface BenchRunResult { decode: number; prefill: number; tokens: number; ok: boolean; poisoned: boolean }
+// benchRun result + flag indicating the engine is poisoned (timed out mid-stream).
+// `decode` is pure decode tok/s (post-prefill); `wall` is whole-request tok/s
+// (kept for backward-compat / sanity); `prefill` is prompt-processing tok/s.
+interface BenchRunResult {
+  decode: number;
+  prefill: number;
+  wall: number;
+  ttftMs: number;
+  prefillMs: number;
+  prefillTokens: number;
+  tokens: number;
+  ok: boolean;
+  poisoned: boolean;
+}
 
 async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs = 120_000): Promise<BenchRunResult> {
-  const fail = { decode: 0, prefill: 0, tokens: 0, ok: false, poisoned: false };
+  const fail = { decode: 0, prefill: 0, wall: 0, ttftMs: 0, prefillMs: 0, prefillTokens: 0, tokens: 0, ok: false, poisoned: false };
   try {
     await withTimeout(e.send({ type: "reset" }).then(() => e.recv()), 10_000, "reset");
   } catch { return { ...fail, poisoned: true }; }
@@ -1508,12 +1528,18 @@ async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs 
     temperature: 0, max_tokens: maxTokens,
     repeat_penalty: 1.1, top_p: 1.0,
   };
-  let decode = 0, prefill = 0, tokens = 0;
+  let decode = 0, prefill = 0, wall = 0, ttftMs = 0, prefillMs = 0, prefillTokens = 0, tokens = 0;
   try {
     const run = async () => {
       for await (const msg of e.generate(genMsg)) {
         if (msg.type === "done") {
-          decode = msg.tok_s || 0;
+          // New daemons emit split metrics; fall back to tok_s if missing.
+          wall = msg.tok_s || 0;
+          decode = msg.decode_tok_s ?? wall;
+          prefill = msg.prefill_tok_s ?? 0;
+          ttftMs = msg.ttft_ms ?? 0;
+          prefillMs = msg.prefill_ms ?? 0;
+          prefillTokens = msg.prefill_tokens ?? 0;
           tokens = msg.tokens || 0;
         }
       }
@@ -1523,7 +1549,32 @@ async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs 
     // Timed out mid-stream — daemon is reading/writing stale data, must be killed
     return { ...fail, poisoned: true };
   }
-  return { decode, prefill, tokens, ok: decode > 0, poisoned: false };
+  return {
+    decode, prefill, wall, ttftMs, prefillMs, prefillTokens, tokens,
+    ok: decode > 0,
+    poisoned: false,
+  };
+}
+
+// Synthetic prefill measurement: runs `bench_prefill` on the daemon which
+// times forward_prefill_batch over N deterministic tokens from a zeroed
+// state. Returns tok/s and ms, or null on error (e.g. N > max_seq).
+async function benchPrefill(e: Engine, tokens: number, timeoutMs = 60_000): Promise<{ tokS: number; ms: number } | null> {
+  try {
+    await withTimeout(e.send({ type: "bench_prefill", tokens }), 5_000, "bench_prefill send");
+    const res = await withTimeout(e.recv(), timeoutMs, `bench_prefill (${tokens} tok)`);
+    if (res.type === "prefill_result") {
+      return { tokS: res.tok_s || 0, ms: res.ms || 0 };
+    }
+    // Surface daemon errors to stderr but don't poison the engine; the
+    // state reset on the daemon side is independent of the error path.
+    if (res.type === "error" && res.message) {
+      console.error(`  pp${tokens}: ${res.message}`);
+    }
+    return null;
+  } catch {
+    return null;
+  }
 }
 
 async function bench(model: string, runs: number, experimental: boolean, prompt: string) {
@@ -1545,22 +1596,38 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
   const e = new Engine();
   await e.start();
   await e.send({ type: "ping" }); await e.recv();
-  await e.send(buildLoadMessage(modelPath, model));
+
+  // Pre-load VRAM snapshot — lets us compute weights+scratch+KV footprint
+  // by diffing against the post-load snapshot.
+  await e.send({ type: "diag" });
+  const preDiag = await e.recv();
+  const vramFreePreMb = preDiag.vram_free_mb || 0;
+  const vramTotalMb = preDiag.vram_total_mb || 0;
+  const gpuArch = preDiag.arch || "unknown";
+  const hipVer = preDiag.hip_version || "?";
+  const isRdna2 = gpuArch === "gfx1030" || gpuArch === "gfx1031";
+
+  const loadMsg = buildLoadMessage(modelPath, model);
+  await e.send(loadMsg);
   const loaded = await e.recv();
   if (loaded.type === "error") { console.error(loaded.message); process.exit(1); }
 
-  // Get real GPU arch from diag (loaded.arch is the model arch, not GPU)
+  // Post-load VRAM snapshot — delta gives model footprint.
   await e.send({ type: "diag" });
-  const diag = await e.recv();
-  const gpuArch = diag.arch || "unknown";
-  const isRdna2 = gpuArch === "gfx1030" || gpuArch === "gfx1031";
+  const postDiag = await e.recv();
+  const vramFreePostMb = postDiag.vram_free_mb || 0;
+  const loadedMb = Math.max(0, vramFreePreMb - vramFreePostMb);
 
   console.error(`hipfire bench`);
-  console.error(`  model:  ${basename(modelPath!)}  [${loaded.arch}]`);
-  console.error(`  gpu:    ${gpuArch}`);
-  console.error(`  kv:     ${cfg.kv_cache}`);
-  console.error(`  runs:   ${runs}`);
-  console.error(`  prompt: "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
+  console.error(`  model:     ${basename(modelPath!)}  [${loaded.arch}]`);
+  if (loaded.dim)    console.error(`  arch:      dim=${loaded.dim}, layers=${loaded.layers}, vocab=${loaded.vocab}${loaded.vl ? " (vision)" : ""}`);
+  console.error(`  gpu:       ${gpuArch}  (HIP ${hipVer})`);
+  console.error(`  kv_cache:  ${cfg.kv_cache}`);
+  console.error(`  max_seq:   ${loadMsg.params.max_seq}`);
+  if (loadedMb > 0) console.error(`  vram:      ${loadedMb} MB loaded  (${vramFreePostMb}/${vramTotalMb} MB free)`);
+  else              console.error(`  vram:      ${vramFreePostMb}/${vramTotalMb} MB free`);
+  console.error(`  runs:      ${runs}`);
+  console.error(`  prompt:    "${prompt.length > 60 ? prompt.slice(0, 57) + "..." : prompt}"`);
 
   if (experimental && !isRdna2) {
     console.error(`\n--exp requires RDNA2 (gfx1030/gfx1031), detected ${gpuArch}. Running standard bench.`);
@@ -1610,7 +1677,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       }
 
       if (!variantOk) {
-        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [] });
+        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [], ttft: [] });
         await ve.stop();
         continue;
       }
@@ -1619,7 +1686,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       const warmup = await benchRun(ve, "Hello", 16, 30_000);
       if (warmup.poisoned) {
         console.error(`  v${v.n} ${v.name}: warmup timed out`);
-        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [] });
+        results.push({ label: `v${v.n} ${v.name}`, decode: [], prefill: [], ttft: [] });
         await ve.stop();
         continue;
       }
@@ -1627,6 +1694,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
       process.stderr.write(`  v${v.n} ${v.name.padEnd(18)} `);
       const decodes: number[] = [];
       const prefills: number[] = [];
+      const ttfts: number[] = [];
       let abandoned = false;
 
       for (let r = 0; r < runs; r++) {
@@ -1643,10 +1711,12 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
           continue;
         }
         decodes.push(res.decode);
+        if (res.prefill > 0) prefills.push(res.prefill);
+        if (res.ttftMs > 0) ttfts.push(res.ttftMs);
         process.stderr.write(".");
       }
       console.error("");
-      results.push({ label: `v${v.n} ${v.name}`, decode: decodes, prefill: prefills });
+      results.push({ label: `v${v.n} ${v.name}`, decode: decodes, prefill: prefills, ttft: ttfts });
       if (!abandoned) await ve.stop();
     }
     delete process.env.HIPFIRE_RDNA2_VARIANT;
@@ -1681,7 +1751,7 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
 
   } else {
     // ── Standard bench ──
-    console.error(`  mode:   standard\n`);
+    console.error(`  mode:      standard\n`);
 
     // Warmup
     process.stderr.write("  warming up...");
@@ -1693,8 +1763,45 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     }
     console.error(" done\n");
 
+    // Synthetic prefill tests: canonical pp128/pp512/pp1024 numbers that
+    // don't depend on prompt tokenization. Older daemons ignore the command
+    // and return an error; we silently skip in that case. Each size is run
+    // `runs` times so we can report variance.
+    const ppSizes = [128, 512, 1024, 2048].filter(n => n + 32 <= loadMsg.params.max_seq);
+    const ppResults: { size: number; samples: number[]; ms: number[] }[] = [];
+    if (ppSizes.length > 0) {
+      process.stderr.write("  prefill: ");
+      for (const size of ppSizes) {
+        // Discarded warmup: the first prefill at a new size often hits cold
+        // kernel-specific caches (scratch buffers sized for this N, memoized
+        // launch configs). Throwing it away gives tight variance.
+        await benchPrefill(e, size);
+
+        const samples: number[] = [];
+        const mss: number[] = [];
+        for (let r = 0; r < runs; r++) {
+          const res = await benchPrefill(e, size);
+          if (!res) break;
+          samples.push(res.tokS);
+          mss.push(res.ms);
+        }
+        if (samples.length > 0) {
+          ppResults.push({ size, samples, ms: mss });
+          const s = stats(samples);
+          process.stderr.write(`pp${size}=${s.mean.toFixed(0)} `);
+        } else {
+          process.stderr.write(`pp${size}=skip `);
+        }
+      }
+      console.error("");
+    }
+
     const decodes: number[] = [];
+    const prefills: number[] = [];
+    const ttfts: number[] = [];
+    const walls: number[] = [];
     const tokenCounts: number[] = [];
+    let lastPrefillTokens = 0;
 
     for (let r = 0; r < runs; r++) {
       process.stderr.write(`  run ${r + 1}/${runs} `);
@@ -1709,21 +1816,56 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
         continue;
       }
       decodes.push(res.decode);
+      walls.push(res.wall);
+      if (res.prefill > 0)  prefills.push(res.prefill);
+      if (res.ttftMs > 0)   ttfts.push(res.ttftMs);
+      if (res.prefillTokens) lastPrefillTokens = res.prefillTokens;
       tokenCounts.push(res.tokens);
-      console.error(`${res.decode.toFixed(1)} tok/s (${res.tokens} tok)`);
+      // One-liner: pp tok/s | TTFT ms | decode tok/s (n tok)
+      const pp = res.prefill > 0 ? `pp ${res.prefill.toFixed(0)} tok/s` : `pp --`;
+      const tt = res.ttftMs > 0  ? `TTFT ${res.ttftMs.toFixed(0)} ms` : `TTFT --`;
+      console.error(`${pp} | ${tt} | decode ${res.decode.toFixed(1)} tok/s (${res.tokens} tok)`);
     }
 
     const d = stats(decodes);
+    const p = stats(prefills);
+    const t = stats(ttfts);
+    const w = stats(walls);
 
     console.log("");
-    console.log("  Decode  tok/s");
-    console.log(`    mean:  ${d.mean.toFixed(1)}`);
-    console.log(`    min:   ${d.min.toFixed(1)}`);
-    console.log(`    max:   ${d.max.toFixed(1)}`);
-    console.log(`    stdev: ${d.stdev.toFixed(1)}`);
+
+    // Synthetic prefill scaling table (pp128, pp512, pp1024, ...): canonical
+    // numbers comparable across builds and against other engines.
+    if (ppResults.length > 0) {
+      console.log(`  Prefill    tok/s      mean      min      max    stdev     ms`);
+      console.log("  " + "─".repeat(64));
+      for (const pp of ppResults) {
+        const s = stats(pp.samples);
+        const mMean = pp.ms.reduce((a, b) => a + b, 0) / pp.ms.length;
+        console.log(
+          `  pp${String(pp.size).padEnd(5)}         ` +
+          `${fmtNum(s.mean,9)}${fmtNum(s.min,9)}${fmtNum(s.max,9)}${fmtNum(s.stdev,9)}   ${mMean.toFixed(1)}`
+        );
+      }
+      console.log("");
+    }
+
+    console.log(`                       mean      min      max    stdev`);
+    console.log("  " + "─".repeat(58));
+    if (p.mean > 0) {
+      console.log(`  Prefill  tok/s  ${fmtNum(p.mean,9)}${fmtNum(p.min,9)}${fmtNum(p.max,9)}${fmtNum(p.stdev,9)}   (user prompt, ${lastPrefillTokens} tok)`);
+    }
+    if (t.mean > 0) {
+      console.log(`  TTFT     ms     ${fmtNum(t.mean,9)}${fmtNum(t.min,9)}${fmtNum(t.max,9)}${fmtNum(t.stdev,9)}`);
+    }
+    console.log(`  Decode   tok/s  ${fmtNum(d.mean,9)}${fmtNum(d.min,9)}${fmtNum(d.max,9)}${fmtNum(d.stdev,9)}`);
+    if (w.mean > 0 && Math.abs(w.mean - d.mean) > 0.5) {
+      // Wall-clock is useful only when prefill meaningfully drags on decode.
+      console.log(`  Wall     tok/s  ${fmtNum(w.mean,9)}${fmtNum(w.min,9)}${fmtNum(w.max,9)}${fmtNum(w.stdev,9)}`);
+    }
 
     if (d.mean > 0) {
-      console.log(`    ms/tok: ${(1000 / d.mean).toFixed(1)}`);
+      console.log(`\n  Decode ms/tok: ${(1000 / d.mean).toFixed(2)}`);
     }
 
     if (isRdna2) {
