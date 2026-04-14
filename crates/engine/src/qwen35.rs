@@ -2068,15 +2068,19 @@ pub fn forward_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
-    // hipGraph capture is currently DISABLED for MoE configs. The captured
-    // graph corrupts multi-turn state — single-token decode looks healthy
-    // (validated by a3b_smoke_forward at HIPFIRE_GRAPH=1: 162 tok/s,
-    // coherent single-shot output), but every additional `forward_scratch`
-    // call that follows a graph capture writes through the same per-layer
-    // moe_topk / gate_batch / rot_batch scratch, and replay produces
-    // increasingly garbage logits across turns (verified against the
-    // daemon multi-turn test). Until that's properly diagnosed, MoE
-    // configs always take the direct path.
+    // hipGraph capture is currently DISABLED for MoE configs. Single-shot
+    // replay looks fine for short sequences, but state diverges from the
+    // direct-dispatch path after ~30–50 decoded tokens — the model drops
+    // a number in a count (skips "8" → "9"), loops on a single token, etc.
+    // The divergence is consistent under HIPFIRE_GRAPH=1 with the same
+    // prompt that succeeds with HIPFIRE_GRAPH=0. Investigated without
+    // finding the root cause: all kernels used by the MoE forward path
+    // appear individually graph-safe (pos-dependent ones read pos_buf
+    // dynamically; size-dependent ones use max_tiles/max_seq; the indexed
+    // MoE kernels have only static pointer kernargs). Suspect a numerical
+    // reordering between capture and replay in one of the flash-attn or
+    // GDN state-update kernels that compounds over many replays.
+    // Until that's isolated, MoE always takes the direct path.
     let use_graph = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1")
         && config.num_experts == 0;
 
