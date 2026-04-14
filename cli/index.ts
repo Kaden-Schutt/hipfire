@@ -33,6 +33,15 @@ interface HipfireConfig {
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
+  // ── Experimental / research knobs (OFF by default, no stable contract) ──
+  // Gates the daemon's `budget_alert_at_tok` + `budget_alert_text` generate
+  // params. When false (default), the daemon ignores those params entirely.
+  // Research-only feature: in-band nudges to the model's own think stream,
+  // which CAN leak into visible output if the client doesn't also constrain
+  // when the alert fires (e.g. injecting past </think>). Only enable if you
+  // understand the knob. See docs/MULTI_MODEL_QUEUE.md path for where this
+  // lives in the roadmap.
+  experimental_budget_alert: boolean;
 }
 
 // Detect GPU at import time for smart defaults
@@ -56,6 +65,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_think_tokens: 0,
   port: DEFAULT_PORT,
   idle_timeout: 300,
+  experimental_budget_alert: false,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -72,6 +82,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
+    case "experimental_budget_alert": return typeof value === "boolean";
     default: return false;
   }
 }
@@ -347,6 +358,16 @@ function applyConfigEnv(cfg: HipfireConfig): void {
     if (cfg.flash_mode === "always" || cfg.flash_mode === "never") {
       process.env.HIPFIRE_ATTN_FLASH = cfg.flash_mode;
     }
+  }
+  // Experimental budget-alert gate. The daemon reads this env var on every
+  // generate request; if not set to "1", it refuses `budget_alert_at_tok`
+  // even if a client passes it. Keeps an unstable research feature from
+  // leaking into real responses via misconfigured callers. Setting cleanly
+  // (no env → unset) matters because this is the signed gate.
+  if (cfg.experimental_budget_alert) {
+    process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT = "1";
+  } else {
+    delete process.env.HIPFIRE_EXPERIMENTAL_BUDGET_ALERT;
   }
 }
 

@@ -227,11 +227,32 @@ fn main() {
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                // Experimental: inject a nudge string at a specific generated-
+                // token count. The nudge tokens get forward-fed through the KV
+                // cache so the model "sees" them as part of its own trajectory,
+                // and are emitted to stdout so the client stream includes them.
+                // Used to test whether telling a thinking model "time's up"
+                // gets it to close </think> and commit to an answer.
+                //
+                // GATED: off by default. The feature has a real UX hazard — if
+                // the alert fires after </think> has already closed, the nudge
+                // leaks into the visible answer. Only honor the params when the
+                // operator has explicitly opted in via config
+                // (`experimental_budget_alert: true` → HIPFIRE_EXPERIMENTAL_
+                // BUDGET_ALERT=1 set by the CLI). Research use only; not a
+                // stable contract.
+                let experimental_ok = std::env::var("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").ok().as_deref() == Some("1");
+                let budget_alert_at_tok = if experimental_ok {
+                    msg.get("budget_alert_at_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize
+                } else { 0 };
+                let budget_alert_text = if experimental_ok {
+                    msg.get("budget_alert_text").and_then(|v| v.as_str()).unwrap_or("").to_string()
+                } else { String::new() };
 
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text);
                 }
             }
 
@@ -513,7 +534,7 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     gpu.drain_pool();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str) {
     // Auto-reset on multi-turn rollover. The estimate here is intentionally
     // rough (ignores system prompt, which is only prepended on seq_pos==0);
     // undercounting only means we reset slightly later, and the EXACT
@@ -660,8 +681,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
         let mut emitted_bytes = 0usize;
+        let mut alert_fired = false;
 
-        for _ in 0..max_tokens {
+        // `while` instead of `for 0..max_tokens` so budget-alert injection
+        // (which increments `generated` beyond the iteration count) can't
+        // push generated past max_tokens: each loop start rechecks the cap.
+        while generated < max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
@@ -686,6 +711,92 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
+
+            // Budget-alert injection: once we hit the configured token count,
+            // splice the nudge text into the stream. Tokens are emitted to
+            // stdout (so the client sees them) AND forward-fed through the KV
+            // cache (so the model's next sample is conditioned on having
+            // "said" them itself). Injected tokens count against `max_tokens`
+            // — we never exceed the caller's requested budget — so we clip
+            // the nudge if not enough room remains, and break out of the
+            // outer loop if the budget is fully spent after injection.
+            if !alert_fired && budget_alert_at_tok > 0 && generated >= budget_alert_at_tok && !budget_alert_text.is_empty() {
+                alert_fired = true;
+                // Only inject while the model is inside an open <think> block.
+                // The whole point of the feature is to nudge the model's
+                // reasoning; firing past </think> just graffities the visible
+                // answer with a system-alert string. Check the raw decoded
+                // text rather than token IDs since <think> tokenizes as a
+                // multi-token sequence in Qwen3.5's vocab.
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let think_open_idx = raw_str.rfind("<think>");
+                let think_close_idx = raw_str.rfind("</think>");
+                let in_think = match (think_open_idx, think_close_idx) {
+                    (Some(o), Some(c)) => o > c,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if !in_think {
+                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not inside an open <think> block"}}"#, id);
+                    let _ = stdout.flush();
+                    // Fall through — resample next token as normal
+                    let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
+                    let scope_start = ngram_scope.len().saturating_sub(repeat_buf_cap);
+                    let scope = &ngram_scope[scope_start..];
+                    let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
+                    if !bytes.is_empty() {
+                        gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+                    }
+                    let (tok, rng) = gpu.sample_top_p(
+                        &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
+                        vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
+                    ).unwrap();
+                    next_token = tok;
+                    rng_state = rng;
+                    continue;
+                }
+                let nudge_tokens = tokenizer.encode(budget_alert_text);
+                let budget_left = max_tokens.saturating_sub(generated);
+                let nudge_len = nudge_tokens.len().min(budget_left);
+                // KV headroom check — don't run past max_seq. If we don't have
+                // room for the clipped nudge, skip entirely rather than emit a
+                // partial nudge that poisons the trajectory. Trailer reservation
+                // matches the post-loop ChatML `\n` write so we don't slide past
+                // the KV budget guard established at the top of `generate`.
+                let need_kv = m.seq_pos + generated + nudge_len + (max_tokens - generated - nudge_len) + nl.len();
+                if nudge_len > 0 && need_kv <= m.max_seq {
+                    for &tok in &nudge_tokens[..nudge_len] {
+                        m.conversation_tokens.push(tok);
+                        streamed_tokens.push(tok);
+                        // Emit the injected token's text to stdout so the client
+                        // sees it as part of the stream (will be inside <think>
+                        // if that's the current state, and get stripped client-
+                        // side just like any other think token).
+                        let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
+                        let new_bytes2 = &all_bytes2[emitted_bytes..];
+                        let vl2 = match std::str::from_utf8(new_bytes2) { Ok(_) => new_bytes2.len(), Err(e) => e.valid_up_to() };
+                        if vl2 > 0 {
+                            let t = std::str::from_utf8(&new_bytes2[..vl2]).unwrap();
+                            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&t).unwrap_or_default());
+                            let _ = stdout.flush();
+                            emitted_bytes += vl2;
+                        }
+                        let pos2 = m.seq_pos + generated;
+                        qwen35::forward_scratch(gpu, weights, config, tok, pos2, kv, dn, scratch).unwrap();
+                        generated += 1;
+                    }
+                } else if nudge_len < nudge_tokens.len() {
+                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert clipped or skipped: nudge_len={} budget_left={}"}}"#, id, nudge_len, budget_left);
+                    let _ = stdout.flush();
+                } else {
+                    let _ = writeln!(stdout, r#"{{"type":"info","id":"{}","message":"budget_alert skipped: not enough KV headroom"}}"#, id);
+                    let _ = stdout.flush();
+                }
+                // Respect max_tokens: if injection used the remainder, bail
+                // before sampling another model token.
+                if generated >= max_tokens { break; }
+            }
 
             // Upload fresh repeat window (scope = generated tokens so far).
             let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
