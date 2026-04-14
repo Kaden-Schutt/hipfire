@@ -2112,6 +2112,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
       range: [0, 86400], step: 30,
     },
+    experimental_budget_alert: {
+      label: "budget_alert",
+      desc: "show VRAM budget alerts during generation",
+      options: ["true", "false"],
+    },
   };
 
   let selected = 0;
