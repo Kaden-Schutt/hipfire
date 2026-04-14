@@ -2943,7 +2943,7 @@ switch (cmd) {
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
       [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
-      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
       console.error("");
@@ -2958,7 +2958,7 @@ switch (cmd) {
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
     const buildQ = Bun.spawnSync(
       [CARGO_BIN, "build", "--release", "-p", "hipfire-quantize"],
-      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"] }
+      { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (buildQ.exitCode !== 0) {
       console.error("  hipfire-quantize build failed (quantize subcommand won't work). Continuing.");
@@ -3038,7 +3038,14 @@ switch (cmd) {
     const daemonForPrecompile = join(binDir, `daemon${exe}`) ;
     if (existsSync(daemonForPrecompile)) {
       console.error("Pre-compiling GPU kernels...");
-      const pc = Bun.spawnSync([daemonForPrecompile, "--precompile"], { stdio: ["inherit", "inherit", "inherit"] });
+      // Explicit env pass-through: Bun.spawnSync's default env inheritance
+      // on some platforms (observed on Arch/Cachy) drops mid-run PATH
+      // mutations when stdio: "inherit" is used. The daemon's kernel
+      // precompile shells out to hipcc, which needs /opt/rocm/bin on PATH.
+      const pc = Bun.spawnSync([daemonForPrecompile, "--precompile"], {
+        stdio: ["inherit", "inherit", "inherit"],
+        env: { ...process.env },
+      });
       if (pc.exitCode !== 0) console.error("  Warning: kernel precompilation failed (serve will compile on first run)");
     }
     console.error("hipfire updated ✓");
