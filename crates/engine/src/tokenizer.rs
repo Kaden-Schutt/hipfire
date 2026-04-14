@@ -73,12 +73,21 @@ impl Tokenizer {
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
 
-        // Detect tokenizer type
+        // Detect tokenizer type.
+        //
+        // Three flavours we support:
+        //   • gpt2 BPE     (Qwen3, Qwen3.5): model_type="gpt2", vocab has Ġ.
+        //   • SPM-BPE      (Gemma 4): model_type="bpe"-ish, vocab has ▁-prefixed
+        //                  common words AND a non-empty merges table.
+        //   • Plain SPM    (LLaMA, Mistral): Unigram model, model_type="llama",
+        //                  vocab has ▁-prefixed words but ZERO merges.
+        //
+        // The ▁-prefix alone is NOT enough to discriminate SPM-BPE from Unigram
+        // SentencePiece — both share the convention. We also require merges
+        // to be present, since Unigram tokenizers never emit merge rules.
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
-        // Prefer SPM-BPE detection (Gemma 4) when both flavours look plausible —
-        // Gemma 4 has "Ġ" in vocab as a byte-fallback slot, which would wrongly
-        // trigger GPT-2 detection.
-        let is_spm_bpe = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let has_spm_prefix = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let is_spm_bpe = has_spm_prefix && !merges.is_empty();
         let is_gpt2_bpe = !is_spm_bpe && model_type == "gpt2";
 
         // Build special tokens list: vocab entries matching <|...|> or </...> patterns
@@ -179,10 +188,13 @@ impl Tokenizer {
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
 
-        // SPM-BPE (Gemma 4) uses ▁ for spaces. GPT-2 (Qwen) uses Ġ. Check SPM
+        // SPM-BPE (Gemma 4) uses ▁ for spaces. GPT-2 (Qwen) uses Ġ. Plain SPM
+        // (LLaMA, Mistral) also uses ▁ but is Unigram (no merges). Check SPM-BPE
         // first — Gemma 4's vocab includes "Ġ" as a byte-fallback slot, which
-        // would otherwise mis-trigger GPT-2 detection and break encoding.
-        let is_spm_bpe = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        // would mis-trigger GPT-2 detection. Require non-empty merges to
+        // distinguish BPE from Unigram SentencePiece which ALSO has ▁ prefixes.
+        let has_spm_prefix = token_to_id.contains_key("▁the") || token_to_id.contains_key("▁a");
+        let is_spm_bpe = has_spm_prefix && !merges.is_empty();
         let is_gpt2_bpe = !is_spm_bpe
             && (token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ"));
 
