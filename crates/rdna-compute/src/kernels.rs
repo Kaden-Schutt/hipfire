@@ -764,6 +764,9 @@ pub const GEMM_F16_TILED_SRC: &str = include_str!("../../../kernels/src/gemm_f16
 /// Eliminates transpose + bias_add kernel launches (~7MB saved per linear layer).
 /// Grid=[N,1], Block=[256], 8-way unrolled.
 pub const GEMM_F16_BIAS_SRC: &str = include_str!("../../../kernels/src/gemm_f16_bias.hip");
+/// Optimized vision attention with tiled K/V loading and 4 queries per block.
+/// ~3-5x faster than naive vit_attention_f32 via shared memory K/V reuse.
+pub const VIT_ATTENTION_OPT_SRC: &str = include_str!("../../../kernels/src/vit_attention_opt.hip");
 
 
 /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
