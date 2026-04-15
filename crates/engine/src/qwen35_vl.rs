@@ -94,7 +94,9 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     let vals: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
+        6 => dequant_hfq4g256(data, n),
+        7 => dequant_hfq4g128(data, n),
+        _ => panic!("expected F16/F32/HFQ4 for {name}, got qt={}", info.quant_type),
     };
     gpu.upload_f32(&vals[..n], &[n])
 }
@@ -128,15 +130,17 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
 fn dequant_hfq4g256(data: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let block_size = 136usize;
-    let n_groups = (n + 255) / 256;
+    let n_groups = n.div_ceil(256);
     for g in 0..n_groups {
         let off = g * block_size;
+        if off + 8 > data.len() { break; }
         let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
         let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
-        let nibbles = &data[off+8..off+136];
+        let nibbles = &data[off+8..(off+136).min(data.len())];
         let base = g * 256;
-        for i in 0..256.min(n - base) {
+        for i in 0..256.min(n.saturating_sub(base)) {
             let byte_idx = i / 2;
+            if byte_idx >= nibbles.len() { break; }
             let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
             out.push(scale * nibble as f32 + zero);
         }
@@ -150,15 +154,17 @@ fn dequant_hfq4g256(data: &[u8], n: usize) -> Vec<f32> {
 fn dequant_hfq4g128(data: &[u8], n: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let block_size = 72usize;
-    let n_groups = (n + 127) / 128;
+    let n_groups = n.div_ceil(128);
     for g in 0..n_groups {
         let off = g * block_size;
+        if off + 8 > data.len() { break; }
         let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
         let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
-        let nibbles = &data[off+8..off+72];
+        let nibbles = &data[off+8..(off+72).min(data.len())];
         let base = g * 128;
-        for i in 0..128.min(n - base) {
+        for i in 0..128.min(n.saturating_sub(base)) {
             let byte_idx = i / 2;
+            if byte_idx >= nibbles.len() { break; }
             let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
             out.push(scale * nibble as f32 + zero);
         }
