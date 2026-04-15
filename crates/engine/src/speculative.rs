@@ -1299,6 +1299,14 @@ fn verify_dflash_block_inner(
         gdn_tape,
         tree_verify,
     );
+    // TODO(root-cause): tree-mode needs an explicit device sync here or
+    // subsequent kernels (lm_head, argmax) see partially-written memory and
+    // produce wrong argmaxes / illegal accesses. Suspected queue-ordering
+    // bug in the tree-masked FA kernels — same-stream dispatch SHOULD
+    // serialize but empirically doesn't on gfx1100. Cost: one pipeline
+    // stall per cycle (~µs) but without it τ degrades from 2.0 to 1.1 and
+    // destabilizes across runs. Fix the underlying race before shipping
+    // to master.
     if batch_result.is_ok() && tree_verify.is_some() {
         if let Err(e) = gpu.hip.device_synchronize() {
             let _ = gpu.free_tensor(final_hidden);
@@ -2633,22 +2641,15 @@ pub fn spec_step_ddtree_batched(
     debug_assert_eq!(big_n, 1 + tree.num_nodes());
 
     // ── 5. Upload mask to GPU as [N × N] f32 ──────────────────────────────
+    // The bias buffer is read by the FA attention kernels inside step 7's
+    // forward. `memcpy_htod` is synchronous on the default stream so the
+    // data is in VRAM before forward kernels queue — no device sync needed.
     let attn_bias_gpu = gpu.alloc_tensor(&[big_n * big_n], rdna_compute::DType::F32)?;
     {
         let mask_bytes = unsafe {
             std::slice::from_raw_parts(mask_host.as_ptr() as *const u8, mask_host.len() * 4)
         };
         if let Err(e) = gpu.hip.memcpy_htod(&attn_bias_gpu.buf, mask_bytes) {
-            let _ = gpu.free_tensor(attn_bias_gpu);
-            return Err(e);
-        }
-        // Force the htod to drain before any kernel launches see the buffer.
-        // Belt-and-suspenders: `memcpy_htod` should already be synchronous on
-        // the default stream, but the asym FA kernels are dispatched on a
-        // stream from `self.stream_ref()` and we've observed launches race
-        // with the bias read without this barrier. Cheap (<1 µs) and removes
-        // the race entirely.
-        if let Err(e) = gpu.hip.device_synchronize() {
             let _ = gpu.free_tensor(attn_bias_gpu);
             return Err(e);
         }
@@ -2662,17 +2663,23 @@ pub fn spec_step_ddtree_batched(
 
     // ── 7. Tree verify: single batched forward with tree-attention mask ──
     //
+    // Key optimization: pass `gdn_tape` INTO the tree verify so GDN
+    // innovations get captured in the linear tree-traversal order. For the
+    // topk=1 (or topk>1 where the accepted path coincides with the top-1
+    // linear chain) case, the committed path is a contiguous prefix of the
+    // linear order — so replaying `tape[0..accept_len+1]` advances LA state
+    // correctly and we save an entire forward pass. For topk>1 paths that
+    // diverge from the linear prefix, we fall back to a second verify over
+    // the committed tokens (step 10 below).
+    //
     // argmax_per_pos[i] = target's argmax prediction at slot i in the
     // linearization, i.e. what comes AFTER the token at that slot.
-    // Matches exactly the DdTree `posterior` convention expected by
-    // `follow_verified_tree`: posterior[0] = pred after seed, posterior[i+1]
-    // = pred after tree.nodes[i].
     let ctx = qwen35::TreeVerifyCtx {
         positions: &verify_positions,
         attn_bias: &attn_bias_gpu,
     };
     let verify_out = verify_dflash_block_tree(
-        gpu, target, &verify_tokens, position, hidden_rb, None, false, ctx,
+        gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false, ctx,
     );
     let posterior = match verify_out {
         Ok(v) => v.argmax_per_pos,
@@ -2702,42 +2709,55 @@ pub fn spec_step_ddtree_batched(
         drafted.push(tree.nodes[ni].token);
     }
 
-    // ── 10. Tape-capturing verify on the committed path ──────────────────
+    // ── 10. Tape/hidden path selection ────────────────────────────────────
     //
-    // Same tape_block decision as spec_step_ddtree: use the full-B top-1
-    // block when the accepted path coincides with the top-1 chain
-    // (byte-exact with DFlash's LA state advance), else use just the
-    // committed prefix (correct LA innovations for the accepted path).
-    let topk1_is_committed_prefix = accept_len > 0 && committed[1..=accept_len].iter().enumerate()
-        .all(|(d, &tok)| tok == top_tokens[d * tree_topk]);
-    let tape_block: Vec<u32> = if topk1_is_committed_prefix || accept_len == 0 {
-        let mut vb: Vec<u32> = Vec::with_capacity(b);
-        vb.push(seed_token);
-        for d in 0..(b - 1) {
-            vb.push(top_tokens[d * tree_topk]);
-        }
-        vb
+    // Fast path: accepted tree nodes occupy linear slots [0, 1, 2, ...,
+    // accept_len - 1] in the tree. Their tokens are in linear-order
+    // positions [1, 2, ..., accept_len] of the tape (slot 0 = seed). The
+    // tree tape captures innovations at those same linear slots, so
+    // `replay_gdn(accept_len + 1)` is exact with DFlash.
+    //
+    // Fast path is ALWAYS the case at topk=1 (tree is a chain, accepted
+    // indices are [0, 1, 2, ...]). At topk>1 it holds iff the greedy walk
+    // picked the rank-0 child at every accepted step (no sibling detour).
+    //
+    // Slow path (topk>1 detour): re-capture tape on the committed prefix
+    // with a second verify, then replay as before. Costs +1 forward but
+    // keeps LA state byte-correct.
+    let fast_tape_ok = accepted_node_indices.iter().enumerate()
+        .all(|(i, &ni)| ni == i);
+    let hidden_rows_written;
+    if fast_tape_ok {
+        // Tape already captured in tree verify. Restore + replay directly.
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        gdn_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            accept_len + 1,
+        )?;
+        hidden_rows_written = big_n;
     } else {
-        committed[..accept_len + 1].to_vec()
-    };
+        // Slow path: committed path diverges from linear order. Re-verify
+        // the committed prefix to get a linear-order tape that matches.
+        let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        let _tape_verify = verify_dflash_block(
+            gpu, target, &tape_block, position, hidden_rb, Some(gdn_tape), false,
+        )?;
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        gdn_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            accept_len + 1,
+        )?;
+        hidden_rows_written = tape_block.len();
+    }
 
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
-    let _tape_verify = verify_dflash_block(
-        gpu, target, &tape_block, position, hidden_rb, Some(gdn_tape), false,
-    )?;
-
-    // ── 11. Restore + tape replay for accept_len + 1 committed tokens ────
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
-    gdn_tape.replay_gdn(
-        gpu,
-        &target.weights,
-        &target.config,
-        &mut target.dn_state,
-        accept_len + 1,
-    )?;
-
-    // ── 12. Append (1 + accept_len) hidden rows to target_hidden_host ────
-    let hidden_rows_written = tape_block.len();
+    // ── 11. Append (1 + accept_len) hidden rows to target_hidden_host ────
     let hidden_block = download_hidden_block(gpu, hidden_rb, hidden_rows_written)?;
     let rows_to_keep = accept_len + 1;
     target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);

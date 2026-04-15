@@ -286,8 +286,14 @@ fn main() {
     // GdnTape: per-LA-layer (q, k, v, α, β) innovation tape — sized for B
     // positions, allocated once and reused every spec step. Enables the
     // rollback path to replay GDN recurrence without re-running the target.
+    //
+    // Tree verify extends the block size: `1 + tree_budget` rows per forward
+    // (seed + tree nodes). Size max_n = max(block_size, 1 + tree_budget) so
+    // the tape is large enough whether we run per-path DFS, batched tree,
+    // or plain DFlash.
+    let tape_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
     let mut gdn_tape = engine::speculative::GdnTape::new_for_config(
-        &mut gpu, &target.config, draft_cfg.block_size,
+        &mut gpu, &target.config, tape_max_n,
     ).expect("alloc gdn tape");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);
