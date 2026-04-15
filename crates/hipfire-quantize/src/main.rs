@@ -1247,6 +1247,9 @@ fn main() {
     let mut _n_quant_groups = 0u64;
 
     let include_vision = std::env::args().any(|a| a == "--include-vision");
+    let vision_quant = std::env::args().position(|a| a == "--vision-quant")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .unwrap_or_default();
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
         // Skip MTP head; optionally include vision encoder for VL inference
@@ -1619,8 +1622,31 @@ fn main() {
                 data: quantized,
             });
             } // end else (non-Q8HFQ path)
+        } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
+            // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
+            let f32_data = to_f32(raw_data, &meta.dtype);
+            quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let k_dim = if shape.len() == 2 { shape[1] as usize } else { n_elements };
+            let (quantized, gs) = if k_dim % 256 == 0 {
+                (quantize_hfq4g256(&f32_data), 256u32)
+            } else {
+                (quantize_hfq4g128(&f32_data), 128u32)
+            };
+            let qt = if gs == 256 { QuantType::HFQ4G256 } else { QuantType::HFQ4G128 };
+            let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
+            eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
+                name, meta.shape, n_elements,
+                raw_data.len() as f64 / 1024.0, quantized.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: qt,
+                shape,
+                group_size: gs,
+                data: quantized,
+            });
         } else {
-            // Keep as F16 (convert BF16 → F16 if needed)
+            // Keep as F16 (convert BF16 -> F16 if needed)
             let f16_data = match meta.dtype.as_str() {
                 "F16" => raw_data.to_vec(),
                 "BF16" => {

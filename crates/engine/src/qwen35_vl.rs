@@ -99,11 +99,72 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     gpu.upload_f32(&vals[..n], &[n])
 }
 
-fn load_f16_gpu(hfq: &HfqFile, gpu: &Gpu, name: &str) -> HipResult<GpuTensor> {
+fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
     let (info, data) = hfq.tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    assert_eq!(info.quant_type, 1, "{name}: expected F16, got qt={}", info.quant_type);
-    gpu.upload_raw(data, &[data.len()])
+    match info.quant_type {
+        1 => {
+            // F16 — upload directly
+            gpu.upload_raw(data, &[data.len()])
+        }
+        6 => {
+            // HFQ4G256 — dequantize to F32 on CPU, then upload
+            let n: usize = info.shape.iter().map(|&s| s as usize).product();
+            let f32_data = dequant_hfq4g256(data, n);
+            gpu.upload_f32(&f32_data, &[n])
+        }
+        7 => {
+            // HFQ4G128 — dequantize to F32 on CPU, then upload
+            let n: usize = info.shape.iter().map(|&s| s as usize).product();
+            let f32_data = dequant_hfq4g128(data, n);
+            gpu.upload_f32(&f32_data, &[n])
+        }
+        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4G256=6, HFQ4G128=7)"),
+    }
+}
+
+/// Dequantize HFQ4-G256 blocks to F32.
+/// Each block: [scale:f32, zero:f32, 128 bytes of 4-bit nibbles] = 136 bytes per 256 values.
+fn dequant_hfq4g256(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    let block_size = 136usize;
+    let n_groups = (n + 255) / 256;
+    for g in 0..n_groups {
+        let off = g * block_size;
+        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+        let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+        let nibbles = &data[off+8..off+136];
+        let base = g * 256;
+        for i in 0..256.min(n - base) {
+            let byte_idx = i / 2;
+            let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
+            out.push(scale * nibble as f32 + zero);
+        }
+    }
+    out.truncate(n);
+    out
+}
+
+/// Dequantize HFQ4-G128 blocks to F32.
+/// Each block: [scale:f32, zero:f32, 64 bytes of 4-bit nibbles] = 72 bytes per 128 values.
+fn dequant_hfq4g128(data: &[u8], n: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n);
+    let block_size = 72usize;
+    let n_groups = (n + 127) / 128;
+    for g in 0..n_groups {
+        let off = g * block_size;
+        let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+        let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+        let nibbles = &data[off+8..off+72];
+        let base = g * 128;
+        for i in 0..128.min(n - base) {
+            let byte_idx = i / 2;
+            let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
+            out.push(scale * nibble as f32 + zero);
+        }
+    }
+    out.truncate(n);
+    out
 }
 
 pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
