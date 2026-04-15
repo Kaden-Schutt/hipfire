@@ -18,7 +18,7 @@ pub fn load_and_preprocess(path: &Path, target_size: usize) -> Vec<f32> {
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
 
-    // Convert to CHW float, normalize: (pixel / 255.0 - 0.5) / 0.5 = pixel / 127.5 - 1.0
+    // Convert to CHW float, normalize: pixel / 127.5 - 1.0
     let mut out = vec![0.0f32; 3 * h * w];
     for y in 0..h {
         for x in 0..w {

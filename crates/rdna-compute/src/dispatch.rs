@@ -10215,6 +10215,89 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [m as u32, n as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
     }
 
+    /// WMMA-accelerated batched GEMM for F16 weights × F32 activations (gfx1100+).
+    /// Y[M,N] = W_f16[M,K] @ X_f32[N,K]^T.  Tiled 16×16 WMMA matrix multiply.
+    /// Grid=[ceil(M/16), ceil(N/16)], Block=[32].  Replaces naive gemm_f16 for vision encoder.
+    pub fn gemm_f16_wmma(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_f16_wmma", kernels::GEMM_F16_WMMA_SRC, "gemm_f16_wmma")?;
+        let func = &self.functions["gemm_f16_wmma"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_n = ((n + 15) / 16) as u32;
+        unsafe { self.hip.launch_kernel(func, [grid_m, grid_n, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Tiled F16 GEMM — 4-way ILP unrolled, no shared memory (high occupancy).
+    /// Grid=[M, N], Block=[32], LDS=0.
+    pub fn gemm_f16_tiled(
+        &mut self, w: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_f16_tiled", kernels::GEMM_F16_TILED_SRC, "gemm_f16_tiled")?;
+        let func = &self.functions["gemm_f16_tiled"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        // Same grid as naive: [M, N], block [32], no LDS
+        unsafe { self.hip.launch_kernel(func, [m as u32, n as u32, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// Fused GEMM + bias: Y[N,M] = X[N,K] @ W_f16[M,K]^T + bias[M].
+    /// Replaces gemm_f16 + transpose_f32 + bias_add_f32 (3 ops → 1).
+    /// Grid=[N, 1], Block=[256].
+    pub fn gemm_f16_bias(
+        &mut self, w: &GpuTensor, x: &GpuTensor, bias: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_f16_bias", kernels::GEMM_F16_BIAS_SRC, "gemm_f16_bias")?;
+        let func = &self.functions["gemm_f16_bias"];
+        let mut wp = w.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut bp = bias.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        // One block per row of X, 256 threads, no LDS
+        unsafe { self.hip.launch_kernel(func, [n as u32, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
     /// Batched GEMM for F32: Y[M,N] = A[M,K] @ B[N,K]^T
     pub fn gemm_f32_batched(
         &mut self, a: &GpuTensor, b: &GpuTensor, y: &GpuTensor,

@@ -232,12 +232,11 @@ pub fn vision_forward(
         // Residual: x += fc2
         gpu.add_inplace_f32(&x, &fc2)?;
         gpu.free_tensor(fc2)?;
-
-        if li % 9 == 0 || li == config.num_layers - 1 {
-            gpu.hip.device_synchronize()?;
-            eprintln!("  vision layer {}/{} ({:.2}s)", li + 1, config.num_layers, t0.elapsed().as_secs_f32());
-        }
     }
+
+    // Single sync at end of all layers (avoids per-layer sync overhead)
+    gpu.hip.device_synchronize()?;
+    eprintln!("  vision forward complete ({:.2}s)", t0.elapsed().as_secs_f32());
 
     // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
     let sms = config.spatial_merge_size;
