@@ -422,6 +422,33 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2H")
     }
 
+    /// Copy bytes from a GPU buffer at a given source offset to host.
+    /// `dst.len()` bytes are copied starting from `src.ptr + src_offset`.
+    pub fn memcpy_dtoh_at(
+        &self,
+        dst: &mut [u8],
+        src: &DeviceBuffer,
+        src_offset: usize,
+    ) -> HipResult<()> {
+        assert!(
+            src_offset + dst.len() <= src.size,
+            "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
+            src_offset, dst.len(), src.size
+        );
+        let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let t = std::time::Instant::now();
+        let code = unsafe {
+            (self.fn_memcpy)(
+                dst.as_mut_ptr() as *mut c_void,
+                src_ptr,
+                dst.len(),
+                MemcpyKind::DeviceToHost as c_uint,
+            )
+        };
+        crate::ffi::launch_counters::memcpy_dtoh::record(t.elapsed().as_nanos() as u64);
+        self.check(code, "hipMemcpy D2H at offset")
+    }
+
     pub fn memcpy_dtod(
         &self,
         dst: &DeviceBuffer,
