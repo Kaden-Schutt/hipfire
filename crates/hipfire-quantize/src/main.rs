@@ -922,6 +922,7 @@ enum QuantType {
     MQ4G256 = 13,  // MagnumQuant: FWHT-rotated HFQ4-G256
     MQ8G256 = 14,  // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
     MQ6G256 = 15,  // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
+    BF16 = 16,     // Original BF16 weights (zero precision loss for vision)
 }
 
 struct HfqTensor {
@@ -1644,6 +1645,33 @@ fn main() {
                 shape,
                 group_size: gs,
                 data: quantized,
+            });
+        } else if is_vision && vision_quant == "bf16" && meta.dtype == "BF16" {
+            // Store vision weights as original BF16 (zero precision loss)
+            quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!("  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
+                name, meta.shape, n_elements, raw_data.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::BF16,
+                shape,
+                group_size: 0,
+                data: raw_data.to_vec(),
+            });
+        } else if is_vision && vision_quant == "bf16" {
+            // Non-BF16 source (F16/F32) — store as F16
+            let data = if meta.dtype == "F16" { raw_data.to_vec() } else {
+                let f32_vals = to_f32(raw_data, &meta.dtype);
+                f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            };
+            quantized_params += n_elements as u64;
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            eprintln!("  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
+                name, meta.shape, data.len() as f64 / 1024.0);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(), quant_type: QuantType::F16,
+                shape, group_size: 0, data,
             });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
