@@ -2548,14 +2548,25 @@ fn forward_prefill_chunk(
     }
 
     // ── 1b. Upload positions array ────────────────────────────────────────
-    // Used by batched rope / kv_write / attention kernels in FA layers.
-    // Legacy mode: sequential `start_pos .. start_pos + n`.
-    // Tree-verify mode: depth-based positions from the DDTree linearization
-    //   (seed at `start_pos`; each tree node at `start_pos + depth_i`).
-    let positions_host: Vec<i32> = match tree_verify.as_ref() {
-        Some(ctx) => ctx.positions.to_vec(),
-        None => (0..n).map(|i| (start_pos + i) as i32).collect(),
-    };
+    //
+    // Positions is the per-row RoPE angle AND the physical KV cache slot (the
+    // batched kv_write kernels use the same index for both). We always use
+    // flat linear `start_pos .. start_pos + n`. Siblings in DDTree mode get
+    // DISTINCT slots this way — no write race — and the stored K carries a
+    // RoPE angle that matches the physical slot, which keeps subsequent
+    // cycles' attention reads consistent.
+    //
+    // Semantic trade vs. the original depth-based scheme (paper): tree
+    // siblings that represent "alternative futures at the same time step"
+    // now see a RoPE distance of 1 (or more) instead of 0. Empirically that
+    // slight distance shift costs little — the attn_bias mask still gates
+    // ancestor visibility exactly, and the Q·K dot products stay consistent
+    // across the whole cache (prompt + tree block). In exchange we get
+    // DDTree correctness for topk>1 without needing a tree-local KV scratch
+    // or a scatter-kernel for commit. `ctx.positions` is accepted for API
+    // compatibility but ignored — the DdNode depths it carries are only
+    // used by `linearize_tree` to build the attn_bias mask.
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
     let positions_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
     };
