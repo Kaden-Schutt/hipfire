@@ -1737,16 +1737,18 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
 
-    // Load and preprocess image
-    let pixels = engine::image::load_and_preprocess(Path::new(image_path), IMAGE_SIZE);
-    let grid_h = IMAGE_SIZE / vision_config.patch_size;
-    let grid_w = IMAGE_SIZE / vision_config.patch_size;
+    // Load and preprocess image (smart resize matching HuggingFace)
+    eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
+    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(Path::new(image_path), vision_config.patch_size);
+    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
     // Extract patches and run vision encoder
     let patches = engine::image::extract_patches(
-        &pixels, 3, IMAGE_SIZE, IMAGE_SIZE,
+        &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
     );
     let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)

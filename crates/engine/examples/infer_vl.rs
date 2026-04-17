@@ -51,16 +51,16 @@ fn main() {
 
     // Load and preprocess image
     eprintln!("Preprocessing image...");
-    let pixels = engine::image::load_and_preprocess(Path::new(image_path), IMAGE_SIZE);
-    let grid_h = IMAGE_SIZE / vision_config.patch_size;
-    let grid_w = IMAGE_SIZE / vision_config.patch_size;
+    let (pixels, img_h, img_w) = engine::image::load_and_preprocess(Path::new(image_path), vision_config.patch_size);
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-    eprintln!("Image: {}x{} → {}x{} patches → {} visual tokens", IMAGE_SIZE, IMAGE_SIZE, grid_h, grid_w, n_visual_tokens);
+    eprintln!("Image: {}x{} → {}x{} patches → {} visual tokens", img_w, img_h, grid_h, grid_w, n_visual_tokens);
 
     // Extract patches for vision encoder
     let patches = engine::image::extract_patches(
-        &pixels, 3, IMAGE_SIZE, IMAGE_SIZE,
+        &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
     );
 

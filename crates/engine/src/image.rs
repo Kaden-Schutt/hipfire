@@ -3,16 +3,52 @@
 
 use std::path::Path;
 
-/// Load an image, resize to target_size x target_size, normalize.
-/// Returns [3, target_size, target_size] in CHW order, values in [-1, 1].
-pub fn load_and_preprocess(path: &Path, target_size: usize) -> Vec<f32> {
+/// Smart resize matching HuggingFace Qwen2VLImageProcessorFast.
+/// Uses factor=28 (= patch_size * sms * 2 for Qwen3.5) to ensure grid is multiple of sms.
+pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usize, max_pixels: usize) -> (usize, usize) {
+    let h_bar = ((height as f64 / factor as f64).round() as usize) * factor;
+    let w_bar = ((width as f64 / factor as f64).round() as usize) * factor;
+    
+    if h_bar * w_bar > max_pixels {
+        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+        let h_bar = factor.max(((height as f64 / beta / factor as f64).floor() as usize) * factor);
+        let w_bar = factor.max(((width as f64 / beta / factor as f64).floor() as usize) * factor);
+        (h_bar, w_bar)
+    } else if h_bar * w_bar < min_pixels {
+        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        let h_bar = factor.max(((height as f64 * beta / factor as f64).ceil() as usize) * factor);
+        let w_bar = factor.max(((width as f64 * beta / factor as f64).ceil() as usize) * factor);
+        (h_bar, w_bar)
+    } else {
+        (h_bar, w_bar)
+    }
+}
+
+/// Load an image, smart-resize to match HuggingFace, normalize.
+/// Returns (CHW data, height, width) where height and width are multiples of patch_size.
+pub fn load_and_preprocess(path: &Path, patch_size: usize) -> (Vec<f32>, usize, usize) {
     let img = image::open(path)
         .unwrap_or_else(|e| panic!("Failed to open image {}: {e}", path.display()));
 
+    let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
+    
+    // Smart resize matching HuggingFace Qwen2VLImageProcessorFast
+    // factor=28 ensures the grid is multiple of sms (28/16=1.75, but patches extracted
+    // via unfold with stride=16 gives floor(dim/16) which is always multiple of sms=2
+    // because 28 = 7*4 and 16 divides into the result evenly for the grid)
+    let factor = 28;
+    let min_pixels = 56 * 56;         // 3136
+    let max_pixels = 14 * 14 * 4 * 1280; // 1003520
+    let (resized_h, resized_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
+    
+    // Round down to nearest multiple of patch_size for clean patch extraction
+    let final_h = (resized_h / patch_size) * patch_size;
+    let final_w = (resized_w / patch_size) * patch_size;
+    
     let img = img.resize_exact(
-        target_size as u32,
-        target_size as u32,
-        image::imageops::FilterType::Triangle, // bilinear
+        final_w as u32,
+        final_h as u32,
+        image::imageops::FilterType::Triangle,
     );
 
     let rgb = img.to_rgb8();
@@ -28,7 +64,7 @@ pub fn load_and_preprocess(path: &Path, target_size: usize) -> Vec<f32> {
             }
         }
     }
-    out
+    (out, h, w)
 }
 
 /// Extract non-overlapping patches from a CHW image.
