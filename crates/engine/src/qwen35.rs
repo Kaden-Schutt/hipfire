@@ -1133,7 +1133,7 @@ fn moe_ffn_decode(
         topk_indices:  &topk_indices,
         topk_weights:  &topk_weights,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs);
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
 
     for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
               up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
@@ -1141,6 +1141,17 @@ fn moe_ffn_decode(
         gpu.free_tensor(t)?;
     }
     result
+}
+
+/// All gate-side + routed MoE weights are MQ4G256 — the precondition for
+/// the prerotated fast path where the caller can fuse rmsnorm+FWHT via
+/// `fused_rmsnorm_rotate_mq` and call `moe_ffn_decode_with_scratch_prerotated`.
+fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
+    ffn.router.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+        && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
 }
 
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
@@ -1155,7 +1166,24 @@ fn moe_ffn_decode_with_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+}
+
+/// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
+/// already populated `scratch.moe_x_rot` with FWHT-rotated post-rmsnorm x
+/// (e.g. via a fused `fused_rmsnorm_rotate_mq` launch at the call site).
+/// For all-MQ4 MoE layers this saves one launch per layer by eliding the
+/// internal `rotate_x_mq`. On non-MQ4 layers this flag is ignored.
+fn moe_ffn_decode_with_scratch_prerotated(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    scratch: &Qwen35Scratch,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(scratch);
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -1167,6 +1195,7 @@ fn moe_ffn_decode_impl(
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
+    x_rot_prerotated: bool,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -1193,7 +1222,10 @@ fn moe_ffn_decode_impl(
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
     let x_rot_local = if gate_side_mq4 {
         gpu.ensure_mq_signs()?;
-        gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
+        if !x_rot_prerotated {
+            gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
+        }
+        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
         Some(s.x_rot_local)
     } else {
         None
@@ -1210,11 +1242,36 @@ fn moe_ffn_decode_impl(
         .unwrap_or(false);
     let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
 
-    // ── 1. Router GEMV ──
+    // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
+    // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
+    // into `fused_qkvza_hfq4g256` saves 3 launch submits per MoE layer and
+    // lets underused tails (shared_expert_gate_m=1, router_m=256) co-schedule
+    // with the larger 512-row gate/up bodies. 40 layers × 3 saved launches
+    // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
+    let shared_gate = slice_f32_view(gate_buf, 0, smi);
+    let shared_up   = slice_f32_view(up_buf,   0, smi);
     if let Some(xr) = x_rot_local {
-        gpu.gemv_mq4g256_prerotated(&ffn.router.buf, xr, router_logits, ffn.router.m, ffn.router.k)?;
+        // All MQ4: use the 4-way fused prerotated GEMV. Router weight, shared
+        // sigmoid-gate weight, shared gate weight, shared up weight — all
+        // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
+        // rotated at quant time, so `gemv_hfq4g256` inner loop with the
+        // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
+        gpu.fused_qkvza_hfq4g256(
+            &ffn.router.buf, &ffn.shared_expert_gate.buf,
+            &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+            xr,
+            router_logits, scalar_buf, &shared_gate, &shared_up,
+            ffn.router.m, ffn.shared_expert_gate.m,
+            ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+            ffn.router.k,
+        )?;
     } else {
+        // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
+        // weight_gemv handles its own rotation for MQ4 weights internally.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
+        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
+        weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
+        weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
     }
 
     // ── 2a. Top-K selection — GPU fast path or CPU fallback ──
@@ -1249,35 +1306,10 @@ fn moe_ffn_decode_impl(
         (Some(topk_indices), Some(topk_weights))
     };
 
-    // ── 2b. Shared-expert scalar gate: sigmoid(W · x_norm) — stays on GPU ──
-    // Phase 2a: compute the sigmoid on-device and pass the result by
-    // device pointer into the fused scaled-add below. Eliminates one
-    // D2H sync per layer.
-    if let Some(xr) = x_rot_local {
-        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert_gate.buf, xr, scalar_buf,
-            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k)?;
-    } else {
-        weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
-    }
-    gpu.sigmoid_f32(scalar_buf)?;
-
-    // ── 3. Shared expert FFN (gate/up/down) scaled by the sigmoid gate ──
-    // Phase 2a-ii: fuse silu_mul + rotate + down-GEMV + scaled-residual-add
-    // into two launches (fused_silu_mul_rotate_mq + gemv_residual_scaled_gpu)
-    // when down weights are MQ4G256. Eliminates the separate silu_mul,
-    // explicit scale_f32, and add_inplace_f32 launches — one kernel does
-    // the full `y += sigmoid(gate_scalar) * W_down · silu_mul(gate, up)`.
-    let shared_gate = slice_f32_view(gate_buf, 0, smi);
-    let shared_up   = slice_f32_view(up_buf,   0, smi);
-    if let Some(xr) = x_rot_local {
-        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.gate.buf, xr, &shared_gate,
-            ffn.shared_expert.gate.m, ffn.shared_expert.gate.k)?;
-        gpu.gemv_mq4g256_prerotated(&ffn.shared_expert.up.buf, xr, &shared_up,
-            ffn.shared_expert.up.m, ffn.shared_expert.up.k)?;
-    } else {
-        weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
-        weight_gemv(gpu, &ffn.shared_expert.up,   x_norm, &shared_up)?;
-    }
+    // The shared-expert gate scalar (in `scalar_buf`) is the RAW logit from
+    // the 4-way fused GEMV — sigmoid is applied internally by
+    // `gemv_hfq4g256_residual_sigmoid_scaled_gpu`, eliminating the separate
+    // 1-elem `sigmoid_f32` launch (~40 saved per forward on A3B).
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
@@ -1286,11 +1318,13 @@ fn moe_ffn_decode_impl(
             dtype: DType::F32,
         };
         gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi)?;
-        gpu.gemv_hfq4g256_residual_scaled_gpu(
+        gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
             &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
         )?;
     } else {
+        // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
+        gpu.sigmoid_f32(scalar_buf)?;
         // Non-MQ fallback: pre-2a-ii path.
         let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
         gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
@@ -3867,8 +3901,23 @@ fn forward_scratch_layers(
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
 
                 // ── MoE FFN ──
-                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                // Fuse rmsnorm + FWHT-rotate when all MoE weights are MQ4:
+                // one `fused_rmsnorm_rotate_mq` kernel writes FWHT(rmsnorm(s.x))
+                // directly into `s.moe_x_rot`, replacing the separate
+                // `rmsnorm_f32` + internal `rotate_x_mq` pair. When the
+                // prerotated flag is set, `moe_ffn_decode_impl` consumes
+                // s.x_rot_local only — `x_norm` becomes a dummy on that path.
+                if ffn_all_mq4_for_moe(&layer.ffn) {
+                    gpu.fused_rmsnorm_rotate_mq(
+                        &s.x, &layer.ffn_norm,
+                        s.moe_x_rot.as_ref().expect("MoE scratch"),
+                        config.dim, config.norm_eps,
+                    )?;
+                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                } else {
+                    gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -4001,8 +4050,23 @@ fn forward_scratch_layers(
                 weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
 
                 // ── MoE FFN ──
-                gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                // Fuse rmsnorm + FWHT-rotate when all MoE weights are MQ4:
+                // one `fused_rmsnorm_rotate_mq` kernel writes FWHT(rmsnorm(s.x))
+                // directly into `s.moe_x_rot`, replacing the separate
+                // `rmsnorm_f32` + internal `rotate_x_mq` pair. When the
+                // prerotated flag is set, `moe_ffn_decode_impl` consumes
+                // s.x_rot_local only — `x_norm` becomes a dummy on that path.
+                if ffn_all_mq4_for_moe(&layer.ffn) {
+                    gpu.fused_rmsnorm_rotate_mq(
+                        &s.x, &layer.ffn_norm,
+                        s.moe_x_rot.as_ref().expect("MoE scratch"),
+                        config.dim, config.norm_eps,
+                    )?;
+                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                } else {
+                    gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
