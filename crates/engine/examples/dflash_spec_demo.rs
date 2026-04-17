@@ -443,12 +443,13 @@ fn main() {
     // hipMalloc/hipFree pairs per cycle (biggest is 16 MB logits buffer),
     // saving 0.5-1.5 ms/cycle.
     let verify_max_n = draft_cfg.block_size.max(1 + ddtree_budget);
-    let verify_scratch = engine::speculative::VerifyScratch::new(
+    let verify_scratch = engine::speculative::VerifyScratch::with_prefill(
         &mut gpu,
         verify_max_n,
         target.config.dim,
         target.config.vocab_size,
         target.weights.output.k,
+        &target.config,
     ).expect("alloc verify scratch");
     let mut target_hidden_host: Vec<f32> =
         Vec::with_capacity(ctx_capacity * draft_cfg.num_extract() * draft_cfg.hidden);

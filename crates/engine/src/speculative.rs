@@ -697,6 +697,14 @@ pub struct VerifyScratch {
     pub rot: GpuTensor,
     /// Argmax output for greedy path, [max_n] f32 (treated as i32 host-side).
     pub argmax: GpuTensor,
+    /// Persistent per-layer batch scratch for `qwen35::forward_prefill_batch`.
+    /// Sized to `max_n`, so `verify_dflash_block` processes each block in a
+    /// single chunk without the ~25 hipMalloc/hipFree pairs the in-function
+    /// allocation would incur. Present whenever the caller passes a config
+    /// to `VerifyScratch::with_prefill`. Absent (None) for the legacy
+    /// constructor — `forward_prefill_batch` then falls back to allocating
+    /// its own scratch.
+    pub prefill_batch: Option<qwen35::PrefillBatchScratch>,
 }
 
 impl VerifyScratch {
@@ -716,7 +724,26 @@ impl VerifyScratch {
             logits: gpu.alloc_tensor(&[max_n * vocab], rdna_compute::DType::F32)?,
             rot: gpu.alloc_tensor(&[max_n * hidden_k], rdna_compute::DType::F32)?,
             argmax: gpu.alloc_tensor(&[max_n], rdna_compute::DType::F32)?,
+            prefill_batch: None,
         })
+    }
+
+    /// Like `new`, but also allocates a persistent `PrefillBatchScratch`
+    /// sized to `max_n`. Use this for DFlash verify where the same block
+    /// scratch is reused every cycle — drops ~25 tensor alloc/free pairs
+    /// per cycle (measured ~3-5 ms/cycle on 27B Qwen3.5 where the per-call
+    /// allocation dominated verify wall-time).
+    pub fn with_prefill(
+        gpu: &mut Gpu,
+        max_n: usize,
+        dim: usize,
+        vocab: usize,
+        hidden_k: usize,
+        config: &qwen35::Qwen35Config,
+    ) -> HipResult<Self> {
+        let mut s = Self::new(gpu, max_n, dim, vocab, hidden_k)?;
+        s.prefill_batch = Some(qwen35::PrefillBatchScratch::new(gpu, config, max_n)?);
+        Ok(s)
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -724,6 +751,9 @@ impl VerifyScratch {
         let _ = gpu.free_tensor(self.logits);
         let _ = gpu.free_tensor(self.rot);
         let _ = gpu.free_tensor(self.argmax);
+        if let Some(pbs) = self.prefill_batch {
+            pbs.free_gpu(gpu);
+        }
     }
 }
 
@@ -1387,7 +1417,7 @@ fn verify_dflash_block_inner(
     // shapes. sub_offset returns a non-owning view; do NOT free these.
     let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
 
-    let batch_result = qwen35::forward_prefill_batch(
+    let batch_result = qwen35::forward_prefill_batch_with_pbs(
         gpu,
         &target.weights,
         &target.config,
@@ -1400,6 +1430,7 @@ fn verify_dflash_block_inner(
         Some(&final_hidden),
         gdn_tape,
         tree_verify,
+        verify_scratch.prefill_batch.as_ref(),
     );
     // Tree mode at topk>1 REQUIRES this sync. Without it τ degrades badly
     // (e.g. budget=60 topk=8 drops 7.0 → 3.3; 9B asym3 2026-04-14). topk=1

@@ -2328,10 +2328,40 @@ pub fn forward_prefill_batch(
     kv_cache: &mut llama::KvCache,
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs(
+        gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
+        hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, None,
+    )
+}
+
+/// Like `forward_prefill_batch`, but accepts a caller-owned `PrefillBatchScratch`
+/// so the ~25 per-cycle tensor allocations can be amortized across many calls.
+///
+/// `pbs = None` preserves the original behavior (per-call allocate + free);
+/// `pbs = Some(&pbs)` reuses the provided scratch. The provided scratch's
+/// `max_batch` determines the chunk size — `tokens` is processed in chunks of
+/// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
+/// to the maximum block size they'll ever request (e.g. `block_size` or
+/// `1 + tree_budget`) so everything fits in one chunk.
+pub fn forward_prefill_batch_with_pbs(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
     per_token_hidden_out: Option<&GpuTensor>,
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -2444,13 +2474,34 @@ pub fn forward_prefill_batch(
         );
     }
 
-    // Allocate the batch scratch once, reuse across chunks. Scope with an
-    // inner closure so the explicit free runs even on error.
-    let pbs = PrefillBatchScratch::new(gpu, config, MAX_BATCH)?;
+    // Allocate the batch scratch once per call (or reuse a caller-owned one).
+    // When `pbs_in` is Some, we neither allocate nor free — the caller retains
+    // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
+    // pairs on the hot verify path. When None we fall back to the original
+    // allocate-here / free-on-exit pattern so unmodified callers behave the
+    // same. The chunk size is `pbs.max_batch` so a caller-owned scratch sized
+    // to e.g. `block_size` or `1 + tree_budget` keeps DFlash verify in one
+    // chunk without the full 256-row MAX_BATCH footprint.
+    if let Some(p) = pbs_in {
+        debug_assert!(
+            n <= p.max_batch,
+            "caller-owned PrefillBatchScratch max_batch {} < tokens {}",
+            p.max_batch, n,
+        );
+    }
+    let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
+        let pbs: &PrefillBatchScratch = match pbs_in {
+            Some(p) => p,
+            None => {
+                own_pbs = Some(PrefillBatchScratch::new(gpu, config, MAX_BATCH)?);
+                own_pbs.as_ref().unwrap()
+            }
+        };
+        let chunk_batch = pbs.max_batch;
         let mut chunk_start = 0usize;
         while chunk_start < n {
-            let chunk_end = (chunk_start + MAX_BATCH).min(n);
+            let chunk_end = (chunk_start + chunk_batch).min(n);
             let chunk = &tokens[chunk_start..chunk_end];
             let chunk_n = chunk.len();
             // The chunk only reads the ring buffer's head/dims to place its
@@ -2466,7 +2517,7 @@ pub fn forward_prefill_batch(
             let tv_for_chunk = tree_verify.as_ref().copied();
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
-                kv_cache, dn_state, scratch, &pbs, hidden_rb.as_deref(),
+                kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
@@ -2476,7 +2527,9 @@ pub fn forward_prefill_batch(
         }
         Ok(())
     })();
-    pbs.free_gpu(gpu);
+    if let Some(owned) = own_pbs {
+        owned.free_gpu(gpu);
+    }
     result
 }
 

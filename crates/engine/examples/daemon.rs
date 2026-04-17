@@ -655,12 +655,13 @@ fn load_dflash_state(
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
     let gdn_tape = GdnTape::new_for_config(gpu, target_config, draft_config.block_size)
         .map_err(|e| format!("gdn_tape: {e}"))?;
-    let verify_scratch = VerifyScratch::new(
+    let verify_scratch = VerifyScratch::with_prefill(
         gpu,
         draft_config.block_size,
         target_config.dim,
         target_config.vocab_size,
         target_config.dim,
+        target_config,
     ).map_err(|e| format!("verify_scratch: {e}"))?;
 
     let target_hidden_host: Vec<f32> = Vec::with_capacity(
