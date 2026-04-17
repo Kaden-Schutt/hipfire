@@ -1085,11 +1085,21 @@ fn resolve_model_path(input: &str) -> String {
                 }
             }
 
-            // Not in cache — try to download
-            eprintln!("Model {input} not found locally. Downloading via huggingface-cli...");
-            let status = std::process::Command::new("huggingface-cli")
-                .args(["download", input])
-                .status();
+            // Not in cache — try to download. Prefer the new `hf` CLI (huggingface_hub
+            // >= 0.30); fall back to the deprecated `huggingface-cli` so older installs
+            // still work. As of huggingface_hub 1.0, `huggingface-cli` is a no-op stub
+            // that just prints a deprecation message and exits non-zero, which broke
+            // the auto-download path when the HF cache didn't already have the model.
+            eprintln!("Model {input} not found locally. Downloading from HuggingFace...");
+            let run_download = |prog: &str| {
+                std::process::Command::new(prog)
+                    .args(["download", input])
+                    .status()
+            };
+            let mut status = run_download("hf");
+            if matches!(&status, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+                status = run_download("huggingface-cli");
+            }
 
             match status {
                 Ok(s) if s.success() => {
@@ -1104,8 +1114,8 @@ fn resolve_model_path(input: &str) -> String {
                         }
                     }
                 }
-                Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
-                Err(e) => eprintln!("Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"),
+                Ok(s) => eprintln!("HuggingFace download failed with status {s}"),
+                Err(e) => eprintln!("Failed to run hf/huggingface-cli: {e}. Install with: pip install -U huggingface_hub"),
             }
         }
     }

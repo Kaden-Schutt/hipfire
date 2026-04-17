@@ -229,6 +229,15 @@ const REGISTRY: Record<string, ModelEntry> = {
   // sees the local copy and skips the download).
   "qwen3.5:35b-a3b":  { repo: "", file: "qwen3.5-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
 
+  // Qwen3.6 MoE (A3B) — 35B total / 3B activated, released April 2026.
+  // HF config still declares `model_type: qwen3_5_moe` so it loads through
+  // the existing A3B (arch_id=6) code path; weights differ (coding/agentic
+  // fine-tune) but architecture (256 experts top-8, hybrid DeltaNet+FA,
+  // head_dim=256 with partial_rotary=0.25, shared expert) is identical.
+  // Local-only until a pre-quantized HF repo exists; use `hipfire quantize
+  // Qwen/Qwen3.6-35B-A3B --format mq4` to produce the file.
+  "qwen3.6:35b-a3b":  { repo: "", file: "qwen3.6-35b-a3b.mq4", size_gb: 18.7, min_vram_gb: 22, desc: "MoE 35B/3B-active (coding/agent) — LOCAL ONLY, quantize Qwen/Qwen3.6-35B-A3B" },
+
   // Qwen3.5 MQ6 — 6-bit rotated, higher quality / larger file (~1.47× MQ4)
   "qwen3.5:0.8b-mq6": { repo: hfRepo("qwen3.5","0.8b"), file: "qwen3.5-0.8b.mq6",   size_gb: 0.67, min_vram_gb: 2,  desc: "MQ6, higher quality" },
   "qwen3.5:4b-mq6":   { repo: hfRepo("qwen3.5","4b"),   file: "qwen3.5-4b.mq6",     size_gb: 3.5,  min_vram_gb: 5,  desc: "MQ6, higher quality" },
@@ -259,6 +268,12 @@ const ALIASES: Record<string, string> = {
   "qwen3.5:latest": "qwen3.5:9b",
   "qwen3.5:small": "qwen3.5:0.8b",
   "qwen3.5:large": "qwen3.5:27b",
+  // Qwen3.6 only ships as 35B-A3B MoE (no dense variants) — all short tags
+  // fall through to the single entry.
+  "qwen3.6": "qwen3.6:35b-a3b",
+  "qwen3.6:latest": "qwen3.6:35b-a3b",
+  "qwen3.6:35b": "qwen3.6:35b-a3b",
+  "qwen3.6:a3b": "qwen3.6:35b-a3b",
   "qwen3": "qwen3:8b",
   "carnice": "carnice:9b",
   "qwopus": "qwopus:9b",
