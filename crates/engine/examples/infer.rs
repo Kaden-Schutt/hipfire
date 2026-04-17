@@ -87,13 +87,13 @@ fn main() {
         eprintln!("Vision: hidden={}, layers={}, heads={}", vision_config.hidden_size, vision_config.num_layers, vision_config.num_heads);
 
         let img = image_path.as_ref().unwrap();
-        let pixels = engine::image::load_and_preprocess(Path::new(img), IMAGE_SIZE);
-        let grid_h = IMAGE_SIZE / vision_config.patch_size;
-        let grid_w = IMAGE_SIZE / vision_config.patch_size;
+        let (pixels, img_h, img_w) = engine::image::load_and_preprocess(Path::new(img), vision_config.patch_size);
+        let grid_h = img_h / vision_config.patch_size;
+        let grid_w = img_w / vision_config.patch_size;
         n_visual_tokens = (grid_h * grid_w) / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
 
         let patches = engine::image::extract_patches(
-            &pixels, 3, IMAGE_SIZE, IMAGE_SIZE,
+            &pixels, 3, img_h, img_w,
             vision_config.patch_size, vision_config.temporal_patch_size,
         );
 
