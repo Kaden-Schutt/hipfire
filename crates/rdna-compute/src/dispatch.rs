@@ -585,6 +585,20 @@ impl Gpu {
         Ok(Some(ptr))
     }
 
+    /// Whether the arch is eligible for the rocBLAS/MFMA batched-prefill
+    /// path. Default: CDNA3 only (MI300-series, gfx94x). Override with
+    /// `HIPFIRE_ROCBLAS_ALL_ARCHS=1` for local testing on RDNA3+ — rocBLAS
+    /// runs fine there (uses WMMA backends on RDNA3, not MFMA) so this is
+    /// a useful smoke-path in the absence of an MI300.
+    fn rocblas_arch_eligible(&self) -> bool {
+        static CACHE: OnceLock<bool> = OnceLock::new();
+        let all_archs = *CACHE.get_or_init(|| {
+            std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1")
+        });
+        if all_archs { return self.rocblas.is_some(); }
+        matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+    }
+
     /// Configurable batch threshold for MFMA dispatch. Below this we stay on
     /// the hand-rolled GEMV — rocBLAS launch overhead eats the compute win
     /// at tiny batches. Overridable via `HIPFIRE_ROCBLAS_MIN_BATCH` env var.
@@ -1895,8 +1909,7 @@ impl Gpu {
         // matrices (beta, alpha) are tiny (n_v_heads = 128 on A3B) so we
         // could skip them and stay on the GEMV path, but dispatching all
         // four via rocBLAS keeps the codepath uniform. Amortizes well.
-        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        if cdna3_outer
+        if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
@@ -2176,8 +2189,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // CDNA3 MFMA path — 3 back-to-back rocBLAS calls for Q, K, V.
-        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        if cdna3_outer
+        if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
@@ -3642,8 +3654,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
-        let cdna3_outer = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        if cdna3_outer
+        if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
@@ -3913,8 +3924,6 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-
         // CDNA3 MFMA path (task #130): when rocBLAS is loaded and batch is
         // big enough for the launch overhead to amortize, route through the
         // dequantize-once FP16 shadow + rocBLAS GEMM. Expected 20-100× over
@@ -3923,7 +3932,7 @@ impl Gpu {
         // (batch<4), capture mode (rocBLAS launches don't graph-capture
         // cleanly; revisit if hipGraph becomes critical for CDNA3 prefill),
         // or if the fp16 shadow alloc fails under VRAM pressure.
-        if cdna3
+        if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
             && !self.capture_mode
@@ -3953,6 +3962,7 @@ impl Gpu {
             // Shadow allocation failed — fall through to the GEMV path.
         }
 
+        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
             self.ensure_kernel(
                 "gemm_hfq4g256_wave64",
