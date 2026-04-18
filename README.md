@@ -8,7 +8,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d       # background daemon on port 11435 (OpenAI API compatible)
 ```
 
-Current release: **v0.1.7-alpha** — FlashTriAttn long-ctx speculative decoding (+42% tok/s on 9B), CASK m-folding KV eviction, Qwen3.6-35B-A3B MoE support, MI300X wave64 port. See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.6 "deltacut"**.
+Current release: **v0.1.7-alpha.2** — hotfix for `hipfire config` TUI crash + A3B DFlash default-off. FlashTriAttn long-ctx speculative decoding (+42% tok/s on 9B), CASK m-folding KV eviction, Qwen3.6-35B-A3B MoE support, MI300X wave64 port. See [CHANGELOG.md](CHANGELOG.md). Previous: **v0.1.6 "deltacut"**.
 
 ## Why
 

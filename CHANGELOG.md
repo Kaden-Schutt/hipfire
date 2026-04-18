@@ -1,5 +1,54 @@
 # Changelog
 
+## v0.1.7-alpha.2 (2026-04-18)
+
+Hotfix release for three user-visible regressions in v0.1.7-alpha. No
+behavior changes beyond the fixes listed — intended as a drop-in
+replacement for anyone running v0.1.7-alpha.
+
+### Fixes
+
+- **`hipfire config` TUI crash** (`TypeError: undefined is not an object
+  (evaluating 'meta[k].label')`). The v0.1.7-alpha release added 8 new
+  config keys (`experimental_budget_alert`, `dflash_adaptive_b`,
+  `cask_sidecar`, `cask`, `cask_budget`, `cask_beta`, `cask_core_frac`,
+  `cask_fold_m`) to `CONFIG_DEFAULTS` without matching entries in the
+  TUI's `meta` field descriptor table, so every interactive `hipfire
+  config` invocation on a real TTY threw on first render. Non-interactive
+  `hipfire config list|get|set` flows were unaffected. Added full meta
+  entries + boolean option round-tripping in `cycleOption` / `commitEdit`.
+- **A3B DFlash default-on perf regression** (2-5× slower than plain AR on
+  code/prose). A3B drafts reject most tokens (τ≈1.0-1.5 outside math),
+  and the spec cycle overhead dominates the AR win. New `dflash_mode`
+  per-model config key: `on | off | auto`. `auto` keeps dense targets
+  running DFlash as before and flips A3B off unless a `cask_sidecar` is
+  configured (A3B long-context on 24 GB consumer cards needs eviction to
+  fit). Daemon-side belt-and-suspenders: `dflash_mode=off` skips draft
+  load outright even when a draft path is supplied.
+- **`hipfire config set dflash_mode <value>` → "Unknown key"**. The
+  dflash_mode key was not in the released alpha's validKeys list. Ships
+  as part of the same commit as the default-off gate above.
+
+### Upgrade path
+
+```
+curl -fsSL https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/install.sh | bash
+# or: hipfire update
+```
+
+No config migration needed — `~/.hipfire/config.json` written by
+v0.1.7-alpha remains compatible. If you want to explicitly disable
+DFlash on A3B (defaults to auto-off now anyway), either edit config.json
+or run:
+
+```
+hipfire config set dflash_mode off
+hipfire config qwen3.5:35b-a3b set dflash_mode off   # per-model override
+```
+
+Full v0.1.7 stable release (rocBLAS MFMA on MI300X, hipGraph+MoE fix,
+full Hermes agent validation) tracking on `dflash` branch.
+
 ## v0.1.7-alpha (2026-04-18)
 
 Pre-release tag cutting the dflash branch against master. Gated to full
@@ -59,6 +108,7 @@ Per-model config (via `hipfire config` or `~/.hipfire/per_model_config.json`):
 
 ```
 dflash_adaptive_b   boolean   default true     # τ-window trip-wire block shrink
+dflash_mode         enum      default auto     # on | off | auto (A3B-aware)
 cask_sidecar        string    default ""       # path to a .triattn.bin
 cask                boolean   default false    # enable m-folding (on top of sidecar)
 cask_budget         int       default 512
@@ -71,6 +121,19 @@ The daemon protocol accepts all of these in the `load` message's `params` object
 `cask_sidecar` is accepted and logged today; the generate-loop integration
 lands in 0.1.7 stable (current serve users run DFlash without eviction —
 use `dflash_spec_demo` directly for the `--cask-sidecar` path).
+
+### Post-alpha fixes (land in v0.1.7 stable)
+
+- **`dflash_mode` gate** — A3B DFlash silently routed every temp=0 request
+  through DFlash in the alpha; a 7900 XTX sweep showed it's 2-5× slower than
+  plain AR on code/prose (A3B draft rejects most drafted tokens — τ≈1.0-1.5
+  — and the cycle overhead dwarfs the AR win). New per-model config key
+  `dflash_mode: on | off | auto`. `auto` keeps dense-on, flips A3B off
+  unless a `cask_sidecar` is configured (long-ctx A3B on 24 GB consumer
+  cards needs eviction for correctness, and that combo wins on τ too).
+  Daemon-side belt-and-suspenders: `dflash_mode=off` skips draft load even
+  when a draft path is supplied. Also fixes the draft-discovery regex so
+  A3B targets pick up `qwen3{N}-35b-a3b-dflash-*.hfq` under `on`/`auto+sidecar`.
 
 ### Pending for v0.1.7 stable
 

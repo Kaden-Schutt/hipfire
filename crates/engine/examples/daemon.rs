@@ -224,8 +224,24 @@ fn main() {
                 // through `spec_step_dflash` for the 1.7-2.5× speedup on the
                 // 27B target. Non-matching archs / missing draft file are
                 // logged but don't fail the load.
-                let draft_path = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                //
+                // `dflash_mode=off` is a hard daemon-side override: even if a
+                // draft path was passed, skip the load. CLI-side gating is the
+                // primary path (saves the wire round-trip for the draft path
+                // string), but this guard makes the flag durable when the
+                // daemon is driven by a non-hipfire-CLI client.
+                let dflash_mode = msg.get("params").and_then(|p| p.get("dflash_mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("auto");
+                let raw_draft = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let draft_path = if dflash_mode == "off" {
+                    if raw_draft.is_some() {
+                        eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({})", raw_draft.unwrap());
+                    }
+                    None
+                } else {
+                    raw_draft.map(|s| s.to_string())
+                };
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
