@@ -150,6 +150,19 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
 
 pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
+    // Detect vision weight format (F16 direct vs HFQ4 auto-dequant) and log once.
+    // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load
+    // time for the gemm_f16 path — there is no GPU HFQ4 kernel for vision yet.
+    // See CHANGELOG.md "v0.1.7-alpha.4 / Vision" for details.
+    if let Some((info, _)) = hfq.tensor_data("model.visual.patch_embed.proj.weight") {
+        let fmt = match info.quant_type {
+            1 => "F16 (direct)",
+            6 => "HFQ4-G256 (dequanting to F16 on load)",
+            7 => "HFQ4-G128 (dequanting to F16 on load)",
+            other => &format!("qt={other}"),
+        };
+        eprintln!("  vision weight format: {fmt}");
+    }
     eprintln!("  loading vision weights (GPU)...");
     let patch_embed_w = load_f16_gpu(hfq, gpu, "model.visual.patch_embed.proj.weight")?;
     let patch_embed_b = load_f32_gpu(hfq, gpu, "model.visual.patch_embed.proj.bias", h)?;
