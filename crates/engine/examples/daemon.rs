@@ -45,7 +45,7 @@ impl Eviction {
         gpu: &mut rdna_compute::Gpu,
         kv: &mut llama::KvCache,
         physical: usize,
-    ) -> HipResult<Option<usize>> {
+    ) -> HipResult<Option<engine::triattn::EvictionResult>> {
         match self {
             Eviction::Plain(c) => c.maybe_evict(gpu, kv, physical),
             Eviction::Cask(c) => c.maybe_evict(gpu, kv, physical),
@@ -1061,6 +1061,8 @@ fn generate_dflash(
         eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+    df.draft_scratch.target_hidden_abs_positions =
+        (0..prompt_tokens.len() as i32).collect();
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -1099,12 +1101,19 @@ fn generate_dflash(
     // `budget`. compact_offset is maintained on target.kv_cache; subsequent
     // forwards inside spec_step_dflash read it for RoPE phase automatically.
     if let Some(ref ev) = m.eviction {
-        if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+        if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+            let pre_phys = position;
             eprintln!(
                 "[dflash] post-prefill evict: {} -> {} (compact_offset={})",
-                position, new_phys, target.kv_cache.compact_offset,
+                pre_phys, res.new_physical, target.kv_cache.compact_offset,
             );
-            position = new_phys;
+            position = res.new_physical;
+            if !res.retain_mask.is_empty() {
+                let _ = speculative::apply_eviction_retain_to_draft(
+                    gpu, &mut df.draft_scratch, &res.retain_mask,
+                    df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                );
+            }
         }
     }
 
@@ -1139,6 +1148,8 @@ fn generate_dflash(
             &emitted,
             0.0_f32,                   // cactus_delta
             None,                      // pld_spine
+            1.0_f32,                   // repeat_penalty (off)
+            0,                         // repeat_window
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -1173,8 +1184,15 @@ fn generate_dflash(
         // has grown to budget+β since the last compaction. No-op when
         // physical < budget+β, so non-firing cycles pay only the check cost.
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
-                position = new_phys;
+            if let Some(res) = ev.maybe_evict(gpu, &mut target.kv_cache, position).unwrap() {
+                let pre_phys = position;
+                position = res.new_physical;
+                if !res.retain_mask.is_empty() {
+                    let _ = speculative::apply_eviction_retain_to_draft(
+                        gpu, &mut df.draft_scratch, &res.retain_mask,
+                        df.draft_config.num_extract(), df.draft_config.hidden, pre_phys,
+                    );
+                }
             }
         }
         if hit_eos { break; }
@@ -1349,7 +1367,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     None, None, None, None,
                 ).unwrap();
                 m.seq_pos += chunk_len;
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
                 remaining = rest;
@@ -1439,7 +1457,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
             }
@@ -1521,7 +1539,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         qwen35::forward_scratch(gpu, weights, config, tok, m.seq_pos, kv, dn, scratch).unwrap();
                         m.seq_pos += 1;
                         if let Some(ref ev) = m.eviction {
-                            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                                 m.seq_pos = new_phys;
                             }
                         }
@@ -1567,7 +1585,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
                 m.seq_pos += 1;
                 if let Some(ref ev) = m.eviction {
-                    if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                    if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                         m.seq_pos = new_phys;
                     }
                 }
@@ -1807,7 +1825,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                 m.seq_pos = new_phys;
             }
         }
@@ -1833,7 +1851,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
         m.seq_pos += 1;
         if let Some(ref ev) = m.eviction {
-            if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+            if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                 m.seq_pos = new_phys;
             }
         }
@@ -1849,7 +1867,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
             if let Some(ref ev) = m.eviction {
-                if let Some(new_phys) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                if let Some(engine::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
                 }
             }

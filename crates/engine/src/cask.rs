@@ -20,7 +20,7 @@
 //! score is the score-mass variant with a numerically stable normalizer.
 
 use crate::llama::{f16_to_f32, f32_to_f16, KvCache};
-use crate::triattn::EvictionCtx;
+use crate::triattn::{EvictionCtx, EvictionResult};
 use hip_bridge::HipResult;
 use rdna_compute::Gpu;
 
@@ -65,12 +65,17 @@ impl CaskCtx {
 
     /// Same trigger + return convention as `EvictionCtx::maybe_evict`.
     /// Falls back to plain TriAttention for non-Q8 modes in v1.
+    ///
+    /// Returns an `EvictionResult` with `retain_mask = Vec::new()` on the
+    /// m-fold path — merge-smoothed slots don't correspond to any single
+    /// source position, so callers (e.g. DFlash draft) that need a retain
+    /// selection treat the empty mask as "can't mirror, skip".
     pub fn maybe_evict(
         &self,
         gpu: &mut Gpu,
         kv: &mut KvCache,
         current_physical: usize,
-    ) -> HipResult<Option<usize>> {
+    ) -> HipResult<Option<EvictionResult>> {
         if current_physical < self.base.budget + self.base.beta {
             return Ok(None);
         }
@@ -305,7 +310,10 @@ impl CaskCtx {
         // Output size is always `budget` slots (core_slots + merge_slots = budget).
         kv.compact_offset += current_physical - budget;
         self.base.eviction_count.set(self.base.eviction_count.get() + 1);
-        Ok(Some(budget))
+        // m-fold merges multiple source positions per output slot — no single
+        // retain_mask captures the mapping. Empty mask signals "can't mirror"
+        // to callers that shadow the eviction into non-KV buffers.
+        Ok(Some(EvictionResult { new_physical: budget, retain_mask: Vec::new() }))
     }
 }
 

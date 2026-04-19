@@ -29,14 +29,14 @@ fn main() {
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
     use engine::tokenizer::Tokenizer;
-    use engine::triattn::{EvictionCtx, TriAttnCenters};
+    use engine::triattn::{EvictionCtx, EvictionResult, TriAttnCenters};
     use std::path::Path;
     use std::time::Instant;
 
     enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl CaskPolicy {
         fn maybe_evict(&self, gpu: &mut rdna_compute::Gpu, kv: &mut engine::llama::KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<usize>>
+            -> hip_bridge::HipResult<Option<EvictionResult>>
         {
             match self {
                 CaskPolicy::Plain(c) => c.maybe_evict(gpu, kv, physical),
@@ -69,6 +69,8 @@ fn main() {
     let mut block_size_override: Option<usize> = None;
     let mut temp: f32 = 0.0;
     let mut seed: u64 = 42;
+    let mut repeat_penalty: f32 = 1.0;
+    let mut repeat_window: usize = 128;
     // Adaptive block size: on by default (2026-04-16). Shrinks B from 16
     // → 8 when rolling τ drops below 4 so hard/creative prompts where the
     // draft diverges per position don't pay the full 16-token verify cost.
@@ -183,6 +185,14 @@ fn main() {
             }
             "--seed" => {
                 seed = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--repeat-penalty" => {
+                repeat_penalty = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--repeat-window" => {
+                repeat_window = args[i + 1].parse().unwrap();
                 i += 2;
             }
             "--adaptive-b" => {
@@ -489,6 +499,11 @@ fn main() {
     )
     .expect("seed scatter");
     draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
+    // Seed per-row absolute positions for the draft's cross-attention RoPE.
+    // Pre-eviction these match [0..prompt_len) exactly, so FlashCASK-free runs
+    // stay byte-identical to the old contiguous-range behaviour.
+    draft_scratch.target_hidden_abs_positions =
+        (0..prompt_tokens.len() as i32).collect();
     eprintln!("prefill (per-token) in {:.2}s", t2.elapsed().as_secs_f64());
 
     // ── Build FlashCASK policy (opt-in via --cask-sidecar) ──────────
@@ -530,13 +545,26 @@ fn main() {
     // budget-sized physical state.
     let mut position: usize = prompt_tokens.len();
     if let Some(ref p) = cask_policy {
-        if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+        if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
             .expect("post-prefill cask evict") {
+            let pre_phys = position;
             eprintln!(
                 "FlashCASK: post-prefill compact {} -> {} (compact_offset={})",
-                position, new_phys, target.kv_cache.compact_offset,
+                pre_phys, ev.new_physical, target.kv_cache.compact_offset,
             );
-            position = new_phys;
+            position = ev.new_physical;
+            // Mirror the KV eviction into the draft's target_hidden so
+            // draft/target see the same windowed context.
+            if !ev.retain_mask.is_empty() {
+                speculative::apply_eviction_retain_to_draft(
+                    &mut gpu,
+                    &mut draft_scratch,
+                    &ev.retain_mask,
+                    draft_cfg.num_extract(),
+                    draft_cfg.hidden,
+                    pre_phys,
+                ).expect("mirror eviction to draft (post-prefill)");
+            }
         }
     }
 
@@ -686,9 +714,10 @@ fn main() {
             emitted.push(next);
             position += 1;
             if let Some(ref p) = cask_policy {
-                if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+                if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
                     .expect("ar cask evict") {
-                    position = new_phys;
+                    // AR baseline doesn't touch draft state — no mirror needed.
+                    position = ev.new_physical;
                 }
             }
             if next == eos_id {
@@ -900,6 +929,8 @@ fn main() {
                 &emitted,
                 cactus_delta,
                 pld_spine,
+                repeat_penalty,
+                repeat_window,
             )
             .expect("spec step")
         };
@@ -981,9 +1012,24 @@ fn main() {
         // budget+β. compact_offset is maintained on the cache so the next
         // cycle's target.forward_scratch uses the right RoPE phase.
         if let Some(ref p) = cask_policy {
-            if let Some(new_phys) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
+            if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
                 .expect("spec cask evict") {
-                position = new_phys;
+                let pre_phys = position;
+                position = ev.new_physical;
+                // Mirror the KV eviction into the draft's target_hidden view.
+                // Empty retain_mask (CASK m-fold path) → skip; draft keeps the
+                // pre-eviction buffer, the old τ-collapse behaviour still
+                // applies there until m-fold gets a compatible draft mirror.
+                if !ev.retain_mask.is_empty() {
+                    speculative::apply_eviction_retain_to_draft(
+                        &mut gpu,
+                        &mut draft_scratch,
+                        &ev.retain_mask,
+                        draft_cfg.num_extract(),
+                        draft_cfg.hidden,
+                        pre_phys,
+                    ).expect("mirror eviction to draft");
+                }
             }
         }
 

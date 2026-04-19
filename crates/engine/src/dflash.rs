@@ -330,6 +330,15 @@ pub struct DflashScratch {
     // Set to 0 by `reset_upload_tracking` (called at new-prompt boundary).
     // draft_forward updates it after each partial upload.
     pub uploaded_target_hidden_rows: usize,
+
+    /// Absolute (pre-compaction) position of every populated row of
+    /// `target_hidden` on GPU. Length always equals the number of valid rows.
+    /// Used by `spec_step_dflash` to build non-contiguous `positions_k` when
+    /// a TriAttention eviction has compacted `target_hidden` out of order.
+    /// Seeded during prompt ingestion and updated on every cycle commit and
+    /// every eviction mirror. Empty on the ctx_slice=Some path (caller
+    /// manages positions explicitly for that diagnostic mode).
+    pub target_hidden_abs_positions: Vec<i32>,
 }
 
 impl DflashScratch {
@@ -402,6 +411,7 @@ impl DflashScratch {
 
             mq_x_rot,
             uploaded_target_hidden_rows: 0,
+            target_hidden_abs_positions: Vec::new(),
         })
     }
 
@@ -411,6 +421,7 @@ impl DflashScratch {
     /// skip required rows.
     pub fn reset_upload_tracking(&mut self) {
         self.uploaded_target_hidden_rows = 0;
+        self.target_hidden_abs_positions.clear();
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {

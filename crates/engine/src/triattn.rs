@@ -515,6 +515,16 @@ pub fn compute_retain_indices(
 
 // ─── Forward-loop eviction trigger ────────────────────────────────────────
 
+/// Outcome of a successful eviction pass. `retain_mask` is the source-position
+/// retain selection from the **last** FA layer processed — callers that need
+/// to mirror the eviction into a non-KV auxiliary buffer (DFlash's
+/// `draft_scratch.target_hidden`) use it as a single representative mask, since
+/// retain decisions across FA layers are strongly correlated in practice.
+pub struct EvictionResult {
+    pub new_physical: usize,
+    pub retain_mask: Vec<u32>,
+}
+
 /// Pre-allocated scratch + policy for periodic TriAttention eviction during
 /// autoregressive decode. Instantiate once per inference session; call
 /// `maybe_evict` after every new-token write. When the physical cache has
@@ -621,7 +631,7 @@ impl EvictionCtx {
         gpu: &mut Gpu,
         kv: &mut crate::llama::KvCache,
         current_physical: usize,
-    ) -> HipResult<Option<usize>> {
+    ) -> HipResult<Option<EvictionResult>> {
         if current_physical < self.budget + self.beta {
             return Ok(None);
         }
@@ -642,6 +652,7 @@ impl EvictionCtx {
         };
         let v_bytes_per_pos = self.n_kv_heads * (self.head_dim / 32) * 34;
 
+        let mut last_retain: Vec<u32> = Vec::new();
         for (fa_i, &layer_idx) in self.fa_layer_ids.iter().enumerate() {
             let offset = fa_i * self.centers_per_layer;
             let centers_layer = self.centers_dev.sub_offset(offset, self.centers_per_layer);
@@ -692,11 +703,12 @@ impl EvictionCtx {
 
             gpu.hip.memcpy_dtod_at(&kv.k_gpu[layer_idx].buf, 0, &self.k_compact.buf, 0, self.budget * k_bytes_per_pos)?;
             gpu.hip.memcpy_dtod_at(&kv.v_gpu[layer_idx].buf, 0, &self.v_compact.buf, 0, self.budget * v_bytes_per_pos)?;
+            last_retain = retain;
         }
 
         kv.compact_offset += current_physical - self.budget;
         self.eviction_count.set(self.eviction_count.get() + 1);
-        Ok(Some(self.budget))
+        Ok(Some(EvictionResult { new_physical: self.budget, retain_mask: last_retain }))
     }
 
     /// Release all GPU buffers held by the context. Consumed by value;

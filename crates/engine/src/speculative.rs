@@ -1759,6 +1759,8 @@ pub fn spec_step_dflash(
     prev_committed: &[u32],
     cactus_delta: f32,
     pld_spine: Option<&[u32]>,
+    repeat_penalty: f32,
+    repeat_window: usize,
 ) -> HipResult<SpecStepResult> {
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
@@ -1805,6 +1807,7 @@ pub fn spec_step_dflash(
     let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
     let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
     let use_temp_sampling = temp > 0.0;
+    let rp_active = repeat_penalty > 1.0 && !use_temp_sampling;
 
     if let Some(pld) = pld_spine {
         // PLD spine path: drafted tokens come from context-suffix match.
@@ -1851,21 +1854,45 @@ pub fn spec_step_dflash(
     }
 
     // ── 3. Position arrays + optional context slice ─────────────────────
-    // Q positions: the absolute positions of the block slots, [position..position+B).
-    // K positions by default: all accepted context [0..position), then block [position..position+B).
+    // Q positions: the absolute positions of the block slots,
+    //   [position + compact_offset .. position + B + compact_offset).
+    // K positions by default: absolute positions of all populated target_hidden
+    // rows (potentially non-contiguous after a TriAttention eviction), then
+    // the same block slots.
+    //
+    // Pre-eviction: positions are contiguous [0..position+B), so the
+    // abs_positions vec contains [0..position) and this matches the old
+    // behaviour byte-for-byte.
+    // Post-eviction: abs_positions contains the subset retained by the last
+    // FA layer's top-B mask, paired with the correct pre-eviction absolute
+    // positions so draft RoPE aligns with target.
     //
     // If `ctx_slice = Some(N)` is set, restrict the draft's context view to
     // the last `N` rows of target_hidden_host, with RoPE positions
-    // [position-N..position+B). This tests whether distant context hurts
-    // accept rate (e.g., if the draft was trained on shorter contexts).
+    // [position-N..position+B). Eviction-aware abs positions are not tracked
+    // on this diagnostic path — callers using it don't expect FlashCASK.
     let effective_ctx_len = match ctx_slice {
         Some(n) => n.min(position),
-        None => position,
+        None => draft_scratch.target_hidden_abs_positions.len().min(position),
     };
     let ctx_start = position - effective_ctx_len;
-    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
-    let positions_k: Vec<i32> =
-        (ctx_start as i32..(position + b) as i32).collect();
+    let co = target.kv_cache.compact_offset as i32;
+    let positions_q: Vec<i32> =
+        ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
+    let positions_k: Vec<i32> = if ctx_slice.is_some() {
+        // Diagnostic path: keep legacy contiguous layout. abs_positions isn't
+        // tracked here and eviction isn't supported with ctx_slice anyway.
+        (ctx_start as i32..(position + b) as i32).collect()
+    } else {
+        let mut v = Vec::with_capacity(effective_ctx_len + b);
+        let th_abs = &draft_scratch.target_hidden_abs_positions;
+        let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
+        v.extend_from_slice(&th_abs[start_idx..]);
+        for p in 0..b {
+            v.push(position as i32 + p as i32 + co);
+        }
+        v
+    };
 
     // Slice target_hidden_host to the last effective_ctx_len rows. When
     // ctx_slice is None, this is a no-op (ctx_start = 0). Row stride is
@@ -1970,6 +1997,18 @@ pub fn spec_step_dflash(
                 drafted.push(t);
                 draft_softmaxes.push(probs);
             }
+        } else if rp_active {
+            // RP-adjusted greedy: apply repeat_penalty to each row before argmax
+            // so draft and target pick from the same reshaped distribution. Keeps
+            // spec-decode aligned (τ doesn't collapse from mismatched argmaxes).
+            let host_logits = gpu.download_f32(&logits_batch)?;
+            debug_assert_eq!(host_logits.len(), batch * vocab);
+            let mut row = vec![0f32; vocab];
+            for i in 0..batch {
+                row.copy_from_slice(&host_logits[i * vocab..(i + 1) * vocab]);
+                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                drafted.push(argmax_u32(&row));
+            }
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);
@@ -2000,6 +2039,10 @@ pub fn spec_step_dflash(
                 draft_probs_at_drafted.push(probs[t as usize]);
                 drafted.push(t);
                 draft_softmaxes.push(probs);
+            } else if rp_active {
+                let mut row = logits.clone();
+                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                drafted.push(argmax_u32(&row));
             } else {
                 drafted.push(argmax_u32(&logits));
             }
@@ -2078,7 +2121,7 @@ pub fn spec_step_dflash(
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling,  // need full target logits for rejection sampling
+        use_temp_sampling || rp_active,  // full target logits needed for rejection sampling or RP-adjusted argmax
         verify_scratch,
     )?;
 
@@ -2162,14 +2205,31 @@ pub fn spec_step_dflash(
             sample_categorical(&target_probs, u)
         };
     } else {
+        // Greedy path. If RP is active, re-derive argmax per row after applying
+        // the repeat_penalty to the full target logits (requires want_full_logits).
+        // `prev_committed` carries the emitted history used as the penalty window.
+        let argmax_per_pos: std::borrow::Cow<'_, [u32]> = if rp_active {
+            let tgt_logits = &verify_out.logits_per_pos;
+            debug_assert_eq!(tgt_logits.len(), b * vocab);
+            let mut out: Vec<u32> = Vec::with_capacity(b);
+            let mut row = vec![0f32; vocab];
+            for i in 0..b {
+                row.copy_from_slice(&tgt_logits[i * vocab..(i + 1) * vocab]);
+                llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
+                out.push(argmax_u32(&row));
+            }
+            std::borrow::Cow::Owned(out)
+        } else {
+            std::borrow::Cow::Borrowed(verify_out.argmax_per_pos.as_slice())
+        };
         for i in 0..b - 1 {
-            if verify_out.argmax_per_pos[i] == block[i + 1] {
+            if argmax_per_pos[i] == block[i + 1] {
                 accept_len += 1;
             } else {
                 break;
             }
         }
-        bonus_token = verify_out.argmax_per_pos[accept_len];
+        bonus_token = argmax_per_pos[accept_len];
     }
 
     // ── 8. Committed sequence ───────────────────────────────────────────
@@ -2247,6 +2307,16 @@ pub fn spec_step_dflash(
         // ctx_slice=Some call in the same session doesn't try to re-upload what
         // GPU already has; and so the assertion-in-draft path stays coherent.
         draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
+        // Track the absolute positions of the rows we just appended. These are
+        // the logical positions `position..position+rows_to_keep` plus the
+        // current target KV compact_offset (zero pre-eviction; non-zero after).
+        // Used by the next cycle's `positions_k` construction.
+        let co = target.kv_cache.compact_offset as i32;
+        for p in 0..rows_to_keep {
+            draft_scratch
+                .target_hidden_abs_positions
+                .push(position as i32 + p as i32 + co);
+        }
     }
 
     // ── 10. Rewind DeltaNet + replay committed tokens ────────────────────
@@ -3218,5 +3288,78 @@ pub fn seed_target_hidden_from_prompt(
     // Gather the just-written rows from the ring buffer.
     let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
     target_hidden_host.extend_from_slice(&block);
+    Ok(())
+}
+
+/// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
+/// `target_hidden` and `target_hidden_abs_positions`, so the draft's cross-
+/// attention sees the same subset of context target now has.
+///
+/// `retain_mask` is the source-position retain selection returned by
+/// `EvictionCtx::maybe_evict` (ascending, length == budget). An empty
+/// `retain_mask` is a no-op — the caller should have skipped calling this
+/// (CASK m-fold path returns empty because merged slots don't map cleanly
+/// to a single source position).
+///
+/// Implementation: download the relevant `physical` rows of `target_hidden`,
+/// reorder to `budget` rows on the host per `retain_mask`, upload back. Runs
+/// at eviction cadence (~once per β decoded tokens) so the PCIe round-trip
+/// is amortized — perf impact is small relative to the τ recovery.
+///
+/// Post-conditions:
+/// - `draft_scratch.target_hidden_abs_positions` has exactly `budget` entries,
+///   each pulled from `retain_mask[i]` of the pre-eviction abs_positions.
+/// - `draft_scratch.target_hidden` GPU slots [0..budget) hold the retained
+///   rows in ascending source order.
+/// - `draft_scratch.uploaded_target_hidden_rows = budget` so the next
+///   draft_forward sees the compacted layout as already-uploaded.
+pub fn apply_eviction_retain_to_draft(
+    gpu: &mut rdna_compute::Gpu,
+    draft_scratch: &mut dflash::DflashScratch,
+    retain_mask: &[u32],
+    ne: usize,
+    h: usize,
+    physical: usize,
+) -> HipResult<()> {
+    if retain_mask.is_empty() {
+        return Ok(());
+    }
+    let row_floats = ne * h;
+    // Download only the populated prefix of target_hidden. `alloc_tensor`
+    // is sized to max_ctx_len — we just need `physical` rows.
+    let mut host = vec![0f32; physical * row_floats];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                host.as_mut_ptr() as *mut u8,
+                host.len() * std::mem::size_of::<f32>(),
+            )
+        };
+        gpu.hip.memcpy_dtoh(bytes, &draft_scratch.target_hidden.buf)?;
+    }
+    let budget = retain_mask.len();
+    let mut compacted = Vec::with_capacity(budget * row_floats);
+    let mut new_abs = Vec::with_capacity(budget);
+    for &src_idx in retain_mask {
+        let s = src_idx as usize;
+        let row = &host[s * row_floats..(s + 1) * row_floats];
+        compacted.extend_from_slice(row);
+        new_abs.push(
+            *draft_scratch
+                .target_hidden_abs_positions
+                .get(s)
+                .expect("retain_mask index out of range for abs_positions"),
+        );
+    }
+    let dst_bytes = budget * row_floats * std::mem::size_of::<f32>();
+    let compacted_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            compacted.as_ptr() as *const u8,
+            dst_bytes,
+        )
+    };
+    gpu.hip.memcpy_htod(&draft_scratch.target_hidden.buf, compacted_bytes)?;
+    draft_scratch.target_hidden_abs_positions = new_abs;
+    draft_scratch.uploaded_target_hidden_rows = budget;
     Ok(())
 }

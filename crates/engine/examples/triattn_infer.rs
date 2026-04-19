@@ -35,7 +35,7 @@ fn main() {
     enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl Policy {
         fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<usize>>
+            -> hip_bridge::HipResult<Option<engine::triattn::EvictionResult>>
         {
             match self {
                 Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
@@ -170,8 +170,8 @@ fn main() {
     for t in &toks {
         qwen35::forward_scratch(&mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch).unwrap();
         physical += 1;
-        if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-            physical = new_phys;
+        if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+            physical = ev.new_physical;
         }
         #[allow(unused)]
         let _ = &ctx;
@@ -196,8 +196,8 @@ fn main() {
     for _ in 0..max_tokens {
         qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
         physical += 1;
-        if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-            physical = new_phys;
+        if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+            physical = ev.new_physical;
         }
         #[allow(unused)]
         let _ = &ctx;

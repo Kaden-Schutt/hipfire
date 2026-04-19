@@ -29,7 +29,7 @@ fn main() {
     enum Policy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl Policy {
         fn maybe_evict(&self, gpu: &mut Gpu, kv: &mut KvCache, physical: usize)
-            -> hip_bridge::HipResult<Option<usize>>
+            -> hip_bridge::HipResult<Option<engine::triattn::EvictionResult>>
         {
             match self {
                 Policy::Plain(c) => c.maybe_evict(gpu, kv, physical),
@@ -169,8 +169,8 @@ fn main() {
                 qwen35::forward_scratch(&mut gpu, &weights, &config, *t, physical, &mut kv, &mut dn, &scratch).unwrap();
                 physical += 1;
                 if let Some(ctx) = ctx_opt.as_ref() {
-                    if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-                        physical = new_phys;
+                    if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+                        physical = ev.new_physical;
                     }
                 }
             }
@@ -181,8 +181,8 @@ fn main() {
                 qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
                 physical += 1;
                 if let Some(ctx) = ctx_opt.as_ref() {
-                    if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-                        physical = new_phys;
+                    if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+                        physical = ev.new_physical;
                     }
                 }
                 logits = gpu.download_f32(&scratch.logits).unwrap();

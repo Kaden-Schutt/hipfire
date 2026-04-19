@@ -92,8 +92,8 @@ fn main() {
             qwen35::forward_scratch(&mut gpu, &weights, &config, *t, p, &mut kv, &mut dn, &scratch).unwrap();
         }
         let mut physical = prompt_len;
-        if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-            physical = new_phys;
+        if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+            physical = ev.new_physical;
         }
 
         let mut logits = gpu.download_f32(&scratch.logits).unwrap();
@@ -102,8 +102,8 @@ fn main() {
         for _step in 0..gen_len {
             qwen35::forward_scratch(&mut gpu, &weights, &config, next, physical, &mut kv, &mut dn, &scratch).unwrap();
             physical += 1;
-            if let Some(new_phys) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
-                physical = new_phys;
+            if let Some(ev) = ctx.maybe_evict(&mut gpu, &mut kv, physical).unwrap() {
+                physical = ev.new_physical;
             }
             logits = gpu.download_f32(&scratch.logits).unwrap();
             next = llama::argmax(&logits);
