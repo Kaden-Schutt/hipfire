@@ -106,16 +106,17 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
         1 => {
-            // F16 — upload directly
-            gpu.upload_raw(data, &[data.len()])
+            // F16 — upload directly. Shape records element count, not byte count.
+            gpu.upload_raw(data, &[n])
         }
         6 | 7 => {
-            // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16
+            // HFQ4 — dequantize to F32, then convert to F16 for gemm_f16.
+            // Shape records element count, not byte count.
             let f32_data = dequant_hfq4(data, n, info.group_size as usize);
             let f16_bytes: Vec<u8> = f32_data.iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
-            gpu.upload_raw(&f16_bytes, &[f16_bytes.len()])
+            gpu.upload_raw(&f16_bytes, &[n])
         }
         other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
     }
