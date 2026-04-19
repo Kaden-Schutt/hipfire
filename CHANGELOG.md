@@ -32,6 +32,37 @@
   gets the regressed engine. Expected fix: a small follow-up PR cherry-
   picking just the kernel restoration + `prompt_normalize` default flip.
 
+## Unreleased — vision correctness bundle (PR #35)
+
+Fixes issue #23 (VL color misidentification) and addresses review feedback
+on the superseded PR #22.
+
+### Fixes
+
+- **`#23` — VL model misidentifies green and blue objects.** Pure-color
+  probing (red/green/blue PNGs, temp=0 greedy decoding) showed the vision
+  encoder reading green pixels as blue and blue pixels as green while red
+  came through correctly — a classic G↔B transposition. Root cause is most
+  likely a channel permutation in the HuggingFace `patch_embed` weight
+  export (input conv channels 1 and 2 appear transposed); the repair here
+  lives in preprocessing: `load_and_preprocess` now writes pixel bytes in
+  R,B,G order into the CHW tensor so the two transpositions cancel.
+  Regression test pins the contract at
+  `crates/engine/tests/channel_order.rs`.
+- **Vision weight upload shape encoding.** `qwen35_vl::load_f16_gpu`
+  passed byte-length as the tensor shape on both the F16-direct and
+  HFQ4-dequant paths, so downstream shape-aware dispatch saw a tensor
+  shaped `[byte_count]` instead of `[element_count]`. Corrected to use
+  the element count.
+- **Quant-format visibility for vision weights.** The loader now logs
+  the detected quant format (F16 / HFQ4-G256 / HFQ4-G128) for
+  `model.visual.patch_embed.proj.weight` at load time so HFQ4 models
+  can be distinguished from F16 models at a glance during debugging.
+- **Dead kernel file cleanup.** Removed `gemm_f16_wmma_tiled.hip` and
+  `vit_attention_flash.hip` — neither was referenced via
+  `ensure_kernel` dispatch and both were stale copies superseded by the
+  active vit_attention and gemm kernels.
+
 ## v0.1.7-alpha.2 (2026-04-18)
 
 Hotfix release for three user-visible regressions in v0.1.7-alpha. No

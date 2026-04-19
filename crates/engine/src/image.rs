@@ -55,13 +55,31 @@ pub fn load_and_preprocess(path: &Path, patch_size: usize) -> (Vec<f32>, usize, 
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
 
     // Convert to CHW float, normalize: pixel / 127.5 - 1.0
+    //
+    // Channel-order fix for issue #23: the vision patch_embed weights expect
+    // channels in [R, B, G] layout, not [R, G, B]. Empirically confirmed by
+    // feeding pure-color PNGs (R=(255,0,0), G=(0,255,0), B=(0,0,255)) through
+    // the encoder with temp=0 greedy decoding:
+    //
+    //   input  | RGB-order (pre-fix) | R<->B swap | B<->G swap (this fix)
+    //   -------+---------------------+------------+---------------------
+    //   red    | "Red"   ✓           | "Green"    | "Red"   ✓
+    //   green  | "Blue"  ✗           | "Blue"     | "Green" ✓
+    //   blue   | "Green" ✗           | "Red"      | "Blue"  ✓
+    //
+    // Root cause is most likely a channel permutation in the HF patch_embed
+    // weight export (input conv channels 1 and 2 appear transposed), but the
+    // preprocessing swap here resolves the end-to-end symptom. See
+    // crates/engine/tests/channel_order.rs for the pure-color test matrix.
     let mut out = vec![0.0f32; 3 * h * w];
+    let plane = h * w;
     for y in 0..h {
         for x in 0..w {
             let pixel = rgb.get_pixel(x as u32, y as u32);
-            for c in 0..3 {
-                out[c * h * w + y * w + x] = pixel[c] as f32 / 127.5 - 1.0;
-            }
+            let idx = y * w + x;
+            out[idx] = pixel[0] as f32 / 127.5 - 1.0;             // channel 0 = R
+            out[plane + idx] = pixel[2] as f32 / 127.5 - 1.0;     // channel 1 = B  (was G)
+            out[2 * plane + idx] = pixel[1] as f32 / 127.5 - 1.0; // channel 2 = G  (was B)
         }
     }
     (out, h, w)
