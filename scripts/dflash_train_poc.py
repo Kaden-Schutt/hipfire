@@ -316,14 +316,22 @@ def main() -> int:
             # ── Build the K concatenated blocks ────────────────────────
             # block_token_ids[k*B : (k+1)*B] = [anchor_token, mask, mask, ..., mask]
             block_tok = torch.empty((1, K * B), dtype=torch.long, device=device)
-            position_ids = torch.empty((1, K * B), dtype=torch.long, device=device)
+            noise_positions = torch.empty((K * B,), dtype=torch.long, device=device)
             for k in range(K):
                 s = int(anchors[b, k].item())
                 blk = clean_seq[:, s : s + B].clone()
                 blk[:, 1:] = mask_token_id
                 block_tok[:, k * B : (k + 1) * B] = blk
-                position_ids[:, k * B : (k + 1) * B] = torch.arange(s, s + B, device=device)
+                noise_positions[k * B : (k + 1) * B] = torch.arange(s, s + B, device=device)
             noise_embedding = target.model.embed_tokens(block_tok).to(dtype)
+
+            # position_ids covers BOTH the context (target_hidden, L positions)
+            # AND the noise (K*B positions). The reference attention layer
+            # does `cat([k_ctx, k_noise])`, so the K dim has L+K*B rows and
+            # RoPE's cos/sin must match that length. Q (noise only) picks
+            # its RoPE from the LAST K*B entries via `cos[..., -q_len:, :]`.
+            ctx_positions = torch.arange(L, device=device)
+            position_ids = torch.cat([ctx_positions, noise_positions]).unsqueeze(0)  # [1, L + K*B]
 
             # ── Sparse block-structured attention mask (paper Figure 4) ──
             # Q axis:  K*B noise positions (one row per concatenated block slot)
