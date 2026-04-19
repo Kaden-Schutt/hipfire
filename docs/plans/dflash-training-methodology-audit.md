@@ -8,7 +8,9 @@
 
 ## TL;DR
 
-Our POC is a **reasonable sketch** of DFlash training but is missing three of the paper's five key training contributions. Training as-is will produce a draft that converges to some competent baseline but will under-deliver vs the paper's claimed 5-6× speedups. Before burning MI300X hours on 3.6-A3B, we need the fixes below. Target fix scope: ~250 lines in `dflash_train_poc.py`, roughly half a day.
+Our POC now implements **all five key training contributions** from the DFlash paper §4.2 (T1-T5). The only paper technique we don't use is **target-generated training responses** — Lambda hermes has kimi/glm outputs, not Qwen3.6-A3B outputs. That's a data-pipeline choice, not a training-script gap. Safe to fire the validation run.
+
+Earlier concern about Flex Attention (T3 optimization): we use a **dense [q_len, L+q_len] boolean mask** instead. Correctness-equivalent to Flex. At our scales (seq_len ≤ 8k, K=4 anchors, B=16 → q_len=64) the mask is ≤ 1 MB. Flex would be a 1.5-2× speedup — future optimization.
 
 ## What the paper actually specifies
 
@@ -29,9 +31,9 @@ Plus a data specification: **target-generated responses**, not original corpus r
 | Technique | POC status | Effect if skipped |
 |---|---|---|
 | T1 KV injection | ✅ **correct** — passes `target_hidden` to `draft.forward`, the reference `Qwen3DFlashAttention` does `k_proj(target_hidden)` per layer | — |
-| T2 Multi-block anchor sampling | ❌ **single-block per example** — picks ONE random start, masks one block | Dramatically fewer supervised positions per forward pass; convergence 5-10× slower; no inter-block attention-mask training (draft won't generalize to multi-block inference patterns) |
-| T3 Long-context training / Flex Attention | ❌ **per-example target forward** — separate target pass per batch element, no concatenation | ~B× wasted target compute; seq_len=1024 cap means draft never sees the 6k+ agentic prompts it'll deploy on |
-| T4 Loss weighting | ❌ **uniform cross-entropy** over all B−1 positions | Slower convergence; final τ likely 10-20% lower |
+| T2 Multi-block anchor sampling | ✅ **implemented** (commit 1e21405 / c551eb2): stratified-random K anchors per sequence, each contributing B−1 supervised predictions | — |
+| T3 Concatenated-block sparse attention mask (paper Figure 4) | ✅ **implemented** as dense boolean mask (not Flex Attention): all K blocks concatenated into one [K×B] draft forward per example, sparse [q_len, L+q_len] mask enforces causal target_hidden visibility + bidirectional within-block + no cross-block leakage | Flex Attention would be 1.5-2× faster; optional future optimization (needs torch ≥ 2.5 block-mask callable) |
+| T4 Loss weighting | ✅ **implemented** — per-position `w_k = exp(-(k-1)/γ)` weighting, default γ=3 | — |
 | T5 Shared/frozen target embedding + lm_head | ✅ **correct** — draft has no embedding/lm_head of its own; caller uses `target.model.embed_tokens` and `target.lm_head` | — |
 | Arch defaults: 5 layers, 5 hidden features, block=16 | ✅ match paper | — |
 | Mask token id = 248070 | ✅ match paper (reference uses it) | — |

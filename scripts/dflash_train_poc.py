@@ -282,14 +282,26 @@ def main() -> int:
             for _ in range(args.batch_size)
         ])  # [batch, K]
 
-        # Single target forward per batch element on the clean sequence,
-        # extracting hidden features for all positions. Enumerated loop to
-        # keep memory tractable for 35B targets; small models could batch.
-        # Loss is accumulated across blocks per example.
+        # Single draft forward per example over a CONCATENATED [K×B]-length
+        # noise sequence. Paper §4.2 / Figure 4: "all blocks are concatenated
+        # into a single sequence and processed jointly using a sparse
+        # attention mask ... Tokens attend bidirectionally within the same
+        # block and to the corresponding injected target context features,
+        # while attention across different blocks is disallowed."
+        #
+        # We implement the sparse mask as a dense boolean matrix rather than
+        # torch.flex_attention. At our scales (seq_len ≤ 8k, K×B ≤ 256) the
+        # mask is ≤ 2 MB — well under HBM. Flex Attention would be a ~1.5-2×
+        # speedup over dense and is a future optimization (requires torch
+        # >= 2.5 + block-mask callable); skipping keeps compat broader.
+        #
+        # Enumerated loop over batch because the target forward is memory-
+        # heavy for 35B targets; inner loop per anchor is vectorized.
         all_logits = []
         all_labels = []
         for b in range(args.batch_size):
-            clean_seq = batch[b : b + 1]  # [1, seq_len]
+            clean_seq = batch[b : b + 1]  # [1, L]
+            L = clean_seq.shape[1]
             with torch.no_grad():
                 t_out = target(
                     input_ids=clean_seq,
@@ -297,41 +309,85 @@ def main() -> int:
                     use_cache=False,
                 )
                 layer_ids = draft_cfg.dflash_config["target_layer_ids"]
-                # context feature shape: [1, seq_len, hidden * len(layer_ids)]
+                # [1, L, hidden * len(layer_ids)]. The draft's own `fc` +
+                # `hidden_norm` fuse it down to [1, L, hidden].
                 tgt_ctx = extract_context_feature(t_out.hidden_states, layer_ids)
 
-            # For each anchor, build an independent draft forward. This is
-            # simpler than the paper's single-sequence concatenated-block mask
-            # (which needs Flex Attention to be fast); correctness-equivalent
-            # as long as the draft sees the same context slice + same masking
-            # per block. Latency-equivalent to the paper once Flex Attention
-            # lands — for now the K-loop is a readable stand-in.
+            # ── Build the K concatenated blocks ────────────────────────
+            # block_token_ids[k*B : (k+1)*B] = [anchor_token, mask, mask, ..., mask]
+            block_tok = torch.empty((1, K * B), dtype=torch.long, device=device)
+            position_ids = torch.empty((1, K * B), dtype=torch.long, device=device)
             for k in range(K):
                 s = int(anchors[b, k].item())
-                block_ids = clean_seq[:, s : s + B]            # [1, B]
-                # First position = real token (anchor = "bonus from prev verify");
-                # positions 1..B-1 masked.
-                masked_block = block_ids.clone()
-                masked_block[:, 1:] = mask_token_id
-                noise_embedding = target.model.embed_tokens(masked_block).to(dtype)
+                blk = clean_seq[:, s : s + B].clone()
+                blk[:, 1:] = mask_token_id
+                block_tok[:, k * B : (k + 1) * B] = blk
+                position_ids[:, k * B : (k + 1) * B] = torch.arange(s, s + B, device=device)
+            noise_embedding = target.model.embed_tokens(block_tok).to(dtype)
 
-                # Context for this block = all tokens before the anchor.
-                ctx_slice = tgt_ctx[:, :s, :]
+            # ── Sparse block-structured attention mask (paper Figure 4) ──
+            # Q axis:  K*B noise positions (one row per concatenated block slot)
+            # K/V axis: [target_hidden (L positions)] ++ [noise (K*B positions)]
+            # Rules:
+            #   - noise q at block k (anchor a_k):
+            #       * attends to target context positions j < a_k. Strictly
+            #         BEFORE the anchor — matches inference (spec_generate
+            #         slices target_hidden to `[:, :accept+1, :]` right before
+            #         the NEXT anchor, so target_hidden never includes the
+            #         position the draft is about to predict from). Including
+            #         target_hidden at position ≥ a_k would leak the answer
+            #         (target's own hidden state at the positions we're
+            #         predicting).
+            #       * attends to noise q'_j ONLY IF q'_j is in the same block k
+            #         (bidirectional within-block; no cross-block leakage).
+            q_len = K * B
+            k_len_total = L + q_len
+            q_block = torch.arange(q_len, device=device) // B                   # [q_len] which block
+            q_anchor = anchors[b][q_block]                                      # [q_len] abs anchor of q
+            # Context visibility: [q_len, L] — j < anchor(q)
+            ctx_idx = torch.arange(L, device=device).unsqueeze(0)               # [1, L]
+            ctx_visible = ctx_idx < q_anchor.unsqueeze(1)                       # [q_len, L]
+            # Noise-to-noise: same block only
+            k_block = torch.arange(q_len, device=device) // B                   # [q_len]
+            same_block = q_block.unsqueeze(1) == k_block.unsqueeze(0)           # [q_len, q_len]
+            mask_bool = torch.cat([ctx_visible, same_block], dim=1)             # [q_len, L + q_len]
+            # Additive mask: 0 where allowed, -inf where blocked. Shape
+            # [1, 1, q_len, k_len_total] broadcasts across batch/heads.
+            attn_mask = torch.zeros_like(mask_bool, dtype=dtype)
+            attn_mask.masked_fill_(~mask_bool, float("-inf"))
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)
 
-                position_ids = torch.arange(s, s + B, device=device).unsqueeze(0)
-                draft_hidden = draft(
-                    noise_embedding=noise_embedding,
-                    target_hidden=ctx_slice,
-                    position_ids=position_ids,
-                    use_cache=False,
-                )
-                # Predict positions 1..B-1 inside the block from draft states
-                # at those same positions. [1, B-1, vocab].
-                logits = target.lm_head(draft_hidden[:, -B + 1 :, :])
-                all_logits.append(logits)
-                all_labels.append(block_ids[:, 1:])
+            # ── Single draft forward over the concatenated blocks ────
+            draft_hidden = draft(
+                noise_embedding=noise_embedding,
+                target_hidden=tgt_ctx,
+                position_ids=position_ids,
+                attention_mask=attn_mask,
+                use_cache=False,
+            )  # [1, K*B, hidden]
 
-        # Stack: [B*K, B-1, vocab] and [B*K, B-1].
+            # Pull out prediction positions (1..B-1 within each block).
+            # Indexing trick: construct a [K*(B-1)] index tensor.
+            pred_idx = torch.tensor(
+                [k * B + i for k in range(K) for i in range(1, B)],
+                dtype=torch.long, device=device,
+            )
+            pred_hidden = draft_hidden[:, pred_idx, :]                          # [1, K*(B-1), hidden]
+            logits = target.lm_head(pred_hidden)                                # [1, K*(B-1), vocab]
+
+            # Labels: original token at each predicted position.
+            label_abs = torch.tensor(
+                [int(anchors[b, k].item()) + i for k in range(K) for i in range(1, B)],
+                dtype=torch.long, device=device,
+            )
+            labels = clean_seq[:, label_abs]                                    # [1, K*(B-1)]
+
+            # Reshape to [K, B-1] so the per-position weighting applies
+            # uniformly within each block (not across the concatenated stream).
+            all_logits.append(logits.view(K, B - 1, -1))
+            all_labels.append(labels.view(K, B - 1))
+
+        # Stack across batch: [batch*K, B-1, vocab] and [batch*K, B-1].
         draft_logits = torch.cat(all_logits, dim=0)
         labels = torch.cat(all_labels, dim=0)
 
