@@ -109,17 +109,19 @@ def main():
           f"hidden={zlab_cfg.hidden_size}, heads={zlab_cfg.num_attention_heads}, "
           f"head_dim={getattr(zlab_cfg, 'head_dim', zlab_cfg.hidden_size // zlab_cfg.num_attention_heads)}")
 
-    # ── Load corpus ────────────────────────────────────────────────────
-    print(f"[data] tokenizing {args.corpus}...")
-    text = Path(args.corpus).read_text()
-    docs = [d.strip() for d in text.split("\n\n") if d.strip()]
+    # ── Load corpus (SAMPLED — we only need num_batches random slices) ─
+    # Full 1GB corpus tokenize is 5+ min; cap at first ~2M chars then
+    # tokenize only that. Plenty for 5 random L-length slices.
+    print(f"[data] tokenizing head of {args.corpus}...", flush=True)
+    head = Path(args.corpus).read_text()[:4_000_000]
+    docs = [d.strip() for d in head.split("\n\n") if d.strip()][:200]
     bos = tokenizer.bos_token_id
     ids = []
     for d in docs:
         if bos is not None:
             ids.append(bos)
         ids.extend(tokenizer.encode(d, add_special_tokens=False))
-    print(f"[data] {len(ids):,} tokens")
+    print(f"[data] {len(ids):,} tokens ({len(docs)} docs head-sample)", flush=True)
 
     mask_token_id = zlab_cfg.dflash_config["mask_token_id"]
     K = args.masked_blocks_per_seq

@@ -117,6 +117,13 @@ def parse_args() -> argparse.Namespace:
                    help="Path to a text file with the fixed held-out prompt. If omitted, uses an in-script default.")
     p.add_argument("--tau-probe-max-new", type=int, default=64,
                    help="max_new_tokens for probe (small for speed; τ converges fast).")
+    # Architectural A/B knob: Qwen3.5 targets use partial_rotary_factor=0.25
+    # (only 64 of 256 head_dim rotated). z-lab's 4B-DFlash draft config has
+    # NO partial_rotary_factor → full rotary. If the partial-rotary inheritance
+    # is the culprit for our draft's τ=0.09, --full-rotary drops
+    # partial_rotary_factor from the draft's rope_parameters.
+    p.add_argument("--full-rotary", action="store_true",
+                   help="Force full (100%) rotary in the draft, matching z-lab's convention.")
     return p.parse_args()
 
 
@@ -241,7 +248,8 @@ def sample_batch(
     return out
 
 
-def build_draft_config(target_config, draft_layers: int, block_size: int, mask_token_id: int):
+def build_draft_config(target_config, draft_layers: int, block_size: int, mask_token_id: int,
+                       full_rotary: bool = False):
     """Build a flat Qwen3Config for the DFlash draft.
 
     Qwen/Qwen3.5-* returns a composite `Qwen3_5Config` with text_config +
@@ -273,6 +281,8 @@ def build_draft_config(target_config, draft_layers: int, block_size: int, mask_t
         # rope_type doesn't accept mrope_section/mrope_interleaved).
         rope_params = {k: v for k, v in rope_params.items()
                        if k not in ("mrope_section", "mrope_interleaved")}
+    if full_rotary:
+        rope_params.pop("partial_rotary_factor", None)
 
     # Copy every flat field Qwen3Config supports, plus DFlash-specific ones.
     cfg = Qwen3Config(
@@ -359,7 +369,8 @@ def main() -> int:
 
     # ── build draft ───────────────────────────────────────────────────
     draft_cfg = build_draft_config(
-        target.config, args.draft_layers, args.block_size, mask_token_id
+        target.config, args.draft_layers, args.block_size, mask_token_id,
+        full_rotary=args.full_rotary,
     )
     draft = DFlashDraftModel(draft_cfg).to(device=device, dtype=dtype)
     if args.resume:
