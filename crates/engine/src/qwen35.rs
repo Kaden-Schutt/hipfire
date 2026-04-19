@@ -3096,7 +3096,7 @@ fn forward_prefill_chunk(
                     // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
                     // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
                     // the batched path is guaranteed byte-exact with the per-token path.
-                    gpu.gemm_qkvza_hfq4g256_per_row(
+                    gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
@@ -3757,7 +3757,7 @@ fn forward_prefill_chunk(
                     // divergence is root-caused, use `gemm_qkvza_hfq4g256_per_row`, which
                     // runs N × fused_qkvza_hfq4g256 (same kernel as the per-token path) so
                     // the batched path is guaranteed byte-exact with the per-token path.
-                    gpu.gemm_qkvza_hfq4g256_per_row(
+                    gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
                         &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
