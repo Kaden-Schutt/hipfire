@@ -37,7 +37,13 @@ fn main() {
         "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
     );
     let mut load_sidecar = false;
-    let mut cpu_calib = false;
+    // GPU-path kernel exists (triattn_accumulate_f32) and is numerically
+    // equivalent to the CPU path (max relative diff 3.6e-10 on 9B/100k cal),
+    // but it's SLOWER in wall clock on short-chunk corpora (40% regression
+    // measured on MI300X 9B + agentic corpus, avg ~3 tok/chunk — kernel
+    // launch overhead dominates per-block work). Keep default CPU; opt into
+    // GPU path explicitly for experimentation on longer-chunk corpora.
+    let mut gpu_calib = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -47,10 +53,10 @@ fn main() {
             "--chunk-len" => { chunk_len = args[i + 1].parse().unwrap(); i += 2; }
             "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
             "--load-sidecar" => { load_sidecar = true; i += 1; }
-            "--cpu-calib" => { cpu_calib = true; i += 1; }
+            "--gpu-calib" => { gpu_calib = true; i += 1; }
             s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--cpu-calib]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib]");
                 std::process::exit(1);
             }
         }
@@ -137,11 +143,13 @@ fn main() {
             config.n_heads,
             config.head_dim / 2,
         );
-        // Default to GPU-path calibration (~5-8× faster on MI300X).
-        // --cpu-calib flag forces the legacy CPU tap for A/B comparison.
-        let using_gpu_tap = !cpu_calib;
+        // Default CPU path (faster in practice — see 2026-04-19 bench in
+        // docs/plans/sidecar-training-strategy.md). --gpu-calib opts into
+        // the HIP reduce kernel which is numerically equivalent but slower
+        // on short-chunk corpora due to kernel-launch overhead.
+        let using_gpu_tap = gpu_calib;
         if using_gpu_tap {
-            eprintln!("calibration path: GPU (kernel triattn_accumulate_f32)");
+            eprintln!("calibration path: GPU (kernel triattn_accumulate_f32) [opt-in]");
             let gpu_state = triattn::TriAttnCalibStateGpu::new(
                 &mut gpu,
                 config.n_layers, config.n_heads, config.head_dim,

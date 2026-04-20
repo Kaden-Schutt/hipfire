@@ -35,7 +35,40 @@ Serial on MI300X at $16 is the "if CPU-GPU split is too much work" fallback. Sti
 
 Parallel on 8× MI300X makes no sense for sidecar cal alone — you pay for 8 cards, only need 4, and the wall-time improvement is small. Only worth it if co-locating with 3.6-A3B draft training.
 
-## CPU-GPU split design (primary implementation target)
+## Empirical results — GPU kernel was a perf regression (2026-04-19)
+
+Implemented the HIP reduce kernel as designed. Results on MI300X 9B + agentic
+corpus (100k tokens):
+
+| path | wall | throughput |
+|---|---|---|
+| CPU baseline | 720s | 139 tok/s |
+| CPU + rayon-per-sample | 625s | 160 tok/s (+15%) |
+| **GPU kernel (default)** | **1194s** | **84 tok/s (−40%)** |
+
+Sidecar numerical correctness ✓ (max relative diff 3.6e-10 GPU vs CPU).
+
+**Why the GPU kernel lost:**
+1. The "99% CPU-bound" signal from `/usr/bin/time` was misleading — CPU at
+   100% included time blocked on async GPU memcpy. The CPU was already
+   overlapping accumulation with the next forward via the pipelined
+   download pattern. Moving work to GPU eliminated that free overlap.
+2. Per-chunk launch overhead: 8 kernel launches × 316k chunks = 2.5M HIP
+   dispatches on the same stream as the forward — each dispatch serializes
+   against forward due to implicit stream ordering.
+3. Grid sizing problem on short chunks: for the first 100k tokens of the
+   agentic corpus (avg ~3 tok/chunk), each (head × band) = 2048 blocks
+   per kernel call only do ~3 sqrts each. Block setup + reduction overhead
+   swamps the actual work.
+
+**Outcome**: kernel kept in codebase for future experimentation (long-chunk
+corpora may win), but `triattn_validate` defaults to CPU path. `--gpu-calib`
+flag opts into the kernel. Rayon-per-sample change kept (+15% real gain).
+
+For the 4-sidecar agentic_xl matrix, use CPU path — ~2hr per target on
+MI300X, ~$8 for the matrix. Still cheaper than trying to optimize further.
+
+## CPU-GPU split design (original implementation — NOT shipping as default)
 
 ### Current bottleneck
 
