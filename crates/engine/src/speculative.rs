@@ -765,23 +765,38 @@ pub struct HiddenStateRingBuffer {
     pub hidden_dim: usize,
     pub head: usize,
     pub written: usize,
+    /// Per-extract-layer staging buffer, shape `[max_batch × hidden_dim]`.
+    /// Captured kernels (verify forward) write here with FIXED offsets so
+    /// their captured pointers don't bake in a per-cycle `head`. After the
+    /// graph returns, `commit_staging_to_ring` scatters staging → `layer_bufs`
+    /// at the current head (outside the captured region, head-aware).
+    pub staging_bufs: Vec<GpuTensor>,
+    /// Max rows a single staging write can hold — sized to the maximum batch
+    /// the caller ever passes to `write_rows_to_staging`. For DFlash verify
+    /// this is `budget + 1`.
+    pub max_batch: usize,
 }
 
 impl HiddenStateRingBuffer {
     /// Allocate GPU ring buffer for `num_extract` target layers.
+    ///
+    /// `max_batch` sizes the staging buffers used by the graph-capture path.
+    /// Typical value for DFlash verify is `budget + 1`.
     pub fn new(
         gpu: &mut Gpu,
         num_target_layers: usize,
         num_extract: usize,
         hidden_dim: usize,
         max_positions: usize,
+        max_batch: usize,
     ) -> HipResult<Self> {
         let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
         let mut layer_bufs = Vec::with_capacity(num_extract);
+        let mut staging_bufs = Vec::with_capacity(num_extract);
         for _ in 0..num_extract {
             layer_bufs.push(gpu.alloc_tensor(&[max_positions * hidden_dim], rdna_compute::DType::F32)?);
+            staging_bufs.push(gpu.alloc_tensor(&[max_batch * hidden_dim], rdna_compute::DType::F32)?);
         }
-        let _ = layer_bufs.len(); // silence unused in case of Vec field confusion
         Ok(Self {
             layer_bufs,
             extract_layers,
@@ -789,6 +804,8 @@ impl HiddenStateRingBuffer {
             hidden_dim,
             head: 0,
             written: 0,
+            staging_bufs,
+            max_batch,
         })
     }
 
@@ -876,6 +893,101 @@ impl HiddenStateRingBuffer {
                 (n - first) * row_bytes,
             )?;
         }
+        Ok(())
+    }
+
+    /// Write `n` contiguous rows from `src` into the staging buffer for the
+    /// given extraction layer at FIXED offset 0. Safe to call inside a
+    /// hipGraph stream capture: the captured memcpy node bakes in the
+    /// staging pointer (which is stable across cycles), not a per-cycle head.
+    ///
+    /// Callers must call `commit_staging_to_ring(n)` after the forward
+    /// returns (outside the captured region) to scatter staging → `layer_bufs`
+    /// at the current head, then advance the head.
+    pub fn write_rows_to_staging(
+        &self,
+        gpu: &mut Gpu,
+        extract_idx: usize,
+        src: &GpuTensor,
+        n: usize,
+    ) -> HipResult<()> {
+        debug_assert!(n <= self.max_batch,
+            "write_rows_to_staging: n {} > max_batch {}", n, self.max_batch);
+        let row_bytes = self.hidden_dim * 4;
+        let bytes = n * row_bytes;
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            gpu.hip.memcpy_dtod_async_at(
+                &self.staging_bufs[extract_idx].buf, 0,
+                &src.buf, 0,
+                bytes, stream,
+            )
+        } else {
+            gpu.hip.memcpy_dtod_at(
+                &self.staging_bufs[extract_idx].buf, 0,
+                &src.buf, 0,
+                bytes,
+            )
+        }
+    }
+
+    /// Scatter staging buffers into `layer_bufs` at the current head, handling
+    /// ring wrap, then advance the head by `n`. Must be called AFTER the
+    /// forward (outside any captured region) — uses the current `head` to
+    /// compute destination offsets, which would be baked wrong in a replayed
+    /// graph. When `gpu.active_stream` is Some, copies are async on that
+    /// stream so they're ordered after the graph_launch; otherwise sync.
+    pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
+        let row_bytes = self.hidden_dim * 4;
+        let head = self.head;
+        let max_pos = self.max_positions;
+        let use_async = gpu.active_stream.is_some();
+
+        for ei in 0..self.layer_bufs.len() {
+            if head + n <= max_pos {
+                if use_async {
+                    let stream = gpu.active_stream.as_ref().unwrap();
+                    gpu.hip.memcpy_dtod_async_at(
+                        &self.layer_bufs[ei].buf, head * row_bytes,
+                        &self.staging_bufs[ei].buf, 0,
+                        n * row_bytes, stream,
+                    )?;
+                } else {
+                    gpu.hip.memcpy_dtod_at(
+                        &self.layer_bufs[ei].buf, head * row_bytes,
+                        &self.staging_bufs[ei].buf, 0,
+                        n * row_bytes,
+                    )?;
+                }
+            } else {
+                let first = max_pos - head;
+                if use_async {
+                    let stream = gpu.active_stream.as_ref().unwrap();
+                    gpu.hip.memcpy_dtod_async_at(
+                        &self.layer_bufs[ei].buf, head * row_bytes,
+                        &self.staging_bufs[ei].buf, 0,
+                        first * row_bytes, stream,
+                    )?;
+                    gpu.hip.memcpy_dtod_async_at(
+                        &self.layer_bufs[ei].buf, 0,
+                        &self.staging_bufs[ei].buf, first * row_bytes,
+                        (n - first) * row_bytes, stream,
+                    )?;
+                } else {
+                    gpu.hip.memcpy_dtod_at(
+                        &self.layer_bufs[ei].buf, head * row_bytes,
+                        &self.staging_bufs[ei].buf, 0,
+                        first * row_bytes,
+                    )?;
+                    gpu.hip.memcpy_dtod_at(
+                        &self.layer_bufs[ei].buf, 0,
+                        &self.staging_bufs[ei].buf, first * row_bytes,
+                        (n - first) * row_bytes,
+                    )?;
+                }
+            }
+        }
+        self.head = (head + n) % max_pos;
+        self.written += n;
         Ok(())
     }
 

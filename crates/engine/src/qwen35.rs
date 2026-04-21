@@ -2455,6 +2455,12 @@ impl PrefillBatchScratch {
 /// to replay GDN recurrence from a pre-verify S-state snapshot for
 /// `accept_len + 1` steps — no full-target re-run needed.
 #[allow(clippy::too_many_arguments)]
+/// Upper bound on `forward_prefill_batch`'s per-chunk size. Exposed so
+/// callers sizing `HiddenStateRingBuffer` staging can match the chunk
+/// upper bound (staging that's smaller than a chunk will assert-fail
+/// on prompt seeding of long prompts).
+pub const PREFILL_MAX_BATCH: usize = 256;
+
 pub fn forward_prefill_batch(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -2513,7 +2519,10 @@ pub fn forward_prefill_batch_with_pbs(
     // gated_delta_net_q8_batch_seq loop is still sequential per token, so
     // the per-chunk DeltaNet cost is linear in N either way; raising the
     // batch just amortizes the NON-DeltaNet kernels more.
-    const MAX_BATCH: usize = 256;
+    //
+    // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
+    // staging can match the chunk upper bound.
+    const MAX_BATCH: usize = PREFILL_MAX_BATCH;
 
     let n = tokens.len();
     if n == 0 {
@@ -2682,7 +2691,13 @@ pub fn forward_prefill_batch_with_pbs(
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
-                rb.advance_head_by(chunk_n);
+                // Scatter fixed-offset staging writes (done inside the chunk)
+                // to the ring at the current head, then advance head by n.
+                // This is the out-of-capture step: graph-captured writes went
+                // to staging[0..n*h], this commit places them at head*h
+                // where head is read from CPU state at call time (not baked
+                // into a captured graph node).
+                rb.commit_staging_to_ring(gpu, chunk_n)?;
             }
             chunk_start = chunk_end;
         }
@@ -3204,7 +3219,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
@@ -3508,7 +3523,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
@@ -3534,7 +3549,7 @@ fn forward_prefill_chunk(
                 // for all N tokens (last copy-back finishes each row).
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 
@@ -3656,7 +3671,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
                 delta_layer_idx += 1;
@@ -3861,7 +3876,7 @@ fn forward_prefill_chunk(
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
-                        rb.write_rows_at_head(gpu, slot, &pbs.x_batch, n)?;
+                        rb.write_rows_to_staging(gpu, slot, &pbs.x_batch, n)?;
                     }
                 }
 

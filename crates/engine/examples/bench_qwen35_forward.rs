@@ -46,7 +46,7 @@ fn main() {
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
     let mut hidden_rb = if with_extract {
         Some(engine::speculative::HiddenStateRingBuffer::new(
-            &mut gpu, config.n_layers, 5, config.dim, 32,
+            &mut gpu, config.n_layers, 5, config.dim, 32, 32,
         ).unwrap())
     } else {
         None

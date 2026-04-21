@@ -866,6 +866,7 @@ fn load_dflash_state(
         draft_config.num_extract(),
         draft_config.hidden,
         ctx_capacity + draft_config.block_size,
+        engine::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
     ).map_err(|e| format!("hidden_rb: {e}"))?;
 
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;

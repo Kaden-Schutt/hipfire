@@ -430,6 +430,7 @@ fn main() {
         draft_cfg.num_extract(),
         draft_cfg.hidden,
         ctx_capacity + draft_cfg.block_size,
+        engine::qwen35::PREFILL_MAX_BATCH.max(draft_cfg.block_size),
     )
     .expect("alloc hidden_rb");
 
