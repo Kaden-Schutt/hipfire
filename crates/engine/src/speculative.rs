@@ -2013,6 +2013,13 @@ pub fn spec_step_dflash(
         );
     }
 
+    // HIPFIRE_SPEC_PHASES=1: per-cycle host-side phase breakdown. Answers the
+    // question "of the ~35 ms 'other' per cycle, which phase owns it?"
+    // Costs ~5 Instant::now() calls (~150 ns total), printed only when enabled.
+    let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
+    let t_spec_start = std::time::Instant::now();
+    let mut t_phase = t_spec_start;
+
     // ── 1. block_output_ids seeded with prev bonus at [0], masks at [1..B] ──
     let mut block: Vec<u32> = vec![mask_token; b];
     block[0] = seed_token;
@@ -2274,6 +2281,8 @@ pub fn spec_step_dflash(
         block[i] = drafted[i];
     }
 
+    let t_draft_end = std::time::Instant::now();
+
     // ── 5b. N-gram override (DFlash path only) ───────────────────────────
     // When an n-gram cache is supplied, walk the block left-to-right. For
     // each position i, look up the bigram (block[i-2], block[i-1]) → t. If
@@ -2338,12 +2347,16 @@ pub fn spec_step_dflash(
     if target_has_moe {
         gdn_tape_opt = None;
     }
+
+    let t_verify_start = std::time::Instant::now();
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
         use_temp_sampling || rp_active,  // full target logits needed for rejection sampling or RP-adjusted argmax
         verify_scratch,
     )?;
+
+    let t_verify_end = std::time::Instant::now();
 
     // ── 7. Acceptance ──────────────────────────────────────────────────
     //
@@ -2466,6 +2479,8 @@ pub fn spec_step_dflash(
     let committed_count = committed.len();
     debug_assert_eq!(committed_count, accept_len + 2);
 
+    let t_accept_end = std::time::Instant::now();
+
     // ── 9. Append accepted target hidden rows to target_hidden_host ─────
     // Verify wrote B rows into hidden_rb. We keep the first accept_len+1
     // (= committed_count - 1) because the last committed token (bonus) is
@@ -2579,6 +2594,22 @@ pub fn spec_step_dflash(
     // written K/V at positions [position..position+accept_len]. The bonus
     // token's K/V will be written on the next iter's verify (at position
     // `position + accept_len + 1`) as part of that iter's block[0] forward.
+
+    if phase_on {
+        let t_end = std::time::Instant::now();
+        let us_draft  = t_draft_end.duration_since(t_spec_start).as_micros();
+        let us_ngram  = t_verify_start.duration_since(t_draft_end).as_micros();
+        let us_verify = t_verify_end.duration_since(t_verify_start).as_micros();
+        let us_accept = t_accept_end.duration_since(t_verify_end).as_micros();
+        let us_rewind = t_end.duration_since(t_accept_end).as_micros();
+        let us_total  = t_end.duration_since(t_spec_start).as_micros();
+        eprintln!(
+            "[phase] B={} draft={}µs ngram={}µs verify={}µs accept={}µs rewind+scatter={}µs | total={}µs",
+            b, us_draft, us_ngram, us_verify, us_accept, us_rewind, us_total,
+        );
+    }
+    // Mute the timer variables when disabled so the compiler doesn't warn.
+    let _ = (t_phase, t_draft_end, t_verify_start, t_verify_end, t_accept_end);
 
     Ok(SpecStepResult {
         accepted: accept_len,
