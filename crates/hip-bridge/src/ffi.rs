@@ -423,6 +423,7 @@ impl HipRuntime {
         self.check(code, "hipMemcpy H2D")
     }
 
+    #[track_caller]
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: &DeviceBuffer) -> HipResult<()> {
         assert!(
             dst.len() <= src.size,
@@ -430,6 +431,7 @@ impl HipRuntime {
             dst.len(),
             src.size
         );
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
@@ -439,14 +441,21 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(
-            t.elapsed().as_nanos() as u64, dst.len() as u64,
-        );
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("dtoh bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+        }
         self.check(code, "hipMemcpy D2H")
     }
 
     /// Copy bytes from a GPU buffer at a given source offset to host.
     /// `dst.len()` bytes are copied starting from `src.ptr + src_offset`.
+    #[track_caller]
     pub fn memcpy_dtoh_at(
         &self,
         dst: &mut [u8],
@@ -459,6 +468,7 @@ impl HipRuntime {
             src_offset, dst.len(), src.size
         );
         let src_ptr = unsafe { (src.ptr as *const u8).add(src_offset) as *const c_void };
+        let loc = std::panic::Location::caller();
         let t = std::time::Instant::now();
         let code = unsafe {
             (self.fn_memcpy)(
@@ -468,9 +478,15 @@ impl HipRuntime {
                 MemcpyKind::DeviceToHost as c_uint,
             )
         };
-        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(
-            t.elapsed().as_nanos() as u64, dst.len() as u64,
-        );
+        let elapsed = t.elapsed().as_nanos() as u64;
+        crate::ffi::launch_counters::memcpy_dtoh::record_bytes(elapsed, dst.len() as u64);
+        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let dump = *DUMP.get_or_init(|| {
+            std::env::var("HIPFIRE_DTOH_DUMP").ok().as_deref() == Some("1")
+        });
+        if dump {
+            eprintln!("dtoh_at bytes={} us={} at {}:{}", dst.len(), elapsed / 1000, loc.file(), loc.line());
+        }
         self.check(code, "hipMemcpy D2H at offset")
     }
 
