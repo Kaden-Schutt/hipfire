@@ -31,6 +31,22 @@ high DPM (effective ~770 GiB/s during warmup, verified with
 variance is still >5 % with warmup, the noise source is elsewhere
 (thermal, kernel cache, etc.) — don't ship until you understand it.
 
+**Never pass `--no-chatml` for `dflash_spec_demo` perf runs.** That flag
+strips the ChatML template wrap (`<|im_start|>user…<|im_end|><|im_start|>assistant`)
+and feeds raw-prompt tokens that don't match the model's training
+distribution. The target then rejects draft speculations more often,
+τ crashes, tok/s drops ~25 %. Measured 2026-04-22 on 27B DFlash,
+Fibonacci-continuation prompt, HEAD `5cd6117`:
+
+| flags | tok/s | τ |
+|---|---|---|
+| `--max 120` (default chatml) | **151** | 7.64 |
+| `--max 120 --ctx 2048 --no-chatml` | 111 | 5.3 |
+
+`--no-chatml` is correct for coherence-gate / byte-exact token-ID
+comparisons where you need to compare raw-prompt outputs without
+template noise. Never for perf.
+
 ## 2. The speed-gate is the source of truth
 
 `./scripts/speed-gate.sh` runs `bench_qwen35_mq4` on the 4 MQ4 sizes with
