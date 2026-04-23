@@ -66,12 +66,23 @@ fn main() {
 
     // Calibration corpus: either chunks from --corpus file or 8 built-in
     // sentences (quick-iterate mode).
+    //
+    // ⚠️ caveat: two of these prompts (Federalist #10, Constitution)
+    // lexically overlap the default validation prompt below. When running
+    // with no --corpus AND no --val-prompt, expect r̄ to be INFLATED vs a
+    // disjoint-corpus run on the same model — that inflation is
+    // contamination, not quality. Use needle_eval (or a disjoint --corpus /
+    // --val-prompt pair) to actually rank sidecars.
     let builtin_prompts: Vec<String> = [
         "The quick brown fox jumps over the lazy dog.",
+        // ⚠ overlaps default --val-prompt (James Madison / Federalist No. 10);
+        //   drives a spurious +0.10 r̄ bump vs a disjoint Wikipedia corpus.
         "Federalist No. 10 addresses the problem of factions in a republic.",
         "RoPE encodes positional information via geometric frequencies applied to Q/K.",
         "Speculative decoding verifies many draft tokens in one forward pass.",
         "Attention heads in a transformer specialize during training.",
+        // ⚠ "Constitution" also surfaces in the default Madison val-prompt
+        //   context; lesser contaminator than the Federalist line above.
         "The Constitution of the United States was ratified in 1788.",
         "Shakespeare wrote thirty-seven plays and over a hundred sonnets.",
         "Pythagoras proved that a squared plus b squared equals c squared.",
@@ -110,6 +121,23 @@ fn main() {
         builtin_prompts
     };
     let calibration_prompts: Vec<&str> = calibration_chunks.iter().map(|s| s.as_str()).collect();
+
+    // Contamination warning: r̄ is NOT a fair cross-corpus ranking metric
+    // when the calibration corpus lexically overlaps the validation prompt.
+    // The builtin seed prompts include a Federalist No. 10 line which
+    // directly overlaps the default validation prompt below. Fire a loud
+    // one-shot warning if we detect both defaults in play so operators
+    // don't mistake the inflated r̄ for a real quality signal — empirically,
+    // a disjoint Wikipedia corpus gives WORSE r̄ but BETTER downstream
+    // needle-recall on the same model.
+    let default_val_prompt = validation_prompt.contains("James Madison")
+        && validation_prompt.contains("Federalist No. 10");
+    let using_builtin_corpus = corpus_path.is_none() && !load_sidecar;
+    if using_builtin_corpus && default_val_prompt {
+        eprintln!(
+            "[triattn_validate] ⚠ r̄ CONTAMINATION: builtin calibration corpus contains a Federalist No. 10 line that overlaps the default validation prompt. r̄ reported below will be INFLATED by ~0.10 vs a disjoint corpus (empirically on qwen3.5-9b: builtin r̄≈0.400 vs Wikipedia r̄≈0.304, yet Wikipedia gave BETTER downstream needle recall). For fair sidecar ranking, pass --corpus <disjoint_text> AND --val-prompt <unrelated_text>, and validate against an external long-context recall test."
+        );
+    }
 
     // ── Load model ─────────────────────────────────────────────────────
     let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
@@ -298,6 +326,10 @@ fn main() {
         let overall: f32 = per_layer_r.iter().sum::<f32>() / per_layer_r.len() as f32;
         eprintln!("\n=== overall mean r̄ across FA layers: {overall:.3} ===");
         eprintln!("paper target: ≈0.5 (Figure 3 mean), per-head 0.6-0.9 common; calibration corpus is tiny here");
+        eprintln!("note: r̄ plateaus by ~20k calibration tokens under running-mean aggregation — more data does NOT improve r̄ past that point. r̄ is also validation-prompt-dependent; for sidecar quality decisions, validate against a downstream long-context recall test rather than this number alone.");
+        if using_builtin_corpus && default_val_prompt {
+            eprintln!("⚠ r̄ above is CONTAMINATED by corpus/val-prompt overlap (see warning at startup). Do not compare this number against runs with a disjoint corpus.");
+        }
     }
 
     fn apply_rope(x: &[f32], pos: f32, d_rot: usize, theta: f32) -> Vec<f32> {
@@ -344,5 +376,6 @@ fn main() {
             "Mean Resultant Length R_f across all (layer, head, band): mean={mean:.3}, median={median:.3}, {pct_above_095:.1}% > 0.95",
         );
         eprintln!("paper target: ~90% of heads R > 0.95 (Figure 2C)");
+        eprintln!("note: R_f is validation-prompt-INDEPENDENT (a plus) but has LOW DYNAMIC RANGE — empirically on qwen3.5-9b, calibration corpora of 20k / 50k / 100k Wikipedia tokens all land at R_f≈0.74 despite the 5× size difference. Treat R_f as a floor check (is aggregation converging at all?), not as a ranking metric.");
     }
 }
