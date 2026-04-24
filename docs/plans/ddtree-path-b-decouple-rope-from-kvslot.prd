@@ -1,6 +1,47 @@
 # DDTree Path B — decouple RoPE phase from KV slot index
 
-_Follow-up to Path A reverted in ecbc49d (2026-04-23). Unblocks DDTree slow-path kill._
+_Follow-up to Path A reverted in ecbc49d + corruption confirmed in 6c84b13
+(2026-04-23). Unblocks DDTree slow-path kill._
+
+## ⚠️ CATASTROPHIC FAILURE SURFACE — READ BEFORE TOUCHING CODE ⚠️
+
+Path B touches the K projection / RoPE / KV-write hot path on the
+production tree-verify forward. Subtle bugs HIDE behind plausible-looking
+metrics — Path A was reverted only after we eyeballed the actual decoded
+tokens, because the bug presented as "+120% tok/s, +79% τ, sd=0.15".
+
+The failure mode is **degenerate token attractor**: model locks into
+predicting the same token over and over because RoPE / K phase skew
+warps attention into a fixed-point basin. Every metric likes this:
+- 100% draft acceptance (draft trivially matches target's repeated token)
+- High τ (mean accepted per cycle ≫ 5)
+- LOW stddev (deterministic loop)
+- High tok/s (no slow-path fires once stuck)
+
+The output is `numbers(numbers(numbers(...)` forever. Pure-stat gates
+(speed-gate, τ-gate, even coherence-gate's PPL check on short outputs)
+**do not catch this**. Only an eyeball or token-distribution check does.
+
+**Mandatory guards for every Path B iteration**:
+
+1. **Token-distribution check after every smoke**:
+   - Decode 256 emitted tokens
+   - Assert `unique_token_count / total > 0.3`
+   - Assert `max_token_frequency / total < 0.4`
+   - If either fails → STOP, you have a bug, do NOT trust τ
+2. **Eyeball decoded text** for at least one prose, one code, one
+   instruct prompt before claiming a win.
+3. **3-prompt smoke before any commit**: run prose / code / instruct
+   end-to-end, dump first 200 chars of output to stderr, visually scan.
+4. Speed-gate / quality-gate runs are NECESSARY but NOT SUFFICIENT.
+
+**Do not commit Path B changes that have not passed the eyeball check.**
+A "great metrics, garbage output" commit can and will be cargo-culted
+into release before someone notices.
+
+This trap is also why the GdnTape / kv_gather scaffolding shipped in
+ecbc49d is gated to opt-in via env vars when re-enabled — it should
+remain opt-in until Path B applies the per-commit RoPE rotation.
 
 ## Why this exists
 
@@ -25,18 +66,31 @@ through the FA dispatch.
 
 ## Two implementation variants
 
-### B1 — Pre-RoPE K storage + post-commit RoPE pass
+### B1 — Pre-RoPE K storage + post-commit RoPE pass (CHOSEN)
 
 - Tree verify dispatches FA with `rope_phase = position + linear_idx` (current)
-  AND stores **pre-RoPE K** in a per-tree-verify scratch buffer (sized
-  `big_n × n_kv_heads × head_dim × 2` bytes F16, ~26 KB for 27B at budget=12).
-- Post-commit, a small kernel reads pre-RoPE K from scratch at slot
-  `accepted_node_indices[j]+1`, applies RoPE for `position + j + 1`, writes
-  to `kv_cache[position + j + 1]`. One launch per FA layer per slow cycle.
-- Pros: minimal kernel surgery — RoPE-apply kernel is ~50 LOC, dispatch
-  wiring is straightforward.
+  AND stores **pre-RoPE K (F32)** in a per-tree-verify scratch buffer
+  sized `big_n × n_kv_heads × head_dim × 4` bytes per FA layer
+  (~52 KB per FA layer × ~16 FA layers on 27B = ~830 KB total).
+- Post-commit, in slow path:
+  1. Tape gather (existing scaffolding from ecbc49d)
+  2. Per FA layer: gather pre-RoPE K rows from scratch by
+     `accepted_node_indices[j]+1` into a contiguous `[accept_len+1] × n_kv_heads × head_dim`
+     buffer (and seed at index 0 — already correct linearly)
+  3. Apply existing `rope_partial_interleaved_f32_batched` with positions
+     `[position + 0, position + 1, ..., position + accept_len]` (committed
+     phases — the right ones) to the gathered K rows
+  4. Re-quant + write to `kv_cache[position .. position + accept_len + 1]`
+     using the existing `kv_cache_write_*_batched` kernels
+  5. Replay GDN tape (existing)
+- Pros: reuses existing RoPE + kv_write kernels — no new HIP kernels needed
+  for B1 itself. Just orchestration + scratch.
 - Cons: doubles K storage cost during tree verify. V doesn't need this
   treatment (no RoPE on V).
+- **Pre-RoPE K capture means we tap fa_k_batch BEFORE the
+  rope_partial_interleaved kernel runs in qwen35.rs:3468. That kernel
+  rotates K in-place. A separate memcpy_dtod into the scratch BEFORE
+  the RoPE call captures the pre-RoPE state.**
 
 ### B2 — Two-array FA kernel
 
