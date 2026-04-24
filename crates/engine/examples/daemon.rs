@@ -1177,7 +1177,7 @@ fn generate_dflash(
                 emitted_bytes += vl;
             }
             generated += 1;
-            if tok == target.config.eos_token || im_end_token == Some(tok) { hit_eos = true; break; }
+            if tok == target.config.eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
         }
         position += step.accepted + 1;
         seed_token = step.bonus_token;
@@ -1465,6 +1465,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
+            if tokenizer.is_terminator(next_token) { break; }
 
             // Budget-alert injection: once we hit the configured token count,
             // splice the nudge text into the stream. Tokens are emitted to
@@ -1670,6 +1671,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
             if next_token == config.eos_token { break; }
             if im_end_token == Some(next_token) { break; }
+            if tokenizer.is_terminator(next_token) { break; }
 
             next_token = tok;
             rng_state = rng;
@@ -1848,6 +1850,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
+        if tokenizer.is_terminator(next_token) { break; }
 
         qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
         m.seq_pos += 1;

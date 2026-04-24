@@ -298,7 +298,7 @@ fn main() {
                 print!("{}", text);
                 std::io::stdout().flush().unwrap();
             }
-            tok == eos_token || im_end_token_val == Some(tok)
+            tok == eos_token || im_end_token_val == Some(tok) || tokenizer.is_terminator(tok)
         };
 
         if spec_active {
