@@ -17,6 +17,11 @@ pub struct Tokenizer {
     /// Special tokens
     pub bos_id: u32,
     pub eos_id: u32,
+    /// Auxiliary end-of-generation id (e.g. `<|endoftext|>` when `eos_id` is
+    /// `<|im_end|>`). When a raw-text draft without ChatML finishes naturally
+    /// it emits this, not `eos_id` — stop-loops must check both via
+    /// `is_terminator()`. None if the vocab only has one terminator.
+    pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA)
     is_gpt2_bpe: bool,
 }
@@ -64,6 +69,13 @@ impl Tokenizer {
 
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
+        let endoftext = token_to_id.get("<|endoftext|>").copied();
+        let im_end    = token_to_id.get("<|im_end|>").copied();
+        let eot_id = match (endoftext, im_end) {
+            (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
+            (Some(et), _) if et != eos_id => Some(et),
+            _ => None,
+        };
 
         // Detect tokenizer type
         let model_type = gguf.meta_str("tokenizer.ggml.model").unwrap_or("llama");
@@ -88,6 +100,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            eot_id,
             is_gpt2_bpe,
         })
     }
@@ -165,6 +178,11 @@ impl Tokenizer {
             .or_else(|| token_to_id.get("<|endoftext|>").copied())
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
+        let endoftext = token_to_id.get("<|endoftext|>").copied();
+        let eot_id = match endoftext {
+            Some(et) if et != eos_id => Some(et),
+            _ => None,
+        };
 
         let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
 
@@ -175,6 +193,7 @@ impl Tokenizer {
             special_tokens,
             bos_id,
             eos_id,
+            eot_id,
             is_gpt2_bpe,
         })
     }
@@ -184,6 +203,17 @@ impl Tokenizer {
         let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let tok_str = meta.get("tokenizer")?.as_str()?;
         Self::from_hf_json(tok_str)
+    }
+
+    /// True if `id` is any end-of-generation terminator (`eos_id` or the
+    /// auxiliary `eot_id` — e.g. `<|endoftext|>` when `eos_id` is `<|im_end|>`).
+    /// Decode loops MUST check this instead of `== eos_id` — a raw-text draft
+    /// without ChatML naturally emits `<|endoftext|>`, not `<|im_end|>`, and a
+    /// bare `eos_id` compare silently falls through, causing the post-EOT
+    /// attractor loop (bench findings 2026-04-24 §3.5).
+    #[inline]
+    pub fn is_terminator(&self, id: u32) -> bool {
+        id == self.eos_id || self.eot_id == Some(id)
     }
 
     /// Decode a sequence of token IDs to text.

@@ -677,7 +677,6 @@ fn main() {
     // SpecStats histogram must fit the max accept_len we'll ever see, so
     // size by draft_scratch_b (which accounts for adaptive_b_max).
     let mut stats = SpecStats::new(draft_scratch_b);
-    let eos_id: u32 = tokenizer.eos_id;
 
     if adaptive_b && draft_scratch_b != draft_cfg.block_size {
         eprintln!(
@@ -813,8 +812,8 @@ fn main() {
                     position = ev.new_physical;
                 }
             }
-            if next == eos_id {
-                eprintln!("eos");
+            if tokenizer.is_terminator(next) {
+                eprintln!("eos (id={next})");
                 break;
             }
             cur_token = next;
@@ -1208,8 +1207,11 @@ fn main() {
             }
         }
 
-        // Stop on EOS.
-        if step.committed.iter().skip(1).any(|&t| t == eos_id) {
+        // Stop on any terminator (eos_id OR eot_id). Checking only eos_id
+        // misses `<|endoftext|>` when running --no-chatml on a raw-text draft
+        // — see findings/dflash-benchmark-2026-04-24.md §3.5 (post-EOT
+        // attractor loop). `is_terminator` covers both.
+        if step.committed.iter().skip(1).any(|&t| tokenizer.is_terminator(t)) {
             eprintln!("eos");
             break;
         }
