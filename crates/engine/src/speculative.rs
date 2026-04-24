@@ -3801,28 +3801,195 @@ pub fn spec_step_ddtree_batched(
             accept_len + 1,
         )?;
         hidden_rows_written = big_n;
-    } else {
-        // Slow path: full re-verify on the committed prefix to get a
-        // linear-order tape AND correctly RoPE'd K written to committed
-        // slots. ~40-50 ms cost on 27B; the only known correct slow path
-        // until Path B (decouple RoPE from KV slot index) lands.
+    } else if std::env::var("HIPFIRE_DDTREE_PATH_B_CAPTURE").ok().as_deref() == Some("1")
+              && !scratch.pre_rope_k.is_empty()
+    {
+        // Path B slow-path-kill (opt-in, WIP). Replaces the ~40-50 ms full
+        // re-verify with a gather + per-commit RoPE + quant-write chain
+        // that operates on the pre-RoPE K captured during tree verify
+        // (qwen35.rs:3486 — Phase 1 capture). Plus the existing tape
+        // gather scaffolding from ecbc49d.
         //
-        // Path A (gather-only kill) was attempted under env gate
-        // HIPFIRE_DDTREE_PATH_A and CORRECTNESS-CONFIRMED BROKEN by an
-        // eyeball test on 27B asym3 code (HE/0): output collapsed to
-        // "numbers(numbers(numbers(..." forever. The 5-run mean stats
-        // (tok/s +120%, τ +79%, sd 0.15) were a degenerate loop — same
-        // token predicted every step → 100% draft acceptance → metric
-        // wins despite garbage output. Cause: tree verify bakes RoPE
-        // phase per linearization slot; gather moves K bytes but stale
-        // phase pollutes next-cycle attention enough to lock the model
-        // into a token attractor. Removed the env gate. The
-        // GdnTape::gather_accepted + DdtreeScratch.kv_gather_*
-        // infrastructure stays — Path B reuses it verbatim with a per-
-        // commit RoPE rotation kernel.
+        // Path A failed because gathered K carried stale RoPE phase. Path
+        // B fixes that by re-applying RoPE for the COMMITTED slot phases
+        // before quant-writing back to the cache.
+        //
+        // CORRECTNESS-CRITICAL: the dflash coherence battery
+        // (scripts/coherence-gate-dflash.sh) is the ONLY barrier between
+        // a Path B regression and a corrupted-output release. Token
+        // attractors here look like +τ/+tok-s wins on stat gates. Run
+        // the eyeball check before trusting any result.
+        let n_positions = accept_len + 1;
+        let kv = &mut target.kv_cache;
+        let n_kv_heads = kv.n_kv_heads;
+        let head_dim = kv.head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+
+        // ── (a) Tape gather (qkv/alpha/beta innovations into committed order)
+        let tape_idx_host: Vec<i32> = std::iter::once(0i32)
+            .chain(accepted_node_indices.iter().map(|&i| (i + 1) as i32))
+            .collect();
+        let tape_idx_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(tape_idx_host.as_ptr() as *const u8, n_positions * 4)
+        };
+        gpu.hip.memcpy_htod(&scratch.parent_indices.buf, tape_idx_bytes)?;
+        gdn_tape.gather_accepted(
+            gpu,
+            &scratch.parent_indices,
+            &scratch.tape_gather_scratch,
+            n_positions,
+        )?;
+
+        // ── (b) Per-FA-layer K rotate + V gather + quant-write
+        //
+        // For K: gather pre-RoPE K rows (captured BEFORE the original
+        // rope_partial in qwen35.rs:3486) by accepted indices into a
+        // contiguous F32 buffer, apply RoPE with COMMITTED positions
+        // [start_pos, start_pos+1, ...], then quant-write to KV cache at
+        // those committed slots. The Q half of rope_partial is throwaway —
+        // we feed verify_scratch.prefill_batch's fa_q_batch as a scratch
+        // and ignore the rotated Q.
+        //
+        // For V: V doesn't carry a position-dependent rotation, so a
+        // pure byte gather (raced slot → committed slot) is correct. Same
+        // pattern Path A used.
+        let pbs = verify_scratch.prefill_batch.as_ref()
+            .expect("Path B requires VerifyScratch.prefill_batch (set during DdtreeScratch init)");
+
+        // Tree-verify K source indices (one per accepted committed slot, in
+        // pre-RoPE K scratch which has positions [0..big_n] in tree-
+        // linearization order, so 0 = seed slot, i+1 = tree node i).
+        let k_src_idx_host: Vec<i32> = std::iter::once(0i32)
+            .chain(accepted_node_indices.iter().map(|&i| (i + 1) as i32))
+            .collect();
+        let k_src_idx_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(k_src_idx_host.as_ptr() as *const u8, n_positions * 4)
+        };
+        // Reuse parent_indices buffer for the K gather indices (it was
+        // already used for the tape gather above; re-upload now).
+        gpu.hip.memcpy_htod(&scratch.parent_indices.buf, k_src_idx_bytes)?;
+
+        // Committed slot positions for RoPE + KV write: [start_pos+0..start_pos+accept_len].
+        let pos_host: Vec<i32> = (0..n_positions).map(|i| (position + i) as i32).collect();
+        let pos_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, n_positions * 4)
+        };
+        gpu.hip.memcpy_htod(&scratch.kv_gather_indices.buf, pos_bytes)?;
+
+        // Absolute KV slots for V gather: [position+0, position+1+acc[0], ...]
+        // (V is the same as Path A: byte gather from raced slots to committed).
+        let v_src_abs_host: Vec<i32> = std::iter::once(position as i32)
+            .chain(accepted_node_indices.iter().map(|&i| (position + 1 + i) as i32))
+            .collect();
+        let v_src_abs_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(v_src_abs_host.as_ptr() as *const u8, n_positions * 4)
+        };
+        // Park the V indices in the tape_gather_scratch's first 4×n bytes —
+        // tape gather is done; the buffer is free until next cycle. (Avoids
+        // adding yet another tiny i32 buffer to DdtreeScratch.)
+        gpu.hip.memcpy_htod(&scratch.tape_gather_scratch.buf, v_src_abs_bytes)?;
+
+        let v_bpp = n_kv_heads * (head_dim / 32) * 34; // Q8 V (all asym* modes use Q8 V)
+
+        let n_rot = (target.config.head_dim as f32 * target.config.partial_rotary_factor) as usize;
+
+        for (fa_idx, layer_idx) in target.config.layer_types.iter()
+            .enumerate()
+            .filter_map(|(li, lt)| if *lt == qwen35::LayerType::FullAttention { Some(li) } else { None })
+            .enumerate()
+        {
+            // 1. Gather pre-RoPE K rows by k_src_idx into pbs.fa_k_batch.
+            //    Each row is n_kv_heads * head_dim F32 = kv_dim*4 bytes.
+            gpu.kv_compact_gather(
+                &scratch.pre_rope_k[fa_idx],
+                &pbs.fa_k_batch,
+                &scratch.parent_indices,
+                kv_dim * 4,
+                n_positions,
+            )?;
+
+            // 2. Apply RoPE in-place to gathered K with committed positions.
+            //    Q is throwaway — fa_q_batch is large enough.
+            gpu.rope_partial_interleaved_f32_batched(
+                &pbs.fa_q_batch, &pbs.fa_k_batch, &scratch.kv_gather_indices,
+                target.config.n_heads, target.config.n_kv_heads, target.config.head_dim,
+                n_rot, target.config.rope_theta, n_positions,
+            )?;
+
+            // 3. V gather via the existing kv_compact_gather pattern.
+            gpu.kv_compact_gather(
+                &kv.v_gpu[layer_idx],
+                &scratch.kv_gather_scratch_v,
+                &scratch.tape_gather_scratch,
+                v_bpp, n_positions,
+            )?;
+
+            // 4. Quant-write K (rotated, in pbs.fa_k_batch) + V (gathered,
+            //    in scratch.kv_gather_scratch_v) to the committed KV slots.
+            //    All asym* and q8 KV variants supported. F16 unquantized
+            //    isn't on the batched path so we panic here — see the
+            //    fa_batched_ok gate in qwen35.rs:3081.
+            if kv.quant_asym3 {
+                let ct = kv.givens_cos.as_ref().expect("asym3 requires Givens cos");
+                let st = kv.givens_sin.as_ref().expect("asym3 requires Givens sin");
+                // The batched K writer expects a contiguous K source of
+                // [n × n_kv_heads × head_dim] F32 — pbs.fa_k_batch is
+                // exactly that. We give it the REAL kv.v_gpu as the V
+                // dst (so writer indices stay in-bounds for absolute slot
+                // numbers). The V values it writes are garbage (sourced
+                // from pbs.fa_v_batch, leftover from the last FA layer)
+                // but we OVERWRITE every committed V slot below from a
+                // proper gather of the raced-but-correctly-quantized V
+                // values. So the garbage V write is a transient no-op.
+                gpu.kv_cache_write_asym3_batched(
+                    &kv.k_gpu[layer_idx], &kv.v_gpu[layer_idx],
+                    &pbs.fa_k_batch, &pbs.fa_v_batch,
+                    &scratch.kv_gather_indices,
+                    ct, st, n_kv_heads, head_dim, n_positions,
+                )?;
+                // V byte-gather: read pre-quantized V from raced slots
+                // [position+0, position+1+acc[0], ...] into a contiguous
+                // scratch, then memcpy scratch → kv.v_gpu at committed
+                // slots [position..position+accept_len]. Using a scratch
+                // intermediate avoids same-slot src=dst memcpys (which
+                // are HIP UB) when the accept chain happens to hit the
+                // rank-0 prefix early.
+                gpu.kv_compact_gather(
+                    &kv.v_gpu[layer_idx],
+                    &scratch.kv_gather_scratch_v,
+                    &scratch.tape_gather_scratch,
+                    v_bpp, n_positions,
+                )?;
+                gpu.hip.memcpy_dtod_at(
+                    &kv.v_gpu[layer_idx].buf, position * v_bpp,
+                    &scratch.kv_gather_scratch_v.buf, 0,
+                    n_positions * v_bpp,
+                )?;
+            } else {
+                // TODO: asym4 / asym2 / q8 paths — same pattern as asym3
+                // but with the matching kv_cache_write_*_batched call.
+                // For initial Phase 2 prototype, panic so we notice if a
+                // non-asym3 model accidentally enables Path B.
+                panic!("Path B Phase 2 only supports asym3 KV today (got: q8={} asym4={} asym2={})",
+                    kv.quant_q8, kv.quant_asym4, kv.quant_asym2);
+            }
+        }
+
+        // ── (c) Replay GDN tape on the committed-order tape.
+        target_snap.restore_to(&mut target.dn_state, gpu)?;
+        gdn_tape.replay_gdn(
+            gpu,
+            &target.weights,
+            &target.config,
+            &mut target.dn_state,
+            n_positions,
+        )?;
+        hidden_rows_written = big_n;
+    } else {
         // Default slow path: re-verify the committed prefix to get a
         // linear-order tape AND correctly RoPE'd K written to committed
-        // slots. ~40-50 ms cost on 27B; opt out via HIPFIRE_DDTREE_PATH_A=1.
+        // slots. ~40-50 ms cost on 27B. Path B kill is opt-in via
+        // HIPFIRE_DDTREE_PATH_B_CAPTURE=1.
         let tape_block: Vec<u32> = committed[..accept_len + 1].to_vec();
         target_snap.restore_to(&mut target.dn_state, gpu)?;
         let _tape_verify = verify_dflash_block(
