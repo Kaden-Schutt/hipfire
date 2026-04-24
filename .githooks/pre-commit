@@ -69,6 +69,46 @@ echo
 
 echo
 
+# ── DFlash + DDTree coherence battery ────────────────────────────────────
+# Sibling to coherence-gate.sh — exercises spec_step_dflash and
+# spec_step_ddtree_batched on 27B with prose + code prompts. Hard-fails
+# on Path-A-class single-token attractors (unique_ratio < 0.15 or
+# max_freq > 0.50 in first 128 tokens pre-EOT). Skips silently if 27B
+# target/draft aren't installed.
+SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write'
+if echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
+   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
+    echo "=== DFlash/DDTree Coherence Battery ==="
+    echo "Spec-decode path changed. Running dflash coherence battery (~3 min)..."
+    echo
+    if ! ./scripts/coherence-gate-dflash.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: dflash coherence battery hit a HARD error."
+        echo "========================================================================"
+        echo
+        echo "Either a panic / zero tokens, OR a token attractor was detected"
+        echo "in the first 128 tokens pre-EOT (single token > 50% of generation,"
+        echo "or unique-token-ratio < 0.15). This is the Path A failure class —"
+        echo "see commit 6c84b13 + docs/plans/ddtree-path-b-decouple-rope-from-kvslot.prd."
+        echo
+        echo "DO NOT bypass with --no-verify. Token-attractor bugs masquerade as"
+        echo "+τ / +tok-s wins on stat gates and silently corrupt outputs."
+        echo
+        echo "Investigation:"
+        echo "  ./scripts/coherence-gate-dflash.sh    # re-run short"
+        echo "  ./scripts/coherence-gate-dflash.sh --full   # add b22-k4 + b8-k2"
+        echo
+        exit 1
+    fi
+    echo
+    echo "NOTE: soft warnings (paragraph-level repetition) do not block but"
+    echo "indicate quality drift. Read the report and confirm before commit."
+    echo
+fi
+
+echo
+
 # ── Speed gate ────────────────────────────────────────────────────────────
 echo "=== MQ4 Speed Gate (fast) ==="
 echo "Running 4B prefill/decode regression check..."
