@@ -294,6 +294,12 @@ to a single newline.
 unverifiable. Don't accept "X agent got Y tok/s" without reproducing
 on the exact prompt bytes they ran.
 
+**Mitigation (Phase 1 implemented):** Set `HIPFIRE_NORMALIZE_PROMPT=1` to collapse
+all 3+ consecutive newlines to exactly 2 before tokenization. This eliminates the
+whitespace-variance source entirely, making PEP-8 and single-blank prompts tokenize
+identically. See `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` and
+`crates/engine/examples/encode_prompt.rs` for verification utilities.
+
 ## GPU Lock Protocol (Multi-Agent)
 
 When multiple Claude Code agents work in parallel (e.g. via worktrees), they coordinate
