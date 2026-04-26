@@ -2532,11 +2532,18 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
       write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
-      write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n\n`);
+      write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
-      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${ARCH_DEFAULTS.kv_cache}${C.reset}\n\n`);
+      write(`${C.dim}GPU: ${DETECTED_ARCH} · auto = ${ARCH_DEFAULTS.kv_cache}${C.reset}\n`);
     }
+    if (process.env.HIPFIRE_GRAPH === "1") {
+      write(`${C.yellow}⚠ HIPFIRE_GRAPH=1 is set in your environment. AR forward hipGraph capture is${C.reset}\n`);
+      write(`${C.yellow}  perf-neutral on average and drifts from direct dispatch on dense models${C.reset}\n`);
+      write(`${C.yellow}  ≥9B (#19/#36 class). DFlash uses its own graph paths and is unaffected.${C.reset}\n`);
+      write(`${C.yellow}  Recommended: \`unset HIPFIRE_GRAPH\` unless you are debugging.${C.reset}\n`);
+    }
+    write(`\n`);
 
     // Column widths
     const labelW = Math.max(...keys.map(k => meta[k].label.length)) + 2;
@@ -2876,6 +2883,13 @@ function listConfig(cfg: HipfireConfig): void {
     const v = cfg[k];
     const isDefault = v === CONFIG_DEFAULTS[k];
     console.log(`  ${k.padEnd(18)} ${String(v).padEnd(14)}${isDefault ? "(default)" : ""}`);
+  }
+  if (process.env.HIPFIRE_GRAPH === "1") {
+    console.log(`\n\x1b[33m⚠ HIPFIRE_GRAPH=1 is set in your environment.\x1b[0m`);
+    console.log(`  AR forward hipGraph capture is perf-neutral on average and drifts from`);
+    console.log(`  direct dispatch on dense models ≥9B (#19/#36 class). DFlash uses its own`);
+    console.log(`  graph paths and is unaffected. Recommended: \`unset HIPFIRE_GRAPH\` unless`);
+    console.log(`  you are debugging.`);
   }
   console.log(`\nInteractive: hipfire config`);
   console.log(`Set:         hipfire config set <key> <value>`);
