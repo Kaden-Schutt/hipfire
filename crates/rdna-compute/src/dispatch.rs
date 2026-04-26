@@ -1833,18 +1833,27 @@ impl Gpu {
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
-        let rot_func = &self.functions["mq_rotate_x"];
-        let mut xp = x.buf.as_ptr(); let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr; let mut s2 = s2_ptr;
-        let mut kv = k as i32;
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void, &mut xrp as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void, &xrp as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void, &s2_ptr as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
         ];
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x", bytes);
-        let result = unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x",
+            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
+                b.push_i32(kv);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -2114,19 +2123,25 @@ impl Gpu {
         let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
         self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+            b.push_i32(m_val); b.push_i32(k_val);
+            b
+        };
 
         // Multi-row GEMV: one warp computes R output rows, sharing x register
         // state across rows. Per-arch default picks R=1 on RDNA3 (negative)
@@ -2161,23 +2176,26 @@ impl Gpu {
                 ("gemv_hfq4g256_multirow_default", kernels::GEMV_HFQ4G256_MULTIROW_SRC)
             };
             self.ensure_kernel(mr_name, mr_src, func_name)?;
-            let mrfunc = &self.functions[func_name];
             let grid = ((m as u32) + grid_div - 1) / grid_div;
-            unsafe {
-                self.hip.launch_kernel(mrfunc, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-            }
+            self.launch_maybe_blob(
+                func_name,
+                [grid, 1, 1], [32, 1, 1], 0, &mut params,
+                blob_builder,
+            )
         } else if use_wide {
             self.ensure_kernel("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC, "gemv_hfq4g256_wide")?;
-            let wfunc = &self.functions["gemv_hfq4g256_wide"];
             let grid = ((m + 1) / 2) as u32;
-            unsafe {
-                self.hip.launch_kernel(wfunc, [grid, 1, 1], [64, 1, 1], 0, self.stream_ref(), &mut params)
-            }
+            self.launch_maybe_blob(
+                "gemv_hfq4g256_wide",
+                [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                blob_builder,
+            )
         } else {
-            let func = &self.functions["gemv_hfq4g256"];
-            unsafe {
-                self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-            }
+            self.launch_maybe_blob(
+                "gemv_hfq4g256",
+                [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+                blob_builder,
+            )
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
@@ -3435,11 +3453,17 @@ impl Gpu {
                 kernels::GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC,
                 func_name,
             )?;
-            let mrfunc = &self.functions[func_name];
             let grid = ((m as u32) + grid_div - 1) / grid_div;
-            unsafe {
-                self.hip.launch_kernel(mrfunc, [grid, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
-            }
+            self.launch_maybe_blob(
+                func_name,
+                [grid, 1, 1], [32, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                    b.push_i32(m_val); b.push_i32(k_val);
+                    b
+                },
+            )
         } else {
             self.launch_maybe_blob(
                 "gemv_hfq4g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
@@ -5815,45 +5839,47 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
+
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+            b.push_i32(m_val); b.push_i32(k_val);
+            b
+        };
 
         // Adaptive dispatch: wide kernel for small K (more threads per row),
         // narrow kernel for large K (more blocks, better occupancy).
         if k <= 1536 {
             self.ensure_kernel("gemv_q8_0_wide", kernels::GEMV_Q8_0_WIDE_SRC, "gemv_q8_0_wide")?;
-            let func = &self.functions["gemv_q8_0_wide"];
             let block_size = 64u32; // 2 warps, each processes one row
             let grid = ((m + 1) / 2) as u32; // ceil(M/2)
-            return unsafe {
-                self.hip.launch_kernel(func, [grid, 1, 1], [block_size, 1, 1], 0, None, &mut params)
-            };
+            return self.launch_maybe_blob(
+                "gemv_q8_0_wide",
+                [grid, 1, 1], [block_size, 1, 1], 0, &mut params,
+                blob_builder,
+            );
         }
 
         self.ensure_kernel("gemv_q8_0", kernels::GEMV_Q8_0_SRC, "gemv_q8_0")?;
-        let func = &self.functions["gemv_q8_0"];
         let block_size = 32u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [block_size, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_q8_0",
+            [m as u32, 1, 1], [block_size, 1, 1], 0, &mut params,
+            blob_builder,
+        )
     }
 
     /// Y[batch, M] = X[batch, K] @ A_q8[M, K]^T — batched Q8_0 GEMM.
@@ -6374,24 +6400,31 @@ impl Gpu {
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
-        let func = &self.functions["add_inplace_f32"];
 
         let n = a.numel() as i32;
-        let mut a_ptr = a.buf.as_ptr();
-        let mut b_ptr = b.buf.as_ptr();
-        let mut n_val = n;
+        let a_ptr = a.buf.as_ptr();
+        let b_ptr = b.buf.as_ptr();
+        let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut b_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &b_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise_bytes(n as usize);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "add_inplace_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) };
+        let result = self.launch_maybe_blob(
+            "add_inplace_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_i32(n_val);
+                bb
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -7074,21 +7107,29 @@ impl Gpu {
         n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.ensure_kernel("kv_cache_write_q8_0", kernels::KV_CACHE_WRITE_Q8_0_SRC, "kv_cache_write_q8_0")?;
-        let func = &self.functions["kv_cache_write_q8_0"];
-        let mut d = dst.buf.as_ptr();
-        let mut s = src.buf.as_ptr();
-        let mut p = pos_buf.as_ptr();
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = pos_buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut d as *mut _ as *mut c_void, &mut s as *mut _ as *mut c_void,
-            &mut p as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &d as *const _ as *mut c_void, &s as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void, &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
         let total_blocks = (n_kv_heads * head_dim / 32) as u32;
         let bytes = crate::profile::kv_cache_write_q8_0_bytes(n_kv_heads, head_dim);
         let timer = crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_q8_0", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [total_blocks, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "kv_cache_write_q8_0",
+            [total_blocks, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d); b.push_ptr(s); b.push_ptr(p);
+                b.push_i32(nkv); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
@@ -9118,25 +9159,33 @@ impl Gpu {
     pub fn deinterleave_f32(&mut self, interleaved: &GpuTensor, out_a: &GpuTensor, out_b: &GpuTensor,
                             n_heads: usize, head_dim: usize) -> HipResult<()> {
         self.ensure_kernel("deinterleave", kernels::DEINTERLEAVE_SRC, "deinterleave_f32")?;
-        let func = &self.functions["deinterleave_f32"];
-        let mut inp = interleaved.buf.as_ptr();
-        let mut ap = out_a.buf.as_ptr();
-        let mut bp = out_b.buf.as_ptr();
-        let mut nh = n_heads as i32;
-        let mut hd = head_dim as i32;
+        let inp = interleaved.buf.as_ptr();
+        let ap = out_a.buf.as_ptr();
+        let bp = out_b.buf.as_ptr();
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut inp as *mut _ as *mut c_void,
-            &mut ap as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &inp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
         let total = (n_heads * head_dim) as u32;
         let block = 256u32;
         let grid = (total + block - 1) / block;
         let bytes = n_heads * head_dim * 4 * 3; // read interleaved, write both outputs
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "deinterleave_f32", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "deinterleave_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(inp); b.push_ptr(ap); b.push_ptr(bp);
+                b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
