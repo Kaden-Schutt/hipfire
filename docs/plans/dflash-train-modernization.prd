@@ -1,0 +1,290 @@
+# dflash_train_poc.py modernization per Red Hat recipe
+
+**Task:** #109
+**Status:** OPEN — **blocks #93 (Path C 3.6 alignment) and #106 (sidecar-aware drafts)**
+**Owner:** TBD
+**Date opened:** 2026-04-26
+**Source recipe:** `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md` (last updated 2026-04-24)
+
+## Background
+
+The current `scripts/dflash_train_poc.py` was written before the Red Hat
+recipe was distilled. The Path C PRD (`task-93-path-c-trained-draft.prd`)
+audited the script against the recipe and flagged six gaps. Independently,
+task #106 needs a new flag for random-eviction augmentation to train
+sidecar-aware drafts.
+
+Running EITHER #93 or #106 against the current script wastes MI300X budget
+— the resulting draft would be missing the major τ wins from target-aligned
+training. **Modernization must land first.**
+
+## Recipe-mandated gap inventory (verbatim from recipe + audit)
+
+| Gap | Current state | Severity | Recipe section |
+|---|---|---|---|
+| Target-generated responses | Train on raw corpus text | **CRITICAL** | "The Critical Step: Target-Generated Responses" |
+| Reduced draft vocab (8192) | Hard-coded 151936 | **HIGH** | "Reduced draft vocab" — cuts head compute ~18× |
+| Conversational data (ShareGPT/UltraChat) | Default = wikitext | **HIGH** | "Conversational data > raw text" |
+| Hand-picked target layer IDs | Auto via build_target_layer_ids | MEDIUM | `target_layer_ids: [2, 18, 33]` |
+| Loss mask on assistant turns only | All-tokens loss | MEDIUM | `--loss-mask assistant_only` |
+| Block-size randomization | Fixed at 16 | LOW | "Random offset per sample (future)" |
+
+Plus task #106 addition:
+| Gap | Current state | Severity | Source |
+|---|---|---|---|
+| Eviction-augmentation for sidecar-aware drafts | Missing | **HIGH** for #106 | `task-93-path-c-trained-draft.prd` (#106 PRD) |
+
+## Phases (independently shippable)
+
+### Phase A — `scripts/generate_target_responses.py` (CRITICAL gap fix)
+
+New script. Reads input corpus (.jsonl with `messages`), generates assistant
+responses using the target model via vLLM's OpenAI-compatible API,
+writes target-generated `.jsonl`.
+
+```python
+# Per recipe section 6.1 "Target Self-Generation"
+async def generate_target_responses(
+    model_repo: str,        # "Qwen/Qwen3.5-9B"
+    input_path: str,        # raw conversations
+    output_path: str,       # target-generated conversations
+    vllm_url: str = "http://localhost:8000/v1",
+    batch_size: int = 32,
+    max_tokens: int = 2048,
+):
+    # 1. Stream input .jsonl
+    # 2. For each conversation: take user/system, generate assistant via target
+    # 3. Write target-generated .jsonl
+    # 4. Resumable via output-line count
+```
+
+Dependencies: `vllm==0.11.0+rocm7.2`, `openai` async client, `asyncio` for
+concurrency.
+
+**Acceptance:**
+- Script generates 1k samples in <10 min on MI300X
+- Output schema: `{"messages": [{"role": "system|user|assistant", "content": "..."}]}`
+- Fully resumable (skips already-processed lines)
+
+### Phase B — Modernize `dflash_train_poc.py` flags
+
+Add five new argparse flags + corresponding plumbing:
+
+```python
+parser.add_argument("--draft-vocab-size", type=int, default=8192,
+    help="Reduced draft vocab head; full vocab default would mean ~18× more head compute.")
+parser.add_argument("--target-layer-ids", type=str, default=None,
+    help='Hand-picked layer IDs for context features, e.g. "2,18,33". '
+         'None = use existing build_target_layer_ids auto-selection.')
+parser.add_argument("--loss-mask", choices=["assistant", "all"], default="assistant",
+    help="Mask non-assistant tokens in loss. Recipe default: assistant.")
+parser.add_argument("--corpus-format", choices=["jsonl-messages", "raw-text"],
+    default="raw-text",
+    help="jsonl-messages = conversational format with role markers (recipe). "
+         "raw-text = legacy wikitext-style.")
+parser.add_argument("--eviction-augment-prob", type=float, default=0.0,
+    help="Task #106: probability per training step of injecting a "
+         "random-eviction pattern in target hidden states before the "
+         "draft sees them. 0.0 = no augmentation (default).")
+```
+
+Implementation notes:
+- Loss mask: when `--loss-mask assistant`, build a binary mask from the
+  conversation's role markers (only `role == "assistant"` tokens get
+  loss=1.0; user/system get 0.0).
+- Layer IDs: when `--target-layer-ids` is set, override
+  `build_target_layer_ids` and pass the explicit list to
+  `extract_context_feature`.
+- Vocab size: changes the draft model's head dimension. Need to handle
+  out-of-vocab target tokens (recipe truncates softmax to top-8192 by
+  global frequency; alternative is per-target-corpus frequency).
+
+**Acceptance:**
+- All five flags parse and validate (negative values rejected, etc.)
+- Default behavior with no flags set = byte-identical to current script
+  (no regression for legacy callers)
+- Each flag has a unit test that the change actually affects training
+  (e.g., loss-mask=assistant reduces loss-token-count vs `all`).
+
+### Phase C — Conversational corpus default
+
+Replace the wikitext default with a Red-Hat-mix conversational corpus.
+
+```python
+# scripts/fetch_calibration_corpus.sh additions:
+case "$RECIPE" in
+    sharegpt-target)
+        # 50K samples, target-generated
+        curl https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered/...
+        # then run generate_target_responses.py
+        ;;
+    ultrachat-target)
+        # HuggingFaceH4/ultrachat_200k train_sft, target-generated
+        ;;
+    magpie-qwen-target)
+        # Magpie-Align/Magpie-Qwen-2.5-Pro-300K-Filtered, target-generated
+        ;;
+    redhat-mix-50k)
+        # Recipe section 6.5 mix:
+        # 20K ShareGPT-target + 15K UltraChat-target +
+        # 10K agentic traces + 5K paraphrased
+        ;;
+esac
+```
+
+Phase A's `generate_target_responses.py` is invoked per source. Output
+written to `/root/calib_corpus_<recipe>.jsonl` for reuse across training
+runs (parallel to existing sidecar corpora pattern).
+
+**Acceptance:**
+- `redhat-mix-50k` recipe produces 50k conversation .jsonl
+- Each line has `messages` with target-generated `assistant` content
+- Total disk: ~300-500 MB for 50k samples (varies by tokens-per-sample)
+
+### Phase D — Validation harness `scripts/dflash_position_acceptance.py`
+
+New script that reproduces recipe section 8.2 acceptance-rate test.
+
+```python
+def evaluate_per_position_acceptance(
+    target_path: str,
+    draft_path: str,
+    dataset: str = "mt_bench",  # or humaneval, sharegpt subset
+    num_prompts: int = 80,
+    max_tokens: int = 2048,
+) -> dict:
+    # For each prompt:
+    #   1. Run draft to predict B=16 tokens given target hidden state
+    #   2. Run target on full B-token block
+    #   3. Compare per-position argmax vs draft prediction
+    #   4. Tally accept rate per position 0..15
+    # Return: {pos_0_accept, pos_1_accept, ..., mean_accept_length}
+```
+
+Compare against recipe targets:
+```
+Position 0:    30% min, 40% good, 50%+ excellent
+Position 1:    10% min, 15% good, 25%+ excellent
+Position 2:     5% min,  8% good, 12%+ excellent
+Mean length:  1.3 min, 1.5 good, 2.0+ excellent
+```
+
+**Acceptance:**
+- Script runs on 80 mt_bench prompts in < 5 min on 7900 XTX
+- Output JSON with all per-position accept rates + mean accept length
+- Existing z-lab DFlash draft evaluated for baseline numbers (z-lab is
+  task-93's "current baseline" — known to underperform; this gives the
+  before-after delta target)
+
+### Phase E — Eviction-augmentation (#106 specific)
+
+Inside `dflash_train_poc.py`'s training inner loop, when
+`--eviction-augment-prob > 0.0`:
+
+```python
+def maybe_inject_eviction(target_hidden, prob, rng):
+    """Simulate sidecar-policy eviction on target_hidden before draft sees it.
+    target_hidden: [batch, seq_len, hidden_dim]
+    Returns: (compacted_hidden, position_indices)
+    """
+    if rng.random() > prob:
+        return target_hidden, list(range(target_hidden.shape[1]))
+    # Drop a random 25-50% of recent positions, shift remaining forward.
+    # Match the production sidecar's drop pattern: prefer to keep
+    # high-attention tokens (use TriAttention drop policy if simulator
+    # available, else uniform random drop).
+    seq_len = target_hidden.shape[1]
+    keep = sorted(rng.sample(range(seq_len), max(seq_len // 2, 1)))
+    compacted = target_hidden[:, keep, :]
+    return compacted, keep  # caller adjusts position embeddings using keep[]
+```
+
+Plumbing changes:
+- Random-drop simulator (Phase E.1) — uniform first, sidecar-policy-matched second
+- Position-embedding handling — feed `keep[]` to draft's RoPE so positions
+  match what production would see post-eviction
+- Loss-mask preservation — eviction shouldn't drop assistant-role tokens
+
+**Acceptance:**
+- With `--eviction-augment-prob=0.3`, training loss converges to ≤ 1.2× the
+  no-augmentation loss (the augmentation should be modest difficulty add)
+- A trained-with-augmentation draft, evaluated under sidecar eviction
+  during inference, achieves τ within -10% of no-eviction τ (vs current
+  -30% in commit 8685da8 measurements)
+
+## Phase ordering + sequencing
+
+```
+Phase A  (gen-target-responses)  ─┐
+                                  ├─→ Phase C (corpus default)
+Phase B  (script flags)  ─────────┤
+                                  └─→ Phase D (validation)
+
+Phase E  (eviction-aug, #106)  ──→ depends on Phase B (--eviction-augment-prob flag)
+```
+
+A and B are independent; both can be done in parallel. C depends on A.
+D depends on B + a trained draft to validate. E depends on B's flag
+addition.
+
+Suggested order for incremental shipment:
+1. **Phase B** (script flags) — pure additive, no new infrastructure
+2. **Phase A** (gen-target-responses) — new script, needs vLLM
+3. **Phase C** (corpus default) — uses A
+4. **Phase E** (eviction-aug) — small addition to B
+5. **Phase D** (validation) — last, needs trained drafts to evaluate
+
+## Acceptance for #109 closure
+
+- All five phases shipped + tested
+- A pilot training run (5k samples, 5 epochs, Qwen3.5-4B target, ~2hr on
+  MI300X) completes successfully and the resulting draft hits recipe
+  acceptance targets per Phase D harness
+- Path C #93 + sidecar-aware #106 can both be triggered against the
+  modernized script with no further changes
+
+## Risk
+
+- **Recipe drift**: if the source recipe doc updates after we ship, our
+  modernization could lag again. Mitigation: pin the recipe revision in
+  this PRD's Source field, re-audit on update.
+- **Conversational corpus quality**: if the conversational mix doesn't
+  include enough of the target's deployment distribution (e.g., code
+  prompts dominate user workload but the corpus is 90% chitchat), the
+  draft will be undertrained on real workload. Mitigation: scope the
+  recipe-mix recipe to user-realistic shares (50% code, 30% chat, 20%
+  reasoning per audit of typical hipfire workloads).
+- **Eviction-aug mixing**: if augmented examples interleave with clean
+  ones at high rate, draft may not learn either well. Recipe doesn't
+  cover this, so we need to discover the right `--eviction-augment-prob`
+  empirically. Default 0.3 is a reasonable starting point.
+
+## Why this blocks #93 and #106
+
+- **#93 (Path C 3.6 alignment)**: PRD already calls out the recipe gaps
+  in its own audit table. Running #93 against the unmodernized script
+  produces a 3.6 draft that's better than nothing but won't hit the
+  recipe's acceptance targets. We'd need to re-train after modernization
+  anyway. Better to modernize first and train once.
+- **#106 (sidecar-aware drafts)**: explicitly requires Phase E
+  (`--eviction-augment-prob`). Cannot proceed without #109 Phase B + E.
+
+## Triggers to start
+
+- Currently: Phase C target sidecars (3.6:27b + A3B + 3.6-A3B) running on
+  MI300X; ETA 24-26 hours from 2026-04-26 18:48 UTC
+- After Phase C completes, MI300X is free for #109's pilot training run
+- Recipe doc is now in `dflash-fe/RECIPE_RedHat_DFlash_MI300X.md`,
+  read at last revision 2026-04-24
+
+## References
+
+- `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md` — the source recipe
+- `docs/plans/task-93-path-c-trained-draft.prd` — Path C work that this
+  blocks
+- `docs/plans/sidecar-aware-draft-training.prd` — #106 work that this
+  blocks
+- `scripts/dflash_train_poc.py` — script being modernized
+- `scripts/fetch_calibration_corpus.sh` — corpus fetcher (Phase C extends)
+- `RedHatAI/gemma-4-31B-it-speculator.dflash` — reference HF repo
+- `vllm-project/speculators` — the upstream library mirroring this recipe
