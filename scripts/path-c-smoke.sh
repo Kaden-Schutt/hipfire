@@ -277,6 +277,7 @@ for entry in "${TESTS[@]}"; do
     fi
 
     stats=$(grep -aE '^emitted:|^cycles:|^accept_rate:' "$out_file" | head -3)
+    path_c_last=$(grep -a '^\[path-c\]' "$out_file" | tail -1)
 
     {
         echo "## $label (phase=$phase, b=12, k=2)"
@@ -287,6 +288,12 @@ for entry in "${TESTS[@]}"; do
             echo "- stats:"
             echo '  ```'
             echo "$stats" | sed 's/^/  /'
+            echo '  ```'
+        fi
+        if [ -n "$path_c_last" ]; then
+            echo "- path-c counters (HIPFIRE_DDTREE_PATH_C_VERBOSE=1):"
+            echo '  ```'
+            echo "  $path_c_last"
             echo '  ```'
         fi
         if [ -n "$panic" ]; then
