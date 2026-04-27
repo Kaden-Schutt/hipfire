@@ -33,6 +33,16 @@
 set -u
 cd "$(dirname "$0")/.."
 
+FULL=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --full) FULL=1 ;;
+        -h|--help) sed -n '3,33p' "$0"; exit 0 ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
 EXE="./target/release/examples/dflash_spec_demo"
 
 # Model resolution: explicit env wins, else /tmp default, else $HOME defaults.
@@ -101,6 +111,13 @@ fi
 # ── Prompts ──────────────────────────────────────────────────────────────
 PROSE_PROMPT="The Roman Empire, at its height, stretched from the windswept moors of northern Britain to the sands of the Arabian peninsula. Its decline was not a single event but a long slow unraveling that took centuries. Several factors contributed to this gradual collapse. The first and perhaps most important was"
 
+# Second prose: science-leaning expository — different domain than empire-history.
+PROSE2_PROMPT="The discovery of penicillin by Alexander Fleming in 1928 was a turning point in the history of medicine, but the path from a serendipitous mould in a Petri dish to a mass-produced antibiotic that saved millions of lives was anything but straightforward. The decade between Fleming's observation and the first clinical use of penicillin was marked by"
+
+# Third prose: narrative — a third register again to triangulate paragraph-level
+# repetition versus genuine cohesion.
+PROSE3_PROMPT="The lighthouse keeper's daughter had grown up listening to the sea. Every gale that battered the rocks below the cottage taught her something new about the moods of the Atlantic, and by the time she was twelve she could read a coming storm from the colour of the spray alone. The morning the lifeboat went out and did not return, the wind was"
+
 CODE_PROMPT='from typing import List
 
 
@@ -114,13 +131,48 @@ def has_close_elements(numbers: List[float], threshold: float) -> bool:
     """
 '
 
+# Second code: HumanEval #14 (all_prefixes). Different control flow than #0.
+CODE2_PROMPT='from typing import List
+
+
+def all_prefixes(string: str) -> List[str]:
+    """ Return list of all prefixes from shortest to longest of the input string
+    >>> all_prefixes("abc")
+    ["a", "ab", "abc"]
+    """
+'
+
+# Instruct: assistant-style request, less repetitive than continuation prompts.
+INSTRUCT_PROMPT="Explain step by step why a soap film between two parallel wires forms a flat surface rather than a curved one, and describe what would change if one of the wires were heated. Use clear physical reasoning."
+
 # ── Test matrix ──────────────────────────────────────────────────────────
-TESTS=(
+SHORT_TESTS=(
     "path-c-phase1-prose|phase1|PROSE_PROMPT|192"
     "path-c-phase1-code|phase1|CODE_PROMPT|128"
     "path-c-phase2-prose|phase2|PROSE_PROMPT|192"
     "path-c-phase2-code|phase2|CODE_PROMPT|128"
 )
+# --full: 3 prose × 2 code × 1 instruct, each at 256 tokens, on phase1 + phase2.
+# Per-prompt PRD smoke gate: unique_ratio > 0.3, max_freq < 0.4 over 256 tokens.
+FULL_TESTS=(
+    "path-c-phase1-prose1|phase1|PROSE_PROMPT|256"
+    "path-c-phase1-prose2|phase1|PROSE2_PROMPT|256"
+    "path-c-phase1-prose3|phase1|PROSE3_PROMPT|256"
+    "path-c-phase1-code1|phase1|CODE_PROMPT|192"
+    "path-c-phase1-code2|phase1|CODE2_PROMPT|192"
+    "path-c-phase1-instruct|phase1|INSTRUCT_PROMPT|256"
+    "path-c-phase2-prose1|phase2|PROSE_PROMPT|256"
+    "path-c-phase2-prose2|phase2|PROSE2_PROMPT|256"
+    "path-c-phase2-prose3|phase2|PROSE3_PROMPT|256"
+    "path-c-phase2-code1|phase2|CODE_PROMPT|192"
+    "path-c-phase2-code2|phase2|CODE2_PROMPT|192"
+    "path-c-phase2-instruct|phase2|INSTRUCT_PROMPT|256"
+)
+if [ "$FULL" -eq 1 ]; then
+    TESTS=("${FULL_TESTS[@]}")
+else
+    TESTS=("${SHORT_TESTS[@]}")
+fi
 
 # ── Detector (same logic as coherence-gate-dflash.sh) ────────────────────
 DETECT_PY=$(cat <<'PYEOF'
@@ -174,6 +226,7 @@ hard_errors=0
     echo "- commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
+    echo "- mode:   $( [ "$FULL" -eq 1 ] && echo full || echo short )"
     echo "- target: $TARGET"
     echo "- draft:  $DRAFT"
     echo
@@ -185,8 +238,12 @@ hard_errors=0
 for entry in "${TESTS[@]}"; do
     IFS='|' read -r label phase prompt_var max_tok <<< "$entry"
     case "$prompt_var" in
-        PROSE_PROMPT) prompt="$PROSE_PROMPT" ;;
-        CODE_PROMPT)  prompt="$CODE_PROMPT" ;;
+        PROSE_PROMPT)    prompt="$PROSE_PROMPT" ;;
+        PROSE2_PROMPT)   prompt="$PROSE2_PROMPT" ;;
+        PROSE3_PROMPT)   prompt="$PROSE3_PROMPT" ;;
+        CODE_PROMPT)     prompt="$CODE_PROMPT" ;;
+        CODE2_PROMPT)    prompt="$CODE2_PROMPT" ;;
+        INSTRUCT_PROMPT) prompt="$INSTRUCT_PROMPT" ;;
         *) echo "unknown prompt_var: $prompt_var" >&2; exit 2 ;;
     esac
 
