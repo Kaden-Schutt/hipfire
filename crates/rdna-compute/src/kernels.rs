@@ -197,6 +197,12 @@ pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
+// gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
+// and half8_t operands (vs half16_t). C-output mapping is a HYPOTHESIS
+// pending channel-test on RDNA4 silicon; see issue #54 and
+// `.skills/hipfire-arch-port/wmma-matrix.md`.
+pub const GEMM_QKV_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip");
 
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
