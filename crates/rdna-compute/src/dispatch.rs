@@ -4031,8 +4031,8 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC,
@@ -4095,8 +4095,8 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_wave64",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_WAVE64_SRC,
@@ -4206,8 +4206,8 @@ impl Gpu {
         y_up:   &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_WAVE64_SRC,
@@ -4274,8 +4274,8 @@ impl Gpu {
         x_residual: &GpuTensor,
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_batched_wave64",
                 kernels::GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC,
@@ -4379,8 +4379,8 @@ impl Gpu {
             // FP16 packed on all other RDNA: ~15% prefill improvement
             return self.gemm_hfq4g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_residual_wave64",
                 kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC,
@@ -4711,8 +4711,8 @@ impl Gpu {
             // Shadow allocation failed — fall through to the GEMV path.
         }
 
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = has_wave64_native(&self.arch);
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_wave64",
                 kernels::GEMM_HFQ4G256_WAVE64_SRC,
