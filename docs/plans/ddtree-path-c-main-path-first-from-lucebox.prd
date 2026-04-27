@@ -1,0 +1,382 @@
+# DDTree Path C — main-path-first lazy FA re-verify
+
+_Follow-up to Path A reverted (ecbc49d / 6c84b13, 2026-04-23) and Path B
+dead-ended (commit 39aa358, 2026-04-23). Unblocks DDTree slow-path kill on
+hybrid Qwen3 architectures (DeltaNet + FullAttention)._
+
+_Author note: this PRD is contributed from outside the hipfire codebase,
+informed by an independent Lucebox / buun-llama-cpp DDTree port that
+validated end-to-end on RDNA3 (RX 7900 XTX, gfx1100, ROCm 7.2.26043) using
+the architecture described below. Numbers cited come from that port; the
+Rust + HIP translation work is for hipfire to do, but the architectural
+shape is no longer speculative._
+
+## Why this exists
+
+Two prior paths failed:
+
+- **Path A** (ecbc49d) — byte-wise K gather without re-RoPE. Token-attractor
+  failure mode: `numbers(numbers(numbers(...)` despite +120% tok/s / +79% τ
+  / sd 0.15. Reverted after eyeball check.
+
+- **Path B variants B1/B2** (39aa358) — pre-RoPE K capture + post-commit
+  re-RoPE pass. **Structurally dead**: per the linked commit, "the pre-RoPE
+  K we capture in tree mode is ALREADY poisoned by upstream FA's wrong
+  phase deltas. No per-commit RoPE rotation on that K can recover the
+  correct values."
+
+The shared root cause is unchanged:
+
+> Tree-mode FA attention uses linearization slot deltas for relative
+> position phase (RoPE). For accepted nodes `[0, 1, 4, 5]` this gives
+> deltas `[1, 3, 1]`. A linear forward on the same accepted tokens would
+> use committed slot deltas `[1, 1, 1]`. Different relative-phase deltas
+> → different FA output → different wqkv → poisoned downstream K.
+> (39aa358)
+
+39aa358 lists four "updated viable paths". This PRD is **option 1**
+("FA-only re-verify on the committed chain") fleshed out with an
+implementation pattern that has been validated on the same target/draft
+class (Qwen3 hybrid 27B, RDNA3) end-to-end.
+
+## External validation: the Lucebox port
+
+The architecture below was independently developed and shipped in the
+`lucebox-hub/buun-llama-cpp` fork between 2026-04 and now, in four
+sequential commits whose messages are reproduced in full at the end of
+this document:
+
+| Commit | Innovation | What it solves |
+|---|---|---|
+| `0d534bd` | SD-060c: DDTree Phase 2 multi-pass verification | Sibling DeltaNet recurrent-state contamination ("the the the" garbage at budget>16). Decode main path flat, then evaluate branches lazily via tape-replayed state restoration. |
+| `2e5423d` | DDTree main-path-first ordering + tape replay for tree rollback | Establishes ordering invariant: main path commits cleanly first, branches restore from tape. |
+| `bd75571` | SD-070: tree-aware SSM kernels for single-pass DDTree verification | `parent_ids` for state reload at branch transitions (SSM/GDN); persistent f16 intermediate buffer per recurrent layer; conv tree kernel walks the parent chain. |
+| `729ded7` | SD-071: DDTree KV cache fix — eliminate re-decode after tree verification | Use **separate seq_ids** during tree verify (seq=0 main chain, seq=2 branches), then `seq_rm` to clean up instead of backup+restore+re-decode. `decode2` drops from 40-60 ms to 0 ms. |
+
+Empirical anchor on the Lucebox port (refreshed 2026-04-27 on the same
+machine that ran this PRD's hipfire bench):
+
+- Hardware: AMD Radeon RX 7900 XTX, gfx1100, 24.56 GB VRAM, ROCm
+  7.2.26043, HIP 7.2 (same node hipfire targets).
+- Target: `Qwen3.6-27B-Q4_K_M.gguf` (16.8 GB GGUF, 851 tensors on GPU).
+- Draft: Qwen3.6 DFlash safetensors.
+- DDTree budget: 22 (NVIDIA-tuned default, not RDNA3-tuned).
+
+| Run | n_gen | Wall (s) | tok/s | Accept/step | Commit/step | Output |
+|---|---:|---:|---:|---:|---:|---|
+| cold short | 20 | 2.35 | 8.52 | 41.7 % | 6.67 | varied, no attractor |
+| long steady | 128 | 5.00 | **25.62** | 34.8 % | 5.57 | varied, no attractor |
+
+`verify_compute` dominates per-step wall (175 ms/step on the long
+run, 597 ms cold). Path C does not move that ceiling — what it does is
+make the run **correct**: 128 tokens with 23 draft steps and 34.8 %
+per-step acceptance, no `numbers(numbers(...))` failure mode, no
+token-distribution collapse. The architecture is portable across the
+RoPE-poisoning failure class. What blocks acceptance _above_ the
+budget-0/flat floor after correctness lands is a separate, known issue
+described under "Known caveats" below.
+
+## Architecture: main-path-first lazy FA re-verify
+
+The pattern is three steps, executed in order.
+
+### Step 1 — main path flat verify (existing infra)
+
+Choose a **main path** through the DDTree (currently: greedy
+highest-prior chain, root → deepest greedy descendant). Run the existing
+**linear** verify forward on this chain only:
+
+- KV writes go to committed slots `[start_pos, start_pos+1, ..., start_pos+L−1]`
+  where `L = main_path_depth`.
+- RoPE phases are committed-slot phases. **No poisoning**: this is a flat
+  linear forward, identical to AR.
+- DeltaNet `GdnTape` records innovations at each step (already in
+  `speculative.rs:498-823`).
+- Hidden ring buffer captures pre-LM-head hidden states.
+- LM head produces target marginals at each main-path slot; verify
+  acceptance against the draft's main-path tokens.
+
+Outcome: an accepted prefix of length `accepted_main ∈ [0, L]`. KV slots
+`[start_pos, start_pos + accepted_main − 1]` are committed at correct
+phases. DeltaNet tape rows `[0..accepted_main]` are the canonical
+recurrent trajectory.
+
+### Step 2 — lazy per-branch FA-only re-verify
+
+For each child of the main path that branches off at depth `d ≤
+accepted_main`, the candidate is its own short chain `[d+1, d+2, ...]`.
+Verify it lazily as follows:
+
+1. **Restore DeltaNet state** from `GdnTape` row `d` (existing
+   `DeltaNetSnapshot::restore_to`, see `speculative.rs:474`).
+2. **Run a forward** on the branch's tokens at depth `d+1, d+2, ...`,
+   with positions `[start_pos+d, start_pos+d+1, ...]` (the **committed**
+   positions the branch *would* land at if accepted, not the linearized
+   tree slot).
+3. The forward is FA-only on the FullAttention layers (which now see
+   correct phase deltas) plus a normal DN forward on the LinearAttention
+   layers (which now see correct recurrent state thanks to the tape
+   restore). No tree mask, no linearization phase, no `pre_rope_k`
+   capture, no post-commit re-RoPE pass.
+4. KV writes for FA layers go to **scratch slots** (or a separate
+   `seq_id`, see Step 3) — not the main chain's committed slots, so the
+   main path's cache is not corrupted by failed branch tries.
+5. Verify the branch's logits against its draft tokens. On accept:
+   commit branch tokens by **promoting scratch KV writes** to the
+   committed positions and extending DN tape. On reject: discard scratch
+   slots; main path remains intact.
+
+**Trade-off vs Path B's failed single-pass tree FA**: Path C does
+`accepted_main + 1` FA forwards in the worst case (one for the main path,
+one for each accepted-then-extended branch level), where Path B did 1.
+But each of Path C's forwards is on a chain ≤ accepted depth, and the FA
+weights are reused — wall cost is roughly `(1 + acc_branch_depth) × FA_cost`,
+matching what Lucebox measured: branches dominated by their own forward
+cost rather than by per-branch decode setup. The win vs Path B is
+correctness; the win vs full re-verify (option 1 in 39aa358 framing) is
+that DN layers are tape-restored, not re-forwarded, saving the SSM scan.
+
+### Step 3 — KV cleanup (separate seq_ids, optional)
+
+The Lucebox port discovered (SD-071) that the simplest way to keep
+branch KV writes from polluting the main chain is to **assign branches a
+distinct seq_id** at write time and use `seq_rm` to drop rejected
+branches. This works because llama.cpp's KV cache is seq_id-indexed.
+
+Hipfire's KV cache is structurally different (asym3/asym4 fold, linear
+write into a single per-layer ring). The equivalent here is one of:
+
+- **Scratch slots**: reserve `branch_max_depth` slots past `start_pos +
+  L` in the same KV ring; FA branch forwards write there; on accept,
+  `memcpy_dtods` from scratch range to committed range (cheap; same
+  buffer, just an offset shift).
+- **Branch shadow cache**: a separate `KvCache` view sized to
+  `branch_max_depth × n_kv_heads × head_dim` that the FA branch forward
+  attends into for branch slots and into the main cache for ancestor
+  slots. Accept = `memcpy_dtods` shadow → main + tape extend. Reject =
+  no-op.
+
+The scratch-slot variant is closer to existing hipfire patterns and the
+recommended starting point. The shadow cache is a hedge if scratch slot
+ordering interacts badly with the verify-graph capture path.
+
+## Mapping to existing hipfire infrastructure
+
+What's already there and reusable:
+
+| Need | Existing | Location |
+|---|---|---|
+| DeltaNet snapshot | `DeltaNetSnapshot` | `speculative.rs:432` |
+| DeltaNet tape (multi-row) | `DeltaNetTape`, `GdnTape` | `speculative.rs:498-823` |
+| Tape restore | `DeltaNetSnapshot::restore_to` | `speculative.rs:474` |
+| Tree node parent walk | `DdTree::ancestors_of` | `ddtree.rs:69` |
+| Linearized tree with parent ids | `linearize_tree_with_parents` | `ddtree.rs:403` |
+| Linear (flat) verify forward | `verify_dflash_block` (no tree_verify arg) | `speculative.rs:2025` |
+| Tree-aware GDN kernel (parent_ids) | `gated_delta_net_q8_tree.hip` | `kernels/src/` |
+| Tree-aware conv kernel (parent walk) | `conv1d_silu_split_tree.hip` | `kernels/src/` |
+
+What needs to be added:
+
+1. **Main-path selector**: given a `DdTree`, return the greedy highest-prior
+   chain (root → leaf). One-time computation in `ddtree.rs`.
+2. **Branch enumerator**: given main path + accepted depth, return list of
+   `(parent_node_index, branch_chain)` pairs to lazily verify. Reuse
+   `ancestors_of` and `child_maps`.
+3. **`spec_step_ddtree_path_c`** in `speculative.rs`: orchestrates Step 1 →
+   Step 2 → Step 3. Replaces the current `verify_dflash_block_tree`
+   dispatch when DDTree budget > 0; the existing function stays for the
+   linear-verify and budget-0 fast path.
+4. **Branch FA forward**: a thin variant of `verify_dflash_block_inner`
+   that takes a `DeltaNetSnapshot` to restore from before forwarding,
+   and writes FA KV to scratch slots. Most of the work is already there
+   in the inner function; the diff is "snapshot.restore() at entry +
+   `kv_slot_offset` parameter on the FA dispatch."
+5. **Scratch KV slot range**: extend `VerifyScratch` with
+   `branch_kv_scratch: Vec<GpuTensor>` sized to `branch_max_depth ×
+   n_kv_heads × head_dim`, one per FullAttention layer. Allocated at
+   `VerifyScratch::new` time, reused across cycles. ~few hundred KB
+   for 27B at branch_max=8.
+
+## Phasing
+
+Three phases, each independently releasable behind an env-var gate
+(`HIPFIRE_DDTREE_PATH_C={off,phase1,phase2,phase3}`, default `off` until
+phase3 passes the smoke gates). This matches the hipfire phasing pattern
+used for Path B.
+
+### Phase 1 — main-path-first (no branches)
+
+- Add main-path selector in `ddtree.rs`.
+- New `spec_step_ddtree_path_c` runs Step 1 only; treats all branch
+  tokens as "rejected past main path acceptance depth."
+- Equivalent to running budget-0 with a tree-shaped draft: should produce
+  identical output to `verify_dflash_block` on the main chain.
+
+**Smoke gate**: bit-exact tokens vs `verify_dflash_block` for 100 prompts
+on 27B Qwen3.6 + DFlash, temp=0.
+
+**Expected delta vs Path B-dead state**: zero perf change (same
+forward count); zero correctness change. This phase exists to land the
+plumbing without behavior risk.
+
+### Phase 2 — lazy branch FA-only re-verify (scratch slots)
+
+- Add branch enumerator + scratch slot range.
+- Wire branch FA forward (Step 2 with scratch slots, Step 3 variant A).
+- Token-distribution gate (see "Smoke gates") on every smoke run before
+  declaring a Phase 2 win.
+
+**Smoke gate**: (a) `unique_tokens / total > 0.3` and `max_freq / total
+< 0.4` on 256-token decodes for 3 prompt classes (prose / code / instruct).
+(b) Eyeball decoded output for one prose, one code, one instruct prompt.
+(c) Coherence battery (commit `9883e98`) passes.
+
+**Expected delta**: τ recovery on code/instruct above the budget-0 (flat)
+floor. Lucebox-port cross-check: tree branches are technically functional
+but acceptance stays modest (~28% on independent-logits drafts). See
+"Known caveats."
+
+### Phase 3 — verify-graph capture for Path C (optional)
+
+- Re-enable verify-graph capture for the Path C path (currently broken
+  for tree mode per `verify_dflash_block_inner` lines 2095-2113).
+- Each branch FA forward is a separate captured graph (parameterized by
+  branch depth, captured once per `branch_depth` value).
+- Main-path graph capture is unchanged from current linear-verify path
+  (already proven good per the +14% tok/s on 27B-3.5).
+
+**Smoke gate**: same as Phase 2 plus `HIPFIRE_VERIFY_GRAPH=1` matrix.
+
+**Expected delta**: ~10-15% tok/s on top of Phase 2, mirroring the
++14% gain seen when verify-graph was first enabled on linear verify.
+
+## Smoke gates (mandatory, copied from Path B PRD style)
+
+Path C touches the verify forward and KV write hot path. The Path A /
+Path B failure mode (degenerate token attractor — every metric loves it,
+output is garbage) **applies here too**. Even though the architecture is
+validated externally, RDNA3 + Rust + asym3 KV is a different
+implementation surface; structural correctness in C/CUDA does not
+transfer for free.
+
+For every Phase 2 / Phase 3 smoke run:
+
+1. **Token-distribution check** after every smoke, automated:
+   - Decode 256 tokens.
+   - Assert `unique_token_count / total > 0.3`.
+   - Assert `max_token_frequency / total < 0.4`.
+   - On fail → abort, do not trust τ.
+2. **Eyeball decoded text** for ≥ 1 prose, 1 code, 1 instruct prompt
+   before commit.
+3. **3-prompt smoke before any commit**: prose / code / instruct,
+   first 200 chars to stderr, visual scan.
+4. Coherence battery (`9883e98`) must pass.
+5. Speed/τ-gates are necessary but not sufficient.
+
+The Lucebox port hit a near-attractor mode during Phase 1 development of
+SD-060c (siblings corrupting recurrent state, output looked like "the
+the the the"). It surfaced exactly as 39aa358 warns. The fix landing
+order — main-path-first ordering FIRST, branches LAST — is what made
+the contamination boundary tractable; reversing the phasing tends to
+produce correctness regressions that don't surface in pure stat gates.
+
+## Risks and known caveats
+
+### The independent-logits draft wall (the real ceiling)
+
+The Lucebox port's SD-060c and SD-071 commit messages both flag this:
+
+> *"DFlash's independent per-position logits make tree branches
+> ineffective — optimal budget remains 0 (flat). Infrastructure ready
+> for better drafter."* (SD-060c)
+>
+> *"DFlash independent logits give poor branch acceptance (28%).
+> Infrastructure ready for better drafter."* (SD-071)
+
+Path C resolves the **correctness** failure of Path A/B (RoPE poisoning
+→ token attractor). It does not, on its own, lift τ above the
+budget-0/flat floor on dense Qwen3.5/3.6 targets paired with the
+current DFlash drafter, because that drafter emits per-position
+*marginal* distributions; tree branches at the same depth are sampled
+independently. With independent draws, P(accept whole branch) ≈
+∏ P(accept each token), and the joint that DDTree is supposed to exploit
+isn't there to exploit.
+
+This is the same wall Lucebox hit. The gap between "tree mode works
+correctly on RDNA3" (10.18 tok/s on a cold cold cold short run, no
+attractor) and "tree mode beats flat on RDNA3" is a draft-quality gap,
+not an implementation gap. Two ways forward, both upstream of Path C:
+
+- **Tree-aware DFlash training** (mentioned in 39aa358's task list,
+  "Path C — trained draft", `task-93-path-c-trained-draft.prd`): add a
+  consistency loss across positions during draft training so the
+  position-i and position-(i+1) heads agree on the joint, not just on
+  the marginals.
+- **Sidecar n-gram cache**: PLD/n-gram cache match feeds into branch
+  selection, biasing tree topology toward chains that are jointly
+  high-prior. This is what `chained-ngram-integration.prd` (already in
+  `docs/plans/`) is reaching for.
+
+These are out of scope for Path C correctness, but worth flagging so
+that Phase 2 / Phase 3 acceptance gates aren't read as failure: a 28%
+branch acceptance rate IS the expected result, not a bug. The win on
+top of that is the unlocked path to use a better drafter without
+running into the RoPE poisoning wall.
+
+### Scratch slot vs verify-graph capture
+
+Branch FA forwards write to scratch slots, then `memcpy_dtods` on
+accept. Inside a captured graph this works only if the source/dest
+ranges are stable across replays. If branch depth varies cycle to
+cycle, the captured graph will bake in a fixed branch_depth and silently
+do the wrong copy. Path C's Phase 3 should capture **one graph per
+branch_depth value seen**, mirroring the current `verify_graph` cache
+(`speculative.rs` `verify-graph` cache size). Watch for the same failure
+class as the 480e51e/ee0bedf attempt to capture tree verify with varying
+mask shapes.
+
+### asym3 K rotation and FA dispatch
+
+Path C's branch FA writes K to scratch slots **with branch-committed
+positions**, so the asym3 3-bit-rotated K kernel needs to accept a
+`kv_slot_offset` parameter (or the caller writes to a tensor offset
+within the existing per-layer K buffer that maps to scratch). The K
+rotation math is unchanged — the rotated K is a function of the
+post-RoPE K bytes, and post-RoPE K depends only on the position phase
+that this PRD has now made correct. So no kernel-math change is needed,
+just an addressing change.
+
+## References
+
+- Path A revert: `ecbc49d`, corruption confirmation `6c84b13` (2026-04-23).
+- Path B dead-end: `39aa358` (2026-04-23). The four "updated viable
+  paths" listed there map to Path C as: option 1 = the FA forward in
+  Step 2; option 2 = orthogonal to Path C, can be added on top; option
+  3 = main-path-first ordering of Step 1; option 4 = explicitly NOT
+  taken (depth-based phase scheme has the sibling KV-write race).
+- Lucebox / buun-llama-cpp commits (the validation): `0d534bd`,
+  `2e5423d`, `bd75571`, `729ded7`. All four are in the
+  `lucebox-hub/buun-llama-cpp` repo.
+- DDTree reference impl: `github.com/liranringel/ddtree` (PyTorch, MIT).
+  The reference is single-pass batched tree attention — non-applicable
+  on hybrid Qwen3.5/3.6 for the same reason `ddtree.rs:6-12` notes.
+- Lucebox blog (per the README's "Inspiration: Lucebox" section): blog
+  post on Qwen3.5-27B DFlash with the persist-write SSM intermediate
+  and bounded rolling target-feature buffer that this PRD's tape and
+  ring-buffer infra also pattern after.
+- RDNA3 cross-check: same machine that produced this PRD's hipfire
+  bench. Refreshed 2026-04-27: cold n_gen=20 → 8.52 tok/s, steady
+  n_gen=128 → 25.62 tok/s, both with budget=22 (NVIDIA-tuned, not
+  RDNA3-tuned). 34.8 % per-step acceptance on the steady run; output
+  varied / no attractor in either.
+
+## What this PRD does NOT propose
+
+- A change to MQ4 / asym3 / WMMA kernel math.
+- A new draft training run.
+- Single-pass batched tree FA (option 4 in 39aa358 — left explicitly on
+  the table for someone who wants to fight the sibling KV-write race).
+- A licence change. The PRD itself is contributed without strings; if
+  hipfire wants to use any of the Lucebox-side commit references for
+  inspiration, those commits live in a public repo and the maintainer
+  is open to a technical conversation on either side.
