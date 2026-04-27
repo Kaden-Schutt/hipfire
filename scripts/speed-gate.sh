@@ -124,7 +124,13 @@ bench_dflash_27b_lru() {
     local target draft
     for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
         [ -f "$dir/qwen3.5-27b.mq4" ] && [ -z "${target:-}" ] && target="$dir/qwen3.5-27b.mq4"
-        [ -f "$dir/qwen35-27b-dflash.mq4" ] && [ -z "${draft:-}" ] && draft="$dir/qwen35-27b-dflash.mq4"
+        # Registry filename is `qwen35-27b-dflash-mq4.hfq` (cli/index.ts:469).
+        # The legacy `qwen35-27b-dflash.mq4` was renamed when the registry
+        # standardized on `<base>-<quant>.hfq`. Accept both for back-compat
+        # with older pulls; #61 reporter hit MISSING_DRAFT here.
+        for cand in "$dir/qwen35-27b-dflash-mq4.hfq" "$dir/qwen35-27b-dflash.mq4"; do
+            [ -f "$cand" ] && [ -z "${draft:-}" ] && draft="$cand" && break
+        done
     done
     [ ! -x "$DFLASH_EXE" ] && { echo "MISSING_BIN"; return; }
     [ -z "${target:-}" ] && { echo "MISSING_TARGET"; return; }
@@ -189,7 +195,23 @@ _bench_dflash_merge_sort_core() {
 }
 
 bench_dflash_27b_merge_sort() {
-    _bench_dflash_merge_sort_core "qwen3.5-27b.mq4" "qwen35-27b-dflash.mq4"
+    # Registry filename is `qwen35-27b-dflash-mq4.hfq`; the legacy
+    # `qwen35-27b-dflash.mq4` was renamed when the registry standardized.
+    # Try the current name first, then the legacy. Reported in #61.
+    if _draft_exists "qwen35-27b-dflash-mq4.hfq"; then
+        _bench_dflash_merge_sort_core "qwen3.5-27b.mq4" "qwen35-27b-dflash-mq4.hfq"
+    else
+        _bench_dflash_merge_sort_core "qwen3.5-27b.mq4" "qwen35-27b-dflash.mq4"
+    fi
+}
+
+# Helper: does a draft file with this basename exist in any known model dir?
+_draft_exists() {
+    local name="$1"
+    for dir in "$MODELS_DIR" "$HOME/.hipfire/models"; do
+        [ -f "$dir/$name" ] && return 0
+    done
+    return 1
 }
 
 bench_dflash_9b_merge_sort() {
