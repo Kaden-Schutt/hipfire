@@ -1,5 +1,5 @@
 # hipfire speed-gate baseline — gfx908 (CDNA1, AMD Instinct MI100)
-# Captured 2026-04-27 against commit 9709964 on port/gfx908-wave64
+# Captured 2026-04-27 on port/gfx908-wave64
 # Config: KV=asym3 (matches the speed-gate's run_bench env_prefix),
 #         no HIPFIRE_GRAPH on 0.8B (gate skips it; known panic).
 #         HIPFIRE_GRAPH not enabled on 4B/9B either pending hipGraph
@@ -16,22 +16,24 @@
 # GROUND FLOOR — no commit may regress below these numbers.
 #
 # Cross-process verified across 5 fresh-process runs per metric:
-#   9B gen: master 64.38 ± 0.27 vs HEAD 65.70 ± 0.41 (range gap 0.6 tok/s)
-#   4B gen: master 75.22 ± 0.30 vs HEAD 76.16 ± 0.30 (range gap 0.6 tok/s)
-# i.e. the wave64 dispatch from #58 lifted 9B decode by +2.05%, 4B by +1.25%.
-# 0.8B and prefill columns are within within-session noise (kernels
-# exercised under wave32 fallback regardless of the new dispatch arm).
+#   9B gen: master 64.38 ± 0.27  →  HEAD 70.34 ± 0.40   +9.3%  (no range overlap)
+#   4B gen: master 75.22 ± 0.30  →  HEAD 78.88 ± 0.30   +4.9%  (no range overlap)
+# This branch enables wave64 dispatch on 4 fused projection sites + the
+# gemv decode path + adds a wave64 variant of fused_gate_up_hfq4g256.
+# 0.8B and prefill columns are within within-session noise (kernel-launch
+# overhead dominates 0.8B decode; gfx908 prefill falls to gemm_*_fp16
+# packed because gfx908 isn't in has_dot2_f32_f16 — separate lever).
 
-0.8b_mq4_pp32_prefill_tok_s=396.8
-0.8b_mq4_gen_tok_s=230.7
-0.8b_mq4_pp128_prefill_tok_s=423.4
+0.8b_mq4_pp32_prefill_tok_s=397.2
+0.8b_mq4_gen_tok_s=235.1
+0.8b_mq4_pp128_prefill_tok_s=423.5
 
 4b_mq4_pp32_prefill_tok_s=73.9
-4b_mq4_gen_tok_s=76.8
+4b_mq4_gen_tok_s=78.8
 4b_mq4_pp128_prefill_tok_s=75.7
 
 9b_mq4_pp32_prefill_tok_s=35.6
-9b_mq4_gen_tok_s=66.5
+9b_mq4_gen_tok_s=69.8
 9b_mq4_pp128_prefill_tok_s=36.0
 
 # 27b: not yet measured. MI100's 32 GiB VRAM has plenty of headroom for the

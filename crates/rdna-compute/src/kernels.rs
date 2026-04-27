@@ -486,6 +486,11 @@ pub const ATTENTION_FLASH_SRC: &str = include_str!("../../../kernels/src/attenti
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
 pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256.hip");
 
+/// Wave64-native counterpart to FUSED_GATE_UP_HFQ4G256_SRC for CDNA1/3.
+/// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
+/// gate_m + up_m to (total + 1) / 2. Byte-exact with the wave32 base.
+pub const FUSED_GATE_UP_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64.hip");
+
 
 /// INT8 co-located KV v2: [f16 scale (2B)][padding (2B)][int8 × head_dim] = 132 bytes per head.
 /// f16 scale matches Q8_0 but with one block per head. Padding for 4-byte alignment.

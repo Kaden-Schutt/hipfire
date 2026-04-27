@@ -7164,7 +7164,23 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
-        self.ensure_kernel("fused_gate_up_hfq4g256", kernels::FUSED_GATE_UP_HFQ4G256_SRC, "fused_gate_up_hfq4g256")?;
+        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna_wave64 {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256_wave64",
+                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
+                "fused_gate_up_hfq4g256_wave64",
+            )?;
+            let total = (gate_m + up_m) as u32;
+            ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+        } else {
+            self.ensure_kernel(
+                "fused_gate_up_hfq4g256",
+                kernels::FUSED_GATE_UP_HFQ4G256_SRC,
+                "fused_gate_up_hfq4g256",
+            )?;
+            ("fused_gate_up_hfq4g256", [32u32, 1, 1], (gate_m + up_m) as u32)
+        };
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -7179,9 +7195,8 @@ impl Gpu {
             &yu as *const _ as *mut c_void, &gm as *const _ as *mut c_void,
             &um as *const _ as *mut c_void, &kv as *const _ as *mut c_void,
         ];
-        let total_rows = (gate_m + up_m) as u32;
         self.launch_maybe_blob(
-            "fused_gate_up_hfq4g256", [total_rows, 1, 1], [32, 1, 1], 0, &mut params,
+            func_name, [grid_x, 1, 1], block, 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
@@ -11096,17 +11111,18 @@ impl Gpu {
                             kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_gate_up_hfq4g256",
                             kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
-                // CDNA3 (MI300X / gfx94x) wave64-native variants — cut
-                // wavefront pressure in half on the three hottest kernels
-                // (30 LA fused + 40 MoE gate_up + 40 MoE down per token
-                // on A3B). Wave32 block=[32,1,1] kernels otherwise waste
-                // the upper 32 lanes of every wave slot.
-                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                // CDNA1 (gfx908) + CDNA3 (gfx94x) wave64-native variants — cut
+                // wavefront pressure in half on the hottest kernels. Wave32
+                // block=[32,1,1] kernels otherwise waste the upper 32 lanes
+                // of every wave slot on these wave64-native arches.
+                if matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942") {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("fused_qkv_hfq4g256_wave64",
                                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_gate_up_hfq4g256_wave64",
+                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
                                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
@@ -11155,13 +11171,15 @@ impl Gpu {
                             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
-                // CDNA3 wave64 variants — see hfq4 branch for rationale.
-                if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") {
+                // CDNA1 (gfx908) + CDNA3 wave64 variants — see hfq4 branch for rationale.
+                if matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942") {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("fused_qkv_hfq4g256_wave64",
                                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC.to_string()));
+                    specs.push(("fused_gate_up_hfq4g256_wave64",
+                                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_gate_up_indexed_wave64",
                                 kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_WAVE64_SRC.to_string()));
                     specs.push(("gemv_hfq4g256_moe_down_indexed_wave64",
