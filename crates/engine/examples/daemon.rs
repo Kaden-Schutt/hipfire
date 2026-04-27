@@ -998,29 +998,43 @@ fn load_dflash_state(
             // builder. Algorithm 1's typical setting is 4; values above
             // ~32 stop being meaningful (siblings beyond rank-32 contribute
             // ≪1% mass on a Qwen-class draft) and inflate scratch usage
-            // without acceptance benefit. The vocab_size upper bound the
-            // previous version used was permissive to the point of being
-            // a footgun (152064 on Qwen3.6 → unbounded children).
-            const DDTREE_TOPK_MAX: usize = 32;
+            // without acceptance benefit.
+            //
+            // Two upper bounds:
+            //   - DDTREE_TOPK_MAX: usability cap (32) — beyond this, no
+            //     acceptance gain on Qwen-class targets.
+            //   - vocab_size: HARD correctness cap. Asking the tree builder
+            //     to extract top-K from a distribution narrower than K
+            //     would panic in the kernel. Almost never the binding
+            //     constraint on real LLMs (vocab ~50K-200K), but matters
+            //     for small / test / character-level vocabs.
+            //
+            // Effective cap = min(32, vocab_size). Default = min(4, vocab_size).
+            // The previous-iteration vocab_size-only filter (no usability cap)
+            // was a footgun on Qwen3.6; the no-vocab-check version was a
+            // panic vector on tiny-vocab models. Need both.
+            let vocab = target_config.vocab_size;
+            let effective_topk_max = std::cmp::min(32usize, vocab);
+            let default_topk = std::cmp::min(4usize, vocab.max(1));
             let topk = match std::env::var("HIPFIRE_DDTREE_TOPK").ok() {
-                None => 4,
-                Some(s) if s.is_empty() => 4,
+                None => default_topk,
+                Some(s) if s.is_empty() => default_topk,
                 Some(s) => match s.parse::<usize>() {
-                    Ok(k) if k >= 1 && k <= DDTREE_TOPK_MAX => k,
+                    Ok(k) if k >= 1 && k <= effective_topk_max => k,
                     Ok(k) => {
                         eprintln!(
-                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {DDTREE_TOPK_MAX}]. \
-                             Falling back to default topk=4."
+                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {effective_topk_max}] \
+                             (vocab_size={vocab}). Falling back to default topk={default_topk}."
                         );
-                        4
+                        default_topk
                     }
                     Err(_) => {
                         eprintln!(
                             "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={:?} is not a positive integer. \
-                             Falling back to default topk=4.",
+                             Falling back to default topk={default_topk}.",
                             s
                         );
-                        4
+                        default_topk
                     }
                 },
             };
