@@ -248,15 +248,27 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   return { ...base, ...overrides };
 }
 
-// thinking: "off" prepends a directive to the system prompt asking the model
-// to skip <think> reasoning. Effective on instruction-tuned models (Qwen 3.5
-// in particular honors this); advisory-only — for hard suppression we'd need
-// a daemon-side <think></think> bypass injection.
-function applyThinkingMode(systemPrompt: string | undefined, thinking: string): string | undefined {
+// applyThinkingMode is intentionally NOT called anywhere. The previous
+// implementation injected a prose system directive that contained the
+// literal "<think>" / "</think>" special tokens, which Qwen3.5 read as
+// a partial generation cue and halted at 3-4 tokens. Coherence-gate
+// (which talks to the daemon directly with no system injection) keeps
+// passing on the same models, proving the daemon path is fine — the
+// breakage was always at the CLI layer where this directive landed.
+//
+// Kept as dead code for archaeology; do not re-enable. Multiple session
+// patches have re-introduced equivalent injections (`/no_think` in
+// system / user-prefix / user-suffix / mixed) and each variant breaks
+// some prompt shape on Qwen3.5 (3798399, 2d9c24b, 799c268, cf2a3d8,
+// 68b32ee, b292565 — all reverted in 5533926). The correct behavior
+// is no injection: thinking=off is advisory at the CLI layer; the
+// downstream <think>...</think> filter still hides visible reasoning.
+function _applyThinkingMode_deprecated(systemPrompt: string | undefined, thinking: string): string | undefined {
   if (thinking !== "off") return systemPrompt;
   const directive = "Respond directly without using <think>...</think> reasoning blocks. Give the final answer only.";
   return systemPrompt ? `${directive}\n\n${systemPrompt}` : directive;
 }
+void _applyThinkingMode_deprecated;
 
 // Build the {type: "load", ...} message for the daemon, carrying per-model
 // params (max_seq). The tag is optional — pass it from the caller when known,
@@ -991,13 +1003,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   }
 
   const modelCfg = resolveModelConfig(model);
-  const thinkingDirective = applyThinkingMode(undefined, modelCfg.thinking);
   const genMsg: any = {
     type: "generate", id: "run", prompt,
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  if (thinkingDirective) genMsg.system = thinkingDirective;
   if (modelCfg.max_think_tokens > 0) genMsg.max_think_tokens = modelCfg.max_think_tokens;
   if (image) {
     genMsg.image = resolve(image);
@@ -1285,11 +1295,17 @@ async function serve(port: number) {
           repeat_penalty: body.repeat_penalty ?? (body.frequency_penalty != null ? 1.0 + body.frequency_penalty : effective.repeat_penalty),
           top_p: body.top_p ?? effective.top_p,
         };
-        // Per-model thinking mode: prepend the "no-think" directive when
-        // this model's override (or the global config) sets thinking=off.
-        const thinkModel = resolveModelConfig(body.model).thinking;
-        const resolvedSystem = applyThinkingMode(systemPrompt || undefined, thinkModel);
-        if (resolvedSystem) genParams.system = resolvedSystem;
+        // thinking=off is currently a no-op at the CLI layer. Earlier
+        // versions injected a prose system directive ("Respond directly
+        // without using <think>...</think> reasoning blocks") here, but
+        // the literal special tokens in that string caused Qwen3.5 to
+        // halt at 3-4 tokens — coherence-gate (which hits the daemon
+        // direct, no system injection) consistently passes on the same
+        // models, while CLI-routed requests with this directive break.
+        // Pass through whatever system prompt the client sent, no
+        // augmentation. The downstream <think>...</think> filter still
+        // strips visible reasoning so users get clean answers.
+        if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
