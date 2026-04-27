@@ -1,0 +1,41 @@
+# hipfire speed-gate baseline — gfx908 (CDNA1, AMD Instinct MI100)
+# Captured 2026-04-27 against commit 9709964 on port/gfx908-wave64
+# Config: KV=asym3 (matches the speed-gate's run_bench env_prefix),
+#         no HIPFIRE_GRAPH on 0.8B (gate skips it; known panic).
+#         HIPFIRE_GRAPH not enabled on 4B/9B either pending hipGraph
+#         qualification on gfx908; raise this once it's measured.
+# Hardware: 2x AMD Instinct MI100 (32 GiB HBM2 each), bench pinned to GPU 0
+# ROCm 7.0.51831 / HIP 7.0 / amd-clang 20 (roc-7.0.0)
+# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
+#
+# Measurements: best-of-2 via bench_qwen35_mq4 with HIPFIRE_KV_MODE=asym3.
+# Two prefill sizes per model:
+#   pp32  — short-context / launch-overhead regression detector
+#   pp128 — realistic prompt / GEMM-efficiency detector
+# Decode numbers are taken from the pp32 run (warmup=5 + gen=50 settles).
+# GROUND FLOOR — no commit may regress below these numbers.
+#
+# Cross-process verified across 5 fresh-process runs per metric:
+#   9B gen: master 64.38 ± 0.27 vs HEAD 65.70 ± 0.41 (range gap 0.6 tok/s)
+#   4B gen: master 75.22 ± 0.30 vs HEAD 76.16 ± 0.30 (range gap 0.6 tok/s)
+# i.e. the wave64 dispatch from #58 lifted 9B decode by +2.05%, 4B by +1.25%.
+# 0.8B and prefill columns are within within-session noise (kernels
+# exercised under wave32 fallback regardless of the new dispatch arm).
+
+0.8b_mq4_pp32_prefill_tok_s=396.8
+0.8b_mq4_gen_tok_s=230.7
+0.8b_mq4_pp128_prefill_tok_s=423.4
+
+4b_mq4_pp32_prefill_tok_s=73.9
+4b_mq4_gen_tok_s=76.8
+4b_mq4_pp128_prefill_tok_s=75.7
+
+9b_mq4_pp32_prefill_tok_s=35.6
+9b_mq4_gen_tok_s=66.5
+9b_mq4_pp128_prefill_tok_s=36.0
+
+# 27b: not yet measured. MI100's 32 GiB VRAM has plenty of headroom for the
+# 15 GiB MQ4 model, but the bundle hasn't been pulled to this rig yet.
+# Add a row when the bundle is fetched. DFlash baselines (drafted-decode) also
+# pending — drafts lookup paths in scripts/speed-gate.sh's bench_dflash_*
+# need a `qwen35-9b-dflash-mq4.hfq` (or similar) pulled here.

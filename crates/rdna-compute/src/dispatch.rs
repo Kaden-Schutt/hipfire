@@ -38,11 +38,12 @@ fn gemv_rows_default(arch: &str) -> u32 {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => 1,
         "gfx1030" | "gfx1031" => 1,
-        // CDNA3 (MI300X): wave64 native. `gemv_hfq4g256_wide` uses
-        // block=[64,1,1] = exactly one wave — zero lane waste. The 32-
-        // thread multirow variants run on half a wave, so the wide
-        // kernel is the natural fit. Return rows=1 to trigger use_wide.
-        "gfx940" | "gfx941" | "gfx942" => 1,
+        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X): wave64 native.
+        // `gemv_hfq4g256_wide` uses block=[64,1,1] = exactly one wave —
+        // zero lane waste. The 32-thread multirow variants run on half a
+        // wave, so the wide kernel is the natural fit. Return rows=1 to
+        // trigger use_wide.
+        "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
         _ => 2,
     }
 }
@@ -2168,8 +2169,8 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256_wave64",
                 kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
@@ -2251,10 +2252,12 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // CDNA3 (MI300X / gfx94x) wave64-native path: 2 rows per block, halves
-        // grid count vs wave32 kernel which wastes half the wave slot.
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_x) = if cdna3 {
+        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X / gfx94x) wave64-native path:
+        // 2 rows per block, halves grid count vs wave32 kernel which wastes half
+        // the wave slot. gfx908 added 2026-04-27 — kernel uses no MFMA, just
+        // FMA + shfl_down within wave64.
+        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_wave64",
                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
@@ -2388,8 +2391,8 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkvza_hfq4g256_wave64",
                 kernels::GEMM_QKVZA_HFQ4G256_WAVE64_SRC,
@@ -2665,8 +2668,8 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkv_hfq4g256_fp16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna3 {
+        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkv_hfq4g256_wave64",
                 kernels::GEMM_QKV_HFQ4G256_WAVE64_SRC,
