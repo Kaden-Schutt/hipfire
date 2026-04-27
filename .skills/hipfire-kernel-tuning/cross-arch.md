@@ -141,22 +141,35 @@ contributed gfx12 — code now, dispatch flip after numbers.
 
 ## Cross-arch matrix (current targets)
 
-From `cli/index.ts::archDefaults` + the speed-baselines tree:
+From `cli/index.ts::archDefaults` + the speed-baselines tree
+(`tests/speed-baselines/`). The "Speed-baseline" column is literal:
+yes = a `<arch>.txt` file exists on disk and the speed-gate
+compares against it; no = the gate refuses to run for that arch
+unless `HIPFIRE_BASELINE_ARCH` overrides AND a baseline file is
+authored.
 
-| Arch | Wave | Matrix engine | KV default | Speed-baseline shipped |
+| Arch | Wave | Matrix engine | KV default | Speed-baseline |
 |---|---|---|---|---|
-| gfx1010 (RX 5700 XT) | 32 | none | asym2 | yes |
-| gfx1013 (BC-250 APU) | 32 | none | asym2 | yes |
-| gfx1030 (V620 / RX 6800 XT) | 32 | dot2 | asym3 | yes |
-| gfx1031 (RX 6700 XT) | 32 | dot2 | asym3 | (extrapolated) |
-| gfx1032 (RX 6600 XT) | 32 | dot2 | asym2 | (extrapolated) |
-| gfx1100 (7900 XTX) | 32 | WMMA | asym3 | yes |
-| gfx1101 (7900 XT) | 32 | WMMA | asym3 | (gfx1100-class) |
-| gfx1102 (7800 XT) | 32 | WMMA | asym3 | (gfx1100-class) |
-| gfx1150 (Strix Halo APU) | 32 | WMMA | asym2 | needs reproducer (#50) |
-| gfx1200 (Radeon AI Pro R9700) | 32 | WMMA-gfx12 | asym3 | yes (via PR #56 contributor) |
-| gfx1201 (RX 9070 XT) | 32 | WMMA-gfx12 | asym3 | needs perf data (#57) |
-| gfx94x (MI300X) | 64 | MFMA | asym3 (default) | yes (remote) |
+| gfx1010 (RX 5700 XT) | 32 | none | asym2 | no |
+| gfx1013 (BC-250 APU) | 32 | none | asym2 | yes (`gfx1013.txt`) |
+| gfx1030 (V620 / RX 6800 XT) | 32 | dot2 | asym3 | yes (`gfx1030.txt`) |
+| gfx1031 (RX 6700 XT) | 32 | dot2 | asym3 | no (gfx1030-class) |
+| gfx1032 (RX 6600 XT) | 32 | dot2 | asym2 | no |
+| gfx1100 (7900 XTX) | 32 | WMMA | asym3 | yes (`gfx1100.txt`) |
+| gfx1101 (7900 XT) | 32 | WMMA | asym3 | no (gfx1100-class) |
+| gfx1102 (7800 XT) | 32 | WMMA | asym3 | no (gfx1100-class) |
+| gfx1150 (Strix Halo APU) | 32 | WMMA | asym2 | no (issue #50 reproducer pending) |
+| gfx1200 (Radeon AI Pro R9700) | 32 | WMMA-gfx12 | asym3 | no |
+| gfx1201 (RX 9070 XT) | 32 | WMMA-gfx12 | asym3 | no (issue #57 — needs first measurement) |
+| gfx94x (MI300X) | 64 | MFMA | asym3 (default) | no (remote rentals only) |
 
-If you add a new arch, update `archDefaults`, ship a speed-baseline,
-add a row here.
+A row reading "no (gfx1100-class)" means the chip is in the same
+arch family with the same matrix engine and is expected to inherit
+the parent's perf shape within ~5%; if you have one, contributing a
+`gfx1101.txt` (etc.) is welcome — see [`hipfire-tester`](../hipfire-tester/)
+for the bench-submission flow.
+
+If you add a new arch, update `archDefaults`, ship a speed-baseline
+file, and add a row here. Adding the row without the file is the
+mistake this section was just rewritten to fix — Codex stop-time
+review caught it on the initial draft, 2026-04-27.
