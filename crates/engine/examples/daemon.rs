@@ -25,7 +25,7 @@ use engine::qwen35;
 use engine::qwen35::{DeltaNetState, LayerType};
 use engine::qwen35_vl;
 use engine::speculative::{
-    self, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
+    self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use engine::triattn::{EvictionCtx, TriAttnCenters};
 use hip_bridge::HipResult;
@@ -177,6 +177,31 @@ struct DflashState {
     ctx_capacity: usize,
     /// Block size the draft was trained at.
     block_size: usize,
+    /// Optional DDTree state. Populated only when `HIPFIRE_DDTREE_BUDGET` is
+    /// set to a positive integer at daemon startup. None = DDTree disabled,
+    /// the decode loop falls through to `spec_step_dflash` (chain mode).
+    /// See `spec_step_ddtree_batched` for the tree-verify path.
+    ddtree: Option<DdtreeState>,
+}
+
+/// Side state for DDTree-mode speculative decoding. Allocated alongside
+/// the rest of `DflashState` at model-load time when DDTree is enabled,
+/// reused across all decode cycles.
+struct DdtreeState {
+    /// Second DeltaNetSnapshot used by `spec_step_ddtree_batched`: snap0 =
+    /// pre-seed (lives in `DflashState::target_snap`), snap1 = post-seed.
+    /// The batched verify forward uses both to bracket the tree-verify pass.
+    post_seed_snap: DeltaNetSnapshot,
+    /// Persistent tree-verify scratch (attn_bias, parent_indices, kv-gather
+    /// staging, pre-RoPE K capture). Sized for `budget` non-root nodes.
+    scratch: DdtreeScratch,
+    /// Maximum non-root tree nodes per cycle. Read once at daemon startup
+    /// from `HIPFIRE_DDTREE_BUDGET` (positive integer required to enable).
+    budget: usize,
+    /// Per-position top-K width fed into the DDTree builder. Read from
+    /// `HIPFIRE_DDTREE_TOPK` (default 4 — matches paper Algorithm 1's
+    /// typical setting on dense Qwen targets).
+    topk: usize,
 }
 
 struct LoadedModel {
@@ -893,11 +918,28 @@ fn load_dflash_state(
     ).map_err(|e| format!("hidden_rb: {e}"))?;
 
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
-    let gdn_tape = GdnTape::new_for_config(gpu, target_config, draft_config.block_size)
+
+    // Read DDTree budget env-var BEFORE sizing GdnTape / VerifyScratch.
+    // When DDTree is enabled, both must be sized for `1 + budget` nodes
+    // per cycle (the linearized tree includes one root slot plus all
+    // tree nodes), not just `block_size`. Reading the env-var here keeps
+    // a single source of truth and avoids re-allocating these scratches
+    // after the model is on GPU.
+    let ddtree_budget_env: usize = std::env::var("HIPFIRE_DDTREE_BUDGET")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    let scratch_max_n = if ddtree_budget_env > 0 {
+        std::cmp::max(draft_config.block_size, 1 + ddtree_budget_env)
+    } else {
+        draft_config.block_size
+    };
+
+    let gdn_tape = GdnTape::new_for_config(gpu, target_config, scratch_max_n)
         .map_err(|e| format!("gdn_tape: {e}"))?;
     let verify_scratch = VerifyScratch::with_prefill(
         gpu,
-        draft_config.block_size,
+        scratch_max_n,
         target_config.dim,
         target_config.vocab_size,
         target_config.dim,
@@ -908,6 +950,55 @@ fn load_dflash_state(
         ctx_capacity * draft_config.num_extract() * draft_config.hidden,
     );
     let block_size = draft_config.block_size;
+
+    // Optional DDTree allocation. `HIPFIRE_DDTREE_BUDGET=<n>` (positive
+    // integer) wires the decode loop to `spec_step_ddtree_batched` instead
+    // of `spec_step_dflash`. `HIPFIRE_DDTREE_TOPK=<k>` controls the
+    // per-position top-K (default 4). Anything else, or budget=0, leaves
+    // the existing DFlash chain-mode path untouched.
+    let ddtree = match Some(ddtree_budget_env).filter(|&n| n > 0) {
+        Some(budget) => {
+            let topk = std::env::var("HIPFIRE_DDTREE_TOPK")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .filter(|&k| k >= 1 && k <= target_config.vocab_size)
+                .unwrap_or(4);
+            let post_seed_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
+                .map_err(|e| format!("ddtree post_seed_snap: {e}"))?;
+            let n_fa_layers = target_config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::FullAttention)
+                .count();
+            // qkv_dim mirrors GdnTape::new_for_config: linear-attention
+            // qkv row width (k_dim × 2 + v_dim).
+            let k_dim = target_config.linear_num_key_heads
+                * target_config.linear_key_head_dim;
+            let v_dim = target_config.linear_num_value_heads
+                * target_config.linear_value_head_dim;
+            let qkv_dim = k_dim * 2 + v_dim;
+            let scratch = DdtreeScratch::new(
+                gpu,
+                budget,
+                target_config.n_kv_heads,
+                target_config.head_dim,
+                qkv_dim,
+                n_fa_layers,
+            )
+            .map_err(|e| format!("ddtree scratch: {e}"))?;
+            eprintln!(
+                "[hipfire-daemon] DDTree enabled: budget={budget}, topk={topk}, n_fa_layers={n_fa_layers}"
+            );
+            Some(DdtreeState {
+                post_seed_snap,
+                scratch,
+                budget,
+                topk,
+            })
+        }
+        None => None,
+    };
+
     Ok(DflashState {
         draft_config,
         draft_weights,
@@ -919,6 +1010,7 @@ fn load_dflash_state(
         target_hidden_host,
         ctx_capacity,
         block_size,
+        ddtree,
     })
 }
 
@@ -942,7 +1034,9 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
 ) {
-    use engine::speculative::{spec_step_dflash, ModelSlot, ModelSlotConfig, SpecStats};
+    use engine::speculative::{
+        spec_step_ddtree_batched, spec_step_dflash, ModelSlot, ModelSlotConfig, SpecStats,
+    };
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
     // is always prepended because this fast path is single-turn.
@@ -1158,23 +1252,44 @@ fn generate_dflash(
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
         if position + df.block_size >= ctx_capacity { break; }
-        let step = match spec_step_dflash(
-            gpu, &mut target, &df.draft_weights, &df.draft_config,
-            &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
-            &mut df.target_snap, &df.verify_scratch,
-            position, seed_token,
-            None,                      // ctx_slice = full history
-            Some(&mut df.gdn_tape),
-            0.0_f32,                   // temperature
-            &mut rng_state,
-            None,                      // block_size override
-            None,                      // ngram_cache
-            &emitted,
-            0.0_f32,                   // cactus_delta
-            None,                      // pld_spine
-            1.0_f32,                   // repeat_penalty (off)
-            0,                         // repeat_window
-        ) {
+
+        // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
+        // at startup), route through `spec_step_ddtree_batched`. Otherwise
+        // keep the existing chain-mode `spec_step_dflash` path. The two
+        // produce the same `SpecStepResult` shape so the rest of the loop
+        // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
+        // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
+        let step_result = if let Some(dd) = df.ddtree.as_mut() {
+            spec_step_ddtree_batched(
+                gpu, &mut target, &df.draft_weights, &df.draft_config,
+                &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
+                &dd.scratch, &df.verify_scratch,
+                position, seed_token,
+                None,                      // ctx_slice = full history
+                dd.budget,
+                dd.topk,
+            )
+        } else {
+            spec_step_dflash(
+                gpu, &mut target, &df.draft_weights, &df.draft_config,
+                &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                &mut df.target_snap, &df.verify_scratch,
+                position, seed_token,
+                None,                      // ctx_slice = full history
+                Some(&mut df.gdn_tape),
+                0.0_f32,                   // temperature
+                &mut rng_state,
+                None,                      // block_size override
+                None,                      // ngram_cache
+                &emitted,
+                0.0_f32,                   // cactus_delta
+                None,                      // pld_spine
+                1.0_f32,                   // repeat_penalty (off)
+                0,                         // repeat_window
+            )
+        };
+        let step = match step_result {
             Ok(s) => s,
             Err(e) => {
                 let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"spec_step: {}"}}"#, id, e);
