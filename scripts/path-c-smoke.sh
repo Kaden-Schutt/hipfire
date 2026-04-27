@@ -34,9 +34,11 @@ set -u
 cd "$(dirname "$0")/.."
 
 FULL=0
+GRAPH_AB=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --full) FULL=1 ;;
+        --graph-ab) GRAPH_AB=1 ;;  # A/B verify-graph capture on/off (Phase 3 gate)
         -h|--help) sed -n '3,33p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
@@ -174,6 +176,20 @@ else
     TESTS=("${SHORT_TESTS[@]}")
 fi
 
+# --graph-ab pairs each test with a `-nograph` variant that runs the same
+# command with HIPFIRE_VERIFY_GRAPH=0. Used to validate the PRD's Phase 3
+# expected delta (+10-15 % tok/s with verify-graph capture on the Path C
+# main + branch FA forwards). Doubles the test count.
+if [ "$GRAPH_AB" -eq 1 ]; then
+    AB=()
+    for t in "${TESTS[@]}"; do
+        AB+=("$t")
+        IFS='|' read -r label phase prompt_var max_tok <<< "$t"
+        AB+=("${label}-nograph|$phase|$prompt_var|$max_tok|nograph")
+    done
+    TESTS=("${AB[@]}")
+fi
+
 # ── Detector (same logic as coherence-gate-dflash.sh) ────────────────────
 DETECT_PY=$(cat <<'PYEOF'
 import sys, re, json, collections
@@ -236,7 +252,7 @@ hard_errors=0
 } > "$OUT"
 
 for entry in "${TESTS[@]}"; do
-    IFS='|' read -r label phase prompt_var max_tok <<< "$entry"
+    IFS='|' read -r label phase prompt_var max_tok graph_flag <<< "$entry"
     case "$prompt_var" in
         PROSE_PROMPT)    prompt="$PROSE_PROMPT" ;;
         PROSE2_PROMPT)   prompt="$PROSE2_PROMPT" ;;
@@ -246,11 +262,18 @@ for entry in "${TESTS[@]}"; do
         INSTRUCT_PROMPT) prompt="$INSTRUCT_PROMPT" ;;
         *) echo "unknown prompt_var: $prompt_var" >&2; exit 2 ;;
     esac
+    # graph_flag = "nograph" → HIPFIRE_VERIFY_GRAPH=0 for this run; otherwise
+    # default behaviour (graph capture on by default for eligible models).
+    if [ "${graph_flag:-}" = "nograph" ]; then
+        graph_env=("HIPFIRE_VERIFY_GRAPH=0")
+    else
+        graph_env=()
+    fi
 
     echo "== $label =="
     out_file="/tmp/path_c_out_$$.log"
     t0=$(date +%s.%N)
-    timeout 240 "$EXE" \
+    timeout 240 env "${graph_env[@]}" "$EXE" \
         --target "$TARGET" --draft "$DRAFT" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
         --kv-mode asym3 --no-chatml \
