@@ -1035,7 +1035,8 @@ fn generate_dflash(
     max_tokens: usize,
 ) {
     use engine::speculative::{
-        spec_step_ddtree_batched, spec_step_dflash, ModelSlot, ModelSlotConfig, SpecStats,
+        spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
+        ModelSlotConfig, SpecStats,
     };
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
@@ -1259,17 +1260,37 @@ fn generate_dflash(
         // produce the same `SpecStepResult` shape so the rest of the loop
         // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
         // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
+        //
+        // `HIPFIRE_DDTREE_PATH_C=phase1` (only meaningful when DDTree is
+        // already enabled) reroutes to `spec_step_ddtree_path_c`, which
+        // runs Step 1 of the PRD only — main-path-first linear verify, no
+        // branches. Bit-exact gate: should produce the same tokens as
+        // calling `verify_dflash_block` directly on the greedy main chain.
+        // See `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+        let path_c_phase = std::env::var("HIPFIRE_DDTREE_PATH_C").ok();
         let step_result = if let Some(dd) = df.ddtree.as_mut() {
-            spec_step_ddtree_batched(
-                gpu, &mut target, &df.draft_weights, &df.draft_config,
-                &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
-                &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
-                &dd.scratch, &df.verify_scratch,
-                position, seed_token,
-                None,                      // ctx_slice = full history
-                dd.budget,
-                dd.topk,
-            )
+            if path_c_phase.as_deref() == Some("phase1") {
+                spec_step_ddtree_path_c(
+                    gpu, &mut target, &df.draft_weights, &df.draft_config,
+                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                    &mut df.target_snap, &mut df.gdn_tape, &df.verify_scratch,
+                    position, seed_token,
+                    None,                      // ctx_slice = full history
+                    dd.budget,
+                    dd.topk,
+                )
+            } else {
+                spec_step_ddtree_batched(
+                    gpu, &mut target, &df.draft_weights, &df.draft_config,
+                    &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
+                    &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
+                    &dd.scratch, &df.verify_scratch,
+                    position, seed_token,
+                    None,                      // ctx_slice = full history
+                    dd.budget,
+                    dd.topk,
+                )
+            }
         } else {
             spec_step_dflash(
                 gpu, &mut target, &df.draft_weights, &df.draft_config,

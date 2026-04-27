@@ -4279,6 +4279,190 @@ pub fn spec_step_ddtree_batched(
     })
 }
 
+/// Path C — main-path-first lazy FA-only re-verify. Phase 1 implementation:
+/// Step 1 only (linear verify on the greedy main chain; branches dropped).
+///
+/// PRD: `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`. This
+/// function exists to land the orchestrator plumbing without behavior risk.
+/// At Phase 1, output must be **bit-exact** with calling
+/// [`verify_dflash_block`] directly on the same chain — by construction it
+/// is, since the only forward we run IS that linear verify.
+///
+/// Phase 2 (future) extends this with lazy per-branch FA-only re-verify
+/// using scratch KV slots; see PRD §"Architecture / Step 2-3".
+///
+/// Signature mirrors [`spec_step_ddtree_batched`] for drop-in dispatch
+/// from the daemon, minus the `post_seed_snap` and `scratch` arguments
+/// (Phase 1 has no second snapshot need and writes no tree-bias scratch).
+#[cfg(feature = "deltanet")]
+pub fn spec_step_ddtree_path_c(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    target_snap: &mut DeltaNetSnapshot,
+    gdn_tape: &mut GdnTape,
+    verify_scratch: &VerifyScratch,
+    position: usize,
+    seed_token: u32,
+    ctx_slice: Option<usize>,
+    tree_budget: usize,
+    tree_topk: usize,
+) -> HipResult<SpecStepResult> {
+    let b = draft_cfg.block_size;
+    let vocab = target.config.vocab_size;
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    assert!(b >= 2, "spec_step_ddtree_path_c: block_size must be ≥ 2");
+    assert_eq!(
+        target_hidden_host.len(),
+        position * ne * h,
+        "target_hidden_host size mismatches position"
+    );
+    assert!(
+        tree_topk >= 1 && tree_topk <= vocab,
+        "tree_topk must be in [1, vocab]"
+    );
+
+    // ── 1+2. GPU-resident draft + per-row top-K (identical to batched path) ──
+    let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
+        gpu,
+        target,
+        draft_weights,
+        draft_cfg,
+        draft_scratch,
+        target_hidden_host,
+        position,
+        seed_token,
+        ctx_slice,
+        b,
+        tree_topk,
+    )?;
+
+    // ── 3. Build the DDTree ───────────────────────────────────────────────
+    let tree = crate::ddtree::build_ddtree_tree_with_cutoff(
+        &top_tokens,
+        &top_log_probs,
+        b - 1,
+        tree_topk,
+        tree_budget,
+        ddtree_logw_cutoff(),
+    );
+    record_ddtree_meta_nodes(tree.num_nodes());
+
+    // ── 3b. Empty-tree shortcut (matches spec_step_ddtree_batched). Also
+    //       handles the degenerate case where build returned a tree with no
+    //       direct root child (would imply main_path is empty too).
+    let main_path: Vec<usize> = if tree.nodes.is_empty() {
+        Vec::new()
+    } else {
+        crate::ddtree::select_main_path(&tree)
+    };
+    if main_path.is_empty() {
+        target_snap.save_from(&target.dn_state, gpu)?;
+        qwen35::forward_scratch_with_hidden(
+            gpu, &target.weights, &target.config, seed_token, position,
+            &mut target.kv_cache, &mut target.dn_state, &target.scratch, hidden_rb,
+        )?;
+        let logits0 = gpu.download_f32(&target.scratch.logits)?;
+        let bonus = argmax_u32(&logits0);
+        let hidden_block = download_hidden_block(gpu, hidden_rb, 1)?;
+        target_hidden_host.extend_from_slice(&hidden_block[..ne * h]);
+        return Ok(SpecStepResult {
+            accepted: 0,
+            bonus_token: bonus,
+            drafted: vec![seed_token],
+            committed: vec![seed_token, bonus],
+        });
+    }
+
+    // ── 4. Build the verify chain: [seed, main_path[0].tok, main_path[1].tok, …]
+    let mut verify_tokens: Vec<u32> = Vec::with_capacity(1 + main_path.len());
+    verify_tokens.push(seed_token);
+    for &ni in &main_path {
+        verify_tokens.push(tree.nodes[ni].token);
+    }
+
+    // ── 5. Snapshot pre-seed target DN state for tape replay below. ──────
+    target_snap.save_from(&target.dn_state, gpu)?;
+
+    // ── 6. Linear verify on the main chain. No tree mask, no linearization
+    //       phase poisoning — RoPE phases match committed slots exactly.
+    //       This is the entire "Step 1" of the PRD's three-step pattern.
+    let verify_out = verify_dflash_block(
+        gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false,
+        verify_scratch,
+    )?;
+    let posterior = verify_out.argmax_per_pos;
+    debug_assert_eq!(posterior.len(), 1 + main_path.len());
+
+    // ── 7. Greedy walk: longest prefix of `main_path` whose tokens match
+    //       target's per-slot argmax. `posterior[i]` is target's argmax at
+    //       chain slot i+1 (= "what comes after slot i") in the linear
+    //       convention used by `verify_dflash_block_inner`. So compare
+    //       `posterior[j]` against `main_path[j].token` to decide whether
+    //       to accept main_path[j].
+    let mut accepted_main: usize = 0;
+    for j in 0..main_path.len() {
+        let drafted_tok = tree.nodes[main_path[j]].token;
+        if posterior[j] == drafted_tok {
+            accepted_main = j + 1;
+        } else {
+            break;
+        }
+    }
+    // posterior length is 1 + main_path.len(); accepted_main ∈ [0..=main_path.len()].
+    // posterior[accepted_main] is either the first rejection (when partial)
+    // or the predict-after-last-accepted (when fully accepted).
+    let bonus_token = posterior[accepted_main];
+
+    // ── 8. Build committed and drafted sequences ─────────────────────────
+    let mut committed: Vec<u32> = Vec::with_capacity(accepted_main + 2);
+    committed.push(seed_token);
+    for j in 0..accepted_main {
+        committed.push(tree.nodes[main_path[j]].token);
+    }
+    committed.push(bonus_token);
+
+    let mut drafted: Vec<u32> = Vec::with_capacity(main_path.len() + 1);
+    drafted.push(seed_token);
+    for &ni in &main_path {
+        drafted.push(tree.nodes[ni].token);
+    }
+
+    // ── 9. Tape replay over the committed prefix. The chain is linear,
+    //       so the tape captured by verify_dflash_block above is already
+    //       in commit order — no sibling-detour fast/slow-path split is
+    //       needed (unlike spec_step_ddtree_batched).
+    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    gdn_tape.replay_gdn(
+        gpu,
+        &target.weights,
+        &target.config,
+        &mut target.dn_state,
+        accepted_main + 1,
+    )?;
+
+    // ── 10. Append (1 + accepted_main) hidden rows to target_hidden_host.
+    //        verify_dflash_block writes `verify_tokens.len()` rows into the
+    //        ring buffer in commit order; we keep only the accepted prefix.
+    let chain_len = 1 + main_path.len();
+    let hidden_block = download_hidden_block(gpu, hidden_rb, chain_len)?;
+    let row_stride = ne * h;
+    let rows_to_keep = accepted_main + 1;
+    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
+
+    Ok(SpecStepResult {
+        accepted: accepted_main,
+        bonus_token,
+        drafted,
+        committed,
+    })
+}
+
 /// Seed `target_hidden_host` from the prompt by running the target over
 /// each prompt token one at a time with hidden-state extraction enabled.
 /// This is a slow but correct MVP path — the target already ran a fast
