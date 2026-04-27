@@ -4472,12 +4472,40 @@ pub fn spec_step_ddtree_path_c(
     let mut accepted_branch_indices: Vec<usize> = Vec::new();
     let mut effective_bonus = bonus_token;
     let mut branch_hidden_block: Option<Vec<f32>> = None;
+    // Diagnostic counters keyed by HIPFIRE_DDTREE_PATH_C_VERBOSE=1. Tracks
+    // the funnel: how often does the tree even contain a sibling at the
+    // right fork depth, how often does its first token match the main
+    // verify's bonus, and how often does the branch FA forward then accept
+    // ≥1 of its tokens. Lets us tell a "draft has no useful siblings"
+    // signal apart from "draft has them but target rejects" signal.
+    thread_local! {
+        static PATH_C_TOTAL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_PHASE2: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_HAS_FORK_SIBLING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_CANDIDATE_FOUND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_BRANCH_ACCEPTED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+        static PATH_C_BRANCH_TOKENS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    }
+    PATH_C_TOTAL.with(|c| c.set(c.get() + 1));
+    let verbose = std::env::var("HIPFIRE_DDTREE_PATH_C_VERBOSE").ok().as_deref() == Some("1");
+    let mut diag_phase2 = false;
+    let mut diag_fork_sibling = false;
+    let mut diag_candidate = false;
+    let mut diag_accept_branch: usize = 0;
     if let Some(snaps) = path_c_phase2 {
+        diag_phase2 = true;
+        PATH_C_PHASE2.with(|c| c.set(c.get() + 1));
         // Save the main-end DN state so we can roll back on branch reject.
         snaps.main_end_snap.save_from(&target.dn_state, gpu)?;
 
         // Find the unique candidate branch.
         let branches = crate::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
+        diag_fork_sibling = branches
+            .iter()
+            .any(|b| b.fork_depth as usize == accepted_main);
+        if diag_fork_sibling {
+            PATH_C_HAS_FORK_SIBLING.with(|c| c.set(c.get() + 1));
+        }
         let candidate = branches.into_iter().find(|b| {
             b.fork_depth as usize == accepted_main
                 && tree
@@ -4486,6 +4514,10 @@ pub fn spec_step_ddtree_path_c(
                     .map(|n| n.token == bonus_token)
                     .unwrap_or(false)
         });
+        diag_candidate = candidate.is_some();
+        if diag_candidate {
+            PATH_C_CANDIDATE_FOUND.with(|c| c.set(c.get() + 1));
+        }
 
         if let Some(branch) = candidate {
             // Step 2.1: restore DN to the branch parent's pre-state.
@@ -4544,6 +4576,12 @@ pub fn spec_step_ddtree_path_c(
                 } else {
                     break;
                 }
+            }
+
+            diag_accept_branch = accepted_branch;
+            if accepted_branch > 0 {
+                PATH_C_BRANCH_ACCEPTED.with(|c| c.set(c.get() + 1));
+                PATH_C_BRANCH_TOKENS.with(|c| c.set(c.get() + accepted_branch as u32));
             }
 
             if accepted_branch == 0 {
@@ -4622,6 +4660,25 @@ pub fn spec_step_ddtree_path_c(
         let start = row_stride;
         let end = (1 + accepted_branch_indices.len()) * row_stride;
         target_hidden_host.extend_from_slice(&bb[start..end]);
+    }
+
+    if verbose {
+        let total = PATH_C_TOTAL.with(|c| c.get());
+        let p2 = PATH_C_PHASE2.with(|c| c.get());
+        let fs = PATH_C_HAS_FORK_SIBLING.with(|c| c.get());
+        let cf = PATH_C_CANDIDATE_FOUND.with(|c| c.get());
+        let ba = PATH_C_BRANCH_ACCEPTED.with(|c| c.get());
+        let bt = PATH_C_BRANCH_TOKENS.with(|c| c.get());
+        let mean_branch = if ba > 0 { bt as f32 / ba as f32 } else { 0.0 };
+        let cand_rate = if p2 > 0 { 100.0 * cf as f32 / p2 as f32 } else { 0.0 };
+        let accept_rate = if cf > 0 { 100.0 * ba as f32 / cf as f32 } else { 0.0 };
+        eprintln!(
+            "[path-c] cycle: phase2={} acc_main={} fork_sibling={} candidate={} accept_branch={} \
+             | cumul: cycles={} phase2={} fork_sib={} cand={} ({:.1}% of phase2) \
+             accept={} ({:.1}% of cand) mean_branch_tok={:.2}",
+            diag_phase2, accepted_main, diag_fork_sibling, diag_candidate, diag_accept_branch,
+            total, p2, fs, cf, cand_rate, ba, accept_rate, mean_branch,
+        );
     }
 
     Ok(SpecStepResult {
