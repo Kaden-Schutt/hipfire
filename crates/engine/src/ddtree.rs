@@ -393,6 +393,103 @@ pub fn select_main_path(tree: &DdTree) -> Vec<usize> {
     chain
 }
 
+/// A branch off the main path: the smallest-indexed-child chain that
+/// descends from a non-main sibling of one of the main-path nodes (or a
+/// non-main root child). Produced by [`enumerate_branches`] for Path C
+/// Phase 2's lazy FA-only re-verify.
+#[derive(Debug, Clone)]
+pub struct DdBranch {
+    /// Tree depth of the parent (= the fork point). `0` means the branch
+    /// forks off the root (seed); `k > 0` means the parent is
+    /// `main_path[k-1]`, which sits at tree depth `k`.
+    ///
+    /// Matches the PRD's "branches off at depth `d`" convention: the
+    /// branch spans depths `[fork_depth + 1, ..., fork_depth + chain.len()]`.
+    /// Chain element `chain[i]` would land at absolute position
+    /// `start_pos + fork_depth + i` if accepted (where `start_pos` is the
+    /// position `main_path[0]` would commit to).
+    pub fork_depth: u32,
+    /// Greedy chain of tree node indices in root-to-leaf order. `chain[0]`
+    /// is the forking sibling (a non-main child of the parent at depth
+    /// `fork_depth`); subsequent entries descend by smallest-indexed-child,
+    /// matching [`select_main_path`]'s greedy rule. Always non-empty.
+    pub chain: Vec<usize>,
+}
+
+/// Enumerate the branches of `tree` that need lazy FA-only re-verify
+/// against an already-committed `main_path` of which the first
+/// `accepted_main` nodes were accepted by the target.
+///
+/// A branch is eligible iff its fork depth `d` satisfies `d ≤ accepted_main`
+/// (PRD §"Architecture / Step 2"): the branch's parent must itself be on
+/// the accepted main-path prefix (or be root), so the caller has a valid
+/// DeltaNet snapshot to restore from before the branch's FA forward.
+///
+/// The output is in fork-depth-then-heap order (shallowest forks first;
+/// within a fork depth, in `tree.nodes` order). For each branch, the
+/// `chain` follows the smallest-indexed-child rule at every step — same
+/// convention as [`select_main_path`] — so chains are deterministic
+/// and consistent with the rest of the linearization.
+///
+/// `accepted_main` is bounded above by `main_path.len()`; passing a
+/// larger value is treated as full acceptance.
+pub fn enumerate_branches(
+    tree: &DdTree,
+    main_path: &[usize],
+    accepted_main: usize,
+) -> Vec<DdBranch> {
+    let mut branches: Vec<DdBranch> = Vec::new();
+    let max_d = accepted_main.min(main_path.len());
+
+    for d in 0..=max_d {
+        // Parent tree index in DdNode::parent_index convention: `-1` for
+        // root (d == 0), `main_path[d-1]` otherwise (a node at depth d).
+        let parent_tree_idx: i32 = if d == 0 {
+            -1
+        } else {
+            main_path[d - 1] as i32
+        };
+        // The main-path child at depth d+1 (if any) is the one to skip;
+        // every other child of `parent_tree_idx` is a branch root.
+        let main_child: Option<usize> = main_path.get(d).copied();
+
+        for (node_idx, node) in tree.nodes.iter().enumerate() {
+            if node.parent_index != parent_tree_idx {
+                continue;
+            }
+            if Some(node_idx) == main_child {
+                continue;
+            }
+            // Greedy descent: at each step take the smallest-indexed child,
+            // which by `build_ddtree_tree_with_cutoff`'s heap-pop invariant
+            // is the highest-cumulative-logw child of the current node.
+            let mut chain = vec![node_idx];
+            let mut current_parent: i32 = node_idx as i32;
+            loop {
+                let next = tree
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, n)| n.parent_index == current_parent)
+                    .map(|(i, _)| i);
+                match next {
+                    Some(idx) => {
+                        chain.push(idx);
+                        current_parent = idx as i32;
+                    }
+                    None => break,
+                }
+            }
+            branches.push(DdBranch {
+                fork_depth: d as u32,
+                chain,
+            });
+        }
+    }
+
+    branches
+}
+
 /// Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)`
 /// triple suitable for a single batched target forward.
 ///
@@ -859,6 +956,143 @@ mod tests {
         let (lin_tokens, _pos, _mask) = linearize_tree(&t, /*seed=*/ 1, 0);
         for &idx in &main {
             assert_eq!(t.nodes[idx].token, lin_tokens[idx + 1]);
+        }
+    }
+
+    #[test]
+    fn enumerate_branches_empty_tree_returns_empty() {
+        let t = build_ddtree_tree(&[], &[], 0, 0, 0);
+        assert!(enumerate_branches(&t, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn enumerate_branches_zero_accepted_yields_only_root_siblings() {
+        // Same 4-node tree as deeper_tree_maintains_heap_order:
+        //   nodes[0] = 10 (main path step 1)
+        //   nodes[1] = 30 under nodes[0] (main path step 2)
+        //   nodes[2] = 20 (alt root child — branch sibling)
+        //   nodes[3] = 30 under nodes[2] (extends the alt branch)
+        let tokens = vec![10, 20, 30, 40];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5];
+        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
+        let main = select_main_path(&t);
+        assert_eq!(main, vec![0, 1]);
+
+        let bs = enumerate_branches(&t, &main, 0);
+        // accepted_main=0 → only forks at depth 0 (root). Sibling = nodes[2]
+        // with greedy descent extending into nodes[3].
+        assert_eq!(bs.len(), 1);
+        assert_eq!(bs[0].fork_depth, 0);
+        assert_eq!(bs[0].chain, vec![2, 3]);
+    }
+
+    #[test]
+    fn enumerate_branches_full_accept_includes_terminal_siblings() {
+        // Build a tree where main_path[1] (last main node) has a sibling
+        // (= a non-main child of main_path[0]). With full accept, that
+        // terminal sibling should appear as a fork at depth 1.
+        // Construction: depth=2, topk=2, budget=5 with logps tuned so
+        // nodes[0]=A, nodes[1]=A's best child (main path 0,1), nodes[2]=
+        // alt root child, nodes[3]=A's second child (= sibling of main 1),
+        // nodes[4]=alt-root-child's child.
+        let tokens = vec![10, 20, 30, 40];
+        let logps = vec![
+            -0.1, -1.0, // depth 1: top-2
+            -0.2, -0.5, // depth 2: top-2 (close so alt sibling expands)
+        ];
+        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 5);
+        let main = select_main_path(&t);
+        // Main path = [0, 1]: nodes[0]=10 → nodes[1]=30
+        assert_eq!(main, vec![0, 1]);
+
+        let bs = enumerate_branches(&t, &main, main.len());
+        // Forks expected:
+        //   - fork_depth=0: nodes[2] (alt root child = 20)
+        //   - fork_depth=1: nodes[1]'s parent is nodes[0]; sibling of main_path[1]
+        //     under nodes[0] = a 4th node if budget permits. With heap order:
+        //     pop (d1 r0)=10 logw=-0.1 → push (d1 r1) logw=-1, (d2 r0 of 10) logw=-0.3
+        //     pop (d2 r0 of 10)=30 logw=-0.3 → push (d2 r1 of 10)=40 logw=-0.6
+        //     pop (d2 r1 of 10)=40 logw=-0.6 → no further push (d=2 max)
+        //     pop (d1 r1)=20 logw=-1 → push (d2 r0 of 20)=30 logw=-1.2
+        //     pop (d2 r0 of 20)=30 logw=-1.2
+        //   So nodes order: [10@d1, 30@d2 child-of-10, 40@d2 child-of-10, 20@d1, 30@d2 child-of-20]
+        // Branches: fork_depth=0 → chain starting at nodes[3]=20, descend to nodes[4]=30
+        //           fork_depth=1 → chain = [nodes[2]=40] (no further descent)
+        assert_eq!(bs.len(), 2);
+        // Sort by fork_depth for deterministic check.
+        let mut by_depth: Vec<_> = bs.iter().collect();
+        by_depth.sort_by_key(|b| b.fork_depth);
+        assert_eq!(by_depth[0].fork_depth, 0);
+        assert_eq!(by_depth[0].chain, vec![3, 4]);
+        assert_eq!(by_depth[1].fork_depth, 1);
+        assert_eq!(by_depth[1].chain, vec![2]);
+    }
+
+    #[test]
+    fn enumerate_branches_chain_only_tree_has_no_branches() {
+        // Pure spine: every node is the only child of its predecessor.
+        let tokens = vec![10, 20, 30];
+        let logps = vec![-0.1, -0.1, -0.1];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
+        let main = select_main_path(&t);
+        assert_eq!(main, vec![0, 1, 2]);
+        assert!(enumerate_branches(&t, &main, main.len()).is_empty());
+    }
+
+    #[test]
+    fn enumerate_branches_partial_accept_caps_eligible_depth() {
+        // Reuse full-accept tree; with accepted_main=1 only fork_depth ∈ [0, 1]
+        // are eligible — same as full accept here because main path has
+        // length 2 and its full accept also yields fork_depth ∈ [0, 1].
+        // To distinguish, build a 3-deep main path tree and accept just 1.
+        let tokens = vec![1, 2, 3, 4, 5, 6];
+        let logps = vec![-0.1, -1.0, -0.1, -1.0, -0.1, -1.0];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 8);
+        let main = select_main_path(&t);
+        assert!(main.len() >= 2, "test fixture needs main path ≥ 2");
+
+        let bs_zero = enumerate_branches(&t, &main, 0);
+        let bs_one = enumerate_branches(&t, &main, 1);
+        // accepted_main=0 ⇒ only depth-0 forks; accepted_main=1 ⇒ depths 0 + 1.
+        // → bs_one ⊇ bs_zero, and bs_one has at least one fork at depth 1
+        //   (sibling of main_path[1] under main_path[0]) iff the tree has one.
+        assert!(bs_one.len() >= bs_zero.len());
+        assert!(bs_zero.iter().all(|b| b.fork_depth == 0));
+        assert!(bs_one.iter().all(|b| b.fork_depth <= 1));
+    }
+
+    #[test]
+    fn enumerate_branches_chains_descend_smallest_index_first() {
+        // Property: each chain follows the smallest-indexed child rule
+        // (i.e. greedy / select_main_path-consistent). For every branch,
+        // verify chain[i+1] is the smallest-index node whose parent_index
+        // equals chain[i].
+        let tokens = vec![10, 20, 30, 40, 50, 60];
+        let logps = vec![-0.1, -0.5, -0.2, -0.6, -0.3, -0.7];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 8);
+        let main = select_main_path(&t);
+        let bs = enumerate_branches(&t, &main, main.len());
+        for branch in &bs {
+            assert!(!branch.chain.is_empty());
+            for win in branch.chain.windows(2) {
+                let parent = win[0] as i32;
+                let child = win[1];
+                let expected = t
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .find(|(_, n)| n.parent_index == parent)
+                    .map(|(i, _)| i)
+                    .expect("chain step must have at least one descendant");
+                assert_eq!(child, expected);
+            }
+            // chain[0]'s parent must be at fork_depth (root if 0, else main_path[fork_depth-1]).
+            let expected_parent: i32 = if branch.fork_depth == 0 {
+                -1
+            } else {
+                main[branch.fork_depth as usize - 1] as i32
+            };
+            assert_eq!(t.nodes[branch.chain[0]].parent_index, expected_parent);
         }
     }
 
