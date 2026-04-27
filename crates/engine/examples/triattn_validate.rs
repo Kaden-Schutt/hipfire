@@ -171,10 +171,10 @@ fn main() {
             config.n_heads,
             config.head_dim / 2,
         );
-        // Default CPU path (faster in practice — see 2026-04-19 bench in
-        // docs/plans/sidecar-training-strategy.md). --gpu-calib opts into
-        // the HIP reduce kernel which is numerically equivalent but slower
-        // on short-chunk corpora due to kernel-launch overhead.
+        // Default CPU path — faster in practice on short-chunk corpora
+        // because the kernel-launch overhead of the HIP reduce dominates
+        // the savings (verified 2026-04-19). --gpu-calib opts into the
+        // numerically-equivalent HIP path for long-chunk corpora.
         let using_gpu_tap = gpu_calib;
         if using_gpu_tap {
             eprintln!("calibration path: GPU (kernel triattn_accumulate_f32) [opt-in]");

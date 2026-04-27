@@ -39,8 +39,7 @@ interface HipfireConfig {
   // Research-only feature: in-band nudges to the model's own think stream,
   // which CAN leak into visible output if the client doesn't also constrain
   // when the alert fires (e.g. injecting past </think>). Only enable if you
-  // understand the knob. See docs/MULTI_MODEL_QUEUE.md path for where this
-  // lives in the roadmap.
+  // understand the knob.
   experimental_budget_alert: boolean;
 
   // ── DFlash runtime tuning (0.1.7-alpha) ───────────────────────────────
@@ -99,9 +98,8 @@ interface HipfireConfig {
   // When true, collapses runs of 3+ '\n' chars to exactly 2 before the
   // tokenizer encode. Eliminates rare BPE token 1358 ('\n\n\n') in favor
   // of HOT token 271 ('\n\n') on Qwen3.5/3.6, lifting τ on PEP-8-style
-  // code prompts by up to +26.7% (commit 8a4a211). Default OFF until more
-  // validation across non-Python prompt families. See PRD:
-  // docs/plans/prompt-shape-adaptation.prd
+  // code prompts by up to +26.7% (commit 8a4a211). Default ON since
+  // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
 }
 

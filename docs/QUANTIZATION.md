@@ -109,13 +109,22 @@ asymmetric uniform, slightly better fit on the actual K distribution.
 
 ## Asym KV per arch defaults
 
+Set in `cli/index.ts::archDefaults`. Override with `hipfire config set
+kv_cache <mode>` or `HIPFIRE_KV_MODE=<mode>` env.
+
 | Arch | Default | Reason |
 |---|---|---|
-| gfx1100 (RDNA3) | asym3 | 24 GB VRAM affords it; perceptual quality at K=3 matches Q8 |
-| gfx1030 (RDNA2) | asym3 | Same |
-| gfx1010 (RDNA1) | asym2 | 8 GB VRAM forces tighter quant |
+| gfx1100 (7900 XTX) | asym3 | 24 GB VRAM affords it; quality matches Q8 |
+| gfx1101 (7900 XT) | asym3 | Same |
+| gfx1102 (7800 XT) | asym3 | Same |
+| gfx1030 (V620 / 6800 XT) | asym3 | 32 GB on V620 — plenty of headroom |
+| gfx1031 (6700 XT) | asym3 | 12 GB |
+| gfx1032 (6600 XT) | asym2 | 8 GB — tighter quant for headroom |
+| gfx1010 (5700 XT) | asym2 | 8 GB |
 | gfx1013 (BC-250 APU) | asym2 | 14 GB shared, prioritize ctx length |
-| gfx94x (CDNA3) | q8 | Fewer KV-bound hot paths; saturate compute |
+| gfx1151 (Strix Halo APU) | asym2 | 16 GB shared |
+| gfx1200 (9070 XT) | asym3 | 16 GB |
+| (default fall-through) | asym3 | Includes gfx94x / MI300X — override to `q8` if you have spare HBM |
 
 Override with `hipfire config set kv_cache <mode>` or
 `HIPFIRE_KV_MODE=<mode>` env.

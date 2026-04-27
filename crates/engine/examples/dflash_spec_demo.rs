@@ -76,9 +76,9 @@ fn main() {
     // 2026-04-16: initial two-level version shrank B from 16→8 when rolling
     // τ dropped below 4.
     //
-    // 2026-04-24 (Task #93 Phase B fallback — see docs/plans/task-93-inter-
-    // cycle-pipelining.prd): replaced with a continuous scheduler that
-    // adjusts B across the range [ADAPTIVE_B_MIN .. ADAPTIVE_B_MAX] using
+    // 2026-04-24 (Task #93 Phase B fallback): replaced with a continuous
+    // scheduler that adjusts B across the range [ADAPTIVE_B_MIN ..
+    // ADAPTIVE_B_MAX] using
     // EWMA of accept_len with hysteresis + cooldown. Raises B when the
     // recent cycle is under-budgeted (draft accepting almost everything →
     // amortize verify over more positions). Drops B when draft is losing

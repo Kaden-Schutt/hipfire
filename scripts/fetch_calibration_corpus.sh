@@ -4,13 +4,11 @@
 # stream. **Used by two distinct flows; do not confuse them:**
 #
 #   1. Sidecar calibration  — feed to `triattn_validate --corpus`,
-#      produces `.triattn.bin`. See docs/plans/sidecar-training-strategy.md
-#      and docs/plans/8x-sidecar-sweep.md.
+#      produces `.triattn.bin`.
 #
 #   2. DFlash draft training — feed to `generate_target_responses.py`
 #      (Phase C2 of task #93), then to `dflash_train_poc.py` after
 #      target-regeneration. Produces `.hfq` draft weights.
-#      See docs/plans/task-93-path-c-trained-draft.prd.
 #
 # Same recipes (`agentic`, `agentic_xl`, `reasoning`, `blended`, `all`)
 # serve both flows; the consumer differs. The legacy file name kept for

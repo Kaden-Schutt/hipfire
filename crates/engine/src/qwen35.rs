@@ -55,12 +55,11 @@ pub struct TreeVerifyCtx<'a> {
     /// s_tape scratch in `PrefillBatchScratch`.
     pub parent_indices: Option<&'a GpuTensor>,
     /// Per-FA-layer F32 scratch buffers for capturing K BEFORE RoPE is
-    /// applied. Used by Path B slow-path-kill (see
-    /// `docs/plans/ddtree-path-b-decouple-rope-from-kvslot.prd`): on the
-    /// slow path, the speculative caller gathers accepted K rows out of
-    /// these scratches, re-runs RoPE with COMMITTED slot phases (instead
-    /// of the linearization phases the in-cache K carries), and re-quants
-    /// to the committed kv_cache slots — avoiding a full re-verify forward
+    /// applied. Used by Path B slow-path-kill: on the slow path, the
+    /// speculative caller gathers accepted K rows out of these scratches,
+    /// re-runs RoPE with COMMITTED slot phases (instead of the
+    /// linearization phases the in-cache K carries), and re-quants to
+    /// the committed kv_cache slots — avoiding a full re-verify forward
     /// while preserving RoPE phase correctness.
     ///
     /// Slice length must equal the number of FullAttention layers in

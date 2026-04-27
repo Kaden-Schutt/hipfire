@@ -9,7 +9,7 @@
 //! `lm_head` to map to logits. This matches the upstream z-lab/dflash
 //! reference and lets a single tokenizer / embedding table be shared.
 //!
-//! Architectural notes (also see `docs/DFLASH_ARCHITECTURE.md`):
+//! Architectural notes:
 //! - 5-layer Qwen3 decoder, all full attention, non-causal.
 //! - Per-layer cross-attention over `target_hidden` (the projected
 //!   concatenation of hidden states from a configured set of target

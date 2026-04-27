@@ -42,10 +42,13 @@ be a net loss.
 | Qwen 3.5 9B | prose (Rome) | **122.7** | 98.3 | 0.80× ✗ | 1.20 |
 | Qwen 3.6 27B | code (HumanEval/53) | 44.2 | **185.5** | **4.19×** | 9.25 |
 
-**Default `dflash_mode=auto`** picks per-config — DFlash on for dense
-Qwen 3.5+ targets, off where it historically loses. Override per
-model: `hipfire config qwen3.5:9b set dflash_mode off` if your
-workload is mostly prose.
+**Default `dflash_mode=off`** as of v0.1.8 — DFlash is opt-in until
+the genre-conditional speedup is more universally a win. Enable it
+globally with `hipfire config set dflash_mode auto` (the engine then
+turns DFlash on for dense Qwen 3.5+ targets and off where it
+historically loses) or per model with `hipfire config qwen3.5:27b set
+dflash_mode on`. The numbers above were measured with DFlash forced
+on.
 
 ## vs ollama (Q4_K_M GGUF) — 7900 XTX
 

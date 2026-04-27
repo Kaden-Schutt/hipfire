@@ -40,7 +40,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// draft has no native prediction at position `b`, so REJ_BOUNDARY is
 /// undefined and TAIL/ANYPOS are the only candidates there).
 ///
-/// See docs/plans/task-93-inter-cycle-pipelining.prd Phase B.
 static SEED_ORACLE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static SEED_ORACLE_REJ_MATCH: AtomicU64 = AtomicU64::new(0);
 static SEED_ORACLE_TAIL_MATCH: AtomicU64 = AtomicU64::new(0);

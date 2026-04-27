@@ -10,8 +10,8 @@
   but they were on the K4 / wmma dispatch path for 27B verify-shape GEMMs.
   Per-cycle cost on 64-layer × B=16 verify forward: 57 → 100+ ms. Fixed via
   revert of merge `e3a3da2` (commit `357e314`) followed by cherry-pick of the
-  8 master commits that did NOT introduce the regression. Full timeline:
-  `docs/plans/perf-regression-recovery-2026-04-26.prd`.
+  8 master commits that did NOT introduce the regression. Full timeline in
+  the recovery commit (`9a2c667`).
   - Empirical anchor: 27B-3.5 LRU code DFlash @ max=120 = 199 tok/s τ=10.36
     (was: 95 tok/s in pre-revert state).
 

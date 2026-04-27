@@ -285,11 +285,9 @@ commits MUST use byte-identical prompts. Embed prompts as committed
 files (not heredocs in scripts that get reformatted by editors), and
 record the prompt md5 alongside the result. A 14% perf delta from a
 whitespace cleanup is invisible in code review but catastrophic for
-benchmarking. See `docs/plans/prompt-structure-tau-discovery-2026-04-24.prd`
-for the forensic timeline + reproduction commands. Discovery cost
-~6 hours of phantom-regression chasing on 2026-04-24 (rocBLAS, DKMS,
-firmware, kernel cache, mold/sccache, DPM — all null) before isolating
-to a single newline.
+benchmarking. Discovery cost ~6 hours of phantom-regression chasing
+on 2026-04-24 (rocBLAS, DKMS, firmware, kernel cache, mold/sccache,
+DPM — all null) before isolating to a single newline.
 
 **Corollary**: agent-to-agent perf claims that lack prompt md5 are
 unverifiable. Don't accept "X agent got Y tok/s" without reproducing
@@ -308,8 +306,7 @@ correctness cost. Opt out with `HIPFIRE_NORMALIZE_PROMPT=0` (or
 semantically load-bearing. See:
 - `crates/engine/src/tokenizer.rs:maybe_normalize_prompt()` — engine impl
 - `crates/engine/examples/encode_prompt.rs` — verification utility
-- `docs/plans/perf-regression-recovery-2026-04-26.prd` — root cause + bench
-  data behind the default flip
+- commit 9a2c667 — root cause + bench data behind the default flip
 
 **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
 ```

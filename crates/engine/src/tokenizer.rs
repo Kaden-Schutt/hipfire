@@ -811,8 +811,6 @@ pub fn collapse_newline_runs(s: &str) -> String {
 ///
 /// Returns Cow::Borrowed when input has no `\n{3,}` runs or when explicitly
 /// disabled; Cow::Owned only on actual rewrite.
-/// See `docs/plans/prompt-shape-adaptation.prd` and the post-mortem at
-/// `docs/post-mortems/2026-04-26-perf-regression-recovery.md`.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     // Default ON. Explicit "0" / "false" / "off" opts out.
     if let Ok(v) = std::env::var("HIPFIRE_NORMALIZE_PROMPT") {

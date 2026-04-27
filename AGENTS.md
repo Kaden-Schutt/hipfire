@@ -96,8 +96,7 @@ Qwen3.5/3.6 vocab.
 **Default ON since 2026-04-26** — empirical 199 tok/s on 27B-3.5 LRU
 DFlash (vs 159 with opt-out). The original v0.1.8-alpha ship had this
 opt-in; it was promoted to default after the 2026-04-26 perf-regression
-recovery confirmed +24% τ with zero correctness cost (see
-`docs/plans/perf-regression-recovery-2026-04-26.prd`).
+recovery confirmed +24% τ with zero correctness cost (commit 9a2c667).
 
 To **opt out** (rare — only when raw `\n{3,}` whitespace is semantically
 load-bearing):
@@ -254,12 +253,18 @@ For dataclass benches:
 
 ### Where to put bench results
 
-- **Numerical perf-checkpoints:** `docs/perf-checkpoints/YYYY-MM-DD-<topic>.md`
-- **Forensic discoveries (e.g. "I found X regresses Y"):** open a `.prd`
-  in `docs/plans/` with the timeline + reproduction commands.
+- **Numerical perf-checkpoints:** in the commit message body of the
+  commit that produced the numbers, or in the PR description. The
+  prior `docs/perf-checkpoints/` tree was archived 2026-04-27 — first-
+  class artifacts now live in git history, not in a parallel doc tree
+  that drifts.
+- **Forensic discoveries (e.g. "I found X regresses Y"):** in the
+  commit message of the fix (or the bisect commit). For longer
+  writeups, the PR description. Local-only scratch goes to
+  `.codeinsight+research/` (gitignored).
 - **Coherence-gate failures:** include the gate's report path
-  (`/tmp/coherence-dflash-*.md`) verbatim. Investigate as numerical
-  bug, NOT sampling variance.
+  (`/tmp/coherence-dflash-*.md`) verbatim in the commit/PR.
+  Investigate as numerical bug, NOT sampling variance.
 - **Regression vs. last-shipped baseline:** include the binary md5
   (md5sum target/release/examples/dflash_spec_demo) and prompt md5.
   Without these, the result is unreproducible.
@@ -294,7 +299,7 @@ For dataclass benches:
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
-| "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit. See `docs/plans/perf-regression-recovery-2026-04-26.prd`. |
+| "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
 
 ---
@@ -334,15 +339,12 @@ For dataclass benches:
 If you want to actively contribute findings, these are open:
 
 1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
-   τ? See `docs/plans/prompt-shape-adaptation.prd`. Run
-   `encode_prompt --heat` on a wide variety of prompts and look for
-   patterns.
+   τ? Run `encode_prompt --heat` on a wide variety of prompts and look
+   for patterns.
 2. **Path C training**: a target-aligned custom DFlash draft. Recipe at
-   `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md`. Datasets identified
-   in `docs/plans/task-93-path-c-trained-draft.prd`.
+   `../dflash-fe/RECIPE_RedHat_DFlash_MI300X.md`.
 3. **Path D engineering**: stale-context overlap pipelining — the only
    structural lever still on the table for 27B-3.5 code beyond +8.2%.
-   See `docs/plans/task-93-path-d-stale-context.prd`.
 4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
    (commit 39aa358). Per-genre data: `feedback_dflash_per_genre`
    memory. If you have an idea for the structural fix, the project

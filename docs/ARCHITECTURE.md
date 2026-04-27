@@ -145,29 +145,31 @@ for the math.
 
 Qwen 3.5+ alternates FullAttention with DeltaNet linear-attention
 layers. DeltaNet replaces softmax attention with a recurrent gated
-linear update — O(N) compute, fixed-size state, no KV cache for those
-layers (the state IS the cache).
+linear update — O(1) per-token compute, fixed-size state, no KV cache
+for those layers (the state IS the cache).
 
-```
-state[h] = α[h] · state[h] + β[h] · (k[h] ⊗ v[h])    # outer product into state
-out[h]   = q[h] · state[h]                            # state-vector inner product
-```
-
-`α` is a per-head learnable decay; `β` is a per-head per-token gate.
-Plus a 1D conv across the time axis for local mixing. The Qwen 3.5
-config carries a `layer_types` array that decides which layers are
-linear vs full.
+The Qwen 3.5 config carries a `layer_types` array that decides which
+layers are linear vs full. A 1D causal conv across the time axis runs
+before the linear-attention update for local mixing. Per-head
+learnable decay + per-head per-token gate parameterize the state
+update; see `crates/engine/src/qwen35.rs` for the exact form.
 
 ## DFlash (speculative decode)
 
 `crates/engine/src/dflash.rs`. Target model + small same-family draft
-model run in parallel; the draft proposes K tokens, the target verifies
-in one batched forward pass and accepts the longest correctly-predicted
-prefix. Average accepted-tokens-per-cycle (τ) drives the speedup.
+model run in parallel; the draft proposes K tokens, the target
+verifies in one batched forward pass and accepts the longest
+correctly-predicted prefix. Average accepted-tokens-per-cycle (τ)
+drives the speedup.
 
-Draft is auto-discovered by filename: `qwen3.5-9b.mq4` pairs with
-`qwen3.5-9b.mq4.draft.bin` in the same dir. Toggle with
-`hipfire config set dflash_mode {auto,on,off}`.
+Draft pairing is registry-driven, not filename-derived. Each shipped
+target tag has a sibling `:<size>-draft` registry entry pointing at a
+distinct file (e.g. `qwen3.5:27b` ↔ `qwen3.5:27b-draft` with files
+`qwen3.5-27b.mq4` and `qwen35-27b-dflash-mq4.hfq`). The CLI passes
+the resolved draft path to the daemon, which loads both target and
+draft together. Toggle with `hipfire config set dflash_mode
+{auto,on,off}` — default is `off` as of v0.1.8 (opt-in until the
+speedup is more universally a win).
 
 ## Observability
 
