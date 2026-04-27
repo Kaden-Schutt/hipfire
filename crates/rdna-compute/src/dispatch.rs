@@ -88,6 +88,16 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
+/// CDNA wave64-native arches: CDNA1 (gfx908, MI100) and CDNA3 (gfx94x,
+/// MI300X). On these, wave32 kernels (block=[32,1,1]) waste the upper 32
+/// lanes of every wave slot. The `*_wave64.hip` kernel variants pack two
+/// rows per block (one per warp) with block=[64,1,1] and halve the grid
+/// count. Adding gfx90a (CDNA2, MI200) here is a one-line change once it
+/// has been bring-up validated.
+fn has_wave64_native(arch: &str) -> bool {
+    matches!(arch, "gfx908" | "gfx940" | "gfx941" | "gfx942")
+}
+
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -2169,7 +2179,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256_wave64",
@@ -2256,7 +2266,7 @@ impl Gpu {
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. gfx908 added 2026-04-27 — kernel uses no MFMA, just
         // FMA + shfl_down within wave64.
-        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256_wave64",
@@ -2391,7 +2401,7 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkvza_hfq4g256_wave64",
@@ -2668,7 +2678,7 @@ impl Gpu {
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkv_hfq4g256_fp16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkv_hfq4g256_wave64",
@@ -7164,7 +7174,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
-        let cdna_wave64 = matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942");
+        let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256_wave64",
@@ -11115,7 +11125,7 @@ impl Gpu {
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
-                if matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942") {
+                if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
@@ -11172,7 +11182,7 @@ impl Gpu {
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
                 // CDNA1 (gfx908) + CDNA3 wave64 variants — see hfq4 branch for rationale.
-                if matches!(self.arch.as_str(), "gfx908" | "gfx940" | "gfx941" | "gfx942") {
+                if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
