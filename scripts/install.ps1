@@ -290,25 +290,45 @@ if (-not $PreBuilt) {
         $DaemonAsset = $LatestRelease.assets | Where-Object { $_.name -eq "daemon.exe" } | Select-Object -First 1
         if ($DaemonAsset) {
             $ReleaseDest = "$BinDir\daemon.exe"
+            # Cache discipline: store the asset id (immutable per upload) of
+            # whatever we last downloaded as a sidecar. Refresh whenever the
+            # current asset id differs — catches both new tags and re-uploaded
+            # binaries on the same tag. Size-only matching was insufficient
+            # because two builds can share a byte count.
+            $StampPath = "$BinDir\daemon.exe.release-id"
+            $CurrentAssetId = "$($DaemonAsset.id)"
             $NeedsDownload = $true
-            if (Test-Path $ReleaseDest) {
-                $LocalSize = (Get-Item $ReleaseDest).Length
-                if ($LocalSize -eq $DaemonAsset.size) {
-                    Write-Host "  daemon.exe matches release $($LatestRelease.tag_name) by size ($LocalSize bytes) — keeping" -ForegroundColor Green
+            if ((Test-Path $ReleaseDest) -and (Test-Path $StampPath)) {
+                $StoredAssetId = (Get-Content $StampPath -Raw -ErrorAction SilentlyContinue).Trim()
+                if ($StoredAssetId -eq $CurrentAssetId) {
+                    Write-Host "  daemon.exe already at latest release $($LatestRelease.tag_name) (asset id $CurrentAssetId) — keeping" -ForegroundColor Green
                     $PreBuilt = $ReleaseDest
                     $NeedsDownload = $false
                 } else {
-                    Write-Host "  Existing daemon.exe is stale (local=$LocalSize, release=$($DaemonAsset.size)) — refreshing" -ForegroundColor Yellow
+                    Write-Host "  daemon.exe is stale (local id $StoredAssetId, latest id $CurrentAssetId) — refreshing" -ForegroundColor Yellow
                 }
+            } elseif (Test-Path $ReleaseDest) {
+                Write-Host "  daemon.exe present but no release-id stamp — refreshing to be safe" -ForegroundColor Yellow
             }
             if ($NeedsDownload) {
                 Write-Host "  Pulling daemon.exe from release $($LatestRelease.tag_name)..." -ForegroundColor Cyan
+                $TempDest = "$ReleaseDest.download"
                 try {
-                    Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile $ReleaseDest -UseBasicParsing
+                    # Stage to a temp file so a partial / failed download
+                    # doesn't corrupt the existing daemon.exe.
+                    Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile $TempDest -UseBasicParsing
+                    if ((Get-Item $TempDest).Length -ne $DaemonAsset.size) {
+                        Remove-Item $TempDest -Force -ErrorAction SilentlyContinue
+                        throw "downloaded size mismatch (got $((Get-Item $TempDest).Length), expected $($DaemonAsset.size))"
+                    }
+                    Move-Item -Path $TempDest -Destination $ReleaseDest -Force
+                    Set-Content -Path $StampPath -Value $CurrentAssetId -NoNewline
                     $PreBuilt = $ReleaseDest
                     Write-Host "  Downloaded ✓" -ForegroundColor Green
                 } catch {
+                    Remove-Item $TempDest -Force -ErrorAction SilentlyContinue
                     Write-Host "  Download failed: $_" -ForegroundColor Yellow
+                    Write-Host "  Existing daemon.exe (if any) is unchanged. Falling through to source build." -ForegroundColor Yellow
                 }
             }
         } else {
