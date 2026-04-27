@@ -1931,6 +1931,19 @@ fn verify_dflash_block_inner(
         )
         && verify_scratch.prefill_batch.is_some();
 
+    // Per-cycle timing for verify-graph A/B diagnostic
+    // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the
+    // forward + lm_head; the recorded mode tag distinguishes replay vs
+    // warmup-direct vs first-capture vs no-graph-eligible.
+    let vg_timing = std::env::var("HIPFIRE_VERIFY_GRAPH_TIMING").ok().as_deref() == Some("1");
+    let mut vg_mode = "direct";
+    let vg_t0 = if vg_timing {
+        gpu.hip.device_synchronize()?;
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let batch_result = if verify_graph_ok {
         let pbs = verify_scratch.prefill_batch.as_ref().unwrap();
         debug_assert!(b <= pbs.max_batch);
@@ -1941,11 +1954,13 @@ fn verify_dflash_block_inner(
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
         if gpu.verify_has_graph(b) {
+            vg_mode = "replay";
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
             gpu.verify_graph_launch(b)?;
             Ok(())
         } else if gpu.verify_needs_warmup(b) {
+            vg_mode = "warmup";
             // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
@@ -1972,6 +1987,7 @@ fn verify_dflash_block_inner(
             }
             r
         } else {
+            vg_mode = "capture";
             // Capture path: first call at this B after warmup.
             gpu.begin_verify_graph_capture(b)?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
@@ -2149,6 +2165,14 @@ fn verify_dflash_block_inner(
             argmax_per_pos.push(argmax_u32(&row));
             logits_per_pos.extend_from_slice(&row);
         }
+    }
+
+    if let Some(t0) = vg_t0 {
+        gpu.hip.device_synchronize()?;
+        eprintln!(
+            "[vg-time] B={} mode={} elapsed_us={}",
+            b, vg_mode, t0.elapsed().as_micros()
+        );
     }
 
     Ok(DflashVerifyOutput {
