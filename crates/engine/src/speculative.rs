@@ -4279,21 +4279,51 @@ pub fn spec_step_ddtree_batched(
     })
 }
 
-/// Path C — main-path-first lazy FA-only re-verify. Phase 1 implementation:
-/// Step 1 only (linear verify on the greedy main chain; branches dropped).
+/// Auxiliary DeltaNet snapshots that Path C Phase 2 needs but Phase 1
+/// does not. Pre-allocated by the caller (one of each at session start)
+/// and re-used across cycles. Pass `Some(...)` to enable Phase 2 (Step 2
+/// + Step 3 of the PRD); pass `None` for Phase 1 behavior.
 ///
-/// PRD: `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`. This
-/// function exists to land the orchestrator plumbing without behavior risk.
-/// At Phase 1, output must be **bit-exact** with calling
-/// [`verify_dflash_block`] directly on the same chain — by construction it
-/// is, since the only forward we run IS that linear verify.
+/// - `parent_pre_snap`: the DN state at "after position + accepted_main −
+///   1", i.e. immediately before the branch's parent is forwarded. Saved
+///   by the orchestrator, restored before the branch FA forward.
+/// - `main_end_snap`: the DN state at "after position + accepted_main",
+///   i.e. the main path's final committed state. Saved before the branch
+///   FA forward. Restored on branch reject so callers see the same
+///   `target.dn_state` they would have under Phase 1.
+#[cfg(feature = "deltanet")]
+pub struct Phase2Snapshots<'a> {
+    pub parent_pre_snap: &'a mut DeltaNetSnapshot,
+    pub main_end_snap: &'a mut DeltaNetSnapshot,
+}
+
+/// Path C — main-path-first lazy FA-only re-verify (PRD orchestrator).
 ///
-/// Phase 2 (future) extends this with lazy per-branch FA-only re-verify
-/// using scratch KV slots; see PRD §"Architecture / Step 2-3".
+/// PRD: `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+///
+/// **Phase 1** (`path_c_phase2 = None`): runs Step 1 only — linear verify
+/// on the DDTree's greedy main chain, no branches. Output is bit-exact
+/// with calling [`verify_dflash_block`] directly on the same chain (by
+/// construction — the only forward run IS that linear verify).
+///
+/// **Phase 2** (`path_c_phase2 = Some(...)`): adds Steps 2+3 — at most
+/// **one** lazy branch FA-only re-verify per cycle (the candidate sibling
+/// at fork depth = `accepted_main` whose first token equals the main
+/// verify's bonus). On branch accept the commit is extended by the
+/// accepted branch tokens; on reject behavior matches Phase 1.
+///
+/// **No KV backup buffers needed**. Phase 2 lets the branch FA forward
+/// freely overwrite KV slots past the main path's accept boundary
+/// (`position + accepted_main + 1` onwards). Stale branch K/V written
+/// past the new commit boundary is tolerated by the same mechanism that
+/// makes [`spec_step_dflash`]'s rejected-tail K/V tolerable: the next
+/// decode cycle's verify starts at the new commit boundary and overwrites
+/// every slot it will subsequently read. See `spec_step_dflash` ~line
+/// 3097 for the original write-up of this invariant.
 ///
 /// Signature mirrors [`spec_step_ddtree_batched`] for drop-in dispatch
 /// from the daemon, minus the `post_seed_snap` and `scratch` arguments
-/// (Phase 1 has no second snapshot need and writes no tree-bias scratch).
+/// (this function uses `target_snap` + `path_c_phase2` snapshots instead).
 #[cfg(feature = "deltanet")]
 pub fn spec_step_ddtree_path_c(
     gpu: &mut Gpu,
@@ -4311,6 +4341,7 @@ pub fn spec_step_ddtree_path_c(
     ctx_slice: Option<usize>,
     tree_budget: usize,
     tree_topk: usize,
+    path_c_phase2: Option<Phase2Snapshots<'_>>,
 ) -> HipResult<SpecStepResult> {
     let b = draft_cfg.block_size;
     let vocab = target.config.vocab_size;
@@ -4379,7 +4410,7 @@ pub fn spec_step_ddtree_path_c(
         });
     }
 
-    // ── 4. Build the verify chain: [seed, main_path[0].tok, main_path[1].tok, …]
+    // ── 4. Build the main-path verify chain: [seed, main_path tokens…] ───
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(1 + main_path.len());
     verify_tokens.push(seed_token);
     for &ni in &main_path {
@@ -4392,51 +4423,26 @@ pub fn spec_step_ddtree_path_c(
     // ── 6. Linear verify on the main chain. No tree mask, no linearization
     //       phase poisoning — RoPE phases match committed slots exactly.
     //       This is the entire "Step 1" of the PRD's three-step pattern.
-    let verify_out = verify_dflash_block(
+    let main_verify_out = verify_dflash_block(
         gpu, target, &verify_tokens, position, hidden_rb, Some(gdn_tape), false,
         verify_scratch,
     )?;
-    let posterior = verify_out.argmax_per_pos;
-    debug_assert_eq!(posterior.len(), 1 + main_path.len());
+    let main_posterior = main_verify_out.argmax_per_pos;
+    debug_assert_eq!(main_posterior.len(), 1 + main_path.len());
 
-    // ── 7. Greedy walk: longest prefix of `main_path` whose tokens match
-    //       target's per-slot argmax. `posterior[i]` is target's argmax at
-    //       chain slot i+1 (= "what comes after slot i") in the linear
-    //       convention used by `verify_dflash_block_inner`. So compare
-    //       `posterior[j]` against `main_path[j].token` to decide whether
-    //       to accept main_path[j].
+    // ── 7. Greedy walk on the main chain (see Phase 1 doc-comment). ──────
     let mut accepted_main: usize = 0;
     for j in 0..main_path.len() {
         let drafted_tok = tree.nodes[main_path[j]].token;
-        if posterior[j] == drafted_tok {
+        if main_posterior[j] == drafted_tok {
             accepted_main = j + 1;
         } else {
             break;
         }
     }
-    // posterior length is 1 + main_path.len(); accepted_main ∈ [0..=main_path.len()].
-    // posterior[accepted_main] is either the first rejection (when partial)
-    // or the predict-after-last-accepted (when fully accepted).
-    let bonus_token = posterior[accepted_main];
+    let bonus_token = main_posterior[accepted_main];
 
-    // ── 8. Build committed and drafted sequences ─────────────────────────
-    let mut committed: Vec<u32> = Vec::with_capacity(accepted_main + 2);
-    committed.push(seed_token);
-    for j in 0..accepted_main {
-        committed.push(tree.nodes[main_path[j]].token);
-    }
-    committed.push(bonus_token);
-
-    let mut drafted: Vec<u32> = Vec::with_capacity(main_path.len() + 1);
-    drafted.push(seed_token);
-    for &ni in &main_path {
-        drafted.push(tree.nodes[ni].token);
-    }
-
-    // ── 9. Tape replay over the committed prefix. The chain is linear,
-    //       so the tape captured by verify_dflash_block above is already
-    //       in commit order — no sibling-detour fast/slow-path split is
-    //       needed (unlike spec_step_ddtree_batched).
+    // ── 8. Drive DN state to "main-end" via tape replay. Same as Phase 1.
     target_snap.restore_to(&mut target.dn_state, gpu)?;
     gdn_tape.replay_gdn(
         gpu,
@@ -4446,18 +4452,181 @@ pub fn spec_step_ddtree_path_c(
         accepted_main + 1,
     )?;
 
-    // ── 10. Append (1 + accepted_main) hidden rows to target_hidden_host.
-    //        verify_dflash_block writes `verify_tokens.len()` rows into the
-    //        ring buffer in commit order; we keep only the accepted prefix.
-    let chain_len = 1 + main_path.len();
-    let hidden_block = download_hidden_block(gpu, hidden_rb, chain_len)?;
+    // ── 9. Download main verify's hidden rows. download_hidden_block
+    //       reads the LAST `n` rows from the ring; after main verify's
+    //       writes those last `n` rows ARE the main chain's hidden states.
+    //       Branch verify (if any) will overwrite this region of the ring,
+    //       so we must download main rows BEFORE running it.
+    let main_chain_len = 1 + main_path.len();
+    let main_hidden_block = download_hidden_block(gpu, hidden_rb, main_chain_len)?;
     let row_stride = ne * h;
-    let rows_to_keep = accepted_main + 1;
-    target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * row_stride]);
+
+    // ── 10. Phase 2: lazy branch FA-only re-verify. At most one branch
+    //        per cycle is structurally able to accept (PRD §"Architecture
+    //        /Step 2"): the candidate is the sibling at fork depth =
+    //        `accepted_main` whose first token equals `bonus_token`. All
+    //        other branches' first tokens are guaranteed to mismatch the
+    //        target's posterior at their fork depth (because main verify
+    //        accepted main_path's child there, OR rejected with a posterior
+    //        != any siblings' tokens). So one candidate at most.
+    let mut accepted_branch_indices: Vec<usize> = Vec::new();
+    let mut effective_bonus = bonus_token;
+    let mut branch_hidden_block: Option<Vec<f32>> = None;
+    if let Some(snaps) = path_c_phase2 {
+        // Save the main-end DN state so we can roll back on branch reject.
+        snaps.main_end_snap.save_from(&target.dn_state, gpu)?;
+
+        // Find the unique candidate branch.
+        let branches = crate::ddtree::enumerate_branches(&tree, &main_path, accepted_main);
+        let candidate = branches.into_iter().find(|b| {
+            b.fork_depth as usize == accepted_main
+                && tree
+                    .nodes
+                    .get(b.chain[0])
+                    .map(|n| n.token == bonus_token)
+                    .unwrap_or(false)
+        });
+
+        if let Some(branch) = candidate {
+            // Step 2.1: restore DN to the branch parent's pre-state.
+            target_snap.restore_to(&mut target.dn_state, gpu)?;
+            if accepted_main > 0 {
+                gdn_tape.replay_gdn(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    accepted_main,
+                )?;
+            }
+            // Save it: we'll restore here again on accept to replay
+            // branch tape rows into the correct intermediate state.
+            snaps.parent_pre_snap.save_from(&target.dn_state, gpu)?;
+
+            // Step 2.2: run the branch FA forward. start_pos =
+            // position + accepted_main is the parent's absolute slot;
+            // forwarding [parent_tok, c0, c1, ...] there has the model
+            // see committed RoPE phases (no linearization-slot phase
+            // poisoning) and a freshly-restored DN state for LA layers.
+            //
+            // We pass `Some(gdn_tape)`: branch innovations are captured
+            // into tape rows [0..1+chain.len()], CLOBBERING main verify's
+            // captures. That's safe — main tape was already replayed in
+            // step 8 to drive DN to main-end, we don't need it anymore.
+            let parent_tok = if accepted_main == 0 {
+                seed_token
+            } else {
+                tree.nodes[main_path[accepted_main - 1]].token
+            };
+            let mut branch_chain_tokens: Vec<u32> =
+                Vec::with_capacity(1 + branch.chain.len());
+            branch_chain_tokens.push(parent_tok);
+            for &ni in &branch.chain {
+                branch_chain_tokens.push(tree.nodes[ni].token);
+            }
+            let branch_start_pos = position + accepted_main;
+            let branch_verify_out = verify_dflash_block(
+                gpu, target, &branch_chain_tokens, branch_start_pos, hidden_rb,
+                Some(gdn_tape), false, verify_scratch,
+            )?;
+            let branch_posterior = branch_verify_out.argmax_per_pos;
+            debug_assert_eq!(branch_posterior.len(), 1 + branch.chain.len());
+
+            // Step 2.3: greedy walk on the branch.
+            //   branch_posterior[j] = target's predict at branch_start_pos+j+1
+            //   given prefix [parent, c0, ..., c_{j-1}]. Accept c_j iff
+            //   branch_posterior[j] == c_j.tok.
+            let mut accepted_branch: usize = 0;
+            for j in 0..branch.chain.len() {
+                let drafted_tok = tree.nodes[branch.chain[j]].token;
+                if branch_posterior[j] == drafted_tok {
+                    accepted_branch = j + 1;
+                } else {
+                    break;
+                }
+            }
+
+            if accepted_branch == 0 {
+                // Branch reject: restore main-end DN state. KV writes the
+                // branch did at slots > position+accepted_main are stale
+                // but tolerated (next cycle overwrites — see fn doc-comment).
+                snaps.main_end_snap.restore_to(&mut target.dn_state, gpu)?;
+            } else {
+                // Branch accept: extend commit by accepted_branch tokens.
+                // Step 3: drive DN state to "after position + accepted_main +
+                // accepted_branch" via tape replay on the branch tape we
+                // just captured (rows [0..1+accepted_branch]).
+                snaps.parent_pre_snap.restore_to(&mut target.dn_state, gpu)?;
+                gdn_tape.replay_gdn(
+                    gpu,
+                    &target.weights,
+                    &target.config,
+                    &mut target.dn_state,
+                    1 + accepted_branch,
+                )?;
+
+                // Branch hidden rows (1 + chain.len() rows for [parent,
+                // c0..c_{chain.len()-1}]). Download now while they're the
+                // most-recent ring writes; we'll skip parent's row at index 0
+                // (it's a duplicate of the corresponding main verify row).
+                let bb = download_hidden_block(gpu, hidden_rb, 1 + branch.chain.len())?;
+                branch_hidden_block = Some(bb);
+
+                // Update the bonus token to the branch's predict-after-last-
+                // accepted slot (= branch_posterior[accepted_branch] —
+                // same off-by-one convention as the main greedy walk).
+                effective_bonus = branch_posterior[accepted_branch];
+
+                // Capture which branch nodes we accepted so we can build
+                // the final committed/drafted lists once we're out of the
+                // Phase 2 block (where the borrow on `branch.chain` ends).
+                accepted_branch_indices.extend_from_slice(&branch.chain[..accepted_branch]);
+            }
+        }
+    }
+
+    // ── 11. Build committed + drafted sequences. Includes any accepted
+    //        branch tokens (empty when Phase 2 is off, no candidate, or
+    //        candidate rejected).
+    let total_accepted = accepted_main + accepted_branch_indices.len();
+    let mut committed: Vec<u32> = Vec::with_capacity(total_accepted + 2);
+    committed.push(seed_token);
+    for j in 0..accepted_main {
+        committed.push(tree.nodes[main_path[j]].token);
+    }
+    for &ni in &accepted_branch_indices {
+        committed.push(tree.nodes[ni].token);
+    }
+    committed.push(effective_bonus);
+
+    let mut drafted: Vec<u32> = Vec::with_capacity(1 + main_path.len() + accepted_branch_indices.len());
+    drafted.push(seed_token);
+    for &ni in &main_path {
+        drafted.push(tree.nodes[ni].token);
+    }
+    for &ni in &accepted_branch_indices {
+        drafted.push(tree.nodes[ni].token);
+    }
+
+    // ── 12. Append accepted hidden rows to target_hidden_host. Same row
+    //        accounting as spec_step_dflash: keep `1 + accepted_count`
+    //        rows (seed + accepted committed); the bonus-token row is
+    //        deliberately NOT appended because its hidden was captured at
+    //        a wrong-token slot (will materialize correctly on next cycle's
+    //        verify). See spec_step_dflash §"step 9" comment block.
+    let main_rows_to_keep = accepted_main + 1; // seed + accepted main
+    target_hidden_host.extend_from_slice(&main_hidden_block[..main_rows_to_keep * row_stride]);
+    if let Some(bb) = &branch_hidden_block {
+        // Branch block layout: row 0 = parent (duplicate), rows
+        // [1..1+accepted_branch] = c_0 .. c_{accepted_branch-1}.
+        let start = row_stride;
+        let end = (1 + accepted_branch_indices.len()) * row_stride;
+        target_hidden_host.extend_from_slice(&bb[start..end]);
+    }
 
     Ok(SpecStepResult {
-        accepted: accepted_main,
-        bonus_token,
+        accepted: total_accepted,
+        bonus_token: effective_bonus,
         drafted,
         committed,
     })

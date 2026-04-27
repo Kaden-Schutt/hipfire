@@ -202,6 +202,13 @@ struct DdtreeState {
     /// `HIPFIRE_DDTREE_TOPK` (default 4 — matches paper Algorithm 1's
     /// typical setting on dense Qwen targets).
     topk: usize,
+    /// Path C Phase 2 auxiliary snapshots. Used only when
+    /// `HIPFIRE_DDTREE_PATH_C=phase2`. Allocated unconditionally when DDTree
+    /// is enabled — DN state buffers are small (a few KB each on 27B) and
+    /// avoiding the gate keeps allocation deterministic at session start.
+    /// See `speculative::Phase2Snapshots` for what each snapshot holds.
+    path_c_parent_pre_snap: DeltaNetSnapshot,
+    path_c_main_end_snap: DeltaNetSnapshot,
 }
 
 struct LoadedModel {
@@ -965,6 +972,10 @@ fn load_dflash_state(
                 .unwrap_or(4);
             let post_seed_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
                 .map_err(|e| format!("ddtree post_seed_snap: {e}"))?;
+            let path_c_parent_pre_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
+                .map_err(|e| format!("ddtree path_c_parent_pre_snap: {e}"))?;
+            let path_c_main_end_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
+                .map_err(|e| format!("ddtree path_c_main_end_snap: {e}"))?;
             let n_fa_layers = target_config
                 .layer_types
                 .iter()
@@ -994,6 +1005,8 @@ fn load_dflash_state(
                 scratch,
                 budget,
                 topk,
+                path_c_parent_pre_snap,
+                path_c_main_end_snap,
             })
         }
         None => None,
@@ -1036,7 +1049,7 @@ fn generate_dflash(
 ) {
     use engine::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
-        ModelSlotConfig, SpecStats,
+        ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
@@ -1261,15 +1274,25 @@ fn generate_dflash(
         // is unchanged. Note: `spec_step_ddtree_batched` is greedy-only
         // (temp=0); the daemon currently runs at 0.0_f32 so this matches.
         //
-        // `HIPFIRE_DDTREE_PATH_C=phase1` (only meaningful when DDTree is
-        // already enabled) reroutes to `spec_step_ddtree_path_c`, which
-        // runs Step 1 of the PRD only — main-path-first linear verify, no
-        // branches. Bit-exact gate: should produce the same tokens as
-        // calling `verify_dflash_block` directly on the greedy main chain.
-        // See `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+        // `HIPFIRE_DDTREE_PATH_C={phase1|phase2}` (only meaningful when
+        // DDTree itself is enabled) reroutes to `spec_step_ddtree_path_c`,
+        // which runs the PRD's main-path-first orchestrator. `phase1`
+        // runs Step 1 only (linear main-path verify); `phase2` adds the
+        // lazy branch FA-only re-verify (Steps 2+3). Anything else falls
+        // back to `spec_step_ddtree_batched`. See
+        // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
         let path_c_phase = std::env::var("HIPFIRE_DDTREE_PATH_C").ok();
+        let path_c_mode = path_c_phase.as_deref();
         let step_result = if let Some(dd) = df.ddtree.as_mut() {
-            if path_c_phase.as_deref() == Some("phase1") {
+            if path_c_mode == Some("phase1") || path_c_mode == Some("phase2") {
+                let phase2_snaps = if path_c_mode == Some("phase2") {
+                    Some(Phase2Snapshots {
+                        parent_pre_snap: &mut dd.path_c_parent_pre_snap,
+                        main_end_snap: &mut dd.path_c_main_end_snap,
+                    })
+                } else {
+                    None
+                };
                 spec_step_ddtree_path_c(
                     gpu, &mut target, &df.draft_weights, &df.draft_config,
                     &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
@@ -1278,6 +1301,7 @@ fn generate_dflash(
                     None,                      // ctx_slice = full history
                     dd.budget,
                     dd.topk,
+                    phase2_snaps,
                 )
             } else {
                 spec_step_ddtree_batched(
