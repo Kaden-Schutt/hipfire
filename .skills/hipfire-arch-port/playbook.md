@@ -59,19 +59,36 @@ near the top of `dispatch.rs` (around lines 30–80) — extend them
 when the same predicate would be tested in 3+ places. Add new
 inline checks when one site needs the test once.
 
-When adding a new arch's dispatch branch, ensure each arch
-appears in exactly one branch per dispatch site. If the new arch
-was previously absorbed by a more permissive check (e.g. an
-existing `gfx11 || gfx12` branch routing gfx12 to the gfx11
-kernel), narrow that older check to drop the now-handled arch in
-the same commit — don't leave dead alternates. The dispatch tree
-is read by humans and agents trying to figure out which arch
-takes which path; stale conditions corrupt that signal.
+When adding a new arch's dispatch branch, the only invariant is
+**no unreachable code**. The dispatch sites are layered fast-paths
+with fallthrough — multiple archs legitimately share a downstream
+predicate (e.g. `has_dot2_f32_f16` matches RDNA1.5 / RDNA2 / RDNA3
+/ RDNA4 all together for the dot2 fallback), and that's correct
+because they each route there only after the higher-priority
+branches return-or-fall-through.
+
+What you DO need to check after adding a new branch: did your new
+branch make any of the literal conditions in lower-priority
+branches redundant? Specifically:
+
+- A literal `... || starts_with("gfxN")` clause where every gfxN-
+  prefixed arch is now matched by your earlier branch → drop the
+  `|| starts_with("gfxN")` clause in the same diff.
+- An entire branch whose predicate is now strictly subsumed by an
+  earlier branch (rare, usually a sign your new branch is too
+  broad).
+
+Predicate-style helpers (`has_dot2_f32_f16(arch)`, etc.) typically
+do NOT need narrowing when you add a new arch — the helper
+intentionally covers a broad family, and downstream sites rely on
+that. Edit the helper only if its definition is genuinely wrong
+for the new arch, not because your new branch overlaps with part
+of its set.
 
 Run the speed-gate on the baseline arch (gfx1100 on the local
-7900 XTX bench) after the combined change. If the gate
-regresses, root-cause it (see `validation.md` troubleshooting)
-rather than splitting the diff to dodge the regression.
+7900 XTX bench) after the change. If the gate regresses,
+root-cause it (see `validation.md` troubleshooting) rather than
+splitting the diff to dodge the regression.
 
 ### 3. Open root-cause: "predicate-vs-inline" gfx11 perf observation
 
