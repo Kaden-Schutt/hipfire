@@ -76,7 +76,7 @@ and pointers at where the fat is. Cached snapshot at
 
 ## License
 
-MIT.
+MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
