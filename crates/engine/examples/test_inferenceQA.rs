@@ -37,6 +37,12 @@ use std::time::{Duration, Instant};
 const SKIP_EXIT: u8 = 10;
 #[cfg(feature = "deltanet")]
 const QWEN_GGUF_FALLBACK: &str = "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf";
+#[cfg(feature = "deltanet")]
+const PREFILL_MEAN_LOGIT_TOL: f64 = 0.15;
+#[cfg(feature = "deltanet")]
+const PREFILL_ASYM2_MEAN_LOGIT_TOL: f64 = 0.25;
+#[cfg(feature = "deltanet")]
+const PREFILL_SELECTED_LOGIT_TOL: f32 = 1.0;
 
 #[cfg(feature = "deltanet")]
 struct CaseDef {
@@ -53,6 +59,7 @@ const CASES: &[CaseDef] = &[
     CaseDef { name: "chatml_single_tokens", timeout: Duration::from_secs(10) },
     CaseDef { name: "givens4_cache_allocates", timeout: Duration::from_secs(20) },
     CaseDef { name: "givens4_forward_no_hang", timeout: Duration::from_secs(20) },
+    CaseDef { name: "prefill_batch_matches_sequential", timeout: Duration::from_secs(120) },
     CaseDef { name: "decode_speed_sanity", timeout: Duration::from_secs(35) },
     CaseDef { name: "vram_leak_signal", timeout: Duration::from_secs(20) },
 ];
@@ -236,6 +243,7 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
             "chatml_single_tokens" => chatml_single_tokens(&mut ctx),
             "givens4_cache_allocates" => givens4_cache_allocates(&mut ctx),
             "givens4_forward_no_hang" => givens4_forward_no_hang(&mut ctx),
+            "prefill_batch_matches_sequential" => prefill_batch_matches_sequential(&mut ctx),
             "decode_speed_sanity" => decode_speed_sanity(&mut ctx),
             "vram_leak_signal" => vram_leak_signal(&mut ctx),
             other => CaseOutcome::Fail(format!("unknown case: {other}")),
@@ -359,6 +367,88 @@ fn ensure(cond: bool, msg: impl Into<String>) -> Result<(), String> {
     } else {
         Err(msg.into())
     }
+}
+
+#[cfg(feature = "deltanet")]
+fn logit_diff_stats(a: &[f32], b: &[f32]) -> (f32, f64) {
+    let mut max_diff = 0.0f32;
+    let mut sum_diff = 0.0f64;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        let diff = (x - y).abs();
+        max_diff = max_diff.max(diff);
+        sum_diff += diff as f64;
+    }
+    (max_diff, sum_diff / a.len().max(1) as f64)
+}
+
+#[cfg(feature = "deltanet")]
+fn prefill_mean_logit_tol(mode: &str) -> f64 {
+    match mode {
+        // The rotated 2-bit K cache is intentionally the lossiest KV mode.
+        // Keep top-token and selected-logit checks strict, but allow a wider
+        // full-vocab mean drift than q8/asym3/asym4.
+        "asym2" | "turbo2" => PREFILL_ASYM2_MEAN_LOGIT_TOL,
+        _ => PREFILL_MEAN_LOGIT_TOL,
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn prompt_processing_tokens(ctx: &Context) -> Result<Vec<u32>, String> {
+    let prompt = "\
+Write a Python function that returns the length of the longest substring without repeating characters.
+
+
+Use a sliding window and include a small doctest.";
+    let seed = ctx.tokenizer.encode(prompt);
+    ensure(!seed.is_empty(), "prompt encoded to zero tokens")?;
+
+    let mut tokens = seed.clone();
+    while tokens.len() < 40 {
+        tokens.extend(seed.iter().copied());
+    }
+    tokens.truncate(40);
+    Ok(tokens)
+}
+
+#[cfg(feature = "deltanet")]
+fn kv_cache_for_mode(
+    gpu: &mut rdna_compute::Gpu,
+    config: &qwen35::Qwen35Config,
+    mode: &str,
+    seq_len: usize,
+) -> Result<llama::KvCache, String> {
+    match mode {
+        "q8" => llama::KvCache::new_gpu_q8(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq_len,
+        ),
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq_len,
+        ),
+        "asym3" | "turbo3" | "turbo" => llama::KvCache::new_gpu_asym3(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq_len,
+        ),
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2(
+            gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            seq_len,
+        ),
+        other => return Err(format!("unknown KV mode: {other}")),
+    }
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(feature = "deltanet")]
@@ -502,6 +592,104 @@ fn givens4_forward_no_hang(ctx: &mut Context) -> CaseOutcome {
                 .map_err(|e: hip_bridge::HipError| e.to_string())?;
         }
         Ok(format!("{} tokens in {}ms", tokens.len(), t0.elapsed().as_millis()))
+    })() {
+        Ok(msg) => CaseOutcome::Pass(msg),
+        Err(err) => CaseOutcome::Fail(err),
+    }
+}
+
+#[cfg(feature = "deltanet")]
+fn prefill_batch_matches_sequential(ctx: &mut Context) -> CaseOutcome {
+    match (|| -> Result<String, String> {
+        let tokens = prompt_processing_tokens(ctx)?;
+        let lengths = [2usize, 7, 17, 33];
+        let kv_modes = env::var("HIPFIRE_QA_KV_MODES")
+            .unwrap_or_else(|_| "q8,asym4,asym3,asym2".to_string());
+        let kv_modes: Vec<&str> = kv_modes
+            .split(',')
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .collect();
+        ensure(!kv_modes.is_empty(), "HIPFIRE_QA_KV_MODES produced zero modes")?;
+        let mut summaries = Vec::new();
+
+        for mode in kv_modes {
+            for &n in &lengths {
+                ensure(n <= tokens.len(), format!("test length {n} exceeds prompt length {}", tokens.len()))?;
+                let kv_seq_len = (n + 8).max(128);
+                let mut kv_seq = kv_cache_for_mode(&mut ctx.gpu, &ctx.config, mode, kv_seq_len)?;
+                let mut kv_batch = kv_cache_for_mode(&mut ctx.gpu, &ctx.config, mode, kv_seq_len)?;
+                let mut dn_seq = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+                    .map_err(|e: hip_bridge::HipError| e.to_string())?;
+                let mut dn_batch = DeltaNetState::new(&mut ctx.gpu, &ctx.config)
+                    .map_err(|e: hip_bridge::HipError| e.to_string())?;
+                let scratch = qwen35::Qwen35Scratch::new_with_kv_max(&mut ctx.gpu, &ctx.config, 64, kv_seq_len)
+                    .map_err(|e: hip_bridge::HipError| e.to_string())?;
+
+                for (pos, &tok) in tokens[..n].iter().enumerate() {
+                    qwen35::forward_scratch(&mut ctx.gpu, &ctx.weights, &ctx.config, tok, pos, &mut kv_seq, &mut dn_seq, &scratch)
+                        .map_err(|e: hip_bridge::HipError| e.to_string())?;
+                }
+                let seq_logits = ctx.gpu.download_f32(&scratch.logits).map_err(|e| e.to_string())?;
+
+                qwen35::forward_prefill_batch(
+                    &mut ctx.gpu,
+                    &ctx.weights,
+                    &ctx.config,
+                    &tokens[..n],
+                    0,
+                    &mut kv_batch,
+                    &mut dn_batch,
+                    &scratch,
+                    None,
+                    None,
+                    None,
+                    None,
+                ).map_err(|e: hip_bridge::HipError| e.to_string())?;
+                let batch_logits = ctx.gpu.download_f32(&scratch.logits).map_err(|e| e.to_string())?;
+
+                let seq_top = llama::argmax(&seq_logits);
+                let batch_top = llama::argmax(&batch_logits);
+                let (max_diff, mean_diff) = logit_diff_stats(&seq_logits, &batch_logits);
+                let selected_diff = (seq_logits[seq_top as usize] - batch_logits[seq_top as usize]).abs();
+                let mean_tol = prefill_mean_logit_tol(mode);
+                ensure(
+                    seq_top == batch_top,
+                    format!("prefill top token diverged at mode={mode} n={n}: sequential={seq_top} batch={batch_top} max_diff={max_diff:.6} mean_diff={mean_diff:.6} selected_diff={selected_diff:.6}"),
+                )?;
+                ensure(
+                    mean_diff < mean_tol && selected_diff < PREFILL_SELECTED_LOGIT_TOL,
+                    format!("prefill logits drift too high at mode={mode} n={n}: max_diff={max_diff:.6} mean_diff={mean_diff:.6} mean_tol={mean_tol:.3} selected_diff={selected_diff:.6}"),
+                )?;
+
+                let next = seq_top;
+                qwen35::forward_scratch(&mut ctx.gpu, &ctx.weights, &ctx.config, next, n, &mut kv_seq, &mut dn_seq, &scratch)
+                    .map_err(|e: hip_bridge::HipError| e.to_string())?;
+                let seq_next_logits = ctx.gpu.download_f32(&scratch.logits).map_err(|e| e.to_string())?;
+                qwen35::forward_scratch(&mut ctx.gpu, &ctx.weights, &ctx.config, next, n, &mut kv_batch, &mut dn_batch, &scratch)
+                    .map_err(|e: hip_bridge::HipError| e.to_string())?;
+                let batch_next_logits = ctx.gpu.download_f32(&scratch.logits).map_err(|e| e.to_string())?;
+
+                let seq_next_top = llama::argmax(&seq_next_logits);
+                let batch_next_top = llama::argmax(&batch_next_logits);
+                let (next_max_diff, next_mean_diff) = logit_diff_stats(&seq_next_logits, &batch_next_logits);
+                let next_selected_diff = (seq_next_logits[seq_next_top as usize] - batch_next_logits[seq_next_top as usize]).abs();
+                ensure(
+                    seq_next_top == batch_next_top,
+                    format!("post-prefill decode top token diverged at mode={mode} n={n}: sequential={seq_next_top} batch={batch_next_top} max_diff={next_max_diff:.6} mean_diff={next_mean_diff:.6} selected_diff={next_selected_diff:.6}"),
+                )?;
+                ensure(
+                    next_mean_diff < mean_tol && next_selected_diff < PREFILL_SELECTED_LOGIT_TOL,
+                    format!("post-prefill decode logits drift too high at mode={mode} n={n}: max_diff={next_max_diff:.6} mean_diff={next_mean_diff:.6} mean_tol={mean_tol:.3} selected_diff={next_selected_diff:.6}"),
+                )?;
+
+                summaries.push(format!(
+                    "{mode}/n={n} prefill(max={max_diff:.4},mean={mean_diff:.5},sel={selected_diff:.4}) next(max={next_max_diff:.4},mean={next_mean_diff:.5},sel={next_selected_diff:.4})"
+                ));
+            }
+        }
+
+        Ok(summaries.join("; "))
     })() {
         Ok(msg) => CaseOutcome::Pass(msg),
         Err(err) => CaseOutcome::Fail(err),

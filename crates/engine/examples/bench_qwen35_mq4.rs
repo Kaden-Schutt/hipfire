@@ -4,7 +4,7 @@
 //! via an explicit warmup phase, and reports per-token latency stats plus
 //! an effective memory bandwidth estimate (weights_bytes × gen_tok/s).
 //!
-//! Usage: bench_qwen35_mq4 <model.hfq> [--prefill <N>] [--gen <N>] [--warmup <N>]
+//! Usage: bench_qwen35_mq4 <model.hfq> [--prefill <N>] [--prefill-runs <N>] [--gen <N>] [--warmup <N>]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() { eprintln!("build with --features deltanet"); }
@@ -19,19 +19,21 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--gen N] [--warmup N]");
+        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N]");
         std::process::exit(1);
     }
     let model_path = &args[1];
 
     // Defaults: 32-token prefill, 5-token warmup, 100-token bench.
     let mut prefill_len: usize = 32;
+    let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--prefill" => { prefill_len = args[i + 1].parse().unwrap(); i += 2; }
+            "--prefill-runs" => { prefill_runs = args[i + 1].parse::<usize>().unwrap().max(1); i += 2; }
             "--gen"     => { gen_len     = args[i + 1].parse().unwrap(); i += 2; }
             "--warmup"  => { warmup_len  = args[i + 1].parse().unwrap(); i += 2; }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
@@ -40,7 +42,7 @@ fn main() {
 
     eprintln!("=== bench_qwen35_mq4 ===");
     eprintln!("Model: {model_path}");
-    eprintln!("Phases: prefill={prefill_len} warmup={warmup_len} gen={gen_len}");
+    eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
     let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
@@ -113,34 +115,64 @@ fn main() {
         rdna_compute::profile::start();
     }
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
-    let t_prefill = Instant::now();
-    qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, &prompt_tokens, 0,
-        &mut kv_cache, &mut dn_state, &scratch,
-        None, None, None, None,
-    ).expect("prefill forward failed");
-    gpu.hip.device_synchronize().expect("sync after prefill");
-    let prefill_ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+    let mut prefill_samples_ms = Vec::with_capacity(prefill_runs);
+    for run in 0..prefill_runs {
+        if run > 0 {
+            dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+            kv_cache = match kv_mode.as_str() {
+                "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                "asym4" | "turbo4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                "asym2" | "turbo2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+            };
+        }
+        let t_prefill = Instant::now();
+        qwen35::forward_prefill_batch(
+            &mut gpu, &weights, &config, &prompt_tokens, 0,
+            &mut kv_cache, &mut dn_state, &scratch,
+            None, None, None, None,
+        ).expect("prefill forward failed");
+        gpu.hip.device_synchronize().expect("sync after prefill");
+        let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+        prefill_samples_ms.push(ms);
+        if prefill_runs > 1 {
+            eprintln!("  run {:>2}: {:.1}ms  {:.1} tok/s", run + 1, ms, prefill_len as f64 / (ms / 1000.0));
+        }
+    }
+    let prefill_ms = *prefill_samples_ms.last().unwrap();
     if do_profile {
         if let Some(entries) = rdna_compute::profile::stop() {
-            let mut by_kernel: std::collections::HashMap<&str, (f64, usize)> = Default::default();
+            let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> = Default::default();
             for e in &entries {
-                let (time, count) = by_kernel.entry(e.kernel).or_default();
+                let (time, count, bytes) = by_kernel.entry(e.kernel).or_default();
                 *time += e.time_us;
                 *count += 1;
+                *bytes += e.bytes;
             }
             eprintln!("\n=== PROFILE ({} launches, {:.1}ms wall) ===", entries.len(), prefill_ms);
             let mut kerns: Vec<_> = by_kernel.iter().collect();
             kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
-            let total_us: f64 = kerns.iter().map(|(_, (t, _))| t).sum();
-            for (kern, (us, n)) in &kerns {
-                eprintln!("  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%",
-                    us / 1000.0, us / *n as f64, us / total_us * 100.0);
+            let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
+            for (kern, (us, n, bytes)) in &kerns {
+                let gib_s = if *us > 0.0 {
+                    (*bytes as f64 / (1024.0 * 1024.0 * 1024.0)) / (*us / 1_000_000.0)
+                } else {
+                    0.0
+                };
+                eprintln!("  {kern:45} {n:5}x  {:.1}ms  ({:.0}µs/call)  {:.1}%  {:.1} GiB/s",
+                    us / 1000.0, us / *n as f64, us / total_us * 100.0, gib_s);
             }
             eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
         }
     }
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
+    if prefill_samples_ms.len() > 1 {
+        let mut sorted_prefill = prefill_samples_ms.clone();
+        sorted_prefill.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let median_ms = sorted_prefill[sorted_prefill.len() / 2];
+        eprintln!("  median: {median_ms:.1}ms  {:.1} tok/s", prefill_len as f64 / (median_ms / 1000.0));
+    }
     eprintln!("  total: {prefill_ms:.1}ms");
     eprintln!("  tok/s: {prefill_tok_s:.1}");
     eprintln!("  NOTE: first prefill run includes kernel JIT compile cost");
@@ -200,6 +232,13 @@ fn main() {
     let mut sorted = per_token_ms.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = sorted.len();
+    if n == 0 {
+        eprintln!("  total: {gen_total_ms:.1}ms over 0 tokens");
+        eprintln!("  tok/s (gen): 0.0");
+        eprintln!();
+        eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00");
+        return;
+    }
     let sum: f64 = sorted.iter().sum();
     let avg_ms = sum / n as f64;
     let min_ms = sorted[0];

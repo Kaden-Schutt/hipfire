@@ -2032,6 +2032,10 @@ pub struct Qwen35Scratch {
     /// can stay in a graph-capturable stream).
     pub moe_topk_indices:  Option<GpuTensor>,   // [k] i32 stored as f32 alias
     pub moe_topk_weights:  Option<GpuTensor>,   // [k] f32
+
+    // Optional long-prefill scratch. Default is None to preserve VRAM
+    // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
+    pub prefill_batch: Option<PrefillBatchScratch>,
 }
 
 impl Qwen35Scratch {
@@ -2118,6 +2122,7 @@ impl Qwen35Scratch {
             moe_rot_batch:     None,
             moe_topk_indices:  None,
             moe_topk_weights:  None,
+            prefill_batch:     None,
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -2152,6 +2157,14 @@ impl Qwen35Scratch {
                 // error). Idempotent if already computed.
                 gpu.ensure_mq_signs()?;
             }
+            if std::env::var("HIPFIRE_PREFILL_REUSE_PBS").ok().as_deref() == Some("1") {
+                let max_batch = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|&v| v >= 2)
+                    .unwrap_or(PREFILL_MAX_BATCH);
+                s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+            }
             Ok(s)
         })
     }
@@ -2177,6 +2190,9 @@ impl Qwen35Scratch {
                    self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
                    self.moe_topk_indices, self.moe_topk_weights] {
             if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
+        }
+        if let Some(pbs) = self.prefill_batch {
+            pbs.free_gpu(gpu);
         }
     }
 }
@@ -2609,7 +2625,7 @@ pub fn forward_prefill_batch(
 ) -> HipResult<()> {
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
-        hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, None,
+        hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
     )
 }
 
@@ -2654,7 +2670,11 @@ pub fn forward_prefill_batch_with_pbs(
     //
     // Exposed via PREFILL_MAX_BATCH so callers sizing `HiddenStateRingBuffer`
     // staging can match the chunk upper bound.
-    const MAX_BATCH: usize = PREFILL_MAX_BATCH;
+    let max_batch: usize = std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_BATCH)
+        .unwrap_or(PREFILL_MAX_BATCH);
 
     let n = tokens.len();
     if n == 0 {
@@ -2770,9 +2790,9 @@ pub fn forward_prefill_batch_with_pbs(
     // is extra work for a case we don't need.
     if tree_verify.is_some() {
         assert!(
-            n <= MAX_BATCH,
-            "tree-verify tokens {} exceeds MAX_BATCH {}; tree budget must fit",
-            n, MAX_BATCH,
+            n <= max_batch,
+            "tree-verify tokens {} exceeds max_batch {}; tree budget must fit",
+            n, max_batch,
         );
     }
 
@@ -2784,19 +2804,12 @@ pub fn forward_prefill_batch_with_pbs(
     // same. The chunk size is `pbs.max_batch` so a caller-owned scratch sized
     // to e.g. `block_size` or `1 + tree_budget` keeps DFlash verify in one
     // chunk without the full 256-row MAX_BATCH footprint.
-    if let Some(p) = pbs_in {
-        debug_assert!(
-            n <= p.max_batch,
-            "caller-owned PrefillBatchScratch max_batch {} < tokens {}",
-            p.max_batch, n,
-        );
-    }
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
             None => {
-                own_pbs = Some(PrefillBatchScratch::new(gpu, config, MAX_BATCH)?);
+                own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
                 own_pbs.as_ref().unwrap()
             }
         };
