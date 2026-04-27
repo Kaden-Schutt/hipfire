@@ -1,5 +1,143 @@
 # Changelog
 
+## v0.1.8-alpha.2 (2026-04-27)
+
+Released the same day as alpha.1 — a second cycle's worth of contributor PRs and
+infrastructure hardening landed too quickly to bundle. Five PRs merged
+(#71, #72, #73, #74, #75), three Codex-flagged config-path hardening passes on
+the just-merged DDTree wire-up, plus a stale-path bugfix that was blocking 27B
+DFlash measurement in the speed-gate.
+
+### Highlights
+
+- **gfx12 WMMA dispatch is now feature-complete** for HFQ4 prefill on RDNA4.
+  PR #62 wired the qkv / qkvza / gate_up scaffolds; PR #71 (@RobinVanCauter) closes
+  the last un-ported GEMM hot path: `gemm_hfq4g256_residual_wmma_gfx12`. The
+  residual kernel was ~42% of 9B prefill GEMM time on the dot2 fallback. R9700
+  numbers vs master: 9B prefill +29.7%/+31.3% (pp32/pp128), 27B prefill
+  +27.8%/+42.4%, 4B prefill +26.0%/+25.5%. Decode unaffected. New
+  `tests/speed-baselines/gfx1201.txt` floor committed.
+- **DDTree wire-up + Path C PRD** (PR #72, @flamme-demon). DDTree was implemented
+  in `speculative.rs` but never reachable from production. Now opt-in via
+  `HIPFIRE_DDTREE_BUDGET=<n>`; default decode path bit-exact preserved. The PR
+  also ships `select_main_path()` + 6 unit tests in `ddtree.rs` (the first brick
+  of Path C) and a 382-line PRD documenting the main-path-first orchestrator
+  pattern as a follow-up to Path A revert (`ecbc49d`) and Path B dead-end
+  (`39aa358`). Local validation on 7900 XTX with Qwen3.6-27B + DFlash MQ4 draft:
+  12/12 attractor-clean across the `path-c-smoke.sh --full` battery, on the
+  exact target/draft pair where Paths A/B1 single-token-attractor failed. Path C
+  avoids the linearization-slot RoPE phase skew by construction (heap-pop
+  ordering invariant). See `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+- **gfx908 / MI100 CDNA1 bring-up** (PR #67, @linus-amg). 2× MI100 hardware
+  validation. Wave64 dispatch added to 4 fused projection sites + a new
+  `fused_gate_up_hfq4g256_wave64` kernel (HFQ4 gate+up FFN GEMV fused; same
+  shape as `fused_qkv_hfq4g256_wave64`, no MFMA). Cross-process verified
+  across 5 fresh-process runs per metric: 9B decode +9.3% (64.4 → 70.3 tok/s),
+  4B decode +4.9%, A3B MoE decode +11.0% (86.6 → 96.1). Also extracted
+  `has_wave64_native(arch)` predicate replacing 7 inline `matches!()` —
+  gfx90a (CDNA2) is now a one-line addition once it has hardware to validate.
+  New `tests/speed-baselines/gfx908.txt`. Two negative results documented in
+  the PR body so the next CDNA1 contributor doesn't re-burn the hours
+  (`v_dot2_f32_f16` regresses prefill on gfx908 despite the instruction
+  existing; wave64 batched GEMM loses to fp16-packed at small batch).
+- **Opt-in HFQ4 MMQ prefill path** (PR #73, @KotDath). Q8_1 activation
+  pre-quantize + i8 WMMA over 128×128 output/batch tiles, similar in shape to
+  llama.cpp's AMD MMQ prompt-processing path. Gated behind `HIPFIRE_MMQ=1`,
+  architecture-gated to gfx1100/1101/1102/1103/1150/1151. Targets the
+  Strix Halo prefill gap vs llama.cpp (#60) where the author measured the
+  largest wins; on gfx1100, +19.8% on 4B pp256 once the per-batch quantize
+  amortizes (small batch is dominated by quantize overhead and is not a
+  target workload). Default behavior unchanged — gate verified bit-exact on
+  master baseline.
+
+### API
+
+- **`/v1/chat/completions` thinking-mode fix** (#74, fae2867). Per-model
+  `max_think_tokens` was silently dropped on the OpenAI-compatible API path,
+  so models with `thinking: "on"` could consume the entire `max_tokens`
+  budget inside a single `<think>...</think>` block; the downstream strip
+  then left `message.content` empty while `completion_tokens` reported the
+  full burn. Reproducer in #74. Also fixed `prompt_tokens: 0` hardcode —
+  `total_tokens` now correctly reports `prompt + completion`.
+
+### CLI
+
+- **`hipfire list` shows `.mq6` models** (PR #75, @Nereuxofficial, 8c352d7).
+  `listLocal()` was missing `.mq6` from its discovery filter. One-line fix.
+
+### Speculative decode hardening
+
+- **HFQ6 WMMA graph-capture safety** (83358c6). All 6 HFQ6 WMMA wrappers
+  (3 gfx11 + 3 gfx12) used raw `unsafe self.hip.launch_kernel` instead of
+  `launch_maybe_blob` — same bug class as the hipGraph dangling-kernarg
+  story (#19, `project_hipgraph_moe_investigation`). Pre-fix: latent on gfx11
+  (HIPFIRE_GRAPH=1 + MQ6 + prefill is a niche combination; speed-gate uses
+  `.mq4` so the bug was dormant). PR #62 routed gfx12 HFQ6 to the same
+  broken wrappers; Codex stop-time review caught it before any user hit it.
+  Migrated all 6 to `launch_maybe_blob` with proper `KernargBlob` builders.
+- **DDTree daemon config hardening** (0931afb, ce36dc8, c8ba1c1). Three
+  Codex-flagged crashable env-var paths in the just-merged DDTree wire-up:
+  - `HIPFIRE_DDTREE_BUDGET` had no upper bound. `DdtreeScratch::attn_bias`
+    is `max_n²`; budget=10000 silently allocated 400 MB, budget=100000
+    OOMed. Capped at 256 (paper Algorithm 1 typically uses ≤22).
+  - `HIPFIRE_DDTREE_TOPK` was clamped to vocab_size (152064 on Qwen3.6).
+    The active kernel `run_dflash_draft_for_topk_gpu` asserts `k <= 8`
+    (speculative.rs:3302); my first cap of 32 still let values 9-32 panic
+    the kernel. Re-capped at `min(8, vocab_size)`. Default scales to
+    tiny-vocab models too: `min(4, vocab_size.max(1))`.
+  - `HIPFIRE_DDTREE_PATH_C` was re-read inside the per-spec-cycle decode
+    loop (microseconds of waste on the hot path) AND silently accepted
+    invalid values like `"phase3"`. Hoisted out, eagerly validated, warns
+    once on bad input.
+  All three replace silent OOM / silent fallback with clear stderr lines.
+
+### Tooling
+
+- **`scripts/speed-gate.sh` 27B DFlash draft path fix** (#61, a3b8f11).
+  Reported by @m0n5t3r as MISSING_DRAFT despite the file being downloaded.
+  Root cause: gate hardcoded `qwen35-27b-dflash.mq4` (legacy basename +
+  extension); registry standardized on `qwen35-27b-dflash-mq4.hfq` when the
+  `<base>-<quant>.hfq` convention landed. Gate now accepts both names.
+  9B path was already correct so it's untouched. Fixes 27B DFlash anchor
+  rows in any future `--update-baselines` capture across all arches.
+
+### Issues filed for follow-up
+
+- **#65** — gfx12 WMMA: tune 9B prefill (multi-row, K-tile, s_prefetch,
+  launch_bounds). RDNA4 follow-up to PR #71. Each lever is a discrete
+  experiment. Hardware: R9700 / 9070 XT.
+- **#70** — gfx908 / MI100 CDNA1: port MFMA prefill kernels (4 kernels +
+  channel-tests). Closes ~35× prefill gap vs gfx1100. Toolchain validated;
+  per-PR-#56 channel-test discipline applies.
+- **#41** — DDTree on gfx1100 RoPE phase-skew. Superseded by PR #72's Path C
+  orchestrator (different mechanism, attractor-clean). Closing in 7 days
+  unless reopened.
+
+### Upgrade
+
+```bash
+hipfire update                      # if installed via curl-bash
+# or
+git pull && cargo install --path crates/engine
+```
+
+Windows: re-run `install.ps1` — the dynamic-release-query (#69) will pull the
+fresh `daemon.exe` automatically; asset-id cache stamp prevents a stale binary
+from being preserved.
+
+### Known issues
+
+- **#60 reporter (@h2252) hit a `--gen 0` panic** on `bench_qwen35_mq4` pre-alpha.2.
+  Cannot reproduce on master; many of today's commits could have addressed it
+  incidentally. If you hit this on alpha.2, please retry with
+  `RUST_BACKTRACE=1` and post the trace on #60.
+- **#68 (Windows + qwen3.6:27b VL trace)** — root-caused to the
+  v0.1.0-alpha-pinned daemon.exe; alpha.1's fresh binary should resolve.
+  Awaiting reporter confirmation.
+- **#50 (gfx1152 / Strix Halo APU segfault)** — different SKU than the
+  gfx1151 work that landed today. Awaiting bt + dmesg + cache-clean repro
+  from reporter.
+
 ## v0.1.8-alpha.1 (2026-04-27)
 
 Point release rolling up the post-v0.1.8-alpha work. Two contributor PRs land in
