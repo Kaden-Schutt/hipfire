@@ -9,17 +9,20 @@
 # Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle).
 # GROUND FLOOR — no commit may regress below these numbers.
 
-0.8b_mq4_pp32_prefill_tok_s=1525.4
-0.8b_mq4_gen_tok_s=238.1
-0.8b_mq4_pp128_prefill_tok_s=4074.5
+0.8b_mq4_pp32_prefill_tok_s=1560.6
+0.8b_mq4_gen_tok_s=236.0
+0.8b_mq4_pp128_prefill_tok_s=4068.9
 
-4b_mq4_pp32_prefill_tok_s=658.9
+4b_mq4_pp32_prefill_tok_s=655.9
 4b_mq4_gen_tok_s=69.0
-4b_mq4_pp128_prefill_tok_s=1001.4
+4b_mq4_pp128_prefill_tok_s=1003.7
 
-9b_mq4_pp32_prefill_tok_s=406.2
+9b_mq4_pp32_prefill_tok_s=406.9
 9b_mq4_gen_tok_s=46.0
-9b_mq4_pp128_prefill_tok_s=536.3
+9b_mq4_pp128_prefill_tok_s=535.9
 
+27b_mq4_pp32_prefill_tok_s=146.7
+27b_mq4_gen_tok_s=14.9
+27b_mq4_pp128_prefill_tok_s=154.4
 
 
