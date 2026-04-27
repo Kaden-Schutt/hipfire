@@ -9,6 +9,14 @@ prompt-shape adaptation, and HumanEval reproductions.
 This file holds the *testing playbook* — how to verify v0.1.8 works,
 what to measure, what counts as pass/fail.
 
+**v0.1.8 default change you'll trip over (post-2026-04-26):**
+`dflash_mode` is now **`off`** by default (was `auto`). DFlash is
+opt-in until the genre-conditional speedup is more universally a win.
+Any test in §3 that exercises DFlash needs an explicit
+`hipfire config set dflash_mode auto` (or `on`) first, or
+`HIPFIRE_DFLASH_DRAFT=<path>` env. Bare `hipfire run <target>` without
+that config flag will NOT load the draft, even if it's installed.
+
 ---
 
 ## 0 · Hard rules from CLAUDE.md (always apply)
@@ -221,10 +229,16 @@ If you're testing an actual user UX flow:
 ```bash
 hipfire pull qwen3.5:9b
 hipfire pull qwen3.5:9b-draft
+hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
 hipfire run qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
 # expected: daemon logs '[hipfire] DFlash draft detected: ...'
 # response generates at ≥250 tok/s on a 9B target with a paired draft
 ```
+
+Without the `dflash_mode auto` config, `hipfire run` runs pure AR
+even when a paired draft is on disk — the daemon explicitly logs
+`[hipfire] DFlash disabled (dflash_mode=off).` This is the "I pulled
+the draft but DFlash isn't firing" pitfall.
 
 ---
 
@@ -298,6 +312,7 @@ For dataclass benches:
 | `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
 | daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
+| `[hipfire] DFlash disabled (dflash_mode=off)` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.5:9b set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
 | `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
@@ -314,7 +329,7 @@ For dataclass benches:
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
 | `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
-| `HIPFIRE_DFLASH_DRAFT` | Force a specific draft path | (auto-discover) |
+| `HIPFIRE_DFLASH_DRAFT` | Force a specific draft path. Empty string = explicit opt-out | (filename auto-match alongside target) |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
@@ -352,6 +367,7 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-04-25 (v0.1.8-alpha shipping). When this doc gets
-stale (more than 1-2 releases behind HEAD), update it as part of the
-release PR.*
+*Last updated: 2026-04-27 (v0.1.8-alpha — `dflash_mode` default `off`,
+docs/ rewritten, GGUF→HFQ4/MQ4 conversion path shipped, gfx12 WMMA
+kernels landed via PR #56). When this doc gets stale (more than 1-2
+releases behind HEAD), update it as part of the release PR.*
