@@ -1,0 +1,25 @@
+# hipfire speed-gate baseline — gfx1201
+# Captured 2026-04-27 against commit fa6b885
+# Config: KV=givens4, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
+#
+# Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:
+#   pp32  — short-context / launch-overhead regression detector
+#   pp128 — realistic prompt / GEMM-efficiency detector
+# Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle).
+# GROUND FLOOR — no commit may regress below these numbers.
+
+0.8b_mq4_pp32_prefill_tok_s=3043.1
+0.8b_mq4_gen_tok_s=288.1
+0.8b_mq4_pp128_prefill_tok_s=5473.4
+
+4b_mq4_pp32_prefill_tok_s=1084.0
+4b_mq4_gen_tok_s=135.1
+4b_mq4_pp128_prefill_tok_s=1486.4
+
+9b_mq4_pp32_prefill_tok_s=620.8
+9b_mq4_gen_tok_s=98.1
+9b_mq4_pp128_prefill_tok_s=782.5
+
+
+

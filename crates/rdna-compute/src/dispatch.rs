@@ -73,16 +73,18 @@ fn has_dot2_f32_f16(arch: &str) -> bool {
 /// series) has WMMA in hardware too, but the existing kernels use the
 /// gfx11 builtin which AMD clang 22.x in ROCm 7.x does NOT pattern-
 /// match on gfx12 — it errors with `Cannot select: intrinsic
-/// %llvm.amdgcn.wmma.f32.16x16x16.f16` at codegen time. Adding gfx12
-/// requires a kernel-side `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`
-/// (or equivalent) variant; not in scope yet.
-///
-/// Until that lands, gfx12 falls back to `dot2` (which it does have
-/// per `has_dot2_f32_f16`), trading WMMA peak throughput for a working
-/// kernel. See issue #54 (9070 XT crash report) and
-/// `kernels.rs:311` for the deferred RDNA4 GEMV variant.
+/// %llvm.amdgcn.wmma.f32.16x16x16.f16` at codegen time. The gfx12 sister
+/// path uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and is
+/// gated by `has_wmma_f16_gfx12` below.
 fn has_wmma_f16(arch: &str) -> bool {
     arch.starts_with("gfx11")
+}
+
+/// gfx12 (RDNA4) WMMA fp16. Kernels live at
+/// `kernels/src/gemm_*_wmma.gfx12.hip` and are validated by the
+/// `test_wmma_*_gfx12` channel-test examples (issue #54, PR #56).
+fn has_wmma_f16_gfx12(arch: &str) -> bool {
+    arch.starts_with("gfx12")
 }
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -2372,6 +2374,9 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
@@ -2646,6 +2651,9 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+            }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -2902,7 +2910,11 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            // WMMA on gfx11+ (RDNA3/4)
+            // WMMA on gfx12 (RDNA4)
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+            }
+            // WMMA on gfx11 (RDNA3)
             if has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
@@ -5041,6 +5053,9 @@ impl Gpu {
     ) -> HipResult<()> {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_qkvza_hfq6g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
+            }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkvza_hfq6g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
@@ -5425,6 +5440,9 @@ impl Gpu {
     ) -> HipResult<()> {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_qkv_hfq6g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+            }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -5775,6 +5793,9 @@ impl Gpu {
     ) -> HipResult<()> {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_gate_up_hfq6g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+            }
             if has_wmma_f16(&self.arch) {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
