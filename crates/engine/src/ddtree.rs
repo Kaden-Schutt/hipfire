@@ -343,6 +343,56 @@ pub fn follow_verified_tree(tree: &DdTree, posterior: &[u32]) -> (Vec<usize>, u3
     (accepted, next_token)
 }
 
+/// Return the **greedy main path** through the tree as a list of node
+/// indices: the chain that starts at the root and at each step descends
+/// to its highest-cumulative-log-prob child.
+///
+/// The implementation exploits an invariant of `build_ddtree_tree_with_cutoff`:
+/// nodes are pushed into `tree.nodes` in heap-pop order (strictly
+/// descending cumulative logw, push_order tie-breaking). For any given
+/// parent slot, the child with the *lowest* index in `nodes` was popped
+/// earliest and therefore has the highest cumulative logw among that
+/// parent's children. Walking from root and always picking the
+/// smallest-indexed child yields the greedy main path. See
+/// `deeper_tree_maintains_heap_order` for a worked example.
+///
+/// Returns the chain of node indices in root-to-leaf order. The
+/// linearization slot of `chain[i]` (matching `linearize_tree`'s output)
+/// is `chain[i] + 1`. An empty tree returns an empty chain.
+///
+/// Used by Path C (main-path-first lazy verify): the caller forwards the
+/// main chain as a flat linear verify (committed RoPE phases, no
+/// linearization-slot phase poisoning, no GDN drift), then if a position
+/// is rejected, lazily re-verifies any sibling branch at that depth
+/// from a tape-restored DeltaNet snapshot. See
+/// `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
+///
+/// Cost: O(depth × N) linear scan. Tree sizes in production are small
+/// (paper budget ≈ 22, hipfire default ≈ 16) so this is negligible vs
+/// the verify forward.
+pub fn select_main_path(tree: &DdTree) -> Vec<usize> {
+    let mut chain: Vec<usize> = Vec::new();
+    // -1 is the sentinel `DdNode::parent_index` value for direct children
+    // of the root (matches `build_ddtree_tree_with_cutoff`'s seeding).
+    let mut current_parent: i32 = -1;
+    loop {
+        let next = tree
+            .nodes
+            .iter()
+            .enumerate()
+            .find(|(_, n)| n.parent_index == current_parent)
+            .map(|(i, _)| i);
+        match next {
+            Some(idx) => {
+                chain.push(idx);
+                current_parent = idx as i32;
+            }
+            None => break,
+        }
+    }
+    chain
+}
+
 /// Linearize a DDTree into a verify-ready `(tokens, positions, mask_block)`
 /// triple suitable for a single batched target forward.
 ///
@@ -753,5 +803,85 @@ mod tests {
         assert_eq!(toks, vec![0, 1, 3, 2]);
         assert!((logps[0] - (-0.44)).abs() < 0.02);
         assert!((logps[1] - (-1.44)).abs() < 0.02);
+    }
+
+    #[test]
+    fn select_main_path_empty_tree_is_empty() {
+        let t = build_ddtree_tree(&[], &[], 0, 0, 0);
+        assert_eq!(select_main_path(&t), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn select_main_path_single_node_returns_that_node() {
+        // depth=1, top=1, budget=1 → one-node tree.
+        let t = build_ddtree_tree(&[7], &[-0.1], 1, 1, 1);
+        assert_eq!(select_main_path(&t), vec![0]);
+    }
+
+    #[test]
+    fn select_main_path_picks_first_child_at_each_depth() {
+        // Re-uses `deeper_tree_maintains_heap_order`'s tree:
+        // nodes[0] = 10 (root child, best)
+        // nodes[1] = 30 under nodes[0] (best chain extension)
+        // nodes[2] = 20 (alternative root child)
+        // nodes[3] = 30 under nodes[2] (best ext of alt branch)
+        //
+        // Greedy main path = follow root → 10 → 30 = [0, 1].
+        let tokens = vec![10, 20, 30, 40];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5];
+        let t = build_ddtree_tree(&tokens, &logps, 2, 2, 4);
+        assert_eq!(select_main_path(&t), vec![0, 1]);
+    }
+
+    #[test]
+    fn select_main_path_handles_chain_only_tree() {
+        // Force a depth-3 chain by giving every alternative very low prob.
+        // depth=3, topk=1, budget=3 → linear chain of 3 nodes.
+        let tokens = vec![10, 20, 30];
+        let logps = vec![-0.1, -0.1, -0.1];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 1, 3);
+        assert_eq!(t.nodes.len(), 3);
+        // Each node is its predecessor's only child → main path is the
+        // full chain.
+        assert_eq!(select_main_path(&t), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_main_path_consistent_with_linearization() {
+        // The main-path tokens, when read off via `tree.nodes[i].token`,
+        // must equal the slot[i+1] tokens in `linearize_tree`'s output
+        // for those slots. This guarantees the caller can swap a tree
+        // verify for a linear verify on the main chain without resequencing.
+        let tokens = vec![10, 20, 30, 40, 50, 60];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5, -0.3, -2.0];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 6);
+        let main = select_main_path(&t);
+        let (lin_tokens, _pos, _mask) = linearize_tree(&t, /*seed=*/ 1, 0);
+        for &idx in &main {
+            assert_eq!(t.nodes[idx].token, lin_tokens[idx + 1]);
+        }
+    }
+
+    #[test]
+    fn select_main_path_strict_descent_in_depth() {
+        // Main-path nodes must form a parent-chain: each successor's
+        // parent_index must equal its predecessor's tree index, and
+        // depth strictly increases by 1 along the chain.
+        let tokens = vec![10, 20, 30, 40, 50, 60];
+        let logps = vec![-0.1, -1.0, -0.2, -1.5, -0.3, -2.0];
+        let t = build_ddtree_tree(&tokens, &logps, 3, 2, 6);
+        let main = select_main_path(&t);
+        if main.is_empty() {
+            return;
+        }
+        // First node of main path is a direct root child.
+        assert_eq!(t.nodes[main[0]].parent_index, -1);
+        assert_eq!(t.nodes[main[0]].depth, 1);
+        for w in main.windows(2) {
+            let parent = w[0];
+            let child = w[1];
+            assert_eq!(t.nodes[child].parent_index, parent as i32);
+            assert_eq!(t.nodes[child].depth, t.nodes[parent].depth + 1);
+        }
     }
 }
