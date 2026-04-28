@@ -1,5 +1,5 @@
 # hipfire speed-gate baseline — gfx1151
-# Captured 2026-04-27 against commit 83358c6
+# Captured 2026-04-28 against commit 42566de
 # Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
@@ -10,20 +10,20 @@
 # GROUND FLOOR — no commit may regress below these numbers.
 
 0.8b_mq4_pp32_prefill_tok_s=1553.3
-0.8b_mq4_gen_tok_s=234.6
-0.8b_mq4_pp128_prefill_tok_s=4070.5
+0.8b_mq4_gen_tok_s=235.3
+0.8b_mq4_pp128_prefill_tok_s=4241.3
 
 4b_mq4_pp32_prefill_tok_s=660.1
 4b_mq4_gen_tok_s=69.1
-4b_mq4_pp128_prefill_tok_s=1011.0
+4b_mq4_pp128_prefill_tok_s=1031.3
 
-9b_mq4_pp32_prefill_tok_s=406.1
+9b_mq4_pp32_prefill_tok_s=419.5
 9b_mq4_gen_tok_s=46.0
 9b_mq4_pp128_prefill_tok_s=539.1
 
-27b_mq4_pp32_prefill_tok_s=144.7
+27b_mq4_pp32_prefill_tok_s=147.4
 27b_mq4_gen_tok_s=14.9
-27b_mq4_pp128_prefill_tok_s=156.4
+27b_mq4_pp128_prefill_tok_s=163.1
 
 27b_3.5_dflash_lru_code_tok_s=65.83
 27b_3.5_dflash_lru_code_tau=8.846
@@ -33,4 +33,3 @@
 9b_3.5_dflash_merge_sort_tok_s=245.03
 9b_3.5_dflash_merge_sort_tau=13.1538
 9b_3.5_dflash_merge_sort_ttft_ms=135.08
-
