@@ -49,13 +49,16 @@ __global__ void attention_flash_asym3_tile_batched(
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
     const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
-    // Sliding window applied uniformly to AR and tree-verify modes. In tree
-    // mode the in-block keys [block_start, seq_len) are the most recent
-    // positions and stay in-window for any non-zero kv_window; only the
-    // pre-block prompt at [0, block_start) gets clipped. Tree bias indexing
-    // is preserved per-position (unchanged), so even partial tiles spanning
-    // the prompt/block boundary apply the bias correctly.
-    const int kv_start = (kv_window > 0 && seq_len > kv_window) ? (seq_len - kv_window) : 0;
+    // Per-row sliding window (matches Lucebox PR #26 mask semantics). Each
+    // query row q sees keys [max(0, q+1 - W), q+1]. In a batched verify with
+    // B rows, row 0 sees one more pre-block position than row B-1. Uniform
+    // `seq_len - W` (the simpler-but-wrong version) tightens the window for
+    // earlier rows, breaking draft-target argmax alignment Lucebox depends
+    // on for 100% acceptance. In tree mode the in-block keys handle their
+    // own per-row causality via tree_bias (-inf for future / non-ancestor
+    // in-block keys); only pre-block prompt keys are gated by this window.
+    const int q_pos = tree_mode ? (block_start + local_bid) : positions[global_bid];
+    const int kv_start = (kv_window > 0 && q_pos + 1 > kv_window) ? (q_pos + 1 - kv_window) : 0;
     const int tile_start_raw = tile_id * tile_size;
     if (tile_start_raw >= seq_len) return;
     const int tile_end = min(tile_start_raw + tile_size, seq_len);
