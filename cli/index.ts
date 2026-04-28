@@ -1334,7 +1334,31 @@ async function serve(port: number) {
                         text = text.split("</think>").slice(1).join("</think>");
                         inThink = false;
                         stripNextLeadingNl = true;
-                      } else { continue; }
+                      } else {
+                        // Stream thinking-phase tokens as `reasoning_content`
+                        // (OpenAI-compatible field, also adopted by DeepSeek and
+                        // pi-coding-agent). Two reasons to do this even though
+                        // the visible-content stripper still removes
+                        // `<think>...</think>` from the assistant message:
+                        //   1) the wire stays alive — without this, a
+                        //      thinking-heavy turn (Qwen3.5/3.6 routinely 2–8K
+                        //      thinking tokens before answering) leaves the
+                        //      content stream silent for minutes, recreating
+                        //      the same idle-timeout failure mode the prefill
+                        //      heartbeat was added to fix (#79 / #85);
+                        //   2) clients that render reasoning UI (pi, OpenCode
+                        //      with reasoning visible) get a live thinking
+                        //      view rather than nothing.
+                        // Patch contributed by @mikiadev in #79.
+                        if (text) {
+                          ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                            id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                            choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+                          })}\n\n`));
+                          visibleChunkSent = true;
+                        }
+                        continue;
+                      }
                     }
                     text = text.replace(/<\|im_end\|>/g, "");
                     if (!text) continue;
