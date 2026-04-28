@@ -3584,6 +3584,13 @@ switch (cmd) {
         if (diag.type === "diag") {
           console.log(`  GPU arch:    ${diag.arch}`);
           console.log(`  HIP version: ${diag.hip_version}`);
+          if ((diag.arch === "gfx1150" || diag.arch === "gfx1151") && diag.hip_version) {
+            const [maj, min] = diag.hip_version.split(".").map(Number);
+            if (maj < 7 || (maj === 7 && min < 2)) {
+              console.log(`  WARNING: ${diag.arch} requires ROCm 7.2+. Current: ${diag.hip_version}`);
+              console.log(`           ROCm <7.2 segfaults on hipMalloc for RDNA 3.5.`);
+            }
+          }
           console.log(`  VRAM free:   ${diag.vram_free_mb} MB`);
           console.log(`  VRAM total:  ${diag.vram_total_mb} MB`);
 

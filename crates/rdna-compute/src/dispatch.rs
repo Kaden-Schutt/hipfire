@@ -355,6 +355,7 @@ impl Gpu {
         let (hip_major, hip_minor) = hip.runtime_version().unwrap_or((0, 0));
         let (min_major, min_minor) = match arch.as_str() {
             "gfx1200" | "gfx1201" => (6, 4), // RDNA4 needs ROCm 6.4+
+            "gfx1150" | "gfx1151" => (7, 2), // RDNA3.5 (Strix) needs ROCm 7.2+
             "gfx1100" | "gfx1101" | "gfx1102" => (5, 5), // RDNA3 needs ROCm 5.5+
             _ => (5, 0),
         };

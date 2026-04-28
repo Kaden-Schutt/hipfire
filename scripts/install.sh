@@ -180,6 +180,7 @@ if $HIP_FOUND; then
         MIN_MAJOR=5; MIN_MINOR=0
         case "$GPU_ARCH" in
             gfx1200|gfx1201) MIN_MAJOR=6; MIN_MINOR=4 ;;
+            gfx1150|gfx1151) MIN_MAJOR=7; MIN_MINOR=2 ;;
             gfx1100|gfx1101) MIN_MAJOR=5; MIN_MINOR=5 ;;
         esac
 
