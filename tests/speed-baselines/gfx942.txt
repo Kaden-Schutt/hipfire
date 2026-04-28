@@ -23,22 +23,31 @@
 # `has_wave64_native(arch)` so RDNA paths are byte-exact unchanged.
 #
 # Note on HIPFIRE_GRAPH=1: hipGraph capture hurts MI300X 27B decode by
-# ~4-5% (measured 2026-04-28: 66.0 → 63.0 tok/s with HIPFIRE_GRAPH=1).
-# It's enabled here for 4B/9B because the speed-gate's run_bench helper
+# ~4-5% (measured 2026-04-28: 66.0 → 63.0 tok/s with HIPFIRE_GRAPH=1; the
+# 64.9 number below sits between those points after best-of-2). It's
+# enabled here for 4B/9B/27B because the speed-gate's run_bench helper
 # hardcodes it for non-0.8B sizes (matching gfx1100 default). Future
 # work: per-arch override of the gate's HIPFIRE_GRAPH default for CDNA.
+#
+# DFlash anchor rows (27b/9b LRU + merge_sort) not captured — no draft
+# files uploaded to MI300X this rental window. Follow-up: upload
+# qwen35-{27b,9b}-dflash-mq4.hfq drafts + re-run --update-baselines to
+# add the spec-decode rows.
 
-0.8b_mq4_pp32_prefill_tok_s=775.9
-0.8b_mq4_gen_tok_s=457.6
-0.8b_mq4_pp128_prefill_tok_s=2847.8
+0.8b_mq4_pp32_prefill_tok_s=767.7
+0.8b_mq4_gen_tok_s=458.5
+0.8b_mq4_pp128_prefill_tok_s=2873.8
 
-4b_mq4_pp32_prefill_tok_s=451.2
-4b_mq4_gen_tok_s=204.1
-4b_mq4_pp128_prefill_tok_s=1652.6
+4b_mq4_pp32_prefill_tok_s=451.7
+4b_mq4_gen_tok_s=203.4
+4b_mq4_pp128_prefill_tok_s=1653.6
 
-9b_mq4_pp32_prefill_tok_s=352.5
+9b_mq4_pp32_prefill_tok_s=351.4
 9b_mq4_gen_tok_s=164.0
-9b_mq4_pp128_prefill_tok_s=1305.0
+9b_mq4_pp128_prefill_tok_s=1306.3
 
+27b_mq4_pp32_prefill_tok_s=154.4
+27b_mq4_gen_tok_s=64.9
+27b_mq4_pp128_prefill_tok_s=572.5
 
 
