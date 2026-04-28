@@ -221,9 +221,28 @@ fn main() {
             let max_eff = kv_seq.saturating_sub(4).max(1);
             let need_chunks = max_tokens.div_ceil(max_eff)
                 .min(calibration_prompts.len());
+            // Hermes/Aureth corpora contain individual ChatML
+            // conversations of 4-10k tokens each; encoding them whole
+            // and then slicing to 508 wastes 90%+ of tokenizer wall
+            // time. Truncate input text to ~max_eff*5 chars (rough
+            // upper bound at <1 char/token for some tokenizers) so the
+            // encoder sees only what we'll actually use.
+            let max_chars = max_eff.saturating_mul(5).max(64);
             calibration_prompts[..need_chunks]
                 .par_iter()
-                .map(|p| tok.encode(p))
+                .map(|p| {
+                    let s: &str = if p.len() > max_chars {
+                        // Truncate at a char boundary.
+                        let mut end = max_chars;
+                        while end > 0 && !p.is_char_boundary(end) { end -= 1; }
+                        &p[..end]
+                    } else {
+                        &p[..]
+                    };
+                    let mut t = tok.encode(s);
+                    if t.len() > max_eff { t.truncate(max_eff); }
+                    t
+                })
                 .collect()
         };
         let mut covered_tokens = 0usize;
