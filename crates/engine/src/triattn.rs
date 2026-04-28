@@ -543,6 +543,19 @@ pub fn tap_enabled() -> bool {
     TAP_ENABLED.load(Ordering::Relaxed)
 }
 
+/// True only when the active tap actually consumes K (`Capture`). The
+/// `Calibrate` and `CalibrateGpu` taps record only Q, so callers can skip
+/// the K download in the calibrate path. ~33 GB PCIe/1M-token 27B run on
+/// the CPU fallback path; small but real win on the GPU path too if the
+/// caller can avoid building K at all.
+pub fn tap_needs_k() -> bool {
+    if !TAP_ENABLED.load(Ordering::Relaxed) { return false; }
+    matches!(
+        TAP_STATE.lock().unwrap().as_ref(),
+        Some(TapState::Capture(_)),
+    )
+}
+
 /// Called from the FA layer pre-RoPE point. `q` is `[n_heads × head_dim]`
 /// pre-RoPE Q; `k_opt` is `[n_kv_heads × head_dim]` pre-RoPE K (only used
 /// by the capture tap; calibrate ignores it).
@@ -558,9 +571,22 @@ pub fn record_prerope_qk(layer_idx: usize, q: &[f32], k_opt: Option<&[f32]>) {
             state.add_sample(layer_idx, q);
         }
         Some(TapState::CalibrateGpu(_)) => {
-            // GPU calibration is handled via record_prerope_q_batch_gpu_if_applicable
-            // called before the download. This CPU path should be unreachable when
-            // the GPU tap is active, but guard it as a no-op.
+            // Reached only when a forward path took the host-side download
+            // fallback while a GPU-resident calibration tap was installed.
+            // Pre-Phase-2 this was a silent no-op, which would have
+            // produced an empty sidecar without warning. With gpu_calib
+            // = true now the default, fail loudly so any new code path
+            // that records Q through host (e.g. single-token decode,
+            // unbatched validation) is caught immediately rather than
+            // silently dropping samples.
+            panic!(
+                "triattn: record_prerope_qk hit while CalibrateGpu tap is installed. \
+                The forward path should call record_prerope_q_batch_gpu_if_applicable \
+                first; a return of Ok(false) means either the GPU tap was lost or a \
+                non-batch path is feeding this hook (would produce empty sidecar). \
+                layer_idx={layer_idx} q.len={}",
+                q.len(),
+            );
         }
         Some(TapState::Capture(cap)) => {
             cap.pending_layer_ids.push(layer_idx);

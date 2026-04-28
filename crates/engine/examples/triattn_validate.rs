@@ -45,13 +45,15 @@ fn main() {
         "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one.",
     );
     let mut load_sidecar = false;
-    // GPU-path kernel exists (triattn_accumulate_f32) and is numerically
-    // equivalent to the CPU path (max relative diff 3.6e-10 on 9B/100k cal),
-    // but it's SLOWER in wall clock on short-chunk corpora (40% regression
-    // measured on MI300X 9B + agentic corpus, avg ~3 tok/chunk — kernel
-    // launch overhead dominates per-block work). Keep default CPU; opt into
-    // GPU path explicitly for experimentation on longer-chunk corpora.
-    let mut gpu_calib = false;
+    // GPU calibration path is now DEFAULT (Phase 2, 2026-04-28).
+    // Rationale: forward_prefill_batch is hard-capped at kv_seq.saturating_sub(4)
+    // = 508 tokens per call regardless of `chunk_len`, so production calibration
+    // never sees the avg ~3 tok/chunk corpus that drove the original 40% GPU
+    // regression. The kernel header for triattn_accumulate.hip annotates a
+    // 5-8× speedup on MI300X. Verified Phase 2 R̄ within ±0.005 of CPU baseline.
+    // Opt out with --cpu-calib when stress-testing the CPU fallback path
+    // (e.g. for FP64 vs FP32 reference comparisons).
+    let mut gpu_calib = true;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -62,9 +64,10 @@ fn main() {
             "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
             "--load-sidecar" => { load_sidecar = true; i += 1; }
             "--gpu-calib" => { gpu_calib = true; i += 1; }
+            "--cpu-calib" => { gpu_calib = false; i += 1; }
             s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
             other => {
-                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib]");
+                eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
                 std::process::exit(1);
             }
         }
@@ -201,15 +204,51 @@ fn main() {
             triattn::install_tap(calib_state);
         }
 
+        // Pre-tokenize chunks once. Per-chunk encode in the original hot
+        // loop accounted for ~44% of wall time on MI300X (measured
+        // 2026-04-28 Phase 1 baseline: 456ms encode vs 580ms forward per
+        // 508-token chunk). Pre-tokenization runs in parallel across the
+        // EPYC cores via rayon (Phase 2.5+: serial pretok still cost 89s
+        // on a 100k-token run, ~50% of remaining wall). Stop early at
+        // max_tokens worth of effective samples (each chunk contributes
+        // min(chunk_tokens, kv_seq-4)).
+        let pretok_t0 = Instant::now();
+        let prompt_tokens: Vec<Vec<u32>> = {
+            use rayon::prelude::*;
+            // Conservative upper-bound on chunks needed: each chunk
+            // contributes at most kv_seq-4 effective tokens, so cap the
+            // parallel encode at this many to avoid wasting work.
+            let max_eff = kv_seq.saturating_sub(4).max(1);
+            let need_chunks = max_tokens.div_ceil(max_eff)
+                .min(calibration_prompts.len());
+            calibration_prompts[..need_chunks]
+                .par_iter()
+                .map(|p| tok.encode(p))
+                .collect()
+        };
+        let mut covered_tokens = 0usize;
+        let mut keep_n = 0usize;
+        for toks in prompt_tokens.iter() {
+            let effective = toks.len().min(kv_seq.saturating_sub(4));
+            covered_tokens = covered_tokens.saturating_add(effective);
+            keep_n += 1;
+            if covered_tokens >= max_tokens { break; }
+        }
+        let prompt_tokens: Vec<Vec<u32>> = prompt_tokens.into_iter().take(keep_n).collect();
+        let pretok_ms = pretok_t0.elapsed().as_secs_f64() * 1000.0;
         if calib_profile {
-            eprintln!("[CALIB_PROFILE] chunk_idx,n_tokens,memset_ms,encode_ms,forward_ms,total_ms,cumulative_tokens");
+            eprintln!(
+                "[CALIB_PROFILE] PRETOK total_ms={pretok_ms:.1} n_chunks={} covered_tokens={covered_tokens}",
+                prompt_tokens.len(),
+            );
+        }
+        if calib_profile {
+            eprintln!("[CALIB_PROFILE] chunk_idx,n_tokens,memset_ms,forward_ms,total_ms,cumulative_tokens");
         }
         let calib_t0 = Instant::now();
         let mut total_tokens = 0usize;
-        'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
+        'outer: for (pi, tokens) in prompt_tokens.iter().enumerate() {
             let chunk_t0 = Instant::now();
-            let tokens = tok.encode(p);
-            let encode_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
             let memset_t0 = Instant::now();
             for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
             for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
@@ -235,7 +274,7 @@ fn main() {
             total_tokens += take_len;
             if calib_profile {
                 eprintln!(
-                    "[CALIB_PROFILE] {pi},{take_len},{memset_ms:.3},{encode_ms:.3},{forward_ms:.3},{total_ms:.3},{total_tokens}",
+                    "[CALIB_PROFILE] {pi},{take_len},{memset_ms:.3},{forward_ms:.3},{total_ms:.3},{total_tokens}",
                 );
             } else if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
                 eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
