@@ -4284,11 +4284,26 @@ fn run_fa_layer_body(
     gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
     if crate::triattn::tap_enabled() {
-        let n_q = config.n_heads * config.head_dim;
-        let n_k = config.n_kv_heads * config.head_dim;
-        let q_cpu = gpu.download_f32(&s.fa_q)?;
-        let k_cpu = gpu.download_f32(&s.fa_k)?;
-        crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+        // Try GPU path first (matches the batched FA tap at line ~3499 in
+        // forward_prefill_batch). When the calibration tap is GPU-resident
+        // (CalibrateGpu) we MUST dispatch the kernel here — falling
+        // through to record_prerope_qk would either silently drop the
+        // sample (pre-Phase-2) or panic (post-Phase-2).
+        let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+            gpu, layer_idx, &s.fa_q.buf,
+            1, config.n_heads, config.head_dim,
+        )?;
+        if !gpu_handled {
+            let n_q = config.n_heads * config.head_dim;
+            let q_cpu = gpu.download_f32(&s.fa_q)?;
+            if crate::triattn::tap_needs_k() {
+                let n_k = config.n_kv_heads * config.head_dim;
+                let k_cpu = gpu.download_f32(&s.fa_k)?;
+                crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+            } else {
+                crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+            }
+        }
     }
 
     // If TriAttention has compacted the cache, absolute RoPE phase diverges
@@ -4665,11 +4680,21 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&s.fa_q)?;
-                    let k_cpu = gpu.download_f32(&s.fa_k)?;
-                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &s.fa_q.buf,
+                        1, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&s.fa_q)?;
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&s.fa_k)?;
+                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                        } else {
+                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                        }
+                    }
                 }
 
                 if kv_cache.compact_offset > 0 {
@@ -4946,11 +4971,21 @@ fn forward_scratch_layers(
                 gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
 
                 if crate::triattn::tap_enabled() {
-                    let n_q = config.n_heads * config.head_dim;
-                    let n_k = config.n_kv_heads * config.head_dim;
-                    let q_cpu = gpu.download_f32(&s.fa_q)?;
-                    let k_cpu = gpu.download_f32(&s.fa_k)?;
-                    crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                    let gpu_handled = crate::triattn::record_prerope_q_batch_gpu_if_applicable(
+                        gpu, layer_idx, &s.fa_q.buf,
+                        1, config.n_heads, config.head_dim,
+                    )?;
+                    if !gpu_handled {
+                        let n_q = config.n_heads * config.head_dim;
+                        let q_cpu = gpu.download_f32(&s.fa_q)?;
+                        if crate::triattn::tap_needs_k() {
+                            let n_k = config.n_kv_heads * config.head_dim;
+                            let k_cpu = gpu.download_f32(&s.fa_k)?;
+                            crate::triattn::record_prerope_qk(layer_idx, &q_cpu[..n_q], Some(&k_cpu[..n_k]));
+                        } else {
+                            crate::triattn::record_prerope_q(layer_idx, &q_cpu[..n_q]);
+                        }
+                    }
                 }
 
                 if kv_cache.compact_offset > 0 {
