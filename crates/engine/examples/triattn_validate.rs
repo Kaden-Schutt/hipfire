@@ -25,6 +25,14 @@ fn main() {
     use engine::tokenizer::Tokenizer;
     use engine::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
     use std::path::Path;
+    use std::time::Instant;
+
+    // Per-chunk CSV timing breakdown for calibration optimization sessions.
+    // Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr.
+    let calib_profile = std::env::var("HIPFIRE_CALIB_PROFILE")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
 
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
@@ -193,31 +201,51 @@ fn main() {
             triattn::install_tap(calib_state);
         }
 
+        if calib_profile {
+            eprintln!("[CALIB_PROFILE] chunk_idx,n_tokens,memset_ms,encode_ms,forward_ms,total_ms,cumulative_tokens");
+        }
+        let calib_t0 = Instant::now();
         let mut total_tokens = 0usize;
         'outer: for (pi, p) in calibration_prompts.iter().enumerate() {
+            let chunk_t0 = Instant::now();
             let tokens = tok.encode(p);
+            let encode_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
+            let memset_t0 = Instant::now();
             for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
             for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
             for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
             for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
             for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            let memset_ms = memset_t0.elapsed().as_secs_f64() * 1000.0;
             let max_len = tokens.len().min(kv_seq.saturating_sub(4));
             let remaining = max_tokens.saturating_sub(total_tokens);
             let take_len = max_len.min(remaining);
             if take_len == 0 { break 'outer; }
+            let fwd_t0 = Instant::now();
             qwen35::forward_prefill_batch(
                 &mut gpu, &weights, &config, &tokens[..take_len], 0,
                 &mut kv, &mut dn, &scratch,
                 None, None, None, None,
             ).expect("calib batched forward");
+            // Force the device to drain so the timing reflects real GPU work,
+            // not just queued kernels — Phase 1 attribution depends on this.
+            if calib_profile { let _ = gpu.hip.device_synchronize(); }
+            let forward_ms = fwd_t0.elapsed().as_secs_f64() * 1000.0;
+            let total_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
             total_tokens += take_len;
-            if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
+            if calib_profile {
+                eprintln!(
+                    "[CALIB_PROFILE] {pi},{take_len},{memset_ms:.3},{encode_ms:.3},{forward_ms:.3},{total_ms:.3},{total_tokens}",
+                );
+            } else if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
                 eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
             }
             if total_tokens >= max_tokens { break 'outer; }
         }
+        let calib_loop_ms = calib_t0.elapsed().as_secs_f64() * 1000.0;
 
         eprintln!("total calibration samples: {total_tokens} tokens × FA layers");
+        let finalize_t0 = Instant::now();
         let c = if using_gpu_tap {
             let gpu_state = triattn::take_tap_gpu().expect("GPU tap still installed");
             gpu_state.finalize(&mut gpu).expect("finalize GPU calib")
@@ -225,6 +253,13 @@ fn main() {
             let calib = triattn::take_tap().expect("tap still installed");
             calib.finalize()
         };
+        let finalize_ms = finalize_t0.elapsed().as_secs_f64() * 1000.0;
+        if calib_profile {
+            eprintln!(
+                "[CALIB_PROFILE] SUMMARY total_tokens={total_tokens} loop_ms={calib_loop_ms:.1} finalize_ms={finalize_ms:.1} effective_tok_per_sec={:.1}",
+                (total_tokens as f64) * 1000.0 / calib_loop_ms.max(1.0),
+            );
+        }
         c.save(Path::new(&sidecar_path)).expect("save sidecar");
         eprintln!("saved sidecar: {sidecar_path}");
         c
