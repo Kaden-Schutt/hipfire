@@ -37,7 +37,8 @@ __global__ void attention_flash_asym3_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int kv_window                              // 0 = unbounded; else clip to last kv_window positions
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -48,9 +49,27 @@ __global__ void attention_flash_asym3_tile_batched(
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
     const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
-    const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
+    // Sliding window applied uniformly to AR and tree-verify modes. In tree
+    // mode the in-block keys [block_start, seq_len) are the most recent
+    // positions and stay in-window for any non-zero kv_window; only the
+    // pre-block prompt at [0, block_start) gets clipped. Tree bias indexing
+    // is preserved per-position (unchanged), so even partial tiles spanning
+    // the prompt/block boundary apply the bias correctly.
+    const int kv_start = (kv_window > 0 && seq_len > kv_window) ? (seq_len - kv_window) : 0;
+    const int tile_start_raw = tile_id * tile_size;
+    if (tile_start_raw >= seq_len) return;
+    const int tile_end = min(tile_start_raw + tile_size, seq_len);
+    const int tile_start = max(tile_start_raw, kv_start);
+    if (tile_start >= tile_end) {
+        // Tile entirely outside window — write sentinel so reduce skips.
+        if (tid == 0) {
+            float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                + tile_id * (2 + head_dim);
+            p[0] = -1e30f;
+            p[1] = 0.0f;
+        }
+        return;
+    }
     const int tile_len = tile_end - tile_start;
 
     const int kv_group = n_heads / n_kv_heads;

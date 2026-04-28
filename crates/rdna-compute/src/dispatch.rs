@@ -8371,6 +8371,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        kv_window: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -8414,6 +8415,7 @@ impl Gpu {
                 let sc = scale; let ts = TILE_SIZE as i32;
                 let mt = max_tiles as i32; let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
+                let kw = kv_window as i32;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -8433,6 +8435,7 @@ impl Gpu {
                     &bo as *const _ as *mut c_void,
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
+                    &kw as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
                     tile_func_name,
@@ -8447,7 +8450,7 @@ impl Gpu {
                         b.push_ptr(ct_ptr); b.push_ptr(st_ptr); b.push_ptr(bias_ptr);
                         b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                         b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
-                        b.push_i32(bs); b.push_i32(bc);
+                        b.push_i32(bs); b.push_i32(bc); b.push_i32(kw);
                         b
                     },
                 )?;
@@ -8551,6 +8554,11 @@ impl Gpu {
     /// `attention_q8_0_kv_batched_masked` and `ddtree::linearize_tree` for the
     /// bias layout. Passes `tree_bias` / `block_start` / `block_cols` into the
     /// tile + reduce kernels.
+    ///
+    /// asym4 is not the production KV mode for sliding-window FA (asym3 is —
+    /// see PRD `docs/plans/sliding-window-fa.prd`). The kv_window param is
+    /// always passed as 0 here; the asym4 kernel accepts it at ABI level and
+    /// ignores it.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym4_batched_masked(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -8570,10 +8578,12 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            0,
         )
     }
 
     /// Batched flash attention for asym2 (K 2-bit rotated + V Q8_0).
+    /// kv_window=0 (no sliding-window — see asym4_batched_masked docstring).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym2_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -8590,6 +8600,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
+            0,
         )
     }
 
@@ -8658,17 +8669,25 @@ impl Gpu {
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        kv_window: usize,
     ) -> HipResult<()> {
         self.attention_flash_asym3_batched_masked(
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             None, 0, 0,
+            kv_window,
         )
     }
 
     /// Tree-mask variant of `attention_flash_asym3_batched`. asym3 is the
     /// default live KV path on 9B MQ4 — this is the primary target for
     /// DDTree batched verify on the hybrid arch.
+    ///
+    /// `kv_window` bounds attention to the last `kv_window` KV positions
+    /// (sliding-window FA Phase 3 — Lucebox PR #26 batched verify port).
+    /// Pass `0` for unbounded (default). In tree mode the in-block keys
+    /// `[block_start, seq_len)` are always in-window for any non-zero
+    /// `kv_window`; only pre-block prompt at `[0, block_start)` is clipped.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym3_batched_masked(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -8680,6 +8699,7 @@ impl Gpu {
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        kv_window: usize,
     ) -> HipResult<()> {
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
@@ -8688,6 +8708,7 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+            kv_window,
         )
     }
 

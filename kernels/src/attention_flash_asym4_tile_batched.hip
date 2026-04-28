@@ -32,7 +32,8 @@ __global__ void attention_flash_asym4_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int /*kv_window*/                          // accepted for shared launcher ABI; asym4 ignores (sliding-window FA is asym3-only — PRD docs/plans/sliding-window-fa.prd)
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
