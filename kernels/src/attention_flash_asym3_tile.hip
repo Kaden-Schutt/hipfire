@@ -34,20 +34,31 @@ __global__ void attention_flash_asym3_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    int kv_window
 ) {
     const int seq_len = pos_buf[0] + 1;
+    const int kv_start = (kv_window > 0 && seq_len > kv_window) ? (seq_len - kv_window) : 0;
     const int h = blockIdx.x;
     if (h >= n_heads) return;
     const int tile_id = blockIdx.y;
-    const int tile_start = tile_id * tile_size;
-    const int tile_end = min(tile_start + tile_size, seq_len);
-    if (tile_start >= seq_len) return;
+    const int tile_start_raw = tile_id * tile_size;
+    const int tile_end = min(tile_start_raw + tile_size, seq_len);
+    if (tile_start_raw >= seq_len) return;
+    const int tid = threadIdx.x;
+    const int tile_start = max(tile_start_raw, kv_start);
+    if (tile_start >= tile_end) {
+        if (tid == 0) {
+            float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+            p[0] = -1e30f;
+            p[1] = 0.0f;
+        }
+        return;
+    }
     const int tile_len = tile_end - tile_start;
 
     const int kv_group = n_heads / n_kv_heads;
     const int kv_h = h / kv_group;
-    const int tid = threadIdx.x;
 
     // K geometry (3-bit rotated)
     const int k_bytes_per_head = 4 + (head_dim * 3) / 8;     // 100 for hd=256

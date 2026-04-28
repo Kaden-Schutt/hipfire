@@ -109,6 +109,20 @@ pub struct Qwen35Config {
 
     // Per-layer type dispatch
     pub layer_types: Vec<LayerType>,
+
+    /// Sliding-window flash attention. `0` (default) = unbounded — attend to
+    /// all KV positions (legacy behavior, bit-exact). When `> 0`, FA decode
+    /// only attends to the last `fa_window` KV positions; tiles entirely
+    /// outside the window write a zero-sum sentinel partial that the reduce
+    /// kernel ignores. Lucebox PR #26 measures 3.48× decode at 60K context
+    /// with `fa_window=2048` on Qwen 3.6-27B (RTX 3090). Loaded from
+    /// `HIPFIRE_FA_WINDOW` env var at config build time.
+    ///
+    /// Mutually exclusive with TriAttention/CASK eviction: when the KV cache
+    /// is compacting (`compact_offset > 0`), call sites force `fa_window = 0`
+    /// for that step so the windowed mask doesn't operate on a compacted
+    /// index space.
+    pub fa_window: usize,
 }
 
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
@@ -164,6 +178,11 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     // for Qwen3.5-MoE / A3B to match the HF reference.
     let norm_topk_prob = tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
 
+    let fa_window = std::env::var("HIPFIRE_FA_WINDOW")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+
     Some(Qwen35Config {
         dim, n_layers, vocab_size, norm_eps, eos_token,
         n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
@@ -171,6 +190,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
         norm_topk_prob,
+        fa_window,
     })
 }
 
@@ -4284,11 +4304,13 @@ fn run_fa_layer_body(
         gpu.kv_cache_write_asym3_fused(
             &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+        let fa_window = if kv_cache.compact_offset > 0 { 0 } else { config.fa_window };
         gpu.attention_flash_asym3(
             &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
             &s.flash_partials,
+            fa_window,
         )?;
     } else if kv_cache.quant_asym2 {
         let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -4661,11 +4683,13 @@ fn forward_scratch_layers(
                     gpu.kv_cache_write_asym3_fused(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    let fa_window = if kv_cache.compact_offset > 0 { 0 } else { config.fa_window };
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        fa_window,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();
@@ -4942,11 +4966,13 @@ fn forward_scratch_layers(
                     gpu.kv_cache_write_asym3_fused(
                         &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_k, &s.fa_v, &s.pos_buf, ct, st, config.n_kv_heads, config.head_dim)?;
+                    let fa_window = if kv_cache.compact_offset > 0 { 0 } else { config.fa_window };
                     gpu.attention_flash_asym3(
                         &s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
                         &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                         config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                         &s.flash_partials,
+                        fa_window,
                     )?;
                 } else if kv_cache.quant_asym2 {
                     let ct = kv_cache.givens_cos.as_ref().unwrap();

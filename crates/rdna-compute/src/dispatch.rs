@@ -8693,12 +8693,19 @@ impl Gpu {
 
     /// Flash attention for asym3 KV (K at 3-bit rotated, V at Q8_0).
     /// Reuses Q8_0 flash reduce (output in normal space — V was un-rotated).
+    ///
+    /// `kv_window` bounds attention to the last `kv_window` KV positions
+    /// (sliding-window FA, Lucebox PR #26 port). Pass `0` for unbounded
+    /// (default). Tiles entirely outside the window write a sentinel
+    /// `tile_sum=0` partial that the reduce kernel skips.
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_asym3(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,
         cos_theta: &GpuTensor, sin_theta: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        kv_window: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -8724,6 +8731,7 @@ impl Gpu {
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut kw = kv_window as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -8739,6 +8747,7 @@ impl Gpu {
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut kw as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
