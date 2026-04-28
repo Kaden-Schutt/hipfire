@@ -20,3 +20,13 @@ cross-session timing comparisons meaningful (per
 If a larger corpus is needed for Phase 5 re-calibration of A3B sidecars
 at 5M tokens, generate `calib-5m.txt` separately rather than overwriting
 this file.
+
+## `calib-5m.txt`
+
+- Source: HuggingFace `Salesforce/wikitext` config `wikitext-103-raw-v1`,
+  composed of `train-00000-of-00002.parquet` (full prefix to 20 MB).
+- Size: 19,996,814 bytes — ~5M est tokens at 4 chars/tok.
+- md5: `5dc7dc29676eb591869378b3ddc17815`
+
+Used by Phase 5 sidecar re-calibration on MI300X. Stable, byte-identical
+across rental sessions for cross-commit comparison.
