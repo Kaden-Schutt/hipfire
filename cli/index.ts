@@ -1298,6 +1298,27 @@ async function serve(port: number) {
           const hasTool = tools.length > 0;
           return new Response(new ReadableStream({
             async start(ctrl) {
+              // Prefill heartbeat: emit an SSE comment every 10s while no
+              // visible body bytes have been sent. The daemon's
+              // `forward_prefill_batch` is one synchronous device call per
+              // chunk and emits no events until the first sampled token, so on
+              // a 27B model with a 10–30K-token agent context (CLAUDE.md /
+              // AGENTS.md / skills / tools) the connection sits silent for 1–5
+              // minutes. OpenCode (#85) and pi-coding-agent (#79) have
+              // sub-minute first-byte/idle timeouts and abort. SSE comment
+              // lines (": …\n\n") are spec-required to be ignored by clients
+              // but keep the TCP connection — and any intermediary timer —
+              // alive. The flag is gated on actually enqueuing a visible
+              // chunk: thinking-block tokens are dropped and tool-mode tokens
+              // are buffered into `accumulated` and only flushed at `done`, so
+              // a "daemon emitted a token" signal does NOT mean the wire saw
+              // bytes — heartbeat must keep firing until the first real
+              // outgoing chunk.
+              let visibleChunkSent = false;
+              const heartbeat = setInterval(() => {
+                if (visibleChunkSent || streamCancelled) return;
+                try { ctrl.enqueue(enc.encode(": prefill\n\n")); } catch {}
+              }, 10_000);
               try {
                 let inThink = false;
                 let stripNextLeadingNl = false;
@@ -1325,8 +1346,11 @@ async function serve(port: number) {
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
                       })}\n\n`));
+                      visibleChunkSent = true;
                     }
                   } else if (msg.type === "done") {
+                    // Every path below enqueues at least the [DONE] sentinel.
+                    visibleChunkSent = true;
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -1370,6 +1394,7 @@ async function serve(port: number) {
                     ctrl.close();
                     return;
                   } else if (msg.type === "error") {
+                    visibleChunkSent = true;
                     // Propagate daemon-side errors (e.g. KV-budget rejection on a
                     // giant prompt) to the client instead of masking them as a
                     // normal zero-token "stop" — otherwise clients can't tell a
@@ -1386,6 +1411,7 @@ async function serve(port: number) {
                 // Safety: if loop exits without done/error (shouldn't happen), close stream
                 try { ctrl.close(); } catch {}
               } finally {
+                clearInterval(heartbeat);
                 e.generating = false;
                 safeRelease();
               }
