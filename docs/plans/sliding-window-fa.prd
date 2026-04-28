@@ -1,0 +1,262 @@
+# Sliding-window Flash Attention (port from Lucebox PR #26)
+
+**Status:** Filed 2026-04-27 (post-v0.1.8-alpha.2). Branch: `feat/sliding-window-fa`.
+
+## Summary
+
+Port Lucebox-Org/lucebox-hub PR #26 ("feat(dflash): sliding window FA + two-phase
+cache") to hipfire. The first lever — sliding-window flash attention — limits
+FA to the last `fa_window` KV positions instead of the full sequence. On
+RTX 3090 with Qwen3.6-27B at 60K context, Lucebox measures decode jumping from
+25 tok/s (full attention) to 89.7 tok/s (window=2048), 3.48× with **100%
+speculative acceptance at all window sizes**. Hipfire has no equivalent
+mechanism; CASK / TriAttention are sparse-top-B (more sophisticated, more
+complex), and KV eviction is rotate-out (compaction, not windowing).
+
+This PRD scopes Phase 1 only (sliding-window FA). The second lever
+(two-phase cache allocation that frees ~1.4 GB for prefill ubatch
+192→384) is captured as a follow-up PRD because it's a distinct refactor.
+
+## Why this matters
+
+- Empirically validated at 3.48× decode speedup on the same target/draft
+  class (Qwen3.6-27B + DFlash MQ4 draft) hipfire ships.
+- 100% acceptance is structural: when target and draft both apply the
+  same windowed mask, their argmax distributions agree by construction.
+  This is not a probabilistic claim — it's a property of the dispatch.
+- Cheaper than CASK / TriAttention at runtime: a single `win_start` shift
+  in the FA mask, no separate scoring kernel pass per cycle.
+- Compounds with DFlash spec-decode where verify/replay FA is the long-context
+  hot path. Lucebox's measurements are taken on this exact regime.
+
+## Reference
+
+- Lucebox PR: <https://github.com/Luce-Org/lucebox-hub/pull/26>
+- Sandro's announcement post: text snapshot in commit message; key claim
+  is `2048` default window, 3.64× decode @ 60K, 100% acceptance.
+- Lucebox commit before fix-docs: `633a4c01` (2026-04-27).
+
+## Scope
+
+### In scope (this PRD / branch)
+
+1. Add `fa_window: usize` to `Qwen35Config` (default `0` = unbounded).
+2. Add `HIPFIRE_FA_WINDOW=<n>` env override.
+3. Modify the asym3 decode FA kernel (`attention_flash_asym3_tile.hip`)
+   to bound the iteration to `[max(0, kv_len - window), kv_len)`.
+4. Plumb `fa_window` through `qwen35::forward_scratch` decode path on
+   the asym3 KV mode (default for 9B/27B production).
+5. Coherence-gate (short context, must be no-op) + long-context smoke
+   eyeball at 16K+ with window enabled.
+6. Speed-gate at gfx1100 (verify no regression at default, win at long-ctx).
+
+### Out of scope (deferred)
+
+1. Two-phase cache allocation (Lucebox's second lever — separate PRD).
+2. Layer-segmented prefill (Lucebox kept opt-in, slower >8K).
+3. Verify/replay FA window for DFlash spec-decode (this is where the
+   3.48× materializes; Phase 3 of the implementation plan below).
+4. asym2 / asym4 / q8_0 FA kernel variants (Phase 2).
+5. CLI flag `--fa-window` on `hipfire run` (env var first; CLI flag if
+   feature graduates to default-on).
+6. Interaction with TriAttention / CASK — initially mutually exclusive.
+
+## Phases
+
+### Phase 1 — single-kernel proof (~3-4 hr)
+
+Touch only the asym3 decode path. Goal: prove the mechanism on the
+default KV mode for Qwen 3.5/3.6 9B+27B without touching anything else.
+
+**Files to modify:**
+- `kernels/src/attention_flash_asym3_tile.hip` — add `kv_window` arg, bound `tile_start`.
+- `crates/rdna-compute/src/dispatch.rs::attention_flash_asym3_*` — pass through.
+- `crates/engine/src/qwen35.rs::forward_scratch` — read config / env var, pass `kv_window` to FA call.
+- `crates/engine/src/qwen35.rs::Qwen35Config` — add `fa_window: usize` field.
+
+**Acceptance:**
+- Coherence-gate (`./scripts/coherence-gate.sh`) PASS — no env set ⇒ default behavior bit-exact preserved on 0.8B / 4B / 9B.
+- With `HIPFIRE_FA_WINDOW=2048`, 16K-context smoke prompt produces fluent English (eyeball, not byte-exact).
+- Speed-gate `--fast` PASS on gfx1100 (4B pp32/decode, no regression).
+
+**Edge cases:**
+- `kv_window == 0` → unbounded (existing behavior).
+- `kv_len <= kv_window` → window inactive (existing behavior).
+- `kv_window > kv_len` → window inactive.
+- Tile entirely outside window → tile launch should no-op cheaply.
+
+### Phase 2 — fan out to other KV modes (~2-3 hr)
+
+After Phase 1 holds, replicate the change in:
+- `attention_flash_asym2_tile.hip`
+- `attention_flash_asym4_tile.hip`
+- `attention_flash_q8_0_tile.hip`
+
+Each gets the same `kv_window` parameter and same iteration bound.
+Mechanical port; coherence-gate and speed-gate at each step.
+
+### Phase 3 — verify/replay FA window for DFlash spec-decode (~3-4 hr)
+
+This is where the 3.64× materializes. Lucebox's measurements all
+include speculative decode. Touch the batched FA variants:
+- `attention_flash_asym2_tile_batched.hip`
+- `attention_flash_asym3_tile_batched.hip`
+- `attention_flash_asym4_tile_batched.hip`
+- `attention_flash_asym_reduce_batched.hip`
+
+Plus the speculative-decode call sites in `crates/engine/src/speculative.rs`.
+
+**Acceptance:**
+- DFlash coherence-gate (`./scripts/coherence-gate-dflash.sh`) PASS at
+  `HIPFIRE_FA_WINDOW=2048` on 27B + DFlash draft, attractor detector clean.
+- 27B-3.5 LRU code DFlash anchor ≥ committed baseline (no regression).
+- Long-context (32K+) DFlash smoke shows decode tok/s improvement matching
+  Lucebox's regime within 30% (porting between vendors / kernel implementations
+  has scatter; we're checking direction not magnitude).
+
+### Phase 4 — graduation (deferred to follow-up PR)
+
+If Phases 1-3 hold:
+- Add `--fa-window <n>` CLI flag on `hipfire run` / `hipfire serve`.
+- Default `fa_window = 2048` for `qwen3.5:27b` / `qwen3.6:27b` registry entries
+  (where long-context decode is the bottleneck). Other models keep `0`.
+- Update `docs/CONFIG.md`, `docs/BENCHMARKS.md` with measured numbers.
+
+## Architecture
+
+### Kernel modification pattern
+
+Current `attention_flash_asym3_tile` iterates the KV tile range
+`[tile_start, tile_end)` where `tile_end = min(tile_start + tile_size, seq_len)`.
+
+Proposed change: add `int kv_start` parameter (computed CPU-side as
+`max(0, seq_len - kv_window)` when `kv_window > 0`, else `0`), then bound:
+
+```c
+const int effective_start = max(tile_start, kv_start);
+if (effective_start >= tile_end) return;  // entire tile outside window
+const int tile_len = tile_end - effective_start;
+```
+
+The tile-iteration loop starts at `effective_start - tile_start` instead of `0`.
+RoPE phase / position-buffer indexing uses **absolute** position
+(`pos_buf[effective_start + t_local]`), not `tile_start + t_local`.
+
+### Dispatch plumbing
+
+`Gpu::attention_flash_asym3_tile()` already takes `seq_len` via
+`pos_buf[0]+1`. Adding `kv_window` is a new arg — caller passes `0` for
+existing call sites (no behavior change), Qwen35 forward path passes the
+configured window.
+
+### Config plumbing
+
+`Qwen35Config` gains `fa_window: usize` (default 0). Read in
+`forward_scratch` once per call. Env override: `HIPFIRE_FA_WINDOW=2048`
+before model load is the v1 surface; per-model registry override comes in Phase 4.
+
+## Risks
+
+### High-load (λ ≥ 0.7)
+
+1. **RoPE phase math under windowing.** Hipfire's KV cache uses absolute
+   position indexing for RoPE. When the window slides, the K-cache STILL
+   contains positions `[0, kv_len)`; we just don't attend to early ones.
+   So RoPE doesn't change. Mitigation: Phase 1 acceptance includes
+   coherence-gate which would catch this.
+2. **DeltaNet/FA hybrid interaction.** Qwen 3.5/3.6 alternates LA + FA
+   layers. LA is O(1) and unaffected by window. Lucebox notes the same
+   structure. Mitigation: Phase 1 explicitly tests on Qwen 3.5 9B which
+   has 8 FA layers + 24 LA layers.
+3. **TriAttention / CASK conflict.** TriAttention compacts the KV cache;
+   if both run, the window math operates on a compacted index space and
+   misses positions that should be attended to. Mitigation: assert in
+   `forward_scratch` that `fa_window == 0` when TriAttention eviction is
+   active. Document mutual exclusion.
+
+### Medium-load (λ ≈ 0.4)
+
+4. **Tile-launch overhead at large `kv_len`** when window is small. If
+   `kv_len = 60000` and `window = 2048`, we still launch tiles for the
+   full 60K range; most return early. Mitigation: outer dispatch in
+   `dispatch.rs` can clamp `n_tiles` to `ceil(window / tile_size) + 1`
+   for the windowed case. Phase 1 ships with simple early-return; the
+   tile-clamp is a Phase 2 micro-optimization.
+
+### Low-load (λ ≈ 0.2)
+
+5. **Backwards-compat: prebuilt kernels in `~/.hipfire/bin/kernels`** with
+   the old kernel signature would mismatch. Mitigation: the .hsaco hash
+   sidecar already gates this — kernel source change ⇒ hash change ⇒ rebuild.
+
+## Success criteria
+
+- [ ] Phase 1 ships behind `HIPFIRE_FA_WINDOW=<n>`, default 0, default
+      behavior bit-exact.
+- [ ] Coherence-gate PASS with env unset (no regression).
+- [ ] Long-context smoke at 16K+ produces fluent output with window enabled.
+- [ ] Speed-gate `--fast` PASS on gfx1100.
+- [ ] Speed measurement at 32K context: decode tok/s improvement >2× over
+      window=0 baseline. (Direction match with Lucebox; magnitude scatter expected.)
+- [ ] DFlash coherence-gate PASS with `HIPFIRE_FA_WINDOW=2048` (Phase 3).
+- [ ] Documented in CHANGELOG + CONFIG.md (Phase 4).
+
+## Open questions
+
+1. **Default window value.** Lucebox uses 2048. Is that right for hipfire's
+   target/draft pair? Phase 1 measurements at `{1024, 2048, 4096, 8192}`
+   should pin this empirically before Phase 4 graduation.
+2. **Per-layer vs per-model window.** Lucebox applies the same window to
+   every FA layer. Some research papers vary by depth. Out of scope for v1;
+   revisit if Phase 3 numbers don't match Lucebox's regime.
+3. **Compatibility with PR #72's Path C orchestrator.** Path C uses
+   `spec_step_ddtree_path_c` which itself uses FA on the verify pass.
+   Should the window apply to Path C? Test in Phase 3.
+
+## Test plan
+
+### Phase 1 acceptance
+
+```bash
+# Bit-exact baseline (env unset)
+./scripts/coherence-gate.sh
+
+# Default-path speed (env unset)
+./scripts/speed-gate.sh --fast
+
+# Window-enabled smoke
+HIPFIRE_FA_WINDOW=2048 ./target/release/examples/bench_qwen35_mq4 \
+    ~/.hipfire/models/qwen3.5-9b.mq4 --prefill 16384 --gen 50
+
+# Eyeball coherence at long context (use ~16K-token prompt file)
+HIPFIRE_FA_WINDOW=2048 ./target/release/examples/daemon < /tmp/long-prompt.jsonl
+```
+
+### Phase 3 acceptance
+
+```bash
+# DFlash coherence with window
+HIPFIRE_FA_WINDOW=2048 ./scripts/coherence-gate-dflash.sh
+
+# Long-context DFlash speed measurement
+HIPFIRE_FA_WINDOW=2048 ./target/release/examples/dflash_spec_demo \
+    --target ~/.hipfire/models/qwen3.6-27b.mq4 \
+    --draft ~/.hipfire/models/qwen36-27b-dflash-mq4.hfq \
+    --prompt-file /tmp/32k-prompt.txt --max 256 --no-chatml --kv-mode asym3
+```
+
+## Implementation queue (next session)
+
+Branch: `feat/sliding-window-fa`. Resume by:
+
+1. Read this PRD top-to-bottom.
+2. Verify `git checkout feat/sliding-window-fa` is the current branch.
+3. Start Phase 1, file 1: `kernels/src/attention_flash_asym3_tile.hip`. Add `int kv_start` arg.
+4. Pass-through in `dispatch.rs` for `attention_flash_asym3_*`.
+5. Plumb config through `qwen35.rs::forward_scratch`.
+6. Coherence-gate (no env) — must pass.
+7. 16K-prompt smoke with `HIPFIRE_FA_WINDOW=2048` — eyeball coherence.
+8. Speed-gate `--fast` — must pass.
+9. Commit. Push. Open draft PR pointing at this PRD + the issue.
+
+Acceptance: Phase 1 done when all 4 gates green AND eyeball coherent at 16K context.
