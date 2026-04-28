@@ -4953,12 +4953,17 @@ impl Gpu {
         //   ksplit — K-split + atomicAdd (non-deterministic accum order)
         //   k2     — 2× K-tile pipeline (byte-exact accum order)
         //   k2x32  — 32-row block with shared X fragment per K-tile. Slower
-        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo
-        //            for Qwen3.5 9B prefill (pp2048 q8: 339.7 → 351.3 tok/s).
+        //            than k2 on gfx1100, but faster on gfx1151 Strix Halo for
+        //            small-M residual projections at prefill-sized batches.
+        //            DFlash verify/lm_head runs at B<=16 and large-M draft
+        //            FFN/lm_head also prefer k2.
         //   k4     — 4× K-tile pipeline (output-mapping bug, τ=0 on dflash — debug only)
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let auto_variant = if matches!(self.arch.as_str(), "gfx1150" | "gfx1151") {
+        let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151");
+        let auto_variant = if is_gfx115x && batch_size <= 16 {
+            "k2"
+        } else if is_gfx115x && m < 8192 {
             "k2x32"
         } else if m >= 8192 {
             "k2"
