@@ -194,6 +194,57 @@ style code prompts vs the opt-out path.
 
 ---
 
+## §6 — wave64 residual gemv on MI300X (small win, BW-saturation ceiling)
+
+**Commit**: this branch — "perf(cdna3): wave64 port of gemv_hfq4g256_residual"
+
+**Bottleneck**: rocprof on 27B 3.6 mq4 decode (50 gen tokens, asym3 KV)
+showed `gemv_hfq4g256_residual.kd` at 19.2% of GPU time — the largest
+non-wave64 kernel after the 2026-04-17 (`4105035`) wave64 port. The
+original commit ported 10 hot HFQ4 kernels but missed the residual
+variants of gemv (`_residual` and `_wide`).
+
+**Hypothesis**: wave64 port should give 1.5-2× per-call speedup
+(matching the original commit's win on the same kernel family).
+
+**Lever**: §1 wave-size port. New `gemv_hfq4g256_residual_wave64.hip`
+with 2-rows-per-block layout (warp_id selects row, lane drives the
+32-lane reduction unchanged). Dispatch routes via `has_wave64_native(arch)`.
+
+**Numbers**:
+
+```
+27B 3.6 decode pre-port:  66.0 tok/s on MI300X (gfx942)
+27B 3.6 decode post-port: 68.1 tok/s     (+3.2%, within noise)
+
+per-call kernel time:
+  pre-port:   28783 ns/call (single-row wave32 on wave64 hardware)
+  post-port:  25222 ns/call (two-rows-per-block wave64)              -12.4%
+
+A3B 3.6 decode pre/post: 194.6 → 198.0 tok/s (+1.7%, within noise)
+```
+
+**Why the small wall-clock delta despite -12% kernel time**: residual
+gemv on this shape (M ~ 5120, K ~ 5120, single output row per warp32) is
+**bandwidth-bound, not lane-bound**. Each row already saturates a wide
+HBM3 read on MI300X regardless of wave size — the wave32 kernel was
+issuing one coalesced 128-byte transaction every 32 packed-u32 weight
+reads, and the new wave64 kernel pays the same BW for half the lanes.
+The 12% per-call drop is real (less ALU pressure on the unused upper
+lanes) but the wall-clock is dominated by the BW transfer, not the
+compute pipeline.
+
+**Lesson**: wave64 port wins biggest on kernels that are
+**lane-utilization-bound** (multi-row fused projections like qkv, where
+each lane has its own row-output to compute). On per-row gemv shapes
+that are already BW-saturated, the win is incremental — ship it because
+it's correctness-preserving and additive with future fusion work, but
+don't expect 2× decode.
+
+**Cross-arch**: gated by `has_wave64_native(&self.arch)`, so
+gfx908/gfx940/gfx941/gfx942 only. RDNA archs unchanged. Speed-gate on
+gfx1100 should pass byte-exact.
+
 ## How to add a case study
 
 If you land a real perf win or revert worth documenting, append a

@@ -1,0 +1,42 @@
+# hipfire speed-gate baseline — gfx942 (CDNA3, AMD Instinct MI300X)
+# Captured 2026-04-28 on feat/cdna-calib-mfma after wave64 residual gemv lever
+# Hardware: 1× AMD Instinct MI300X VF (192 GiB HBM3, 5.3 TB/s peak, gfx942)
+# ROCm 7.2.0 / clang 21 / kernel 6.8.0-106-generic
+# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
+#
+# Config: KV=asym3 (matches the speed-gate's run_bench env_prefix),
+#         no HIPFIRE_GRAPH (hipGraph is perf-neutral or worse on MI300X
+#         per project_hipgraph_moe_investigation.md and 2026-04-28 bench).
+# Measurements: best-of-2 via bench_qwen35_mq4 with HIPFIRE_KV_MODE=asym3.
+# Two prefill sizes per model:
+#   pp32  — short-context / launch-overhead regression detector
+#           (first-run number includes JIT compile and is SUSPICIOUSLY LOW
+#            on this baseline; the second run after JIT is the real number,
+#            captured here)
+#   pp128 — realistic prompt / GEMM-efficiency detector
+# Decode numbers are taken from the pp32 run (warmup=5 + gen=50 settles).
+# GROUND FLOOR — no commit may regress below these numbers.
+#
+# Wave64 status: all hot HFQ4 kernels (qkv, qkvza, gate_up, residual)
+# are wave64-native on this baseline. The 2026-04-28 wave64 residual gemv
+# port (this commit) adds the residual path that the original 4105035
+# wave64 commit didn't cover. Per-call kernel time -12% on rocprof; net
+# decode wall change is within within-session noise (residual gemv was
+# already near HBM3 BW saturation). Shipped because the kernel-level
+# improvement is real and the cross-arch path (gfx1100/RDNA) is unchanged.
+#
+# Cross-arch invariant: the wave64 residual lever lives behind
+# `has_wave64_native(arch)`, gating to gfx908/gfx940/gfx941/gfx942.
+# RDNA archs continue to use the existing single-row + multirow paths.
+
+0.8b_mq4_pp32_prefill_tok_s=764.2
+0.8b_mq4_gen_tok_s=453.6
+0.8b_mq4_pp128_prefill_tok_s=2780.0
+
+4b_mq4_pp32_prefill_tok_s=444.1
+4b_mq4_gen_tok_s=221.2
+4b_mq4_pp128_prefill_tok_s=1648.6
+
+9b_mq4_pp32_prefill_tok_s=350.7
+9b_mq4_gen_tok_s=174.0
+9b_mq4_pp128_prefill_tok_s=1306.9

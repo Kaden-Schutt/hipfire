@@ -3763,6 +3763,11 @@ impl Gpu {
             &k_val as *const _ as *mut c_void,
         ];
 
+        // CDNA3 wave64 fast path: 2 rows per block, halves grid.x. The base
+        // kernel runs at half throughput on a wave64-native arch because
+        // half the wave masks out per `__shfl_down`. Byte-exact with base.
+        let cdna3 = has_wave64_native(&self.arch);
+
         // RDNA3 multi-row override path. Same selector as the non-residual
         // variant but there's currently no gfx1010-default multi-row residual
         // kernel, so non-RDNA3 archs still take the single-row residual path
@@ -3776,7 +3781,24 @@ impl Gpu {
         // Bandwidth: weight + x + y_read (for residual) + y_write.
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
-        let result = if use_multirow {
+        let result = if cdna3 {
+            self.ensure_kernel(
+                "gemv_hfq4g256_residual_wave64",
+                kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                "gemv_hfq4g256_residual_wave64",
+            )?;
+            let grid = ((m as u32) + 1) / 2;
+            self.launch_maybe_blob(
+                "gemv_hfq4g256_residual_wave64",
+                [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                    b.push_i32(m_val); b.push_i32(k_val);
+                    b
+                },
+            )
+        } else if use_multirow {
             let (func_name, grid_div) = match rows {
                 2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
                 4 => ("gemv_hfq4g256_residual_multirow_r4", 4u32),
