@@ -78,7 +78,15 @@ impl Device {
         // Map family_id + asic_id to gfx arch string
         // family 143 (AMDGPU_FAMILY_NV) covers both RDNA1 and RDNA2
         let gfx_arch = match gpu_info.family_id {
-            141 => "gfx900",  // AMDGPU_FAMILY_AI (Vega)
+            141 => {
+                // AMDGPU_FAMILY_AI covers Vega 10/20. Vega 20 devices report
+                // gfx906 through ROCm and use the same wave64 execution model
+                // as the hipfire runtime port.
+                match gpu_info.chip_external_rev {
+                    0x3c | 0x3d | 0x3e | 0x3f => "gfx906",
+                    _ => "gfx900",
+                }
+            },
             142 => "gfx902",  // AMDGPU_FAMILY_RV (Raven Ridge)
             143 => {
                 // AMDGPU_FAMILY_NV: distinguish by asic_id

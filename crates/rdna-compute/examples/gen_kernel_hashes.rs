@@ -59,7 +59,7 @@ fn main() {
     kernel_sources.sort_by(|a, b| a.0.cmp(&b.0));
     rdna2_variant_sources.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let archs = ["gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201"];
+    let archs = ["gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201"];
 
     let mut written = 0;
     let mut skipped = 0;

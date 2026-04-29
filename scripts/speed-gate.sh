@@ -47,8 +47,28 @@ else
             if [ -n "$BASELINE_ARCH" ]; then break; fi
         fi
     done
+    if [ -z "$BASELINE_ARCH" ]; then
+        for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            [ -f "$node_props" ] || continue
+            ver=$(awk '/gfx_target_version/ {print $2; exit}' "$node_props" 2>/dev/null || true)
+            case "$ver" in
+                90006)          BASELINE_ARCH="gfx906";  break ;;
+                90008)          BASELINE_ARCH="gfx908";  break ;;
+                100100)         BASELINE_ARCH="gfx1010"; break ;;
+                100300|100302)  BASELINE_ARCH="gfx1030"; break ;;
+                110000|110001)  BASELINE_ARCH="gfx1100"; break ;;
+                110501)         BASELINE_ARCH="gfx1151"; break ;;
+                120000)         BASELINE_ARCH="gfx1200"; break ;;
+                120001)         BASELINE_ARCH="gfx1201"; break ;;
+            esac
+        done
+    fi
+    if [ -z "$BASELINE_ARCH" ] && command -v rocminfo >/dev/null 2>&1; then
+        BASELINE_ARCH="$(rocminfo 2>/dev/null | awk '/^  Name:/ && $2 ~ /^gfx/ {print $2; exit}')"
+    fi
 fi
 case "${HSA_OVERRIDE_GFX_VERSION:-}" in
+    9.0.6|9.0) BASELINE_ARCH="gfx906" ;;
     10.1.0|10.1) BASELINE_ARCH="gfx1010" ;;
     10.3.0|10.3) BASELINE_ARCH="gfx1030" ;;
     11.0.0|11.0) BASELINE_ARCH="gfx1100" ;;
