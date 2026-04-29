@@ -38,12 +38,13 @@ fn gemv_rows_default(arch: &str) -> u32 {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => 1,
         "gfx1030" | "gfx1031" => 1,
-        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X): wave64 native.
+        // Vega 20 / GCN5 (gfx906), CDNA1 (MI100, gfx908), and CDNA3
+        // (MI300X): wave64 native.
         // `gemv_hfq4g256_wide` uses block=[64,1,1] = exactly one wave —
         // zero lane waste. The 32-thread multirow variants run on half a
         // wave, so the wide kernel is the natural fit. Return rows=1 to
         // trigger use_wide.
-        "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
+        "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
         _ => 2,
     }
 }
@@ -88,14 +89,14 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
-/// CDNA wave64-native arches: CDNA1 (gfx908, MI100) and CDNA3 (gfx94x,
-/// MI300X). On these, wave32 kernels (block=[32,1,1]) waste the upper 32
-/// lanes of every wave slot. The `*_wave64.hip` kernel variants pack two
-/// rows per block (one per warp) with block=[64,1,1] and halve the grid
-/// count. Adding gfx90a (CDNA2, MI200) here is a one-line change once it
-/// has been bring-up validated.
+/// Wave64-native arches: Vega 20 / GCN5 (gfx906), CDNA1 (gfx908, MI100),
+/// and CDNA3 (gfx94x, MI300X). On these, wave32 kernels (block=[32,1,1])
+/// waste the upper 32 lanes of every wave slot. The `*_wave64.hip` kernel
+/// variants pack two rows per block (one per warp) with block=[64,1,1] and
+/// halve the grid count. Adding gfx90a (CDNA2, MI200) here is a one-line
+/// change once it has been bring-up validated.
 fn has_wave64_native(arch: &str) -> bool {
-    matches!(arch, "gfx908" | "gfx940" | "gfx941" | "gfx942")
+    matches!(arch, "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942")
 }
 
 fn has_mmq_i8_wmma(arch: &str) -> bool {
@@ -2331,10 +2332,10 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
-        // CDNA1 (MI100, gfx908) + CDNA3 (MI300X / gfx94x) wave64-native path:
+        // gfx906/gfx908/gfx94x wave64-native path:
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
-        // the wave slot. gfx908 added 2026-04-27 — kernel uses no MFMA, just
-        // FMA + shfl_down within wave64.
+        // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
+        // wave64, so it is safe for Vega 20 as well as CDNA.
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -11595,7 +11596,7 @@ impl Gpu {
                             kernels::FUSED_QKV_HFQ4G256_SRC.to_string()));
                 specs.push(("fused_gate_up_hfq4g256",
                             kernels::FUSED_GATE_UP_HFQ4G256_SRC.to_string()));
-                // CDNA1 (gfx908) + CDNA3 (gfx94x) wave64-native variants — cut
+                // gfx906/gfx908/gfx94x wave64-native variants — cut
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
@@ -11655,7 +11656,7 @@ impl Gpu {
                             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC.to_string()));
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
-                // CDNA1 (gfx908) + CDNA3 wave64 variants — see hfq4 branch for rationale.
+                // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
                 if has_wave64_native(&self.arch) {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
@@ -11800,6 +11801,18 @@ impl Gpu {
                     "gemv_hfq4g256_residual_multirow_r2",
                     "gemv_hfq4g256_residual_multirow_r4",
                     "gemv_hfq4g256_residual_multirow_r8",
+                ],
+                "gemv_hfq4g256_moe_gate_up_indexed_wave64" => vec![
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_wave64",
+                ],
+                "gemv_hfq4g256_moe_down_indexed_wave64" => vec![
+                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_wave64",
+                ],
+                "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64" => vec![
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_batched_wave64",
+                ],
+                "gemv_hfq4g256_moe_down_indexed_batched_wave64" => vec![
+                    "gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched_wave64",
                 ],
                 other => vec![other],
             };

@@ -28,7 +28,27 @@ if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
             [ -n "$HIPFIRE_DETECTED_ARCH" ] && break
         fi
     done
+    if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ]; then
+        for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
+            [ -f "$node_props" ] || continue
+            ver=$(awk '/gfx_target_version/ {print $2; exit}' "$node_props" 2>/dev/null || true)
+            case "$ver" in
+                90006)          HIPFIRE_DETECTED_ARCH="gfx906";  break ;;
+                90008)          HIPFIRE_DETECTED_ARCH="gfx908";  break ;;
+                100100)         HIPFIRE_DETECTED_ARCH="gfx1010"; break ;;
+                100300|100302)  HIPFIRE_DETECTED_ARCH="gfx1030"; break ;;
+                110000|110001)  HIPFIRE_DETECTED_ARCH="gfx1100"; break ;;
+                110501)         HIPFIRE_DETECTED_ARCH="gfx1151"; break ;;
+                120000)         HIPFIRE_DETECTED_ARCH="gfx1200"; break ;;
+                120001)         HIPFIRE_DETECTED_ARCH="gfx1201"; break ;;
+            esac
+        done
+    fi
+    if [ -z "${HIPFIRE_DETECTED_ARCH:-}" ] && command -v rocminfo >/dev/null 2>&1; then
+        HIPFIRE_DETECTED_ARCH="$({ rocminfo 2>/dev/null | awk '/^  Name:/ && $2 ~ /^gfx/ {print $2; exit}'; } || true)"
+    fi
     case "${HSA_OVERRIDE_GFX_VERSION:-}" in
+        9.0.6|9.0) HIPFIRE_DETECTED_ARCH="gfx906" ;;
         10.1.0|10.1) HIPFIRE_DETECTED_ARCH="gfx1010" ;;
         10.3.0|10.3) HIPFIRE_DETECTED_ARCH="gfx1030" ;;
         11.0.0|11.0) HIPFIRE_DETECTED_ARCH="gfx1100" ;;
@@ -38,8 +58,8 @@ fi
 # ── Marketing name ("Radeon RX 7900 XTX") ──────────────────────
 if [ -z "${HIPFIRE_DETECTED_NAME:-}" ]; then
     if command -v rocminfo >/dev/null 2>&1; then
-        HIPFIRE_DETECTED_NAME="$(rocminfo 2>/dev/null \
-            | awk '/^  Name:/{n=$2} /^  Marketing Name:/{$1=""; $2=""; sub(/^[ \t]+/,""); if (n ~ /^gfx/) {print; exit}}')"
+        HIPFIRE_DETECTED_NAME="$({ rocminfo 2>/dev/null \
+            | awk '/^  Name:/{n=$2} /^  Marketing Name:/{$1=""; $2=""; sub(/^[ \t]+/,""); if (n ~ /^gfx/) {print; exit}}'; } || true)"
     fi
     [ -z "$HIPFIRE_DETECTED_NAME" ] && HIPFIRE_DETECTED_NAME="Unknown GPU"
 fi
@@ -50,11 +70,11 @@ if [ -z "${HIPFIRE_DETECTED_VRAM_GB:-}" ]; then
     # GPU agent's GLOBAL pool is the VRAM. We grep "Size:" lines under
     # the first gfx-named agent.
     if command -v rocminfo >/dev/null 2>&1; then
-        HIPFIRE_DETECTED_VRAM_GB="$(rocminfo 2>/dev/null \
+        HIPFIRE_DETECTED_VRAM_GB="$({ rocminfo 2>/dev/null \
             | awk '
                 /^  Name:/                { in_gpu = ($2 ~ /^gfx/) }
                 in_gpu && /^      Size:/  { size_kb = $2; print int(size_kb/1024/1024); exit }
-            ')"
+            '; } || true)"
     fi
     [ -z "$HIPFIRE_DETECTED_VRAM_GB" ] && HIPFIRE_DETECTED_VRAM_GB="?"
 fi

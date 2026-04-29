@@ -36,6 +36,12 @@ struct ArchSpec {
 
 fn arch_spec(arch: &str) -> ArchSpec {
     match arch {
+        // Vega 20 / GCN5
+        "gfx906" => ArchSpec {
+            generation: "GCN5", simds_per_cu: 4, max_waves_per_simd: 10,
+            vgprs_per_simd: 1024, lds_per_cu: 65536,
+            l2_cache_mb: 4.0, infinity_cache_mb: 0.0, default_bus_width: 4096,
+        },
         // RDNA1
         "gfx1010" | "gfx1011" | "gfx1012" => ArchSpec {
             generation: "RDNA1", simds_per_cu: 2, max_waves_per_simd: 20,
@@ -78,6 +84,7 @@ impl GpuCapability {
         let cu_count = read_sysfs_cu_count().unwrap_or_else(|| {
             // Fallback: common defaults per arch
             match arch {
+                "gfx906" => 60,   // Vega 20 / Radeon VII / MI50 class
                 "gfx1010" => 40,   // RX 5700 XT
                 "gfx1030" => 60,   // RX 6800
                 "gfx1100" => 48,   // RX 7800 XT
@@ -97,6 +104,7 @@ impl GpuCapability {
         // GDDR6 data rate = clock * 2 (DDR) * 8 (prefetch) = 16x multiplier.
         // Peak BW = mem_clock * 16 * bus_width / 8 (bits→bytes) / 1000 (MHz→GHz)
         let gddr_multiplier: f32 = match spec.generation {
+            "GCN5" => 2.0,                         // HBM2 DDR
             "RDNA1" | "RDNA2" | "RDNA3" => 16.0, // GDDR6
             "RDNA4" => 16.0,                       // GDDR6 (9070 series)
             _ => 16.0,

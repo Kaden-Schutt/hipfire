@@ -276,7 +276,7 @@ fn main() {
             // Arch is unknown until Gpu::init; use a broad mkdir for the common arches
             // we support so the probe picks one up. The real arch check after init
             // will log the active dir.
-            for arch in ["gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1200", "gfx1201"] {
+            for arch in ["gfx906", "gfx1010", "gfx1013", "gfx1030", "gfx1031", "gfx1100", "gfx1101", "gfx1102", "gfx1151", "gfx1200", "gfx1201"] {
                 let _ = std::fs::create_dir_all(exe_dir.join("kernels").join("compiled").join(arch));
             }
         }

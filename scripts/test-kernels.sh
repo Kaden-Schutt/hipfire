@@ -15,7 +15,15 @@ ARCH="${1:-${HIPFIRE_DETECTED_ARCH:-gfx1100}}"
 echo "=== hipfire kernel test harness (${ARCH}) ==="
 
 # Build the test binary
-cargo build --release --features deltanet --example test_kernels -p engine 2>&1 | tail -2
+BUILD_LOG=$(mktemp)
+if cargo build --release --features deltanet --example test_kernels -p engine >"$BUILD_LOG" 2>&1; then
+    tail -2 "$BUILD_LOG"
+else
+    tail -40 "$BUILD_LOG"
+    rm -f "$BUILD_LOG"
+    exit 1
+fi
+rm -f "$BUILD_LOG"
 
 echo ""
 echo "Running kernel tests..."

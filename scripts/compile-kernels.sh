@@ -1,7 +1,7 @@
 #!/bin/bash
 # Pre-compile all HIP kernels for target GPU architectures.
 # Usage: ./scripts/compile-kernels.sh [arch1 arch2 ...]
-# Default: gfx1010 gfx1030 gfx1100 gfx1200
+# Default: gfx906 gfx1010 gfx1030 gfx1100 gfx1200
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,7 +12,7 @@ OUT_BASE="$SCRIPT_DIR/kernels/compiled"
 if [ $# -gt 0 ]; then
     ARCHS=("$@")
 else
-    ARCHS=(gfx1010 gfx1030 gfx1100 gfx1200 gfx1201)
+    ARCHS=(gfx906 gfx1010 gfx1030 gfx1100 gfx1200 gfx1201)
 fi
 
 echo "=== hipfire kernel compiler ==="
@@ -49,6 +49,19 @@ for arch in "${ARCHS[@]}"; do
         fi
 
         name=$(basename "$src" .hip)
+
+        # gfx906 (Vega 20 / GCN5) is wave64-native but predates the RDNA3/4
+        # WMMA builtins and the dot8 instruction used by MQ8. These kernels
+        # are not dispatched on gfx906, so don't make packaging fail on blobs
+        # this arch cannot legally compile.
+        if [ "$arch" = "gfx906" ]; then
+            case "$name" in
+                *_wmma*|gemv_mq8g256)
+                    echo "  - $name SKIP (unsupported ISA on gfx906)"
+                    continue
+                    ;;
+            esac
+        fi
 
         # Variant precedence:
         #   1. ${name}.${arch}.hip          (chip-specific, e.g. .gfx1100.)

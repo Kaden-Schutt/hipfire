@@ -49,7 +49,11 @@ EXE="./target/release/examples/dflash_spec_demo"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
 TARGET_27B="$MODELS_DIR/qwen3.5-27b.mq4"
 DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash.mq4"
+if [ ! -f "$DRAFT_27B" ] && [ -f "$MODELS_DIR/qwen35-27b-dflash-mq4.hfq" ]; then
+    DRAFT_27B="$MODELS_DIR/qwen35-27b-dflash-mq4.hfq"
+fi
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-dflash-$(date +%Y%m%d-%H%M%S).md}"
+CASE_TIMEOUT="${HIPFIRE_COHERENCE_TIMEOUT:-240}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 # ── Rebuild dflash_spec_demo if any relevant source is newer ──────────────
@@ -236,7 +240,7 @@ for entry in "${tests[@]}"; do
     echo "== $label =="
     out_file="/tmp/cohdf_out_$$.log"
     t0=$(date +%s.%N)
-    timeout 240 "$EXE" \
+    timeout "$CASE_TIMEOUT" "$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
         --kv-mode asym3 --no-chatml \

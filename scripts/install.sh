@@ -102,6 +102,7 @@ for node_props in /sys/class/kfd/kfd/topology/nodes/*/properties; do
     [ -f "$node_props" ] || continue
     ver=$(grep -oP 'gfx_target_version\s+\K\d+' "$node_props" 2>/dev/null || true)
     case "$ver" in
+        90006)          GPU_ARCH="gfx906";  break ;;
         90008)          GPU_ARCH="gfx908";  break ;;
         100100)         GPU_ARCH="gfx1010"; break ;;
         100300|100302)  GPU_ARCH="gfx1030"; break ;;
@@ -120,7 +121,7 @@ fi
 # Fallback: ask user
 if [ "$GPU_ARCH" = "unknown" ]; then
     echo "  WARNING: Could not detect GPU architecture."
-    echo "  Supported: gfx908 (MI100), gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1151 (Strix Halo), gfx1200 (R9700), gfx1201 (9070 XT)"
+    echo "  Supported: gfx906 (Vega 20), gfx908 (MI100), gfx1010 (5700 XT), gfx1030 (6800 XT), gfx1100 (7900 XTX), gfx1151 (Strix Halo), gfx1200 (R9700), gfx1201 (9070 XT)"
     GPU_ARCH=$(ask "  Enter your GPU arch [or Enter to skip]: " "unknown")
 fi
 echo "  GPU arch: $GPU_ARCH"
