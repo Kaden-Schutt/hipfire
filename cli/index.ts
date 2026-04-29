@@ -2498,6 +2498,130 @@ interface FieldMeta {
 // pressed Enter on the "[per-model configs]" virtual row.
 type TuiExit = "exit" | "open_picker";
 
+// CASK profiles: curated bundles that map to concrete eviction behaviors.
+// Setting a profile rewrites the bundle in one shot.
+//
+// IMPORTANT: the daemon triggers eviction iff `cask_sidecar.is_some()`
+// (daemon.rs:798). The `cask` boolean only switches between m-fold and
+// drop-eviction; it does NOT disable eviction. Therefore the `off` profile
+// includes `cask_sidecar: ""` in its apply bundle — clearing the sidecar
+// path is the only way to actually disable eviction. Non-`off` profiles
+// leave `cask_sidecar` untouched (the user supplies the path).
+//
+// Why profiles vs raw knobs: the knobs interact non-obviously and have
+// hard-rule failure modes (m-fold + DFlash → block attractor; any sidecar
+// + A3B → confident-wrong hallucination at current R̄). A profile picker
+// collapses those into a small set of validated combinations.
+type CaskPolicyBundle = Pick<HipfireConfig, "cask" | "cask_budget" | "cask_beta" | "cask_core_frac" | "cask_fold_m">;
+type CaskProfileBundle = CaskPolicyBundle & { cask_sidecar?: string };
+interface CaskProfile {
+  label: string;
+  short: string;       // one-liner for the active row
+  desc: string;        // multi-line for the picker overlay
+  apply: CaskProfileBundle;
+  ar_only: boolean;    // true → warn if dflash_mode != off when this profile applied
+  a3b_safe: boolean;   // false → warn if applying to A3B target (per-model mode)
+}
+
+const CASK_PROFILES: Record<string, CaskProfile> = {
+  "off": {
+    label: "off",
+    short: "no eviction; clears cask_sidecar; physical_cap = max_seq",
+    desc: [
+      "No KV eviction. Physical KV buffer = max_seq tokens (full allocation).",
+      "Clears cask_sidecar — the daemon triggers eviction whenever a sidecar",
+      "path is set, regardless of the cask boolean, so clearing the path is",
+      "the only way to actually disable eviction.",
+      "",
+      "Use when:",
+      "  • Plenty of VRAM relative to context goal",
+      "  • Model is A3B (eviction is unsafe at current R̄≈0.36–0.39)",
+      "  • Quality-sensitive single-turn workloads",
+      "Only profile that's safe on 35B-A3B today.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "" },
+    ar_only: false,
+    a3b_safe: true,
+  },
+  "balanced": {
+    label: "balanced",
+    short: "drop-eviction, budget=1024 (~165 MB KV on 27B asym3)",
+    desc: [
+      "Plain TriAttention drop-eviction at budget=1024.",
+      "physical_cap ≈ 1280 slots regardless of advertised max_seq.",
+      "Lets a 16 GB card fit dense 27B with usable long context.",
+      "Per-eviction quality cost on AR ≈ 1.7% (graceful).",
+      "m-fold OFF — no DFlash regression risk; works on AR or DFlash.",
+      "Dense models only — A3B safety not validated at this budget.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 1024, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2 },
+    ar_only: false,
+    a3b_safe: false,
+  },
+  "conservative": {
+    label: "conservative",
+    short: "drop-eviction, budget=2048 (≥20 GB headroom)",
+    desc: [
+      "Plain TriAttention drop-eviction at budget=2048.",
+      "physical_cap ≈ 2304 slots. Use when you have ≥20 GB VRAM and",
+      "want predictable VRAM footprint with very long advertised contexts.",
+      "Same per-event quality cost as balanced (~1.7% on AR), but evicts",
+      "less often → fewer cumulative events, smoother quality curve.",
+      "Dense models only.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 2048, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2 },
+    ar_only: false,
+    a3b_safe: false,
+  },
+  "aggressive-vram": {
+    label: "aggressive-vram",
+    short: "CASK m-fold, budget=512 (~96 MB KV on 27B asym3)",
+    desc: [
+      "CASK m-fold at the paper's frac=0.25 sweet spot (budget=512, m=2).",
+      "physical_cap ≈ 896 → ~96 MB KV on dense 27B asym3.",
+      "Pins VRAM hard — a 16 GB card fits 27B with a comfortable margin.",
+      "Validated +11 pts vs drop-eviction at this aggressive budget (paper §4).",
+      "",
+      "AR ONLY: m-fold + DFlash has a documented block-attractor regression",
+      "(feedback_cask_mfold_dflash_broken.md). Set dflash_mode=off when using",
+      "this profile. NOT for A3B at current R̄.",
+    ].join("\n"),
+    apply: { cask: true, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2 },
+    ar_only: true,
+    a3b_safe: false,
+  },
+};
+
+// Maps the current effective values to a profile name. Returns "custom" if
+// no profile exactly matches — this is what `hipfire config list` shows for
+// users who hand-tuned individual knobs. Compares each key declared in the
+// profile's `apply` bundle, so `off` (which includes `cask_sidecar: ""`)
+// requires the sidecar path to actually be empty before it matches.
+function detectCaskProfile(values: Pick<HipfireConfig, keyof CaskPolicyBundle | "cask_sidecar">): string {
+  for (const [name, p] of Object.entries(CASK_PROFILES)) {
+    let matches = true;
+    for (const [k, v] of Object.entries(p.apply)) {
+      const cur = (values as any)[k];
+      if (typeof v === "number" && typeof cur === "number") {
+        if (Math.abs(cur - v) > 1e-9) { matches = false; break; }
+      } else if (cur !== v) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) return name;
+  }
+  return "custom";
+}
+
+// Heuristic: does the resolved tag refer to an A3B model? Used to flag the
+// (any-eviction, A3B) hard-rule when applying a non-"off" profile in per-
+// model mode.
+function tagIsA3B(tag: string | null | undefined): boolean {
+  if (!tag) return false;
+  return /a3b/i.test(tag);
+}
+
 // Scope = null → edit global config. Scope = tag string → edit per-model
 // overlay for that tag. Per-model mode shows inherited values dimmed and
 // highlights overrides in cyan; `r` removes an override.
@@ -2515,9 +2639,20 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const keys = isPerModel
     ? allKeys.filter(k => (PER_MODEL_KEYS as readonly string[]).includes(k))
     : allKeys;
-  // Virtual rows (nav-only, not real config keys). Only in global mode.
-  const navKeys = isPerModel ? [] : ["__per_model__"];
+  // Virtual rows (nav-only, not real config keys). `__cask_profile__` is
+  // shown in both global and per-model modes — CASK is per-model overridable
+  // and the profile bundle is exactly what most users want to change in the
+  // per-model A3B/dense distinction. `__per_model__` is global-only.
+  const navKeys = isPerModel
+    ? ["__cask_profile__"]
+    : ["__cask_profile__", "__per_model__"];
   const totalRows = keys.length + navKeys.length;
+
+  // Inline modal state for the CASK profile picker. Open on Enter from the
+  // __cask_profile__ row; close on Enter (apply) or Esc (cancel).
+  const profileNames = Object.keys(CASK_PROFILES);
+  let profilePickerOpen = false;
+  let profilePickerSelected = 0;
 
   // Effective value for a key: override wins in per-model mode, else cfg.
   const effective = (k: keyof HipfireConfig): any =>
@@ -2746,7 +2881,42 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     editBuffer = "";
   };
 
+  const renderProfilePicker = () => {
+    write("\x1b[H\x1b[2J");
+    write(`${C.bold}cask profile${C.reset}  ${C.dim}${isPerModel ? `per-model overlay for ${resolvedTag}` : "global config"}${C.reset}\n`);
+    write(`${C.dim}Pick a preset to set the (cask, cask_budget, cask_beta, cask_core_frac, cask_fold_m)\nbundle in one shot. cask_sidecar is preserved — set its path separately.${C.reset}\n\n`);
+
+    const a3bWarn = isPerModel && tagIsA3B(resolvedTag);
+    const dflashOn = effective("dflash_mode") !== "off";
+
+    for (let i = 0; i < profileNames.length; i++) {
+      const name = profileNames[i];
+      const p = CASK_PROFILES[name];
+      const caret = i === profilePickerSelected ? `${C.cyan}▸${C.reset}` : " ";
+      const title = `${caret} ${C.bold}${p.label.padEnd(18)}${C.reset} ${C.dim}${p.short}${C.reset}`;
+      write(`${title}\n`);
+      if (i === profilePickerSelected) {
+        for (const line of p.desc.split("\n")) write(`     ${C.dim}${line}${C.reset}\n`);
+        const warns: string[] = [];
+        if (a3bWarn && !p.a3b_safe) warns.push("⚠ A3B target — eviction unsafe at current R̄ (per feedback memory). Pick `off`.");
+        if (p.ar_only && dflashOn) warns.push("⚠ dflash_mode is ON. m-fold + DFlash has a documented attractor regression. Set dflash_mode=off first.");
+        for (const w of warns) write(`     ${C.yellow}${w}${C.reset}\n`);
+        write("\n");
+      }
+    }
+
+    write(`\n  ${C.dim}↑↓ select · enter apply · esc cancel${C.reset}\n`);
+    if (flash) {
+      write(`\n  ${flash}\n`);
+      flash = "";
+    }
+  };
+
   const render = () => {
+    if (profilePickerOpen) {
+      renderProfilePicker();
+      return;
+    }
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
@@ -2832,8 +3002,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       }
     }
 
-    // Virtual nav rows (global mode only). Shown as a distinct-looking row
-    // the user can Enter into.
+    // Virtual nav rows. Shown as a distinct-looking row the user can Enter into.
     for (let n = 0; n < navKeys.length; n++) {
       const rowIdx = keys.length + n;
       const nk = navKeys[n];
@@ -2848,6 +3017,28 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
         write(`\n${caret} ${C.bold}${label}${C.reset} ${val}  ${C.dim}→ enter to open model picker${C.reset}\n`);
         if (rowIdx === selected) {
           write(`${" ".repeat(3 + labelW)}${C.dim}Per-model overlays let you customize settings for a specific model (e.g. bigger max_seq for long ctx on 9B).${C.reset}\n`);
+        }
+      } else if (nk === "__cask_profile__") {
+        const profileVals = {
+          cask: effective("cask") as boolean,
+          cask_budget: effective("cask_budget") as number,
+          cask_beta: effective("cask_beta") as number,
+          cask_core_frac: effective("cask_core_frac") as number,
+          cask_fold_m: effective("cask_fold_m") as number,
+          cask_sidecar: effective("cask_sidecar") as string,
+        };
+        const active = detectCaskProfile(profileVals);
+        const sidecarSet = !!effective("cask_sidecar");
+        const label = "cask profile".padEnd(labelW);
+        const valColor = active === "custom" ? C.yellow : (active === "off" ? C.dim : C.green);
+        const val = `${valColor}${active}${C.reset}`.padEnd(14 + 20);
+        const evictHint = sidecarSet
+          ? `${C.dim}sidecar set → eviction ${effective("cask") ? "(m-fold)" : "(drop)"} active${C.reset}`
+          : `${C.dim}no sidecar — set cask_sidecar to engage${C.reset}`;
+        write(`\n${caret} ${C.bold}${label}${C.reset} ${val}  ${evictHint}\n`);
+        if (rowIdx === selected) {
+          const short = CASK_PROFILES[active]?.short ?? "hand-tuned values; not a preset";
+          write(`${" ".repeat(3 + labelW)}${C.dim}${short} — enter to open profile picker${C.reset}\n`);
         }
       }
     }
@@ -2888,6 +3079,30 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     };
 
     const onData = (data: string) => {
+      if (profilePickerOpen) {
+        // Profile picker modal — Up/Down navigate, Enter applies, Esc cancels.
+        if (data === "\x1b[A") {
+          profilePickerSelected = (profilePickerSelected + profileNames.length - 1) % profileNames.length;
+        } else if (data === "\x1b[B") {
+          profilePickerSelected = (profilePickerSelected + 1) % profileNames.length;
+        } else if (data === "\r" || data === "\n") {
+          const name = profileNames[profilePickerSelected];
+          const p = CASK_PROFILES[name];
+          for (const k of Object.keys(p.apply) as (keyof CaskProfileBundle)[]) {
+            setValue(k, (p.apply as any)[k]);
+          }
+          profilePickerOpen = false;
+          flash = `${C.green}cask profile → ${name}${C.reset}`;
+        } else if (data === "\x1b" || data === "q" || data === "Q") {
+          profilePickerOpen = false;
+          flash = `${C.dim}cancelled${C.reset}`;
+        } else if (data === "\x03") {
+          cleanup();
+          process.exit(130);
+        }
+        render();
+        return;
+      }
       if (editing) {
         // Text/number edit mode
         if (data === "\r" || data === "\n") {
@@ -2955,9 +3170,23 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
           break;
         case "\r": case "\n": {
           if (onNavRow()) {
-            if (currentNavKey() === "__per_model__") {
+            const nk = currentNavKey();
+            if (nk === "__per_model__") {
               saveAndExit("open_picker");
               return;
+            } else if (nk === "__cask_profile__") {
+              const profileVals = {
+                cask: effective("cask") as boolean,
+                cask_budget: effective("cask_budget") as number,
+                cask_beta: effective("cask_beta") as number,
+                cask_core_frac: effective("cask_core_frac") as number,
+                cask_fold_m: effective("cask_fold_m") as number,
+                cask_sidecar: effective("cask_sidecar") as string,
+              };
+              const active = detectCaskProfile(profileVals);
+              const idx = profileNames.indexOf(active);
+              profilePickerSelected = idx >= 0 ? idx : 0;
+              profilePickerOpen = true;
             }
             break;
           }
@@ -4003,14 +4232,16 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   case "config": {
     // `hipfire config`                                  → global TUI
     // `hipfire config list|get|set|reset [...]`          → global scripting
+    // `hipfire config cask-profile <name>`               → bundle setter
     // `hipfire config <model:tag>`                       → per-model TUI
     // `hipfire config <model:tag> list|get|set|reset ...` → per-model scripting
+    // `hipfire config <model:tag> cask-profile <name>`   → per-model bundle setter
     //
     // Disambiguate: first arg is a model tag if it's a known REGISTRY entry
     // (resolved) or matches the `name:tag` shape. Otherwise treat as action.
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
-    if (firstArg && !["list", "get", "set", "reset"].includes(firstArg)) {
+    if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
       // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
       if (REGISTRY[resolved] || firstArg.includes(":")) {
@@ -4170,8 +4401,71 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         saveConfig({ ...CONFIG_DEFAULTS });
         console.log("All config reset to defaults");
       }
+    } else if (action === "cask-profile") {
+      // `hipfire config cask-profile` — print active + list available
+      // `hipfire config cask-profile <name>` — apply bundle to global
+      // `hipfire config <model:tag> cask-profile <name>` — apply to per-model
+      const profileName = key;
+      const effectiveCfg = modelScope ? resolveModelConfig(modelScope) : cfg;
+      const profileVals = {
+        cask: effectiveCfg.cask,
+        cask_budget: effectiveCfg.cask_budget,
+        cask_beta: effectiveCfg.cask_beta,
+        cask_core_frac: effectiveCfg.cask_core_frac,
+        cask_fold_m: effectiveCfg.cask_fold_m,
+        cask_sidecar: effectiveCfg.cask_sidecar,
+      };
+      const active = detectCaskProfile(profileVals);
+      if (!profileName) {
+        console.log(`Active CASK profile${modelScope ? ` (${modelScope})` : ""}: ${active}`);
+        console.log(`\nAvailable profiles:`);
+        for (const [n, p] of Object.entries(CASK_PROFILES)) {
+          const marker = n === active ? "▸" : " ";
+          console.log(`  ${marker} ${n.padEnd(18)} ${p.short}`);
+        }
+        console.log(`\nApply: hipfire config${modelScope ? ` ${modelScope}` : ""} cask-profile <name>`);
+        console.log(`Detail: see docs/CONFIG.md "CASK profiles" section.`);
+        break;
+      }
+      if (!CASK_PROFILES[profileName]) {
+        console.error(`Unknown CASK profile: ${profileName}`);
+        console.error(`Available: ${Object.keys(CASK_PROFILES).join(", ")}`);
+        process.exit(1);
+      }
+      const bundle = CASK_PROFILES[profileName].apply;
+      // Safety check: per-model A3B + non-`off` profile is unsafe at current R̄.
+      if (modelScope && tagIsA3B(modelScope) && profileName !== "off") {
+        console.error(`⚠ ${modelScope} is an A3B model. Eviction at current R̄≈0.36–0.39 produces`);
+        console.error(`  confident-wrong hallucinations under multi-turn (see feedback memory).`);
+        console.error(`  Refusing to apply '${profileName}'. Use cask-profile=off on A3B targets,`);
+        console.error(`  or set HIPFIRE_FORCE_A3B_EVICTION=1 to override (not recommended).`);
+        if (process.env.HIPFIRE_FORCE_A3B_EVICTION !== "1") process.exit(1);
+      }
+      if (modelScope) {
+        for (const k of Object.keys(bundle) as (keyof CaskProfileBundle)[]) {
+          writePerModel(k as PerModelKey, (bundle as any)[k]);
+        }
+        console.log(`${modelScope}: cask-profile → ${profileName}`);
+      } else {
+        for (const k of Object.keys(bundle) as (keyof CaskProfileBundle)[]) {
+          (cfg as any)[k] = (bundle as any)[k];
+        }
+        saveConfig(cfg);
+        console.log(`cask-profile → ${profileName}`);
+      }
+      const sidecarSet = !!effectiveCfg.cask_sidecar;
+      if (!sidecarSet && profileName !== "off") {
+        console.log(`note: cask_sidecar is not set. The profile is configured, but eviction`);
+        console.log(`      only engages when a sidecar path is loaded. Set with:`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.bin`);
+      }
+      if (CASK_PROFILES[profileName].ar_only && effectiveCfg.dflash_mode !== "off") {
+        console.log(`warn: ${profileName} is AR-only (m-fold + DFlash has documented attractor regression).`);
+        console.log(`      dflash_mode is currently '${effectiveCfg.dflash_mode}'. Recommend:`);
+        console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set dflash_mode off`);
+      }
     } else {
-      console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} [list|get|set|reset]`);
+      console.error(`Usage: hipfire config${modelScope ? ` ${modelScope}` : ""} [list|get|set|reset|cask-profile]`);
     }
     break;
   }
