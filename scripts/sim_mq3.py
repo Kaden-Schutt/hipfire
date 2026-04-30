@@ -25,13 +25,28 @@ NOT a strict upper bound on its quality cost:
       simulator picks q4_sim=0 → reconstructs to 0 (error 9%).
       Simulator LESS accurate than real MQ3.
 
-  Aggregate (variance / mean MSE) is approximately equivalent because the
-  MQ4 and MQ3 grids overlap closely on average. But the simulator's
-  worst-case per-weight error is ~10% of range vs real MQ3's ~7%, so the
-  simulator has heavier tail errors. For LLM coherence (which depends on
-  per-element worst-case more than averages — see
-  feedback_attention_precision.md), the simulator is biased toward
-  pessimism but NOT a strict upper bound.
+  Aggregate per-element variance is HIGHER for the simulator, not equal.
+  Real MQ3 has 8 uniform bins of width 2/14 ≈ 0.143; per-element variance
+  for uniform w is (1/14)² / 3 ≈ 1/588.
+  The simulator has 7 bins of width 4/30 ≈ 0.133 plus one outlier bin of
+  width 6/30 = 0.2 (the gap between recon=6/15 and recon=9/15 caused by
+  SNAP_4 skipping q4=7 and q4=8). Probability-weighted variance:
+    7 narrow bins × (4/30)²/12 × (4/30) + 1 wide bin × (6/30)²/12 × (6/30)
+    ≈ 1/486
+  So the simulator has ~20% higher per-element error variance than real
+  MQ3.
+
+  Worst-case per-weight error is ~10% of range for the simulator
+  (half the wide bin's width = 3/30 = 0.1) vs ~7% for real MQ3
+  (half the bin width = 1/14 = 0.071). About 40% heavier tail.
+
+  Combined: the simulator is biased pessimistic at every aggregation
+  scale — just by varying amounts. Per-weight ~50/50 either direction;
+  per-element variance ~20% heavier; worst-case ~40% heavier. For LLM
+  coherence (which depends on tail errors compounding through layers
+  per feedback_attention_precision.md), the simulator probably collapses
+  before real MQ3 would, but that's a probabilistic statement not a
+  strict ordering. NOT an upper bound on real MQ3 quality cost.
 
   Concretely: if even this approximate MQ3 produces fluent output, real
   MQ3 is very likely viable too. If this approximate MQ3 collapses (as
