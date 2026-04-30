@@ -767,6 +767,33 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 qt_desc
             ));
         }
+
+        // Defense-in-depth (Codex stop-time review 2026-04-30): even when
+        // lm_head is supported, refuse if any body weight is MQ3 (qt=17)
+        // or MQ2 (qt=18). The eligibility gate in `qwen35::forward_prefill_batch`
+        // (`is_batchable_la` excludes MQ3/MQ2) and `dflash::gemm_dispatch`
+        // (panics on non-{F16,F32,HFQ4,MQ4} dtypes) already prevent any
+        // memory-fault path, but a model with MQ3/MQ2 body + supported
+        // lm_head would pass this guard and silently fall back to per-token
+        // forward_scratch for every spec-verify cycle — providing zero
+        // DFlash speedup over AR while wasting the draft load. Refuse
+        // cleanly at load instead. Today hipfire-quantize produces uniform
+        // models so this is overwhelmingly caught by the lm_head check
+        // above; the body scan is for future mixed-precision PRD Phase 3.
+        let mq_lowbit = hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
+            .or_else(|| hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n)));
+        if let Some((qt_label, name)) = mq_lowbit {
+            return Err(format!(
+                "DFlash draft requested but model contains {qt_label} weight \
+                 `{name}`. No batched HFQ4 GEMM kernel exists for sub-4-bit \
+                 MQ formats, so the prefill fast-path (`forward_prefill_batch`) \
+                 falls back to per-token `forward_scratch` for every spec \
+                 verify cycle — defeating DFlash's speedup. Reload without \
+                 a draft, or use an MQ4 / HFQ4 / Q8 target. (PRD Phase 2: \
+                 add gemm_hfq3g256_batched_lmhead / gemm_hfq2g256_batched_lmhead \
+                 + the corresponding MQ3/MQ2 WMMA prefill kernels.)"
+            ));
+        }
     }
 
     // Derive physical_cap. With eviction (cask.sidecar set), the physical

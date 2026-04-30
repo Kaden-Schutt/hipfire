@@ -140,6 +140,17 @@ impl HfqFile {
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
         self.tensor_map.get(name).map(|&i| &self.tensors[i])
     }
+
+    /// Returns the name of the first tensor whose `quant_type` matches `qt`,
+    /// or `None` if none match. Used by the daemon's DFlash-refusal guard to
+    /// detect MQ3/MQ2 body weights without iterating the index outside this
+    /// module.
+    pub fn first_tensor_with_quant_type(&self, qt: u8) -> Option<&str> {
+        self.tensors
+            .iter()
+            .find(|t| t.quant_type == qt)
+            .map(|t| t.name.as_str())
+    }
 }
 
 // ─── Config from HFQ metadata ───────────────────────────────────────────────
