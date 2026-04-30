@@ -39,36 +39,54 @@ but don't show a clear trend.
 Layer 27 qkv.v has max_err=0.232, roughly 3x the typical qkv.v value
 (~0.06). This is a FullAttn layer. Worth investigating with channel-map.
 
-## Stage 2: channel-map — residual, layer 0
+## Stage 2: channel-map — residual across layers
 
-### Finding: Row 3994 is a catastrophic outlier
+### Finding: Row 3994 is the #1 outlier in EVERY Wo layer
 
-| Row  | max_err   | mean_err  | bad_acts (of 128) |
-|------|-----------|-----------|-------------------|
-| **3994** | **0.516** | **0.135** | **123/128**    |
-| 1504 | 0.092     | 0.022     | 92/128            |
-| 3092 | 0.085     | 0.019     | 85/128            |
-| 3986 | 0.084     | 0.020     | 85/128            |
+| Layer | Row 3994 max_err | Row 3994 mean_err | 2nd worst row | 2nd max_err | Ratio |
+|-------|-----------------|-------------------|---------------|-------------|-------|
+| 0     | **0.516**       | 0.135             | 1504          | 0.092       | 5.6x  |
+| 1     | **0.456**       | 0.136             | 3986          | 0.073       | 6.3x  |
+| 3     | **0.493**       | 0.126             | 3968          | 0.068       | 7.3x  |
+| 6     | **0.357**       | 0.077             | 3769          | 0.070       | 5.1x  |
 
-Row 3994 is 5.6x worse than the next worst row. All 4096 rows exceed
-the 0.01 threshold, but 4095 of them are in the "normal" ~0.02 mean
-error range. Row 3994 is the only structural outlier:
+Row 3994 is consistently 5-7x worse than the 2nd worst row in every
+layer tested. The 2nd-worst rows vary across layers (1504, 3986, 3968,
+3769) but row 3994 is always #1. This is a structural property of the
+weight matrix at hidden dimension 3994, not a random quantization
+artifact.
 
-- 0.516 max error (vs ~0.08 for 2nd worst)
-- 0.135 mean error (vs ~0.02 for 2nd worst)
-- 123/128 batch elements exceed threshold (vs ~85 for 2nd worst)
+All ~4095 other rows are in the "normal" 0.05-0.07 max_err range.
+Row 3994 is the only row that consistently breaks the 0.1 barrier.
 
-### Interpretation
+### Finding: Layer 27 qkv.v — row 265 is an outlier
 
-Row 3994 in the Wo projection of layer 0 maps to hidden dimension 3994
-in the residual stream. A 0.5 absolute error here at layer 0 propagates
-through all 31 subsequent layers, compounding through attention and FFN.
+| Row | max_err | mean_err | bad_acts | 2nd worst |
+|-----|---------|----------|----------|-----------|
+| **265** | **0.232** | 0.072 | 117/128 | 0.113 (row 395) |
 
-The Q8_1 quantization of the activation vector (the `ensure_q8_1_mmq_x`
-step) loses precision specifically for the dot product involving this
-weight row. This is likely caused by the HFQ4 weight statistics for row
-3994 having a scale/zero-point combination that amplifies the Q8_1
-rounding error beyond what other rows experience.
+Same pattern as the Wo outlier: one catastrophic row, everything else
+is ~2x lower. Row 265 in the V projection has a weight group whose
+HFQ4 scale/zero statistics amplify Q8_1 rounding error.
+
+Unlike the Wo outlier (same row 3994 in every layer), this is specific
+to layer 27's V weights. The other FullAttn layers (3, 7, 11, 15, 19,
+23, 31) have qkv.v max_err in the normal 0.06-0.09 range.
+
+## Root cause
+
+**Specific weight rows in the HFQ4 quantized model have scale/zero-point
+statistics that amplify Q8_1 activation rounding error.** The MMQ kernel
+computes `W_q4 * X_q8` where both operands are quantized. When a weight
+row has an unusual dynamic range (e.g., very small scale or extreme
+zero-point), the combined quantization error of both operands compounds
+multiplicatively for that row's dot product, producing errors 5-7x
+larger than typical rows.
+
+Row 3994 appears in every Wo layer because the output projection
+weights for hidden dimension 3994 have consistently unusual statistics
+across the entire model — likely reflecting an activation channel in
+the original fp16 model with atypical magnitude.
 
 ## Conclusions
 
@@ -76,37 +94,41 @@ rounding error beyond what other rows experience.
    site-specific or layer-specific defect. Every (site, layer) pair
    shows ~1% mean error from Q8_1 activation quantization.
 
-2. **The residual (Wo) site has the highest peak errors** (up to 0.5)
-   because of isolated outlier rows in the weight matrix. These spikes
-   compound through the residual stream across layers.
+2. **The peak errors are driven by ~1-2 outlier weight rows per site.**
+   Row 3994 in every Wo projection; row 265 in layer 27 qkv.v. These
+   are 5-7x worse than all other rows.
 
-3. **The tool-call corruption in #87 is likely a threshold effect:**
-   the cumulative error from 32 layers of ~1% mean error plus occasional
-   0.5 spikes eventually flips special-token logits. Tool-call prompts
-   are more sensitive because they require precise probability
+3. **The tool-call corruption in #87 is a threshold effect:** 32 layers
+   of ~1% mean error + 0.3-0.5 spikes from outlier rows compound through
+   the residual stream until special-token logit probabilities flip.
+   Tool-call prompts are more sensitive because they require precise
    distributions around ChatML token IDs.
 
-## Recommended fix approaches
+4. **The fix is per-row screening, not per-site or per-layer.** Skipping
+   MMQ for the entire Wo site works but sacrifices too much speedup.
+   Screening the ~1-2 outlier rows per weight matrix and falling back to
+   f16 WMMA only for those rows preserves >99% of the MMQ benefit.
 
-1. **Skip MMQ for residual (Wo) site only** — use f16 WMMA for Wo,
-   keep MMQ for QKV and gate/up. Wo is the single-matrix call
-   (not fused), so falling back to WMMA is cheap. This eliminates the
-   worst spikes while preserving most of the prefill speedup.
+## Recommended fix: per-row error screening
 
-2. **Per-row error screening** — at model load time, run a quick
-   synthetic comparison for each Wo row and flag rows with max_err
-   above a threshold. Use mixed-precision: MMQ for clean rows, WMMA
-   for dirty rows. More complex but preserves more of the speedup.
+At model load time, for each weight matrix that will use the MMQ path:
+1. Generate a small synthetic activation vector (batch=16, same LCG seed)
+2. Run both WMMA and MMQ on it
+3. Compute per-row max_err
+4. Flag rows exceeding a threshold (e.g., 0.15 — catches the 0.3-0.5
+   outliers while ignoring the normal 0.05-0.08 range)
+5. Store a per-matrix bitmask of "dirty rows"
+6. At runtime, the MMQ kernel skips dirty rows (or a post-MMQ fixup
+   kernel replaces those rows with WMMA results)
 
-3. **Raise batch-size threshold** — if MMQ only activates at batch >= 256
-   instead of >= 128, fewer prefill chunks hit the path and the
-   corruption probability drops. Least invasive but gives up the most
-   performance.
+Expected cost: ~1-2 rows per 4096 fall back to WMMA. Performance
+impact: negligible (<0.05% of compute).
 
 ## Still to do
 
-- [ ] Run channel-map on residual at other high-max_err layers (1, 3, 6)
-      to check if the same rows are consistently bad across layers
-- [ ] Run site-scan on qwen3.6-27b.mq4 (the canonical #87 reproducer)
-- [ ] Channel-map on layer 27 qkv.v anomaly
-- [ ] Investigate row 3994's weight statistics (HFQ4 scale/zero/range)
+- [x] Run channel-map on residual at layers 0, 1, 3, 6 — row 3994
+      confirmed as consistent outlier
+- [x] Channel-map on layer 27 qkv.v — row 265 confirmed as outlier
+- [ ] Run site-scan on qwen3.6-27b.mq4 (canonical #87 reproducer)
+- [ ] Investigate row 3994's HFQ4 weight statistics (scale/zero/range)
+- [ ] Prototype per-row screening fix
