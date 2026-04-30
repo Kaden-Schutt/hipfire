@@ -17,6 +17,17 @@ four production formats.
 | HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
 | MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |
 | MQ6-G256 | 6 | FWHT | 200 | Qwen 3.5+ higher quality |
+| MQ3-G256 | 3 | FWHT | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth play (≥7B models only) |
+| MQ2-G256 | 2 | FWHT | 72 (8 hdr + 64 data) | Sub-4-bit aggressive (experimental) |
+
+**Sub-4-bit caveat**: MQ3 and MQ2 reuse the production HFQ3/HFQ2
+decode kernels with a pre-rotated `x` (no separate kernel). They're
+viable on ≥7B models (per QuIP# literature, 3-bit + Hadamard hits
+within 1–2% perplexity of 4-bit on larger models), but small models
+(≤1B) collapse — Qwen 3.5 0.8B in MQ3 produces incoherent text where
+0.8B in MQ4 answers fluently. There is no WMMA prefill path for MQ3
+or MQ2 yet, so prefill falls back to per-row GEMV until the kernel
+lands in a follow-up PR.
 
 Header layout (8 bytes): 4 bytes scale (f32-bitcast-from-f16) + 4 bytes
 zero point. Data: bitwidth × 256 / 8 bytes = 128 (4-bit) or 192 (6-bit)

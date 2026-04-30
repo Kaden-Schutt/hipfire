@@ -1,0 +1,216 @@
+# MQ Sub-4-Bit Roadmap: RDNA-Native Lower Magnum Quants
+
+**Status:** Phase 1 implemented (`feature/mq-sub4bit`); Phase 2 / 3 still draft
+**Author:** Agent analysis (cross-session memory-eligible)  
+**Date:** 2026-04-29  
+**Target Release:** v0.1.9 or v0.2.0 (at maintainer discretion)  
+**Related:** `docs/QUANTIZATION.md`, `AGENTS.md` §3, `CLAUDE.md`
+
+---
+
+## 1. Objective
+
+Extend the Magnum Quant (MQ) line below 4 bits — specifically MQ3 and MQ2 — while retaining maximum possible model quality. Every proposed path must be **RDNA-respecting**: it must be as efficient as or more efficient than the current MQ4 kernel suite on GCN/RDNA ISAs, or it must slot into the existing MQ dispatch matrix without regressing occupancy, wave geometry, or memory access patterns.
+
+---
+
+## 2. Current State Audit
+
+hipfire already has more sub-4-bit infrastructure than advertised:
+
+| Format | Rotation | Bytes / 256 | bpw | Kernel VGPRs | Status |
+|---|---|---|---|---|---|
+| HFQ4-G256 | none | 136 | 4.25 | ~18 | Production |
+| HFQ6-G256 | none | 200 | 6.25 | — | Production |
+| MQ4-G256 | FWHT | 136 | 4.25 | ~18 | Production |
+| MQ6-G256 | FWHT | 200 | 6.25 | — | Production |
+| MQ8-G256 | FWHT | 258 | 8.06 | dp4a target | Exists, not default |
+| HFQ3-G256 | none | 104 | **3.25** | ~20 | **Exists** |
+| HFQ3-G128 | none | 56 | 3.50 | — | **Exists** |
+| HFQ2-G256 | none | 72 | **2.25** | ~19 | **Exists** |
+| HFQ2-G128 | none | 40 | 2.50 | — | **Exists** |
+
+**The gap:** `mq_rotate_x` (FWHT pre-pass), `mq_signs1/2` buffers, and `mq_x_rot` scratch are all live in `dispatch.rs`, but only MQ4/MQ6/MQ8 consume them. There are **no MQ3 or MQ2 variants** in `kernels.rs`, `dispatch.rs`, or the quantizer.
+
+Adding `quantize_mq3g256` and `quantize_mq2g256` is a trivial composition: run `cpu_fwht_256` then feed the rotated group into the existing HFQ3/2 packers.
+
+---
+
+## 3. RDNA Hard Constraints (Non-Negotiable)
+
+Any new MQ variant must respect the following, which the existing kernel suite has proven on-device:
+
+| Constraint | Why it matters | What it forbids |
+|---|---|---|
+| **Memory-bound decode** | tok/s ≈ bandwidth / model_size. Extra ALU must hide behind global loads. | Large LUTs, per-weight branches, non-sequential memory access |
+| **Wave32 geometry** | `gemv_mq4g256` / `gemv_hfq2g256` use `__launch_bounds__(32, N)`. Matches RDNA3/4 SIMD width. | Wave64-only kernels (would force divergent paths) |
+| **VGPR ≤ ~24** | HFQ2 is ~19 VGPR → 20 waves/SIMD on gfx1100. HFQ3 is slightly higher from cross-byte unpack. | Spilling, wide accumulator arrays, per-thread lookup tables |
+| **Byte/WORD loads only** | GCN/RDNA has no 2-bit or 3-bit scalar loads. Must load bytes/words and shift-mask. HFQ2 loads 2 B/thread (16 bits → 8 weights); HFQ3 loads 3 B/thread (24 bits → 8 weights). | Fancy sub-byte addressing fantasies |
+| **`ds_swizzle` FWHT** | `mq_rotate_x` uses `ds_swizzle` for wave-level butterfly. LDS-bandwidth-free, O(log n) cycles. Operates on the *input activation*, not weights. | Per-weight transform, LDS-based reduction trees |
+| **WMMA prefill parity** | Decode GEMV is trivial; prefill GEMM must eventually have a WMMA path or long-prompt throughput collapses. | Shipping decode-only formats and forgetting prefill |
+
+**Rule:** If a proposed quantization trick violates any row in this table, it is not a Magnum Quant. It may be a research experiment, but it does not belong in the MQ production line.
+
+---
+
+## 4. Frontier Literature Survey (Filtered for RDNA)
+
+| Paper | Core Claim | RDNA Verdict |
+|---|---|---|
+| **QuIP / QuIP#** (Chee et al., NeurIPS 2023 / Tseng et al., ICML 2024) | 2-bit PTQ viable with incoherence preprocessing (random orthogonal / Hadamard). | **Directly validated by MQ.** hipfire’s `cpu_fwht_256` + `mq_rotate_x` *is* QuIP#’s RHT at group granularity. Their E8 lattice VQ is hardware-hostile; we skip it. |
+| **QTIP** (Tseng et al., NeurIPS 2024 Spotlight) | Trellis Coded Quantization + RHT; compute-based codes (1MAD, 3INST, HYB) avoid LUTs. | **Research backup.** If uniform MQ2 fails the gate narrowly, QTIP-style compute-based trellis codes are the next step. Quantizer complexity goes up (Viterbi, stateful bitstream); kernels stay ALU-light. |
+| **BitNet b1.58** (Microsoft) | Native ternary {-1, 0, +1} via QAT. | **Out of scope.** hipfire is PTQ-only. Kernel tricks (absmean, sign-xor) are interesting but not directly applicable without a training stack. |
+| **SliM-LLM / LLM-MQ / MixLLM** (2024–2025) | Mixed-precision: sensitive layers get 4-bit, tolerant layers get 2–3-bit. | **Immediate win.** hipfire already supports multiple quant types per model. No new kernels needed — just a smarter quantizer policy. |
+
+---
+
+## 5. Tractable Paths (Ranked by Effort / Risk)
+
+### 5.1 Path A: MQ3-G256 / MQ3-G128 — The Trivial Win
+
+**Effort:** 1–2 days.  
+**Quality risk:** Low-to-moderate.  
+**RDNA shape:** Identical to HFQ3-G256 kernel. 3-bit cross-byte unpacking adds ~6 integer ALU ops per 8 weights, but decode is memory-bound; extra ALU hides behind loads.
+
+**Implementation:**
+1. `quantize_mq3g256(f32_data, signs1, signs2)` in `crates/hipfire-quantize/src/main.rs`: call `cpu_fwht_256`, then existing HFQ3 packer.
+2. `gemv_mq3g256.hip`: copy `gemv_hfq3g256.hip`, swap `x` → `x_rot`.
+3. Add `MQ3G256` / `MQ3G128` to `DType`, `dispatch.rs`, `kernels.rs`, `llama.rs`, `qwen35.rs`.
+
+**Quality expectation:** QuIP# results suggest 3-bit + Hadamard is often within 1–2% of 4-bit on perplexity for models ≥7B. Qwen 3.5/3.6 hybrid architecture (DeltaNet layers) may tolerate lower bitwidths better than dense Llama.
+
+**Gate criteria:** Coherence gate pass on 9B and 27B; perplexity delta ≤ 3% vs MQ4.
+
+---
+
+### 5.2 Path B: MQ2-G256 / MQ2-G128 — The Bandwidth Play
+
+**Effort:** 1–2 days for basic variant; weeks if chasing quality.  
+**Quality risk:** Moderate-to-high.  
+**RDNA shape:** Excellent. HFQ2-G256 is the simplest kernel in the tree: 2 byte loads, 8 shift-and-mask ops, 8 FMADDs. ~19 VGPRs, 20 waves/SIMD. With FWHT, bandwidth is the only bottleneck.
+
+**Implementation:** Same mechanical steps as Path A.
+
+**Quality expectation:** The gamble. Uniform 2-bit after FWHT may fail on code-generation or multi-turn recall. If it fails narrowly, escalate to Path D (Lloyd-Max thresholds) before rejecting 2-bit outright.
+
+**Gate criteria:** Coherence gate pass on 9B and 27B; perplexity delta ≤ 6% vs MQ4. If gate fails, do not ship MQ2 uniform.
+
+---
+
+### 5.3 Path C: Mixed-Precision MQ — The Quality Preserver
+
+**Effort:** 3–5 days (quantizer policy + CLI integration).  
+**Quality risk:** Very low.  
+**RDNA shape:** Best possible. Different kernels per tensor, same dispatch overhead. You pay for precision only where it matters.
+
+**Policy proposal:**
+
+| Tensor class | Bpw | Rationale |
+|---|---|---|
+| `q_proj`, `k_proj`, `v_proj`, `o_proj` | MQ6 or MQ4 | Attention sensitive; QKV errors compound through softmax |
+| `gate_proj`, `up_proj` | MQ4 or MQ3 | FFN expands then contracts; noise filtered by SwiGLU |
+| `down_proj` | MQ3 or MQ2 | Widest matrix; biggest bandwidth win from low bpw |
+| Embeddings | Q8F16 (existing) | Already too lossy below 8-bit |
+| Norms / scales | F16 (existing) | Tiny, keep full precision |
+
+**Target:** Average ~3.2–3.5 bpw. A model with this average could beat uniform MQ3 on quality while matching its bandwidth.
+
+**CLI interface:** `--format mixed-mq` or `--format mq-hybrid`.
+
+---
+
+### 5.4 Path D: Lloyd-Max MQ3 / Non-Uniform MQ2 — The Codebook Upgrade
+
+**Effort:** 1–2 weeks.  
+**Quality risk:** Low if implemented correctly.  
+**RDNA shape:** Minimal change. Replaces `scale * q + zero` with a lerp or 3-way select. Same VGPR count, same load pattern.
+
+**Idea:** Replace per-group uniform `scale + zero` with **optimal codebook boundaries**.
+
+Current: `recon = scale * q + zero`, where `scale = range / (2^K - 1)`.
+
+Lloyd-Max compromise (RDNA-friendly): store `cb_min` and `cb_max` (2 floats). Reconstruction is `lerp(cb_min, cb_max, q / (2^K - 1))`. This is mathematically identical for symmetric distributions, but wins ~0.5–1 dB SQNR on skewed post-FWHT distributions.
+
+For MQ2 specifically: ternary {-1, 0, +1} with learned thresholds. Reconstruction: `q == 0 ? 0.0 : (q == 1 ? +thresh : -thresh)`. This is 1.58-bit information density stored in 2-bit frames.
+
+**Precedent:** The KV cache `asym3`/`asym4` modes already use Lloyd-Max-style reconstruction. The engine knows how to do this.
+
+---
+
+### 5.5 Path E: TCQ / Compute-Based MQ2 — The QTIP Homage
+
+**Effort:** 1–2 months.  
+**Quality risk:** Moderate.  
+**RDNA shape:** Debatable. QTIP is optimized for NVIDIA tensor-core batch-MM. hipfire is decode-bound (batch-1 GEMV). Compute-based codes add ALU ops that do not overlap with memory loads as cleanly on RDNA.
+
+**Verdict:** Research-grade. Pursue only if Paths A–D collectively fail to hit a target average bpw (e.g., 3.0) for a specific SKU.
+
+---
+
+### 5.6 Path F: BitNet-Style Native Ternary — The Training Pivot
+
+**Effort:** Months (requires training stack).  
+**RDNA shape:** Irrelevant without QAT.  
+**Verdict:** Out of scope for hipfire PTQ pipeline.
+
+---
+
+## 6. Bandwidth Math
+
+| Format | Bytes / Param | 27B Model Size | gfx1100 Decode @ 1.0 TB/s effective |
+|---|---|---|---|
+| MQ6 | 0.781 | 21.1 GB | ~48 tok/s |
+| MQ4 | 0.531 | 14.3 GB | ~70 tok/s |
+| **MQ3** | **0.406** | **11.0 GB** | **~91 tok/s** |
+| **MQ2** | **0.281** | **7.6 GB** | **~132 tok/s** |
+| Mixed (~3.3 avg) | ~0.42 | ~11.3 GB | ~88 tok/s |
+
+*Assumes weight-bandwidth bound; actual numbers depend on KV cache footprint and activation memory.*
+
+**Capability unlock on 24 GB gfx1100:**
+- MQ3 27B leaves ~13 GB for KV cache → ~8K ctx at `asym3`.
+- MQ2 27B leaves ~16.4 GB for KV cache → ~12K ctx at `asym3`.
+
+---
+
+## 7. Implementation Order
+
+### Phase 1 — Immediate (this week)
+1. Implement `quantize_mq3g256` and `gemv_mq3g256.hip`.
+2. Implement `quantize_mq2g256` and `gemv_mq2g256.hip`.
+3. Wire both into `DType`, `dispatch.rs`, `kernels.rs`, `llama.rs`, `qwen35.rs`.
+4. Add `--format mq3` and `--format mq2` to `hipfire-quantize` CLI.
+
+### Phase 2 — Validation (next week)
+5. Run coherence gate on Qwen 3.5 9B and 27B for both formats.
+6. Record perplexity / HumanEval deltas vs MQ4 baseline.
+7. If MQ2 uniform fails narrowly, prototype Path D (Lloyd-Max thresholds).
+
+### Phase 3 — Polish (next release)
+8. Implement mixed-precision quant mode (`--format mixed-mq`).
+9. Add MQ3 WMMA prefill kernel (non-trivial; decode GEMV is the easy part).
+10. Update `docs/QUANTIZATION.md` and `AGENTS.md` with new gate baselines.
+
+---
+
+## 8. Coherence-Gate Checklist Before Claiming Any MQ3/MQ2 Result
+
+- [ ] ≥3 fresh-process runs per prompt
+- [ ] Prompt md5 recorded
+- [ ] Binary md5 recorded
+- [ ] `./scripts/coherence-gate-dflash.sh` pass (adapted for MQ3/MQ2 target)
+- [ ] Eyeball check on decoded output (especially when τ is unusually high, if testing with DFlash draft)
+- [ ] Perplexity delta vs MQ4 baseline documented
+- [ ] If regression vs MQ4: bisect to confirm it is a quant issue, not a prompt or thermal issue
+
+---
+
+## 9. Open Questions
+
+1. Does Qwen 3.6 hybrid architecture (more DeltaNet layers than 3.5) tolerate MQ2 better than 3.5? DeltaNet linear attention has lower outlier sensitivity than softmax attention — this is an empirical question with a bounded experiment.
+2. Is G128 granularity necessary for MQ3, or does G256 suffice? G128 adds overhead (more metadata bytes, more group iterations in the kernel). It should only be pursued if G256 fails the gate.
+3. Can we reuse the existing `asym` KV-cache Lloyd-Max packing logic for weight quantization (Path D)? The data layouts differ, but the reconstruction math is identical.
+
+---
+
+*End of document. When this plan is stale (more than one release behind implementation status), update it as part of the release PR.*

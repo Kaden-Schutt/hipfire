@@ -149,6 +149,8 @@ pub enum DType {
     MQ4G256,   // MagnumQuant: FWHT-rotated HFQ4-G256 (136 bytes/group, same as HFQ4G256)
     MQ8G256,   // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target (258 bytes/group)
     MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
+    MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
+    MQ2G256,   // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -160,7 +162,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -1970,6 +1972,41 @@ impl Gpu {
         &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
     ) -> HipResult<()> {
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
+    /// MQ3 weights are stored in HFQ3-G256 format (104 B/group) with FWHT pre-applied,
+    /// so the GEMV inner loop is identical to standard HFQ3.
+    pub fn gemv_mq3g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ3 with pre-rotated x.
+    pub fn gemv_mq3g256_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq3g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ2: rotate x once, then HFQ2-G256 GEMV against rotated x.
+    /// MQ2 weights are stored in HFQ2-G256 format (72 B/group) with FWHT pre-applied.
+    pub fn gemv_mq2g256_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ2 with pre-rotated x.
+    pub fn gemv_mq2g256_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.gemv_hfq2g256(a_raw, x_rot, y, m, k)
     }
 
     /// MagnumQuant MQ6: rotate x via FWHT, then HFQ6 GEMV.

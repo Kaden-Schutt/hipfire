@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **MQ3-G256 and MQ2-G256 sub-4-bit Magnum Quants** (`feature/mq-sub4bit`).
+  Adds FWHT-rotated 3-bit and 2-bit weight formats. MQ3 = 104 B/group
+  (3.25 bpw), MQ2 = 72 B/group (2.25 bpw). Quantizer flags `--format mq3`
+  and `--format mq2`. Engine reuses the production HFQ3/HFQ2 GEMV kernels
+  with pre-rotated `x` — no new HIP files. Verified: Qwen 3.5 9B in MQ3
+  answers `"What is the capital of France?"` with `"The capital of France
+  is Paris."` (fluent, identical kernel path as MQ4). Small models (0.8B)
+  collapse at MQ3, matching QuIP# literature on the sub-4-bit quality
+  cliff. WMMA prefill paths and mixed-precision (`--format mixed-mq`) are
+  follow-up PRs per `docs/plans/mq-sub4bit-roadmap.prd`.
+
 ## v0.1.8-alpha.2 (2026-04-27)
 
 Released the same day as alpha.1 — a second cycle's worth of contributor PRs and

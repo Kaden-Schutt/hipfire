@@ -531,6 +531,14 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
         }
+        17 => { // MQ3-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+        }
+        18 => { // MQ2-G256
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -587,6 +595,14 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         15 => { // MQ6-G256 — MagnumQuant FWHT-rotated 6-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0 })
+        }
+        17 => { // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+        }
+        18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -817,6 +833,78 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     out.push(scale * q6 + zero);
                     out.push(scale * q7 + zero);
                 }
+            }
+            out
+        }
+        17 | 18 => {
+            // MQ3-G256 (qt 17, 104 B/group, 3-bit) or MQ2-G256 (qt 18, 72 B/group, 2-bit).
+            // Both store FWHT-rotated weights — dequant then inverse-rotate to recover
+            // original values for CPU consumers (e.g., DeltaNet conv1d).
+            let is_mq3 = info.quant_type == 17;
+            let group_size: usize = 256;
+            let bytes_per_group: usize = if is_mq3 { 104 } else { 72 };
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let scale = f32::from_le_bytes([data[off], data[off+1], data[off+2], data[off+3]]);
+                let zero = f32::from_le_bytes([data[off+4], data[off+5], data[off+6], data[off+7]]);
+                let start = out.len();
+                if is_mq3 {
+                    // 8 values per 3 bytes (matches gemv_hfq3g256.hip unpack).
+                    for chunk in 0..32 {
+                        let bo = off + 8 + chunk * 3;
+                        let b0 = data[bo] as u32;
+                        let b1 = data[bo + 1] as u32;
+                        let b2 = data[bo + 2] as u32;
+                        let q0 = (b0 & 7) as f32;
+                        let q1 = ((b0 >> 3) & 7) as f32;
+                        let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as f32;
+                        let q3 = ((b1 >> 1) & 7) as f32;
+                        let q4 = ((b1 >> 4) & 7) as f32;
+                        let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as f32;
+                        let q6 = ((b2 >> 2) & 7) as f32;
+                        let q7 = ((b2 >> 5) & 7) as f32;
+                        out.push(scale * q0 + zero);
+                        out.push(scale * q1 + zero);
+                        out.push(scale * q2 + zero);
+                        out.push(scale * q3 + zero);
+                        out.push(scale * q4 + zero);
+                        out.push(scale * q5 + zero);
+                        out.push(scale * q6 + zero);
+                        out.push(scale * q7 + zero);
+                    }
+                } else {
+                    // MQ2: 4 values per byte (matches gemv_hfq2g256.hip unpack).
+                    for i in 0..64 {
+                        let byte_val = data[off + 8 + i] as u32;
+                        out.push(scale * ((byte_val & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 2) & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 4) & 3) as f32) + zero);
+                        out.push(scale * (((byte_val >> 6) & 3) as f32) + zero);
+                    }
+                }
+                // Inverse FWHT: recover original (pre-rotation) weight values.
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let scale_inv = 0.0625; // 1/sqrt(256)
+                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
             }
             out
         }
