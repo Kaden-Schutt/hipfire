@@ -4559,11 +4559,11 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
       }
       const bundle = CASK_PROFILES[profileName].apply;
       // Safety check: per-model A3B + non-`off` profile is unsafe at current R̄.
-      if (modelScope && tagIsA3B(modelScope) && profileName !== "off") {
+      if (modelScope && tagIsA3B(modelScope) && !CASK_PROFILES[profileName].a3b_safe) {
         console.error(`⚠ ${modelScope} is an A3B model. Eviction at current R̄≈0.36–0.39 produces`);
         console.error(`  confident-wrong hallucinations under multi-turn (see feedback memory).`);
-        console.error(`  Refusing to apply '${profileName}'. Use cask-profile=off on A3B targets,`);
-        console.error(`  or set HIPFIRE_FORCE_A3B_EVICTION=1 to override (not recommended).`);
+        console.error(`  Refusing to apply '${profileName}'. Safe profiles for A3B: ${Object.entries(CASK_PROFILES).filter(([_, p]) => p.a3b_safe).map(([n]) => n).join(", ")}.`);
+        console.error(`  Override with HIPFIRE_FORCE_A3B_EVICTION=1 (not recommended).`);
         if (process.env.HIPFIRE_FORCE_A3B_EVICTION !== "1") process.exit(1);
       }
       if (modelScope) {
