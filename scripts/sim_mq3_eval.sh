@@ -4,11 +4,13 @@
 #
 # IMPORTANT: the "MQ3" file produced by sim_mq3.py is an APPROXIMATION of
 # real MQ3, NOT a strict upper bound on its quality cost. Per-weight error
-# vs real MQ3 can go either way (sometimes more accurate, sometimes less);
-# tail error is biased pessimistic but bulk variance is similar. If this
-# eval shows fluent output, real MQ3 is likely viable; if it collapses,
-# real MQ3 probably also fails but the gap can't be characterized from
-# this harness alone. See sim_mq3.py docstring for the full discussion.
+# vs real MQ3 can go either way; per-element variance is ~20% heavier;
+# worst-case error is ~40% heavier (because SNAP_4's 6→9 gap creates one
+# wide reconstruction bin spanning 0.4..0.6 of range vs 0.133-wide elsewhere).
+# Probabilistically biased pessimistic but not strictly worse. If this eval
+# shows fluent output, real MQ3 is likely viable; if it collapses, real
+# MQ3 probably also fails but the gap can't be characterized from this
+# harness alone. See sim_mq3.py docstring for the derivation.
 set -u
 cd "$(dirname "$0")/.."
 
