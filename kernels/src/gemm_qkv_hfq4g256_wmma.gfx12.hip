@@ -109,46 +109,47 @@ extern "C" __global__ void gemm_qkv_hfq4g256_wmma_gfx12(
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
-        // K2 unroll: 2 K-tiles per loop body (8 iterations to cover K=256).
-        for (int kt = 0; kt < 16; kt += 2) {
-            // === Tile A (kt) ===
-            const int k_off_a = kt * 16;
-            // Each lane reads ONE 4-byte (8-nibble) chunk of weights covering
-            // its half of K=[k_off..k_off+7] (k_grp=0)
-            // or K=[k_off+8..k_off+15] (k_grp=1).
-            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
+        // K4 unroll (issue #65 lever 2): 4 K-tiles per loop body, all loads
+        // up-front so the compiler can deep-pipeline the WMMA chain.
+        // 4 iterations cover K=256. RDNA4 measured 2× on the gate_up kernel
+        // at 9B pp=128.
+        #define DQ8(pk) \
+            a_reg[0] = sc_h * (_Float16)(float)(((pk) >>  0) & 0xFu) + zp_h; \
+            a_reg[1] = sc_h * (_Float16)(float)(((pk) >>  4) & 0xFu) + zp_h; \
+            a_reg[2] = sc_h * (_Float16)(float)(((pk) >>  8) & 0xFu) + zp_h; \
+            a_reg[3] = sc_h * (_Float16)(float)(((pk) >> 12) & 0xFu) + zp_h; \
+            a_reg[4] = sc_h * (_Float16)(float)(((pk) >> 16) & 0xFu) + zp_h; \
+            a_reg[5] = sc_h * (_Float16)(float)(((pk) >> 20) & 0xFu) + zp_h; \
+            a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
+            a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
-            // === Tile B (kt+1) — start loading early ===
+        for (int kt = 0; kt < 16; kt += 4) {
+            const int k_off_a = (kt + 0) * 16;
             const int k_off_b = (kt + 1) * 16;
-            unsigned int pkb = *(const unsigned int*)(gp + 8 + k_off_b / 2 + k_grp * 4);
+            const int k_off_c = (kt + 2) * 16;
+            const int k_off_d = (kt + 3) * 16;
 
-            // Load both X tiles early (one half8_t per lane, K-offset by k_grp*8)
+            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
+            unsigned int pkb = *(const unsigned int*)(gp + 8 + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + 8 + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + 8 + k_off_d / 2 + k_grp * 4);
+
             half8_t b_a = *(const half8_t*)(x_base + k_off_a + k_grp * 8);
             half8_t b_b = *(const half8_t*)(x_base + k_off_b + k_grp * 8);
+            half8_t b_c = *(const half8_t*)(x_base + k_off_c + k_grp * 8);
+            half8_t b_d = *(const half8_t*)(x_base + k_off_d + k_grp * 8);
 
-            // Dequant tile A (8 fp16 per lane).
             half8_t a_reg;
-            #define DQ8(pk) \
-                a_reg[0] = sc_h * (_Float16)(float)(((pk) >>  0) & 0xFu) + zp_h; \
-                a_reg[1] = sc_h * (_Float16)(float)(((pk) >>  4) & 0xFu) + zp_h; \
-                a_reg[2] = sc_h * (_Float16)(float)(((pk) >>  8) & 0xFu) + zp_h; \
-                a_reg[3] = sc_h * (_Float16)(float)(((pk) >> 12) & 0xFu) + zp_h; \
-                a_reg[4] = sc_h * (_Float16)(float)(((pk) >> 16) & 0xFu) + zp_h; \
-                a_reg[5] = sc_h * (_Float16)(float)(((pk) >> 20) & 0xFu) + zp_h; \
-                a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
-                a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
             DQ8(pka);
-
-            // WMMA A — b_b load may still be in flight
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_a, acc);
-
-            // Dequant tile B (reuse a_reg register).
             DQ8(pkb);
-            #undef DQ8
-
-            // WMMA B
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_b, acc);
+            DQ8(pkc);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_c, acc);
+            DQ8(pkd);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_d, acc);
         }
+        #undef DQ8
     }
 
     // --- Output ---

@@ -1,6 +1,11 @@
 # hipfire speed-gate baseline — gfx1201
-# Captured 2026-04-27 against the gfx12 residual-WMMA wiring (this commit).
-# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Captured 2026-04-29 against issue #65 K4 unroll (this branch).
+# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug),
+#         HIPFIRE_DPM_WARMUP_SECS=10 (the bench's pre-prefill DPM ramp added
+#         in this branch — without it the GPU starts at DPM step 0/1 and the
+#         first ~50ms of prefill measures clock-ramp, not steady-state),
+#         R9700 with no other concurrent GPU consumers (bench-cold.sh handles
+#         this via the gpu-lock).
 # Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
 #
 # Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:
@@ -9,24 +14,36 @@
 # Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle).
 # GROUND FLOOR — no commit may regress below these numbers.
 #
-# Prefill numbers updated by `dispatch(gfx12 residual): wire WMMA kernel`
-# (this commit). Decode + 0.8B pp32 left at the prior floor: this change
-# only routes batched residual GEMM through WMMA, so decode (GEMV-only)
-# and the 0.8B pp32 launch-overhead band aren't affected by it; the small
-# observed shifts on those metrics are within the cross-process noise
-# band and shouldn't be locked in as a new floor.
+# Prefill numbers on this gate roughly DOUBLE the prior gfx1201 floor
+# (0.8B pp128 +48%, 4B pp128 +75%, 9B pp128 +84%, 27B pp128 first capture).
+# The lift comes from K4 unroll applied to all six gfx12 WMMA GEMM kernels
+# plus the residual variant — see kernels/src/gemm_*_wmma.gfx12.hip for
+# the K-tile inner loop. Channel-tests (43/43 across hfq4 + hfq6),
+# coherence-gate (4/4 fluent outputs), and the DFlash anchors below all
+# validate.
 
-0.8b_mq4_pp32_prefill_tok_s=3043.1
-0.8b_mq4_gen_tok_s=288.1
-0.8b_mq4_pp128_prefill_tok_s=6433.8
+0.8b_mq4_pp32_prefill_tok_s=3967.8
+0.8b_mq4_gen_tok_s=361.0
+0.8b_mq4_pp128_prefill_tok_s=9511.5
 
-4b_mq4_pp32_prefill_tok_s=1366.2
-4b_mq4_gen_tok_s=135.1
-4b_mq4_pp128_prefill_tok_s=1866.1
+4b_mq4_pp32_prefill_tok_s=1977.9
+4b_mq4_gen_tok_s=150.4
+4b_mq4_pp128_prefill_tok_s=3268.7
 
-9b_mq4_pp32_prefill_tok_s=805.1
-9b_mq4_gen_tok_s=98.1
-9b_mq4_pp128_prefill_tok_s=1027.4
+9b_mq4_pp32_prefill_tok_s=1403.9
+9b_mq4_gen_tok_s=102.0
+9b_mq4_pp128_prefill_tok_s=1894.9
 
+27b_mq4_pp32_prefill_tok_s=516.2
+27b_mq4_gen_tok_s=36.0
+27b_mq4_pp128_prefill_tok_s=566.6
 
+27b_3.5_dflash_lru_code_tok_s=140.48
+27b_3.5_dflash_lru_code_tau=9.500
+27b_3.5_dflash_merge_sort_tok_s=195.00
+27b_3.5_dflash_merge_sort_tau=13.2727
+27b_3.5_dflash_merge_sort_ttft_ms=135.39
+9b_3.5_dflash_merge_sort_tok_s=360.77
+9b_3.5_dflash_merge_sort_tau=13.1538
+9b_3.5_dflash_merge_sort_ttft_ms=63.41
 

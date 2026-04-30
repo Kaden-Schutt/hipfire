@@ -73,39 +73,48 @@ extern "C" __global__ void gemm_gate_up_hfq6g256_wmma_gfx12(
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
-        // K2 unroll: 2 K-tiles per loop body.
-        for (int kt = 0; kt < 16; kt += 2) {
-            // === Tile A (kt) ===
-            // half-tile base = (kt * 12) + (k_grp * 6); 8 6-bit values = 6 bytes,
-            // read as two unaligned uints at byte offsets {0, 3} of the half-tile.
-            const int byte_base_a = kt * 12 + k_grp * 6;
-            const unsigned char* dp_a = (const unsigned char*)(gp + 8 + byte_base_a);
+        // K4 unroll (issue #65 lever 2): 4 K-tiles per body, all loads
+        // up-front. Same lift pattern as the hfq4 family.
+        #define DQ6(i, dw, sh) a_reg[i] = sc_h * (_Float16)(float)(((dw) >> (sh)) & 63u) + zp_h
+        #define DQ6_8(d0, d1) \
+            DQ6(0, (d0), 0);  DQ6(1, (d0), 6);  DQ6(2, (d0), 12); DQ6(3, (d0), 18); \
+            DQ6(4, (d1), 0);  DQ6(5, (d1), 6);  DQ6(6, (d1), 12); DQ6(7, (d1), 18)
+
+        for (int kt = 0; kt < 16; kt += 4) {
+            const int bb_a = (kt + 0) * 12 + k_grp * 6;
+            const int bb_b = (kt + 1) * 12 + k_grp * 6;
+            const int bb_c = (kt + 2) * 12 + k_grp * 6;
+            const int bb_d = (kt + 3) * 12 + k_grp * 6;
+            const unsigned char* dp_a = (const unsigned char*)(gp + 8 + bb_a);
+            const unsigned char* dp_b = (const unsigned char*)(gp + 8 + bb_b);
+            const unsigned char* dp_c = (const unsigned char*)(gp + 8 + bb_c);
+            const unsigned char* dp_d = (const unsigned char*)(gp + 8 + bb_d);
             unsigned int d0a = *(const unsigned int*)(dp_a);
             unsigned int d1a = *(const unsigned int*)(dp_a + 3);
-
-            // === Tile B (kt+1) — start loading early ===
-            const int byte_base_b = (kt + 1) * 12 + k_grp * 6;
-            const unsigned char* dp_b = (const unsigned char*)(gp + 8 + byte_base_b);
             unsigned int d0b = *(const unsigned int*)(dp_b);
             unsigned int d1b = *(const unsigned int*)(dp_b + 3);
+            unsigned int d0c = *(const unsigned int*)(dp_c);
+            unsigned int d1c = *(const unsigned int*)(dp_c + 3);
+            unsigned int d0d = *(const unsigned int*)(dp_d);
+            unsigned int d1d = *(const unsigned int*)(dp_d + 3);
 
-            half8_t b_a = *(const half8_t*)(x_base + kt * 16 + k_grp * 8);
+            half8_t b_a = *(const half8_t*)(x_base + (kt + 0) * 16 + k_grp * 8);
             half8_t b_b = *(const half8_t*)(x_base + (kt + 1) * 16 + k_grp * 8);
+            half8_t b_c = *(const half8_t*)(x_base + (kt + 2) * 16 + k_grp * 8);
+            half8_t b_d = *(const half8_t*)(x_base + (kt + 3) * 16 + k_grp * 8);
 
-            // Dequant tile A (8 fp16 per lane).
             half8_t a_reg;
-            #define DQ6(i, dw, sh) a_reg[i] = sc_h * (_Float16)(float)(((dw) >> (sh)) & 63u) + zp_h
-            DQ6(0, d0a, 0);  DQ6(1, d0a, 6);  DQ6(2, d0a, 12); DQ6(3, d0a, 18);
-            DQ6(4, d1a, 0);  DQ6(5, d1a, 6);  DQ6(6, d1a, 12); DQ6(7, d1a, 18);
-
+            DQ6_8(d0a, d1a);
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_a, acc);
-
-            DQ6(0, d0b, 0);  DQ6(1, d0b, 6);  DQ6(2, d0b, 12); DQ6(3, d0b, 18);
-            DQ6(4, d1b, 0);  DQ6(5, d1b, 6);  DQ6(6, d1b, 12); DQ6(7, d1b, 18);
-            #undef DQ6
-
+            DQ6_8(d0b, d1b);
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_b, acc);
+            DQ6_8(d0c, d1c);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_c, acc);
+            DQ6_8(d0d, d1d);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_d, acc);
         }
+        #undef DQ6_8
+        #undef DQ6
     }
 
     // gfx12 wave32 WMMA C-mapping: contiguous rows per lane-group.

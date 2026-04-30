@@ -87,6 +87,19 @@ fn main() {
     // benchmark independent of tokenizer / chat template behaviour.
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).collect();
 
+    // DPM warmup BEFORE prefill (issue #65). The default `HIPFIRE_DPM_WARMUP_SECS`
+    // hook fires AFTER the warmup tokens, before the timed gen — useless for
+    // prefill measurement when the GPU is in DPM step 0/1 from idle. This
+    // mirrors that hook for the prefill phase: stabilizes clocks before the
+    // timed forward_prefill_batch.
+    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+        if secs > 0.0 {
+            eprintln!("\n=== DPM warmup ({secs:.1}s, pre-prefill) ===");
+            gpu.dpm_warmup(secs).expect("dpm warmup");
+        }
+    }
+
     // === PREFILL ===
     // Route through forward_prefill_batch so the bench measures the production
     // prefill path (daemon + greedy_dump both go through it). Inside, this

@@ -77,38 +77,45 @@ extern "C" __global__ void gemm_qkvza_hfq4g256_wmma_gfx12(
 
         const _Float16* x_base = X + (long long)safe_batch * K + g * 256;
 
-        for (int kt = 0; kt < 16; kt += 2) {
-            // === Tile A (kt) ===
-            const int k_off_a = kt * 16;
-            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
+        // K4 unroll (issue #65 lever 2): 4 K-tiles per body, all loads
+        // up-front. Measured 2× on gate_up at 9B pp=128.
+        #define DQ8(pk) \
+            a_reg[0] = sc_h * (_Float16)(float)(((pk) >>  0) & 0xFu) + zp_h; \
+            a_reg[1] = sc_h * (_Float16)(float)(((pk) >>  4) & 0xFu) + zp_h; \
+            a_reg[2] = sc_h * (_Float16)(float)(((pk) >>  8) & 0xFu) + zp_h; \
+            a_reg[3] = sc_h * (_Float16)(float)(((pk) >> 12) & 0xFu) + zp_h; \
+            a_reg[4] = sc_h * (_Float16)(float)(((pk) >> 16) & 0xFu) + zp_h; \
+            a_reg[5] = sc_h * (_Float16)(float)(((pk) >> 20) & 0xFu) + zp_h; \
+            a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
+            a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
 
-            // === Tile B (kt+1) — start loading early ===
+        for (int kt = 0; kt < 16; kt += 4) {
+            const int k_off_a = (kt + 0) * 16;
             const int k_off_b = (kt + 1) * 16;
+            const int k_off_c = (kt + 2) * 16;
+            const int k_off_d = (kt + 3) * 16;
+
+            unsigned int pka = *(const unsigned int*)(gp + 8 + k_off_a / 2 + k_grp * 4);
             unsigned int pkb = *(const unsigned int*)(gp + 8 + k_off_b / 2 + k_grp * 4);
+            unsigned int pkc = *(const unsigned int*)(gp + 8 + k_off_c / 2 + k_grp * 4);
+            unsigned int pkd = *(const unsigned int*)(gp + 8 + k_off_d / 2 + k_grp * 4);
 
             half8_t b_a = *(const half8_t*)(x_base + k_off_a + k_grp * 8);
             half8_t b_b = *(const half8_t*)(x_base + k_off_b + k_grp * 8);
+            half8_t b_c = *(const half8_t*)(x_base + k_off_c + k_grp * 8);
+            half8_t b_d = *(const half8_t*)(x_base + k_off_d + k_grp * 8);
 
-            // Dequant tile A (8 fp16 per lane).
             half8_t a_reg;
-            #define DQ8(pk) \
-                a_reg[0] = sc_h * (_Float16)(float)(((pk) >>  0) & 0xFu) + zp_h; \
-                a_reg[1] = sc_h * (_Float16)(float)(((pk) >>  4) & 0xFu) + zp_h; \
-                a_reg[2] = sc_h * (_Float16)(float)(((pk) >>  8) & 0xFu) + zp_h; \
-                a_reg[3] = sc_h * (_Float16)(float)(((pk) >> 12) & 0xFu) + zp_h; \
-                a_reg[4] = sc_h * (_Float16)(float)(((pk) >> 16) & 0xFu) + zp_h; \
-                a_reg[5] = sc_h * (_Float16)(float)(((pk) >> 20) & 0xFu) + zp_h; \
-                a_reg[6] = sc_h * (_Float16)(float)(((pk) >> 24) & 0xFu) + zp_h; \
-                a_reg[7] = sc_h * (_Float16)(float)(((pk) >> 28) & 0xFu) + zp_h
             DQ8(pka);
-
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_a, acc);
-
             DQ8(pkb);
-            #undef DQ8
-
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_b, acc);
+            DQ8(pkc);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_c, acc);
+            DQ8(pkd);
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a_reg, b_d, acc);
         }
+        #undef DQ8
     }
 
     // gfx12 wave32 WMMA C-mapping: contiguous rows per lane-group.
