@@ -208,7 +208,7 @@ pub struct Gpu {
     // (batch=16) and flags weights where any output row's max abs error
     // exceeds `mmq_screen_threshold`.
     mmq_screen_cache: HashMap<usize, bool>,
-    mmq_screen_threshold: f32,
+    pub mmq_screen_threshold: f32,
 
     // ── hipGraph capture state ────────────────────────────────────────────
     /// When true, dispatch methods use the blob launch path (graph-capture-safe).

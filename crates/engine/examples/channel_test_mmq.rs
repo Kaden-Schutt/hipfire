@@ -121,8 +121,11 @@ fn main() {
             let site = site_filter.expect("--site <name> required for layer-sweep");
             run_layer_sweep(&mut gpu, &weights, &config, batch_size, threshold, &site);
         }
+        "screen" => {
+            run_screen(&mut gpu, &weights, &config);
+        }
         other => {
-            eprintln!("Unknown stage: {other}  (use site-scan | channel-map | layer-sweep)");
+            eprintln!("Unknown stage: {other}  (use site-scan | channel-map | layer-sweep | screen)");
             std::process::exit(1);
         }
     }
@@ -659,4 +662,51 @@ fn run_layer_sweep(
     );
     let n_fail = all_stats.iter().filter(|s| s.bad_count > 0).count();
     eprintln!("  Layers exceeding threshold: {n_fail}");
+}
+
+// ── Stage: screen — run mmq_screen_weight on all weights ─────────────────
+
+/// Runs the dispatch-level MMQ screening function on every weight in the
+/// model. Reports which weights are safe/unsafe for MMQ.
+#[cfg(feature = "deltanet")]
+fn run_screen(
+    gpu: &mut rdna_compute::Gpu,
+    weights: &engine::qwen35::Qwen35Weights,
+    _config: &engine::qwen35::Qwen35Config,
+) {
+    use engine::qwen35::LayerWeights;
+
+    eprintln!("\n=== screen: running mmq_screen_weight on all weight matrices ===");
+    eprintln!("threshold={:.4}", gpu.mmq_screen_threshold);
+
+    let mut n_safe = 0usize;
+    let mut n_unsafe = 0usize;
+
+    for (layer_idx, layer) in weights.layers.iter().enumerate() {
+        let sites = sites_for_layer(layer);
+        for &site_name in sites {
+            let weight = match get_weight_for_site(layer, site_name) {
+                Some(w) => w,
+                None => continue,
+            };
+            let safe = gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k);
+            if safe {
+                n_safe += 1;
+            } else {
+                eprintln!("  layer={layer_idx} site={site_name} m={} k={} → UNSAFE",
+                    weight.m, weight.k);
+                n_unsafe += 1;
+            }
+        }
+    }
+
+    eprintln!("\n--- Summary ---");
+    eprintln!("  Safe: {n_safe}");
+    eprintln!("  Unsafe: {n_unsafe}");
+    eprintln!("  Total: {}", n_safe + n_unsafe);
+    if n_unsafe > 0 {
+        eprintln!("  With HIPFIRE_MMQ_SCREEN=1, these {n_unsafe} weight(s) will fall back to WMMA.");
+    } else {
+        eprintln!("  All weights pass screening — MMQ is safe for this model.");
+    }
 }
