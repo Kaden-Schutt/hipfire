@@ -833,19 +833,35 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // (temp==0 requests will fall back to AR sampling).
         // DFlash speculative-decode requires the target's lm_head to have a
         // batched-GEMM kernel (used for verify and DDTree top-K). Only
-        // Q8_0 / HFQ4G256 / MQ4G256 currently have that kernel; MQ3G256
-        // and MQ2G256 lm_heads would silently fall back to a per-row
-        // GEMV that hangs. Refuse fast with a clear message so users
-        // know to either drop the draft or wait for the MQ3/MQ2 batched
-        // lm_head kernel (PRD Phase 2 follow-up).
+        // Q8_0 / HFQ4G256 / MQ4G256 are wired into speculative.rs's
+        // `try_batched` predicate (lines 2083-2087, 2606-2609); every
+        // other dtype (MQ3/MQ2, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16,
+        // etc.) falls through to a per-row sequential GEMV path that
+        // can hang on first-token verify (observed: 1 token in 240 s on
+        // 27B MQ3 + dflash-mq4 draft).
+        //
+        // Refuse fast with a clear message instead of silently hanging.
+        // Use a positive-list (whitelist) so future quant formats are
+        // refused by default until they're explicitly wired into both
+        // the verify GEMM and the DDTree top-K paths.
         if draft_path.is_some() {
             let out_dt = weights.output.gpu_dtype;
-            if matches!(out_dt, rdna_compute::DType::MQ3G256 | rdna_compute::DType::MQ2G256) {
+            let supported = matches!(
+                out_dt,
+                rdna_compute::DType::Q8_0
+                    | rdna_compute::DType::HFQ4G256
+                    | rdna_compute::DType::MQ4G256
+            );
+            if !supported {
                 return Err(format!(
                     "DFlash draft requested but target lm_head is {:?} — \
-                     no batched lm_head GEMM kernel exists for sub-4-bit MQ \
-                     targets yet (PRD Phase 2). Reload without a draft, \
-                     or use an MQ4 / HFQ4 / Q8 target.",
+                     speculative.rs only has batched GEMM kernels for \
+                     Q8_0 / HFQ4G256 / MQ4G256. Other dtypes (MQ3/MQ2, \
+                     MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
+                     through to a per-row GEMV path that hangs verify. \
+                     Reload without a draft, or use an MQ4 / HFQ4 / Q8 \
+                     target. (PRD Phase 2: extend speculative.rs match \
+                     arms + add gemm_*_batched_lmhead kernels.)",
                     out_dt
                 ));
             }
