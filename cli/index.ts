@@ -396,6 +396,51 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // treats absent keys as "use engine defaults" so older daemons stay
   // compatible even when the CLI passes new keys.
   params.dflash_adaptive_b = resolved.dflash_adaptive_b;
+
+  // Auto-attach a TriAttention sidecar when:
+  //   (1) user hasn't manually set cask_sidecar (resolved value is empty)
+  //   (2) the loaded model file has a sidecar discoverable next to it
+  //   (3) the target is NOT A3B (R̄≈0.39 + eviction = confident-wrong
+  //       hallucination per feedback_a3b_r_not_acceptable.md)
+  //
+  // Discovery: registry entry's `triattn.file` first (manifest-driven), then
+  // glob-style fallback for `<model>.triattn*.bin` next to the weights for
+  // sidecars dropped manually.
+  let autoAttachedSidecar: string | null = null;
+  if ((!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) && !isA3B) {
+    const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
+    const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
+    if (entry?.triattn?.file) {
+      const candidate = join(modelDir, entry.triattn.file);
+      if (existsSync(candidate)) autoAttachedSidecar = candidate;
+    }
+    if (!autoAttachedSidecar) {
+      // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
+      // hand-installed sidecars not in the registry.
+      try {
+        const baseName = basename(path);
+        const entries = readdirSync(modelDir);
+        const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+        if (m) autoAttachedSidecar = join(modelDir, m);
+      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
+    }
+  }
+  if (autoAttachedSidecar) {
+    params.cask_sidecar = autoAttachedSidecar;
+    // Default policy on auto-attach: drop-eviction (cask=false) at the
+    // user's configured budget — typically 512 from runtime defaults, which
+    // is the `aggressive-vram` policy minus m-fold. Safe under DFlash too.
+    // User can switch to `balanced`/`conservative` via `hipfire config
+    // cask-profile`.
+    params.cask = resolved.cask;
+    params.cask_budget = resolved.cask_budget;
+    params.cask_beta = resolved.cask_beta;
+    params.cask_core_frac = resolved.cask_core_frac;
+    params.cask_fold_m = resolved.cask_fold_m;
+    console.error(`[hipfire] TriAttention sidecar auto-attached: ${autoAttachedSidecar}`);
+    console.error(`[hipfire]   ${resolved.cask ? 'CASK m-folding' : 'drop-eviction'} budget=${resolved.cask_budget} β=${resolved.cask_beta}  (override: hipfire config cask-profile <off|balanced|conservative|aggressive-vram>)`);
+  }
+
   if (resolved.cask_sidecar && resolved.cask_sidecar.length > 0) {
     if (existsSync(resolved.cask_sidecar)) {
       params.cask_sidecar = resolved.cask_sidecar;
@@ -429,6 +474,13 @@ interface ModelEntry {
   size_gb: number;
   min_vram_gb: number;
   desc: string;
+  /// Optional published TriAttention sidecar in the same HF repo. When set,
+  /// `hipfire pull` also fetches it next to the weights, and `serve`/`run`
+  /// auto-attaches the file at startup if `cask_sidecar` is unset and the
+  /// target isn't A3B. Sidecars on A3B targets are intentionally never
+  /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
+  /// eviction = confident-wrong hallucination on multi-turn).
+  triattn?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -897,6 +949,39 @@ async function pull(tag: string): Promise<string> {
 
   const sz = (statSync(dest).size / 1e9).toFixed(1);
   console.error(`  Saved: ${dest} (${sz}GB)`);
+
+  // TriAttention sidecar: fetch alongside the weights when the registry
+  // entry has one. Sidecars are tiny (≈2 MB) so we don't gate this on a
+  // flag — getting the .triattn.bin into MODELS_DIR is the prereq for the
+  // run/serve auto-attach to fire. Failures are non-fatal: weights are
+  // already on disk and runnable; the user just won't get auto-eviction.
+  if (entry.triattn?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.triattn.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  TriAttention sidecar already present: ${entry.triattn.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
+      console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
+      try {
+        const sres = await fetch(sidecarUrl);
+        if (!sres.ok) {
+          console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e6).toFixed(1);
+          console.error(`  Saved: ${sidecarDest} (${ssz}MB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
   return dest;
 }
 

@@ -9,7 +9,7 @@
     "qwen3.5:35b-a3b":  { "repo": "", "file": "qwen3.5-35b-a3b.mq4", "size_gb": 18.7, "min_vram_gb": 22, "desc": "MoE 35B/3B-active, 115 tok/s — LOCAL ONLY (no HF repo yet)" },
     "qwen3.6:35b-a3b":  { "repo": "schuttdev/hipfire-qwen3.6-35b-a3b", "file": "qwen3.6-35b-a3b.mq4", "size_gb": 18.7, "min_vram_gb": 22, "desc": "MoE 35B/3B-active refresh, 148 tok/s" },
 
-    "qwen3.6:27b":      { "repo": "schuttdev/hipfire-qwen3.6-27b",  "file": "qwen3.6-27b.mq4",    "size_gb": 15.0, "min_vram_gb": 16, "desc": "44 tok/s AR / 185 tok/s w/ draft on code" },
+    "qwen3.6:27b":      { "repo": "schuttdev/hipfire-qwen3.6-27b",  "file": "qwen3.6-27b.mq4",    "size_gb": 15.0, "min_vram_gb": 16, "desc": "44 tok/s AR / 185 tok/s w/ draft on code", "triattn": { "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin" } },
 
     "qwen3.5:0.8b-mq6": { "repo": "schuttdev/hipfire-qwen3.5-0.8b", "file": "qwen3.5-0.8b.mq6",   "size_gb": 0.67, "min_vram_gb": 2,  "desc": "MQ6, higher quality" },
     "qwen3.5:4b-mq6":   { "repo": "schuttdev/hipfire-qwen3.5-4b",   "file": "qwen3.5-4b.mq6",     "size_gb": 3.5,  "min_vram_gb": 5,  "desc": "MQ6, higher quality" },
