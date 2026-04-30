@@ -715,6 +715,49 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let tokenizer = engine::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
 
+    // DFlash speculative-decode requires the target's lm_head to have a
+    // batched-GEMM kernel (used for verify and DDTree top-K). Only
+    // Q8_0 (qt=3) / HFQ4G256 (qt=6) / MQ4G256 (qt=13) are wired into
+    // speculative.rs's `try_batched` predicate (lines 2083-2087,
+    // 2606-2609); every other dtype falls through to a per-row sequential
+    // GEMV path that hangs spec verify (observed: 1 token in 240 s on
+    // 27B MQ3 + dflash-mq4 draft).
+    //
+    // Refuse fast at the HFQ-index level — BEFORE any weight upload, KV
+    // alloc, or scratch alloc — so we don't strand ~12 GB of VRAM in the
+    // pool when the operator passed a draft against an unsupported target.
+    // Read the lm_head tensor's `quant_type` byte directly from the index
+    // (no GPU work). lm_head can be a separate tensor or tied to
+    // embed_tokens; check both names in the same order qwen35::load_weights
+    // does (lm_head.weight first, then model.language_model.lm_head.weight,
+    // then fall through to embed_tokens for tied models).
+    if draft_path.is_some() {
+        let lm_qt = hfq.tensor_data("lm_head.weight")
+            .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"))
+            .or_else(|| hfq.tensor_data("model.embed_tokens.weight"))
+            .map(|(info, _)| info.quant_type);
+        if let Some(qt) = lm_qt {
+            // Whitelist: Q8_0=3, HFQ4G256=6, MQ4G256=13. Future quant
+            // formats refused by default until they're explicitly wired
+            // into both the verify GEMM and the DDTree top-K paths.
+            let supported = matches!(qt, 3 | 6 | 13);
+            if !supported {
+                return Err(format!(
+                    "DFlash draft requested but target lm_head quant_type={} \
+                     is not supported by speculative.rs's batched GEMM paths. \
+                     Only Q8_0 (qt=3), HFQ4G256 (qt=6), and MQ4G256 (qt=13) \
+                     have batched lm_head kernels; everything else (MQ3/MQ2 \
+                     qt=17/18, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) \
+                     falls through to a per-row GEMV that hangs verify. \
+                     Reload without a draft, or use an MQ4 / HFQ4 / Q8 \
+                     target. (PRD Phase 2: extend speculative.rs match arms \
+                     + add gemm_*_batched_lmhead kernels.)",
+                    qt
+                ));
+            }
+        }
+    }
+
     // Derive physical_cap. With eviction (cask.sidecar set), the physical
     // buffer only needs to hold budget+beta+safety slots; max_seq is the
     // advertised window the client targets. Without eviction, the two are
@@ -831,41 +874,6 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
         // is missing or arch-mismatched, we log and continue without DFlash
         // (temp==0 requests will fall back to AR sampling).
-        // DFlash speculative-decode requires the target's lm_head to have a
-        // batched-GEMM kernel (used for verify and DDTree top-K). Only
-        // Q8_0 / HFQ4G256 / MQ4G256 are wired into speculative.rs's
-        // `try_batched` predicate (lines 2083-2087, 2606-2609); every
-        // other dtype (MQ3/MQ2, MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16,
-        // etc.) falls through to a per-row sequential GEMV path that
-        // can hang on first-token verify (observed: 1 token in 240 s on
-        // 27B MQ3 + dflash-mq4 draft).
-        //
-        // Refuse fast with a clear message instead of silently hanging.
-        // Use a positive-list (whitelist) so future quant formats are
-        // refused by default until they're explicitly wired into both
-        // the verify GEMM and the DDTree top-K paths.
-        if draft_path.is_some() {
-            let out_dt = weights.output.gpu_dtype;
-            let supported = matches!(
-                out_dt,
-                rdna_compute::DType::Q8_0
-                    | rdna_compute::DType::HFQ4G256
-                    | rdna_compute::DType::MQ4G256
-            );
-            if !supported {
-                return Err(format!(
-                    "DFlash draft requested but target lm_head is {:?} — \
-                     speculative.rs only has batched GEMM kernels for \
-                     Q8_0 / HFQ4G256 / MQ4G256. Other dtypes (MQ3/MQ2, \
-                     MQ6/MQ8, HFQ3/HFQ2, HFQ4G128, HFQ6, F16, …) fall \
-                     through to a per-row GEMV path that hangs verify. \
-                     Reload without a draft, or use an MQ4 / HFQ4 / Q8 \
-                     target. (PRD Phase 2: extend speculative.rs match \
-                     arms + add gemm_*_batched_lmhead kernels.)",
-                    out_dt
-                ));
-            }
-        }
         let dflash = if let Some(dp) = draft_path {
             // DFlash state (hidden_rb + target_hidden_host) sizes linearly with
             // the ctx_capacity argument. Pass `physical_cap` instead of
