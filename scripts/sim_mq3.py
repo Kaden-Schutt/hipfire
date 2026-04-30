@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sim_mq3.py — UPPER-BOUND simulation of 3-bit quantization on an MQ4 file.
+"""sim_mq3.py — approximate 3-bit quantization on an MQ4 file (NOT exact MQ3).
 
 What this script actually does:
   Reads an existing .mq4 file, finds all MQ4-G256 (quant_type=13) tensors,
@@ -10,25 +10,36 @@ What this script actually does:
   reconstructs as min + q4_sim * scale_4. Storage layout, scale, and min
   are preserved.
 
-LIMITATION — this is NOT a faithful simulation of real MQ3-G256:
-  Real MQ3 from f32 would compute q3 = round((w-min)*7/range) directly.
-  This simulator instead computes q3' = round(q4_orig * 7/15) — a
-  rounding-of-rounding because q4_orig is itself round((w-min)*15/range).
-  For ~12% of weights near grid boundaries the double-rounding produces a
-  different q3' than the f32-direct q3, with worst-case extra error of
-  ~14% of range vs real MQ3's ~7% intrinsic 3-bit error. The simulator
-  therefore PESSIMISTICALLY UPPER-BOUNDS the quality cost of MQ3:
-  observed degradation is always at least as bad as real MQ3 would be.
+LIMITATION — this is NOT a faithful simulation of real MQ3-G256, AND
+NOT a strict upper bound on its quality cost:
 
-  A faithful simulator would re-quantize from the original f32 / bf16
-  safetensors weights, not from already-MQ4-quantized values. That's a
-  separate larger script working on the pre-quantize input, not this one.
-  Use this harness for fast go/no-go signals only — if even the
-  upper-bound simulation produces fluent output, real MQ3 might be
-  viable; if it collapses (as it does on Qwen3.5 0.8B/9B per the
-  2026-04-30 ablation), real MQ3 might still work better but the gap
-  must be characterized by re-quantizing from f32, not by reading more
-  into this script's output.
+  Real MQ3 from f32 computes q3 = round((w-min) * 7/range) directly. This
+  simulator computes q3' = round(q4_orig * 7/15) — a rounding-of-rounding
+  because q4_orig is itself round((w-min) * 15/range).
+
+  Per-weight, the simulator's error vs real MQ3 can go EITHER WAY:
+    - At w/range = 0.13: real MQ3 reconstructs to 0.143 (error 1.3%);
+      simulator picks q4_sim=2 → reconstructs to 0.133 (error 0.3%).
+      Simulator MORE accurate than real MQ3.
+    - At w/range = 0.09: real MQ3 reconstructs to 0.143 (error 5.3%);
+      simulator picks q4_sim=0 → reconstructs to 0 (error 9%).
+      Simulator LESS accurate than real MQ3.
+
+  Aggregate (variance / mean MSE) is approximately equivalent because the
+  MQ4 and MQ3 grids overlap closely on average. But the simulator's
+  worst-case per-weight error is ~10% of range vs real MQ3's ~7%, so the
+  simulator has heavier tail errors. For LLM coherence (which depends on
+  per-element worst-case more than averages — see
+  feedback_attention_precision.md), the simulator is biased toward
+  pessimism but NOT a strict upper bound.
+
+  Concretely: if even this approximate MQ3 produces fluent output, real
+  MQ3 is very likely viable too. If this approximate MQ3 collapses (as
+  on Qwen3.5 0.8B/9B per the 2026-04-30 ablation), real MQ3 might be
+  marginally better but probably also fails — the gap can't be
+  characterized from this harness alone. A faithful simulator would
+  re-quantize from the original f32 / bf16 safetensors weights, not
+  from already-MQ4-quantized values.
 
 Usage: ./scripts/sim_mq3.py <input.mq4> <output.mq4>   # requires +x bit
        python3 scripts/sim_mq3.py <input.mq4> <output.mq4>
