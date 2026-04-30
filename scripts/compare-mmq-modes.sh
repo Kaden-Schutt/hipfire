@@ -27,7 +27,7 @@ HIPFIRE_MMQ=0 timeout 120 "$EXE" < "$INPUT_FILE" 2>/dev/null | python3 "$ANALYZE
 echo ""
 
 echo "=== 2. MMQ (no screening) ==="
-HIPFIRE_MMQ=1 timeout 120 "$EXE" < "$INPUT_FILE" 2>/dev/null | python3 "$ANALYZE"
+HIPFIRE_MMQ=1 HIPFIRE_MMQ_SCREEN=0 timeout 120 "$EXE" < "$INPUT_FILE" 2>/dev/null | python3 "$ANALYZE"
 echo ""
 
 echo "=== 3. MMQ + screening ==="

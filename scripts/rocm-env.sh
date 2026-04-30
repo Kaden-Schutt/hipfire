@@ -12,7 +12,10 @@ if [ -d "/opt/rocm/lib" ]; then
 fi
 
 # NixOS: find the clr package in the Nix store
-NIX_HIP=$(find /nix/store -maxdepth 2 -name "libamdhip64.so" -path "*/clr-*/lib/*" 2>/dev/null | head -1)
+NIX_HIP=$(find /nix/store -maxdepth 3 -name "libamdhip64.so" 2>/dev/null | grep '/clr-' | head -1)
+if [ -z "$NIX_HIP" ]; then
+    NIX_HIP=$(find /nix/store -maxdepth 3 -name "libamdhip64.so" 2>/dev/null | head -1)
+fi
 if [ -n "$NIX_HIP" ]; then
     export LD_LIBRARY_PATH="$(dirname "$NIX_HIP"):${LD_LIBRARY_PATH:-}"
     return 0 2>/dev/null || true
