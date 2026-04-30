@@ -200,14 +200,22 @@ pub struct Gpu {
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
     q8_1_mmq_x_scratch_bytes: usize,
 
-    // ── MMQ per-weight screening cache (#87) ─────────────────────────────
-    // Keyed by weight GpuTensor device pointer. `true` = safe to use MMQ,
-    // `false` = outlier row detected, fall back to WMMA.
-    // Populated lazily on first MMQ call for each weight matrix when
-    // `HIPFIRE_MMQ_SCREEN=1`. Screening runs a small synthetic comparison
-    // (batch=16) and flags weights where any output row's max abs error
-    // exceeds `mmq_screen_threshold`.
+    // ── MMQ per-weight screening (#87) ──────────────────────────────────
+    // When enabled, each weight matrix is screened on first MMQ use: a
+    // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
+    // max abs error. Weights exceeding the threshold fall back to WMMA.
+    //
+    // Enabled by default on RDNA3/3.5. Configurable via:
+    //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
+    //   - per-model config overlay
+    //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
+    //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
+    //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
     mmq_screen_cache: HashMap<usize, bool>,
+    /// Whether MMQ per-weight screening is enabled. Default: true.
+    pub mmq_screen: bool,
+    /// Max per-row abs error threshold for screening. Weights with any row
+    /// exceeding this fall back to WMMA. Default: 0.10.
     pub mmq_screen_threshold: f32,
 
     // ── hipGraph capture state ────────────────────────────────────────────
@@ -394,6 +402,9 @@ impl Gpu {
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
+            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
+                .map(|v| v != "0")
+                .unwrap_or(true),
             mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
             capture_mode: false,
@@ -2553,7 +2564,7 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let use_mmq = if std::env::var("HIPFIRE_MMQ_SCREEN").ok().as_deref() == Some("1") {
+                let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
                         && self.mmq_screen_weight(a_z, z_m, k)
                         && self.mmq_screen_weight(a_beta, beta_m, k)
@@ -2855,7 +2866,7 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let use_mmq = if std::env::var("HIPFIRE_MMQ_SCREEN").ok().as_deref() == Some("1") {
+                let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_q, q_m, k)
                         && self.mmq_screen_weight(a_k, k_m, k)
                         && self.mmq_screen_weight(a_v, v_m, k)
@@ -3136,7 +3147,7 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let use_mmq = if std::env::var("HIPFIRE_MMQ_SCREEN").ok().as_deref() == Some("1") {
+                let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
                 } else { true };
@@ -4699,15 +4710,15 @@ impl Gpu {
             // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
             // Strix Halo. Experimental — see PR #73 / issue #60.
             //
-            // When HIPFIRE_MMQ_SCREEN=1, each weight matrix is screened on
-            // first use: a small synthetic comparison detects outlier rows
-            // where Q8_1 precision loss exceeds the threshold (#87). Unsafe
-            // weights fall through to WMMA instead.
+            // When mmq_screen is true (default), each weight matrix is
+            // screened on first use: a small synthetic comparison detects
+            // outlier rows where Q8_1 precision loss exceeds the threshold
+            // (#87). Unsafe weights fall through to WMMA instead.
             if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
                 || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
                 && has_mmq_i8_wmma(&self.arch)
             {
-                let use_mmq = if std::env::var("HIPFIRE_MMQ_SCREEN").ok().as_deref() == Some("1") {
+                let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
                 } else {
                     true

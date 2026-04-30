@@ -108,6 +108,19 @@ interface HipfireConfig {
   // code prompts by up to +26.7% (commit 8a4a211). Default ON since
   // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
+
+  // ── MMQ per-weight screening (#87) ──────────────────────────────────
+  // When true (default), the i8 WMMA (MMQ) prefill path screens each
+  // weight matrix on first use. A quick synthetic comparison (batch=16)
+  // checks per-row max abs error — weights with outlier rows fall back
+  // to f16 WMMA. Prevents tool-call corruption from Q8_1 precision loss
+  // on specific weight channels (e.g. row 3994 in Wo projections).
+  // Only effective when MMQ is active (HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
+  mmq_screen: boolean;
+  // Abs error threshold for MMQ screening. Weights with any output row
+  // exceeding this fall back to WMMA. Default 0.10 — validated on both
+  // qwen3.5-9b and qwen3.6-27b to produce byte-identical output vs WMMA.
+  mmq_screen_threshold: number;
 }
 
 // Detect GPU at import time for smart defaults
@@ -146,6 +159,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
+  // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
+  // WMMA. Default ON — prevents tool-call corruption (#87) at <0.1% perf cost.
+  mmq_screen: true,
+  mmq_screen_threshold: 0.10,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -174,6 +191,8 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
+    case "mmq_screen": return typeof value === "boolean";
+    case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     default: return false;
   }
 }
@@ -218,6 +237,7 @@ const PER_MODEL_KEYS = [
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
   "cask_auto_attach",
   "prompt_normalize",
+  "mmq_screen", "mmq_screen_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -468,6 +488,10 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       console.error(`[hipfire] WARN: cask_sidecar path missing: ${resolved.cask_sidecar} — disabling eviction for this load`);
     }
   }
+
+  // MMQ per-weight screening (#87)
+  params.mmq_screen = resolved.mmq_screen;
+  params.mmq_screen_threshold = resolved.mmq_screen_threshold;
 
   return { type: "load", model: path, params };
 }

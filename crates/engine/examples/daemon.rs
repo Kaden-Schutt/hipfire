@@ -417,6 +417,16 @@ fn main() {
                     fold_m: cask_fold_m,
                 };
 
+                // MMQ per-weight screening (#87): detect outlier rows that
+                // cause Q8_1 precision loss and fall back to WMMA for those
+                // weights. Enabled by default; disable with mmq_screen=false.
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
+                    gpu.mmq_screen = v;
+                }
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen_threshold")).and_then(|v| v.as_f64()) {
+                    gpu.mmq_screen_threshold = v as f32;
+                }
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
