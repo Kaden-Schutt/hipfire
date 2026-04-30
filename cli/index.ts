@@ -93,6 +93,13 @@ interface HipfireConfig {
   cask_beta: number;         // hysteresis buffer before re-triggering
   cask_core_frac: number;    // fraction of budget kept un-merged (CASK only)
   cask_fold_m: number;       // m-way merge factor for non-core slots (CASK only)
+  // When true (default), `serve`/`run` auto-discover a TriAttention sidecar
+  // next to the loaded model file (registry's `triattn.file` first, then a
+  // glob fallback for `<basename>.triattn*.bin`) and engage CASK with the
+  // current policy values. The `off` profile disables this; explicit-`off`
+  // beats discovery. Already silently skipped on A3B targets regardless of
+  // this flag (R̄ hard rule).
+  cask_auto_attach: boolean;
 
   // ── Prompt-shape adaptation (0.1.8) ──────────────────────────────────
   // When true, collapses runs of 3+ '\n' chars to exactly 2 before the
@@ -134,6 +141,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   cask_beta: 128,
   cask_core_frac: 0.5,
   cask_fold_m: 2,
+  cask_auto_attach: true,
   // Default ON since 2026-04-26: collapses \n{3,} → \n\n at engine entry,
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
@@ -164,6 +172,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_beta": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "cask_core_frac": return typeof value === "number" && value >= 0 && value <= 1;
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
+    case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
     default: return false;
   }
@@ -207,6 +216,7 @@ const PER_MODEL_KEYS = [
   "dflash_adaptive_b", "dflash_mode", "dflash_ngram_block",
   "cask_sidecar", "cask",
   "cask_budget", "cask_beta", "cask_core_frac", "cask_fold_m",
+  "cask_auto_attach",
   "prompt_normalize",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
@@ -407,7 +417,11 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
-  if ((!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) && !isA3B) {
+  if (
+    (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
+    !isA3B &&
+    resolved.cask_auto_attach !== false
+  ) {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
@@ -2598,7 +2612,7 @@ type TuiExit = "exit" | "open_picker";
 // + A3B → confident-wrong hallucination at current R̄). A profile picker
 // collapses those into a small set of validated combinations.
 type CaskPolicyBundle = Pick<HipfireConfig, "cask" | "cask_budget" | "cask_beta" | "cask_core_frac" | "cask_fold_m">;
-type CaskProfileBundle = CaskPolicyBundle & { cask_sidecar?: string };
+type CaskProfileBundle = CaskPolicyBundle & { cask_sidecar?: string; cask_auto_attach?: boolean };
 interface CaskProfile {
   label: string;
   short: string;       // one-liner for the active row
@@ -2609,14 +2623,32 @@ interface CaskProfile {
 }
 
 const CASK_PROFILES: Record<string, CaskProfile> = {
+  "auto": {
+    label: "auto",
+    short: "auto-attach if sidecar discoverable; otherwise no eviction",
+    desc: [
+      "Default behavior. At load time, scan for a published TriAttention sidecar",
+      "next to the model file (registry's `triattn.file` first, then a",
+      "`<basename>.triattn*.bin` glob fallback). When found AND target is not",
+      "A3B, attach with drop-eviction at the budget below. Otherwise behaves",
+      "identical to `off`.",
+      "",
+      "This is the pull-and-go path: `hipfire pull qwen3.6:27b` fetches the",
+      "v3 sidecar alongside weights, and `hipfire run` engages CASK on the",
+      "first turn with no further config.",
+    ].join("\n"),
+    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "", cask_auto_attach: true },
+    ar_only: false,
+    a3b_safe: true,  // auto-attach already filters A3B; "auto" itself is a no-op on A3B
+  },
   "off": {
     label: "off",
-    short: "no eviction; clears cask_sidecar; physical_cap = max_seq",
+    short: "explicitly disable; clears sidecar AND auto-attach",
     desc: [
-      "No KV eviction. Physical KV buffer = max_seq tokens (full allocation).",
-      "Clears cask_sidecar — the daemon triggers eviction whenever a sidecar",
-      "path is set, regardless of the cask boolean, so clearing the path is",
-      "the only way to actually disable eviction.",
+      "Hard-off: physical KV buffer = max_seq tokens (full allocation), no",
+      "eviction, no auto-attach. Clears cask_sidecar AND sets cask_auto_attach=false",
+      "so a sidecar-on-disk won't sneak back in via the discovery path.",
+      "Stricter than `auto` — pick this when you want eviction guaranteed off.",
       "",
       "Use when:",
       "  • Plenty of VRAM relative to context goal",
@@ -2624,7 +2656,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
       "  • Quality-sensitive single-turn workloads",
       "Only profile that's safe on 35B-A3B today.",
     ].join("\n"),
-    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "" },
+    apply: { cask: false, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_sidecar: "", cask_auto_attach: false },
     ar_only: false,
     a3b_safe: true,
   },
@@ -2639,7 +2671,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
       "m-fold OFF — no DFlash regression risk; works on AR or DFlash.",
       "Dense models only — A3B safety not validated at this budget.",
     ].join("\n"),
-    apply: { cask: false, cask_budget: 1024, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2 },
+    apply: { cask: false, cask_budget: 1024, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
     ar_only: false,
     a3b_safe: false,
   },
@@ -2654,7 +2686,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
       "less often → fewer cumulative events, smoother quality curve.",
       "Dense models only.",
     ].join("\n"),
-    apply: { cask: false, cask_budget: 2048, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2 },
+    apply: { cask: false, cask_budget: 2048, cask_beta: 256, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
     ar_only: false,
     a3b_safe: false,
   },
@@ -2671,7 +2703,7 @@ const CASK_PROFILES: Record<string, CaskProfile> = {
       "(feedback_cask_mfold_dflash_broken.md). Set dflash_mode=off when using",
       "this profile. NOT for A3B at current R̄.",
     ].join("\n"),
-    apply: { cask: true, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2 },
+    apply: { cask: true, cask_budget: 512, cask_beta: 128, cask_core_frac: 0.5, cask_fold_m: 2, cask_auto_attach: true },
     ar_only: true,
     a3b_safe: false,
   },
@@ -2858,6 +2890,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "cask_fold_m",
       desc: "CASK m-fold factor (1 = no folding, 2+ = fold m heads into one)",
       range: [1, 16], step: 1,
+    },
+    cask_auto_attach: {
+      label: "cask_auto_attach",
+      desc: "auto-discover .triattn.bin next to model file at load (true) or never (false). cask-profile=off sets false; non-off profiles set true.",
+      options: ["true", "false"],
     },
     prompt_normalize: {
       label: "prompt_normalize",
@@ -3111,6 +3148,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
           cask_core_frac: effective("cask_core_frac") as number,
           cask_fold_m: effective("cask_fold_m") as number,
           cask_sidecar: effective("cask_sidecar") as string,
+          cask_auto_attach: effective("cask_auto_attach") as boolean,
         };
         const active = detectCaskProfile(profileVals);
         const sidecarSet = !!effective("cask_sidecar");
@@ -3267,6 +3305,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
                 cask_core_frac: effective("cask_core_frac") as number,
                 cask_fold_m: effective("cask_fold_m") as number,
                 cask_sidecar: effective("cask_sidecar") as string,
+                cask_auto_attach: effective("cask_auto_attach") as boolean,
               };
               const active = detectCaskProfile(profileVals);
               const idx = profileNames.indexOf(active);
@@ -4499,6 +4538,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         cask_core_frac: effectiveCfg.cask_core_frac,
         cask_fold_m: effectiveCfg.cask_fold_m,
         cask_sidecar: effectiveCfg.cask_sidecar,
+        cask_auto_attach: effectiveCfg.cask_auto_attach,
       };
       const active = detectCaskProfile(profileVals);
       if (!profileName) {
@@ -4539,10 +4579,15 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
         console.log(`cask-profile → ${profileName}`);
       }
       const sidecarSet = !!effectiveCfg.cask_sidecar;
-      if (!sidecarSet && profileName !== "off") {
+      if (!sidecarSet && profileName !== "off" && profileName !== "auto") {
         console.log(`note: cask_sidecar is not set. The profile is configured, but eviction`);
         console.log(`      only engages when a sidecar path is loaded. Set with:`);
         console.log(`      hipfire config${modelScope ? ` ${modelScope}` : ""} set cask_sidecar /path/to/<model>.triattn.bin`);
+      }
+      if (profileName === "auto" && !sidecarSet) {
+        console.log(`note: auto-attach will scan for a sidecar next to the model file at load.`);
+        console.log(`      Pull a model with a published sidecar (e.g. \`hipfire pull qwen3.6:27b\`)`);
+        console.log(`      to engage CASK with no further config.`);
       }
       if (CASK_PROFILES[profileName].ar_only && effectiveCfg.dflash_mode !== "off") {
         console.log(`warn: ${profileName} is AR-only (m-fold + DFlash has documented attractor regression).`);

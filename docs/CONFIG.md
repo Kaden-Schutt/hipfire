@@ -82,7 +82,8 @@ hipfire config cask-profile                            # list active + available
 
 | Profile | KV footprint¹ | Use when | Constraints |
 |---|---|---|---|
-| `off` | full `max_seq` | A3B models, plenty of VRAM, single-turn quality | only safe profile for 35B-a3b at current R̄ |
+| `auto` (default) | depends on discovery | fresh-default state — pull a model with a published sidecar and CASK engages on first turn | A3B targets are silently skipped from auto-attach |
+| `off` | full `max_seq` | A3B models, plenty of VRAM, hard-off guarantee | only safe profile for 35B-a3b at current R̄ |
 | `balanced` | budget=1024, ≈165 MB on 27B | dense 27B on a 16 GB card, mixed-length workloads | dense only; AR or DFlash both safe |
 | `conservative` | budget=2048, ≈275 MB on 27B | ≥20 GB VRAM, very long advertised contexts | dense only |
 | `aggressive-vram` | budget=512, ≈96 MB on 27B | dense 27B on a 16 GB card with tight headroom; aggressive long-ctx fit | **AR only** — m-fold + DFlash has a documented attractor regression. Set `dflash_mode=off`. Not for A3B. |
@@ -90,15 +91,26 @@ hipfire config cask-profile                            # list active + available
 ¹ KV footprint estimates for dense 27B with `kv_cache=asym3` (~107 KB/token).
 Scale linearly with the model's `n_layers × n_kv_heads × head_dim`.
 
-Picking a profile rewrites the policy bundle (`cask`, `cask_budget`,
-`cask_beta`, `cask_core_frac`, `cask_fold_m`) in one shot. The non-`off`
-profiles **preserve** `cask_sidecar` — set the path separately with
-`hipfire config set cask_sidecar /path/to/<model>.triattn.bin`.
+Picking a profile rewrites a bundle of CASK config keys in one shot. The
+`balanced` / `conservative` / `aggressive-vram` profiles set the policy
+fields and re-enable `cask_auto_attach`; they preserve `cask_sidecar` —
+set the path separately with `hipfire config set cask_sidecar
+/path/to/<model>.triattn.bin`, or rely on auto-attach by `hipfire pull`'ing
+a model that ships one.
 
-The `off` profile additionally **clears `cask_sidecar`**: the daemon
-triggers eviction whenever a sidecar path is set, regardless of the
-`cask` boolean (which only switches between m-fold and drop-eviction).
-Clearing the path is the only way to actually disable eviction.
+The `auto` profile is the fresh-default state: at load time the engine
+scans for a TriAttention sidecar next to the model file (registry's
+`triattn.file` first, then `<basename>.triattn*.bin` glob fallback). When
+found AND target is not A3B, it attaches with drop-eviction at the
+configured budget. `hipfire pull qwen3.6:27b` fetches the v3 sidecar
+alongside weights, so `hipfire run` engages CASK on the first turn with
+no further config.
+
+The `off` profile is the **hard-off** guarantee: clears `cask_sidecar`
+AND sets `cask_auto_attach=false` so a discoverable sidecar can't sneak
+back in via the auto-attach path. Stricter than `auto`; pick this when
+you want eviction provably off (e.g., on A3B targets, or for
+quality-sensitive single-turn workloads).
 
 ### Underlying knobs (advanced — prefer profiles)
 
@@ -110,6 +122,7 @@ Clearing the path is the only way to actually disable eviction.
 | `cask_beta` | 128 | 0–65536 | Hysteresis. Buffer needs to fill `budget + beta` before re-triggering eviction. |
 | `cask_core_frac` | 0.5 | 0.0–1.0 | Fraction of budget kept un-merged when `cask=true`. Inert otherwise. |
 | `cask_fold_m` | 2 | 1–16 | m-way merge factor for non-core slots when `cask=true`. m=2 is the validated sweet spot; m=4 over-folds. Inert when `cask=false`. |
+| `cask_auto_attach` | true | bool | When true, scan for a sidecar next to the model file at load and attach it if `cask_sidecar` is empty + target isn't A3B. Set false to guarantee no eviction (the `off` profile flips this). |
 
 ### Safety hard rules
 
