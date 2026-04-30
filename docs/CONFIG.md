@@ -58,6 +58,27 @@ mostly long-form prose.
 crossover for the current arch. `never` is the byte-exact reference;
 `always` forces FA even on short prompts.
 
+## MMQ screening
+
+| Key | Default | Range | Notes |
+|---|---|---|---|
+| `mmq_screen` | true | bool | Per-weight outlier detection for the i8 WMMA (MMQ) prefill path. Screens each weight matrix on first use; outlier rows fall back to f16 WMMA. |
+| `mmq_screen_threshold` | 0.10 | 0.01–1.0 | Max per-row abs error threshold. Lower = more conservative (more fallbacks). 0.10 validated on 9B/27B for byte-identical output vs pure WMMA. |
+
+MMQ (i8 WMMA + Q8_1 activation quantization) gives +40-50% prefill
+speedup on RDNA3/3.5 but certain weight rows produce 5-9x higher
+quantization error than normal. Without screening, these outliers
+corrupt tool-call output (ChatML special-token leakage, ref #87).
+
+Screening runs a batch=16 synthetic comparison (WMMA vs MMQ) per weight
+matrix at first use (~0.1ms per weight, cached). On qwen3.5-9b, 25/216
+weights fall back to WMMA; on qwen3.6-27b, 73/432. The remaining 83-88%
+of weights keep the fast MMQ path.
+
+Set `mmq_screen=false` only for benchmarking raw MMQ throughput. Not
+recommended for production — output quality degrades on tool-call and
+structured-output prompts.
+
 ## CASK (TriAttention KV eviction)
 
 CASK is the KV cache eviction system. When a `cask_sidecar` is loaded,

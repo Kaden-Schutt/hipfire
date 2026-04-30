@@ -417,6 +417,16 @@ fn main() {
                     fold_m: cask_fold_m,
                 };
 
+                // MMQ per-weight screening (#87): detect outlier rows that
+                // cause Q8_1 precision loss and fall back to WMMA for those
+                // weights. Enabled by default; disable with mmq_screen=false.
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
+                    gpu.mmq_screen = v;
+                }
+                if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen_threshold")).and_then(|v| v.as_f64()) {
+                    gpu.mmq_screen_threshold = v as f32;
+                }
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
@@ -754,6 +764,20 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         };
 
         let weights = qwen35::load_weights(&hfq, &config, gpu).map_err(|e| format!("{e}"))?;
+
+        // MMQ per-weight screening (#87): pre-screen all weight matrices at
+        // load time so the first prefill doesn't pay the screening overhead.
+        // Results are cached by device pointer in gpu.mmq_screen_cache.
+        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151") {
+            let t0 = std::time::Instant::now();
+            let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
+            let elapsed = t0.elapsed();
+            eprintln!(
+                "  MMQ screening: {n_safe} safe, {n_unsafe} unsafe (threshold={:.2}, {:.1}ms)",
+                gpu.mmq_screen_threshold, elapsed.as_secs_f64() * 1000.0,
+            );
+        }
+
         // KV cache modes (RotorQuant-style asymmetric: K rotated + V Q8):
         //   asym3 (default) — K at 3-bit rotated, V at Q8_0. 5.5× vs fp32.
         //                     Best quality/compression tradeoff — RotorQuant "planar3".
@@ -886,6 +910,50 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dflash: None,
         })
     }
+}
+
+/// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
+/// Returns (n_safe, n_unsafe). Results are cached in gpu.mmq_screen_cache.
+fn screen_weights_qwen35(weights: &qwen35::Qwen35Weights, gpu: &mut rdna_compute::Gpu) -> (usize, usize) {
+    use engine::qwen35::LayerWeights;
+    let mut n_safe = 0usize;
+    let mut n_unsafe = 0usize;
+
+    for layer in &weights.layers {
+        // Collect all weight tensors for this layer that could use MMQ
+        let wts: Vec<(&engine::llama::WeightTensor, &str)> = match layer {
+            LayerWeights::DeltaNet(l) => vec![
+                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
+                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::FullAttn(l) => vec![
+                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
+                (&l.w_gate, "gate_up.gate"), (&l.w_up, "gate_up.up"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::DeltaNetMoe(l) => vec![
+                (&l.wqkv, "qkvza.qkv"), (&l.wz, "qkvza.z"),
+                (&l.w_beta, "qkvza.beta"), (&l.w_alpha, "qkvza.alpha"),
+                (&l.wo, "residual"),
+            ],
+            LayerWeights::FullAttnMoe(l) => vec![
+                (&l.wq, "qkv.q"), (&l.wk, "qkv.k"), (&l.wv, "qkv.v"),
+                (&l.wo, "residual"),
+            ],
+        };
+
+        for (wt, _name) in wts {
+            if gpu.mmq_screen_weight(&wt.buf, wt.m, wt.k) {
+                n_safe += 1;
+            } else {
+                n_unsafe += 1;
+            }
+        }
+    }
+
+    (n_safe, n_unsafe)
 }
 
 fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {

@@ -200,6 +200,24 @@ pub struct Gpu {
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
     q8_1_mmq_x_scratch_bytes: usize,
 
+    // ── MMQ per-weight screening (#87) ──────────────────────────────────
+    // When enabled, each weight matrix is screened on first MMQ use: a
+    // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
+    // max abs error. Weights exceeding the threshold fall back to WMMA.
+    //
+    // Enabled by default on RDNA3/3.5. Configurable via:
+    //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
+    //   - per-model config overlay
+    //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
+    //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
+    //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
+    mmq_screen_cache: HashMap<usize, bool>,
+    /// Whether MMQ per-weight screening is enabled. Default: true.
+    pub mmq_screen: bool,
+    /// Max per-row abs error threshold for screening. Weights with any row
+    /// exceeding this fall back to WMMA. Default: 0.10.
+    pub mmq_screen_threshold: f32,
+
     // ── hipGraph capture state ────────────────────────────────────────────
     /// When true, dispatch methods use the blob launch path (graph-capture-safe).
     /// Kernarg blobs are stored in `capture_blobs` and must stay alive until the
@@ -383,6 +401,12 @@ impl Gpu {
             fp16_x_source_ptr: std::ptr::null_mut(),
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
+            mmq_screen_cache: HashMap::new(),
+            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
@@ -903,7 +927,7 @@ impl Gpu {
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
-    fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
         self.ensure_kernel(
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
@@ -956,6 +980,89 @@ impl Gpu {
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
+    /// comparison (batch=16): f16 WMMA vs MMQ on random activations. If any
+    /// output row's max abs error exceeds `mmq_screen_threshold`, the weight
+    /// is marked unsafe. Result is cached by device pointer.
+    ///
+    /// Returns `true` if MMQ is safe for this weight, `false` if it should
+    /// fall back to WMMA.
+    pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        let key = a_raw.buf.as_ptr() as usize;
+        if let Some(&safe) = self.mmq_screen_cache.get(&key) {
+            return safe;
+        }
+
+        let screen_batch = 16usize;
+        let threshold = self.mmq_screen_threshold;
+
+        // Generate synthetic activations on CPU
+        let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
+        let x_data: Vec<f32> = (0..screen_batch * k).map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let t = (state >> 33) as f32 / (u32::MAX as f32);
+            t * 4.0 - 2.0
+        }).collect();
+
+        let result = (|| -> HipResult<bool> {
+            let x_gpu = self.upload_f32(&x_data, &[screen_batch * k])?;
+            let y_wmma = self.zeros(&[screen_batch * m], DType::F32)?;
+            let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
+
+            let saved_capture = self.capture_mode;
+            self.capture_mode = true;
+
+            // f16 WMMA reference
+            self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+
+            // MMQ path
+            let xq = self.ensure_q8_1_mmq_x(&x_gpu, screen_batch, k)?;
+            self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
+
+            self.capture_mode = saved_capture;
+            self.hip.device_synchronize()?;
+
+            let ref_out = self.download_f32(&y_wmma)?;
+            let mmq_out = self.download_f32(&y_mmq)?;
+
+            self.free_tensor(x_gpu).ok();
+            self.free_tensor(y_wmma).ok();
+            self.free_tensor(y_mmq).ok();
+
+            // Per-row max error check
+            let mut worst_row = 0usize;
+            let mut worst_err = 0f32;
+            for r in 0..m {
+                let mut row_max = 0f32;
+                for b in 0..screen_batch {
+                    let idx = b * m + r;
+                    let err = (ref_out[idx] - mmq_out[idx]).abs();
+                    if err > row_max { row_max = err; }
+                }
+                if row_max > worst_err {
+                    worst_err = row_max;
+                    worst_row = r;
+                }
+            }
+
+            let safe = worst_err <= threshold;
+            if !safe {
+                eprintln!(
+                    "  MMQ screen: UNSAFE weight ptr={key:#x} m={m} k={k} \
+                     worst_row={worst_row} max_err={worst_err:.4} > threshold={threshold:.4} — falling back to WMMA"
+                );
+            }
+            Ok(safe)
+        })();
+
+        let safe = result.unwrap_or_else(|e| {
+            eprintln!("  MMQ screen: error during screening ({e}), assuming unsafe");
+            false
+        });
+        self.mmq_screen_cache.insert(key, safe);
+        safe
     }
 
     /// Ensure an FP16 shadow of `w_mq4` (HFQ4-G256 format, [M × K]) exists in
@@ -2457,12 +2564,20 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size) } else { Ok(()) };
-                let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size) } else { Ok(()) };
-                let r4 = if r3.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2).and(r3).and(r4);
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_qkv, qkv_m, k)
+                        && self.mmq_screen_weight(a_z, z_m, k)
+                        && self.mmq_screen_weight(a_beta, beta_m, k)
+                        && self.mmq_screen_weight(a_alpha, alpha_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_z, xq, y_z, z_m, k, batch_size) } else { Ok(()) };
+                    let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size) } else { Ok(()) };
+                    let r4 = if r3.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_alpha, xq, y_alpha, alpha_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2).and(r3).and(r4);
+                }
             }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
@@ -2751,11 +2866,18 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size) } else { Ok(()) };
-                let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2).and(r3);
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_q, q_m, k)
+                        && self.mmq_screen_weight(a_k, k_m, k)
+                        && self.mmq_screen_weight(a_v, v_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_q, xq, y_q, q_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_k, xq, y_k, k_m, k, batch_size) } else { Ok(()) };
+                    let r3 = if r2.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_v, xq, y_v, v_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2).and(r3);
+                }
             }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
@@ -3025,10 +3147,16 @@ impl Gpu {
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             if std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1") && has_mmq_i8_wmma(&self.arch) {
-                let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
-                let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size) } else { Ok(()) };
-                return r1.and(r2);
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_gate, gate_m, k)
+                        && self.mmq_screen_weight(a_up, up_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_prequant(a_gate, xq, y_gate, gate_m, k, batch_size);
+                    let r2 = if r1.is_ok() { self.gemm_hfq4g256_mmq_set_prequant(a_up, xq, y_up, up_m, k, batch_size) } else { Ok(()) };
+                    return r1.and(r2);
+                }
             }
             // WMMA on gfx12 (RDNA4)
             if has_wmma_f16_gfx12(&self.arch) {
@@ -4581,11 +4709,24 @@ impl Gpu {
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
             // Q8_1 activation quantize + i8 WMMA. ~+20% on pp≥256, larger on
             // Strix Halo. Experimental — see PR #73 / issue #60.
+            //
+            // When mmq_screen is true (default), each weight matrix is
+            // screened on first use: a small synthetic comparison detects
+            // outlier rows where Q8_1 precision loss exceeds the threshold
+            // (#87). Unsafe weights fall through to WMMA instead.
             if (std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
                 || std::env::var("HIPFIRE_MMQ").ok().as_deref() == Some("1"))
                 && has_mmq_i8_wmma(&self.arch)
             {
-                return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_raw, m, k)
+                } else {
+                    true
+                };
+                if use_mmq {
+                    return self.gemm_hfq4g256_residual_mmq(a_raw, x, y, m, k, batch_size);
+                }
+                // else: screening rejected this weight, fall through to WMMA
             }
             // WMMA on gfx12 (RDNA4): K2-unroll port, validated by
             // test_wmma_residual_gfx12 against the dot2 fp16 reference.
@@ -4858,7 +4999,7 @@ impl Gpu {
         result
     }
 
-    fn gemm_hfq4g256_mmq_set_prequant(
+    pub fn gemm_hfq4g256_mmq_set_prequant(
         &mut self,
         a_raw: &GpuTensor,
         x_q8_ptr: *mut c_void,
