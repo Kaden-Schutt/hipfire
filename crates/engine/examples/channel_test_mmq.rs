@@ -141,7 +141,6 @@ struct SiteStats {
     max_err: f32,
     mean_err: f32,
     bad_count: usize,
-    threshold: f32,
 }
 
 #[cfg(feature = "deltanet")]
@@ -221,7 +220,6 @@ fn compute_stats(
         max_err,
         mean_err,
         bad_count,
-        threshold,
     }
 }
 
@@ -474,7 +472,7 @@ fn seed_for_site(site_name: &str) -> u64 {
 fn run_site_scan(
     gpu: &mut rdna_compute::Gpu,
     weights: &engine::qwen35::Qwen35Weights,
-    config: &engine::qwen35::Qwen35Config,
+    _config: &engine::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
 ) {
@@ -540,7 +538,7 @@ fn run_site_scan(
 fn run_channel_map(
     gpu: &mut rdna_compute::Gpu,
     weights: &engine::qwen35::Qwen35Weights,
-    config: &engine::qwen35::Qwen35Config,
+    _config: &engine::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
     site_name: &str,
@@ -606,7 +604,7 @@ fn run_channel_map(
 fn run_layer_sweep(
     gpu: &mut rdna_compute::Gpu,
     weights: &engine::qwen35::Qwen35Weights,
-    config: &engine::qwen35::Qwen35Config,
+    _config: &engine::qwen35::Qwen35Config,
     batch_size: usize,
     threshold: f32,
     site_name: &str,
