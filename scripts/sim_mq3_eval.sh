@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
-# A/B eval: baseline MQ4 vs simulated MQ3 (round-tripped through 8 levels/group).
+# A/B eval: baseline MQ4 vs upper-bound-simulated MQ3 (sim_mq3.py).
 # Runs the same prompts through both copies and prints decoded text side-by-side.
+#
+# IMPORTANT: the "MQ3" file produced by sim_mq3.py is a pessimistic upper bound
+# on real MQ3 quality cost — it double-rounds f32 → q4 → q3' instead of f32 → q3
+# directly. If this eval shows fluent output, real MQ3 is likely viable. If it
+# collapses, real MQ3 might still work but the gap must be characterized by
+# re-quantizing from f32 safetensors, not from this harness output. See
+# sim_mq3.py docstring for the full discussion.
 set -u
 cd "$(dirname "$0")/.."
 
