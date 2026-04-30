@@ -903,7 +903,7 @@ impl Gpu {
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
-    fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+    pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
         self.ensure_kernel(
             "gemm_hfq4g256_residual_mmq",
             kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
@@ -4858,7 +4858,7 @@ impl Gpu {
         result
     }
 
-    fn gemm_hfq4g256_mmq_set_prequant(
+    pub fn gemm_hfq4g256_mmq_set_prequant(
         &mut self,
         a_raw: &GpuTensor,
         x_q8_ptr: *mut c_void,
