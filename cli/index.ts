@@ -515,6 +515,12 @@ function resolveModelTag(input: string): string {
   if (ALIASES[normalized]) return ALIASES[normalized];
   // Try adding "qwen3.5:" prefix
   if (REGISTRY[`qwen3.5:${normalized}`]) return `qwen3.5:${normalized}`;
+  // Reverse-resolve: if input looks like a filename (e.g. "qwen3.6-35b-a3b.mq4"),
+  // find the registry entry whose .file matches and return its tag. Without this,
+  // per-model config is silently ignored when the user passes a raw filename.
+  for (const [tag, entry] of Object.entries(REGISTRY)) {
+    if (entry.file === normalized || entry.file === input) return tag;
+  }
   return normalized;
 }
 
@@ -3594,10 +3600,11 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
-    const temp = Number(flags["--temp"] ?? cfg.temperature);
-    const topP = Number(flags["--top-p"] ?? cfg.top_p);
-    const repeatPenalty = Number(flags["--repeat-penalty"] ?? cfg.repeat_penalty);
-    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? cfg.max_tokens));
+    const runCfg = resolveModelConfig(model);
+    const temp = Number(flags["--temp"] ?? runCfg.temperature);
+    const topP = Number(flags["--top-p"] ?? runCfg.top_p);
+    const repeatPenalty = Number(flags["--repeat-penalty"] ?? runCfg.repeat_penalty);
+    const maxTokens = Math.floor(Number(flags["--max-tokens"] ?? runCfg.max_tokens));
     if (temp < 0) { console.error("Error: --temp must be >= 0 (0 = greedy)"); process.exit(1); }
     if (topP <= 0 || topP > 1) { console.error("Error: --top-p must be in (0, 1]"); process.exit(1); }
     if (repeatPenalty < 1) { console.error("Error: --repeat-penalty must be >= 1.0"); process.exit(1); }
