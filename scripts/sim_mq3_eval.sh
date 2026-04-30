@@ -3,14 +3,22 @@
 # Runs the same prompts through both copies and prints decoded text side-by-side.
 #
 # IMPORTANT: the "MQ3" file produced by sim_mq3.py is an APPROXIMATION of
-# real MQ3, NOT a strict upper bound on its quality cost. Per-weight error
-# vs real MQ3 can go either way; per-element variance is ~20% heavier;
-# worst-case error is ~40% heavier (because SNAP_4's 6→9 gap creates one
-# wide reconstruction bin spanning 0.4..0.6 of range vs 0.133-wide elsewhere).
-# Probabilistically biased pessimistic but not strictly worse. If this eval
-# shows fluent output, real MQ3 is likely viable; if it collapses, real
-# MQ3 probably also fails but the gap can't be characterized from this
-# harness alone. See sim_mq3.py docstring for the derivation.
+# real MQ3, NOT a strict upper bound on its quality cost.
+#
+# Per-element MSE: simulator ~61% heavier than real MQ3 (1.61×, verified
+#   numerically — 37/13500 vs 1/588 for uniform-input). The wide gap in
+#   reconstruction values 6/15 → 9/15 doesn't make a wider input bin (it
+#   stays 4/30), but it forces every internal bin to be poorly centered
+#   on its reconstruction value (offset 1/30 from bin center), inflating
+#   E[e²] by about half via the squared-mean term.
+# Worst-case error: simulator ~40% heavier (10% of range vs real MQ3's
+#   7.1% from the 1/14 max-error of the centered uniform grid).
+#
+# Probabilistically biased pessimistic at every scale, with larger gaps
+# than earlier docs claimed. If this eval shows fluent output, real MQ3
+# is likely viable. If it collapses, real MQ3 is probably also worse
+# than baseline MQ4 but the gap is too large to bound from this harness.
+# See sim_mq3.py docstring for the full derivation.
 set -u
 cd "$(dirname "$0")/.."
 

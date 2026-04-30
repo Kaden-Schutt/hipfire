@@ -25,28 +25,51 @@ NOT a strict upper bound on its quality cost:
       simulator picks q4_sim=0 → reconstructs to 0 (error 9%).
       Simulator LESS accurate than real MQ3.
 
-  Aggregate per-element variance is HIGHER for the simulator, not equal.
-  Real MQ3 has 8 uniform bins of width 2/14 ≈ 0.143; per-element variance
-  for uniform w is (1/14)² / 3 ≈ 1/588.
-  The simulator has 7 bins of width 4/30 ≈ 0.133 plus one outlier bin of
-  width 6/30 = 0.2 (the gap between recon=6/15 and recon=9/15 caused by
-  SNAP_4 skipping q4=7 and q4=8). Probability-weighted variance:
-    7 narrow bins × (4/30)²/12 × (4/30) + 1 wide bin × (6/30)²/12 × (6/30)
-    ≈ 1/486
-  So the simulator has ~20% higher per-element error variance than real
-  MQ3.
+  Aggregate per-element variance is HIGHER for the simulator, but for a
+  more subtle reason than I initially thought. The reconstruction values
+  jump from 6/15 → 9/15 (a 3/15 = 0.2 gap in OUTPUT space), but the
+  INPUT bins remain width 4/30 each — q4∈{6,7} → recon=6/15, q4∈{8,9} →
+  recon=9/15 are adjacent in input space. What the wide output gap
+  actually does is make every internal bin POORLY CENTERED on its
+  reconstruction value, and edge bins fully off-center.
 
-  Worst-case per-weight error is ~10% of range for the simulator
-  (half the wide bin's width = 3/30 = 0.1) vs ~7% for real MQ3
-  (half the bin width = 1/14 = 0.071). About 40% heavier tail.
+  Per-element MSE for uniform w in [0,1] (verified numerically against
+  10M samples — see scripts/sim_mq3.py commit history):
+
+    Real MQ3 — 8 evenly-spaced levels at k/7:
+      6 internal bins width 2/14, recon centered: E[e²]=(1/14)²/3=1/588
+      2 edge bins width 1/14, recon at edge:     E[e²]=(1/14)²/3=1/588
+      Per-element MSE = 1/588 ≈ 1.70e-3
+
+    Simulator — 8 levels at {0, 2/15, 4/15, 6/15, 9/15, 11/15, 13/15, 1}:
+      6 internal bins width 4/30, recon offset 1/30 from center:
+        E[e²] = (4/30)²/12 + (1/30)² = 28/10800 = 7/2700
+      2 edge bins width 3/30, recon at edge:
+        E[e²] = (3/30)²/12 + (1.5/30)² = 1/300
+      Per-element MSE = 6×(4/30)×(7/2700) + 2×(3/30)×(1/300)
+                      = 37/13500 ≈ 2.74e-3
+
+    Ratio: 37/13500 ÷ 1/588 = 1.612×
+
+  So the simulator has **~61% heavier per-element variance** than real
+  MQ3, not "approximately equal" or "~20% heavier" as earlier docs
+  claimed. Worst-case per-weight error is ~10% of range for the
+  simulator (3/30 from the off-center bin geometry) vs ~7.1% for real
+  MQ3 (1/14 from the centered uniform grid) — about 40% heavier tail.
 
   Combined: the simulator is biased pessimistic at every aggregation
-  scale — just by varying amounts. Per-weight ~50/50 either direction;
-  per-element variance ~20% heavier; worst-case ~40% heavier. For LLM
-  coherence (which depends on tail errors compounding through layers
-  per feedback_attention_precision.md), the simulator probably collapses
-  before real MQ3 would, but that's a probabilistic statement not a
-  strict ordering. NOT an upper bound on real MQ3 quality cost.
+  scale, but by larger margins than my prior docs claimed:
+    Per-weight: ~50/50 either direction per individual w
+    Per-element variance: ~61% heavier  (was claimed 20%)
+    Worst-case error: ~40% heavier
+  For LLM coherence (which depends on tail errors compounding through
+  layers per feedback_attention_precision.md), the simulator probably
+  collapses noticeably before real MQ3 would. NOT an upper bound, and
+  the gap is large enough that the qualitative conclusion of the
+  ablation (5/5 collapse on Qwen3.5 0.8B/9B) is weaker evidence about
+  real MQ3 than I previously framed it. A faithful simulator
+  (re-quantize from f32 safetensors, not from MQ4-quantized values) is
+  the only way to get a tight bound on real MQ3 quality cost.
 
   Concretely: if even this approximate MQ3 produces fluent output, real
   MQ3 is very likely viable too. If this approximate MQ3 collapses (as
