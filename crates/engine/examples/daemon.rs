@@ -831,6 +831,25 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
         // is missing or arch-mismatched, we log and continue without DFlash
         // (temp==0 requests will fall back to AR sampling).
+        // DFlash speculative-decode requires the target's lm_head to have a
+        // batched-GEMM kernel (used for verify and DDTree top-K). Only
+        // Q8_0 / HFQ4G256 / MQ4G256 currently have that kernel; MQ3G256
+        // and MQ2G256 lm_heads would silently fall back to a per-row
+        // GEMV that hangs. Refuse fast with a clear message so users
+        // know to either drop the draft or wait for the MQ3/MQ2 batched
+        // lm_head kernel (PRD Phase 2 follow-up).
+        if draft_path.is_some() {
+            let out_dt = weights.output.gpu_dtype;
+            if matches!(out_dt, rdna_compute::DType::MQ3G256 | rdna_compute::DType::MQ2G256) {
+                return Err(format!(
+                    "DFlash draft requested but target lm_head is {:?} — \
+                     no batched lm_head GEMM kernel exists for sub-4-bit MQ \
+                     targets yet (PRD Phase 2). Reload without a draft, \
+                     or use an MQ4 / HFQ4 / Q8 target.",
+                    out_dt
+                ));
+            }
+        }
         let dflash = if let Some(dp) = draft_path {
             // DFlash state (hidden_rb + target_hidden_host) sizes linearly with
             // the ctx_capacity argument. Pass `physical_cap` instead of
