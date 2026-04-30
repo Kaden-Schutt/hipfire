@@ -1,21 +1,70 @@
-//! MMQ vs WMMA bit-comparison diagnostic for Qwen3.5 GEMM call sites.
+//! MMQ vs WMMA bit-comparison diagnostic for Qwen3.5/3.6 GEMM call sites.
 //!
 //! Compares i8 WMMA + Q8_1 (MMQ) output against f16 WMMA output at each
 //! GEMM call site in a transformer layer to diagnose which site/channel/layer
-//! causes tool-call output corruption (ref: #87).
+//! causes tool-call output corruption (ref: Kaden-Schutt/hipfire#87).
 //!
-//! Usage:
-//!   cargo run --release --features deltanet --example channel_test_mmq -- \
-//!       --model <path.hfq> [--stage site-scan|channel-map|layer-sweep]
-//!       [--batch N] [--threshold F] [--layer N] [--site <name>]
+//! # Usage
 //!
-//! Stages:
+//! ```sh
+//! cargo run --release --features deltanet --example channel_test_mmq -- \
+//!     --model <path.mq4> --stage <STAGE> [OPTIONS]
+//! ```
+//!
+//! # Stages
+//!
 //!   site-scan   (default) — sweep every (layer, site) pair; print error table
-//!   channel-map — per-row error for a specific (site, layer) or all layers
-//!   layer-sweep — per-layer error for a specific site across all layers
+//!                           and top-10 worst pairs. Exit 1 if any exceed threshold.
+//!   channel-map           — per-output-row error for a specific (site, layer).
+//!                           Requires --site, optionally --layer.
+//!   layer-sweep           — per-layer error for a single site across all layers.
+//!                           Requires --site.
+//!   screen                — run the dispatch-level mmq_screen_weight() on every
+//!                           weight matrix. Reports which are safe/unsafe for MMQ.
+//!                           Threshold controlled by HIPFIRE_MMQ_SCREEN_THRESHOLD
+//!                           env var (default: 0.10).
 //!
-//! MMQ is only available on RDNA3/3.5: gfx1100, gfx1101, gfx1102, gfx1103,
-//! gfx1150, gfx1151. The binary exits 0 with a message on other archs.
+//! # Options
+//!
+//!   --model <path>       Model file (.mq4 / .hfq), required
+//!   --stage <name>       Stage to run (default: site-scan)
+//!   --batch <N>          Batch size for synthetic activations (default: 128)
+//!   --threshold <F>      Abs error threshold for flagging bad elements (default: 0.01)
+//!   --layer <N>          Filter to a specific layer (channel-map, layer-sweep)
+//!   --site <name>        Filter to a specific site (channel-map, layer-sweep)
+//!
+//! # Site names
+//!
+//! DeltaNet layers:     qkvza.qkv, qkvza.z, qkvza.beta, qkvza.alpha,
+//!                      gate_up.gate, gate_up.up, residual
+//! FullAttn layers:     qkv.q, qkv.k, qkv.v, gate_up.gate, gate_up.up, residual
+//! MoE variants:        same attention sites as above (FFN uses routed experts, skipped)
+//!
+//! # Typical workflow
+//!
+//! ```sh
+//! # 1. Which GEMM site has the most error?
+//! cargo run ... -- --model m.mq4 --stage site-scan --batch 128
+//!
+//! # 2. Which output rows in that site are worst?
+//! cargo run ... -- --model m.mq4 --stage channel-map --site residual --layer 0
+//!
+//! # 3. Is the error concentrated in specific layers?
+//! cargo run ... -- --model m.mq4 --stage layer-sweep --site residual
+//!
+//! # 4. Validate the screening fix catches the outliers
+//! cargo run ... -- --model m.mq4 --stage screen
+//! ```
+//!
+//! # Environment variables
+//!
+//! - `HIPFIRE_MMQ_SCREEN_THRESHOLD` — screening threshold (default: 0.10).
+//!   Weights with any output row exceeding this max abs error fall back to WMMA.
+//!
+//! # Hardware requirements
+//!
+//! MMQ (i8 WMMA) is only available on RDNA3/3.5: gfx1100, gfx1101, gfx1102,
+//! gfx1103, gfx1150, gfx1151. The binary exits 0 with a message on other archs.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -32,11 +81,25 @@ fn main() {
     // ── CLI parsing ──────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        eprintln!(
-            "Usage: channel_test_mmq --model <path.hfq> \
-             [--stage site-scan|channel-map|layer-sweep] \
-             [--batch N] [--threshold F] [--layer N] [--site <name>]"
-        );
+        eprintln!("MMQ vs WMMA bit-comparison diagnostic (ref: #87)");
+        eprintln!();
+        eprintln!("Usage: channel_test_mmq --model <path.mq4> [OPTIONS]");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --model <path>       Model file (.mq4 / .hfq), required");
+        eprintln!("  --stage <name>       site-scan (default) | channel-map | layer-sweep | screen");
+        eprintln!("  --batch <N>          Synthetic activation batch size (default: 128)");
+        eprintln!("  --threshold <F>      Abs error threshold for flagging (default: 0.01)");
+        eprintln!("  --layer <N>          Filter to layer N (channel-map, layer-sweep)");
+        eprintln!("  --site <name>        Filter to site (channel-map, layer-sweep, required)");
+        eprintln!();
+        eprintln!("Site names:");
+        eprintln!("  DeltaNet:  qkvza.qkv  qkvza.z  qkvza.beta  qkvza.alpha");
+        eprintln!("             gate_up.gate  gate_up.up  residual");
+        eprintln!("  FullAttn:  qkv.q  qkv.k  qkv.v  gate_up.gate  gate_up.up  residual");
+        eprintln!();
+        eprintln!("Env vars:");
+        eprintln!("  HIPFIRE_MMQ_SCREEN_THRESHOLD  Screening threshold (default: 0.10)");
         std::process::exit(0);
     }
 

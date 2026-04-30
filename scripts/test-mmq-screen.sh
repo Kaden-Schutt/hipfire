@@ -3,7 +3,8 @@
 # Runs three daemon invocations and checks for <|im_start|> leakage.
 set -uo pipefail
 
-export LD_LIBRARY_PATH="/nix/store/b1k6ma9wh4qrncw3vdbf34iayx7hfwdw-clr-7.2.2/lib:${LD_LIBRARY_PATH:-}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "$SCRIPT_DIR/rocm-env.sh"
 
 MODEL="${1:-$HOME/.hipfire/models/qwen3.5-9b.mq4}"
 EXE="target/release/examples/daemon"
