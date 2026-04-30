@@ -395,7 +395,7 @@ impl Gpu {
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
             mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.15),
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
