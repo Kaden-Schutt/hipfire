@@ -124,11 +124,31 @@ At model load time, for each weight matrix that will use the MMQ path:
 Expected cost: ~1-2 rows per 4096 fall back to WMMA. Performance
 impact: negligible (<0.05% of compute).
 
+## Screening prototype results
+
+Implemented in `dispatch.rs`: `mmq_screen_weight()` with per-weight
+caching. Activated via `HIPFIRE_MMQ_SCREEN=1`.
+
+### 9B model (threshold=0.15)
+
+- **19/216 weights flagged UNSAFE** (8.8%), 197 keep MMQ
+- Row 3994 in Wo: 15 layers (0-10, 12, 14, 16, 31)
+- Row 265 in qkv.v: layer 27
+- Row 644 in qkv.v: layer 31
+- Row 4209 in qkvza.qkv: layer 0
+- Row 1812 in qkvza.qkv: layer 28
+
+The screening correctly identifies the outlier rows that our channel-map
+analysis found, plus a few additional borderline cases in qkvza.qkv.
+All flagged weights fall back to WMMA; unflagged weights keep the fast
+MMQ path.
+
 ## Still to do
 
 - [x] Run channel-map on residual at layers 0, 1, 3, 6 — row 3994
       confirmed as consistent outlier
 - [x] Channel-map on layer 27 qkv.v — row 265 confirmed as outlier
-- [ ] Run site-scan on qwen3.6-27b.mq4 (canonical #87 reproducer)
+- [x] Run site-scan on qwen3.6-27b.mq4 — confirmed, worse peaks (0.91)
+- [x] Prototype per-row screening fix — implemented and validated
 - [ ] Investigate row 3994's HFQ4 weight statistics (scale/zero/range)
-- [ ] Prototype per-row screening fix
+- [ ] End-to-end validation: run daemon with MMQ+screening on tool-call prompt
