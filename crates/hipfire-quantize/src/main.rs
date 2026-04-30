@@ -1702,6 +1702,41 @@ fn main() {
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
 
+    // ── Sub-4-bit guards (2026-04-30 sweep) ─────────────────────────────
+    // MQ2 with the current uniform 4-level codebook collapses at every
+    // model size validated locally (0.8B / 4B / 9B Qwen 3.5 → multilingual
+    // mojibake on all 4 coherence-gate prompts). Refuse by default until
+    // Path D Lloyd-Max non-uniform codebooks land (PRD §5.2).
+    let allow_mq2 = args.iter().any(|a| a == "--allow-mq2")
+        || std::env::var("HIPFIRE_ALLOW_MQ2").ok().as_deref() == Some("1");
+    if use_mq2g256 && !allow_mq2 {
+        eprintln!(
+            "error: --format mq2 is reserved — empirical quality verdict is collapse on every model\n\
+             size validated locally (0.8B / 4B / 9B Qwen 3.5 → mojibake / symbol soup on all 4\n\
+             coherence-gate prompts). The current uniform 4-level codebook is fundamentally too\n\
+             lossy; Path D Lloyd-Max non-uniform codebooks (per-block squared-error-minimising)\n\
+             are the planned remediation per PRD §5.2.\n\
+             \n\
+             To opt in for research / ablation purposes anyway, pass --allow-mq2 or set\n\
+             HIPFIRE_ALLOW_MQ2=1. Don't ship MQ2 artifacts to users until the codebook\n\
+             improvement lands."
+        );
+        std::process::exit(1);
+    }
+    // MQ3 quality threshold ≈ 9B from the same sweep — 27B + 9B fluent,
+    // 4B partial-collapse (intent recognised, language drifts), 0.8B
+    // gibberish. Print a soft advisory so users running --format mq3
+    // against small models don't think the engine is broken.
+    if use_mq3g256 {
+        eprintln!(
+            "note: MQ3 empirical quality threshold ≈ 9B params. 27B / 9B Qwen 3.5 produce\n\
+             fluent output across the coherence-gate battery; 4B partially collapses\n\
+             (intent recognised, language mixes / loops); 0.8B is incoherent. For models\n\
+             below ~9B, prefer --format mq4 (same kernel family, ~30% larger but\n\
+             reliably coherent).\n"
+        );
+    }
+
     // GGUF input branch: if --input is a `.gguf` file, run the GGUF
     // pipeline and exit. Tensor names are translated GGUF → safetensors
     // style. The 2D quantization target follows --format:

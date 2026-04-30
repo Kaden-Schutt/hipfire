@@ -17,17 +17,31 @@ four production formats.
 | HFQ6-G256 | 6 | none | 200 | Dense, higher quality |
 | MQ4-G256 | 4 | FWHT | 136 | Qwen 3.5+ hybrid |
 | MQ6-G256 | 6 | FWHT | 200 | Qwen 3.5+ higher quality |
-| MQ3-G256 | 3 | FWHT | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth play (≥7B models only) |
-| MQ2-G256 | 2 | FWHT | 72 (8 hdr + 64 data) | Sub-4-bit aggressive (experimental) |
+| MQ3-G256 | 3 | FWHT | 104 (8 hdr + 96 data) | Sub-4-bit bandwidth play (≥9B models only) |
+| MQ2-G256 | 2 | FWHT | 72 (8 hdr + 64 data) | Reserved — uniform-grid collapses; pending Lloyd-Max codebook |
 
 **Sub-4-bit caveat**: MQ3 and MQ2 reuse the production HFQ3/HFQ2
-decode kernels with a pre-rotated `x` (no separate kernel). They're
-viable on ≥7B models (per QuIP# literature, 3-bit + Hadamard hits
-within 1–2% perplexity of 4-bit on larger models), but small models
-(≤1B) collapse — Qwen 3.5 0.8B in MQ3 produces incoherent text where
-0.8B in MQ4 answers fluently. There is no WMMA prefill path for MQ3
-or MQ2 yet, so prefill falls back to per-row GEMV until the kernel
-lands in a follow-up PR.
+decode kernels with a pre-rotated `x` (no separate kernel). Local
+validation pass on Qwen 3.5 / 3.6 (gfx1100, master `c448d5e`):
+
+- **MQ3 quality threshold ≈ 9B.** 27B + 9B both produce fluent on-topic
+  output across the 4-prompt coherence battery; 4B partially collapses
+  (recognises intent but loops in `<think>` / mixes languages); 0.8B
+  produces gibberish. Don't recommend MQ3 below 9B.
+- **MQ2 with the current uniform 4-level codebook collapses at every
+  size tested** (0.8B / 4B / 9B → multilingual mojibake / symbol soup
+  on all 4 prompts). Path D Lloyd-Max non-uniform codebooks (per-block
+  squared-error-minimising, see PRD §5.2) are the planned remediation;
+  until then `--format mq2` is reserved and gated behind an explicit
+  opt-in flag.
+
+There is no WMMA prefill path for MQ3 or MQ2 yet, so prefill falls
+back to per-row GEMV until the kernel lands in a follow-up PR. The
+eligibility check in `qwen35::forward_prefill_batch` (`is_batchable_la`)
+correctly excludes MQ3/MQ2 from the batched fast path; per-token
+`forward_scratch` handles them via `weight_gemv`'s MQ3/MQ2 dispatch
+arms. Engine wiring is correct — the quality verdict is purely about
+the format's expressiveness on each model size, not a runtime bug.
 
 Header layout (8 bytes): 4 bytes scale (f32-bitcast-from-f16) + 4 bytes
 zero point. Data: bitwidth × 256 / 8 bytes = 128 (4-bit) or 192 (6-bit)
