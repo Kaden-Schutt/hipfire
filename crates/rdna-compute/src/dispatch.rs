@@ -3692,6 +3692,14 @@ impl Gpu {
             let x_rot_row = x_rot.sub_offset(b * k, k);
             self.rotate_x_mq(&x_row, &x_rot_row, k)?;
         }
+        // Invalidate the fp16-conversion cache: `x_rot`'s pointer is stable
+        // across consecutive MQ3 wrapper calls (same scratch buffer reused
+        // per layer), but the underlying data was just rewritten by the
+        // rotate loop above. Without this, `ensure_fp16_x` would see the
+        // matching `fp16_x_source_ptr` and skip the f32→fp16 conversion,
+        // and the kernel would read stale fp16 values from the previous
+        // layer's rotation.
+        self.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_qkvza_hfq3g256_wmma(
             a_qkv, a_z, a_beta, a_alpha, x_rot,
             y_qkv, y_z, y_beta, y_alpha,
@@ -4075,7 +4083,8 @@ impl Gpu {
     }
 
     /// MQ3 wrapper for `gemm_gate_up_hfq3g256_wmma`: pre-rotates X then
-    /// dispatches the HFQ3 kernel.
+    /// dispatches the HFQ3 kernel. See `gemm_qkvza_mq3g256_wmma` for
+    /// the cache-invalidation rationale.
     pub fn gemm_gate_up_mq3g256_wmma(
         &mut self,
         a_gate: &GpuTensor, a_up: &GpuTensor,
@@ -4091,6 +4100,7 @@ impl Gpu {
             let x_rot_row = x_rot.sub_offset(b * k, k);
             self.rotate_x_mq(&x_row, &x_rot_row, k)?;
         }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_gate_up_hfq3g256_wmma(
             a_gate, a_up, x_rot, y_gate, y_up, gate_m, up_m, k, batch_size,
         )
@@ -5635,7 +5645,8 @@ impl Gpu {
     }
 
     /// MQ3 wrapper for `gemm_hfq3g256_residual_wmma`: pre-rotates X then
-    /// dispatches the HFQ3 kernel.
+    /// dispatches the HFQ3 kernel. See `gemm_qkvza_mq3g256_wmma` for
+    /// the cache-invalidation rationale.
     pub fn gemm_mq3g256_residual_wmma(
         &mut self,
         a_raw: &GpuTensor,
@@ -5651,6 +5662,7 @@ impl Gpu {
             let x_rot_row = x_rot.sub_offset(b * k, k);
             self.rotate_x_mq(&x_row, &x_rot_row, k)?;
         }
+        self.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_hfq3g256_residual_wmma(a_raw, x_rot, y, m, k, batch_size)
     }
 
