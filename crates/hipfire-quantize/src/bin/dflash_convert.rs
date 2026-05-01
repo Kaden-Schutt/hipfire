@@ -220,6 +220,54 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     }).collect()
 }
 
+/// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
+/// 104 bytes per 256 weights (0.406 B/w). Same binary layout as HFQ3-G256.
+/// Lifted verbatim from hipfire-quantize/main.rs's `quantize_mq3g256`.
+fn quantize_mq3g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    let group_size = 256;
+    let block_bytes = 104;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    for b in 0..n_blocks {
+        let start = b * group_size;
+        let end = (start + group_size).min(n);
+        let mut group = [0.0f32; 256];
+        let actual_len = end - start;
+        group[..actual_len].copy_from_slice(&f32_data[start..end]);
+
+        cpu_fwht_256(&mut group, signs1, signs2);
+
+        let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let scale = if range > 0.0 { range / 7.0 } else { 1.0 };
+        let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
+
+        let out_off = b * block_bytes;
+        output[out_off..out_off + 4].copy_from_slice(&scale.to_le_bytes());
+        output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
+
+        for chunk in 0..32 {
+            let ci = chunk * 8;
+            let mut q = [0u8; 8];
+            for j in 0..8 {
+                q[j] = ((group[ci + j] - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
+            }
+            let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
+            let b1 = ((q[2] >> 2) & 1) | ((q[3] & 7) << 1) | ((q[4] & 7) << 4) | ((q[5] & 1) << 7);
+            let b2 = ((q[5] >> 1) & 3) | ((q[6] & 7) << 2) | ((q[7] & 7) << 5);
+
+            let bo = out_off + 8 + chunk * 3;
+            output[bo] = b0;
+            output[bo + 1] = b1;
+            output[bo + 2] = b2;
+        }
+    }
+    output
+}
+
 /// MagnumQuant MQ4-G256: FWHT-rotated 4-bit quantization.
 /// 136 bytes per 256 weights (0.531 B/w). Same binary layout as HFQ4-G256;
 /// the rotation is baked into the weights so the GEMM kernel just rotates
@@ -273,6 +321,7 @@ enum QuantType {
     F16 = 1,
     F32 = 2,
     MQ4G256 = 13,
+    MQ3G256 = 17,
 }
 
 struct HfqTensor {
@@ -407,6 +456,7 @@ fn main() {
     let mut output_path: Option<String> = None;
     let mut keep_f32 = false;
     let mut use_mq4 = false;
+    let mut use_mq3 = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -427,9 +477,13 @@ fn main() {
                 use_mq4 = true;
                 i += 1;
             }
+            "--mq3" => {
+                use_mq3 = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq4]"
+                    "Usage: dflash_convert --input <dir_or_hf_id> --output <file.hfq> [--keep-f32 | --mq4 | --mq3]"
                 );
                 std::process::exit(0);
             }
@@ -439,8 +493,9 @@ fn main() {
             }
         }
     }
-    if keep_f32 && use_mq4 {
-        eprintln!("--keep-f32 and --mq4 are mutually exclusive");
+    let n_format_flags = (keep_f32 as u8) + (use_mq4 as u8) + (use_mq3 as u8);
+    if n_format_flags > 1 {
+        eprintln!("--keep-f32, --mq4, and --mq3 are mutually exclusive");
         std::process::exit(1);
     }
 
@@ -457,6 +512,8 @@ fn main() {
         "F32"
     } else if use_mq4 {
         "MQ4-G256 (weights), F32 (norms)"
+    } else if use_mq3 {
+        "MQ3-G256 (weights), F32 (norms)"
     } else {
         "F16 (weights), F32 (norms)"
     };
@@ -535,12 +592,13 @@ fn main() {
     );
 
     // Metadata JSON for the HFQ file.
-    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else { "f16" };
+    let draft_dtype = if keep_f32 { "f32" } else if use_mq4 { "mq4" } else if use_mq3 { "mq3" } else { "f16" };
     // FWHT sign tables for MQ4 rotation. Seeds 42/1042 match the engine's
     // `rdna_compute::Gpu::ensure_mq_signs()` so quantized weights here can
     // be dequantized/used correctly on GPU at inference.
-    let signs1: Vec<f32> = if use_mq4 { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2: Vec<f32> = if use_mq4 { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let needs_fwht = use_mq4 || use_mq3;
+    let signs1: Vec<f32> = if needs_fwht { gen_fwht_signs(42, 256) } else { Vec::new() };
+    let signs2: Vec<f32> = if needs_fwht { gen_fwht_signs(1042, 256) } else { Vec::new() };
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
@@ -608,6 +666,9 @@ fn main() {
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
             (QuantType::MQ4G256, 256u32, q)
+        } else if use_mq3 && n_elements >= 256 {
+            let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+            (QuantType::MQ3G256, 256u32, q)
         } else {
             (QuantType::F16, 0u32, f32_slice_to_f16_bytes(&f32_data))
         };

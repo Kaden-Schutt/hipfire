@@ -220,6 +220,13 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
         }
+        17 => {
+            // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
+            // as MQ4. Dispatch path (`gemm_dispatch`) routes through
+            // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0 })
+        }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }
 }
@@ -253,7 +260,7 @@ impl DflashWeights {
             .chain(layers.iter().flat_map(|l| {
                 [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down].into_iter()
             }))
-            .any(|w| matches!(w.gpu_dtype, DType::MQ4G256));
+            .any(|w| matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ3G256));
         if has_mq {
             // The MQ4 dispatch needs the engine's FWHT sign tables uploaded
             // (matches `gemv_mq4g256_with_rotate`'s setup).
@@ -575,6 +582,18 @@ fn gemm_dispatch(
             let rot_view = scratch.sub_offset(0, batch * w.k);
             gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
             gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
+        }
+        DType::MQ3G256 => {
+            // Mirrors the MQ4 path: pre-rotate x via FWHT (same shared signs
+            // as MQ4 — rotate_x_mq_batched is dtype-agnostic for the activation
+            // side), invalidate the FP16 x cache because the rotated bytes
+            // share the same source pointer, then dispatch the HFQ3 batched
+            // lm_head WMMA kernel.
+            let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
+            let rot_view = scratch.sub_offset(0, batch * w.k);
+            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
+            gpu.fp16_x_source_ptr = std::ptr::null_mut();
+            gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
