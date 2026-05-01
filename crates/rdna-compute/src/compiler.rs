@@ -311,10 +311,12 @@ impl KernelCompiler {
             "// __clang_cuda_complex_builtins.h that references ::max before it's\n",
             "// brought into scope. Source-level declarations reach the broken\n",
             "// header (unlike -include or -D); see issue #119.\n",
-            "inline __attribute__((device)) double max(double a, double b) { return a > b ? a : b; }\n",
-            "inline __attribute__((device)) float  max(float  a, float  b) { return a > b ? a : b; }\n",
-            "inline __attribute__((device)) double min(double a, double b) { return a < b ? a : b; }\n",
-            "inline __attribute__((device)) float  min(float  a, float  b) { return a < b ? a : b; }\n",
+            "// `static inline` so they coexist with __clang_hip_math.h's identical\n",
+            "// max/min defs (each TU gets its own internal-linkage copy; no ODR clash).\n",
+            "static inline __attribute__((device)) double max(double a, double b) { return a > b ? a : b; }\n",
+            "static inline __attribute__((device)) float  max(float  a, float  b) { return a > b ? a : b; }\n",
+            "static inline __attribute__((device)) double min(double a, double b) { return a < b ? a : b; }\n",
+            "static inline __attribute__((device)) float  min(float  a, float  b) { return a < b ? a : b; }\n",
         );
         let patched = format!("{shim}{source}");
         std::fs::write(src_path, &patched).map_err(|e| {
@@ -331,6 +333,16 @@ impl KernelCompiler {
             "--genco".into(),
             format!("--offload-arch={arch}"),
             "-O3".into(),
+            // Force-include the HIP runtime wrapper. On working ROCm
+            // installs this is auto-included in HIP mode and the directive
+            // is a redundant header-guard no-op; on broken Linux ROCm
+            // 7.2.x packaging (which fails to auto-include it) this is
+            // what brings __clang_hip_math.h's __DEVICE__ rsqrtf/exp2f/
+            // etc. into scope so kernels resolve to the device versions
+            // instead of the host stdlib versions. Pairs with the
+            // source-level max/min shim above. See issue #119.
+            "-include".into(),
+            "__clang_hip_runtime_wrapper.h".into(),
         ];
         // Some hipcc installs (notably V620's CachyOS build of ROCm 7.2) do not
         // auto-inject the HIP include path, so `#include <hip/hip_runtime.h>`
