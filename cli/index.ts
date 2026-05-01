@@ -381,16 +381,32 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
       // at the quant-extension dot. Version digit is captured so the draft
       // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
-      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq3|mq6|hfq4|hfq6|q8)/i);
       if (m) {
         const ver = m[1];                 // "5" or "6"
         const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
         const quant = m[3].toLowerCase();
-        const candidates = [
-          resolve(`${process.cwd()}/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${process.cwd()}/../../models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
-          resolve(`${homedir()}/.hipfire/models/qwen3${ver}-${size}-dflash-${quant}.hfq`),
+        // Prefer a draft matching the target's quant (mq3 target → mq3 draft
+        // for max VRAM savings, mq4 target → mq4 draft for max τ). Fall back
+        // to the cross-quant draft when the matching one isn't present, since
+        // mq3 drafts pair correctly with mq4 targets and vice versa (per the
+        // DFlash MQ3 cross-matrix landed in d62acb0). Search dirs:
+        // local CWD/models, repo root models, ~/.hipfire/models.
+        const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
+        const dirs = [
+          `${process.cwd()}/models`,
+          `${process.cwd()}/../../models`,
+          `${homedir()}/.hipfire/models`,
         ];
+        const candidates: string[] = [];
+        for (const d of dirs) {
+          candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${quant}.hfq`));
+        }
+        if (fallbackQuant) {
+          for (const d of dirs) {
+            candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${fallbackQuant}.hfq`));
+          }
+        }
         for (const c of candidates) {
           if (existsSync(c)) {
             params.draft = c;
