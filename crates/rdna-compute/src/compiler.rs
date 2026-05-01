@@ -287,7 +287,37 @@ impl KernelCompiler {
 
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
     fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str) -> HipResult<()> {
-        std::fs::write(src_path, source).map_err(|e| {
+        // Workaround for ROCm 7.2.x rocm-llvm packaging regression on Linux:
+        // /usr/include/hip/amd_detail/amd_hip_runtime.h:374 includes
+        // <__clang_cuda_complex_builtins.h> BEFORE <cuda_wrappers/algorithm>.
+        // The CUDA-mode complex builtins header expects a free `::max` that
+        // the algorithm wrapper would have brought into scope; in HIP-mode
+        // it isn't there, so kernel JIT fails with
+        //   "use of undeclared identifier 'max'; did you mean 'fmax'?"
+        // Verified affects rocm-llvm 22.0.0.26014 (7.2.0) and 22.0.0.26084
+        // (7.2.2) under Ubuntu 24.04 / noble. NixOS rocm-llvm ships a local
+        // patch that's not in the apt-side packaging.
+        //
+        // Fix: prepend `__attribute__((device)) inline` overloads of max/min
+        // for double and float to every kernel source so they're in scope
+        // before hip_runtime.h includes the broken cuda complex builtins.
+        // `-include` and `-Dmax=fmax` both fail because clang processes the
+        // cuda complex builtins header in an internal scope where user
+        // command-line and pre-include defines don't reach. Source-level
+        // declarations DO work because they're in the same translation unit.
+        // See issue #119.
+        let shim = concat!(
+            "// hipfire shim — works around ROCm 7.2.x rocm-llvm regression in\n",
+            "// __clang_cuda_complex_builtins.h that references ::max before it's\n",
+            "// brought into scope. Source-level declarations reach the broken\n",
+            "// header (unlike -include or -D); see issue #119.\n",
+            "inline __attribute__((device)) double max(double a, double b) { return a > b ? a : b; }\n",
+            "inline __attribute__((device)) float  max(float  a, float  b) { return a > b ? a : b; }\n",
+            "inline __attribute__((device)) double min(double a, double b) { return a < b ? a : b; }\n",
+            "inline __attribute__((device)) float  min(float  a, float  b) { return a < b ? a : b; }\n",
+        );
+        let patched = format!("{shim}{source}");
+        std::fs::write(src_path, &patched).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
         })?;
         let _ = std::fs::remove_file(obj_path);
