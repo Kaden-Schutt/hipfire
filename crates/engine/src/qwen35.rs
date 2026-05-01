@@ -2821,6 +2821,7 @@ pub fn forward_prefill_batch_with_pbs(
     // either constraint is violated, reject all MoE layers so the whole
     // chunk falls through to per-token.
     let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let arch = gpu.arch.as_str();
     let eligible = !force_fallback
         && n >= MIN_BATCH
         && dn_state.quant == StateQuant::Q8
@@ -2830,14 +2831,14 @@ pub fn forward_prefill_batch_with_pbs(
         ))
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype)
-                    && is_batchable_la(l.wz.gpu_dtype)
-                    && is_batchable_la(l.w_beta.gpu_dtype)
-                    && is_batchable_la(l.w_alpha.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
-                    && is_batchable_la(l.w_gate.gpu_dtype)
-                    && is_batchable_la(l.w_up.gpu_dtype)
-                    && is_batchable_la(l.w_down.gpu_dtype),
+                is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch),
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
             // MoE batched path: LA/FA projections must be MQ4 + every
             // routed/shared MoE weight must be MQ4. Top-K=8 and the
@@ -2845,19 +2846,19 @@ pub fn forward_prefill_batch_with_pbs(
             LayerWeights::DeltaNetMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wqkv.gpu_dtype)
-                    && is_batchable_la(l.wz.gpu_dtype)
-                    && is_batchable_la(l.w_beta.gpu_dtype)
-                    && is_batchable_la(l.w_alpha.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
                     && moe_ffn_all_mq4(&l.ffn),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wq.gpu_dtype)
-                    && is_batchable_la(l.wk.gpu_dtype)
-                    && is_batchable_la(l.wv.gpu_dtype)
-                    && is_batchable_la(l.wo.gpu_dtype)
+                    && is_batchable_la(l.wq.gpu_dtype, arch)
+                    && is_batchable_la(l.wk.gpu_dtype, arch)
+                    && is_batchable_la(l.wv.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
                     && moe_ffn_all_mq4(&l.ffn),
         });
 
@@ -2970,12 +2971,26 @@ pub fn forward_prefill_batch_with_pbs(
 /// eligibility check in `forward_prefill_batch` and the per-layer dtype
 /// branches in `forward_prefill_chunk`).
 #[inline]
-fn is_batchable_la(dt: DType) -> bool {
-    matches!(dt,
+fn is_batchable_la(dt: DType, arch: &str) -> bool {
+    let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
         | DType::MQ6G256 | DType::HFQ6G256
-        | DType::MQ3G256
-    )
+    );
+    if always_ok {
+        return true;
+    }
+    // MQ3 is batchable ONLY where the gfx11 wave32 WMMA builtin
+    // (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`) is available.
+    // Other archs (gfx12 RDNA4 / gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x
+    // CDNA3) lack this exact builtin or use a different name; the
+    // MQ3 WMMA family hasn't been ported to them yet, so admitting
+    // MQ3 to the batched fast-path on those archs would JIT-fail or
+    // silently produce wrong values. Keep them on the per-token
+    // forward_scratch fallback (correct, just slower) until the
+    // arch-specific MQ3 kernels land.
+    let mq3_with_wmma = matches!(dt, DType::MQ3G256)
+        && matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
+    mq3_with_wmma
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -3241,23 +3256,24 @@ fn forward_prefill_chunk(
     // differ by dtype and we branch on that at each layer) and (b) a Q8_0
     // or givens KV cache. If the check fails, FA layers fall back to
     // per-token gather/scatter via run_fa_layer_body.
+    let fa_arch = gpu.arch.as_str();
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype) &&
-                is_batchable_la(l.w_gate.gpu_dtype) &&
-                is_batchable_la(l.w_up.gpu_dtype) &&
-                is_batchable_la(l.w_down.gpu_dtype),
+                is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wv.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wo.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_gate.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_up.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.w_down.gpu_dtype, fa_arch),
             // MoE variant: attention weights must be MQ4-class (FFN is
             // checked separately by moe_ffn_all_mq4 in the eligibility gate).
             LayerWeights::FullAttnMoe(l) =>
-                is_batchable_la(l.wq.gpu_dtype) &&
-                is_batchable_la(l.wk.gpu_dtype) &&
-                is_batchable_la(l.wv.gpu_dtype) &&
-                is_batchable_la(l.wo.gpu_dtype),
+                is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wv.gpu_dtype, fa_arch) &&
+                is_batchable_la(l.wo.gpu_dtype, fa_arch),
             _ => true, // LA layers don't gate this check
         });
     // Under hipGraph capture, scalar kernargs get BAKED into the kernarg blob
