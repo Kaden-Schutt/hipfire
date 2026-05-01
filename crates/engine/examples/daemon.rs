@@ -825,29 +825,40 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         }
 
         // Defense-in-depth: refuse if any body weight is MQ2 (qt=18). MQ3
-        // is now allowed on gfx11 because the WMMA prefill family
-        // (qkvza/qkv/gate_up/residual hfq3) and `gemm_hfq3g256_batched_lmhead`
-        // are wired. MQ2 body still has no batched WMMA kernels and would
-        // silently fall back to per-token `forward_scratch` per verify cycle.
+        // is now allowed on gfx11 dense (arch_id=5) because the WMMA prefill
+        // family (qkvza/qkv/gate_up/residual hfq3) and
+        // `gemm_hfq3g256_batched_lmhead` are wired. MQ3 is REFUSED on:
+        //   - non-gfx11 archs (no batched WMMA prefill kernels)
+        //   - MoE/A3B targets (arch_id=6) — the MoE LA/FA prefill branches
+        //     and `moe_ffn_all_mq4` predicate are MQ4-only; MQ3 weights
+        //     would silently fall through to HFQ4 kernels with the wrong
+        //     104-vs-136 byte stride. (Future: wire MQ3 into the MoE
+        //     batched branches and the MoE FFN expert kernels.)
+        // MQ2 body still has no batched WMMA kernels anywhere.
+        let arch_is_dense_qwen35 = hfq.arch_id == 5;
+        let mq3_supported = arch_is_gfx11 && arch_is_dense_qwen35;
         let mq_unsupported = hfq.first_tensor_with_quant_type(18).map(|n| ("MQ2 (qt=18)", n));
         let mq_unsupported = mq_unsupported.or_else(|| {
-            // MQ3 body on non-gfx11 archs is also unsupported for DFlash.
-            if !arch_is_gfx11 {
+            if !mq3_supported {
                 hfq.first_tensor_with_quant_type(17).map(|n| ("MQ3 (qt=17)", n))
             } else {
                 None
             }
         });
         if let Some((qt_label, name)) = mq_unsupported {
+            let arch_reason = if !arch_is_dense_qwen35 && qt_label.starts_with("MQ3") {
+                format!("arch_id={} (MoE/A3B-class) has no MQ3 MoE kernels", hfq.arch_id)
+            } else {
+                format!("arch={} lacks the corresponding batched WMMA prefill family", gpu.arch)
+            };
             return Err(format!(
                 "DFlash draft requested but model contains {qt_label} weight \
-                 `{name}` and arch={} lacks the corresponding batched WMMA \
-                 prefill family. The prefill fast-path falls back to per-token \
-                 `forward_scratch` for every spec verify cycle — defeating \
+                 `{name}` and {arch_reason}. The prefill fast-path falls back \
+                 to per-token `forward_scratch` for every spec verify cycle \
+                 (or worse, a kernel-stride mismatch on MoE) — defeating \
                  DFlash's speedup. Reload without a draft, or use an MQ4 / \
-                 HFQ4 / Q8 target. (Future: port the MQ3/MQ2 WMMA family \
-                 to additional archs, or add gemm_hfq2g256_batched_lmhead.)",
-                gpu.arch
+                 HFQ4 / Q8 target. (Future: port MQ3/MQ2 to MoE branches and \
+                 additional archs.)"
             ));
         }
     }
