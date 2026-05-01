@@ -749,9 +749,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         //   - Always: Q8_0=3, HFQ4G256=6, MQ4G256=13
         //   - gfx11 only: MQ3G256=17
         // MQ2 (qt=18) is not yet wired into speculative.rs match arms.
+        // MQ3 WMMA family is ported to gfx11 (RDNA3) and gfx12 (RDNA4).
+        // Keep them grouped under the same flag — the builtin name differs
+        // (_w32 vs _w32_gfx12) but the dispatch wrappers route per-arch.
         let arch_is_gfx11 = matches!(
             gpu.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
         );
         let supported = match lm_qt {
             Some(3 | 6 | 13) => true,
