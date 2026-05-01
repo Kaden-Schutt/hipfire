@@ -215,6 +215,12 @@ pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/sr
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.gfx12.hip");
+// HFQ3-G256 sister of GEMM_QKVZA_HFQ4G256_WMMA_SRC. Same WMMA shape +
+// lane decomposition; only the inner K-tile unpack differs (3-bit
+// cross-byte vs 4-bit nibble). Used for MQ3 prefill via dispatch
+// wrapper that pre-rotates X. gfx11 K2 unroll variant — gfx12 K4 to
+// follow once K2 is validated.
+pub const GEMM_QKVZA_HFQ3G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_wmma.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
