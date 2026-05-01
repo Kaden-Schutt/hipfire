@@ -2711,6 +2711,56 @@ pub fn forward_prefill_batch_single_chunk_captured(
     let n = tokens.len();
     debug_assert!(n > 0 && n <= pbs.max_batch,
         "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
+
+    // Defense-in-depth: this entry point bypasses the eligibility check
+    // in `forward_prefill_batch_with_pbs`, so the caller is responsible
+    // for ensuring the batched fast-path is valid. The only structural
+    // bypass that could land here is an MQ3-weighted model on an arch
+    // that lacks the gfx11 wave32 WMMA builtin (gfx12, gfx10, gfx906,
+    // gfx94x). In production, `daemon.rs`'s DFlash refusal guard (PR
+    // #108) blocks any MQ3-weight model from reaching this path, but we
+    // still cross-check here so a future loosened guard or new caller
+    // doesn't silently dispatch into JIT-failing kernels.
+    let arch = gpu.arch.as_str();
+    let mq3_present = weights.layers.iter().any(|lw| match lw {
+        LayerWeights::DeltaNet(l) => matches!(l.wqkv.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wz.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_beta.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_alpha.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_gate.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_up.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_down.gpu_dtype, DType::MQ3G256),
+        LayerWeights::FullAttn(l) => matches!(l.wq.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wk.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wv.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_gate.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_up.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_down.gpu_dtype, DType::MQ3G256),
+        LayerWeights::DeltaNetMoe(l) => matches!(l.wqkv.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wz.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_beta.gpu_dtype, DType::MQ3G256)
+            || matches!(l.w_alpha.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wo.gpu_dtype, DType::MQ3G256),
+        LayerWeights::FullAttnMoe(l) => matches!(l.wq.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wk.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wv.gpu_dtype, DType::MQ3G256)
+            || matches!(l.wo.gpu_dtype, DType::MQ3G256),
+    });
+    let arch_has_wmma = matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
+    if mq3_present && !arch_has_wmma {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch_single_chunk_captured: model contains MQ3G256 \
+             weights but arch {arch} lacks the gfx11 wave32 WMMA builtin. The MQ3 \
+             prefill kernels (gemm_*_hfq3g256_wmma) only compile on \
+             gfx1100/1101/1102/1150/1151. Caller must use the non-captured \
+             forward_prefill_batch path (which falls back to per-token \
+             forward_scratch on this arch). gfx12 K4 variant for MQ3 is \
+             a planned follow-up."
+        )));
+    }
+
     forward_prefill_chunk(
         gpu, weights, config, tokens, start_pos,
         kv_cache, dn_state, scratch, pbs, hidden_rb,
