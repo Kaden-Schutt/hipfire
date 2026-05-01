@@ -3700,10 +3700,11 @@ switch (cmd) {
       // Fork a detached child. `setsid` gives it its own session so Ctrl-C
       // in the parent shell doesn't reach it; `nohup` ignores SIGHUP; stdout
       // + stderr go to the log file. HIPFIRE_DETACHED prevents infinite forking.
+      const runBg = (process.platform == "win32") ? ["cmd", "/c", "start", "/b"] : ["setsid", "nohup"]
       const self = process.argv[0];
       const script = process.argv[1];
       const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const child = Bun.spawn(["setsid", "nohup", self, script, "serve", String(port)], {
+      const child = Bun.spawn([...runBg, self, script, "serve", String(port)], {
         stdin: "ignore",
         stdout: logFd,
         stderr: logFd,
