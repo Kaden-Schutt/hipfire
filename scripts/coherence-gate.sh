@@ -85,6 +85,12 @@ SHORT_TESTS=(
     "qwen3.5-4b.mq4|code|Write a one-line Python function named square that returns n*n.|180"
     "qwen3.5-9b.mq4|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-9b.mq4|tool-call|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt"
+    # MQ3 coverage (gfx11+gfx12 only — refused on other archs at load).
+    # Verifies WMMA prefill family + K4-unroll decode + fused residual all
+    # dispatch and stay coherent. Same prompts as the MQ4 rows so output
+    # drift between bit-widths is comparable.
+    "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"

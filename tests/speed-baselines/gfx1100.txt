@@ -34,6 +34,40 @@
 27b_mq4_gen_tok_s=46.5
 27b_mq4_pp128_prefill_tok_s=491.1
 
+# MQ3 baselines — captured 2026-04-30 against commit 8b35171 with MQ3
+# WMMA prefill family (qkvza/qkv/gate_up/residual hfq3) + K4-unrolled
+# decode kernels + fused residual decode wired in. Same shape as the MQ4
+# rows above. Decode beats MQ4 on every size (lower bandwidth at 104 vs
+# 136 B/group); prefill matches MQ4 within ±2% post-WMMA.
+# (HIPFIRE_GRAPH=0 due to known graph-capture issue; see master notes.)
+0.8b_mq3_pp32_prefill_tok_s=1912.7
+0.8b_mq3_gen_tok_s=360.4
+0.8b_mq3_pp128_prefill_tok_s=6937.0
+
+4b_mq3_pp32_prefill_tok_s=1110.1
+4b_mq3_gen_tok_s=169.0
+4b_mq3_pp128_prefill_tok_s=2164.2
+
+9b_mq3_pp32_prefill_tok_s=1006.3
+9b_mq3_gen_tok_s=136.6
+9b_mq3_pp128_prefill_tok_s=1562.2
+
+27b_mq3_pp32_prefill_tok_s=374.8
+27b_mq3_gen_tok_s=48.9
+27b_mq3_pp128_prefill_tok_s=505.0
+
+# Context-fit @ 24 GB (RX 7900 XTX, asym3 KV) — informational, not gated.
+# Headline: 27B MQ3 fits 128K context where MQ4 OOMs at ~115K. 9B MQ3 has
+# headroom for larger scratch buffers / DFlash + bigger drafts.
+#
+#   model     weights  max_ctx (asym3 KV, 24 GB)
+#    9B  MQ3   4.0 GiB  >=128K (loads cleanly)
+#    9B  MQ4   4.9 GiB  >=128K
+#    27B MQ3  10.7 GiB   128K  (loads cleanly)
+#    27B MQ4  13.4 GiB   ~98K  (OOMs at 112K boundary)
+# 27B MQ3 saves ~2.7 GiB on weights vs MQ4, which is the difference between
+# fitting 128K and OOMing.
+
 # DFlash 27B-3.5 LRU code anchor — DEPRECATED 2026-04-28
 # Originally added 2026-04-26 after PR #32 regressed DFlash by 40% on a
 # 27B prompt. The metric measures peak tok/s at max=120, which is

@@ -2785,7 +2785,10 @@ pub fn forward_prefill_batch_single_chunk_captured(
             }
         }
     }
-    let arch_has_wmma = matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
+    let arch_has_wmma = matches!(arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        | "gfx1200" | "gfx1201"
+    );
     if mq3_in_moe {
         return Err(hip_bridge::HipError::new(0,
             "forward_prefill_batch_single_chunk_captured: model has MQ3G256 \
@@ -3076,17 +3079,20 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     if always_ok {
         return true;
     }
-    // MQ3 is batchable ONLY where the gfx11 wave32 WMMA builtin
-    // (`__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`) is available.
-    // Other archs (gfx12 RDNA4 / gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x
-    // CDNA3) lack this exact builtin or use a different name; the
-    // MQ3 WMMA family hasn't been ported to them yet, so admitting
-    // MQ3 to the batched fast-path on those archs would JIT-fail or
-    // silently produce wrong values. Keep them on the per-token
-    // forward_scratch fallback (correct, just slower) until the
-    // arch-specific MQ3 kernels land.
+    // MQ3 is batchable on archs with a WMMA family ported. As of this
+    // commit:
+    //   - gfx11 (gfx1100/1101/1102/1150/1151): wave32 WMMA via the
+    //     `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` builtin.
+    //   - gfx12 (gfx1200/1201): wave32 WMMA via the `_w32_gfx12` builtin
+    //     with K4 unroll + half8_t lane-split.
+    // gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA
+    // kernel; they stay on the per-token forward_scratch fallback
+    // (correct, just slower).
     let mq3_with_wmma = matches!(dt, DType::MQ3G256)
-        && matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
+        && matches!(arch,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
+        );
     mq3_with_wmma
 }
 
