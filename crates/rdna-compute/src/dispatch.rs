@@ -6355,8 +6355,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // WMMA eligibility: any arch with an MQ3 WMMA family ported. Today
+        // that's gfx11 (RDNA3, _w32 builtin) and gfx12 (RDNA4, _w32_gfx12
+        // builtin) — `gemm_hfq3g256_residual_wmma` dispatches internally to
+        // the correct variant per arch. Other archs (gfx10/906/94x) fall
+        // through to the per-row GEMV path.
         let wmma_eligible = batch_size > 1
-            && self.arch.starts_with("gfx11")
+            && (has_wmma_f16(&self.arch) || has_wmma_f16_gfx12(&self.arch))
             && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
             && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
         if wmma_eligible {
@@ -6367,9 +6372,11 @@ impl Gpu {
             }
             return self.gemm_hfq3g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        // Non-RDNA3 fallback: per-batch GEMV. Slow but functional — DFlash
-        // MQ3 drafts on non-gfx11 archs just don't get the WMMA fast-path
-        // until that arch gets its own MQ3 batched GEMM kernel.
+        // Non-WMMA fallback: per-batch GEMV. Slow but functional. DFlash on
+        // non-gfx11/gfx12 archs is already gated upstream by the daemon's
+        // DFlash refusal guard (lm_head whitelist requires gfx11 or gfx12
+        // for MQ3) — this fallback is reachable only via direct callers
+        // that bypass the daemon (e.g., bench harnesses, channel tests).
         for b in 0..batch_size {
             let x_row = x.sub_offset(b * k, k);
             let y_row = y.sub_offset(b * m, m);
