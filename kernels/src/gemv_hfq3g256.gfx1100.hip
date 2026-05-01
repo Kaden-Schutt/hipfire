@@ -1,18 +1,16 @@
 #include <hip/hip_runtime.h>
 
-// HFQ3-G256 GEMV with fused residual add: y[row] += A[row] · x.
-// Default (arch-agnostic) kernel matching the 4-accumulator pairwise-combine
-// ordering of gemv_hfq3g256.gfx1100.hip so that cross-arch byte-exactness is
-// preserved against MQ3 quality-gate baselines.
+// gfx1100 (RDNA3) HFQ3-G256 GEMV: 4x group unroll, packed uint24 unpack.
+// launch_bounds(32, 16) — matches MQ4 (RDNA3 has 16 waves/SIMD max).
+// Mirrors gemv_hfq4g256.gfx1100.hip; closes the MQ3 decode gap by giving
+// MQ3 the same 4-accumulator ILP that MQ4 already has on this arch.
 //
-// Identical math to gemv_hfq3g256 (single-row per warp, 32 threads × 8 weights
-// per group, packed uint24 unpack of 8×3 bits) except the final write
-// accumulates into y instead of overwriting. Used for wo and w_down
-// projections in the Qwen3.5 forward path to eliminate the alloc+gemv+add
-// fallback in the MQ3 arm of weight_gemv_residual.
+// Per group (104 B): 8 B header (fp32 scale + fp32 zero) + 96 B data.
+// 32 threads × 8 weights/group = 256 weights. Each thread owns 3 bytes
+// of packed 3-bit weights at byte_off = tid * 3.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq3g256_residual(
+extern "C" __global__ void gemv_hfq3g256(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -75,6 +73,10 @@ extern "C" __global__ void gemv_hfq3g256_residual(
         #undef DOG3
     }
 
+    // Tail groups must accumulate into their own accumulator (acc[g % 4]) —
+    // see gemv_hfq4g256.gfx1100.hip for the full bug explanation. Single
+    // accumulator drift breaks coherence on long generations when
+    // groups_per_row isn't a multiple of 4.
     #define TAIL_DOG3(pk, sc, zp, b, a) \
         (a) += (sc * (float)((pk) & 7u)        + zp) * x[(b)]     \
              + (sc * (float)(((pk) >> 3) & 7u)  + zp) * x[(b) + 1] \
@@ -121,5 +123,5 @@ extern "C" __global__ void gemv_hfq3g256_residual(
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
 
-    if (tid == 0) y[row] += acc;   // fused residual add
+    if (tid == 0) y[row] = acc;
 }

@@ -1,15 +1,10 @@
 #include <hip/hip_runtime.h>
 
-// HFQ3-G256 GEMV with fused residual add: y[row] += A[row] · x.
-// Default (arch-agnostic) kernel matching the 4-accumulator pairwise-combine
-// ordering of gemv_hfq3g256.gfx1100.hip so that cross-arch byte-exactness is
-// preserved against MQ3 quality-gate baselines.
-//
-// Identical math to gemv_hfq3g256 (single-row per warp, 32 threads × 8 weights
-// per group, packed uint24 unpack of 8×3 bits) except the final write
-// accumulates into y instead of overwriting. Used for wo and w_down
-// projections in the Qwen3.5 forward path to eliminate the alloc+gemv+add
-// fallback in the MQ3 arm of weight_gemv_residual.
+// gfx1100 (RDNA3) HFQ3-G256 GEMV with fused residual add: y[row] += A[row] · x.
+// Same 4x group unroll as gemv_hfq3g256.gfx1100.hip — only the final write
+// differs (+= instead of =). Used for wo and w_down in the Qwen3.5 forward
+// path to eliminate the alloc+gemv+add+free sequence in the MQ3 fallback
+// branch of weight_gemv_residual.
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void gemv_hfq3g256_residual(

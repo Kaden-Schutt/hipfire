@@ -781,7 +781,9 @@ pub fn weight_gemv_residual(
         DType::MQ3G256 => {
             // FWHT-rotate x into the shared mq_x_rot scratch, then dispatch
             // hfq3g256_residual against the rotated activations. Saves one
-            // add_inplace_f32 launch per layer per token vs the generic path.
+            // add_inplace_f32 launch per layer per token vs the generic
+            // path. gfx1100 picks the K4-unrolled chip variant (commit
+            // 0003103, 9B MQ3 decode 114 to 141 tok/s).
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
