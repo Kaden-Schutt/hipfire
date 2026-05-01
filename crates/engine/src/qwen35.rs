@@ -1296,6 +1296,22 @@ fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
 }
 
+/// Detect any MQ3G256 weight inside a MoE FFN block (router, shared expert
+/// gate/up/down, shared_expert_gate router-mix scalar, or any routed
+/// expert's gate_up/down). The MoE batched FFN kernels assume HFQ4-layout
+/// (136 B/group); an MQ3 weight (104 B/group) would dispatch with the wrong
+/// stride. Used by the captured-prefill defense-in-depth check.
+fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
+    ffn.router.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert_gate.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.gate.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.up.gpu_dtype == DType::MQ3G256
+        || ffn.shared_expert.down.gpu_dtype == DType::MQ3G256
+        || ffn.experts.iter().any(|e|
+            e.gate_up.gpu_dtype == DType::MQ3G256
+            || e.down.gpu_dtype == DType::MQ3G256)
+}
+
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
 /// be populated (done automatically by `Qwen35Scratch::new` when config
 /// indicates a MoE model). Safe to call under hipGraph stream capture.
@@ -2756,6 +2772,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
                     || matches!(l.w_beta.gpu_dtype, DType::MQ3G256)
                     || matches!(l.w_alpha.gpu_dtype, DType::MQ3G256)
                     || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || moe_ffn_has_mq3(&l.ffn)
                 { mq3_in_moe = true; }
             }
             LayerWeights::FullAttnMoe(l) => {
@@ -2763,6 +2780,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
                     || matches!(l.wk.gpu_dtype, DType::MQ3G256)
                     || matches!(l.wv.gpu_dtype, DType::MQ3G256)
                     || matches!(l.wo.gpu_dtype, DType::MQ3G256)
+                    || moe_ffn_has_mq3(&l.ffn)
                 { mq3_in_moe = true; }
             }
         }
