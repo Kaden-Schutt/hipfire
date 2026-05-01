@@ -2083,7 +2083,8 @@ fn verify_dflash_block_inner(
     let try_batched = match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0
         | rdna_compute::DType::HFQ4G256
-        | rdna_compute::DType::MQ4G256 => true,
+        | rdna_compute::DType::MQ4G256
+        | rdna_compute::DType::MQ3G256 => true,
         _ => false,
     };
 
@@ -2119,6 +2120,16 @@ fn verify_dflash_block_inner(
                 let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
                 gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
+                )?;
+            }
+            rdna_compute::DType::MQ3G256 => {
+                assert!(b * w_out.k <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized for MQ3 lm_head: b*k={} > max_n*hidden_k={}",
+                    b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
+                let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
+                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
             }
@@ -2605,7 +2616,7 @@ pub fn spec_step_dflash(
     let w_out = &target.weights.output;
     let use_batched_gemm = matches!(
         w_out.gpu_dtype,
-        rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256,
+        rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256 | rdna_compute::DType::MQ3G256,
     );
     let use_q8_staged = matches!(w_out.gpu_dtype, rdna_compute::DType::Q8_0);
     if use_batched_gemm || use_q8_staged {
@@ -2637,6 +2648,15 @@ pub fn spec_step_dflash(
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
                 gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+                )?;
+            }
+            rdna_compute::DType::MQ3G256 => {
+                assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
+                    "verify_scratch.rot undersized for MQ3 draft lm_head");
+                let rotated = verify_scratch.rot.sub_offset(0, batch * h);
+                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -3251,9 +3271,27 @@ fn run_dflash_draft_for_logits(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ3G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            // MQ3 has no scalar batched gemm (unlike MQ4), so use the
+            // WMMA-residual lm_head wrapper which pre-zeros Y. Same pattern
+            // as the verify path — keeps draft and verify byte-identical
+            // for MQ3 targets.
+            let r2 = gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
         )),
     };
     if let Err(e) = gemm_result {
@@ -3374,9 +3412,23 @@ fn run_dflash_draft_for_topk_gpu(
             let _ = gpu.free_tensor(rotated);
             r2
         }
+        rdna_compute::DType::MQ3G256 => {
+            let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
+            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            if let Err(e) = r1 {
+                let _ = gpu.free_tensor(rotated);
+                let _ = gpu.free_tensor(logits_batch);
+                return Err(e);
+            }
+            let r2 = gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
+            );
+            let _ = gpu.free_tensor(rotated);
+            r2
+        }
         _ => Err(hip_bridge::HipError::new(
             0,
-            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256)",
+            "ddtree: unsupported target.output dtype (need Q8/HFQ4G256/MQ4G256/MQ3G256)",
         )),
     };
     if let Err(e) = gemm_result {
