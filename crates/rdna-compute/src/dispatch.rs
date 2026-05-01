@@ -2278,26 +2278,44 @@ impl Gpu {
 
     /// HFQ3-G256 GEMV. K must be multiple of 256.
     /// Per-arch dispatch: gfx1100/1101/1102 uses the K4-unrolled
-    /// 4-accumulator variant (matches MQ4 ILP). Other archs use the baseline.
+    /// 4-accumulator variant. The default kernel was re-ported to match
+    /// the same ordering so non-RDNA3 archs (gfx1010, gfx1030, gfx12,
+    /// gfx9xx) produce byte-exact results against the RDNA3 baseline.
+    /// Uses `launch_maybe_blob` for HIPFIRE_GRAPH=1 capture safety.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq3g256")?;
-        let func = &self.functions["gemv_hfq3g256"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gemv_hfq3g256", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// HFQ3-G256 GEMV with fused residual add: y[row] += A[row] dot x.
     /// Used by `weight_gemv_residual` MQ3 arm to eliminate the
     /// alloc+gemv+add+free fallback chain (saves ~3 launches per residual).
     /// gfx1100 selects the K4-unrolled chip-specific variant (commit 0003103,
-    /// 9B MQ3 decode 114 to 141 tok/s); other archs use the simple default.
+    /// 9B MQ3 decode 114 to 141 tok/s); other archs use the K4-ported default
+    /// (re-port in 9fdba4d keeps non-RDNA3 archs byte-exact with the prior
+    /// gemv + add_inplace path). Uses launch_maybe_blob for HIPFIRE_GRAPH=1
+    /// capture safety.
     pub fn gemv_hfq3g256_residual(
         &mut self,
         a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
@@ -2305,15 +2323,27 @@ impl Gpu {
     ) -> HipResult<()> {
         let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemv_hfq3g256_residual")?;
-        let func = &self.functions["gemv_hfq3g256_residual"];
-        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32; let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "gemv_hfq3g256_residual", [m as u32, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        )
     }
 
     /// MagnumQuant MQ3-G256 GEMV with fused residual add. The pre-rotation
