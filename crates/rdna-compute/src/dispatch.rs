@@ -236,7 +236,7 @@ pub struct Gpu {
     fp16_x_scratch_bytes: usize,
     /// Pointer to the last FP32 source that was converted to fp16_x_scratch.
     /// If the next GEMM uses the same X, skip the conversion.
-    fp16_x_source_ptr: *mut c_void,
+    pub fp16_x_source_ptr: *mut c_void,
     /// Q8_1/MMQ scratch for prefill activations. Layout matches llama.cpp's
     /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
@@ -6044,6 +6044,47 @@ impl Gpu {
             return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
+    }
+
+    /// HFQ3-G256 sister of `gemm_hfq4g256_batched_lmhead`. Same FP16-X cache
+    /// stomp + zero-init of Y, then `gemm_hfq3g256_residual_wmma` to compute
+    /// y[b][row] = A[row] · x[b]. Used by `dflash::gemm_dispatch` for MQ3
+    /// drafts so DFlash works with MQ3-quantized draft weights.
+    ///
+    /// Caller is responsible for FWHT-rotating x first when the weights are
+    /// MQ3 (FWHT-rotated at quant time) — `dflash::gemm_dispatch` handles
+    /// that via `rotate_x_mq_batched`. This wrapper is dtype-agnostic in
+    /// the same sense as `gemm_hfq4g256_batched_lmhead`.
+    pub fn gemm_hfq3g256_batched_lmhead(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let wmma_eligible = batch_size > 1
+            && self.arch.starts_with("gfx11")
+            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+        if wmma_eligible {
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+            match self.active_stream.as_ref() {
+                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_hfq3g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        // Non-RDNA3 fallback: per-batch GEMV. Slow but functional — DFlash
+        // MQ3 drafts on non-gfx11 archs just don't get the WMMA fast-path
+        // until that arch gets its own MQ3 batched GEMM kernel.
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let y_row = y.sub_offset(b * m, m);
+            self.gemv_hfq3g256(a_raw, &x_row, &y_row, m, k)?;
+        }
+        Ok(())
     }
 
     // ========================================================================
