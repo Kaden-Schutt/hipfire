@@ -3590,6 +3590,115 @@ impl Gpu {
         result
     }
 
+    /// HFQ3-G256 sister of `gemm_qkvza_hfq4g256_wmma`. Same WMMA shape +
+    /// lane decomposition; only the inner K-tile unpack differs (3-bit
+    /// cross-byte vs 4-bit nibble) and the per-group byte stride is 104
+    /// instead of 136. Used for MQ3 prefill via dispatch wrappers that
+    /// pre-rotate `x` (see `gemm_qkvza_mq3g256_wmma` below). gfx11 K2
+    /// unroll variant — gfx12 K4 to follow once K2 is validated.
+    pub fn gemm_qkvza_hfq3g256_wmma(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel("gemm_qkvza_hfq3g256_wmma", kernels::GEMM_QKVZA_HFQ3G256_WMMA_SRC, "gemm_qkvza_hfq3g256_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        // HFQ3 storage = 104 B/group → ~3.06 bits/weight (vs HFQ4's 4.25).
+        let weight_bytes = (qkv_m + z_m + beta_m + alpha_m) * (k / 256) * 104;
+        let bytes = weight_bytes
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq3g256_wmma", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_hfq3g256_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m); b.push_i32(z_m_val); b.push_i32(b_m); b.push_i32(a_m);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3 wrapper: rotates `x` via `mq_rotate_x` (FWHT with shared sign
+    /// vectors) into the caller-provided `x_rot` scratch, then invokes
+    /// `gemm_qkvza_hfq3g256_wmma`. Mirror of `gemm_qkvza_mq4g256_wmma`.
+    /// Caller is responsible for `x_rot` being [batch × K] f32 scratch.
+    pub fn gemm_qkvza_mq3g256_wmma(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        x_rot: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Rotate batched x. mq_rotate_x_batched applies FWHT per-row.
+        for b in 0..batch_size {
+            let x_row = x.sub_offset(b * k, k);
+            let x_rot_row = x_rot.sub_offset(b * k, k);
+            self.rotate_x_mq(&x_row, &x_rot_row, k)?;
+        }
+        self.gemm_qkvza_hfq3g256_wmma(
+            a_qkv, a_z, a_beta, a_alpha, x_rot,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+        )
+    }
+
     /// gfx12 (RDNA4) sister of `gemm_qkvza_hfq4g256_wmma`. Same gfx12
     /// recipe as the other scaffolds (validated on R9700) extended to
     /// 4-output qkv/z/beta/alpha routing. Not yet wired into the public
