@@ -431,30 +431,39 @@ function buildLoadMessage(path: string, tag?: string | null): any {
       // Size segment may contain internal dashes (e.g. "35b-a3b"); stop only
       // at the quant-extension dot. Version digit is captured so the draft
       // prefix picks up qwen3.5 → qwen35 vs qwen3.6 → qwen36 correctly.
-      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq6|hfq4|hfq6|q8)/i);
+      const m = targetBn.match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq4|mq3|mq6|hfq4|hfq6|q8)/i);
       if (m) {
         const ver = m[1];                 // "5" or "6"
         const size = m[2].toLowerCase();  // "9b", "27b", "35b-a3b", ...
         const quant = m[3].toLowerCase();
-        const draftFile = `qwen3${ver}-${size}-dflash-${quant}.hfq`;
-        // Candidate order:
-        //   1. dirname(target). Highest priority. The most reliable signal we
-        //      have for "where this user keeps their weights" is the directory
-        //      the target was loaded from. In Docker (#110), `process.cwd()`
-        //      is `/hipfire` (the workdir) but models are mounted at
-        //      `/root/.hipfire/models`, so cwd-relative paths never resolve.
-        //      Using the target's own directory works for Docker, raw-file
-        //      invocations, and registry-tag invocations alike.
-        //   2-3. cwd-relative legacy candidates. Kept for back-compat with
-        //        existing scripts that lay drafts out alongside a project
-        //        `models/` dir.
-        //   4. ~/.hipfire/models: final fallback for native installs.
-        const candidates = [
-          resolve(`${dirname(path)}/${draftFile}`),
-          resolve(`${process.cwd()}/models/${draftFile}`),
-          resolve(`${process.cwd()}/../../models/${draftFile}`),
-          resolve(`${homedir()}/.hipfire/models/${draftFile}`),
+        // Candidate ordering combines two requirements:
+        //   1. dirname(target) goes FIRST. The most reliable signal we have
+        //      for "where this user keeps their weights" is the directory the
+        //      target was loaded from. In Docker (#110), process.cwd() is the
+        //      workdir but models are mounted elsewhere, so cwd-relative
+        //      paths never resolve. dirname-first works for Docker, raw
+        //      absolute paths, and registry-tag invocations alike.
+        //   2. mq3 target falls back to mq4 draft and vice versa, per the
+        //      DFlash MQ3 cross-matrix in d62acb0 (mq3 draft pairs correctly
+        //      with mq4 target and the reverse).
+        // For each search dir, try the target's matching quant first, then
+        // the cross-quant fallback.
+        const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
+        const dirs = [
+          dirname(path),
+          `${process.cwd()}/models`,
+          `${process.cwd()}/../../models`,
+          `${homedir()}/.hipfire/models`,
         ];
+        const candidates: string[] = [];
+        for (const d of dirs) {
+          candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${quant}.hfq`));
+        }
+        if (fallbackQuant) {
+          for (const d of dirs) {
+            candidates.push(resolve(`${d}/qwen3${ver}-${size}-dflash-${fallbackQuant}.hfq`));
+          }
+        }
         for (const c of candidates) {
           if (existsSync(c)) {
             params.draft = c;
