@@ -152,6 +152,8 @@ pub enum DType {
     MQ6G256,   // MagnumQuant: FWHT-rotated HFQ6-G256 (200 bytes/group, same as HFQ6G256)
     MQ3G256,   // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
     MQ2G256,   // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
+    MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
+    MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -163,7 +165,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -1581,6 +1583,55 @@ impl Gpu {
             &mut k_val as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MQ2-Lloyd GEMV (2-bit + per-block 4-entry fp16 codebook). K must be a
+    /// multiple of 256. Same launch shape as gemv_hfq2g256 — header is the
+    /// only layout difference.
+    pub fn gemv_mq2g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_mq2g256_lloyd", kernels::GEMV_MQ2G256_LLOYD_SRC, "gemv_mq2g256_lloyd")?;
+        let func = &self.functions["gemv_mq2g256_lloyd"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MQ2-Lloyd GEMV with engine-side x rotation (matches `gemv_mq2g256_with_rotate`).
+    pub fn gemv_mq2g256_lloyd_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq2g256_lloyd(a_raw, x_rot, y, m, k)
+    }
+
+    /// MQ3-Lloyd GEMV (3-bit + per-block 8-entry fp16 codebook). K must be a
+    /// multiple of 256.
+    pub fn gemv_mq3g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
+        self.ensure_kernel("gemv_mq3g256_lloyd", kernels::GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd")?;
+        let func = &self.functions["gemv_mq3g256_lloyd"];
+        let mut a_ptr = a_raw.buf.as_ptr(); let mut x_ptr = x.buf.as_ptr(); let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32; let mut k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void, &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void, &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(func, [m as u32, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+    }
+
+    /// MQ3-Lloyd GEMV with engine-side x rotation.
+    pub fn gemv_mq3g256_lloyd_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_mq3g256_lloyd(a_raw, x_rot, y, m, k)
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).

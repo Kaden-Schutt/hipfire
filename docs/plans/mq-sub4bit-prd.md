@@ -179,40 +179,102 @@ The post-FWHT weight distribution depends on the sign pattern. A sign vector tha
 
 ## 5. Phased Roadmap
 
-### Phase 1 — Q1: True Non-Uniform Lloyd-Max Codebook for MQ2
+### Phase 1 — Q1: True Non-Uniform Lloyd-Max Codebook for MQ2 (executed 2026-05-01: research-only)
 
-**Effort:** 1–2 weeks  
-**Impact:** Highest — could rescue MQ2 from all-fail to at-least-9B-pass  
-**Risk:** Low (precedent in asym3/asym4 KV codebooks)
+**Outcome (2026-05-01):** Implemented as `qt=19` (`MQ2G256Lloyd`) and
+ppl-validated. The codebook delivers a 41–55× ppl reduction over uniform
+MQ2 (e.g. 9B 120,108 → 2,163) but the absolute floor is still
+text-collapse — bit-width is the binding constraint, not codebook
+shape. **Stays research-only**, gated behind `--allow-mq2-lloyd` /
+`HIPFIRE_ALLOW_MQ2_LLOYD=1`. The format is plumbed for future
+combinations with GPTQ (Phase 2 / Q2) or QuIP#-style RHT (queue Q5).
 
-**Description:** Replace uniform MQ2's `{scale*0+zero, ..., scale*3+zero}` with a **per-block 4-entry fp16 codebook** produced by Lloyd's algorithm minimizing `E[(w − cb[q])²]` over the FWHT-rotated weights of that block.
+The win moved to **Phase 1.5 (Lloyd-Max MQ3)** below, which is what
+actually ships.
+
+**Original spec (kept for reference):**
+- 4 fp16 centroids = 8 bytes header.
+- 64 bytes data (256 × 2 bits).
+- Total: **72 bytes / group** — bit-exact same bandwidth as uniform MQ2.
+- Kernel: 4-entry register-resident lookup `recon = cb[q & 3]`.
+- VGPR: +2 fp16 (19 → 21 on gfx1100), no spill.
+- Quantize: percentile init at 12.5/37.5/62.5/87.5 → Lloyd's iterations
+  (max 8, early-exit on stable assignment) → sort centroids ascending.
+- On-disk: `qt=19`.
+
+**Empirical wikitext2-test ppl** (gfx1100, ctx=2048, scored=2039):
+
+| size | uniform MQ2 | Lloyd-MQ2 | Lloyd factor |
+|---|---:|---:|---:|
+| 0.8B | 803,852 | 19,651 | 40.9× |
+| 9B | 120,108 | 2,163 | 55.5× |
+
+**Acceptance gates failed:** target was 9B Lloyd-MQ2 fluent + ppl ≤ MQ4
+× 1.06; actual 9B Lloyd-MQ2 ppl=2,163 vs MQ4 10.34 = 209× — far below
+fluency floor. Original criteria not reachable at 2 bpw on Qwen3.5
+without bigger algorithmic change (Phase 2 GPTQ stack).
+
+### Phase 1.5 — Q1.5: Lloyd-Max MQ3 (validated 2026-05-01, ships pending dual gate)
+
+**Outcome:** This is what the Lloyd-Max work actually delivers.
+**Status:** Implemented as `qt=20` (`MQ3G256Lloyd`); ppl-validated; ships
+as the 3-bit default once both gates land.
 
 **Storage layout:**
-- Header: 4 fp16 centroids = 8 bytes (same byte count as uniform MQ2 header).
-- Data: 64 bytes (256 × 2 bits) — unchanged.
-- Total: **72 bytes / group** — bit-exact same bandwidth as uniform MQ2.
+- Header: **8 fp16 centroids = 16 bytes** (vs uniform MQ3's 8 B fp32
+  scale + zero — the codebook header doubles).
+- Data: 96 bytes packed 3-bit indices (cross-byte layout unchanged
+  from uniform MQ3, so kernel unpack code is identical except for the
+  reconstruction step).
+- Total: **112 bytes / group** vs uniform MQ3's 104 B → **+7.7 %
+  bandwidth cost**.
 
-**Kernel change:** Replace `recon = scale * q + zero` with a 4-entry register-resident lookup:
-```c
-half4 cb = *(const half4*)(group_ptr);
-half recon = cb[q & 3];
-```
-VGPR cost: +2 fp16 (19 → 21 on gfx1100), no spill.
+The +7.7% is the cost; the win is a 2.27× ppl reduction at 9B (42.03 →
+18.52). Bandwidth comparison against MQ4 (136 B/group) is **−17.6%**:
+Lloyd-MQ3 is materially smaller than MQ4 while sitting at 1.79× MQ4
+ppl (vs uniform MQ3's 4.07×).
 
-**Quantizer change:** Add `quantize_mq2g256_lloyd` in `hipfire-quantize`. Per 256-element block:
-1. Apply `cpu_fwht_256(signs ⊙ block) / 16`.
-2. Initialize 4 centroids at the 12.5/37.5/62.5/87.5 percentiles.
-3. **Lloyd's algorithm** to convergence (typically <10 iterations).
-4. Sort centroids ascending in the header (kernel does not need to know).
-5. Pack indices as 2 bits.
+**Kernel:** `gemv_mq3g256_lloyd.hip` with 8-entry register-resident
+codebook lookup (current implementation uses an 8-way switch which
+costs 3.2× decode vs uniform MQ3 — see ship gate 1 below).
 
-**On-disk:** Bump quant_type to `qt 19` (`MQ2G256_LLOYD`).
+**Quantizer:** `quantize_mq3g256_lloyd` in `hipfire-quantize`. Per
+256-element block: percentile init at 1/16, 3/16, …, 15/16 → Lloyd's
+iterations (max 8, early-exit) → sort centroids ascending → pack 3-bit
+indices same cross-byte layout as uniform MQ3. Parallelized via rayon
+`par_chunks_mut` over output blocks (9B quantize ~85s wall on 24-core).
 
-**Acceptance:**
-- 9B MQ2-Lloyd produces fluent output on the 4-prompt coherence battery.
-- 27B MQ2-Lloyd produces fluent output.
-- Perplexity delta vs MQ4 ≤ 6%.
-- Bytes/param == uniform MQ2.
+**On-disk:** `qt=20` (`MQ3G256Lloyd`).
+
+**Empirical wikitext2-test ppl:**
+
+| size | MQ4 | uniform MQ3 | **Lloyd-MQ3** | Lloyd factor | vs MQ4 |
+|------|---:|---:|---:|---:|---:|
+| 0.8B | 25.65 | 301.06 | **155.22** | 1.94× | 6.05× |
+| 4B   | 12.73 | 45.24  | **22.56**  | 2.01× | 1.77× |
+| 9B   | 10.34 | 42.03  | **18.52**  | 2.27× | 1.79× |
+
+**Ship gates** (both required before flipping `qt=20` to default and
+removing the `--allow-mq3-lloyd` guard):
+
+1. **Decode perf:** K4-unroll kernel restores 9B decode to ≥120 tok/s
+   on gfx1100 (current 8-way switch implementation: 44 tok/s vs uniform
+   MQ3's 141). Don't ship the 44 tok/s path — the user-visible 3.2×
+   latency regression cancels the quality win in chat usage.
+2. **Coherence eyeball:** 4-prompt coherence battery passes on 4B and
+   9B Lloyd-MQ3 with no attractor loops at the new ppl floor.
+
+Until both clear, Lloyd-MQ3 stays research-gated behind
+`--allow-mq3-lloyd` / `HIPFIRE_ALLOW_MQ3_LLOYD=1`.
+
+**Sub-9B status:** 0.8B Lloyd-MQ3 still text-collapse (155 vs MQ4 26 =
+6× worse). Below 9B, Lloyd alone is insufficient — needs Phase 2
+(GPTQ) or Phase 4 (mixed-MQ with MQ4 critical layers) on top.
+
+**See also:**
+- `docs/plans/mq-sub4bit-research-queue.md` Q1.5 — canonical research log.
+- `benchmarks/results/lloyd_max_findings_20260501.md` — empirical writeup.
+- `docs/plans/mq3-rounding-out-precompute-leverage.prd` §A — perf-leverage view.
 
 ### Phase 2 — Q2: GPTQ-Style Block-Wise Error Compensation
 
@@ -267,18 +329,23 @@ VGPR cost: +2 fp16 (19 → 21 on gfx1100), no spill.
 **Impact:** Medium — near-term release lever, no new math  
 **Risk:** Very low
 
-**Description:** Add `--format mixed-mq` to `hipfire-quantize` with a per-tensor policy table:
+**Description:** Add `--format mixed-mq` to `hipfire-quantize` with a per-tensor policy table. **The 3-bit slot uses Lloyd-MQ3 (qt=20, 112 B/group), not uniform MQ3** — see Phase 1.5 for the empirical justification:
 
-| Tensor class | Bpw |
-|---|---|
-| q_proj, k_proj, v_proj, o_proj | MQ4 (or MQ6 for sensitive heads) |
-| gate_proj, up_proj | MQ3 |
-| down_proj | MQ3 (widest matrix → biggest bandwidth win) |
-| lm_head | MQ4 (logits sensitivity) |
-| Embeddings | Q8F16 (existing) |
-| Norms | F16 (existing) |
+| Tensor class | Format | B/group |
+|---|---|---:|
+| q_proj, k_proj, v_proj, o_proj | MQ4 (or MQ6 for sensitive heads) | 136 |
+| gate_proj, up_proj | Lloyd-MQ3 | 112 |
+| down_proj | Lloyd-MQ3 (widest matrix → biggest bandwidth win) | 112 |
+| lm_head | MQ4 (logits sensitivity) | 136 |
+| Embeddings | Q8F16 (existing) | — |
+| Norms | F16 (existing) | — |
 
-**Expected average:** ~3.3 bpw — same bandwidth as uniform MQ3, better quality on sub-9B.
+**Expected average:** ~3.5 bpw — slightly above uniform MQ3's 3.25 bpw because Lloyd-MQ3 carries +7.7% header. The quality reclaim (2.27× ppl reduction on the 3-bit slot) makes the bandwidth bump trivially worth it.
+
+**Phase 4 is gated on Phase 1.5 ship gates clearing** — Lloyd-MQ3 must
+have its K4-unroll perf fix and coherence eyeball pass before mixed-MQ
+ships, or mixed-MQ inherits the 44 tok/s decode regression in its
+3-bit slot.
 
 **Acceptance:**
 - 4B mixed-MQ passes coherence battery where 4B MQ3 partially collapses.

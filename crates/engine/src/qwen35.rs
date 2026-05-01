@@ -539,6 +539,14 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
         }
+        19 => { // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook (72 bytes/group)
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256Lloyd, m, k, row_stride: 0 })
+        }
+        20 => { // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook (112 bytes/group)
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
@@ -603,6 +611,14 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0 })
+        }
+        19 => { // MQ2-G256-Lloyd — MagnumQuant 2-bit + 4-entry fp16 codebook
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256Lloyd, m, k, row_stride: 0 })
+        }
+        20 => { // MQ3-G256-Lloyd — MagnumQuant 3-bit + 8-entry fp16 codebook (112 B/group)
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0 })
         }
         3 => { // Q8_0
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -833,6 +849,115 @@ fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipRes
                     out.push(scale * q6 + zero);
                     out.push(scale * q7 + zero);
                 }
+            }
+            out
+        }
+        20 => {
+            // MQ3-G256-Lloyd (qt 20, 112 B/group): 8 fp16 codebook entries + 3-bit
+            // indices (cross-byte, 32 chunks × 3 bytes × 8 weights). Decode is
+            // direct lookup `cb[idx]` then inverse FWHT for CPU consumers.
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 112;
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let mut cb = [0.0f32; 8];
+                for k in 0..8 {
+                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
+                    cb[k] = crate::llama::f16_to_f32(bits);
+                }
+                let start = out.len();
+                for chunk in 0..32 {
+                    let bo = off + 16 + chunk * 3;
+                    let b0 = data[bo] as u32;
+                    let b1 = data[bo + 1] as u32;
+                    let b2 = data[bo + 2] as u32;
+                    let q0 = (b0 & 7) as usize;
+                    let q1 = ((b0 >> 3) & 7) as usize;
+                    let q2 = (((b0 >> 6) | (b1 << 2)) & 7) as usize;
+                    let q3 = ((b1 >> 1) & 7) as usize;
+                    let q4 = ((b1 >> 4) & 7) as usize;
+                    let q5 = (((b1 >> 7) | (b2 << 1)) & 7) as usize;
+                    let q6 = ((b2 >> 2) & 7) as usize;
+                    let q7 = ((b2 >> 5) & 7) as usize;
+                    out.push(cb[q0]);
+                    out.push(cb[q1]);
+                    out.push(cb[q2]);
+                    out.push(cb[q3]);
+                    out.push(cb[q4]);
+                    out.push(cb[q5]);
+                    out.push(cb[q6]);
+                    out.push(cb[q7]);
+                }
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let scale_inv = 0.0625;
+                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
+            }
+            out
+        }
+        19 => {
+            // MQ2-G256-Lloyd (qt 19, 72 B/group): 4 fp16 codebook entries + 2-bit indices.
+            // Decode is direct lookup `cb[idx]`, then inverse FWHT to recover original
+            // pre-rotation values for CPU consumers (DeltaNet conv1d).
+            let group_size: usize = 256;
+            let bytes_per_group: usize = 72;
+            let n_groups = data.len() / bytes_per_group;
+            let mut out = Vec::with_capacity(n_groups * group_size);
+            let signs1 = crate::llama::KvCache::gen_fwht_signs(42, 256);
+            let signs2 = crate::llama::KvCache::gen_fwht_signs(1042, 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let mut cb = [0.0f32; 4];
+                for k in 0..4 {
+                    let bits = u16::from_le_bytes([data[off + 2 * k], data[off + 2 * k + 1]]);
+                    cb[k] = crate::llama::f16_to_f32(bits);
+                }
+                let start = out.len();
+                for i in 0..64 {
+                    let byte_val = data[off + 8 + i] as usize;
+                    out.push(cb[byte_val & 3]);
+                    out.push(cb[(byte_val >> 2) & 3]);
+                    out.push(cb[(byte_val >> 4) & 3]);
+                    out.push(cb[(byte_val >> 6) & 3]);
+                }
+                // Inverse FWHT to recover pre-rotation weights — same butterfly as the
+                // MQ3/MQ2 arm below.
+                let group = &mut out[start..start + 256];
+                for i in 0..256 { group[i] *= signs2[i]; }
+                let mut stride = 1;
+                while stride < 256 {
+                    let mut j = 0;
+                    while j < 256 {
+                        for k in 0..stride {
+                            let a = group[j + k];
+                            let b = group[j + k + stride];
+                            group[j + k] = a + b;
+                            group[j + k + stride] = a - b;
+                        }
+                        j += stride * 2;
+                    }
+                    stride <<= 1;
+                }
+                let scale_inv = 0.0625;
+                for i in 0..256 { group[i] *= scale_inv * signs1[i]; }
             }
             out
         }

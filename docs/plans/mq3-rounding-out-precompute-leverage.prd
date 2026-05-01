@@ -1,0 +1,367 @@
+# MQ3 Rounding-Out: Quant-Time Pre-Compute Leverage
+
+**Status:** Deferred — documenting the leverage analysis for later pickup.
+**Last updated:** 2026-04-30
+**Companion docs:** `mq-sub4bit-prd.md`, `mq-sub4bit-research-queue.md`
+**Branch context:** Written after the MQ3 WMMA family + engine wiring landed
+on `fix/mq3-mq2-cli-guards` (commits `1a219b2` … `df88da9`). The 17×
+prefill speedup that work delivered was a kernel-coverage win, not a
+quant-time win — this doc inventories what shifting more runtime work
+to quant-time could *additionally* buy.
+
+---
+
+## 1. Framing
+
+The FWHT pre-rotation of weights at quant-time is hipfire's existing
+example of "move the work offline." Weights are stored already-rotated;
+runtime only needs to rotate the activation `x` once per layer (a
+fused `rmsnorm + FWHT(signs ⊙ x)` kernel), and the GEMM kernel sees
+the rotated weight bytes as opaque storage.
+
+**Question:** Are there other runtime ops we can pre-bake the same way
+to give pre-computed leverage on MQ3 perf or quality?
+
+**Honest answer (updated 2026-05-01):** The FWHT pre-rotation already
+captured the cleanest quant-time bake the architecture allows. Most
+remaining levers are small (1–3 % wins) or shift work to *load-time* /
+kernel-fusion rather than quant-time. **One big lever exists**
+(Lloyd-Max per-block codebook); empirically it is a **quality** lever,
+not a perf one — it cuts 9B MQ3 ppl 2.27× over uniform but the GEMV
+codebook lookup is a 3.2× decode regression on gfx1100 that needs a
+follow-on K4-unroll kernel pass to recover. The rest are small side
+moves. Section A documents the validated outcome and the gates before
+shipping it as the 3-bit default.
+
+This PRD inventories the candidates so a future pass can pick them up
+in informed priority order.
+
+---
+
+## 2. Candidates ranked by leverage
+
+### A. Lloyd-Max per-block codebook — VALIDATED 2026-05-01, +127% ppl improvement on 9B MQ3
+
+**Status:** Implemented and ppl-validated for both MQ2 (qt=19) and MQ3
+(qt=20). Lloyd-Max MQ3 is now the most promising sub-4-bit format
+hipfire ships — pending K4-unroll decode-perf recovery and eyeball
+coherence pass before flipping the default away from uniform MQ3.
+
+**Effort:** Spent — full implementation took ~1 day (algorithm +
+parallelization + kernels + DType + dispatch + perplexity harness +
+research-only guards). Single-thread Lloyd's was prohibitive at 9B; the
+parallel rewrite via rayon `par_chunks_mut` over output blocks made it
+viable (9B Lloyd-MQ3 quantize ~85s wall on 24-core).
+
+**Quality wins (wikitext2-test ppl, gfx1100 ctx=2048):**
+
+| size | MQ4 | MQ3 uniform | **MQ3-Lloyd** | uniform-MQ3 → Lloyd |
+|------|---:|---:|---:|---:|
+| 0.8B | 25.65 | 301.06 | **155.22** | 1.94× |
+| 4B   | 12.73 | 45.24  | **22.56**  | 2.01× |
+| 9B   | 10.34 | 42.03  | **18.52**  | **2.27×** |
+
+9B Lloyd-MQ3 sits at **1.79× MQ4** — the closest sub-4-bit has come to
+MQ4 quality at hipfire (uniform MQ3 was 4.07×).
+
+For MQ2 the algorithm also works (55.5× over uniform MQ2 at 9B) but
+absolute floor remains text-collapse (ppl 2,163), so MQ2-Lloyd stays
+research-only behind `--allow-mq2-lloyd`.
+
+**Perf impact:** Decode hit a 3.2× slowdown on 9B (141 → 44 tok/s) from
+the 8-way switch in `gemv_mq3g256_lloyd.hip`. Recoverable via K4-unroll
++ LDS-resident codebook table (mirror `gemv_hfq3g256.gfx1100.hip`'s
+4-accumulator pattern). Tracked as task #83 — **gate on this landing
+before flipping the default**. Don't ship the 44 tok/s decode path to
+users; the prior MQ3 baseline was 141 tok/s and dropping that to 44
+trades a 4× ppl-quality win for a 3× decode-speed regression that's
+visible in chat latency. Both gates required:
+
+1. K4-unroll kernel restores decode to ≥120 tok/s on 9B gfx1100.
+2. Coherence-gate eyeball pass on the 4-prompt battery for 4B and 9B
+   confirms no attractor loops at the new ppl floor.
+
+#### Mechanism
+For each 256-element block at quant time, run Lloyd's algorithm to
+produce 8 fp16 reconstruction values (centroids). Store them in the
+8-byte block header (replacing `scale: fp32 + zero: fp32`). At runtime
+the dequant becomes:
+
+```
+old: recon = sc_h * (fp16 of int q) + zp_h    // 1 mul + 1 add per weight
+new: recon = cb[q]                             // 1 indexed register load
+```
+
+The arithmetic saving was *predicted* to be hidden in the WMMA load
+pipeline. **Empirically the GEMV path doesn't hide it**: an 8-way
+register-resident switch on `q ∈ [0,7]` compiles to a longer dependency
+chain than `scale*q + zero`, and decode dropped 3.2× on 9B (141 → 44
+tok/s) on gfx1100. The K4-unroll perf fix (task #83) is what closes
+this gap; with it the runtime perf delta should be near-zero. The
+**quality** delta is the real win: non-uniform centroids fit the
+post-FWHT weight distribution better than the affine map `scale*q +
+zero` can — 2.27× ppl reduction on 9B is the empirical confirmation.
+
+#### Storage
+Codebook stores 8 fp16 = 16 bytes vs current 8-byte header → +8 bytes
+per 256-element group → 112 B/group → **+7.7 % bandwidth cost**.
+
+The original framing of this storage cost as "net loss as a perf bake
+on MQ3" was wrong — it priced the codebook against bandwidth alone, not
+against the quality reclaim. With 2.27× ppl reduction on 9B for +7.7%
+bandwidth, MQ3-Lloyd has the cleanest quality position of any sub-4-bit
+format hipfire has measured: closer to MQ4 quality (1.79× vs uniform
+MQ3's 4.07×) for less bandwidth (-17.6% vs MQ4's 136 B/group). 9B
+Lloyd-MQ3 ships as the 3-bit default after both gates clear (K4-unroll
+perf fix + 4B/9B coherence eyeball pass — same gates listed under "Perf
+impact" and the "Decision rule" below).
+
+For MQ2 the picture inverts: the 55× win over uniform MQ2 still leaves
+9B at ppl 2,163 (text-collapse) so storage isn't the binding constraint
+— the bit-width is. MQ2-Lloyd ships as research-only (qt=19, gated
+behind `--allow-mq2-lloyd`).
+
+#### Decision rule (2026-05-01 — actual outcome inverts the original prediction)
+
+**Original guidance was**: ship Lloyd-Max as MQ2 storage, not MQ3,
+because the storage cost was assumed to be a perf-only loss on MQ3.
+The empirical answer is the opposite — the codebook delivers a 2.27×
+ppl reduction on 9B MQ3, which is the actual product win. **Lloyd-Max
+MQ3 will become the default 3-bit format** (replacing uniform MQ3) once
+both ship gates clear:
+
+1. K4-unroll kernel (task #83) restores 9B decode to ≥120 tok/s on
+   gfx1100. Without it, Lloyd-MQ3 decode is 44 tok/s vs uniform MQ3's
+   141 — an unacceptable user-visible latency regression.
+2. Coherence-gate eyeball pass on the 4-prompt battery for 4B and 9B
+   confirms no attractor loops at the new ppl floor.
+
+Until both clear, `qt=20` (`MQ3G256Lloyd`) stays plumbed but
+research-gated behind `--allow-mq3-lloyd` /
+`HIPFIRE_ALLOW_MQ3_LLOYD=1`. Lloyd-Max MQ2 (`qt=19`) stays plumbed but
+**permanently** research-only — the bit-width is the binding
+constraint, not storage.
+
+#### Lloyd-Max MQ4 explicitly deprioritized
+
+The natural next extension would be 16 fp16 centroids + 4-bit indices
+= 168 B/group (+23.5% bandwidth over uniform MQ4). **Not pursued**:
+
+1. 9B MQ4 ppl=10.34 already has narrow quant-loss room (fp16 baseline
+   ≈9.5). An oracle codebook reclaims ~10% — small absolute win for
+   +24% bandwidth.
+2. Lloyd-MQ3 closes the bigger gap (4× → 1.79× vs MQ4) for less
+   bandwidth (+7.7%). 3-bit is where the value sits.
+3. No surfaced sub-9B MQ4 quality collapse yet. If a future ppl sweep
+   on smaller MQ4 finds hidden drops the eyeball missed (analogous to
+   what happened with 9B MQ3), reopen.
+
+See `docs/plans/mq-sub4bit-research-queue.md` Q1.5 for the canonical
+research log entry; full empirical data in
+`benchmarks/results/lloyd_max_findings_20260501.md`.
+
+---
+
+### B. Pre-baked `signs1 ⊙ norm_weight` (load-time, not quant-time)
+
+**Effort:** ~half-day.
+**Perf impact:** Negligible (~hidden_dim ops saved per layer per token).
+**Risk:** None — math-equivalent transform.
+
+#### Mechanism
+At load time, fold the FWHT signs1 vector into the per-layer norm weight:
+```
+signed_norm[i] = signs1[i mod 256] * attn_norm[i]
+```
+
+The fused `rmsnorm + rotate` kernel uses `signed_norm[i]` as the
+per-channel scale, dropping one fp16 multiply per dim per token.
+
+#### Why it's small
+RMSNorm is already fast (~50 µs/layer at hidden_dim=4096 on gfx1100).
+Saving one element-wise multiply is in noise.
+
+#### Worth doing alongside
+A future pass that touches the `fused_rmsnorm_rotate_mq_batched`
+kernel for any reason should pick this up as a free side-cleanup.
+
+---
+
+### C. Per-K-group `x_group_sum` precompute + zero-point fold-out
+
+**Effort:** ~1 day.
+**Perf impact:** Trivial (~0.4 % of FLOPs in the GEMM saved).
+**Risk:** Low — math-equivalent decomposition.
+
+#### Mechanism
+Currently the kernel computes:
+```
+y[m] = Σ_k (scale[m,g(k)] · q[m,k] + zero[m,g(k)]) · x[k]
+```
+
+Split into:
+```
+y[m] = Σ_k scale[m,g(k)] · q[m,k] · x[k]      (the main WMMA term)
+     + Σ_g zero[m,g] · x_group_sum[g]          (bias term)
+```
+
+where `x_group_sum[g] = Σ_{k ∈ group g} x[k]` is precomputed once per
+dispatch and reused across all M output rows.
+
+#### Why it's small
+The current kernel computes the bias term inline alongside the main
+term — it's not currently a measurable cost. Splitting it out replaces
+`N × K` bias-multiplies with `N × (K/256) + K` multiplies, but the
+saved ops were already pipelined alongside loads.
+
+#### Worth doing alongside
+A future pass that introduces a custom GEMM kernel for some perf
+reason can pick this up if it unlocks a bigger optimization (e.g.,
+removing the per-group zero load from the inner K-tile loop, freeing
+a register).
+
+---
+
+### D. Pre-compiled `.hsaco` blobs shipped with `.mq3` files
+
+**Effort:** 2–3 days.
+**Perf impact:** First-run wait reduced from a few seconds to ~zero.
+Zero impact on steady-state perf.
+**Risk:** Storage bloat in the artifact; cross-arch matrix complicates
+which blobs to ship.
+
+#### Mechanism
+Currently kernels are JIT'd from `.hip` source on first run, then
+cached at `~/.hipfire/bin/kernels/compiled/<arch>/`. A user's first
+prefill on a fresh machine pays the JIT cost (a few seconds per kernel
+× ~30+ kernels).
+
+Bundling pre-compiled `.hsaco` blobs in the `.mq3` file (or in a
+sibling `.hsaco-bundle` file) would skip the JIT entirely.
+
+#### Tradeoffs
+- **Cross-arch matrix**: 12+ arches × ~30 kernels × ~50–100 KB blob =
+  many MB per arch. Could be selective (gfx11 + gfx12 only) or fetched
+  separately on `hipfire pull <model>`.
+- **Hipfire-version coupling**: blobs are tied to the hipfire version's
+  kernel sources. Re-pulling on engine update.
+- **Productionization, not perf**: doesn't help anyone who's already
+  warmed up their cache.
+
+#### Decision rule
+Worth doing only when the install/onboarding experience becomes a
+priority — not a quant-time perf lever per se.
+
+---
+
+### E. QuIP#-style global codebook + per-row scale (deeper redesign)
+
+**Effort:** Multiple weeks; research-grade.
+**Perf impact:** Saves per-block metadata (~7 % bytes/group); runtime
+becomes `global_cb[q] × row_scale`.
+**Quality risk:** Moderate — gives up per-block adaptation.
+
+#### Mechanism
+1. **At quant time**, per row: compute the row's L2 norm; normalize
+   the row to unit L2; FWHT-rotate; quantize against a SINGLE model-
+   global Lloyd-Max codebook (8 fp16 entries).
+2. **Storage**: 1 fp32 row scale + N×K × 3 bits (no per-block scale or
+   zero). Total bytes/group: 96 B (data only) + (per-row metadata
+   amortized across groups). For Qwen3.5-9B (~32k rows): ~125 KB total
+   row metadata vs current per-block scale+zero overhead. Material
+   savings.
+3. **Runtime**: `recon[k] = global_cb[q] × row_scale[m]`.
+
+#### Why it might fail
+Per-block adaptation is what makes hipfire MQ resilient to outlier
+blocks. After FWHT the distribution is more uniform but not perfectly
+so — outlier blocks still exist. A single global codebook forces all
+blocks to share the same reconstruction levels. Quality could
+collapse on the same blocks where uniform MQ2 collapses today.
+
+#### Why it might work
+QuIP# (RHT + E8 lattice global codebook) reportedly hits Q4-quality
+at 2-bit on 70B+ models. The premise is the same: incoherence
+processing produces approximately-Gaussian residuals which fit a
+single global code. hipfire's `kv_fold_asym3` already uses a global
+N(0, 1/256) codebook (`TURBO_C3_256`) — the precedent works at the
+KV cache scope (where Givens rotation forces unit-normalized vectors).
+
+#### Decision rule
+Pursue only if Path A (per-block Lloyd-Max) doesn't rescue MQ2 and
+the headline goal is shipping ≥9B MQ2. Long timeline; high risk.
+
+---
+
+## 3. Things that *cannot* be shifted to quant-time
+
+For completeness — so future readers don't re-walk:
+
+- **Activation rotation `mq_rotate_x`**: inherently per-token-dynamic.
+  The best version of this is *kernel fusion* (rotate + GEMV in one
+  launch), which is a runtime move, not a quant-time bake. Currently
+  in flight as a separate "MQ3 fused decode" follow-up.
+- **Attention compute**: per-position dynamic by definition.
+- **KV cache writes/reads**: per-token.
+- **FWHT itself**: O(N log N) at runtime (~2k ops for N=256). Pre-
+  computing the full 256×256 transform matrix would be O(N²) =
+  65 k ops at runtime — *strictly worse*.
+- **RMSNorm**: requires per-token reciprocal of the L2 norm of x —
+  data-dependent, can't pre-bake. The per-channel weight CAN fold
+  into FWHT signs (move B above), but that's the only piece.
+- **Sampling / argmax / repeat-penalty / n-gram block**: token-level
+  decisions on logits.
+
+---
+
+## 4. Net recommendation (updated 2026-05-01)
+
+**For perf alone:** the FWHT pre-rotation already grabbed the biggest
+quant-time lever. The remaining quant-time levers (B, C) are 1–3 %
+wins; (D) is productionization not perf; (E) is research-grade and
+risky.
+
+**For quality:** Lloyd-Max per-block codebook (A) is now-validated as
+the headline 3-bit quality lever — 9B Lloyd-MQ3 ppl 18.52 vs uniform
+MQ3's 42.03 (2.27× reduction) for +7.7% bandwidth. **It is NOT
+perf-neutral**: an 8-way switch in the codebook lookup costs 3.2× on
+9B decode and needs the K4-unroll follow-up (task #83) to recover
+before flipping to default.
+
+**For 2-bit:** Lloyd-Max also rescues uniform MQ2 (55× ppl reduction)
+but the absolute floor (9B ppl 2,163) is still text-collapse, so MQ2
+is **not** "quality-essentially rescued" by the codebook alone — the
+bit-width is the binding constraint. Lloyd-MQ2 stays plumbed for
+research, doesn't ship.
+
+**Outcome of the prototype** (already executed): the codebook
+materially reduces error on MQ3, and **MQ3 is where it ships**, not
+MQ2. The original prediction that A would unblock 2-bit was wrong.
+
+The bigger MQ3 perf wins right now are still kernel-coverage moves
+(gfx12 K4 WMMA family, fused rotate+GEMV decode, A3B MoE MQ3 fast-path)
+plus the K4-unroll follow-up for the Lloyd codebook lookup itself.
+See `mq-sub4bit-research-queue.md` Q1.5 for the canonical research log
+on Lloyd-MQ3 and `benchmarks/results/lloyd_max_findings_20260501.md`
+for the empirical writeup.
+
+---
+
+## 5. References
+
+- `docs/QUANTIZATION.md` — current MQ format + FWHT description.
+- `docs/plans/mq-sub4bit-prd.md` — full sub-4-bit roadmap; §5.4 Path D
+  framing of "Lloyd-Max" as `(cb_min, cb_max)` lerp is **incorrect** —
+  see queue Q1 caveat. The actual algorithm is iterative centroid
+  refinement; that's what's implemented.
+- `docs/plans/mq-sub4bit-research-queue.md` — Q1 (MQ2 plan) and Q1.5
+  (validated MQ3 outcome) document the Lloyd-Max work; Q1.5 is the
+  canonical entry for the move-A status.
+- `benchmarks/results/lloyd_max_findings_20260501.md` — empirical
+  perplexity comparison across MQ4 / uniform MQ3 / Lloyd-MQ3 /
+  Lloyd-MQ2 / uniform MQ2 at 0.8B / 4B / 9B.
+- `kernels/src/turbo_common.h` — `TURBO_C3_256` is the global-codebook
+  precedent for asym3 KV cache (move E generalizes this idea to
+  weights).
+- QuIP# (Tseng et al., ICML 2024 / arXiv 2402.04396) — the academic
+  reference for move E (RHT + global lattice codebook).

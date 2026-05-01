@@ -223,6 +223,110 @@ codebook lookup. Don't sit on incorrect docs.
 
 ---
 
+## Q1.5 — Lloyd-Max MQ3 (validated 2026-05-01, shipping pending decode-perf fix)
+
+**Status:** Implemented and ppl-validated. Ships pending K4-unroll perf
+recovery (decode 44 → ~140 tok/s on gfx1100). Research-gated until then
+via `HIPFIRE_ALLOW_MQ3_LLOYD=1` / `--allow-mq3-lloyd`.
+
+### Storage
+
+- **qt 20** (`MQ3G256Lloyd`)
+- **Header**: 8 fp16 centroids = 16 B (vs uniform MQ3's 8 B fp32 scale+zero)
+- **Data**: 96 B packed 3-bit indices (unchanged cross-byte layout)
+- **Total**: **112 B/group** vs uniform MQ3's 104 B → +7.7% bandwidth
+
+### Empirical wikitext2-test perplexity (gfx1100, ctx=2048, warmup=8, scored=2039)
+
+| size | MQ4 | MQ3 uniform | **MQ3-Lloyd** | Lloyd ratio | vs MQ4 gap |
+|------|---:|---:|---:|---:|---:|
+| 0.8B | 25.65 | 301.06 | **155.22** | 1.94× | 6.05× |
+| 4B   | 12.73 | 45.24  | **22.56**  | 2.01× | 1.77× |
+| 9B   | 10.34 | 42.03  | **18.52**  | 2.27× | 1.79× |
+
+**9B Lloyd-MQ3 is the closest sub-4-bit format hipfire has gotten to MQ4
+quality** (1.79× vs uniform-MQ3's 4.07×). Same algorithm wins ~2× across
+all sizes — the per-block 8-entry codebook is fundamentally the right shape
+for 3-bit weight reconstruction on Qwen3.5.
+
+**Sub-9B status (issue #114 update):** halved on 0.8B (301 → 155) but
+still text-collapse zone. Below 9B, Lloyd-MQ3 alone is insufficient —
+needs Q2 (GPTQ) or Q4 (mixed-precision) on top.
+
+### Implementation cost
+
+| component | location | LOC |
+|---|---|---|
+| `quantize_mq3g256_lloyd` (parallel rayon `par_chunks_mut`) | `crates/hipfire-quantize/src/main.rs` | ~110 |
+| `gemv_mq3g256_lloyd.hip` (8-way switch codebook lookup) | `kernels/src/` | ~85 |
+| `DType::MQ3G256Lloyd` + dispatch wrappers | `crates/rdna-compute/src/dispatch.rs` | ~30 |
+| Engine load arms (qt=20 in 3 sites + DeltaNet CPU dequant) | `crates/engine/src/{hfq,llama,qwen35}.rs` | ~80 |
+| `--allow-mq3-lloyd` / `HIPFIRE_ALLOW_MQ3_LLOYD=1` guard | quantizer | ~15 |
+
+Quantize time: 9B Lloyd-MQ3 ~85s wall on 24-core (rayon parallelized over
+output blocks). Single-thread Lloyd's at 12 iter × 256 weights × ~35M
+blocks took >5 min and didn't finish first attempt; the parallel rewrite
+is what makes this practical.
+
+### Decode perf cost (preliminary)
+
+9B decode: uniform MQ3 ~141 tok/s → Lloyd-MQ3 44 tok/s (3.2× slowdown).
+The 8-way switch in `gemv_mq3g256_lloyd.hip` is harder to optimize than
+uniform's `scale*q + zero`. Recoverable via K4-unroll + LDS-resident
+codebook table (mirrors `gemv_hfq3g256.gfx1100.hip` shape that brought
+uniform MQ3 from 114 → 141). Tracked separately.
+
+### Roadmap implications
+
+- **Lloyd-MQ3 supersedes uniform MQ3 as the 3-bit default** once *both*
+  gates land:
+  1. K4-unroll perf fix (task #83) restores decode to ≥120 tok/s on 9B
+     gfx1100. Don't ship the 44 tok/s path — the 3.2× decode regression
+     would be visible in chat latency.
+  2. Coherence-gate eyeball pass on the 4-prompt battery for 4B and 9B
+     confirms no attractor loops at the new ppl floor.
+
+  Until both clear, Lloyd-MQ3 stays gated behind `--allow-mq3-lloyd` /
+  `HIPFIRE_ALLOW_MQ3_LLOYD=1`. Re-upload HF artifacts under the `-mq3`
+  tag (or new `-mq3-lloyd` tag, TBD by user) only after both gates pass.
+- **Q4 (mixed-MQ) updates**: the 3-bit slot in the policy table should
+  use **Lloyd-MQ3, not uniform MQ3**. Average bpw bumps from 3.3 to ~3.5
+  but quality follows the table above.
+- **Q1 (Lloyd-MQ2) reverts to research-only.** Even at 9B, Lloyd-MQ2
+  ppl=2,163 is text-collapse. The 55× win over uniform-MQ2 is informational
+  and the format stays plumbed (qt=19) for future combinations with GPTQ
+  but doesn't ship as a default. Gated behind `--allow-mq2-lloyd`.
+
+### Files
+
+- `benchmarks/results/lloyd_max_findings_20260501.md` — full empirical
+  writeup with all four formats compared.
+- `crates/engine/examples/perplexity.rs` — single-window NLL harness
+  (issue #113 alpha→beta gate is now answered by data, not eyeball).
+- Engine wiring as above.
+
+### Lloyd-MQ4 explicitly deprioritized (2026-05-01)
+
+The natural extension would be Lloyd-MQ4: 16 fp16 centroids (32 B header)
++ 128 B 4-bit indices = 168 B/group (+23.5% bandwidth over uniform MQ4).
+**Not pursued** because:
+
+1. **Narrow quant-loss room.** 9B uniform MQ4 already sits at ppl=10.34;
+   fp16 baseline is presumably ~9.5. Even an oracle codebook can only
+   reclaim ~10% — small absolute win for +24% bandwidth penalty.
+2. **Ship priority.** Lloyd-MQ3 closes the bigger gap (4× → 1.79× vs MQ4)
+   for less bandwidth (+7.7%). 3-bit is where the value is.
+3. **No obvious sub-9B MQ4 collapse.** If a future ppl sweep on smaller
+   MQ4 models surfaces hidden quality drops the coherence-gate eyeball
+   missed (analogous to what happened with 9B MQ3), reopen this. Until
+   then, MQ4 stays uniform.
+
+Revisit if: smaller-than-1B MQ4 gets a quality-eval sweep showing
+collapse, or kernel-perf experiments find that 16 fp16 entries fit in
+LDS with negligible cost (would change the bandwidth calculus).
+
+---
+
 ## Q2 — GPTQ-style block-wise error compensation (NOT in PRD)
 
 **Status:** Pending — new proposal, not in roadmap.
