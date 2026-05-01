@@ -52,6 +52,9 @@ pub const GEMV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
 /// Packing: 8 weights per 3 bytes (24 bits = 8×3 bits).
 pub const GEMV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.hip");
+pub const GEMV_HFQ3G256_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256.gfx1100.hip");
+pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.hip");
+pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
@@ -370,6 +373,30 @@ pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static st
             (GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC, "gemv_hfq4g256_residual_rdna3")
         }
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
+    }
+}
+
+/// Returns the HFQ3-G256 GEMV kernel source AND module name for the given arch.
+/// gfx1100/1101/1102 (RDNA3) gets the K4-unrolled 4-accumulator variant that
+/// closes the per-launch perf gap with MQ4. Other archs use the baseline.
+pub fn gemv_hfq3g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_GFX1100_SRC, "gemv_hfq3g256_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_SRC, "gemv_hfq3g256"),
+    }
+}
+
+/// Same arch dispatch as `gemv_hfq3g256_for_arch` but returns the residual
+/// variant (y[row] += A[row] · x). Used by `weight_gemv_residual` MQ3 arm
+/// to eliminate the alloc+gemv+add+free fallback chain.
+pub fn gemv_hfq3g256_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" => {
+            (GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC, "gemv_hfq3g256_residual_rdna3")
+        }
+        _ => (GEMV_HFQ3G256_RESIDUAL_SRC, "gemv_hfq3g256_residual"),
     }
 }
 
