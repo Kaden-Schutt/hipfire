@@ -173,7 +173,7 @@ impl PflashState {
             s.free_gpu(gpu);
         }
         // KvCache owns layer-keyed GPU buffers (k_gpu/v_gpu/scales/givens
-        // tables). Dropping the Option does NOT release them — the buffers
+        // tables). Dropping the Option does NOT release them -- the buffers
         // are sitting in `gpu`'s pool keyed by handle. Call free_gpu(gpu)
         // explicitly to return them.
         if let Some(kv) = self.drafter_kv.take() {
@@ -248,7 +248,7 @@ pub fn load_drafter(
     )?;
     let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
     let scratch = ForwardScratch::new(gpu, &config)?;
-    // Default to Q8 KV — minimal-risk format, batched-eligible, supported
+    // Default to Q8 KV -- minimal-risk format, batched-eligible, supported
     // across all targeted RDNA archs. Future iterations can pick asym3
     // when scoring quality at long context demands the K-rotation.
     let kv = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_kv_seq)?;
@@ -282,7 +282,7 @@ pub struct BlockScores {
 /// K from the last layer at every position into a host buffer, then build
 /// per-block scores via mean-pooled K · last-position-K.
 ///
-/// This is the Phase 1.2 MVP — uses the existing `forward_scratch_compute`
+/// This is the Phase 1.2 MVP -- uses the existing `forward_scratch_compute`
 /// per-token path so no llama.rs surface needs Q/K capture hooks. For 8K
 /// source on Qwen3-0.6B at gfx1100 this runs in ~30 s; Phase 2+ replaces it
 /// with batched scoring on GPU.
@@ -340,7 +340,7 @@ pub fn compute_scores_cpu(
     let mut scores = vec![0.0f32; n_blocks];
 
     // Last-position K is the proxy for "what the model would attend to next"
-    // — used as the query direction against block-mean Ks.
+    // -- used as the query direction against block-mean Ks.
     let last_k = &k_per_pos[(n - 1) * kv_dim..n * kv_dim];
     let last_norm = norm_l2(last_k);
 
@@ -393,7 +393,7 @@ fn norm_l2(v: &[f32]) -> f32 {
 ///   - always keep `sink_tokens` from the front,
 ///   - always keep `recent_tokens` from the back,
 ///   - always keep every span in `must_keep_spans` (chat boundaries,
-///     system message frames, tool-defs, role markers — anything the
+///     system message frames, tool-defs, role markers -- anything the
 ///     prompt parser needs to find or the model treats as a control
 ///     token). Caller is responsible for locating these positions in
 ///     source-order using the target tokenizer's special-token IDs.
@@ -402,7 +402,7 @@ fn norm_l2(v: &[f32]) -> f32 {
 ///   - coalesce overlapping / adjacent spans so the emitted token stream
 ///     stays span-coherent (no single-token scatter).
 ///
-/// `must_keep_spans` is consumed verbatim — caller passes empty slice when
+/// `must_keep_spans` is consumed verbatim -- caller passes empty slice when
 /// the prompt has no chat boundaries (raw-text completion). Spans outside
 /// `[0, source_tokens)` are clamped, not rejected.
 ///
@@ -463,22 +463,32 @@ pub fn select_spans(
     // Budget for middle-block selection.
     let middle_budget = target_kept - anchored;
 
-    // Rank middle blocks (those that don't overlap any anchor) by descending
-    // score. A block overlaps an anchor if its [start, end) intersects any
-    // anchor span — those tokens are already covered.
-    let block_overlaps_anchor = |start: usize, end: usize| -> bool {
-        anchors.iter().any(|&(a_s, a_e)| start < a_e && a_s < end)
-    };
-    let mut middle: Vec<(usize, f32)> = (0..n_blocks)
-        .filter_map(|b| {
-            let start = b * bs;
-            let end = ((b + 1) * bs).min(n);
-            if block_overlaps_anchor(start, end) {
-                None
-            } else {
-                Some((b, scores.scores[b]))
+    // Rank ALL blocks by descending score. A scored block may partially
+    // overlap an anchor (e.g., a single ChatML boundary token sitting
+    // inside an otherwise interesting block); the overlapping positions
+    // are already covered, but the block's NON-anchored positions still
+    // matter and the block itself stays span-coherent when emitted.
+    //
+    // The earlier "filter out any block touching an anchor" approach
+    // could starve selection: with ChatML boundaries every few hundred
+    // tokens, every middle block is touched and the budget never fills.
+    // Fix: include all blocks, count INCREMENTAL coverage against the
+    // budget. Blocks fully covered by anchors contribute zero increment
+    // and add no tokens, so they're skipped naturally.
+    fn block_incremental(anchors: &[(usize, usize)], start: usize, end: usize) -> usize {
+        // Tokens in [start, end) not already covered by any anchor.
+        let mut covered = 0usize;
+        for &(a_s, a_e) in anchors.iter() {
+            let lo = std::cmp::max(start, a_s);
+            let hi = std::cmp::min(end, a_e);
+            if lo < hi {
+                covered += hi - lo;
             }
-        })
+        }
+        (end - start).saturating_sub(covered)
+    }
+    let mut middle: Vec<(usize, f32)> = (0..n_blocks)
+        .map(|b| (b, scores.scores[b]))
         .collect();
     // Stable sort by descending score; tie-break on block index for
     // determinism.
@@ -493,8 +503,13 @@ pub fn select_spans(
         }
         let start = b * bs;
         let end = ((b + 1) * bs).min(n);
+        let incr = block_incremental(&spans, start, end);
+        if incr == 0 {
+            // Fully anchored already; nothing to add.
+            continue;
+        }
         spans.push((start, end));
-        middle_kept += end - start;
+        middle_kept += incr;
     }
 
     coalesce(spans)
@@ -569,7 +584,7 @@ pub enum BypassReason {
     ModeOff,
     /// Source token count is below `threshold_tokens` and mode is `Auto`.
     BelowThreshold { source_tokens: usize, threshold: usize },
-    /// Vision request — image-bearing prompts always bypass for now.
+    /// Vision request -- image-bearing prompts always bypass for now.
     VisionRequest,
     /// Tool-calling request or prompt with structured JSON tool definitions.
     ToolCallRequest,
@@ -812,7 +827,7 @@ mod tests {
         s[7] = 5.0;
         let scores = synthetic_scores(s, 8);
         // sink=16, recent=16. keep_ratio=0.25 → target=32 tokens. Anchors cover
-        // 32 already, so middle budget = 0 — block 7 is NOT picked because
+        // 32 already, so middle budget = 0 -- block 7 is NOT picked because
         // anchors alone meet the budget. This is the documented behavior.
         let spans = select_spans(&scores, 16, 16, 0.25, 0, &[]);
         // Expected: [0, 16) ∪ [112, 128).
@@ -861,17 +876,47 @@ mod tests {
 
     #[test]
     fn select_coalesces_must_keep_with_anchors() {
-        // Must-keep span [14, 18) overlaps the sink end (sink=16). After
-        // coalesce there should be exactly ONE prefix span [0, 18), not
-        // two split / overlapping ranges.
+        // Must-keep span [14, 18) overlaps the sink end (sink=16). The
+        // coalesce contract is "no two output spans overlap or touch":
+        // sink (0..16) + must_keep (14..18) MUST merge into a single
+        // contiguous prefix range (which may extend further if the budget
+        // pulls in adjacent blocks under the new incremental-coverage
+        // selection).
         let s = vec![0.1f32; 16];
         let scores = synthetic_scores(s, 8);
         let spans = select_spans(&scores, 16, 16, 0.30, 0, &[(14, 18)]);
-        // Expect [0, 18) ∪ [112, 128) at minimum; no overlapping ranges.
-        let prefix_count = spans.iter().filter(|&&(_, e)| e <= 18).count();
-        assert_eq!(prefix_count, 1, "prefix must coalesce, got {spans:?}");
-        assert!(spans.iter().any(|&(a, b)| a == 0 && b == 18),
-            "expected (0, 18) anchor, got {spans:?}");
+        // Whatever extra blocks come in, the prefix must still be one
+        // contiguous span starting at 0 and covering the must-keep range.
+        let prefix = spans.iter().find(|&&(s, _)| s == 0)
+            .copied()
+            .unwrap_or_else(|| panic!("missing prefix anchor in {spans:?}"));
+        assert!(prefix.1 >= 18, "prefix {prefix:?} must cover must_keep end 18");
+        // No two output spans may overlap or be adjacent without merging.
+        for w in spans.windows(2) {
+            assert!(w[0].1 < w[1].0, "spans must be disjoint and gapped, got {spans:?}");
+        }
+    }
+
+    #[test]
+    fn select_does_not_starve_when_every_block_touches_anchor() {
+        // 16 blocks of 8 tokens = 128 source. Boundary token at every 8th
+        // position (0, 8, 16, ...) -- that's one inside every block. With
+        // the old overlap-filter design every middle block would be
+        // disqualified and `middle` would be empty, leaving budget unmet.
+        // Regression: incremental-coverage selection must still pull
+        // high-score blocks despite the boundary touch.
+        let mut s = vec![0.1f32; 16];
+        s[7] = 5.0; // block 7 covers [56, 64); we want this to survive.
+        let scores = synthetic_scores(s, 8);
+        let must: Vec<(usize, usize)> = (0..16).map(|b| (b * 8, b * 8 + 1)).collect();
+        let spans = select_spans(&scores, 0, 0, 0.50, 0, &must);
+        let total: usize = spans.iter().map(|(a, b)| b - a).sum();
+        // 50% of 128 = 64 token target. Anchors alone contribute 16
+        // incremental tokens, so middle selection MUST add ~48 more.
+        assert!(total >= 64, "selector starved -- expected >=64 kept, got {total} (spans = {spans:?})");
+        // Block 7 is the highest-scored, so it should appear.
+        assert!(spans.iter().any(|&(a, b)| a <= 56 && 64 <= b),
+            "block 7 (highest score) must survive despite anchor overlap, got {spans:?}");
     }
 
     #[test]
