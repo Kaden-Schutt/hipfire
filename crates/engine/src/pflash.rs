@@ -267,29 +267,46 @@ impl PflashState {
 /// probe encoding can be used interchangeably for compression.
 const TOKENIZER_COMPAT_PROBE: &str = "Hello, world! 0xCAFEf00d def fn() {} \u{2014}";
 
+/// Vocab / special-token slot strings that are legitimately allowed to
+/// differ between matched-tokenizer pairs in the Qwen3.5 family. Smaller
+/// family members (e.g. 0.8B) ship the high-end audio/TTS reserved slots
+/// as empty strings; larger members (e.g. 27B) populate them with the
+/// real specials. Both sides agree those positions are unreachable from
+/// normal text input, so divergence on them does not break PFlash's
+/// "drafter and target encode identically" invariant.
+fn is_audio_tts_padding(s: &str) -> bool {
+    s.is_empty()
+        || matches!(
+            s,
+            "<|audio_start|>"
+                | "<|audio_end|>"
+                | "<|audio_pad|>"
+                | "<tts_pad>"
+                | "<tts_text_bos>"
+                | "<tts_text_eod>"
+                | "<tts_text_bos_single>"
+        )
+}
+
 /// Compare drafter vs target tokenizers for compression compatibility.
 ///
-/// PRD §5.3 contract: same vocab size, same token byte strings, same
-/// special token ids. Implementation:
-///   - vocab_size equal (catches Qwen3 vocab=151743 vs Qwen3.5
-///     vocab=248144 mismatches).
-///   - bos / eos / eot ids equal (chat template still parseable).
-///   - probe-encoding equal (catches divergent BPE merges on common
-///     text shapes).
+/// PRD §5.3 contract enforced directly:
+///   - same vocab size (catches Qwen3 vocab=151743 vs Qwen3.5 vocab=248144).
+///   - same byte string at every vocab slot, with one documented exception:
+///     slots in the audio/TTS padding band (per `is_audio_tts_padding`) are
+///     allowed to be empty on one side and populated on the other. These
+///     slots are unreachable from normal text encoding.
+///   - same `(string, id)` set in `special_tokens()`, with the same audio/
+///     TTS exception (extras on one side allowed iff their string is in
+///     the documented padding band).
+///   - bos / eos / eot ids equal.
+///   - probe-encoding equal as a final structural sanity check on common
+///     BPE seams (whitespace, punctuation, code shapes, multi-byte glyph).
 ///
-/// We deliberately do NOT require `signature()` equality. The signature
-/// folds in EVERY vocab slot's byte string -- in practice Qwen3.5
-/// models across sizes share the BPE vocab + merges but differ in a
-/// few reserved / padding slots that never appear in normal-text
-/// encoding. A signature mismatch would falsely reject the
-/// 0.8B-drafter-for-27B-target pairing that's the canonical
-/// matched-tokenizer setup.
-///
-/// Risk: if 27B's vocab has a different byte string at slot N and the
-/// source prompt happens to encode through that slot, the target
-/// would interpret it as a different token. With Qwen3.5 family this
-/// has not been observed on normal English / code prompts; the probe
-/// covers the common-shape paths.
+/// The audio/TTS exception is what lets `qwen3.5-0.8b` drive `qwen3.5-27b`:
+/// the family shares the BPE vocab + merges but the smaller members leave
+/// the audio specials as empty padding. No other slot divergence is
+/// tolerated.
 pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
     if target.vocab_size() != draft.vocab_size() {
         return false;
@@ -298,6 +315,35 @@ pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
         return false;
     }
     if target.eot_id != draft.eot_id {
+        return false;
+    }
+    for (a, b) in target.vocab().iter().zip(draft.vocab().iter()) {
+        if a == b {
+            continue;
+        }
+        if is_audio_tts_padding(a) && is_audio_tts_padding(b) {
+            continue;
+        }
+        return false;
+    }
+    let specials_subset_ok = |a: &[(String, u32)], b: &[(String, u32)]| -> bool {
+        for (s, id) in a {
+            match b.iter().find(|(s2, _)| s2 == s) {
+                Some((_, id2)) if id2 == id => {}
+                Some(_) => return false,
+                None => {
+                    if !is_audio_tts_padding(s) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    };
+    if !specials_subset_ok(target.special_tokens(), draft.special_tokens()) {
+        return false;
+    }
+    if !specials_subset_ok(draft.special_tokens(), target.special_tokens()) {
         return false;
     }
     target.encode(TOKENIZER_COMPAT_PROBE) == draft.encode(TOKENIZER_COMPAT_PROBE)
