@@ -441,15 +441,18 @@ fn main() {
 
         match msg_type {
             "load" => {
-                // Unload previous if any.
-                if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
-                }
-                // PFlash drafter outlives a single load; if a previous
-                // session had a drafter resident, free its VRAM now so
-                // the new target gets the headroom.
+                // Unload previous if any. PFlash drafter goes first so
+                // its tensors join the pool before unload_model drains
+                // it -- otherwise free_tensor would queue them into the
+                // pool just-emptied by drain_pool with no follow-up
+                // drain, leaving drafter VRAM resident across the next
+                // load (the explicit "unload" handler has the same
+                // ordering for the same reason).
                 if let Some(mut pf) = pflash_state.take() {
                     pf.unload_drafter(&mut gpu);
+                }
+                if let Some(m) = model.take() {
+                    unload_model(m, &mut gpu);
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -753,17 +756,19 @@ fn main() {
             }
 
             "unload" => {
-                if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
-                }
-                // Pair with the model unload: PFlash drafter holds its
-                // own weights / scratch / KV buffers in the GPU pool
-                // (see PflashState::unload_drafter for the full teardown).
-                // Drop them too so VRAM goes back to free after an
-                // explicit "unload" message, matching the lifecycle
-                // documented at the pflash_state declaration.
+                // PFlash drafter goes FIRST: its weights/scratch/KV
+                // tensors are released via Gpu::free_tensor, which only
+                // queues into the GPU pool. The actual hipFree happens
+                // inside unload_model -> drain_pool. Calling
+                // unload_drafter AFTER unload_model would leave the
+                // drafter buffers cached in the just-emptied pool with
+                // no drain to follow, so the VRAM stays resident until
+                // the next load message arrives. Order matters here.
                 if let Some(mut pf) = pflash_state.take() {
                     pf.unload_drafter(&mut gpu);
+                }
+                if let Some(m) = model.take() {
+                    unload_model(m, &mut gpu);
                 }
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
