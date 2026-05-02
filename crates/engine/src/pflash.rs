@@ -19,6 +19,9 @@ use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu};
 use std::path::Path;
 
+#[cfg(feature = "deltanet")]
+use crate::qwen35;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PflashMode {
     /// Disabled. `maybe_compress_prompt` always returns `Bypass`.
@@ -142,6 +145,74 @@ impl PflashConfig {
     }
 }
 
+/// Drafter model variant. Plain Qwen3 / LLaMA-family loads via `llama::*`;
+/// Qwen3.5 hybrid (DeltaNet + FullAttn + optional MoE) loads via `qwen35::*`.
+/// PFlash dispatches at runtime based on which variant is held.
+///
+/// The matched-tokenizer story for Qwen3.5 targets requires a Qwen3.5-vocab
+/// drafter (vocab=248320). qwen3-0.6b has vocab=151743 and is incompatible.
+/// qwen3.5-0.8b is the matched smallest, hence the Hybrid variant.
+pub enum DrafterModel {
+    Plain {
+        config: LlamaConfig,
+        weights: LlamaWeights,
+        scratch: ForwardScratch,
+    },
+    #[cfg(feature = "deltanet")]
+    Hybrid {
+        config: qwen35::Qwen35Config,
+        weights: qwen35::Qwen35Weights,
+        scratch: qwen35::Qwen35Scratch,
+        dn_state: qwen35::DeltaNetState,
+    },
+}
+
+impl DrafterModel {
+    /// Common config-derived metrics needed by the K-cache layout.
+    pub fn n_layers(&self) -> usize {
+        match self {
+            DrafterModel::Plain { config, .. } => config.n_layers,
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { config, .. } => config.n_layers,
+        }
+    }
+    pub fn n_kv_heads(&self) -> usize {
+        match self {
+            DrafterModel::Plain { config, .. } => config.n_kv_heads,
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { config, .. } => config.n_kv_heads,
+        }
+    }
+    pub fn head_dim(&self) -> usize {
+        match self {
+            DrafterModel::Plain { config, .. } => config.head_dim,
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { config, .. } => config.head_dim,
+        }
+    }
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            DrafterModel::Plain { .. } => "plain",
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { .. } => "hybrid",
+        }
+    }
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            DrafterModel::Plain { weights, scratch, .. } => {
+                weights.free_gpu(gpu);
+                scratch.free_gpu(gpu);
+            }
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { weights, scratch, dn_state, .. } => {
+                weights.free_gpu(gpu);
+                scratch.free_gpu(gpu);
+                dn_state.free_gpu(gpu);
+            }
+        }
+    }
+}
+
 /// Carry-over state across requests: drafter model + tokenizer + scratch.
 ///
 /// Drafter loading is opt-in via `load_drafter`. While `drafter_loaded == false`
@@ -151,15 +222,12 @@ impl PflashConfig {
 pub struct PflashState {
     pub drafter_path: Option<String>,
     pub drafter_loaded: bool,
-    pub drafter_config: Option<LlamaConfig>,
-    pub drafter_weights: Option<LlamaWeights>,
+    pub drafter_model: Option<DrafterModel>,
     pub drafter_tokenizer: Option<Tokenizer>,
-    pub drafter_scratch: Option<ForwardScratch>,
     pub drafter_kv: Option<KvCache>,
-    /// True only if `drafter_tokenizer.vocab_size() == target_tokenizer.vocab_size()`
-    /// AND a fixed probe phrase round-trips identically through both. Set by
-    /// `load_drafter`; if false at request time, `decide_bypass` returns
-    /// `BypassReason::TokenizerMismatch`.
+    /// True only if drafter and target tokenizers match per the
+    /// `tokenizers_compatible` contract. Mismatch surfaces as
+    /// `BypassReason::TokenizerMismatch` at request time.
     pub tokenizer_compat: bool,
 }
 
@@ -168,31 +236,24 @@ impl PflashState {
         Self {
             drafter_path: cfg.drafter_path.clone(),
             drafter_loaded: false,
-            drafter_config: None,
-            drafter_weights: None,
+            drafter_model: None,
             drafter_tokenizer: None,
-            drafter_scratch: None,
             drafter_kv: None,
             tokenizer_compat: false,
         }
     }
 
     /// Drop drafter GPU resources back to the pool. Idempotent.
+    /// Order matters: unload tensors INTO the pool, then upstream
+    /// `unload_model` drains the pool to actually release VRAM. Call
+    /// this BEFORE the next `unload_model`.
     pub fn unload_drafter(&mut self, gpu: &mut Gpu) {
-        if let Some(w) = self.drafter_weights.take() {
-            w.free_gpu(gpu);
+        if let Some(m) = self.drafter_model.take() {
+            m.free_gpu(gpu);
         }
-        if let Some(s) = self.drafter_scratch.take() {
-            s.free_gpu(gpu);
-        }
-        // KvCache owns layer-keyed GPU buffers (k_gpu/v_gpu/scales/givens
-        // tables). Dropping the Option does NOT release them -- the buffers
-        // are sitting in `gpu`'s pool keyed by handle. Call free_gpu(gpu)
-        // explicitly to return them.
         if let Some(kv) = self.drafter_kv.take() {
             kv.free_gpu(gpu);
         }
-        self.drafter_config = None;
         self.drafter_tokenizer = None;
         self.drafter_loaded = false;
         self.tokenizer_compat = false;
@@ -253,26 +314,54 @@ pub fn load_drafter(
     let hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
         "pflash: open drafter HFQ at {}: {e}", path.display(),
     )))?;
-    let config = hfq::config_from_hfq(&hfq).ok_or_else(|| hip_bridge::HipError::new(0,
-        "pflash: drafter HFQ has no recoverable LlamaConfig (model_type missing or unsupported)",
-    ))?;
     let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).ok_or_else(||
         hip_bridge::HipError::new(0, "pflash: drafter HFQ has no embedded tokenizer metadata")
     )?;
+
+    // Detect drafter family via the HFQ header's `arch_id` (set at
+    // quantize time by hipfire-quantize):
+    //   1 = plain Qwen3 / LLaMA-family (loads via llama::*)
+    //   5 = Qwen3.5 / 3.6 dense hybrid (DeltaNet + FullAttn)
+    //   6 = Qwen3.5 / 3.6 MoE-A3B hybrid
+    //
+    // Matched-tokenizer pairing: Qwen3.5 / 3.6 targets (vocab 248320)
+    // need a Qwen3.5-vocab drafter. qwen3.5-0.8b (arch_id=5) is the
+    // smallest matched option and routes through the Hybrid branch.
+    // qwen3-0.6b (arch_id=1, vocab 151743) routes through Plain and is
+    // suitable for plain-Qwen3 targets only.
+    let is_hybrid = hfq.arch_id == 5 || hfq.arch_id == 6;
+    #[cfg(feature = "deltanet")]
+    {
+        if is_hybrid {
+            let q35_cfg = qwen35::config_from_hfq(&hfq).ok_or_else(||
+                hip_bridge::HipError::new(0, "pflash: hybrid tensors detected but qwen35 config parse failed"))?;
+            let weights = qwen35::load_weights(&hfq, &q35_cfg, gpu)?;
+            let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
+            let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
+            let kv = KvCache::new_gpu_q8(gpu, q35_cfg.n_layers, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq)?;
+            let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
+            state.drafter_path = Some(path.display().to_string());
+            state.drafter_model = Some(DrafterModel::Hybrid {
+                config: q35_cfg, weights, scratch, dn_state,
+            });
+            state.drafter_tokenizer = Some(drafter_tokenizer);
+            state.drafter_kv = Some(kv);
+            state.tokenizer_compat = compat;
+            state.drafter_loaded = true;
+            return Ok(());
+        }
+    }
+
+    let config = hfq::config_from_hfq(&hfq).ok_or_else(|| hip_bridge::HipError::new(0,
+        "pflash: drafter HFQ has no recoverable config (neither qwen35 hybrid nor plain LlamaConfig)",
+    ))?;
     let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
     let scratch = ForwardScratch::new(gpu, &config)?;
-    // Default to Q8 KV -- minimal-risk format, batched-eligible, supported
-    // across all targeted RDNA archs. Future iterations can pick asym3
-    // when scoring quality at long context demands the K-rotation.
     let kv = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_kv_seq)?;
-
     let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
-
     state.drafter_path = Some(path.display().to_string());
-    state.drafter_config = Some(config);
-    state.drafter_weights = Some(weights);
+    state.drafter_model = Some(DrafterModel::Plain { config, weights, scratch });
     state.drafter_tokenizer = Some(drafter_tokenizer);
-    state.drafter_scratch = Some(scratch);
     state.drafter_kv = Some(kv);
     state.tokenizer_compat = compat;
     state.drafter_loaded = true;
@@ -324,6 +413,48 @@ fn dequant_q8_kv_position(
     }
 }
 
+/// Run the drafter forward over `source_tokens` (start_pos = 0), populating
+/// the drafter's Q8 K cache for positions [0, n). Dispatches on
+/// `DrafterModel::{Plain, Hybrid}` so a Qwen3.5-vocab matched drafter
+/// (e.g. qwen3.5-0.8b) goes through the qwen35 hybrid path automatically.
+/// Returns `(n_layers, n_kv_heads, head_dim)` for downstream cache-layout
+/// math. Caller still owns `state.drafter_kv`.
+///
+/// Preconditions: drafter_loaded, drafter_kv quant_q8, n <= physical_cap,
+/// head_dim multiple of 32.
+fn drafter_prefill(
+    state: &mut PflashState,
+    gpu: &mut Gpu,
+    source_tokens: &[u32],
+) -> HipResult<(usize, usize, usize)> {
+    let n = source_tokens.len();
+    let model = state.drafter_model.as_mut().expect("loaded -> drafter_model");
+    let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
+    assert!(kv.quant_q8, "drafter_prefill: drafter KV must be Q8_0");
+    assert!(n <= kv.physical_cap, "drafter_prefill: source {n} > physical_cap {}", kv.physical_cap);
+
+    match model {
+        DrafterModel::Plain { config, weights, scratch } => {
+            assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+            llama::forward_prefill_batch(gpu, weights, config, source_tokens, 0, kv, scratch, None)?;
+            Ok((config.n_layers, config.n_kv_heads, config.head_dim))
+        }
+        #[cfg(feature = "deltanet")]
+        DrafterModel::Hybrid { config, weights, scratch, dn_state } => {
+            assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+            // qwen35 batched prefill writes the same Q8_0 K cache layout
+            // as llama::forward_prefill_batch. None on hidden_rb /
+            // per_token_hidden_out / gdn_tape / tree_verify -- pflash
+            // doesn't need DFlash hidden capture or DDTree state.
+            qwen35::forward_prefill_batch(
+                gpu, weights, config, source_tokens, 0, kv, dn_state, scratch,
+                None, None, None, None,
+            )?;
+            Ok((config.n_layers, config.n_kv_heads, config.head_dim))
+        }
+    }
+}
+
 /// Phase 2.0 fast path: drafter scoring via batched prefill + Q8 cache
 /// dequant. Replaces the Phase 1.2 per-token loop (~3 ms/token on
 /// qwen3-0.6b at gfx1100, dominated by decode-mode forward pass) with one
@@ -355,30 +486,14 @@ pub fn compute_scores_batched(
     assert!(block_size > 0, "compute_scores_batched: block_size must be > 0");
     assert!(state.drafter_loaded, "compute_scores_batched: drafter not loaded");
 
-    let cfg = state.drafter_config.as_ref().expect("loaded -> config").clone();
-    let weights = state.drafter_weights.as_ref().expect("loaded -> weights");
-    let scratch = state.drafter_scratch.as_ref().expect("loaded -> scratch");
+    let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
-    assert!(kv.quant_q8, "compute_scores_batched: drafter KV must be Q8_0 (load_drafter default)");
-    assert!(n <= kv.physical_cap,
-        "compute_scores_batched: source {n} exceeds drafter kv physical_cap {}", kv.physical_cap);
 
-    // 1. Batched prefill. Populates kv with positions 0..n at all layers.
-    llama::forward_prefill_batch(gpu, weights, &cfg, source_tokens, 0, kv, scratch, None)?;
-
-    // 2. Pick scoring layer. Last layer (n_layers - 1) sits closest to the
-    // logits and most directly reflects "what the model would attend to
-    // for the next token", which is the heuristic this scorer relies on.
-    let layer_idx = cfg.n_layers - 1;
-
-    // 3. Download the chosen layer's Q8 K cache. The buffer was allocated
-    // as F32 dtype with cache_elems = (cache_bytes + 3) / 4 — download_f32
-    // returns the same backing memory, just typed as f32. Reinterpret as
-    // bytes for dequant.
-    let blocks_per_head = cfg.head_dim / 32;
+    let layer_idx = n_layers - 1;
+    let blocks_per_head = head_dim / 32;
     let bytes_per_head = blocks_per_head * 34;
-    let bytes_per_pos = cfg.n_kv_heads * bytes_per_head;
-    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let bytes_per_pos = n_kv_heads * bytes_per_head;
+    let kv_dim = n_kv_heads * head_dim;
     let cache_f32 = gpu.download_f32(&kv.k_gpu[layer_idx])?;
     let cache_bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(cache_f32.as_ptr() as *const u8, cache_f32.len() * 4)
@@ -389,7 +504,7 @@ pub fn compute_scores_batched(
     for pos in 0..n {
         let pos_in_bytes = &cache_bytes[pos * bytes_per_pos..(pos + 1) * bytes_per_pos];
         let pos_out = &mut k_per_pos[pos * kv_dim..(pos + 1) * kv_dim];
-        dequant_q8_kv_position(pos_in_bytes, cfg.n_kv_heads, cfg.head_dim, pos_out);
+        dequant_q8_kv_position(pos_in_bytes, n_kv_heads, head_dim, pos_out);
     }
 
     // 5. Per-block mean K + cosine vs last-position K. Same scoring math
@@ -446,17 +561,9 @@ pub fn compute_scores_batched_gpu(
     assert!(block_size > 0, "compute_scores_batched_gpu: block_size must be > 0");
     assert!(state.drafter_loaded, "compute_scores_batched_gpu: drafter not loaded");
 
-    let cfg = state.drafter_config.as_ref().expect("loaded -> config").clone();
-    let weights = state.drafter_weights.as_ref().expect("loaded -> weights");
-    let scratch = state.drafter_scratch.as_ref().expect("loaded -> scratch");
-    let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
-    assert!(kv.quant_q8, "compute_scores_batched_gpu: drafter KV must be Q8_0");
-    assert!(cfg.head_dim % 32 == 0, "compute_scores_batched_gpu: head_dim must be multiple of 32");
-    assert!(n <= kv.physical_cap, "compute_scores_batched_gpu: source {n} > physical_cap {}", kv.physical_cap);
-
-    llama::forward_prefill_batch(gpu, weights, &cfg, source_tokens, 0, kv, scratch, None)?;
-
-    let layer_idx = cfg.n_layers - 1;
+    let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
+    let kv = state.drafter_kv.as_ref().expect("loaded -> kv");
+    let layer_idx = n_layers - 1;
     let n_blocks = (n + block_size - 1) / block_size;
 
     let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
@@ -464,8 +571,8 @@ pub fn compute_scores_batched_gpu(
         &kv.k_gpu[layer_idx],
         &scores_buf,
         n,
-        cfg.n_kv_heads,
-        cfg.head_dim,
+        n_kv_heads,
+        head_dim,
         block_size,
         n_blocks,
         n - 1, // last_pos
@@ -510,15 +617,23 @@ pub fn compute_scores_cpu(
     assert!(block_size > 0, "compute_scores_cpu: block_size must be > 0");
     assert!(state.drafter_loaded, "compute_scores_cpu: drafter not loaded");
 
-    let cfg = state.drafter_config.as_ref().expect("drafter loaded → config").clone();
-    let weights = state.drafter_weights.as_ref().expect("drafter loaded → weights");
-    let scratch = state.drafter_scratch.as_ref().expect("drafter loaded → scratch");
-    let kv = state.drafter_kv.as_mut().expect("drafter loaded → kv");
+    // Phase 1.2 per-token path is Plain-only (uses llama::forward_scratch_*
+    // which doesn't have a Qwen3.5 hybrid equivalent that captures K the
+    // same way). Hybrid drafters route through compute_scores_batched(_gpu).
+    let model = state.drafter_model.as_ref().expect("drafter loaded -> model");
+    let (cfg, weights, scratch) = match model {
+        DrafterModel::Plain { config, weights, scratch } =>
+            (config.clone(), weights, scratch),
+        #[cfg(feature = "deltanet")]
+        DrafterModel::Hybrid { .. } => panic!(
+            "compute_scores_cpu: Plain-only path; hybrid drafters must call compute_scores_batched_gpu"
+        ),
+    };
+    let kv = state.drafter_kv.as_mut().expect("drafter loaded -> kv");
     assert!(n <= kv.physical_cap,
         "compute_scores_cpu: source {n} exceeds drafter kv physical_cap {}", kv.physical_cap);
 
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
-    // Per-position last-layer K: [n × kv_dim] f32.
     let mut k_per_pos: Vec<f32> = Vec::with_capacity(n * kv_dim);
 
     for (pos, &tok) in source_tokens.iter().enumerate() {
@@ -1103,10 +1218,8 @@ mod tests {
         PflashState {
             drafter_path: Some("synthetic".into()),
             drafter_loaded: true,
-            drafter_config: None,
-            drafter_weights: None,
+            drafter_model: None,
             drafter_tokenizer: None,
-            drafter_scratch: None,
             drafter_kv: None,
             tokenizer_compat: compat,
         }

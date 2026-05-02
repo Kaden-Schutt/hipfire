@@ -356,8 +356,39 @@ Phase 5 partial status:
   off-default Qwen3.5-4B: PASS
   full coherence-gate:    BLOCKED on environment (escalated)
   speed-gate --fast:      BLOCKED on environment (escalated)
-  NIAH 16K-128K:          BLOCKED on matched-tokenizer drafter
-                           (existing escalation)
+  matched-tokenizer pair: UNBLOCKED (qwen3.5-0.8b → qwen3.5-4b verified
+                          via daemon stdio: tokenizer_compat=true,
+                          565→181 tokens, target prefill 3118 tok/s).
+
+### Hybrid drafter support (Qwen3.5 vocab) DONE
+
+`PflashState.drafter_model: Option<DrafterModel>` is now an enum:
+  - `Plain { config, weights, scratch }` (llama.rs path, vocab 151743)
+  - `Hybrid { config, weights, scratch, dn_state }` (qwen35.rs path, vocab 248320)
+
+`load_drafter` discriminates via the HFQ header's `arch_id`:
+  arch_id == 1 → Plain
+  arch_id == 5 (dense Qwen3.5/3.6) → Hybrid
+  arch_id == 6 (Qwen3.5/3.6 MoE / A3B) → Hybrid
+
+A new private `drafter_prefill(state, gpu, tokens)` helper runs the
+appropriate `forward_prefill_batch` (llama vs qwen35) and returns
+(n_layers, n_kv_heads, head_dim) so downstream Q8 dequant + GPU score
+math is identical for both variants. The Q8 K cache layout is the
+same in both paths, so `pflash_score_q8_kv.hip` works unchanged.
+
+End-to-end via daemon stdio (qwen3.5-4b target + qwen3.5-0.8b drafter):
+
+  loaded {arch:qwen3_5, vocab:248320}
+  pflash {tokenizer_compat:true, keep_ratio:0.3, threshold:1}
+  done   {tokens:24, prefill_tokens:189, prefill_tok_s:3118.8,
+          decode_tok_s:156.8,
+          pflash:{source_tokens:565, kept_tokens:181, keep_ratio:0.320,
+                  alpha:0.85, score_ms:70, total_ms:70, ...}}
+
+That clears the MANUAL_REVIEW.md "matched-tokenizer drafter" item:
+qwen3.5-0.8b is the matched smallest, was on disk the whole time, and
+the vocab is bit-identical (248320 = qwen3.5-4b/9b/27b/35b-A3B).
 
 ### Phase 3.0: sparse-threshold config plumbing (DONE)
 
