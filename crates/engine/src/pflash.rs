@@ -442,6 +442,16 @@ fn drafter_prefill(
         #[cfg(feature = "deltanet")]
         DrafterModel::Hybrid { config, weights, scratch, dn_state } => {
             assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+            // DeltaNet recurrent state (s_matrices, s_scales, conv_states)
+            // is advanced by every forward pass, so a previous scoring run
+            // on a different prompt would leave stale GDN trajectory in
+            // the state. Zero it before this run -- pflash always starts
+            // from a fresh prompt at start_pos = 0, so there is no prior
+            // state to keep. Plain LLaMA path has no recurrent state, so
+            // this is hybrid-only.
+            for s in &dn_state.s_matrices { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
+            for s in &dn_state.s_scales   { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
+            for s in &dn_state.conv_states { gpu.hip.memset(&s.buf, 0, s.buf.size())?; }
             // qwen35 batched prefill writes the same Q8_0 K cache layout
             // as llama::forward_prefill_batch. None on hidden_rb /
             // per_token_hidden_out / gdn_tape / tree_verify -- pflash
