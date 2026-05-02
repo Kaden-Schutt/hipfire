@@ -578,6 +578,8 @@ fn main() {
                     .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
                 let pflash_profile = msg.get("params").and_then(|p| p.get("prefill_profile"))
                     .and_then(|v| v.as_bool()).unwrap_or(false);
+                let pflash_sparse_threshold = msg.get("params").and_then(|p| p.get("prefill_sparse_threshold"))
+                    .and_then(|v| v.as_u64()).unwrap_or(32768) as usize;
 
                 // Validate load-time PFlash params before they reach
                 // PflashConfig + load_drafter. Same range rules the
@@ -636,6 +638,7 @@ fn main() {
                                     block_size: pflash_block,
                                     profile: pflash_profile,
                                     drafter_path: Some(pf_drafter_path.clone()),
+                                    sparse_threshold: pflash_sparse_threshold,
                                 };
                                 let mut pf_state = engine::pflash::PflashState::new(&pf_cfg);
                                 // Pull the target tokenizer out of the loaded model

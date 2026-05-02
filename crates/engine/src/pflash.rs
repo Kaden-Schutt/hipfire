@@ -60,6 +60,14 @@ pub struct PflashConfig {
     pub block_size: usize,
     pub profile: bool,
     pub drafter_path: Option<String>,
+    /// Phase 3 (sparse drafter forward) threshold. Source-token counts
+    /// below this drop to dense `forward_prefill_batch` regardless; at or
+    /// above, the scoring path may dispatch the sparse kernel once it
+    /// lands. Default 32768 per PRD §6 Phase 3 ("Fall back to dense
+    /// drafter attention below a configurable threshold, initially 32K").
+    /// Phase 3.1 wires the actual sparse attention kernel; until then this
+    /// field is plumbing-only and the dense path is always used.
+    pub sparse_threshold: usize,
 }
 
 impl Default for PflashConfig {
@@ -75,6 +83,7 @@ impl Default for PflashConfig {
             block_size: 128,
             profile: false,
             drafter_path: None,
+            sparse_threshold: 32768,
         }
     }
 }
@@ -118,6 +127,10 @@ impl PflashConfig {
         if let Ok(v) = std::env::var("HIPFIRE_PREFILL_BLOCK") {
             cfg.block_size = v.parse()
                 .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_BLOCK={v} not usize"));
+        }
+        if let Ok(v) = std::env::var("HIPFIRE_PREFILL_SPARSE_THRESHOLD") {
+            cfg.sparse_threshold = v.parse()
+                .unwrap_or_else(|_| panic!("HIPFIRE_PREFILL_SPARSE_THRESHOLD={v} not usize"));
         }
         if std::env::var("HIPFIRE_PREFILL_PROFILE").ok().as_deref() == Some("1") {
             cfg.profile = true;

@@ -358,3 +358,28 @@ Phase 5 partial status:
   speed-gate --fast:      BLOCKED on environment (escalated)
   NIAH 16K-128K:          BLOCKED on matched-tokenizer drafter
                            (existing escalation)
+
+### Phase 3.0: sparse-threshold config plumbing (DONE)
+
+Added `sparse_threshold: usize` field to PflashConfig (default 32768
+per PRD §6 Phase 3 "Fall back to dense drafter attention below a
+configurable threshold, initially 32K"). Surfaces via:
+
+  - PflashConfig literal field
+  - PflashConfig::from_env (HIPFIRE_PREFILL_SPARSE_THRESHOLD)
+  - daemon load message (params.prefill_sparse_threshold)
+
+Currently plumbing-only: no kernel switch fires. Phase 3.1+ adds the
+sparse drafter forward and the dense-vs-sparse selector inside
+compute_scores_batched_gpu. 17/17 module tests still green.
+
+The sparse kernel itself (`kernels/src/attention_pflash_sparse_fwd.hip`
+per PRD §6 Phase 3) is the major remaining work item. It needs:
+
+  - sink + recent + dynamic-block selection of source K positions
+  - RDNA-native tiling matching the existing flash kernel families
+  - dense fallback below sparse_threshold (already plumbed here)
+
+This is multi-day work; the field is in place so Phase 3.1's branch
+inside compute_scores_batched_gpu is a one-line dispatch swap when
+the kernel ships.
