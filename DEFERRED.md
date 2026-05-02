@@ -37,10 +37,11 @@ Nice-to-haves and follow-ups that are out of scope for the current PFlash run.
   fields: `needles: [{secret, position}]`, `expected_substrings: [...]`,
   `min_recovered: M`.
 
-## 3-fresh-process TTFT methodology for PFlash claims
+## ~~3-fresh-process TTFT methodology for PFlash claims~~ DONE (d9af202)
 
-- PRD §6 Phase 5 mandates 3 fresh-process TTFT runs for each claimed
-  context length. Current bench is single-shot. Wrap pflash_niah_bench
-  in `scripts/pflash-bench-3runs.sh` that spawns three fresh processes,
-  collects TTFT/decode/compress, and reports median + spread. Cold-start
-  drift (DPM, thermal) is the reason for n=3 per `docs/methodology/perf-benchmarking.md`.
+- Shipped via `scripts/pflash-niah-bench.sh`. Drives N fresh processes
+  per (target, drafter, fixture, mode) point and emits min / median /
+  max + spread per timing bucket. Spread > 5 % flags contamination.
+- Use it for any PFlash perf claim that's going into a release note or
+  PR description. Single-shot is OK for pass/fail (needle survives) but
+  not for tok/s claims.
