@@ -733,6 +733,13 @@ fn main() {
                     // and apply any per-request overrides from `params`.
                     // None when no drafter was configured at load --
                     // generate() then takes the identity path.
+                    //
+                    // Out-of-range overrides (keep_ratio outside (0, 1],
+                    // block_size == 0) would otherwise reach asserts inside
+                    // select_spans / scoring and panic the entire daemon.
+                    // Reject the request with an explicit error event so
+                    // the client gets a clean signal and the daemon stays up.
+                    let mut pf_override_err: Option<String> = None;
                     let pf_cfg_owned = pflash_cfg.as_ref().map(|base| {
                         let mut c = base.clone();
                         if let Some(s) = msg.get("params").and_then(|p| p.get("prefill_compression")).and_then(|v| v.as_str()) {
@@ -742,7 +749,13 @@ fn main() {
                             c.threshold_tokens = v as usize;
                         }
                         if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_keep_ratio")).and_then(|v| v.as_f64()) {
-                            c.keep_ratio = v as f32;
+                            let r = v as f32;
+                            if !(r > 0.0 && r <= 1.0) {
+                                pf_override_err = Some(format!(
+                                    "prefill_keep_ratio={r} not in (0, 1]"));
+                            } else {
+                                c.keep_ratio = r;
+                            }
                         }
                         if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_min_keep")).and_then(|v| v.as_u64()) {
                             c.min_keep_tokens = v as usize;
@@ -754,10 +767,24 @@ fn main() {
                             c.recent_tokens = v as usize;
                         }
                         if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_block")).and_then(|v| v.as_u64()) {
-                            c.block_size = v as usize;
+                            let b = v as usize;
+                            if b == 0 {
+                                pf_override_err = Some("prefill_block must be > 0".to_string());
+                            } else {
+                                c.block_size = b;
+                            }
                         }
                         c
                     });
+                    if let Some(reason) = pf_override_err {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"error","id":"{}","message":"invalid pflash override: {}"}}"#,
+                            id, reason.replace('"', "'"),
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
                     generate(
                         m, &mut gpu, &mut stdout, id, prompt, system,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
@@ -1962,13 +1989,13 @@ fn generate_dflash(
 
 #[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut engine::pflash::PflashState>, pflash_cfg: Option<&engine::pflash::PflashConfig>) {
-    // DFlash fast path — only when a draft model is loaded AND temperature is
+    // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
     if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) {
         if max_think_tokens > 0 {
             // DFlash's spec-cycle emit path doesn't yet honor max_think_tokens
-            // — wiring close-injection through the verify loop is a separate
+            // -- wiring close-injection through the verify loop is a separate
             // change. Tell the operator their cap is being ignored on this
             // path so they don't think a runaway thinking turn is a daemon
             // hang. AR path (no draft, or temp>0) does enforce it.
@@ -1979,9 +2006,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             );
             let _ = stdout.flush();
         }
+        // PFlash + DFlash decode path is not yet wired -- the DFlash spec
+        // loop builds its own prompt token stream internally, so the
+        // generate() PFlash block below never runs. Surface this loud so
+        // an operator who set prefill_compression != off sees a clear
+        // bypass event instead of silently getting full-prefill behavior
+        // they didn't ask for. Compression-on-DFlash lands in a future
+        // phase that threads PflashState through generate_dflash().
+        if let Some(cfg) = pflash_cfg.as_ref() {
+            if cfg.mode != engine::pflash::PflashMode::Off {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
+                    id,
+                );
+                let _ = stdout.flush();
+            }
+        }
         generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
         // Silence unused-variable warnings for the params we didn't need.
-        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text);
+        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
 
@@ -2028,10 +2072,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // Bypass / compressed status is reported as a `pflash_compressed` or
     // `pflash_bypass` event so operators can see what the request actually
     // ran through.
+    //
+    // Tool-call detection: the prompt may contain a `<tool_call>` token
+    // that the parser uses for structure. Compressing those tokens away
+    // would corrupt the response shape, so we surface a ToolCall request
+    // kind to the gate and let `decide_bypass` reject the request loudly.
+    // Detection is best-effort -- the special-token id is missing on
+    // older vocabs, in which case the gate just routes through Text.
+    let request_kind = match tokenizer.special_token_id("<tool_call>") {
+        Some(tid) if raw_q_tokens.iter().any(|&t| t == tid) =>
+            engine::pflash::RequestKind::ToolCall,
+        _ => engine::pflash::RequestKind::Text,
+    };
+
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
             let decision = engine::pflash::maybe_compress_prompt(
-                gpu, state, cfg, &raw_q_tokens, engine::pflash::RequestKind::Text, &[],
+                gpu, state, cfg, &raw_q_tokens, request_kind, &[],
             );
             match decision {
                 Ok(engine::pflash::PflashDecision::Compressed(cp)) => {
