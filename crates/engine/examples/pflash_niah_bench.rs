@@ -119,12 +119,69 @@ fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
         .and_then(|s| s.parse().ok())
 }
 
+/// Companion-file path for a pre-tokenized fixture: replaces the trailing
+/// `.jsonl` with `.tok.jsonl`. The pretok file mirrors the source fields
+/// plus a tokens array and a tokenizer-signature marker. Stored next to
+/// the source fixture so re-runs without `--write-pretok` find it.
+fn pretok_companion_path(fixture: &Path) -> std::path::PathBuf {
+    let stem = fixture.with_extension("");
+    let mut s = stem.into_os_string();
+    s.push(".tok.jsonl");
+    std::path::PathBuf::from(s)
+}
+
+/// JSON-encode a u32 array as `[1,2,3,...]` without pulling in a full
+/// JSON library. Pre-tokenized fixtures only need a numeric array.
+fn encode_token_array(tokens: &[u32]) -> String {
+    let mut s = String::with_capacity(tokens.len() * 6 + 2);
+    s.push('[');
+    for (i, t) in tokens.iter().enumerate() {
+        if i > 0 { s.push(','); }
+        s.push_str(&t.to_string());
+    }
+    s.push(']');
+    s
+}
+
+/// Read a u32 array out of a pretok JSONL line. Strict but minimal: the
+/// writer is `encode_token_array`, so we only need to parse `[N,N,...,N]`.
+fn parse_token_array(text: &str) -> Vec<u32> {
+    let needle = "\"tokens\":";
+    let i = text.find(needle).expect("missing tokens field in pretok jsonl");
+    let rest = &text[i + needle.len()..];
+    let lb = rest.find('[').expect("expected [ for tokens array");
+    let rb = rest.find(']').expect("expected ] for tokens array");
+    rest[lb + 1..rb]
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u32>().expect("token id parse"))
+        .collect()
+}
+
+fn parse_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let i = text.find(&needle)?;
+    let rest = &text[i + needle.len()..];
+    let start = rest.find('"')? + 1;
+    let bytes = rest.as_bytes();
+    let mut j = start;
+    let mut out = String::new();
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b'"' { break; }
+        out.push(b as char);
+        j += 1;
+    }
+    Some(out)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> \
-                   [--maxgen N] [--q8kv|--asym3] [--pflash <drafter.hfq> \
-                   [--keep-ratio K] [--block-size B] [--sink-tokens N] [--recent-tokens N]]");
+                   [--maxgen N] [--q8kv|--asym3] [--pretok|--write-pretok] \
+                   [--pflash <drafter.hfq> [--keep-ratio K] [--block-size B] \
+                   [--sink-tokens N] [--recent-tokens N]]");
         std::process::exit(2);
     }
     let model_path = &args[1];
@@ -138,6 +195,8 @@ fn main() {
     let block_size: usize = parse_arg(&args, "--block-size").unwrap_or(64);
     let sink_tokens: usize = parse_arg(&args, "--sink-tokens").unwrap_or(16);
     let recent_tokens: usize = parse_arg(&args, "--recent-tokens").unwrap_or(32);
+    let use_pretok = args.iter().any(|a| a == "--pretok");
+    let write_pretok = args.iter().any(|a| a == "--write-pretok");
 
     let mode_label = if drafter_path.is_some() { "PFlash compressed" } else { "full prefill" };
     eprintln!("=== PFlash NIAH ({mode_label}) ===");
@@ -156,14 +215,43 @@ fn main() {
     let bin_md5 = md5_file(Path::new("/proc/self/exe"));
     eprintln!("binary md5:  {bin_md5}");
 
-    let raw = fs::read_to_string(fixture_path).expect("read fixture");
-    let raw_md5 = md5_hex(raw.as_bytes());
-    eprintln!("fixture md5: {raw_md5}");
-    let (filler, question, expected) = parse_jsonl_record(&raw);
-    let prompt_text = format!("{filler}\n\n{question}");
+    let pretok_path = pretok_companion_path(Path::new(fixture_path));
+    let pretok_available = use_pretok && pretok_path.exists();
+    if use_pretok && !pretok_available {
+        eprintln!("FAIL: --pretok requested but {} does not exist (run --write-pretok first)",
+            pretok_path.display());
+        std::process::exit(2);
+    }
+
+    let (raw, raw_md5, filler, question, expected, pretok_tokens, pretok_sig) =
+    if pretok_available {
+        let raw = fs::read_to_string(&pretok_path).expect("read pretok fixture");
+        let raw_md5 = md5_hex(raw.as_bytes());
+        eprintln!("pretok fixture: {} ({raw_md5})", pretok_path.display());
+        let question = parse_string_field(&raw, "question").expect("question");
+        let expected = parse_string_field(&raw, "expected_answer_substring").expect("expected");
+        let sig = parse_string_field(&raw, "tokenizer_signature").expect("tokenizer_signature");
+        let toks = parse_token_array(&raw);
+        eprintln!("pretok tokens: {} (sig {sig})", toks.len());
+        (raw, raw_md5, String::new(), question, expected, Some(toks), Some(sig))
+    } else {
+        let raw = fs::read_to_string(fixture_path).expect("read fixture");
+        let raw_md5 = md5_hex(raw.as_bytes());
+        eprintln!("fixture md5: {raw_md5}");
+        let (filler, question, expected) = parse_jsonl_record(&raw);
+        (raw, raw_md5, filler, question, expected, None, None)
+    };
+    let prompt_text = if pretok_tokens.is_some() {
+        // pretok mode never reconstructs a prompt string -- the tokens
+        // _are_ the prompt. Hash the question alone for traceability.
+        question.clone()
+    } else {
+        format!("{filler}\n\n{question}")
+    };
     let prompt_md5 = md5_hex(prompt_text.as_bytes());
     eprintln!("prompt md5:  {prompt_md5}");
     eprintln!("expected:    {expected:?}");
+    let _ = raw; // keep raw alive for any later debug; main path doesn't need it.
 
     let model_md5 = md5_file(Path::new(model_path));
     eprintln!("model md5:   {model_md5}");
@@ -180,12 +268,46 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads);
 
     let t_tok = Instant::now();
-    let source_tokens = wrap_chatml(&tokenizer, &prompt_text);
-    let tok_ms = t_tok.elapsed().as_millis();
-    eprintln!("tokenize:    {tok_ms} ms ({} tokens)", source_tokens.len());
+    let source_tokens: Vec<u32> = if let Some(pretok) = pretok_tokens {
+        let actual_sig = tokenizer.signature().to_string();
+        let recorded = pretok_sig.unwrap_or_default();
+        if actual_sig != recorded {
+            eprintln!("FAIL: pretok tokenizer signature {recorded} != model tokenizer signature {actual_sig}; \
+                       re-run --write-pretok with this model");
+            std::process::exit(2);
+        }
+        eprintln!("tokenize:    skipped (pretok mode, signature matches)");
+        pretok
+    } else {
+        wrap_chatml(&tokenizer, &prompt_text)
+    };
+    let tok_ms = if pretok_available { 0 } else { t_tok.elapsed().as_millis() };
+    if !pretok_available {
+        eprintln!("tokenize:    {tok_ms} ms ({} tokens)", source_tokens.len());
+    }
     let source_bytes: Vec<u8> = source_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
     let source_md5 = md5_hex(&source_bytes);
     eprintln!("source tokens md5: {source_md5}");
+
+    if write_pretok {
+        // Persist a pre-tokenized companion right after encode so future
+        // bench runs can use --pretok and skip the slow O(N²) encoder.
+        let sig = tokenizer.signature().to_string();
+        let mut line = String::with_capacity(source_tokens.len() * 6 + 256);
+        line.push('{');
+        line.push_str(&format!("\"source_fixture\":\"{}\",", fixture_path.replace('"', "")));
+        line.push_str(&format!("\"source_fixture_md5\":\"{raw_md5}\","));
+        line.push_str(&format!("\"tokenizer_signature\":\"{sig}\","));
+        line.push_str(&format!("\"question\":\"{}\",", question.replace('"', "\\\"")));
+        line.push_str(&format!("\"expected_answer_substring\":\"{}\",", expected.replace('"', "\\\"")));
+        line.push_str(&format!("\"tokens_count\":{},", source_tokens.len()));
+        line.push_str(&format!("\"tokens_md5\":\"{source_md5}\","));
+        line.push_str("\"tokens\":");
+        line.push_str(&encode_token_array(&source_tokens));
+        line.push_str("}\n");
+        fs::write(&pretok_path, line).expect("write pretok jsonl");
+        eprintln!("wrote pretok: {} ({} tokens)", pretok_path.display(), source_tokens.len());
+    }
 
     // ── PFlash compression (optional) ────────────────────────────────────
     // Drafter is loaded transiently after target weights, before target KV
