@@ -127,6 +127,12 @@ fn main() {
     eprintln!("maxgen:  {max_gen}");
     eprintln!("kv mode: {kv_label}");
 
+    // Binary md5 — required by PRD §6 / §5.3.3 report fields. Reads the
+    // running executable from /proc/self/exe so reruns of the same binary
+    // produce stable hashes regardless of cwd.
+    let bin_md5 = md5_file(Path::new("/proc/self/exe"));
+    eprintln!("binary md5:  {bin_md5}");
+
     let raw = fs::read_to_string(fixture_path).expect("read fixture");
     let raw_md5 = md5_hex(raw.as_bytes());
     eprintln!("fixture md5: {raw_md5}");
@@ -178,14 +184,25 @@ fn main() {
     let prefill_tok_s = if prefill_ms > 0 { tokens.len() as f64 / (prefill_ms as f64 / 1000.0) } else { 0.0 };
     eprintln!("prefill:     {prefill_ms} ms ({prefill_tok_s:.0} tok/s)");
 
+    // First decoded token comes directly from prefill logits — no
+    // additional GPU work, but isolate the argmax + download as part of
+    // "first decode step" timing so the tokenize/prefill/first-decode/total
+    // breakdown matches the PRD §6 contract.
+    let t_first_dec = Instant::now();
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
     let first_token = llama::argmax(&logits);
+    let first_decode_ms = t_first_dec.elapsed().as_millis();
+    eprintln!("first dec:   {first_decode_ms} ms (token from prefill logits)");
 
+    // Sustained decode loop. `decode_steps` counts ONLY actual
+    // forward_scratch calls; the first token (already accounted for above)
+    // is not in the denominator. This avoids inflating decode tok/s by
+    // counting the prefill-derived token as decode work.
     let t_dec = Instant::now();
     let mut next_token = first_token;
-    let mut generated: Vec<u32> = Vec::new();
-    for _ in 0..max_gen {
-        generated.push(next_token);
+    let mut generated: Vec<u32> = vec![first_token];
+    let mut decode_steps: usize = 0;
+    for _ in 1..max_gen {
         if next_token == config.eos_token {
             break;
         }
@@ -195,20 +212,25 @@ fn main() {
         ).expect("forward_scratch");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         next_token = llama::argmax(&logits);
+        generated.push(next_token);
+        decode_steps += 1;
     }
     let decode_ms = t_dec.elapsed().as_millis();
-    let decode_tok_s = if decode_ms > 0 { generated.len() as f64 / (decode_ms as f64 / 1000.0) } else { 0.0 };
+    let decode_tok_s = if decode_ms > 0 && decode_steps > 0 {
+        decode_steps as f64 / (decode_ms as f64 / 1000.0)
+    } else { 0.0 };
     let answer = tokenizer.decode(&generated);
-    eprintln!("decode:      {decode_ms} ms ({} tokens, {decode_tok_s:.1} tok/s)", generated.len());
+    eprintln!("decode:      {decode_ms} ms ({decode_steps} forward_scratch calls, {decode_tok_s:.1} tok/s)");
 
-    let ttft_ms = tok_ms + prefill_ms;
+    let ttft_ms = tok_ms + prefill_ms + first_decode_ms;
     let total_ms = ttft_ms + decode_ms;
     eprintln!("--- TTFT ---");
-    eprintln!("tokenize:  {tok_ms} ms");
-    eprintln!("prefill:   {prefill_ms} ms");
-    eprintln!("ttft:      {ttft_ms} ms");
-    eprintln!("decode:    {decode_ms} ms");
-    eprintln!("total:     {total_ms} ms");
+    eprintln!("tokenize:    {tok_ms} ms");
+    eprintln!("prefill:     {prefill_ms} ms");
+    eprintln!("first dec:   {first_decode_ms} ms");
+    eprintln!("ttft:        {ttft_ms} ms");
+    eprintln!("decode rest: {decode_ms} ms");
+    eprintln!("total:       {total_ms} ms");
 
     let pass = answer.contains(&expected);
     eprintln!("--- ANSWER ---");
