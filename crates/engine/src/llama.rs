@@ -1195,10 +1195,12 @@ impl PrefillBatchScratch {
     }
 }
 
-/// Upload token ids + positions into `pbs` via sync `memcpy_htod`. Call
-/// before `hipStreamBeginCapture` if the caller needs `forward_prefill_batch`
-/// inside a captured graph; otherwise `forward_prefill_batch` uploads
-/// internally.
+/// Upload token ids + positions into `pbs` via sync `memcpy_htod`. Pair
+/// with `forward_prefill_batch_chunk_captured` to drive a captured graph
+/// without `memcpy_htod` operations sneaking in (which would otherwise
+/// either error under capture or bake stale host data into the captured
+/// kernarg blob). The plain `forward_prefill_batch` does its own uploads
+/// internally and does not need this helper.
 pub fn upload_prefill_batch_inputs(
     gpu: &mut Gpu,
     pbs: &PrefillBatchScratch,
@@ -1304,6 +1306,47 @@ pub fn forward_prefill_batch(
         p.free_gpu(gpu);
     }
     Ok(())
+}
+
+/// Single-chunk capture-friendly entry. The caller must have already
+/// populated `pbs.tokens` and `pbs.positions` via
+/// `upload_prefill_batch_inputs`, and must size `tokens.len() <= pbs.max_batch`.
+/// Skips the internal `memcpy_htod` so the body is safe under
+/// `hipStreamBeginCapture`. The eligibility check still runs; on a non-eligible
+/// model the function asserts rather than silently falling back, since the
+/// fallback would issue uploads that violate capture semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_chunk_captured(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+    assert!(n <= pbs.max_batch,
+        "captured chunk size {n} exceeds pbs.max_batch {}", pbs.max_batch);
+
+    let arch = gpu.arch.as_str();
+    let kv_ok = kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
+    let weights_ok = weights.layers.iter().all(|l|
+        is_batchable_la(l.wq.gpu_dtype, arch) &&
+        is_batchable_la(l.wk.gpu_dtype, arch) &&
+        is_batchable_la(l.wv.gpu_dtype, arch) &&
+        is_batchable_la(l.wo.gpu_dtype, arch) &&
+        is_batchable_la(l.w_gate.gpu_dtype, arch) &&
+        is_batchable_la(l.w_up.gpu_dtype, arch) &&
+        is_batchable_la(l.w_down.gpu_dtype, arch));
+    assert!(kv_ok && weights_ok,
+        "forward_prefill_batch_chunk_captured requires batched-eligible weights + KV");
+
+    forward_prefill_chunk(gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1507,12 +1550,19 @@ fn forward_prefill_chunk(
             )?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
             // Long-context Q8 fallback: per-position flash.
+            //
+            // `pbs.positions` was uploaded as raw i32 bits but the dtype is
+            // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`
+            // would reinterpret those bytes as floats, so positions like 15000
+            // would surface as ~1e-3 subnormals that cast to 0. Reconstruct
+            // from `start_pos + b` directly — the buffer layout is exactly
+            // [start_pos .. start_pos + n] in linear order.
             let q_dim = config.n_heads * config.head_dim;
-            let pos_host = gpu.download_f32(&pbs.positions)?;
             let pos_buf_tmp = gpu.hip.malloc(4)?;
             for b in 0..n {
-                let seq_len_b = pos_host[b] as usize + 1;
-                let pos_i32 = pos_host[b] as i32;
+                let pos_b = start_pos + b;
+                let seq_len_b = pos_b + 1;
+                let pos_i32 = pos_b as i32;
                 gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
                 let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
                 let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
