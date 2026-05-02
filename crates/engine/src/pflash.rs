@@ -382,6 +382,142 @@ fn norm_l2(v: &[f32]) -> f32 {
     s.sqrt()
 }
 
+/// Pick which source positions survive compression. Combines mandatory
+/// anchors (prefix sink + recent tail) with top-scoring middle blocks under
+/// a token budget set by `keep_ratio` × `source_tokens`, floor'd at
+/// `min_keep_tokens`. Returns kept spans `[ (start, end_exclusive) ... ]`
+/// in source order, with adjacent / overlapping spans coalesced.
+///
+/// PRD §5.4 selection rules:
+///   - always keep `sink_tokens` from the front,
+///   - always keep `recent_tokens` from the back,
+///   - select highest-scoring blocks from the middle by descending score,
+///   - coalesce adjacent / overlapping spans so the emitted token stream
+///     stays span-coherent (no single-token scatter).
+///
+/// Pure CPU. Deterministic for a fixed `(scores, source_tokens, ...)`.
+pub fn select_spans(
+    scores: &BlockScores,
+    sink_tokens: usize,
+    recent_tokens: usize,
+    keep_ratio: f32,
+    min_keep_tokens: usize,
+) -> Vec<(usize, usize)> {
+    assert!(keep_ratio > 0.0 && keep_ratio <= 1.0,
+        "keep_ratio {keep_ratio} must be in (0, 1]");
+    let n = scores.source_tokens;
+    let bs = scores.block_size;
+    let n_blocks = scores.n_blocks;
+
+    let target_kept = std::cmp::max(
+        min_keep_tokens,
+        (n as f32 * keep_ratio).ceil() as usize,
+    ).min(n);
+
+    // If the prompt is shorter than the floor, keep everything.
+    if target_kept >= n {
+        return vec![(0, n)];
+    }
+
+    let sink_end = sink_tokens.min(n);
+    let recent_start = if recent_tokens >= n { 0 } else { n - recent_tokens };
+
+    // Anchored token count: tokens already covered by sink ∪ recent.
+    let anchored = if sink_end >= recent_start {
+        // Sink overlaps recent — anchors cover the whole prompt.
+        n
+    } else {
+        sink_end + (n - recent_start)
+    };
+    if anchored >= target_kept {
+        // Anchors alone meet the budget. Return [0, sink_end) ∪ [recent_start, n)
+        // coalesced.
+        if sink_end >= recent_start {
+            return vec![(0, n)];
+        }
+        return coalesce(vec![(0, sink_end), (recent_start, n)]);
+    }
+
+    // Budget for middle-block selection.
+    let middle_budget = target_kept - anchored;
+
+    // Rank middle blocks (those with no overlap into sink/recent) by descending
+    // score. A block overlaps sink if its start < sink_end; a block overlaps
+    // recent if its end > recent_start. Either disqualifies it from the
+    // "middle" pool — those tokens are already kept.
+    let mut middle: Vec<(usize, f32)> = (0..n_blocks)
+        .filter_map(|b| {
+            let start = b * bs;
+            let end = ((b + 1) * bs).min(n);
+            if start >= sink_end && end <= recent_start {
+                Some((b, scores.scores[b]))
+            } else {
+                None
+            }
+        })
+        .collect();
+    // Stable sort by descending score; tie-break on block index for
+    // determinism.
+    middle.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.0.cmp(&b.0)));
+
+    let mut spans = Vec::new();
+    if sink_end > 0 {
+        spans.push((0, sink_end));
+    }
+    if recent_start < n {
+        spans.push((recent_start, n));
+    }
+    let mut middle_kept = 0usize;
+    for (b, _score) in middle {
+        if middle_kept >= middle_budget {
+            break;
+        }
+        let start = b * bs;
+        let end = ((b + 1) * bs).min(n);
+        spans.push((start, end));
+        middle_kept += end - start;
+    }
+
+    coalesce(spans)
+}
+
+/// Sort + merge overlapping or adjacent half-open spans. `[a, b) ∪ [b, c)`
+/// merges into `[a, c)`. Required by the selection output to be span-coherent.
+fn coalesce(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    if spans.is_empty() {
+        return spans;
+    }
+    spans.sort_by_key(|&(s, _)| s);
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(spans.len());
+    out.push(spans[0]);
+    for &(s, e) in &spans[1..] {
+        let last = out.last_mut().unwrap();
+        if s <= last.1 {
+            last.1 = std::cmp::max(last.1, e);
+        } else {
+            out.push((s, e));
+        }
+    }
+    out
+}
+
+/// Emit the compressed token stream by gathering the tokens from every kept
+/// span in source order. `spans` must be coalesced + sorted (output of
+/// `select_spans`); this function does not re-validate.
+pub fn emit_compressed(source_tokens: &[u32], kept_spans: &[(usize, usize)]) -> Vec<u32> {
+    let total: usize = kept_spans.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let mut out = Vec::with_capacity(total);
+    for &(s, e) in kept_spans {
+        let start = s.min(source_tokens.len());
+        let end = e.min(source_tokens.len());
+        if start < end {
+            out.extend_from_slice(&source_tokens[start..end]);
+        }
+    }
+    out
+}
+
 /// Approximate VRAM cost of a drafter load *before* committing to it.
 /// Returns bytes of all GPU buffers a `load_drafter` call would touch
 /// (weights + scratch + KV cache). Useful for the daemon's parking
@@ -630,5 +766,75 @@ mod tests {
         let tokens = vec![1u32; 100];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
         assert_eq!(r, Some(BypassReason::TokenizerMismatch));
+    }
+
+    fn synthetic_scores(scores_vec: Vec<f32>, block_size: usize) -> BlockScores {
+        let n_blocks = scores_vec.len();
+        BlockScores {
+            scores: scores_vec,
+            block_size,
+            n_blocks,
+            source_tokens: n_blocks * block_size,
+        }
+    }
+
+    #[test]
+    fn select_returns_full_when_under_min_keep() {
+        let scores = synthetic_scores(vec![0.1; 4], 8); // 32 tokens
+        let spans = select_spans(&scores, 8, 8, 0.5, 64);
+        assert_eq!(spans, vec![(0, 32)], "min_keep>n must return full span");
+    }
+
+    #[test]
+    fn select_picks_top_blocks_with_anchors() {
+        // 16 blocks of 8 tokens = 128 source tokens. Make middle block 7
+        // (positions 56..64) the highest-scoring; expect it to survive
+        // alongside sink + recent.
+        let mut s = vec![0.1f32; 16];
+        s[7] = 5.0;
+        let scores = synthetic_scores(s, 8);
+        // sink=16, recent=16. keep_ratio=0.25 → target=32 tokens. Anchors cover
+        // 32 already, so middle budget = 0 — block 7 is NOT picked because
+        // anchors alone meet the budget. This is the documented behavior.
+        let spans = select_spans(&scores, 16, 16, 0.25, 0);
+        // Expected: [0, 16) ∪ [112, 128).
+        assert_eq!(spans, vec![(0, 16), (112, 128)]);
+
+        // Bump keep_ratio to 0.40 → target=52 → middle budget=20 → block 7
+        // (8 tokens, score 5.0) survives first; the remaining ~12 token
+        // budget pulls the next two tied-score blocks (2 and 3, ascending
+        // index tie-break) which coalesce with the sink into [0, 32).
+        let spans = select_spans(&scores, 16, 16, 0.40, 0);
+        assert_eq!(spans, vec![(0, 32), (56, 64), (112, 128)],
+            "block 7 must survive on score; ties pull lowest-index first → \
+             blocks 2+3 coalesce with sink");
+    }
+
+    #[test]
+    fn select_coalesces_adjacent_spans() {
+        // Two adjacent middle blocks both top-scoring → single coalesced span.
+        let mut s = vec![0.1f32; 16];
+        s[7] = 5.0;
+        s[8] = 5.0;
+        let scores = synthetic_scores(s, 8);
+        let spans = select_spans(&scores, 16, 16, 0.50, 0);
+        assert!(spans.iter().any(|&(a, b)| a == 56 && b == 72),
+            "blocks 7+8 (56..64 + 64..72) must coalesce, got {spans:?}");
+    }
+
+    #[test]
+    fn emit_concatenates_in_order() {
+        let src: Vec<u32> = (0..20).collect();
+        let spans = vec![(0, 4), (10, 14)];
+        let out = emit_compressed(&src, &spans);
+        assert_eq!(out, vec![0, 1, 2, 3, 10, 11, 12, 13]);
+    }
+
+    #[test]
+    fn emit_clamps_out_of_bounds_spans() {
+        let src: Vec<u32> = (0..5).collect();
+        let spans = vec![(0, 100), (200, 300)];
+        let out = emit_compressed(&src, &spans);
+        assert_eq!(out, vec![0, 1, 2, 3, 4]);
     }
 }

@@ -115,7 +115,26 @@ fn main() {
                 let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
                 let any_finite = bs.scores.iter().all(|s| s.is_finite());
                 eprintln!("scores any_nonzero={any_nonzero}, all_finite={any_finite}");
-                any_nonzero && any_finite
+
+                // Phase 1.3: drive scores → select_spans → emit_compressed.
+                // Targets: keep_ratio=0.5, sink=4, recent=4 → at least 16
+                // tokens survive on a 32-token toy prompt. Verify span list
+                // is non-empty, in-order, and the emitted token slice is
+                // length-consistent with the spans.
+                let spans = engine::pflash::select_spans(&bs, 4, 4, 0.5, 0);
+                let compressed = engine::pflash::emit_compressed(&toy_prompt, &spans);
+                let span_total: usize = spans.iter().map(|(s, e)| e - s).sum();
+                eprintln!("select_spans: {} spans = {:?}", spans.len(), spans);
+                eprintln!("emit_compressed: {} tokens (vs source {})", compressed.len(), toy_prompt.len());
+                let span_in_order = spans.windows(2).all(|w| w[0].1 <= w[1].0);
+                let length_ok = compressed.len() == span_total && compressed.len() <= toy_prompt.len();
+                let monotone_tokens = spans.iter()
+                    .flat_map(|&(s, e)| (s..e).map(|i| toy_prompt[i]))
+                    .eq(compressed.iter().copied());
+                eprintln!("spans_in_order={span_in_order} length_ok={length_ok} monotone_tokens={monotone_tokens}");
+
+                any_nonzero && any_finite && span_in_order && length_ok && monotone_tokens
+                    && !spans.is_empty() && !compressed.is_empty()
             }
             Err(e) => {
                 eprintln!("compute_scores_cpu failed: {e:?}");

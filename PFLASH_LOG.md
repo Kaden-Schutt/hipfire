@@ -77,3 +77,25 @@ re-prefill on a Qwen3-0.6B target with the compressed prompt to verify
 correctness end-to-end at smaller-than-NIAH context (since drafter
 availability is still escalated to MANUAL_REVIEW.md for matched-tokenizer
 Qwen3.5 targets).
+
+### Phase 1.3: span selection + compressed token emission (DONE)
+
+Added `pflash::select_spans(scores, sink, recent, keep_ratio, min_keep)`
+and `pflash::emit_compressed(source, kept_spans)`. Selection rules per
+PRD §5.4: always keep sink prefix + recent tail, fill remaining budget
+from highest-scoring middle blocks (descending score, ascending index
+tie-break for determinism), coalesce adjacent spans into single ranges.
+Pure CPU. 5 new unit tests covering full-when-under-min-keep,
+top-block-with-anchors, adjacent-coalesce, in-order emit, OOB clamp.
+12/12 module tests green.
+
+Smoke `pflash_load_demo qwen3-0.6b.hf4 qwen3-0.6b.hf4` extended:
+  32 source → 4 blocks of 8 → scores [0.731, 0.754, 0.779, 0.922]
+  select_spans(sink=4, recent=4, keep_ratio=0.5) → 3 spans:
+    [(0, 4), (16, 24), (28, 32)] = 16 tokens = exactly 0.5 ratio
+  emit_compressed: 16 tokens, monotonic, length-consistent.
+
+Phase 1.4 next: full pflash entry — compute_scores → select_spans →
+emit_compressed, returning a CompressedPrompt. Then end-to-end
+verification: source → compress → re-prefill on target → check the
+compressed prompt produces a coherent next-token continuation.
