@@ -528,3 +528,27 @@ Phase 5 NIAH gate updated:
   16K PASS (10881 tok, 31% wall-clock win)
   32K target full-prefill PASS; PFlash-on bypasses at score-degenerate.
   64K, 128K  not yet attempted; would inherit the same scoring issue.
+
+### Phase 5 multi-needle 16K NIAH (2184239)
+
+PRD §6 Phase 5 mandated multi-needle sanity at 16K. Three needles at
+depths 0.25 / 0.50 / 0.75 (`indigo-octahedron-9931`, `fenrir-quartz-2247`,
+`saint-petersburg-rotunda-5808`), `min_recovered=2`.
+
+Results on qwen3.5-4b.mq4 target, asym3 KV, --pretok:
+
+| mode      | compress | prefill  | decode | total   | recovered  | verdict |
+|-----------|----------|----------|--------|---------|------------|---------|
+| baseline  |  -       | 4654 ms  | 364 ms | 5018 ms | 2/3 (D 25,75) | PASS  |
+| PFlash 30%| 2266 ms  |  983 ms  | 381 ms | 3630 ms | 2/3 (D 25,75) | PASS  |
+
+Both modes recover the depth-0.25 and depth-0.75 needles and miss the
+depth-0.50 one. The miss is target-side recall, not PFlash compression
+artifact: same needle vanishes with full-prefill. PFlash preserves the
+two needles the target can already retrieve while shaving 28% wall
+clock.
+
+The 18 kept spans cover sink (0, 640) and recent (10880, 10934) plus
+16 middle spans -- the score kernel selected blocks containing the
+two surviving needles. Block_size=64; needles at depths 0.25 and 0.75
+land in distinct blocks that each got selected.
