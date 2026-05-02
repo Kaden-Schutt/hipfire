@@ -507,15 +507,32 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
 
           if (text.includes("\n")) {
             const parts = incompleteLine.split("\n");
-            // Commit all complete lines: print the unwritten suffix first, then
-            // re-render with markdown styling. We're switching from "raw tail"
-            // to "rendered committed" so we use \r + clear-EOL for the first
-            // committed line only.
+            const cols = stdout.columns ?? 80;
             for (let i = 0; i < parts.length - 1; i++) {
               const p = parts[i]!;
               if (i === 0) {
-                // First commit needs to clear the raw tail and re-emit styled.
-                w("\r\x1b[K" + md(p) + "\n");
+                // First commit: the raw tail is already on screen. Decide
+                // whether to re-emit with markdown styling.
+                //
+                // Re-emitting via `\r\x1b[K` only clears the CURRENT visual
+                // row — if the raw tail soft-wrapped onto multiple terminal
+                // rows, the rows above stay, and the re-emitted line then
+                // wraps again, producing visible duplication. So we only
+                // re-emit when the line fits on a single visual row.
+                const rendered = md(p);
+                const wrapped = p.length >= cols;
+                if (rendered === p) {
+                  // No markdown transform happened — just terminate the line.
+                  w("\n");
+                } else if (wrapped) {
+                  // Markdown changed the line, but it's wrapped. Skip the
+                  // re-emit to avoid the duplication bug; user sees raw
+                  // delimiters. Acceptable for Phase 1.
+                  w("\n");
+                } else {
+                  // Single visual row, has markdown — safe to re-emit styled.
+                  w("\r\x1b[K" + rendered + "\n");
+                }
               } else {
                 w(md(p) + "\n");
               }
@@ -550,10 +567,17 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
 
     if (spinInterval) { clearInterval(spinInterval); spinInterval = null; }
 
-    // Flush the trailing incomplete line: re-render with markdown so any
-    // closing delimiters that arrived in the final chunk get styled.
+    // Flush the trailing incomplete line. Same wrap-aware re-emit logic as
+    // the per-chunk commit path: only re-emit styled if the line fits on a
+    // single visual row, otherwise just terminate.
     if (incompleteLine && !firstChunk) {
-      w("\r\x1b[K" + md(incompleteLine) + "\n");
+      const rendered = md(incompleteLine);
+      const cols = stdout.columns ?? 80;
+      if (rendered === incompleteLine || incompleteLine.length >= cols) {
+        w("\n");
+      } else {
+        w("\r\x1b[K" + rendered + "\n");
+      }
       state.committedLines.push(incompleteLine);
     }
 
