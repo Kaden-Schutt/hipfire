@@ -38,3 +38,31 @@ unchanged).
 Verified end-to-end via daemon stdio: qwen3.5-4b target +
 qwen3.5-0.8b drafter → tokenizer_compat=true, 565→181 (32%),
 target prefill 3118 tok/s on compressed, decode 157 tok/s. Done.
+
+## PFlash score kernel produces NaN at ~21K source tokens (32K NIAH)
+
+- **Why escalated:** PRD §6 Phase 5 requires NIAH PASS at 32K. With
+  qwen3.5-4b target + any drafter (qwen3.5-0.8b, 2b, or 4b self), the
+  bench cleanly bypasses with
+  `ScoringDegenerate { non-finite scores: 337 NaN, 0 inf }` on the
+  21551-token niah_32k.jsonl source. 16K (10881 tokens) and 8K (5487
+  tokens) are clean and PASS.
+- **Diagnostic surface:** every block (337 of 337) returns NaN, so the
+  issue is global, not edge-block. Suggests:
+   1. drafter forward producing NaN K cache at long source length
+      (RoPE / softmax / DeltaNet recurrent state numerical issue), OR
+   2. the pflash_score_q8_kv.hip kernel has a numerical-instability
+      regime that triggers above ~16K source tokens.
+- **What works:** baseline (full prefill, no PFlash) on niah_32k.jsonl
+  PASSes in 13.4s with the same 4B target via the same forward path.
+  So target arithmetic at 32K asym3 KV is fine. The drafter path is
+  the isolation point.
+- **Suggested next step:** add a debug dump in
+  `pflash::compute_scores_batched_gpu` that downloads the drafter K
+  cache contents at e.g. block 100 and inspects for NaN at the source.
+  If K is finite but scores aren't, the score kernel has a long-context
+  numerical bug. If K itself is NaN, the issue is in the drafter
+  forward at long context.
+- **Files touched:** none (debug dump is the next investigative step).
+- **Commits:** Phase 5 NIAH PASS documented in PFLASH_LOG.md for 8K +
+  16K only. 32K listed as known-bypass-degenerate.

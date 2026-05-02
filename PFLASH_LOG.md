@@ -498,3 +498,33 @@ selection picks up the body span containing the needle by score).
 Phase 5 NIAH gate: PASS at 8K and 16K. 32K/64K/128K need either an
 async tokenizer or pre-encoded fixture artifacts (the encoder takes
 ~10 minutes at 32K end-to-end), tracked in DEFERRED.md.
+
+### 32K NIAH bench attempted; ScoringDegenerate at ~21K source tokens
+
+After pretokenizing niah_32k.jsonl (21551 tokens, ~497s one-time
+encode at 4485 tok/s on qwen3.5-0.8b), the 32K bench was run.
+
+Baseline (no --pflash): qwen3.5-4b target full prefill PASSes in
+13.4s (1605 tok/s prefill, 135 tok/s decode, needle recovered).
+This proves the target's forward path is fine at 32K asym3 KV.
+
+PFlash on (--pflash <drafter>): every drafter tried (0.8b, 2b, 4b
+self) bypasses cleanly with
+`ScoringDegenerate { non-finite scores: 337 NaN, 0 inf }`. All 337
+blocks (block_size=64, n_blocks=21551/64=337) score NaN, so the issue
+is global to the drafter scoring pass, not an edge-block effect.
+
+Escalated to MANUAL_REVIEW.md "PFlash score kernel produces NaN at
+~21K source tokens". Likely root cause is either drafter K cache
+NaN at long context (RoPE / softmax / DeltaNet) or a numerical-
+instability regime in the score kernel above ~16K source tokens.
+The bench's bypass behavior is correct: rather than feed NaN-derived
+spans into target prefill, PFlash emits a typed bypass which the
+daemon will surface as `pflash_bypass{score_degenerate}` to the
+client.
+
+Phase 5 NIAH gate updated:
+  8K  PASS (5487  tok, 31% wall-clock win)
+  16K PASS (10881 tok, 31% wall-clock win)
+  32K target full-prefill PASS; PFlash-on bypasses at score-degenerate.
+  64K, 128K  not yet attempted; would inherit the same scoring issue.
