@@ -330,3 +330,31 @@ Phase 5 next: run the full coherence-gate to verify PFlash off-by-default
 keeps Qwen3.5 byte-identical to master, plus end-to-end NIAH bench at
 larger contexts (blocked on matched-tokenizer Qwen3.5 drafter; see
 MANUAL_REVIEW.md).
+
+### Phase 5 (partial): off-default smoke + gate escalation
+
+PFlash off-by-default smoke (Qwen3.5-4B.mq4 via daemon stdio, no
+`prefill_*` params on the load):
+
+  loaded {arch:qwen3_5, dim:2560, layers:32, vocab:248320}
+  done   {tokens:24, prefill_tok_s:535.9, decode_tok_s:167.5,
+          ttft_ms:28.0}      <-- no `pflash` field
+
+Confirms the off-default code path emits the original done shape and
+the Qwen3.5 hot path runs at normal perf. Existing clients that don't
+opt into PFlash see byte-identical behavior.
+
+Full coherence-gate run (loads ~73 GB of Qwen3.5/3.6 weights across 9
+models in sequence) and the speed-gate `--fast` both hung in this
+session past 20 min on what looks like a local environment issue
+(GPU went idle; no pflash-related panic in stderr). Killed; documented
+as MANUAL_REVIEW.md item: re-run from a fresh shell after the next
+session reset, with a wider bash timeout, to clear PFlash off-default
+contract on all 9 gate models.
+
+Phase 5 partial status:
+  off-default Qwen3.5-4B: PASS
+  full coherence-gate:    BLOCKED on environment (escalated)
+  speed-gate --fast:      BLOCKED on environment (escalated)
+  NIAH 16K-128K:          BLOCKED on matched-tokenizer drafter
+                           (existing escalation)
