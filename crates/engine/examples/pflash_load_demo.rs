@@ -151,7 +151,7 @@ fn main() {
                 let scorer_health_ok = {
                     let mut probe_state = state.drafter_loaded;
                     if probe_state {
-                        match engine::pflash::compute_scores_cpu(
+                        match engine::pflash::compute_scores_batched(
                             &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
                         ) {
                             Ok(bs) => {

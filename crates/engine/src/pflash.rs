@@ -278,9 +278,143 @@ pub struct BlockScores {
     pub source_tokens: usize,
 }
 
+/// Dequantize a single position's Q8_0 K cache slice into f32. Layout per
+/// PRD-aligned KvCache::new_gpu_q8: head_dim must be a multiple of 32 and
+/// each head is `(head_dim / 32) * 34` bytes (`f16 scale | int8 x 32` per
+/// block). Output length = `n_kv_heads * head_dim`.
+///
+/// Pure CPU helper; pulls Q8 K out of a downloaded cache buffer for
+/// pflash scoring without needing a HIP kernel.
+fn dequant_q8_kv_position(
+    bytes: &[u8],
+    n_kv_heads: usize,
+    head_dim: usize,
+    out: &mut [f32],
+) {
+    assert_eq!(head_dim % 32, 0, "Q8 KV cache requires head_dim multiple of 32");
+    let blocks_per_head = head_dim / 32;
+    let bytes_per_head = blocks_per_head * 34;
+    debug_assert_eq!(bytes.len(), n_kv_heads * bytes_per_head);
+    debug_assert_eq!(out.len(), n_kv_heads * head_dim);
+    for h in 0..n_kv_heads {
+        let head_bytes = &bytes[h * bytes_per_head..(h + 1) * bytes_per_head];
+        let head_out = &mut out[h * head_dim..(h + 1) * head_dim];
+        for blk in 0..blocks_per_head {
+            let bb = &head_bytes[blk * 34..(blk + 1) * 34];
+            let scale_bits = u16::from_le_bytes([bb[0], bb[1]]);
+            let scale = crate::llama::f16_to_f32(scale_bits);
+            for j in 0..32 {
+                let v = bb[2 + j] as i8;
+                head_out[blk * 32 + j] = (v as f32) * scale;
+            }
+        }
+    }
+}
+
+/// Phase 2.0 fast path: drafter scoring via batched prefill + Q8 cache
+/// dequant. Replaces the Phase 1.2 per-token loop (~3 ms/token on
+/// qwen3-0.6b at gfx1100, dominated by decode-mode forward pass) with one
+/// `forward_prefill_batch` call (~3000+ tok/s prefill) plus a single CPU
+/// dequant + mean-pool over the chosen scoring layer's K cache.
+///
+/// Algorithm (same heuristic as Phase 1.2; only the FORWARD path changed):
+///   1. Run llama::forward_prefill_batch on source_tokens at start_pos=0.
+///   2. Download the chosen layer's Q8 K cache for [0, source_tokens).
+///   3. CPU dequant per position into [N × kv_dim] f32.
+///   4. Mean-pool K per block, score = cosine(block_mean, last_K).
+///
+/// Preconditions:
+///   - drafter loaded
+///   - drafter_kv quant_q8 (the Phase 1.1 default)
+///   - source_tokens.len() <= drafter_kv.physical_cap
+///
+/// Mutates drafter_kv (overwrites positions 0..source_tokens.len()). Stale
+/// data past the source length is ignored by subsequent calls because
+/// we always start at position 0.
+pub fn compute_scores_batched(
+    state: &mut PflashState,
+    gpu: &mut Gpu,
+    source_tokens: &[u32],
+    block_size: usize,
+) -> HipResult<BlockScores> {
+    let n = source_tokens.len();
+    assert!(n > 0, "compute_scores_batched: empty source");
+    assert!(block_size > 0, "compute_scores_batched: block_size must be > 0");
+    assert!(state.drafter_loaded, "compute_scores_batched: drafter not loaded");
+
+    let cfg = state.drafter_config.as_ref().expect("loaded -> config").clone();
+    let weights = state.drafter_weights.as_ref().expect("loaded -> weights");
+    let scratch = state.drafter_scratch.as_ref().expect("loaded -> scratch");
+    let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
+    assert!(kv.quant_q8, "compute_scores_batched: drafter KV must be Q8_0 (load_drafter default)");
+    assert!(n <= kv.physical_cap,
+        "compute_scores_batched: source {n} exceeds drafter kv physical_cap {}", kv.physical_cap);
+
+    // 1. Batched prefill. Populates kv with positions 0..n at all layers.
+    llama::forward_prefill_batch(gpu, weights, &cfg, source_tokens, 0, kv, scratch, None)?;
+
+    // 2. Pick scoring layer. Last layer (n_layers - 1) sits closest to the
+    // logits and most directly reflects "what the model would attend to
+    // for the next token", which is the heuristic this scorer relies on.
+    let layer_idx = cfg.n_layers - 1;
+
+    // 3. Download the chosen layer's Q8 K cache. The buffer was allocated
+    // as F32 dtype with cache_elems = (cache_bytes + 3) / 4 — download_f32
+    // returns the same backing memory, just typed as f32. Reinterpret as
+    // bytes for dequant.
+    let blocks_per_head = cfg.head_dim / 32;
+    let bytes_per_head = blocks_per_head * 34;
+    let bytes_per_pos = cfg.n_kv_heads * bytes_per_head;
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let cache_f32 = gpu.download_f32(&kv.k_gpu[layer_idx])?;
+    let cache_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(cache_f32.as_ptr() as *const u8, cache_f32.len() * 4)
+    };
+
+    // 4. Dequant per position into a flat [n × kv_dim] f32 buffer.
+    let mut k_per_pos = vec![0.0f32; n * kv_dim];
+    for pos in 0..n {
+        let pos_in_bytes = &cache_bytes[pos * bytes_per_pos..(pos + 1) * bytes_per_pos];
+        let pos_out = &mut k_per_pos[pos * kv_dim..(pos + 1) * kv_dim];
+        dequant_q8_kv_position(pos_in_bytes, cfg.n_kv_heads, cfg.head_dim, pos_out);
+    }
+
+    // 5. Per-block mean K + cosine vs last-position K. Same scoring math
+    // as Phase 1.2 compute_scores_cpu, just over the batched-captured
+    // K instead of per-token.
+    let n_blocks = (n + block_size - 1) / block_size;
+    let mut scores = vec![0.0f32; n_blocks];
+    let last_k = &k_per_pos[(n - 1) * kv_dim..n * kv_dim];
+    let last_norm = norm_l2(last_k);
+    for b in 0..n_blocks {
+        let start = b * block_size;
+        let end = ((b + 1) * block_size).min(n);
+        let mut block_mean = vec![0.0f32; kv_dim];
+        for pos in start..end {
+            let row = &k_per_pos[pos * kv_dim..(pos + 1) * kv_dim];
+            for d in 0..kv_dim {
+                block_mean[d] += row[d];
+            }
+        }
+        let len_inv = 1.0 / (end - start).max(1) as f32;
+        for d in 0..kv_dim {
+            block_mean[d] *= len_inv;
+        }
+        let block_norm = norm_l2(&block_mean);
+        let denom = (last_norm * block_norm).max(1e-12);
+        let mut dot = 0.0f32;
+        for d in 0..kv_dim {
+            dot += block_mean[d] * last_k[d];
+        }
+        scores[b] = dot / denom;
+    }
+
+    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+}
+
 /// Run the drafter over `source_tokens` token by token, capturing post-RoPE
 /// K from the last layer at every position into a host buffer, then build
-/// per-block scores via mean-pooled K · last-position-K.
+/// per-block scores via mean-pooled K . last-position-K.
 ///
 /// This is the Phase 1.2 MVP -- uses the existing `forward_scratch_compute`
 /// per-token path so no llama.rs surface needs Q/K capture hooks. For 8K
@@ -776,9 +910,9 @@ pub fn maybe_compress_prompt(
     let n = token_ids.len();
     let t_total = std::time::Instant::now();
 
-    // 1. Score blocks.
+    // 1. Score blocks via the Phase 2.0 batched path.
     let t_score = std::time::Instant::now();
-    let bs = compute_scores_cpu(state, gpu, token_ids, cfg.block_size)?;
+    let bs = compute_scores_batched(state, gpu, token_ids, cfg.block_size)?;
     let score_ms = t_score.elapsed().as_millis();
     if let Err(detail) = bs.well_formed() {
         // Bypass loudly: select_spans treats NaN as Equal, so a broken

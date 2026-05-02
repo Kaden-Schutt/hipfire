@@ -169,3 +169,31 @@ demonstrate Lucebox-class retrieval numbers.
 Phase 2 (HIP scoring + selection kernels) advances next: the CPU
 scoring loop is ~30 s on 8K and ~12 min projected on 128K. Phase 2
 moves the per-token K capture + block scoring onto the GPU.
+
+### Phase 2.0: batched-prefill K capture + Q8 dequant scoring (DONE)
+
+`pflash::compute_scores_batched(state, gpu, source, block_size)` replaces
+the per-token forward_scratch_compute loop with one
+`llama::forward_prefill_batch` call followed by a CPU-side Q8 dequant of
+the chosen scoring layer's K cache. Mean-pool + cosine math is identical
+to Phase 1.2 -- only the FORWARD path changed.
+
+`maybe_compress_prompt` now calls `compute_scores_batched` so the daemon
+inherits the speedup automatically. The Phase 1.2 `compute_scores_cpu`
+remains public for tests / debug runs that explicitly want the per-token
+trace.
+
+Smoke (qwen3-0.6b.hf4 self-pair, gfx1100):
+
+  Phase 1.5 -> Phase 2.0 deltas (same prompt + ratio):
+    32-token toy:    96 ms -> 11 ms     (~8.7x)
+    392-token demo: 1220 ms -> 42 ms    (~29x)
+
+Pipeline output unchanged (md5s and kept_spans bit-identical between
+the per-token and batched paths on the 32-tok smoke). Compression
+quality preserved because the algorithm is the same; only the K
+capture path is faster.
+
+Projected 8K source: ~3 s (was ~26 s); 128K: ~50 s (was ~12 min).
+Phase 2.1+ moves the mean-pool + cosine onto the GPU to chase the
+remaining CPU dequant time at long context.
