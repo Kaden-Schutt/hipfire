@@ -552,3 +552,42 @@ The 18 kept spans cover sink (0, 640) and recent (10880, 10934) plus
 16 middle spans -- the score kernel selected blocks containing the
 two surviving needles. Block_size=64; needles at depths 0.25 and 0.75
 land in distinct blocks that each got selected.
+
+### Phase 5 NIAH on 27B target (272faf8) -- the headline result
+
+Per user direction "build and optimize for 27b over 4b in every case",
+ran the same NIAH gate against `qwen3.5-27b.mq3` with `qwen3.5-0.8b.mq4`
+as drafter. The compat-signature work was a prerequisite (strict
+Tokenizer::signature() differed across family sizes; new
+`pflash::tokenizer_compat_signature` excludes audio/TTS padding band
+and matches across 0.8B / 4B / 27B).
+
+Results on 7900 XTX, asym3 KV, --pretok, --keep-ratio 0.30,
+--block-size 64:
+
+| fixture        | mode      | compress | prefill   | decode | total    | needle      | verdict |
+|----------------|-----------|----------|-----------|--------|----------|-------------|---------|
+| niah_8k        | baseline  |  -       | 11229 ms  | 454 ms | 11683 ms | recovered   | PASS    |
+| niah_8k        | PFlash 30%|  761 ms  |  3069 ms  | 423 ms |  4253 ms | recovered   | PASS    |
+| niah_16k       | baseline  |  -       | 25468 ms  | 685 ms | 26153 ms | NOT recovered | FAIL  |
+| niah_16k       | PFlash 30%| 2259 ms  |  6332 ms  | 429 ms |  9020 ms | recovered   | PASS    |
+| niah_multi_16k | baseline  |  -       | 25682 ms  |1085 ms | 26767 ms | 0/3         | FAIL    |
+| niah_multi_16k | PFlash 30%| 2287 ms  |  6464 ms  |1218 ms |  9969 ms | 2/3 (D 25,75) | PASS  |
+
+Wall-clock savings: -64% at 8K, -65% at 16K, -63% at multi-needle 16K.
+The 27B target prefill cost dominates baseline TTFT (~25s for 16K of
+asym3 KV). PFlash compresses to 30% kept, dropping prefill into the
+6-7s range while the drafter forward stays well under 3s.
+
+The 16K rows are the headline finding: 27B baseline FAILS to recover
+the needle at 16K context (lost-in-middle effect on a model that
+nominally trains at longer context). PFlash compression with the 0.8B
+drafter -- which selects sink + recent + the top 13 attention-relevant
+middle blocks -- gives the 27B a clean signal it CAN retrieve from.
+PFlash improves retrieval, not just speed, in this regime.
+
+For 4B targets the wins were +28-31% wall clock and PFlash matched
+baseline retrieval. For 27B the wins are 60-65% wall clock AND PFlash
+recovers needles that full prefill misses. The advantage compounds
+with target size, exactly as the PRD §2.1 motivation predicted (long-
+context full attention is the bottleneck PFlash exists to remove).
