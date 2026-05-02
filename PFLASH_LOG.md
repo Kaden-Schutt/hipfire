@@ -591,3 +591,26 @@ baseline retrieval. For 27B the wins are 60-65% wall clock AND PFlash
 recovers needles that full prefill misses. The advantage compounds
 with target size, exactly as the PRD §2.1 motivation predicted (long-
 context full attention is the bottleneck PFlash exists to remove).
+
+### 27B 3-fresh-process TTFT validation (PRD §6 Phase 5 methodology)
+
+Per PRD §6 Phase 5: "3 fresh-process TTFT runs for each claimed
+context length". Used `scripts/pflash-niah-bench.sh` (ships in this
+branch) to drive 3 fresh `pflash_niah_bench` processes per (target,
+fixture, mode) point on 7900 XTX. Spread reported as
+(max-min)/median × 100. Anything > 5% indicates contamination
+(other GPU users, thermal step) and the numbers should not be
+trusted; under 5% is methodology-clean.
+
+```
+27B + niah_8k.jsonl   baseline: median 11768 ms total, 3/3 PASS, spread 0.5%
+27B + niah_8k.jsonl   PFlash30:  median  4266 ms total, 3/3 PASS, spread 0.4%
+                       win: -63.7% wall clock (PFlash 2.76x faster)
+27B + niah_16k.jsonl  baseline: median 26333 ms total, 0/3 PASS, spread 0.2%
+27B + niah_16k.jsonl  PFlash30:  median  9071 ms total, 3/3 PASS, spread 0.2%
+                       win: -65.5% wall clock + recovers needle baseline misses
+```
+
+All claimed PFlash perf numbers on 27B now have 3-fresh-process median
++ spread methodology behind them. Spreads under 1% on the 16K rows
+confirm the win is reproducible, not a one-shot artifact.
