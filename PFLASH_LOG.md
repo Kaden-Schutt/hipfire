@@ -33,3 +33,27 @@ Acceptance:
 ```
 
 Phase 0 status: **DONE for 8K**. 16K-128K runs deferred until Phase 0/Phase 1 share the same harness path; Phase 1's compression demo will exercise larger contexts where tokenize-vs-prefill curves matter most.
+
+### Phase 1.0: pflash module scaffold (DONE 075ddc6)
+
+`crates/engine/src/pflash.rs` with PflashMode/Config/State/Decision/
+BypassReason/RequestKind data model + `decide_bypass` pure-CPU gate +
+`maybe_compress_prompt` entry. 6/6 unit tests green.
+
+### Phase 1.1: drafter loading + tokenizer-compat (FINDING)
+
+Added `pflash::load_drafter` (HFQ → LlamaConfig + LlamaWeights + Tokenizer
++ ForwardScratch + KvCache stashed in PflashState) and
+`tokenizers_compatible` (vocab_size + probe-phrase round-trip).
+`decide_bypass` now returns `TokenizerMismatch` when the drafter loads but
+tokenizer probes diverge.
+
+Smoke `pflash_load_demo qwen3.5-4b.mq4 qwen3-0.6b.hf4`:
+- load 358 ms, 28 layers, 1024 dim, 439 MB VRAM estimate.
+- Target vocab 248144, drafter vocab 151743 → MISMATCH (correct refusal).
+
+Escalated to MANUAL_REVIEW.md: matched-tokenizer drafter is not in the
+local model dir. Three forward paths offered. Phase 1.2 (Q/K capture)
+proceeds with a same-tokenizer dev pairing (qwen3-0.6b as both drafter
+and target stand-in) so the scoring infra advances while the drafter
+question is unblocked by user.

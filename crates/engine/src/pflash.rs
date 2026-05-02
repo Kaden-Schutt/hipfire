@@ -12,7 +12,12 @@
 //! returns `Bypass` regardless of mode. Drafter loading + scoring +
 //! selection land in subsequent phases.
 
+use crate::hfq::{self, HfqFile};
+use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use crate::tokenizer::Tokenizer;
 use hip_bridge::HipResult;
+use rdna_compute::Gpu;
+use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PflashMode {
@@ -126,10 +131,23 @@ impl PflashConfig {
 
 /// Carry-over state across requests: drafter model + tokenizer + scratch.
 ///
-/// Phase 1.0: stub. Phase 1.1 fills in actual drafter model loading.
+/// Drafter loading is opt-in via `load_drafter`. While `drafter_loaded == false`
+/// the GPU-bearing fields are `None`, so this struct stays cheap to construct
+/// even when PFlash is disabled. Tokenizer-compat checking against the target
+/// happens at load time and any mismatch surfaces as `BypassReason::TokenizerMismatch`.
 pub struct PflashState {
     pub drafter_path: Option<String>,
     pub drafter_loaded: bool,
+    pub drafter_config: Option<LlamaConfig>,
+    pub drafter_weights: Option<LlamaWeights>,
+    pub drafter_tokenizer: Option<Tokenizer>,
+    pub drafter_scratch: Option<ForwardScratch>,
+    pub drafter_kv: Option<KvCache>,
+    /// True only if `drafter_tokenizer.vocab_size() == target_tokenizer.vocab_size()`
+    /// AND a fixed probe phrase round-trips identically through both. Set by
+    /// `load_drafter`; if false at request time, `decide_bypass` returns
+    /// `BypassReason::TokenizerMismatch`.
+    pub tokenizer_compat: bool,
 }
 
 impl PflashState {
@@ -137,8 +155,125 @@ impl PflashState {
         Self {
             drafter_path: cfg.drafter_path.clone(),
             drafter_loaded: false,
+            drafter_config: None,
+            drafter_weights: None,
+            drafter_tokenizer: None,
+            drafter_scratch: None,
+            drafter_kv: None,
+            tokenizer_compat: false,
         }
     }
+
+    /// Drop drafter GPU resources back to the pool. Idempotent.
+    pub fn unload_drafter(&mut self, gpu: &mut Gpu) {
+        if let Some(w) = self.drafter_weights.take() {
+            w.free_gpu(gpu);
+        }
+        if let Some(s) = self.drafter_scratch.take() {
+            s.free_gpu(gpu);
+        }
+        // KvCache has its own buffers; let drop handle them.
+        self.drafter_kv = None;
+        self.drafter_config = None;
+        self.drafter_tokenizer = None;
+        self.drafter_loaded = false;
+        self.tokenizer_compat = false;
+    }
+}
+
+/// Probe phrase used to verify drafter and target BPE merges agree. Picked to
+/// hit common BPE seams (whitespace, mixed case, punctuation, code-shape
+/// tokens, a multi-byte glyph). If both tokenizers produce the same id sequence
+/// then they share a vocab and merges and are interchangeable for compression.
+const TOKENIZER_COMPAT_PROBE: &str = "Hello, world! 0xCAFEf00d def fn() {} \u{2014}";
+
+/// Compare drafter vs target tokenizers for compression compatibility.
+/// Returns `true` only if both tokenizers have the same `vocab_size` AND
+/// produce the same encoding for `TOKENIZER_COMPAT_PROBE`.
+pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
+    if target.vocab_size() != draft.vocab_size() {
+        return false;
+    }
+    let a = target.encode(TOKENIZER_COMPAT_PROBE);
+    let b = draft.encode(TOKENIZER_COMPAT_PROBE);
+    a == b
+}
+
+/// Load a Qwen3-family drafter from `path` (HFQ artifact) onto `gpu` and
+/// stash it inside `state`. Verifies tokenizer compatibility against
+/// `target_tokenizer`; mismatch is surfaced via `tokenizer_compat = false`
+/// rather than a hard error so the caller can still bypass cleanly.
+///
+/// Allocates a small KV cache sized for `max_kv_seq` tokens (the drafter
+/// itself never sees more than the source prompt length, but the cache must
+/// be large enough for the longest context the daemon will ever score).
+///
+/// Bumps `state.drafter_loaded = true` only when:
+///   - HFQ opens cleanly,
+///   - LlamaConfig parses,
+///   - tokenizer parses,
+///   - weights load,
+///   - tokenizer_compat passes (otherwise loaded=true but compat=false; the
+///     caller sees BypassReason::TokenizerMismatch downstream).
+pub fn load_drafter(
+    state: &mut PflashState,
+    gpu: &mut Gpu,
+    path: &Path,
+    target_tokenizer: &Tokenizer,
+    max_kv_seq: usize,
+) -> HipResult<()> {
+    let hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
+        "pflash: open drafter HFQ at {}: {e}", path.display(),
+    )))?;
+    let config = hfq::config_from_hfq(&hfq).ok_or_else(|| hip_bridge::HipError::new(0,
+        "pflash: drafter HFQ has no recoverable LlamaConfig (model_type missing or unsupported)",
+    ))?;
+    let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).ok_or_else(||
+        hip_bridge::HipError::new(0, "pflash: drafter HFQ has no embedded tokenizer metadata")
+    )?;
+    let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
+    let scratch = ForwardScratch::new(gpu, &config)?;
+    // Default to Q8 KV — minimal-risk format, batched-eligible, supported
+    // across all targeted RDNA archs. Future iterations can pick asym3
+    // when scoring quality at long context demands the K-rotation.
+    let kv = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_kv_seq)?;
+
+    let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
+
+    state.drafter_path = Some(path.display().to_string());
+    state.drafter_config = Some(config);
+    state.drafter_weights = Some(weights);
+    state.drafter_tokenizer = Some(drafter_tokenizer);
+    state.drafter_scratch = Some(scratch);
+    state.drafter_kv = Some(kv);
+    state.tokenizer_compat = compat;
+    state.drafter_loaded = true;
+    Ok(())
+}
+
+/// Approximate VRAM cost of a drafter load *before* committing to it.
+/// Returns bytes of all GPU buffers a `load_drafter` call would touch
+/// (weights + scratch + KV cache). Useful for the daemon's parking
+/// decision in Phase 4.
+pub fn drafter_vram_estimate_bytes(config: &LlamaConfig, max_kv_seq: usize) -> usize {
+    // Weights: rough HFQ4G256 = 0.5 bytes/element + ~32 bytes/group overhead.
+    // Approximate as 0.6 bytes/element for the dense Qwen3 portion.
+    let n_params = {
+        let dim = config.dim;
+        let hd = config.hidden_dim;
+        let kvd = config.n_kv_heads * config.head_dim;
+        let qd = config.n_heads * config.head_dim;
+        let per_layer = dim * (qd + kvd + kvd) + qd * dim + dim * (hd + hd) + hd * dim;
+        per_layer * config.n_layers + 2 * config.vocab_size * dim
+    };
+    let weights_bytes = (n_params * 6) / 10;
+    // Scratch: a few [dim] + [hidden_dim] buffers plus partials, FP32. Bound
+    // by max(dim, hidden_dim) * 32.
+    let scratch_bytes = std::cmp::max(config.dim, config.hidden_dim) * 4 * 32;
+    // Q8 KV cache: 136 bytes per 128-element head (Q8 block stride).
+    let kv_bytes_per_pos = config.n_kv_heads * 136;
+    let kv_bytes = max_kv_seq * kv_bytes_per_pos * 2;
+    weights_bytes + scratch_bytes + kv_bytes
 }
 
 /// Why a request bypassed compression. Logged so operators can
@@ -242,6 +377,9 @@ pub fn decide_bypass(
     if !state.drafter_loaded {
         return Some(BypassReason::DrafterUnavailable);
     }
+    if !state.tokenizer_compat {
+        return Some(BypassReason::TokenizerMismatch);
+    }
     None
 }
 
@@ -332,13 +470,34 @@ mod tests {
         assert_eq!(r, Some(BypassReason::DrafterUnavailable));
     }
 
+    fn synthetic_loaded(compat: bool) -> PflashState {
+        PflashState {
+            drafter_path: Some("synthetic".into()),
+            drafter_loaded: true,
+            drafter_config: None,
+            drafter_weights: None,
+            drafter_tokenizer: None,
+            drafter_scratch: None,
+            drafter_kv: None,
+            tokenizer_compat: compat,
+        }
+    }
+
     #[test]
     fn no_bypass_when_always_with_loaded_drafter_over_threshold() {
-        // Always mode skips the threshold check; drafter loaded → fall through.
         let cfg = PflashConfig { mode: PflashMode::Always, ..Default::default() };
-        let state = PflashState { drafter_path: Some("synthetic".into()), drafter_loaded: true };
+        let state = synthetic_loaded(true);
         let tokens = vec![1u32; 100];
         let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
-        assert_eq!(r, None, "always mode + drafter loaded must reach scoring");
+        assert_eq!(r, None, "always mode + drafter loaded + compat must reach scoring");
+    }
+
+    #[test]
+    fn bypass_on_tokenizer_mismatch() {
+        let cfg = PflashConfig { mode: PflashMode::Always, ..Default::default() };
+        let state = synthetic_loaded(false);
+        let tokens = vec![1u32; 100];
+        let r = decide_bypass(&state, &cfg, &tokens, RequestKind::Text);
+        assert_eq!(r, Some(BypassReason::TokenizerMismatch));
     }
 }
