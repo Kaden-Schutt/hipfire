@@ -24,3 +24,12 @@ Acceptance:
 - Full-prefill NIAH baseline passes at every supported context size given available VRAM.
 - Bench reports TTFT broken into tokenize / prefill / first decode step / total.
 - Source md5 + binary md5 logged.
+
+### Phase 0 results (qwen3.5-4b.mq4, gfx1100, asym3 KV)
+
+```
+8K   fixture md5 6f24cd79...  ttft 32259 ms  prefill 1748 ms (3139 tok/s)  decode 161.5 tok/s  PASS (mauve-velociraptor-7741 retrieved)
+       tokenize 30511 ms (5487 tokens) — see DEFERRED.md, tokenizer perf is the bench TTFT bottleneck, not prefill
+```
+
+Phase 0 status: **DONE for 8K**. 16K-128K runs deferred until Phase 0/Phase 1 share the same harness path; Phase 1's compression demo will exercise larger contexts where tokenize-vs-prefill curves matter most.
