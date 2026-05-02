@@ -414,3 +414,44 @@ per PRD §6 Phase 3) is the major remaining work item. It needs:
 This is multi-day work; the field is in place so Phase 3.1's branch
 inside compute_scores_batched_gpu is a one-line dispatch swap when
 the kernel ships.
+
+### tokenizers_compatible: PRD §5.3 contract restored (797941b)
+
+Codex stop-gate flagged the prior simplification (da4b56e) as too lax.
+PRD §5.3 mandates same byte string at every vocab slot AND same
+(string, id) for every special token, not just vocab_size + bos/eos/eot.
+Restored both checks directly via `Tokenizer::vocab()` and
+`special_tokens()`, with one documented exception:
+
+  fn is_audio_tts_padding(s: &str) -> bool {
+      s.is_empty() || matches!(s,
+          "<|audio_start|>" | "<|audio_end|>" | "<|audio_pad|>"
+          | "<tts_pad>" | "<tts_text_bos>" | "<tts_text_eod>"
+          | "<tts_text_bos_single>")
+  }
+
+This band (slots 248070-248076) is empty in qwen3.5-0.8b and populated
+in qwen3.5-27b. Both sides agree those positions are unreachable from
+normal text input -- byte-level BPE never reaches into special-string
+territory. Allowing empty<->audio divergence at exactly that band is
+what keeps the qwen3.5-0.8b → qwen3.5-27b drafter pairing valid under
+strict §5.3.
+
+Diff diagnostic via `examples/probe_tokenizer2.rs`:
+  qwen3.5-0.8b.mq4 vs qwen3.5-27b.mq3:
+    vocab byte-string diffs: 7 of 248144 (slots 248070-248076)
+    special_tokens: 26 vs 33; 7 extras in 27B (audio/TTS specials)
+    EOT, BOS, EOS, chat-template specials all match.
+
+Smokes (release build, gpu-lock acquired):
+  - target=qwen3.5-27b.mq3 + drafter=qwen3.5-0.8b.mq4 →
+    tokenizer_compat=true, maybe_compress_prompt 32→16 PASS,
+    spans=[(0,8),(24,32)], scorer health=ok.
+  - target=qwen3.5-4b.mq4 + drafter=qwen3-0.6b.mq4 →
+    tokenizer_compat=false (vocab size 248144 vs 151743) FAIL as expected.
+  - 17/17 pflash module tests green.
+
+The contract now matches what callers depend on: a draft-target pair
+that passes `tokenizers_compatible` produces byte-identical encodings
+for any input the daemon will ever feed PFlash (chat template + EOT
+boundaries match, all merge-reachable slots are byte-equal).
