@@ -415,8 +415,12 @@ fn main() {
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
-    // teardowns. Phase 4.0: load only; request-path wiring lands in Phase 4.1.
+    // teardowns.
     let mut pflash_state: Option<engine::pflash::PflashState> = None;
+    // The PflashConfig captured at load time. Per-request `prefill_*`
+    // params override individual fields; the rest fall back to these
+    // load-time defaults. Cleared alongside `pflash_state`.
+    let mut pflash_cfg: Option<engine::pflash::PflashConfig> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -451,6 +455,7 @@ fn main() {
                 if let Some(mut pf) = pflash_state.take() {
                     pf.unload_drafter(&mut gpu);
                 }
+                pflash_cfg = None;
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
@@ -631,6 +636,7 @@ fn main() {
                                                 pf_state.tokenizer_compat,
                                                 pflash_keep_ratio, pflash_threshold);
                                             pflash_state = Some(pf_state);
+                                            pflash_cfg = Some(pf_cfg);
                                         }
                                         Err(e) => {
                                             let _ = writeln!(stdout,
@@ -723,7 +729,42 @@ fn main() {
                 if image.is_some() && m.vision_config.is_some() {
                     generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
-                    generate(m, &mut gpu, &mut stdout, id, prompt, system, temp, top_p, max_tokens, repeat_penalty, repeat_window, budget_alert_at_tok, &budget_alert_text, max_think_tokens);
+                    // Per-request PflashConfig: clone the load-time cfg
+                    // and apply any per-request overrides from `params`.
+                    // None when no drafter was configured at load --
+                    // generate() then takes the identity path.
+                    let pf_cfg_owned = pflash_cfg.as_ref().map(|base| {
+                        let mut c = base.clone();
+                        if let Some(s) = msg.get("params").and_then(|p| p.get("prefill_compression")).and_then(|v| v.as_str()) {
+                            if let Some(m) = engine::pflash::PflashMode::parse(s) { c.mode = m; }
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_threshold")).and_then(|v| v.as_u64()) {
+                            c.threshold_tokens = v as usize;
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_keep_ratio")).and_then(|v| v.as_f64()) {
+                            c.keep_ratio = v as f32;
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_min_keep")).and_then(|v| v.as_u64()) {
+                            c.min_keep_tokens = v as usize;
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_sink")).and_then(|v| v.as_u64()) {
+                            c.sink_tokens = v as usize;
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_recent")).and_then(|v| v.as_u64()) {
+                            c.recent_tokens = v as usize;
+                        }
+                        if let Some(v) = msg.get("params").and_then(|p| p.get("prefill_block")).and_then(|v| v.as_u64()) {
+                            c.block_size = v as usize;
+                        }
+                        c
+                    });
+                    generate(
+                        m, &mut gpu, &mut stdout, id, prompt, system,
+                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        pflash_state.as_mut(),
+                        pf_cfg_owned.as_ref(),
+                    );
                 }
             }
 
@@ -767,6 +808,7 @@ fn main() {
                 if let Some(mut pf) = pflash_state.take() {
                     pf.unload_drafter(&mut gpu);
                 }
+                pflash_cfg = None;
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
@@ -1918,7 +1960,8 @@ fn generate_dflash(
     let _ = stdout.flush();
 }
 
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize) {
+#[allow(clippy::too_many_arguments)]
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut engine::pflash::PflashState>, pflash_cfg: Option<&engine::pflash::PflashConfig>) {
     // DFlash fast path — only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
@@ -1968,7 +2011,71 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     let nl = tokenizer.encode("\n");
     let user_tok = tokenizer.encode("user");
     let asst_tok = tokenizer.encode("assistant");
-    let q_tokens = tokenizer.encode(prompt);
+    let raw_q_tokens = tokenizer.encode(prompt);
+
+    // ── PFlash compression (Phase 4.1 #93) ──────────────────────────────
+    //
+    // Only on first turn (seq_pos == 0). Multi-turn compression of newly-
+    // added user content has knock-on effects on prior KV state that we
+    // haven't validated yet, so subsequent turns always bypass.
+    //
+    // Compression operates on the user's actual content tokens
+    // (`raw_q_tokens`); chat-template scaffolding (im_start / role / nl /
+    // im_end) wraps the result AFTER and is never compressed away.
+    // Empty must_keep_spans is correct: there are no chat boundaries
+    // INSIDE q_tokens (they live in the scaffolding the daemon adds).
+    //
+    // Bypass / compressed status is reported as a `pflash_compressed` or
+    // `pflash_bypass` event so operators can see what the request actually
+    // ran through.
+    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
+        if m.seq_pos == 0 {
+            let decision = engine::pflash::maybe_compress_prompt(
+                gpu, state, cfg, &raw_q_tokens, engine::pflash::RequestKind::Text, &[],
+            );
+            match decision {
+                Ok(engine::pflash::PflashDecision::Compressed(cp)) => {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"select_ms":{},"gather_ms":{},"total_ms":{}}}"#,
+                        id, cp.source_tokens, cp.kept_tokens,
+                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                        cp.source_md5, cp.compressed_md5,
+                        cp.timings.score_ms, cp.timings.select_ms,
+                        cp.timings.gather_ms, cp.timings.total_ms,
+                    );
+                    let _ = stdout.flush();
+                    cp.token_ids
+                }
+                Ok(engine::pflash::PflashDecision::Bypass { reason }) => {
+                    // Only emit bypass events for non-trivial reasons.
+                    // ModeOff is the silent default; nothing to report.
+                    if !matches!(reason, engine::pflash::BypassReason::ModeOff) {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
+                            id, reason.as_str().replace('"', "'"),
+                        );
+                        let _ = stdout.flush();
+                    }
+                    raw_q_tokens
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
+                        id, e.to_string().replace('"', "'"),
+                    );
+                    let _ = stdout.flush();
+                    raw_q_tokens
+                }
+            }
+        } else {
+            raw_q_tokens
+        }
+    } else {
+        raw_q_tokens
+    };
 
     let mut new_tokens = Vec::new();
 

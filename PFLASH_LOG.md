@@ -261,3 +261,38 @@ existing forward path. Phase 4.1 adds the `decide_bypass +
 maybe_compress_prompt` call inside the request handler so a
 compressed prompt actually reaches the target prefill. Phase 4.2
 enriches the streaming `done` object with compression metadata.
+
+### Phase 4.1: request-path compression (DONE)
+
+`generate(...)` now accepts `pflash_state: Option<&mut PflashState>`
+and `pflash_cfg: Option<&PflashConfig>`. After tokenizing the user's
+prompt into `raw_q_tokens`, the function calls `maybe_compress_prompt`
+(only on first turn, `seq_pos == 0`) and emits one of three events:
+
+  - `pflash_compressed`: source_tokens, kept_tokens, keep_ratio,
+    source_md5, compressed_md5, score_ms / select_ms / gather_ms / total_ms.
+  - `pflash_bypass`: bypass reason (only when not the silent ModeOff case).
+  - `pflash_error`: scoring or compression hit a HipError.
+
+If compressed, the kept token IDs replace `q_tokens` for the prefill
+build. Chat-template scaffolding (im_start / role / nl / im_end)
+wraps the result AFTER, so structure tokens are never compressed away.
+
+Per-request `params.prefill_*` fields override the load-time
+PflashConfig field-by-field (mode / threshold / keep_ratio / min_keep /
+sink / recent / block).
+
+Multi-turn rule: compression runs ONLY on the first turn. Subsequent
+turns route the user's full content through the prefill unchanged so
+the prior KV state and the new tokens stay coherent. Multi-turn
+compression with KV reuse is a follow-up.
+
+End-to-end smoke (qwen3-0.6b self-pair, 565-token prompt with needle):
+  pflash status: tokenizer_compat=true, threshold=1
+  pflash_compressed: 565 -> 185 (32.7%), score 55 ms total 55 ms
+  done: prefill_tokens=193 (185 + 8 scaffolding), prefill 324 tok/s,
+        decode 307 tok/s, 24 generated.
+
+Phase 4 is feature-complete for plumbing. Phase 4.2 / 5 next: streaming
+`done` enrichment with compression metadata, end-to-end NIAH bench
+through the daemon, and validation gate runs.
