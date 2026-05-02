@@ -175,24 +175,30 @@ fn main() {
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn_state");
     let scratch = qwen35::Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).expect("scratch");
 
+    // HIP kernel launches are async. Without an explicit synchronize,
+    // `t_pre.elapsed()` would only measure host-side launch time and the
+    // first D2H download in the "first dec" bucket would absorb the real
+    // prefill compute. Mirror the bench_qwen35_mq4 pattern: sync inside
+    // the prefill timer, then time download+argmax separately as the
+    // first-decode-step bucket.
     let t_pre = Instant::now();
     qwen35::forward_prefill_batch(
         &mut gpu, &weights, &config, &tokens, 0, &mut kv, &mut dn_state, &scratch,
         None, None, None, None,
     ).expect("forward_prefill_batch");
+    gpu.hip.device_synchronize().expect("sync after prefill");
     let prefill_ms = t_pre.elapsed().as_millis();
     let prefill_tok_s = if prefill_ms > 0 { tokens.len() as f64 / (prefill_ms as f64 / 1000.0) } else { 0.0 };
     eprintln!("prefill:     {prefill_ms} ms ({prefill_tok_s:.0} tok/s)");
 
-    // First decoded token comes directly from prefill logits — no
-    // additional GPU work, but isolate the argmax + download as part of
-    // "first decode step" timing so the tokenize/prefill/first-decode/total
-    // breakdown matches the PRD §6 contract.
+    // First decoded token comes directly from prefill logits. With the
+    // sync above, this bucket truly measures only the D2H download +
+    // host-side argmax, not pending prefill kernels.
     let t_first_dec = Instant::now();
     let logits = gpu.download_f32(&scratch.logits).expect("download logits");
     let first_token = llama::argmax(&logits);
     let first_decode_ms = t_first_dec.elapsed().as_millis();
-    eprintln!("first dec:   {first_decode_ms} ms (token from prefill logits)");
+    eprintln!("first dec:   {first_decode_ms} ms (download + argmax of prefill logits)");
 
     // Sustained decode loop. `decode_steps` counts ONLY actual
     // forward_scratch calls; the first token (already accounted for above)
