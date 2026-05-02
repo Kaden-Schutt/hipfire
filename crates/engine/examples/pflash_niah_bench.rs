@@ -369,14 +369,20 @@ fn main() {
 
     let t_tok = Instant::now();
     let source_tokens: Vec<u32> = if let Some(pretok) = pretok_tokens {
-        let actual_sig = tokenizer.signature().to_string();
+        // Use the §5.3 compat signature (excludes audio/TTS padding) so a
+        // pretok authored with qwen3.5-0.8b's tokenizer is accepted by
+        // qwen3.5-27b's tokenizer. Strict signature() differs across family
+        // sizes only in those padding slots, which never appear in encoded
+        // text, so two §5.3-compatible tokenizers produce identical
+        // encodings for the source -- the tokens are safe to consume.
+        let actual_sig = pflash::tokenizer_compat_signature(&tokenizer).to_string();
         let recorded = pretok_sig.unwrap_or_default();
         if actual_sig != recorded {
-            eprintln!("FAIL: pretok tokenizer signature {recorded} != model tokenizer signature {actual_sig}; \
-                       re-run --write-pretok with this model");
+            eprintln!("FAIL: pretok tokenizer compat signature {recorded} != model tokenizer compat signature {actual_sig}; \
+                       re-run --write-pretok with a §5.3-compatible tokenizer");
             std::process::exit(2);
         }
-        eprintln!("tokenize:    skipped (pretok mode, signature matches)");
+        eprintln!("tokenize:    skipped (pretok mode, compat signature matches)");
         pretok
     } else {
         wrap_chatml(&tokenizer, &prompt_text)
@@ -395,7 +401,11 @@ fn main() {
         // Single-needle fixtures keep the singular expected_answer_substring
         // for backward compat; multi-needle fixtures persist the plural
         // array + min_recovered.
-        let sig = tokenizer.signature().to_string();
+        // Record the §5.3 compat signature (not strict signature()) so the
+        // pretok travels safely across same-family members of different
+        // sizes (e.g. authored with 0.8B's tokenizer, consumed by 27B's
+        // tokenizer); see pflash::tokenizer_compat_signature for rationale.
+        let sig = pflash::tokenizer_compat_signature(&tokenizer).to_string();
         let mut line = String::with_capacity(source_tokens.len() * 6 + 256);
         line.push('{');
         line.push_str(&format!("\"source_fixture\":\"{}\",", fixture_path.replace('"', "")));

@@ -288,6 +288,53 @@ fn is_audio_tts_padding(s: &str) -> bool {
         )
 }
 
+/// Stable hash of the §5.3-relevant tokenizer state, EXCLUDING the audio/TTS
+/// padding band per `is_audio_tts_padding`. Two tokenizers that pass
+/// `tokenizers_compatible` produce identical `compat_signature`s; this lets
+/// pretokenized fixtures travel safely across same-family members of
+/// different sizes (e.g. tokens written by qwen3.5-0.8b's tokenizer can be
+/// consumed by qwen3.5-27b's tokenizer because both produce the same encoding
+/// for any reachable text).
+///
+/// Cost: O(vocab_size) plus a one-time sort of specials. Called once per
+/// drafter load and once per pretok read, so the cost is amortized.
+pub fn tokenizer_compat_signature(t: &Tokenizer) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    fn mix(bytes: &[u8], h: &mut u64) {
+        for &b in bytes {
+            *h ^= b as u64;
+            *h = h.wrapping_mul(0x100000001b3);
+        }
+        *h ^= 0xff;
+        *h = h.wrapping_mul(0x100000001b3);
+    }
+    // Vocab in id order, skipping the documented padding band.
+    for tok in t.vocab() {
+        if is_audio_tts_padding(tok) {
+            continue;
+        }
+        mix(tok.as_bytes(), &mut h);
+    }
+    // Specials: filter out audio/tts entries, then sort by name for canonical
+    // order. The filter mirrors `tokenizers_compatible`'s exception, and the
+    // sort means storage-order divergence between two compatible tokenizers
+    // doesn't cause a false mismatch.
+    let mut specials: Vec<&(String, u32)> = t
+        .special_tokens()
+        .iter()
+        .filter(|(s, _)| !is_audio_tts_padding(s))
+        .collect();
+    specials.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (s, id) in specials {
+        mix(s.as_bytes(), &mut h);
+        mix(&id.to_le_bytes(), &mut h);
+    }
+    mix(&t.bos_id.to_le_bytes(), &mut h);
+    mix(&t.eos_id.to_le_bytes(), &mut h);
+    mix(&t.eot_id.unwrap_or(u32::MAX).to_le_bytes(), &mut h);
+    h
+}
+
 /// Compare drafter vs target tokenizers for compression compatibility.
 ///
 /// PRD §5.3 contract enforced directly:
