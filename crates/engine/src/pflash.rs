@@ -266,6 +266,122 @@ pub fn load_drafter(
     Ok(())
 }
 
+/// Per-block scoring output. `scores[b]` is the importance score for source
+/// block `b`; higher means "more relevant" by the drafter's last-layer
+/// K-similarity heuristic. `block_size` and `n_blocks` are the layout used
+/// for selection so caller can map back to source positions.
+#[derive(Debug, Clone)]
+pub struct BlockScores {
+    pub scores: Vec<f32>,
+    pub block_size: usize,
+    pub n_blocks: usize,
+    pub source_tokens: usize,
+}
+
+/// Run the drafter over `source_tokens` token by token, capturing post-RoPE
+/// K from the last layer at every position into a host buffer, then build
+/// per-block scores via mean-pooled K · last-position-K.
+///
+/// This is the Phase 1.2 MVP — uses the existing `forward_scratch_compute`
+/// per-token path so no llama.rs surface needs Q/K capture hooks. For 8K
+/// source on Qwen3-0.6B at gfx1100 this runs in ~30 s; Phase 2+ replaces it
+/// with batched scoring on GPU.
+///
+/// Heuristic: score(block b) = cos_sim(mean_K_block_b, last_K). Picks blocks
+/// whose attention key direction aligns with the autoregressive position's
+/// own key, matching what the model would attend to at the next token.
+/// Cheap, deterministic, NO GPU kernel changes. Phase 2 replaces with
+/// proper tail-Q × source-K attention scoring.
+///
+/// Preconditions:
+///   - `state.drafter_loaded == true`
+///   - `state.drafter_kv` is sized for at least `source_tokens.len()` positions
+///   - drafter is plain Qwen3 (no DeltaNet / MoE)
+///
+/// Mutates `state.drafter_kv` (advances by `source_tokens.len()`). Caller is
+/// responsible for resetting / recreating before reuse if scoring is to be
+/// repeated.
+pub fn compute_scores_cpu(
+    state: &mut PflashState,
+    gpu: &mut Gpu,
+    source_tokens: &[u32],
+    block_size: usize,
+) -> HipResult<BlockScores> {
+    let n = source_tokens.len();
+    assert!(n > 0, "compute_scores_cpu: empty source_tokens");
+    assert!(block_size > 0, "compute_scores_cpu: block_size must be > 0");
+    assert!(state.drafter_loaded, "compute_scores_cpu: drafter not loaded");
+
+    let cfg = state.drafter_config.as_ref().expect("drafter loaded → config").clone();
+    let weights = state.drafter_weights.as_ref().expect("drafter loaded → weights");
+    let scratch = state.drafter_scratch.as_ref().expect("drafter loaded → scratch");
+    let kv = state.drafter_kv.as_mut().expect("drafter loaded → kv");
+    assert!(n <= kv.physical_cap,
+        "compute_scores_cpu: source {n} exceeds drafter kv physical_cap {}", kv.physical_cap);
+
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    // Per-position last-layer K: [n × kv_dim] f32.
+    let mut k_per_pos: Vec<f32> = Vec::with_capacity(n * kv_dim);
+
+    for (pos, &tok) in source_tokens.iter().enumerate() {
+        llama::forward_scratch_embed(gpu, weights, &cfg, tok, pos, scratch)?;
+        llama::forward_scratch_compute(gpu, weights, &cfg, pos, kv, scratch)?;
+        // scratch.k now holds the post-RoPE K for the LAST processed layer
+        // at position `pos`. Download to host. The buffer is sized to kv_dim
+        // f32 elements regardless of cache quantization (it's the pre-quant
+        // K that gets fed into the cache write).
+        let k_row = gpu.download_f32(&scratch.k)?;
+        debug_assert_eq!(k_row.len(), kv_dim,
+            "scratch.k size {} != expected kv_dim {kv_dim}", k_row.len());
+        k_per_pos.extend_from_slice(&k_row);
+    }
+
+    let n_blocks = (n + block_size - 1) / block_size;
+    let mut scores = vec![0.0f32; n_blocks];
+
+    // Last-position K is the proxy for "what the model would attend to next"
+    // — used as the query direction against block-mean Ks.
+    let last_k = &k_per_pos[(n - 1) * kv_dim..n * kv_dim];
+    let last_norm = norm_l2(last_k);
+
+    for b in 0..n_blocks {
+        let start = b * block_size;
+        let end = ((b + 1) * block_size).min(n);
+        // Mean-pool K over positions in this block.
+        let mut block_mean = vec![0.0f32; kv_dim];
+        for pos in start..end {
+            let row = &k_per_pos[pos * kv_dim..(pos + 1) * kv_dim];
+            for d in 0..kv_dim {
+                block_mean[d] += row[d];
+            }
+        }
+        let len_inv = 1.0 / (end - start).max(1) as f32;
+        for d in 0..kv_dim {
+            block_mean[d] *= len_inv;
+        }
+        let block_norm = norm_l2(&block_mean);
+        // Cosine similarity. Avoids favoring large-magnitude blocks just
+        // because they're high-norm. Returns NaN-free even if a vector is
+        // all zeros (rare; clamp denominator).
+        let denom = (last_norm * block_norm).max(1e-12);
+        let mut dot = 0.0f32;
+        for d in 0..kv_dim {
+            dot += block_mean[d] * last_k[d];
+        }
+        scores[b] = dot / denom;
+    }
+
+    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+}
+
+fn norm_l2(v: &[f32]) -> f32 {
+    let mut s = 0.0f32;
+    for &x in v {
+        s += x * x;
+    }
+    s.sqrt()
+}
+
 /// Approximate VRAM cost of a drafter load *before* committing to it.
 /// Returns bytes of all GPU buffers a `load_drafter` call would touch
 /// (weights + scratch + KV cache). Useful for the daemon's parking

@@ -94,6 +94,32 @@ fn main() {
     // afterward would always FAIL even on a compatible pair.
     let compat = state.tokenizer_compat;
 
+    // If tokenizers match, exercise compute_scores_cpu on a tiny synthetic
+    // prompt so the Phase 1.2 scoring path gets one end-to-end smoke per
+    // demo run. Skip if the drafter was not the matching pair (compat=false)
+    // since the scoring fn assumes drafter handles the target's token ids.
+    if compat {
+        // 32-token synthetic prompt. Pick low ids that exist in any vocab
+        // (token 0..31 are typically control tokens but encode/decode round-
+        // trips; the goal here is just to exercise forward_scratch_compute
+        // 32 times and verify scores come back nonzero).
+        let toy_prompt: Vec<u32> = (0..32u32).map(|i| 100 + i).collect();
+        let block_size = 8usize;
+        match engine::pflash::compute_scores_cpu(
+            &mut state, &mut gpu, &toy_prompt, block_size,
+        ) {
+            Ok(bs) => {
+                eprintln!("compute_scores_cpu: {} blocks of {} tokens, scores {:?}",
+                    bs.n_blocks, bs.block_size, bs.scores);
+                let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
+                eprintln!("scores are non-degenerate: {any_nonzero}");
+            }
+            Err(e) => {
+                eprintln!("compute_scores_cpu failed: {e:?}");
+            }
+        }
+    }
+
     // Free GPU resources before exit so the next bench/test sees a clean pool.
     state.unload_drafter(&mut gpu);
 

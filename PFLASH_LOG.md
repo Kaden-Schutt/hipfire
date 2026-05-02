@@ -57,3 +57,23 @@ local model dir. Three forward paths offered. Phase 1.2 (Q/K capture)
 proceeds with a same-tokenizer dev pairing (qwen3-0.6b as both drafter
 and target stand-in) so the scoring infra advances while the drafter
 question is unblocked by user.
+
+### Phase 1.2: K-capture + per-block scoring (DONE)
+
+Added `pflash::BlockScores` + `compute_scores_cpu(state, gpu, source, block_size)`.
+Implementation: per-token `forward_scratch_embed + forward_scratch_compute`,
+then `download_f32(scratch.k)` to capture last-layer post-RoPE K per
+position. CPU mean-pools K per block and computes cosine similarity vs
+the last position's K. Pure CPU at this phase — no llama.rs surface
+changes, no qwen35 risk.
+
+Smoke `pflash_load_demo qwen3-0.6b.hf4 qwen3-0.6b.hf4` (32-token toy
+prompt, block_size=8):
+  4 blocks, scores [0.731, 0.754, 0.779, 0.922]
+  → last block highest (tail-K self-correlation, expected for cosine MVP).
+
+Phase 1.3 next: wire scores → span selection → compressed token IDs,
+re-prefill on a Qwen3-0.6B target with the compressed prompt to verify
+correctness end-to-end at smaller-than-NIAH context (since drafter
+availability is still escalated to MANUAL_REVIEW.md for matched-tokenizer
+Qwen3.5 targets).
