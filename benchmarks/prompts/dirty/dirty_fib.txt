@@ -1,0 +1,14 @@
+Write a Python function that computes the n-th Fibonacci number.
+
+Requirements:
+- Use memoization to keep the recursion fast.   
+- Handle n == 0 and n == 1 as base cases.	
+- Raise ValueError on negative inputs. 
+
+
+
+Begin the function with:
+
+    def fib(n: int) -> int:
+        
+        # memo dict goes here   
