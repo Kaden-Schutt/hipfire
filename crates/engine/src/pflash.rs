@@ -321,23 +321,36 @@ pub fn tokenizer_compat_signature(t: &Tokenizer) -> u64 {
     // foreign tokenizer that happens to share a vocab prefix but differs in
     // total slot count.
     mix(&(t.vocab_size() as u64).to_le_bytes(), &mut h);
-    // Vocab in id order, skipping the documented padding band.
+    // Vocab in id order. Padding slots get a stable marker rather than
+    // being skipped: skipping would lose positional information and let
+    // `[FOO, PAD, BAR]` hash-match `[FOO, BAR, PAD]` even though those
+    // tokenizers map id=1 to different strings, so identical text would
+    // tokenize differently. Mixing the marker IN PLACE preserves slot
+    // alignment, while still allowing two §5.3-compatible tokenizers to
+    // match when they each have padding (empty / audio / tts specials)
+    // at the same slot.
+    const PADDING_MARKER: &[u8] = b"\x00PFLASH_AUDIO_TTS_PAD\x00";
     for tok in t.vocab() {
         if is_audio_tts_padding(tok) {
-            continue;
+            mix(PADDING_MARKER, &mut h);
+        } else {
+            mix(tok.as_bytes(), &mut h);
         }
-        mix(tok.as_bytes(), &mut h);
     }
-    // Specials: filter out audio/tts entries, then sort by name for canonical
-    // order. The filter mirrors `tokenizers_compatible`'s exception, and the
-    // sort means storage-order divergence between two compatible tokenizers
-    // doesn't cause a false mismatch.
+    // Specials: filter out audio/tts entries, then sort by (name, id) for
+    // canonical order. The filter mirrors `tokenizers_compatible`'s exception
+    // (extras on either side are allowed iff their string is in the padding
+    // band), and the sort means storage-order divergence between two
+    // compatible tokenizers doesn't cause a false mismatch. We mix the count
+    // in too so a tokenizer with FEWER non-padding specials can't hash-match
+    // one with MORE (the surplus simply wouldn't be hashed otherwise).
     let mut specials: Vec<&(String, u32)> = t
         .special_tokens()
         .iter()
         .filter(|(s, _)| !is_audio_tts_padding(s))
         .collect();
     specials.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    mix(&(specials.len() as u64).to_le_bytes(), &mut h);
     for (s, id) in specials {
         mix(s.as_bytes(), &mut h);
         mix(&id.to_le_bytes(), &mut h);
@@ -1499,6 +1512,78 @@ mod tests {
         // Block 7 is the highest-scored, so it should appear.
         assert!(spans.iter().any(|&(a, b)| a <= 56 && 64 <= b),
             "block 7 (highest score) must survive despite anchor overlap, got {spans:?}");
+    }
+
+    #[test]
+    fn compat_signature_detects_slot_shuffle_with_padding() {
+        // Property under test: skipping padding slots when hashing would let
+        // [FOO, PAD, BAR] hash-match [FOO, BAR, PAD] even though those
+        // tokenizers map id=1 to different strings (the second has BAR at
+        // id=1, the first has padding there). The fix is to mix a stable
+        // marker IN PLACE for padding slots so positional information is
+        // preserved.
+        //
+        // We exercise this via two synthetic HF tokenizer JSON blobs that
+        // share size + non-padding strings but differ in slot ordering of
+        // an audio/tts padding token.
+        let json_a = r#"{
+            "model": {
+                "vocab": {
+                    "FOO": 0,
+                    "<|audio_pad|>": 1,
+                    "BAR": 2,
+                    "<|endoftext|>": 3
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 3, "content": "<|endoftext|>", "special": true}
+            ]
+        }"#;
+        let json_b = r#"{
+            "model": {
+                "vocab": {
+                    "FOO": 0,
+                    "BAR": 1,
+                    "<|audio_pad|>": 2,
+                    "<|endoftext|>": 3
+                },
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 3, "content": "<|endoftext|>", "special": true}
+            ]
+        }"#;
+        let tok_a = Tokenizer::from_hf_json(json_a).expect("tokenizer A");
+        let tok_b = Tokenizer::from_hf_json(json_b).expect("tokenizer B");
+        // tokenizers_compatible must reject (slot 1 diverges: padding vs BAR).
+        assert!(!tokenizers_compatible(&tok_a, &tok_b),
+            "tokenizers_compatible must reject slot-shuffle pairs");
+        // compat_signature must also diverge (otherwise pretok would silently
+        // load tokens authored by A under B).
+        assert_ne!(tokenizer_compat_signature(&tok_a),
+                   tokenizer_compat_signature(&tok_b),
+                   "compat signature must encode slot position, not just \
+                    the set of non-padding strings");
+    }
+
+    #[test]
+    fn compat_signature_matches_self() {
+        // Sanity: a tokenizer is always compat with itself, and its
+        // signature is deterministic across calls.
+        let json = r#"{
+            "model": {
+                "vocab": {"FOO": 0, "BAR": 1, "<|endoftext|>": 2},
+                "merges": []
+            },
+            "added_tokens": [
+                {"id": 2, "content": "<|endoftext|>", "special": true}
+            ]
+        }"#;
+        let tok = Tokenizer::from_hf_json(json).expect("tokenizer");
+        assert!(tokenizers_compatible(&tok, &tok));
+        assert_eq!(tokenizer_compat_signature(&tok),
+                   tokenizer_compat_signature(&tok));
     }
 
     #[test]
