@@ -266,6 +266,12 @@ fn main() {
     let recent_tokens: usize = parse_arg(&args, "--recent-tokens").unwrap_or(32);
     let use_pretok = args.iter().any(|a| a == "--pretok");
     let write_pretok = args.iter().any(|a| a == "--write-pretok");
+    if use_pretok && write_pretok {
+        eprintln!("FAIL: --pretok and --write-pretok are mutually exclusive \
+                   (one reads cached tokens, the other generates them; combining \
+                   them would re-author the cache against itself)");
+        std::process::exit(2);
+    }
 
     let mode_label = if drafter_path.is_some() { "PFlash compressed" } else { "full prefill" };
     eprintln!("=== PFlash NIAH ({mode_label}) ===");
@@ -292,11 +298,31 @@ fn main() {
         std::process::exit(2);
     }
 
+    // Compute the SOURCE fixture md5 even in pretok mode so we can verify
+    // the pretok artifact wasn't authored against a different (now-edited)
+    // source. Without this, regenerating niah_8k.jsonl with a new needle
+    // would silently keep using the old niah_8k.tok.jsonl tokens because
+    // the tokenizer signature still matches.
+    let source_raw = fs::read_to_string(fixture_path).expect("read source fixture");
+    let source_raw_md5 = md5_hex(source_raw.as_bytes());
+    eprintln!("source fixture md5: {source_raw_md5}");
+
     let (raw, raw_md5, filler, question, expected_substrings, min_recovered, pretok_tokens, pretok_sig) =
     if pretok_available {
         let raw = fs::read_to_string(&pretok_path).expect("read pretok fixture");
         let raw_md5 = md5_hex(raw.as_bytes());
         eprintln!("pretok fixture: {} ({raw_md5})", pretok_path.display());
+        // Stale-pretok guard: the pretok records the source md5 it was
+        // authored against; if the source has changed since, fail loudly
+        // rather than encode-with-old / verdict-against-new.
+        let recorded_source_md5 = parse_string_field(&raw, "source_fixture_md5")
+            .expect("missing source_fixture_md5 in pretok jsonl (was it written by an old --write-pretok?)");
+        if recorded_source_md5 != source_raw_md5 {
+            eprintln!("FAIL: pretok source_fixture_md5 {recorded_source_md5} != \
+                       current source fixture md5 {source_raw_md5}; \
+                       re-run --write-pretok against the current source");
+            std::process::exit(2);
+        }
         let question = parse_string_field(&raw, "question").expect("question");
         // Plural form preferred (multi-needle); fall back to singular.
         let (expected_arr, min_rec) = if let Some(arr) = extract_string_array(&raw, "expected_answer_substrings") {
@@ -308,14 +334,12 @@ fn main() {
         };
         let sig = parse_string_field(&raw, "tokenizer_signature").expect("tokenizer_signature");
         let toks = parse_token_array(&raw);
-        eprintln!("pretok tokens: {} (sig {sig})", toks.len());
+        eprintln!("pretok tokens: {} (sig {sig}, source md5 verified)", toks.len());
         (raw, raw_md5, String::new(), question, expected_arr, min_rec, Some(toks), Some(sig))
     } else {
-        let raw = fs::read_to_string(fixture_path).expect("read fixture");
-        let raw_md5 = md5_hex(raw.as_bytes());
-        eprintln!("fixture md5: {raw_md5}");
-        let (filler, question, expected, min_rec) = parse_jsonl_record(&raw);
-        (raw, raw_md5, filler, question, expected, min_rec, None, None)
+        eprintln!("fixture md5: {source_raw_md5}");
+        let (filler, question, expected, min_rec) = parse_jsonl_record(&source_raw);
+        (source_raw.clone(), source_raw_md5.clone(), filler, question, expected, min_rec, None, None)
     };
     let prompt_text = if pretok_tokens.is_some() {
         // pretok mode never reconstructs a prompt string -- the tokens
