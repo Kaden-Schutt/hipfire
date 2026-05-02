@@ -49,41 +49,110 @@ fn md5_file(path: &Path) -> String {
     md5_hex(&bytes)
 }
 
-fn parse_jsonl_record(text: &str) -> (String, String, String) {
-    fn extract(text: &str, key: &str) -> String {
-        let needle = format!("\"{key}\":");
-        let i = text.find(&needle).unwrap_or_else(|| panic!("missing {key}"));
-        let rest = &text[i + needle.len()..];
-        let start = rest.find('"').unwrap_or_else(|| panic!("expected string for {key}")) + 1;
-        let mut out = String::new();
-        let bytes = rest.as_bytes();
-        let mut j = start;
+fn extract_string_field(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\":");
+    let i = text.find(&needle)?;
+    let rest = &text[i + needle.len()..];
+    // Skip whitespace then expect '"'
+    let start = rest.find('"')? + 1;
+    let mut out = String::new();
+    let bytes = rest.as_bytes();
+    let mut j = start;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b == b'\\' && j + 1 < bytes.len() {
+            let esc = bytes[j + 1];
+            match esc {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                _ => out.push(esc as char),
+            }
+            j += 2;
+        } else if b == b'"' {
+            break;
+        } else {
+            out.push(b as char);
+            j += 1;
+        }
+    }
+    Some(out)
+}
+
+/// Parse a JSON array of strings: `["foo","bar"]`. Stops at the matching `]`.
+/// Used for `expected_answer_substrings` in multi-needle fixtures. Tolerates
+/// `\"` and `\\` escapes consistent with `extract_string_field`.
+fn extract_string_array(text: &str, key: &str) -> Option<Vec<String>> {
+    let needle = format!("\"{key}\":");
+    let i = text.find(&needle)?;
+    let rest = &text[i + needle.len()..];
+    let lb = rest.find('[')?;
+    let bytes = rest.as_bytes();
+    let mut j = lb + 1;
+    let mut out = Vec::new();
+    while j < bytes.len() {
+        // Skip whitespace + commas
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b',' || bytes[j] == b'\n' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        if j >= bytes.len() || bytes[j] == b']' { break; }
+        if bytes[j] != b'"' { return None; }
+        j += 1;
+        let mut s = String::new();
         while j < bytes.len() {
             let b = bytes[j];
             if b == b'\\' && j + 1 < bytes.len() {
                 let esc = bytes[j + 1];
                 match esc {
-                    b'n' => out.push('\n'),
-                    b't' => out.push('\t'),
-                    b'r' => out.push('\r'),
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    _ => out.push(esc as char),
+                    b'n' => s.push('\n'),
+                    b't' => s.push('\t'),
+                    b'"' => s.push('"'),
+                    b'\\' => s.push('\\'),
+                    _ => s.push(esc as char),
                 }
                 j += 2;
             } else if b == b'"' {
+                j += 1;
                 break;
             } else {
-                out.push(b as char);
+                s.push(b as char);
                 j += 1;
             }
         }
-        out
+        out.push(s);
     }
-    let filler = extract(text, "filler_text");
-    let question = extract(text, "question");
-    let expected = extract(text, "expected_answer_substring");
-    (filler, question, expected)
+    Some(out)
+}
+
+fn extract_usize_field(text: &str, key: &str) -> Option<usize> {
+    let needle = format!("\"{key}\":");
+    let i = text.find(&needle)?;
+    let rest = &text[i + needle.len()..];
+    rest.trim_start()
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Parse a fixture record into `(filler, question, expected_substrings, min_recovered)`.
+/// Backward compatible: a single-needle record yields a 1-element vec and
+/// `min_recovered=1`. Multi-needle records carry `expected_answer_substrings`
+/// (plural) and `min_recovered` directly.
+fn parse_jsonl_record(text: &str) -> (String, String, Vec<String>, usize) {
+    let filler = extract_string_field(text, "filler_text")
+        .expect("missing filler_text");
+    let question = extract_string_field(text, "question")
+        .expect("missing question");
+    if let Some(arr) = extract_string_array(text, "expected_answer_substrings") {
+        let min_recovered = extract_usize_field(text, "min_recovered").unwrap_or(arr.len());
+        (filler, question, arr, min_recovered)
+    } else {
+        let single = extract_string_field(text, "expected_answer_substring")
+            .expect("missing expected_answer_substring (and no plural array)");
+        (filler, question, vec![single], 1)
+    }
 }
 
 fn wrap_chatml(tokenizer: &engine::tokenizer::Tokenizer, prompt: &str) -> Vec<u32> {
@@ -223,23 +292,30 @@ fn main() {
         std::process::exit(2);
     }
 
-    let (raw, raw_md5, filler, question, expected, pretok_tokens, pretok_sig) =
+    let (raw, raw_md5, filler, question, expected_substrings, min_recovered, pretok_tokens, pretok_sig) =
     if pretok_available {
         let raw = fs::read_to_string(&pretok_path).expect("read pretok fixture");
         let raw_md5 = md5_hex(raw.as_bytes());
         eprintln!("pretok fixture: {} ({raw_md5})", pretok_path.display());
         let question = parse_string_field(&raw, "question").expect("question");
-        let expected = parse_string_field(&raw, "expected_answer_substring").expect("expected");
+        // Plural form preferred (multi-needle); fall back to singular.
+        let (expected_arr, min_rec) = if let Some(arr) = extract_string_array(&raw, "expected_answer_substrings") {
+            let mr = extract_usize_field(&raw, "min_recovered").unwrap_or(arr.len());
+            (arr, mr)
+        } else {
+            let single = parse_string_field(&raw, "expected_answer_substring").expect("expected");
+            (vec![single], 1usize)
+        };
         let sig = parse_string_field(&raw, "tokenizer_signature").expect("tokenizer_signature");
         let toks = parse_token_array(&raw);
         eprintln!("pretok tokens: {} (sig {sig})", toks.len());
-        (raw, raw_md5, String::new(), question, expected, Some(toks), Some(sig))
+        (raw, raw_md5, String::new(), question, expected_arr, min_rec, Some(toks), Some(sig))
     } else {
         let raw = fs::read_to_string(fixture_path).expect("read fixture");
         let raw_md5 = md5_hex(raw.as_bytes());
         eprintln!("fixture md5: {raw_md5}");
-        let (filler, question, expected) = parse_jsonl_record(&raw);
-        (raw, raw_md5, filler, question, expected, None, None)
+        let (filler, question, expected, min_rec) = parse_jsonl_record(&raw);
+        (raw, raw_md5, filler, question, expected, min_rec, None, None)
     };
     let prompt_text = if pretok_tokens.is_some() {
         // pretok mode never reconstructs a prompt string -- the tokens
@@ -250,7 +326,7 @@ fn main() {
     };
     let prompt_md5 = md5_hex(prompt_text.as_bytes());
     eprintln!("prompt md5:  {prompt_md5}");
-    eprintln!("expected:    {expected:?}");
+    eprintln!("expected ({}/{} req): {expected_substrings:?}", min_recovered, expected_substrings.len());
     let _ = raw; // keep raw alive for any later debug; main path doesn't need it.
 
     let model_md5 = md5_file(Path::new(model_path));
@@ -292,6 +368,9 @@ fn main() {
     if write_pretok {
         // Persist a pre-tokenized companion right after encode so future
         // bench runs can use --pretok and skip the slow O(N²) encoder.
+        // Single-needle fixtures keep the singular expected_answer_substring
+        // for backward compat; multi-needle fixtures persist the plural
+        // array + min_recovered.
         let sig = tokenizer.signature().to_string();
         let mut line = String::with_capacity(source_tokens.len() * 6 + 256);
         line.push('{');
@@ -299,7 +378,18 @@ fn main() {
         line.push_str(&format!("\"source_fixture_md5\":\"{raw_md5}\","));
         line.push_str(&format!("\"tokenizer_signature\":\"{sig}\","));
         line.push_str(&format!("\"question\":\"{}\",", question.replace('"', "\\\"")));
-        line.push_str(&format!("\"expected_answer_substring\":\"{}\",", expected.replace('"', "\\\"")));
+        if expected_substrings.len() == 1 && min_recovered == 1 {
+            line.push_str(&format!("\"expected_answer_substring\":\"{}\",",
+                expected_substrings[0].replace('"', "\\\"")));
+        } else {
+            line.push_str("\"expected_answer_substrings\":[");
+            for (i, s) in expected_substrings.iter().enumerate() {
+                if i > 0 { line.push(','); }
+                line.push_str(&format!("\"{}\"", s.replace('"', "\\\"")));
+            }
+            line.push_str("],");
+            line.push_str(&format!("\"min_recovered\":{},", min_recovered));
+        }
         line.push_str(&format!("\"tokens_count\":{},", source_tokens.len()));
         line.push_str(&format!("\"tokens_md5\":\"{source_md5}\","));
         line.push_str("\"tokens\":");
@@ -463,15 +553,23 @@ fn main() {
     eprintln!("decode rest: {decode_ms} ms");
     eprintln!("total:       {total_ms} ms");
 
-    let pass = answer.contains(&expected);
+    let recovered: Vec<&String> = expected_substrings.iter()
+        .filter(|s| answer.contains(s.as_str()))
+        .collect();
+    let pass = recovered.len() >= min_recovered;
     eprintln!("--- ANSWER ---");
     eprintln!("{answer}");
     eprintln!("--- VERDICT ---");
+    eprintln!("recovered: {} / {} (min_recovered={})", recovered.len(), expected_substrings.len(), min_recovered);
+    for s in &expected_substrings {
+        let mark = if answer.contains(s.as_str()) { "+" } else { "-" };
+        eprintln!("  [{mark}] {s:?}");
+    }
     if pass {
-        eprintln!("PASS: expected substring found in answer");
+        eprintln!("PASS: {} substring(s) found, min_recovered={}", recovered.len(), min_recovered);
         std::process::exit(0);
     } else {
-        eprintln!("FAIL: expected {expected:?} not in answer");
+        eprintln!("FAIL: {} of {} substrings recovered, need {}", recovered.len(), expected_substrings.len(), min_recovered);
         std::process::exit(1);
     }
 }
