@@ -15,6 +15,7 @@ import {
   trimTokenWindow,
   trimMessages,
   renderMarkdown,
+  stripAnsi,
   detectFenceLine,
   renderFenceOpen,
   renderFenceClose,
@@ -254,6 +255,74 @@ describe("trimMessages", () => {
     const r = trimMessages(msgs, 200, NaN);
     // Should behave as 0.5; not infinite-loop or pass through unchanged.
     expect(r.dropped).toBeGreaterThan(0);
+  });
+});
+
+// ─── stripAnsi (NO_COLOR support) ───────────────────────────────────────────
+
+describe("stripAnsi", () => {
+  test("plain text passes through unchanged", () => {
+    expect(stripAnsi("hello world")).toBe("hello world");
+  });
+
+  test("empty string", () => {
+    expect(stripAnsi("")).toBe("");
+  });
+
+  test("strips simple SGR (bold)", () => {
+    expect(stripAnsi("\x1b[1mbold\x1b[0m")).toBe("bold");
+  });
+
+  test("strips compound SGR (bold+cyan)", () => {
+    expect(stripAnsi("\x1b[1;36mtitle\x1b[0m")).toBe("title");
+  });
+
+  test("strips reverse video", () => {
+    expect(stripAnsi("\x1b[7mfoo()\x1b[0m")).toBe("foo()");
+  });
+
+  test("strips dim + italic", () => {
+    expect(stripAnsi("\x1b[2m>\x1b[0m \x1b[3mquoted\x1b[0m")).toBe("> quoted");
+  });
+
+  test("strips OSC 8 hyperlink (ST = ESC \\)", () => {
+    const link = "\x1b]8;;https://example.com\x1b\\\x1b[4mlabel\x1b[0m\x1b]8;;\x1b\\";
+    expect(stripAnsi(link)).toBe("label");
+  });
+
+  test("strips OSC 8 hyperlink with BEL terminator", () => {
+    const link = "\x1b]8;;https://example.com\x07\x1b[4mlabel\x1b[0m\x1b]8;;\x07";
+    expect(stripAnsi(link)).toBe("label");
+  });
+
+  test("strips clear-to-EOL CSI", () => {
+    expect(stripAnsi("foo\x1b[K")).toBe("foo");
+  });
+
+  test("strips cursor positioning CSI", () => {
+    expect(stripAnsi("\x1b[2J\x1b[Hhello")).toBe("hello");
+  });
+
+  test("strips private-mode set/reset (e.g. cursor hide)", () => {
+    expect(stripAnsi("\x1b[?25lhello\x1b[?25h")).toBe("hello");
+  });
+
+  test("preserves Unicode and tabs/newlines", () => {
+    expect(stripAnsi("\x1b[1m你好\x1b[0m\n\t😀")).toBe("你好\n\t😀");
+  });
+
+  test("strips full markdown-rendered output (real-world fragment)", () => {
+    // Render a fragment then verify stripping yields the source text minus
+    // the rendered transformations.
+    const rendered = renderMarkdown("**bold** and `code`");
+    expect(stripAnsi(rendered)).toBe("bold and code");
+  });
+
+  test("strips a complete markdown link (OSC 8 + underline + dim parens)", () => {
+    const rendered = renderMarkdown("[docs](https://example.com)");
+    const stripped = stripAnsi(rendered);
+    // What survives: the visible text + space + raw URL in parens.
+    expect(stripped).toBe("docs (https://example.com)");
   });
 });
 

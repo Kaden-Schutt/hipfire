@@ -97,6 +97,35 @@ export function trimMessages(
   return { kept: out, dropped, remainingTokens: used };
 }
 
+// ─── ANSI stripping (NO_COLOR support) ──────────────────────────────────────
+//
+// Removes SGR (\x1b[...m), OSC 8 hyperlinks (\x1b]8;...\x1b\\text\x1b]8;;\x1b\\),
+// and other CSI/private-mode sequences so output remains readable when colors
+// are disabled. Honors https://no-color.org — set NO_COLOR=1 in the environment
+// or pass --no-color on the command line.
+//
+// We sanitize at write-time rather than gating each SGR call site, so all
+// current and future styling code stays unchanged and the same kill-switch
+// applies to everything (including OSC 8 hyperlinks emitted by markdown links).
+//
+// OSC 8 format is: ESC ] 8 ; params ; URI ST text ESC ] 8 ; ; ST
+// where ST (string terminator) is either ESC \ (BEL also accepted in spec).
+// We collapse the wrapping markers and keep the visible text.
+
+const SGR_RE = /\x1b\[[0-9;?]*[A-Za-z]/g;          // ESC [ params final-byte (any CSI)
+const OSC8_OPEN_RE = /\x1b\]8;[^\x07\x1b]*(?:\x1b\\|\x07)/g; // ESC ] 8 ; ... ST
+const OSC8_CLOSE_RE = /\x1b\]8;;(?:\x1b\\|\x07)/g;
+const OSC_GENERIC_RE = /\x1b\][^\x07\x1b]*(?:\x1b\\|\x07)/g; // any other OSC
+
+export function stripAnsi(s: string): string {
+  if (!s) return s;
+  return s
+    .replace(OSC8_CLOSE_RE, "")    // close before open (close is more specific)
+    .replace(OSC8_OPEN_RE, "")
+    .replace(OSC_GENERIC_RE, "")
+    .replace(SGR_RE, "");
+}
+
 // ─── Markdown rendering ─────────────────────────────────────────────────────
 
 // Phase 1 markdown: fenced code blocks, inline code, bold, italic. ANSI SGR
@@ -123,17 +152,20 @@ export function renderMarkdown(text: string, fenceWidth: number = 60): string {
   text = text.replace(/^(\s*)[-*] +(.+)$/gm, (_m: string, indent: string, inner: string) => `${indent}\x1b[2m•\x1b[0m ${inner}`);
   // Numbered lists: `1. foo`, `12. bar` → dim the digits + dot.
   text = text.replace(/^(\s*)(\d+\.) +(.+)$/gm, (_m: string, indent: string, num: string, inner: string) => `${indent}\x1b[2m${num}\x1b[0m ${inner}`);
+  // Bare URLs (http/https/file) — underline + OSC 8 hyperlink. Done BEFORE
+  // markdown-link replacement so the URL inside [text](url) is protected by
+  // the negative lookbehind on `(` and `[`. Stops at whitespace or trailing
+  // bracket-style punctuation.
+  text = text.replace(/(?<![(\[])\b(https?:\/\/[^\s)\]]+|file:\/\/[^\s)\]]+)/g, (_m: string, url: string) =>
+    `\x1b]8;;${url}\x1b\\\x1b[4m${url}\x1b[0m\x1b]8;;\x1b\\`,
+  );
   // Markdown links: [text](url) → underline text, dim parens with raw URL.
   // OSC 8 hyperlink: `\x1b]8;;url\x1b\\text\x1b]8;;\x1b\\` makes text
   // clickable in iTerm2/kitty/Wezterm/modern xterm; degrades to underline
-  // in non-supporting terminals.
+  // in non-supporting terminals. Inner URL is wrapped raw (not via OSC 8)
+  // to avoid double-wrapping when the visible text is shown in parens.
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m: string, label: string, url: string) =>
     `\x1b]8;;${url}\x1b\\\x1b[4m${label}\x1b[0m\x1b]8;;\x1b\\ \x1b[2m(${url})\x1b[0m`,
-  );
-  // Bare URLs (http/https/file) not already inside [..](..) — underline +
-  // OSC 8 hyperlink. Stops at whitespace or common trailing punctuation.
-  text = text.replace(/(?<![(\[])\b(https?:\/\/[^\s)\]]+|file:\/\/[^\s)\]]+)/g, (_m: string, url: string) =>
-    `\x1b]8;;${url}\x1b\\\x1b[4m${url}\x1b[0m\x1b]8;;\x1b\\`,
   );
   text = text.replace(/`([^`]+)`/g, (_m: string, code: string) => `\x1b[7m${code}\x1b[0m`);
   text = text.replace(/\*\*([^*]+)\*\*/g, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);

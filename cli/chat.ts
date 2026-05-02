@@ -3,7 +3,7 @@ import { findModel, resolveModelTag, isServeUp } from "./index.ts";
 import {
   graphemes, sanitizePaste, estimateTokens,
   computeTokPerSec, trimTokenWindow,
-  trimMessages, renderMarkdown,
+  trimMessages, renderMarkdown, stripAnsi,
   detectFenceLine, renderFenceOpen, renderFenceClose,
   feedPasteParser, type PasteParserState,
   historyUp, historyDown, historySubmit, type HistoryState,
@@ -32,7 +32,11 @@ interface ChatState {
   cleanedUp: boolean;
 }
 
-export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
+export interface ChatTuiOptions {
+  noColor?: boolean;  // explicit --no-color flag from CLI
+}
+
+export async function chatTui(tag: string, cfg: HipfireConfig, opts: ChatTuiOptions = {}): Promise<void> {
   const stdin = process.stdin;
   const stdout = process.stdout;
 
@@ -83,8 +87,23 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     cleanedUp: false,
   };
 
-  const w = (text: string) => stdout.write(text);
-  const we = (text: string) => process.stderr.write(text);
+  // NO_COLOR support: https://no-color.org. Strips SGR + OSC 8 hyperlinks
+  // at write-time so the per-site styling code stays untouched. Also auto-
+  // disables when stdout/stderr aren't TTYs (already gated above for stdin
+  // but redundancy is cheap). Honors:
+  //   - explicit --no-color flag (opts.noColor)
+  //   - NO_COLOR env var (any non-empty value, per the spec)
+  //   - CLICOLOR=0 (de-facto-standard fallback)
+  const colorOff = opts.noColor === true
+    || (process.env.NO_COLOR !== undefined && process.env.NO_COLOR !== "")
+    || process.env.CLICOLOR === "0";
+
+  const w = colorOff
+    ? (text: string) => stdout.write(stripAnsi(text))
+    : (text: string) => stdout.write(text);
+  const we = colorOff
+    ? (text: string) => process.stderr.write(stripAnsi(text))
+    : (text: string) => process.stderr.write(text);
 
   // ─── Daemon management ──────────────────────────────────
 

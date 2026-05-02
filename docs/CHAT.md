@@ -45,6 +45,21 @@ Requires a running `hipfire serve` or auto-spawns a dedicated daemon.
 - **Input history:** Use up/down arrows to recall previous messages.
 - **Context awareness:** Warning when approaching the model's context limit.
 
+## Color output
+
+Colors and OSC 8 hyperlinks track your terminal palette automatically (we
+use 16-color ANSI throughout, no truecolor). To disable styling entirely:
+
+| Trigger | Effect |
+|---|---|
+| `hipfire chat <tag> --no-color` | One-shot: this session only |
+| `NO_COLOR=1 hipfire chat <tag>` | Honors the [no-color.org](https://no-color.org) standard |
+| `CLICOLOR=0 hipfire chat <tag>` | De-facto-standard fallback also honored |
+
+When disabled, all SGR (bold/dim/italic/color) and OSC 8 hyperlink
+sequences are stripped at write-time — markdown still renders to
+plain text but loses styling.
+
 ## Daemon Lifecycle
 
 `hipfire chat` reuses a running `hipfire serve` if one is detected on the

@@ -3846,13 +3846,15 @@ switch (cmd) {
     break;
   }
   case "chat": {
-    const chatTag = rest[0];
+    const chatArgs = rest.filter(a => !a.startsWith("--"));
+    const chatFlags = new Set(rest.filter(a => a.startsWith("--")));
+    const chatTag = chatArgs[0];
     if (!chatTag) {
-      console.error("Usage: hipfire chat <tag>  (e.g. hipfire chat qwen3.5:9b)");
+      console.error("Usage: hipfire chat <tag> [--no-color]  (e.g. hipfire chat qwen3.5:9b)");
       process.exit(1);
     }
     const { chatTui } = await import("./chat.ts");
-    await chatTui(chatTag, cfg);
+    await chatTui(chatTag, cfg, { noColor: chatFlags.has("--no-color") });
     break;
   }
   case "pull": {
