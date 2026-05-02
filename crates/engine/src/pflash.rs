@@ -16,7 +16,7 @@ use crate::hfq::{self, HfqFile};
 use crate::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use crate::tokenizer::Tokenizer;
 use hip_bridge::HipResult;
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +408,57 @@ pub fn compute_scores_batched(
         }
         scores[b] = dot / denom;
     }
+
+    Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
+}
+
+/// Phase 2.1 GPU fast path: drafter scoring entirely on the GPU. Same
+/// algorithm as `compute_scores_batched`, but the per-block mean +
+/// cosine reduce runs on a single HIP launch
+/// (`gpu.pflash_score_q8_kv`) reading the Q8 K cache in place. Returns
+/// the same `BlockScores` as the CPU paths so it's a drop-in upgrade.
+///
+/// Pre-conditions match `compute_scores_batched`. On unsupported configs
+/// (head_dim not a multiple of 32, non-Q8 KV) caller should fall back to
+/// the CPU path. The CPU dequant + reduce in `compute_scores_batched`
+/// stays as the reference for cross-checking GPU results.
+pub fn compute_scores_batched_gpu(
+    state: &mut PflashState,
+    gpu: &mut Gpu,
+    source_tokens: &[u32],
+    block_size: usize,
+) -> HipResult<BlockScores> {
+    let n = source_tokens.len();
+    assert!(n > 0, "compute_scores_batched_gpu: empty source");
+    assert!(block_size > 0, "compute_scores_batched_gpu: block_size must be > 0");
+    assert!(state.drafter_loaded, "compute_scores_batched_gpu: drafter not loaded");
+
+    let cfg = state.drafter_config.as_ref().expect("loaded -> config").clone();
+    let weights = state.drafter_weights.as_ref().expect("loaded -> weights");
+    let scratch = state.drafter_scratch.as_ref().expect("loaded -> scratch");
+    let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
+    assert!(kv.quant_q8, "compute_scores_batched_gpu: drafter KV must be Q8_0");
+    assert!(cfg.head_dim % 32 == 0, "compute_scores_batched_gpu: head_dim must be multiple of 32");
+    assert!(n <= kv.physical_cap, "compute_scores_batched_gpu: source {n} > physical_cap {}", kv.physical_cap);
+
+    llama::forward_prefill_batch(gpu, weights, &cfg, source_tokens, 0, kv, scratch, None)?;
+
+    let layer_idx = cfg.n_layers - 1;
+    let n_blocks = (n + block_size - 1) / block_size;
+
+    let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+    gpu.pflash_score_q8_kv(
+        &kv.k_gpu[layer_idx],
+        &scores_buf,
+        n,
+        cfg.n_kv_heads,
+        cfg.head_dim,
+        block_size,
+        n_blocks,
+        n - 1, // last_pos
+    )?;
+    let scores = gpu.download_f32(&scores_buf)?;
+    let _ = gpu.free_tensor(scores_buf);
 
     Ok(BlockScores { scores, block_size, n_blocks, source_tokens: n })
 }
@@ -910,9 +961,12 @@ pub fn maybe_compress_prompt(
     let n = token_ids.len();
     let t_total = std::time::Instant::now();
 
-    // 1. Score blocks via the Phase 2.0 batched path.
+    // 1. Score blocks via the Phase 2.1 GPU path. The CPU paths
+    // (compute_scores_batched / compute_scores_cpu) remain public for
+    // tests and for archs where head_dim % 32 != 0 (the GPU kernel
+    // requires it).
     let t_score = std::time::Instant::now();
-    let bs = compute_scores_batched(state, gpu, token_ids, cfg.block_size)?;
+    let bs = compute_scores_batched_gpu(state, gpu, token_ids, cfg.block_size)?;
     let score_ms = t_score.elapsed().as_millis();
     if let Err(detail) = bs.well_formed() {
         // Bypass loudly: select_spans treats NaN as Equal, so a broken

@@ -1063,3 +1063,9 @@ pub const REPEAT_INTERLEAVE_QK_SRC: &str = include_str!("../../../kernels/src/re
 
 /// Batched repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk_batched.hip");
+
+/// PFlash per-block scoring kernel.
+/// Reads Q8_0 K cache directly, dequantizes inline, computes per-block
+/// mean K and cosine similarity vs the last position's K. Output: one
+/// f32 score per block. Phase 2.1 of #93.
+pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");

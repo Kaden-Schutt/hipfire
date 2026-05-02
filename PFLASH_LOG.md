@@ -197,3 +197,35 @@ capture path is faster.
 Projected 8K source: ~3 s (was ~26 s); 128K: ~50 s (was ~12 min).
 Phase 2.1+ moves the mean-pool + cosine onto the GPU to chase the
 remaining CPU dequant time at long context.
+
+### Phase 2.1: GPU score kernel (DONE)
+
+`kernels/src/pflash_score_q8_kv.hip`: one workgroup per output block,
+256 threads each, reads Q8 K cache directly, dequantizes inline,
+accumulates per-block (dot, ||block||^2, ||last||^2) fragments via
+shared-memory reduction, writes one cosine f32 score per block.
+
+`Gpu::pflash_score_q8_kv(...)` dispatch wrapper.
+
+`pflash::compute_scores_batched_gpu(state, gpu, source, block_size)`:
+runs forward_prefill_batch then dispatches the kernel; download_f32
+returns scores. CPU path stays public for cross-checking.
+
+`maybe_compress_prompt` now calls compute_scores_batched_gpu by
+default. CPU path is unchanged so any arch / dtype regression can be
+diagnosed by swapping the call.
+
+Smoke (qwen3-0.6b.hf4 self-pair, gfx1100):
+  392 tokens warm: 33 ms (was 42 ms CPU, 1.27x at this size)
+  First call w/ JIT compile: 1127 ms (one-time cost)
+  CPU vs GPU cross-check on 32-tok toy:
+    cpu = [0.730, 0.753, 0.778, 0.921]
+    gpu = [0.730, 0.754, 0.779, 0.921]
+    max_abs_err = 7.4e-4 (well under 1e-3 tolerance)
+  compressed_md5 bit-identical between CPU and GPU paths.
+
+Speedup is modest at 392 tokens because dequant + reduce is a small
+fraction of total wall time at this size. The kernel scales O(N) and
+the GPU win will grow at long context (where Phase 2.0 leaves CPU
+dequant + reduce as the residual cost). 17/17 module tests still
+green.

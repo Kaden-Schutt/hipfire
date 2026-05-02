@@ -148,20 +148,31 @@ fn main() {
                 // anyone running the smoke. NOTE: this re-prefills the
                 // drafter; safe because the scoring path tolerates an
                 // already-advanced cache via state.unload_drafter on exit.
+                // Cross-check: CPU-batched and GPU-batched scoring paths
+                // should agree to within numerical tolerance. If they don't,
+                // the new HIP kernel is wrong.
                 let scorer_health_ok = {
                     let mut probe_state = state.drafter_loaded;
                     if probe_state {
-                        match engine::pflash::compute_scores_batched(
+                        let cpu = engine::pflash::compute_scores_batched(
                             &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
-                        ) {
-                            Ok(bs) => {
-                                let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
-                                let all_finite = bs.scores.iter().all(|s| s.is_finite());
+                        );
+                        let gpu_res = engine::pflash::compute_scores_batched_gpu(
+                            &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
+                        );
+                        match (cpu, gpu_res) {
+                            (Ok(c), Ok(g)) => {
+                                let max_err: f32 = c.scores.iter().zip(g.scores.iter())
+                                    .map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                                eprintln!("scorer xcheck: cpu={:?} gpu={:?} max_abs_err={:.3e}",
+                                    c.scores, g.scores, max_err);
+                                let any_nonzero = g.scores.iter().any(|s| s.abs() > 1e-6);
+                                let all_finite = g.scores.iter().all(|s| s.is_finite());
                                 eprintln!("scorer health: any_nonzero={any_nonzero} all_finite={all_finite}");
-                                any_nonzero && all_finite
+                                any_nonzero && all_finite && max_err < 1e-3
                             }
-                            Err(e) => {
-                                eprintln!("scorer health probe errored: {e:?}");
+                            (Err(e), _) | (_, Err(e)) => {
+                                eprintln!("scorer probe errored: {e:?}");
                                 probe_state = false;
                                 false
                             }

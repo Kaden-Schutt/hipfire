@@ -13204,6 +13204,77 @@ impl Gpu {
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
+    // PFlash scoring
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// Per-block scoring on Q8_0 K cache. Reads `k_cache` (one layer's
+    /// K-cache backing memory; the buffer must be the Q8_0-formatted slab
+    /// produced by `KvCache::new_gpu_q8`) for the first `n_pos` positions,
+    /// computes per-block mean K and cosine similarity vs the K at
+    /// `last_pos`, and writes `n_blocks` f32 scores into `scores_out`.
+    ///
+    /// One workgroup per output block, 256 threads per workgroup. Each
+    /// thread strides through `kv_dim` doing inline f16-scale + i8-value
+    /// dequant; a 256-thread shared-memory reduction folds the partial
+    /// (dot, ||block||^2, ||last||^2) fragments into one cosine score.
+    ///
+    /// Phase 2.1 of #93. Replaces the CPU-side dequant + mean-pool +
+    /// cosine in `pflash::compute_scores_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_q8_kv(
+        &mut self,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        assert!(head_dim % 32 == 0, "head_dim must be a multiple of 32 for Q8 KV cache");
+        assert!(n_blocks > 0 && block_size > 0 && n_pos > 0);
+        assert!(last_pos < n_pos, "last_pos {last_pos} >= n_pos {n_pos}");
+        self.ensure_kernel(
+            "pflash_score_q8_kv",
+            kernels::PFLASH_SCORE_Q8_KV_SRC,
+            "pflash_score_q8_kv_blocks",
+        )?;
+        let func = &self.functions["pflash_score_q8_kv_blocks"];
+
+        let k_ptr = k_cache.buf.as_ptr();
+        let s_ptr = scores_out.buf.as_ptr();
+        let mut np = n_pos as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = block_size as i32;
+        let mut nb = n_blocks as i32;
+        let mut lp = last_pos as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &k_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════
 
