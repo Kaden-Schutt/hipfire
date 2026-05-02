@@ -756,6 +756,15 @@ fn main() {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                // Pair with the model unload: PFlash drafter holds its
+                // own weights / scratch / KV buffers in the GPU pool
+                // (see PflashState::unload_drafter for the full teardown).
+                // Drop them too so VRAM goes back to free after an
+                // explicit "unload" message, matching the lifecycle
+                // documented at the pflash_state declaration.
+                if let Some(mut pf) = pflash_state.take() {
+                    pf.unload_drafter(&mut gpu);
+                }
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }
