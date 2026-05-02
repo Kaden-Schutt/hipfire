@@ -716,7 +716,18 @@ pub fn compute_scores_batched_gpu(
 
     let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
     let kv = state.drafter_kv.as_ref().expect("loaded -> kv");
-    let layer_idx = n_layers - 1;
+    // Source layer for scoring. Default = last layer (most semantic content
+    // for cross-family transfer per the PRD). HIPFIRE_PFLASH_SCORE_LAYER lets
+    // operators bisect the long-context drafter NaN issue
+    // (MANUAL_REVIEW.md): if the last layer's RoPE positions go OOD on a
+    // small drafter at 21K source tokens, picking an earlier layer with
+    // shorter effective context might still give finite K. Documented
+    // experimental knob, not part of the production contract.
+    let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&i| i < n_layers)
+        .unwrap_or(n_layers - 1);
     let n_blocks = (n + block_size - 1) / block_size;
 
     let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
