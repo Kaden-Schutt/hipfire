@@ -86,7 +86,7 @@ checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 
 [[package]]
 name = "engine"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "byteorder",
  "hip-bridge",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "hip-bridge"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "libloading",
  "thiserror",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -286,14 +286,14 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "hip-bridge",
 ]
 
 [[package]]
 name = "redline"
-version = "0.1.8-alpha.2"
+version = "0.1.9-alpha"
 dependencies = [
  "libc",
  "libloading",
