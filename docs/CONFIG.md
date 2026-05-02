@@ -201,6 +201,69 @@ configurations on AR.
 |---|---|---|---|
 | `prompt_normalize` | true | true / false | Collapse `\n{3,}` → `\n\n` at engine entry. +24% τ on PEP-8-style code prompts; default ON since 2026-04-26. Opt out only when raw whitespace patterns are semantically load-bearing. |
 
+## PFlash speculative prefill (EXPERIMENTAL #93)
+
+PFlash compresses long prompts via a small drafter model before the
+target prefill runs. A drafter scores attention importance per source
+block, the daemon emits compressed token spans, and the target
+prefills the compressed stream. Decode (DFlash / DDTree / AR) is
+unchanged. Off by default until per-target validation (NIAH retrieval,
+coherence) clears.
+
+| Key | Default | Range / values | Notes |
+|---|---|---|---|
+| `prefill_compression` | `off` | `off` / `auto` / `always` | Top-level mode. `auto` compresses only when source >= `prefill_threshold`. `always` compresses every request (research / bench). |
+| `prefill_threshold` | 32768 | 0–524288 | Token cutoff for `auto` mode. Below this, requests bypass with reason `below_threshold`. |
+| `prefill_keep_ratio` | 0.05 | (0, 1] | Fraction of source tokens to keep after sink + recent + top-scoring spans. Lower = more aggressive (faster TTFT, riskier retrieval). |
+| `prefill_alpha` | 0.85 | [0, 1] | Block-selection strictness. |
+| `prefill_min_keep` | 2048 | 0–524288 | Floor on retained tokens. Caps over-aggressive compression on short inputs. |
+| `prefill_sink` | 256 | 0–65536 | Always-keep prefix tokens (system / template / first-user-turn). |
+| `prefill_recent` | 1024 | 0–65536 | Always-keep tail tokens. |
+| `prefill_block` | 128 | 1–4096 | Scoring block size in source tokens. |
+| `prefill_drafter` | "" | path | Path to drafter HFQ artifact. Tokenizer must match the target's; mismatch surfaces as `BypassReason::TokenizerMismatch`. |
+| `prefill_profile` | false | true / false | Per-stage timing logs (`score_ms / select_ms / gather_ms / total_ms`). |
+| `prefill_sparse_threshold` | 32768 | 0–524288 | Phase 3 plumbing for the sparse drafter forward (kernel not yet shipped). |
+
+Compression bypass cases (always emit a `pflash_bypass` event keyed by
+request id):
+
+| Reason | Trigger |
+|---|---|
+| `mode_off` | `prefill_compression=off` (silent; no event emitted). |
+| `below_threshold` | `auto` mode + source tokens below `prefill_threshold`. |
+| `vision_request` | Image-bearing requests always bypass. |
+| `tool_call_request` | Either user or system prompt contains the `<tool_call>` token. |
+| `drafter_unavailable` | `prefill_drafter` unset or load failed. |
+| `tokenizer_mismatch` | Drafter and target tokenizer signatures differ. |
+| `dflash_decode_active` | DFlash spec-decode path doesn't yet route through PFlash. Disable `dflash_mode` if compression is required. |
+| `scoring_degenerate` | Scorer returned non-finite or all-zero scores. |
+
+When compression fires, `done` events embed a `pflash` field:
+`{source_tokens, kept_tokens, keep_ratio, alpha, score_ms, total_ms,
+source_md5, compressed_md5}`. When PFlash bypassed (skipped), the
+field is `{bypass_reason, alpha}`.
+
+CLI usage:
+
+```bash
+# Global default
+hipfire config set prefill_compression auto
+hipfire config set prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
+
+# Per-target override (recommended -- different drafters per target)
+hipfire config set-model qwen3.5:9b prefill_compression auto
+hipfire config set-model qwen3.5:9b prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
+
+# Per-request env override (research / one-shot benchmarking)
+HIPFIRE_PREFILL_COMPRESSION=always \
+HIPFIRE_PREFILL_KEEP_RATIO=0.10 \
+hipfire run qwen3.5:9b "long-context prompt..."
+```
+
+`HIPFIRE_PREFILL_*` env vars exist for every config key (mode,
+threshold, keep_ratio, alpha, min_keep, sink, recent, block, drafter,
+profile, sparse_threshold).
+
 ## Server
 
 | Key | Default | Range |
@@ -251,4 +314,9 @@ HIPFIRE_HIPCC_EXTRA_FLAGS="-mcumode"
 HIPFIRE_PROMPT_TOKEN_HEAT=1         # dump per-position BPE merge ranks
 HIPFIRE_PROMPT_HEAT_JSON=1          # the same, machine-readable
 HIPFIRE_GRAPH=1                     # hipGraph capture (debug; AR-only, may degrade quality on large models)
+HIPFIRE_PREFILL_COMPRESSION=auto    # PFlash mode: off|auto|always (#93)
+HIPFIRE_PREFILL_THRESHOLD=32768     # PFlash auto-mode source-token cutoff
+HIPFIRE_PREFILL_KEEP_RATIO=0.05     # PFlash kept fraction in (0, 1]
+HIPFIRE_PREFILL_DRAFTER=~/.hipfire/models/qwen3-0.6b.hf4
+HIPFIRE_PREFILL_PROFILE=1           # PFlash per-stage timing logs
 ```
