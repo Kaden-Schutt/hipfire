@@ -246,7 +246,12 @@ bench_run() {
     local model_path="$MODELS_DIR/qwen3.5-${size}.mq4"
     # givens4 was removed in the asym migration; asym3 is the current default
     # (5.5× compression, same speed regime as the old givens4 baseline).
-    local env_prefix="HIPFIRE_KV_MODE=asym3"
+    # DPM_WARMUP_SECS pins the GPU to high DPM before the timed prefill, so
+    # the measurement does not depend on idle/thermal state. Without it,
+    # pp32 single-shot drops ~16% from cold DPM (e.g. 9B 1240→1040) and the
+    # baseline becomes unreproducible across sessions. The DFlash bench
+    # arms below already set this; bench_qwen35_mq4 calls didn't.
+    local env_prefix="HIPFIRE_KV_MODE=asym3 HIPFIRE_DPM_WARMUP_SECS=3"
     # 0.8B has a known hipGraph panic; use plain path.
     if [ "$size" != "0.8b" ]; then
         env_prefix="$env_prefix HIPFIRE_GRAPH=1"
