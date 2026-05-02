@@ -383,25 +383,37 @@ fn norm_l2(v: &[f32]) -> f32 {
 }
 
 /// Pick which source positions survive compression. Combines mandatory
-/// anchors (prefix sink + recent tail) with top-scoring middle blocks under
-/// a token budget set by `keep_ratio` × `source_tokens`, floor'd at
-/// `min_keep_tokens`. Returns kept spans `[ (start, end_exclusive) ... ]`
-/// in source order, with adjacent / overlapping spans coalesced.
+/// anchors (prefix sink + recent tail + caller-supplied `must_keep` spans)
+/// with top-scoring middle blocks under a token budget set by `keep_ratio`
+/// × `source_tokens`, floor'd at `min_keep_tokens`. Returns kept spans
+/// `[ (start, end_exclusive) ... ]` in source order, with overlapping
+/// spans coalesced.
 ///
 /// PRD §5.4 selection rules:
 ///   - always keep `sink_tokens` from the front,
 ///   - always keep `recent_tokens` from the back,
-///   - select highest-scoring blocks from the middle by descending score,
-///   - coalesce adjacent / overlapping spans so the emitted token stream
+///   - always keep every span in `must_keep_spans` (chat boundaries,
+///     system message frames, tool-defs, role markers — anything the
+///     prompt parser needs to find or the model treats as a control
+///     token). Caller is responsible for locating these positions in
+///     source-order using the target tokenizer's special-token IDs.
+///   - select highest-scoring middle blocks by descending score until the
+///     overall budget is met,
+///   - coalesce overlapping / adjacent spans so the emitted token stream
 ///     stays span-coherent (no single-token scatter).
 ///
-/// Pure CPU. Deterministic for a fixed `(scores, source_tokens, ...)`.
+/// `must_keep_spans` is consumed verbatim — caller passes empty slice when
+/// the prompt has no chat boundaries (raw-text completion). Spans outside
+/// `[0, source_tokens)` are clamped, not rejected.
+///
+/// Pure CPU. Deterministic for a fixed input tuple.
 pub fn select_spans(
     scores: &BlockScores,
     sink_tokens: usize,
     recent_tokens: usize,
     keep_ratio: f32,
     min_keep_tokens: usize,
+    must_keep_spans: &[(usize, usize)],
 ) -> Vec<(usize, usize)> {
     assert!(keep_ratio > 0.0 && keep_ratio <= 1.0,
         "keep_ratio {keep_ratio} must be in (0, 1]");
@@ -422,37 +434,49 @@ pub fn select_spans(
     let sink_end = sink_tokens.min(n);
     let recent_start = if recent_tokens >= n { 0 } else { n - recent_tokens };
 
-    // Anchored token count: tokens already covered by sink ∪ recent.
-    let anchored = if sink_end >= recent_start {
-        // Sink overlaps recent — anchors cover the whole prompt.
-        n
-    } else {
-        sink_end + (n - recent_start)
-    };
-    if anchored >= target_kept {
-        // Anchors alone meet the budget. Return [0, sink_end) ∪ [recent_start, n)
-        // coalesced.
-        if sink_end >= recent_start {
-            return vec![(0, n)];
+    // Build the mandatory-keep set up-front so it counts against budget.
+    // Clamp must_keep entries to [0, n) and drop empty / inverted spans.
+    let mut anchors: Vec<(usize, usize)> = Vec::with_capacity(2 + must_keep_spans.len());
+    if sink_end > 0 {
+        anchors.push((0, sink_end));
+    }
+    if recent_start < n {
+        anchors.push((recent_start, n));
+    }
+    for &(s, e) in must_keep_spans {
+        let s = s.min(n);
+        let e = e.min(n);
+        if s < e {
+            anchors.push((s, e));
         }
-        return coalesce(vec![(0, sink_end), (recent_start, n)]);
+    }
+    let anchors = coalesce(anchors);
+    let anchored: usize = anchors.iter().map(|(s, e)| e - s).sum();
+
+    if anchored >= target_kept {
+        // Anchors alone meet the budget. Return them coalesced; nothing more
+        // to add. Coalesce already collapsed any overlap among sink / recent
+        // / must_keep.
+        return anchors;
     }
 
     // Budget for middle-block selection.
     let middle_budget = target_kept - anchored;
 
-    // Rank middle blocks (those with no overlap into sink/recent) by descending
-    // score. A block overlaps sink if its start < sink_end; a block overlaps
-    // recent if its end > recent_start. Either disqualifies it from the
-    // "middle" pool — those tokens are already kept.
+    // Rank middle blocks (those that don't overlap any anchor) by descending
+    // score. A block overlaps an anchor if its [start, end) intersects any
+    // anchor span — those tokens are already covered.
+    let block_overlaps_anchor = |start: usize, end: usize| -> bool {
+        anchors.iter().any(|&(a_s, a_e)| start < a_e && a_s < end)
+    };
     let mut middle: Vec<(usize, f32)> = (0..n_blocks)
         .filter_map(|b| {
             let start = b * bs;
             let end = ((b + 1) * bs).min(n);
-            if start >= sink_end && end <= recent_start {
-                Some((b, scores.scores[b]))
-            } else {
+            if block_overlaps_anchor(start, end) {
                 None
+            } else {
+                Some((b, scores.scores[b]))
             }
         })
         .collect();
@@ -461,13 +485,7 @@ pub fn select_spans(
     middle.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
         .then(a.0.cmp(&b.0)));
 
-    let mut spans = Vec::new();
-    if sink_end > 0 {
-        spans.push((0, sink_end));
-    }
-    if recent_start < n {
-        spans.push((recent_start, n));
-    }
+    let mut spans = anchors;
     let mut middle_kept = 0usize;
     for (b, _score) in middle {
         if middle_kept >= middle_budget {
@@ -781,7 +799,7 @@ mod tests {
     #[test]
     fn select_returns_full_when_under_min_keep() {
         let scores = synthetic_scores(vec![0.1; 4], 8); // 32 tokens
-        let spans = select_spans(&scores, 8, 8, 0.5, 64);
+        let spans = select_spans(&scores, 8, 8, 0.5, 64, &[]);
         assert_eq!(spans, vec![(0, 32)], "min_keep>n must return full span");
     }
 
@@ -796,7 +814,7 @@ mod tests {
         // sink=16, recent=16. keep_ratio=0.25 → target=32 tokens. Anchors cover
         // 32 already, so middle budget = 0 — block 7 is NOT picked because
         // anchors alone meet the budget. This is the documented behavior.
-        let spans = select_spans(&scores, 16, 16, 0.25, 0);
+        let spans = select_spans(&scores, 16, 16, 0.25, 0, &[]);
         // Expected: [0, 16) ∪ [112, 128).
         assert_eq!(spans, vec![(0, 16), (112, 128)]);
 
@@ -804,7 +822,7 @@ mod tests {
         // (8 tokens, score 5.0) survives first; the remaining ~12 token
         // budget pulls the next two tied-score blocks (2 and 3, ascending
         // index tie-break) which coalesce with the sink into [0, 32).
-        let spans = select_spans(&scores, 16, 16, 0.40, 0);
+        let spans = select_spans(&scores, 16, 16, 0.40, 0, &[]);
         assert_eq!(spans, vec![(0, 32), (56, 64), (112, 128)],
             "block 7 must survive on score; ties pull lowest-index first → \
              blocks 2+3 coalesce with sink");
@@ -817,9 +835,54 @@ mod tests {
         s[7] = 5.0;
         s[8] = 5.0;
         let scores = synthetic_scores(s, 8);
-        let spans = select_spans(&scores, 16, 16, 0.50, 0);
+        let spans = select_spans(&scores, 16, 16, 0.50, 0, &[]);
         assert!(spans.iter().any(|&(a, b)| a == 56 && b == 72),
             "blocks 7+8 (56..64 + 64..72) must coalesce, got {spans:?}");
+    }
+
+    #[test]
+    fn select_preserves_must_keep_chat_boundaries() {
+        // Simulate a ChatML prompt: <|im_start|> at pos 50, <|im_end|> at
+        // pos 51. Even with low scores in that region the boundaries must
+        // survive. The middle block containing those positions has score
+        // 0.0 so it would never be picked otherwise.
+        let s = vec![0.1f32; 16]; // 128 tokens, all near-zero
+        let scores = synthetic_scores(s, 8);
+        // Must-keep two single-token spans. They sit in block 6 (48..56)
+        // which would not be picked by the scoring loop.
+        let must = vec![(50, 51), (51, 52)];
+        let spans = select_spans(&scores, 4, 4, 0.05, 0, &must);
+        // Boundaries must show up in the output.
+        assert!(spans.iter().any(|&(a, b)| a <= 50 && 51 <= b),
+            "must_keep position 50 dropped, spans = {spans:?}");
+        assert!(spans.iter().any(|&(a, b)| a <= 51 && 52 <= b),
+            "must_keep position 51 dropped, spans = {spans:?}");
+    }
+
+    #[test]
+    fn select_coalesces_must_keep_with_anchors() {
+        // Must-keep span [14, 18) overlaps the sink end (sink=16). After
+        // coalesce there should be exactly ONE prefix span [0, 18), not
+        // two split / overlapping ranges.
+        let s = vec![0.1f32; 16];
+        let scores = synthetic_scores(s, 8);
+        let spans = select_spans(&scores, 16, 16, 0.30, 0, &[(14, 18)]);
+        // Expect [0, 18) ∪ [112, 128) at minimum; no overlapping ranges.
+        let prefix_count = spans.iter().filter(|&&(_, e)| e <= 18).count();
+        assert_eq!(prefix_count, 1, "prefix must coalesce, got {spans:?}");
+        assert!(spans.iter().any(|&(a, b)| a == 0 && b == 18),
+            "expected (0, 18) anchor, got {spans:?}");
+    }
+
+    #[test]
+    fn select_clamps_oob_must_keep() {
+        let s = vec![0.1f32; 4];
+        let scores = synthetic_scores(s, 8); // 32 tokens
+        let spans = select_spans(&scores, 0, 0, 0.5, 0, &[(100, 200), (5, 1000)]);
+        // First span clamps to nothing (start > n), second clamps to (5, 32).
+        assert!(spans.iter().all(|&(_, e)| e <= 32), "spans must stay in range, got {spans:?}");
+        assert!(spans.iter().any(|&(a, b)| a == 5 && b == 32),
+            "expected clamped (5, 32), got {spans:?}");
     }
 
     #[test]

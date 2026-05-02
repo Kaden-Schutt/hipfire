@@ -121,7 +121,7 @@ fn main() {
                 // tokens survive on a 32-token toy prompt. Verify span list
                 // is non-empty, in-order, and the emitted token slice is
                 // length-consistent with the spans.
-                let spans = engine::pflash::select_spans(&bs, 4, 4, 0.5, 0);
+                let spans = engine::pflash::select_spans(&bs, 4, 4, 0.5, 0, &[]);
                 let compressed = engine::pflash::emit_compressed(&toy_prompt, &spans);
                 let span_total: usize = spans.iter().map(|(s, e)| e - s).sum();
                 eprintln!("select_spans: {} spans = {:?}", spans.len(), spans);
