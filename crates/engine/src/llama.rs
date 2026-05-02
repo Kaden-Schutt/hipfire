@@ -1073,6 +1073,549 @@ pub fn prefill_forward(
     Ok(logits_data)
 }
 
+// ─── LLaMA-family batched prefill (Phase A of #89) ─────────────────────────
+//
+// The fused WMMA + K4-unroll + flash-attention prefill stack lives here so
+// any plain LLaMA-family loader (Qwen3, Mistral, Phi, Gemma) can drive it
+// directly without going through `qwen35::forward_prefill_batch` (whose
+// eligibility gate requires DeltaNet/MoE layers and whose layer enum
+// branches over hybrid arch variants).
+//
+// Mirrors the FullAttn fast path of `qwen35::forward_prefill_chunk` kernel
+// for kernel, with two adaptations:
+//   1. No "Q + gate" wide projection. Plain Qwen3 attention has a normal
+//      Q output (q_dim wide); no deinterleave, no sigmoid_mul step.
+//   2. Full RoPE via `rope_batched_f32` (non-interleaved, half-split) to
+//      match `forward_scratch`'s `rope_f32` semantics.
+
+/// Upper bound on `forward_prefill_batch`'s per-chunk size. Mirrors the
+/// qwen35 chunk cap; sized so flash_partials stays within 2 GB at the
+/// largest physical_cap any consumer sets up.
+pub const PREFILL_MAX_BATCH: usize = 256;
+
+/// Is this dtype/arch combination eligible for the batched WMMA prefill
+/// kernels? Matches `qwen35::is_batchable_la` exactly so plain Qwen3 and
+/// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
+/// arches gain WMMA support.
+pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
+    let always_ok = matches!(dt,
+        DType::MQ4G256 | DType::HFQ4G256
+        | DType::MQ6G256 | DType::HFQ6G256
+    );
+    if always_ok {
+        return true;
+    }
+    let mq3_with_wmma = matches!(dt, DType::MQ3G256)
+        && matches!(arch,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+            | "gfx1200" | "gfx1201"
+        );
+    mq3_with_wmma
+}
+
+/// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
+/// buffers reused across the per-layer loop. Sized once per model from
+/// `LlamaConfig` and reused across cycles by callers that retain it.
+pub struct PrefillBatchScratch {
+    pub max_batch: usize,
+
+    // Residual stream + rmsnormed/rotated activation [N × dim].
+    pub x_batch: GpuTensor,
+    pub x_rot_batch: GpuTensor,
+
+    // Token ids + positions feeding batched embedding + RoPE/KV-write kernels.
+    // F32 dtype for layout reasons (4 bytes/element matches i32); the kernels
+    // cast the device pointer to `const int*`.
+    pub positions: GpuTensor,
+    pub tokens: GpuTensor,
+
+    // Q/K/V projection outputs (no gate component for plain attention).
+    pub fa_q_batch: GpuTensor,        // [N × n_heads × head_dim]
+    pub fa_k_batch: GpuTensor,        // [N × n_kv_heads × head_dim]
+    pub fa_v_batch: GpuTensor,        // [N × n_kv_heads × head_dim]
+    pub fa_attn_out_batch: GpuTensor, // [N × n_heads × head_dim]
+    // FWHT-rotated fa_attn_out for feeding MQ4 wo.
+    pub fa_attn_out_rot_batch: GpuTensor,
+
+    // FFN intermediates [N × hidden_dim].
+    pub gate_ffn_batch: GpuTensor,
+    pub up_batch: GpuTensor,
+    pub ffn_hidden_batch: GpuTensor,
+
+    // Flash-attention partial-result scratch (sized to support max_batch
+    // tokens × n_heads × max_tiles × (2 + head_dim)).
+    pub flash_partials: GpuTensor,
+}
+
+impl PrefillBatchScratch {
+    pub fn new(gpu: &mut Gpu, config: &LlamaConfig, max_batch: usize, kv_max_seq: usize) -> HipResult<Self> {
+        let dim = config.dim;
+        let hidden_dim = config.hidden_dim;
+        let q_dim = config.n_heads * config.head_dim;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+
+        let tile_size = 128usize;
+        let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
+        let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
+            .unwrap_or(16);
+        let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
+
+        Ok(Self {
+            max_batch,
+            x_batch:               gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            x_rot_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            positions:             gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            tokens:                gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            fa_q_batch:            gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_k_batch:            gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            fa_v_batch:            gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,
+            fa_attn_out_batch:     gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            fa_attn_out_rot_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
+            gate_ffn_batch:        gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            up_batch:              gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            ffn_hidden_batch:      gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
+            flash_partials:        gpu.alloc_tensor(&[partials_size], DType::F32)?,
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.x_batch, self.x_rot_batch,
+            self.positions, self.tokens,
+            self.fa_q_batch, self.fa_k_batch, self.fa_v_batch,
+            self.fa_attn_out_batch, self.fa_attn_out_rot_batch,
+            self.gate_ffn_batch, self.up_batch, self.ffn_hidden_batch,
+            self.flash_partials,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// Upload token ids + positions into `pbs` via sync `memcpy_htod`. Call
+/// before `hipStreamBeginCapture` if the caller needs `forward_prefill_batch`
+/// inside a captured graph; otherwise `forward_prefill_batch` uploads
+/// internally.
+pub fn upload_prefill_batch_inputs(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    tokens: &[u32],
+    start_pos: usize,
+) -> HipResult<()> {
+    let n = tokens.len();
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    let positions_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    Ok(())
+}
+
+/// Process `tokens` through the model with one batched forward, advancing
+/// `kv_cache` by `tokens.len()` positions and writing the *last* token's
+/// logits into `scratch.logits`.
+///
+/// Eligibility (else falls back to per-token `forward_scratch` loop):
+///   - all FA layer weights (wq/wk/wv/wo + w_gate/w_up/w_down) pass
+///     `is_batchable_la`
+///   - KV cache is Q8_0 or asym{2,3,4}
+///
+/// Internally chunks at `pbs.max_batch` to bound VRAM regardless of prompt
+/// length. `pbs_in: Some` reuses caller-owned scratch; `None` allocates +
+/// frees within the call.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs_in: Option<&PrefillBatchScratch>,
+) -> HipResult<()> {
+    let n = tokens.len();
+    if n == 0 {
+        return Ok(());
+    }
+
+    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    const MIN_BATCH: usize = 4;
+    let arch = gpu.arch.as_str();
+    let kv_ok = kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
+    let weights_ok = weights.layers.iter().all(|l|
+        is_batchable_la(l.wq.gpu_dtype, arch) &&
+        is_batchable_la(l.wk.gpu_dtype, arch) &&
+        is_batchable_la(l.wv.gpu_dtype, arch) &&
+        is_batchable_la(l.wo.gpu_dtype, arch) &&
+        is_batchable_la(l.w_gate.gpu_dtype, arch) &&
+        is_batchable_la(l.w_up.gpu_dtype, arch) &&
+        is_batchable_la(l.w_down.gpu_dtype, arch));
+    let eligible = !force_fallback && n >= MIN_BATCH && kv_ok && weights_ok;
+
+    if !eligible {
+        for (i, &tok) in tokens.iter().enumerate() {
+            forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
+            forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
+        }
+        return Ok(());
+    }
+
+    let mut own_pbs: Option<PrefillBatchScratch> = None;
+    let pbs = if let Some(p) = pbs_in {
+        p
+    } else {
+        let max_batch = PREFILL_MAX_BATCH.min(n.max(MIN_BATCH));
+        own_pbs = Some(PrefillBatchScratch::new(gpu, config, max_batch, kv_cache.physical_cap)?);
+        own_pbs.as_ref().unwrap()
+    };
+
+    let max_chunk = pbs.max_batch;
+    let mut offset = 0usize;
+    while offset < n {
+        let chunk_n = (n - offset).min(max_chunk);
+        forward_prefill_chunk(
+            gpu, weights, config,
+            &tokens[offset..offset + chunk_n],
+            start_pos + offset,
+            kv_cache, scratch, pbs,
+            false,
+        )?;
+        offset += chunk_n;
+    }
+
+    // Final norm + output projection on the LAST row of x_batch (chunk-local).
+    let dim = config.dim;
+    let last_n = ((n - 1) % max_chunk) + 1;
+    let last_off_bytes = (last_n - 1) * dim * 4;
+    gpu.hip.memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, last_off_bytes, dim * 4)?;
+    gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
+    weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+
+    if let Some(p) = own_pbs {
+        p.free_gpu(gpu);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_chunk(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut KvCache,
+    s: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
+    pre_uploaded: bool,
+) -> HipResult<()> {
+    let n = tokens.len();
+    debug_assert!(n > 0);
+    debug_assert!(n <= pbs.max_batch);
+
+    let dim = config.dim;
+    let hidden_dim = config.hidden_dim;
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let dim_row_bytes = dim * 4;
+
+    // 1. Embed N tokens into pbs.x_batch.
+    if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
+        if !pre_uploaded {
+            let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let tokens_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+            };
+            gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
+        }
+        match weights.embd_format {
+            EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?,
+            EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?,
+            _ => unreachable!(),
+        }
+    } else {
+        for (i, &tok) in tokens.iter().enumerate() {
+            match weights.embd_format {
+                EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &s.x, tok, dim)?,
+                EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0 => unreachable!(),
+            }
+            gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        }
+    }
+
+    // 1b. Upload positions [start_pos .. start_pos + n] as i32.
+    if !pre_uploaded {
+        let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+        let positions_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+        };
+        gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    }
+
+    let max_ctx_len = if gpu.capture_mode {
+        kv_cache.physical_cap
+    } else {
+        start_pos + n
+    };
+
+    // 2. Per-layer loop.
+    for layer_idx in 0..config.n_layers {
+        let layer = &weights.layers[layer_idx];
+        let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
+
+        // attn_norm (+ FWHT for MQ).
+        if qkv_is_mq {
+            gpu.fused_rmsnorm_rotate_mq_batched(
+                &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+            )?;
+        } else {
+            gpu.rmsnorm_batched(
+                &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
+                n, dim, config.norm_eps,
+            )?;
+        }
+
+        // 3-way fused QKV projection.
+        if qkv_is_6bit {
+            gpu.gemm_qkv_hfq6g256(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                layer.wq.m, layer.wk.m, layer.wv.m,
+                layer.wq.k, n,
+            )?;
+        } else if qkv_is_mq3 {
+            gpu.gemm_qkv_hfq3g256_wmma(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                layer.wq.m, layer.wk.m, layer.wv.m,
+                layer.wq.k, n,
+            )?;
+        } else {
+            gpu.gemm_qkv_hfq4g256(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                layer.wq.m, layer.wk.m, layer.wv.m,
+                layer.wq.k, n,
+            )?;
+        }
+
+        // Per-head Q/K rmsnorm (Qwen3 only — None on plain LLaMA).
+        if config.has_qk_norm {
+            if let Some(ref qn) = layer.q_norm {
+                gpu.rmsnorm_batched(
+                    &pbs.fa_q_batch, qn, &pbs.fa_q_batch,
+                    n * config.n_heads, config.head_dim, config.norm_eps,
+                )?;
+            }
+            if let Some(ref kn) = layer.k_norm {
+                gpu.rmsnorm_batched(
+                    &pbs.fa_k_batch, kn, &pbs.fa_k_batch,
+                    n * config.n_kv_heads, config.head_dim, config.norm_eps,
+                )?;
+            }
+        }
+
+        // Batched full RoPE (non-interleaved, half-split convention —
+        // matches forward_scratch's rope_f32).
+        gpu.rope_batched_f32(
+            &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.positions,
+            config.n_heads, config.n_kv_heads, config.head_dim,
+            config.rope_freq_base, n,
+        )?;
+
+        // Batched KV write.
+        if kv_cache.quant_asym4 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.kv_cache_write_asym4_batched(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                ct, st, config.n_kv_heads, config.head_dim, n,
+            )?;
+        } else if kv_cache.quant_asym3 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.kv_cache_write_asym3_batched(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                ct, st, config.n_kv_heads, config.head_dim, n,
+            )?;
+        } else if kv_cache.quant_asym2 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.kv_cache_write_asym2_batched(
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+                ct, st, config.n_kv_heads, config.head_dim, n,
+            )?;
+        } else {
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions,
+                config.n_kv_heads, config.head_dim, n,
+            )?;
+            gpu.kv_cache_write_q8_0_batched(
+                &kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions,
+                config.n_kv_heads, config.head_dim, n,
+            )?;
+        }
+
+        // Batched causal flash attention.
+        const LDS_CTX_LIMIT: usize = 15000;
+        if kv_cache.quant_asym4 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.attention_flash_asym4_batched_masked(
+                &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
+                None, 0, 0,
+            )?;
+        } else if kv_cache.quant_asym3 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.attention_flash_asym3_batched_masked(
+                &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
+                None, 0, 0,
+            )?;
+        } else if kv_cache.quant_asym2 {
+            let ct = kv_cache.givens_cos.as_ref().unwrap();
+            let st = kv_cache.givens_sin.as_ref().unwrap();
+            gpu.attention_flash_asym2_batched(
+                &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions, ct, st,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
+            )?;
+        } else if max_ctx_len > LDS_CTX_LIMIT {
+            // Long-context Q8 fallback: per-position flash.
+            let q_dim = config.n_heads * config.head_dim;
+            let pos_host = gpu.download_f32(&pbs.positions)?;
+            let pos_buf_tmp = gpu.hip.malloc(4)?;
+            for b in 0..n {
+                let seq_len_b = pos_host[b] as usize + 1;
+                let pos_i32 = pos_host[b] as i32;
+                gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
+                let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
+                let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
+                gpu.attention_flash_q8_0(
+                    &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                    &out_b, &pos_buf_tmp, seq_len_b,
+                    config.n_heads, config.n_kv_heads, config.head_dim,
+                    kv_cache.physical_cap, &pbs.flash_partials,
+                )?;
+            }
+            let _ = gpu.hip.free(pos_buf_tmp);
+        } else {
+            gpu.attention_q8_0_kv_batched_masked(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n,
+                None, 0, 0,
+            )?;
+        }
+
+        // wo + residual.
+        let wo_is_mq = matches!(layer.wo.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
+        let wo_input = if wo_is_mq {
+            gpu.rotate_x_mq_batched(
+                &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
+            )?;
+            &pbs.fa_attn_out_rot_batch
+        } else {
+            &pbs.fa_attn_out_batch
+        };
+        if wo_is_6bit {
+            gpu.gemm_hfq6g256_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+        } else if wo_is_mq3 {
+            gpu.gemm_hfq3g256_residual_wmma(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+        } else {
+            gpu.gemm_hfq4g256_residual(&layer.wo.buf, wo_input, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+        }
+
+        // FFN: rmsnorm (+ FWHT for MQ), gate+up, silu_mul, w_down + residual.
+        let ffn_is_mq = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
+        if ffn_is_mq {
+            gpu.fused_rmsnorm_rotate_mq_batched(
+                &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, dim, config.norm_eps, n,
+            )?;
+        } else {
+            gpu.rmsnorm_batched(
+                &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch,
+                n, dim, config.norm_eps,
+            )?;
+        }
+        if ffn_is_6bit {
+            gpu.gemm_gate_up_hfq6g256(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch, &pbs.up_batch,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+            )?;
+        } else if ffn_is_mq3 {
+            gpu.gemm_gate_up_hfq3g256_wmma(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch, &pbs.up_batch,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+            )?;
+        } else {
+            gpu.gemm_gate_up_hfq4g256(
+                &layer.w_gate.buf, &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch, &pbs.up_batch,
+                layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+            )?;
+        }
+        let w_down_is_mq = matches!(layer.w_down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256);
+        let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+        let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
+        if w_down_is_mq {
+            gpu.fused_silu_mul_rotate_mq_batched(
+                &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
+                hidden_dim, n,
+            )?;
+        } else {
+            gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+        }
+        if w_down_is_6bit {
+            gpu.gemm_hfq6g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        } else if w_down_is_mq3 {
+            gpu.gemm_hfq3g256_residual_wmma(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        } else {
+            gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        }
+
+        let _ = kv_dim;
+    }
+
+    Ok(())
+}
+
 /// Load LLaMA weights from GGUF onto GPU.
 /// Quantized weights stay quantized (Q4_K, Q6_K, Q8_0).
 /// Only norm weights and embeddings are dequantized to F32.
@@ -2968,5 +3511,38 @@ mod tests {
         let history: Vec<u32> = vec![5, 5, 1, 2, 6];
         apply_unclosed_attractor_block(&mut logits, &history, 5, 6, 3, 2);
         assert!(logits[5].is_finite(), "older unclosed opens must not count once they leave the window");
+    }
+
+    #[test]
+    fn is_batchable_la_always_ok_dtypes() {
+        // MQ4/HFQ4/MQ6/HFQ6 batchable on every arch.
+        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx942"] {
+            assert!(is_batchable_la(DType::HFQ4G256, arch));
+            assert!(is_batchable_la(DType::MQ4G256, arch));
+            assert!(is_batchable_la(DType::HFQ6G256, arch));
+            assert!(is_batchable_la(DType::MQ6G256, arch));
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_mq3_wmma_only() {
+        // MQ3 only batchable on archs that have a WMMA family ported.
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch}");
+        }
+        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx942"] {
+            assert!(!is_batchable_la(DType::MQ3G256, arch), "MQ3 must fall back on {arch}");
+        }
+    }
+
+    #[test]
+    fn is_batchable_la_unsupported_dtypes() {
+        // Q4K / Q6K / Q8_0 / F32 stay on per-token forward_scratch.
+        for arch in ["gfx1100", "gfx1200"] {
+            assert!(!is_batchable_la(DType::Q4K, arch));
+            assert!(!is_batchable_la(DType::Q6K, arch));
+            assert!(!is_batchable_la(DType::Q8_0, arch));
+            assert!(!is_batchable_la(DType::F32, arch));
+        }
     }
 }
