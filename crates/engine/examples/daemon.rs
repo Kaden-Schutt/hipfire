@@ -1616,6 +1616,7 @@ fn load_dflash_state(
 /// persist KV across HTTP requests are out of scope for this integration —
 /// they can keep using the AR path.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -1624,6 +1625,8 @@ fn generate_dflash(
     prompt: &str,
     system_prompt: Option<&str>,
     max_tokens: usize,
+    pflash_bypass_reason: Option<&str>,
+    pflash_alpha: Option<f32>,
 ) {
     use engine::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
@@ -1997,12 +2000,23 @@ fn generate_dflash(
     let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
     let prefill_tok_s = if prefill_s > 0.0 { prompt_tokens.len() as f64 / prefill_s } else { 0.0 };
     let tau = if stats.cycles > 0 { stats.accepted_tokens as f64 / stats.cycles as f64 } else { 0.0 };
+    // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
+    // this branch) the `done` object must surface the bypass reason and
+    // alpha alongside the dflash perf metrics. Build a small fragment
+    // when both are available; otherwise empty for back-compat.
+    let pflash_done_field = match (pflash_bypass_reason, pflash_alpha) {
+        (Some(r), Some(a)) => format!(
+            r#","pflash":{{"bypass_reason":"{}","alpha":{:.6}}}"#,
+            r.replace('"', "'"), a,
+        ),
+        _ => String::new(),
+    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}}}"#,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
         id, generated, tok_s, prompt_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles,
+        tau, stats.cycles, pflash_done_field,
     );
     let _ = stdout.flush();
 }
@@ -2033,6 +2047,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // bypass event instead of silently getting full-prefill behavior
         // they didn't ask for. Compression-on-DFlash lands in a future
         // phase that threads PflashState through generate_dflash().
+        let mut dflash_bypass_reason: Option<&'static str> = None;
+        let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
         if let Some(cfg) = pflash_cfg.as_ref() {
             if cfg.mode != engine::pflash::PflashMode::Off {
                 let _ = writeln!(
@@ -2041,9 +2057,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     id,
                 );
                 let _ = stdout.flush();
+                dflash_bypass_reason = Some("dflash_decode_active");
             }
         }
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens);
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
