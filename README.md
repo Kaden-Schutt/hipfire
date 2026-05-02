@@ -9,7 +9,7 @@ hipfire run  qwen3.5:9b "What is the capital of France?"
 hipfire serve -d        # background daemon, OpenAI-compatible API on :11435
 ```
 
-Current release: **v0.1.8-alpha.2**. See [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.1.9-alpha**. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Why
 

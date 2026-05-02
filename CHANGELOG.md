@@ -1,7 +1,5 @@
 # Changelog
 
-## Unreleased
-
 ## v0.1.9-alpha (2026-05-02)
 
 Headline: **MQ3 is production-ready.** The sub-4-bit Magnum Quant from
