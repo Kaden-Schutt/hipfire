@@ -89,10 +89,15 @@ fn main() {
     let bypass = decide_bypass(&state, &demo_cfg, &probe_tokens, RequestKind::Text);
     eprintln!("decide_bypass (Always, 100 tok, Text): {bypass:?}");
 
+    // Capture the verdict BEFORE unload — unload_drafter resets
+    // tokenizer_compat to false (idempotency invariant), so checking it
+    // afterward would always FAIL even on a compatible pair.
+    let compat = state.tokenizer_compat;
+
     // Free GPU resources before exit so the next bench/test sees a clean pool.
     state.unload_drafter(&mut gpu);
 
-    if !state.tokenizer_compat {
+    if !compat {
         eprintln!("FAIL: tokenizer_compat = false (drafter and target tokenizers diverge)");
         std::process::exit(1);
     }

@@ -172,8 +172,13 @@ impl PflashState {
         if let Some(s) = self.drafter_scratch.take() {
             s.free_gpu(gpu);
         }
-        // KvCache has its own buffers; let drop handle them.
-        self.drafter_kv = None;
+        // KvCache owns layer-keyed GPU buffers (k_gpu/v_gpu/scales/givens
+        // tables). Dropping the Option does NOT release them — the buffers
+        // are sitting in `gpu`'s pool keyed by handle. Call free_gpu(gpu)
+        // explicitly to return them.
+        if let Some(kv) = self.drafter_kv.take() {
+            kv.free_gpu(gpu);
+        }
         self.drafter_config = None;
         self.drafter_tokenizer = None;
         self.drafter_loaded = false;
@@ -181,22 +186,32 @@ impl PflashState {
     }
 }
 
-/// Probe phrase used to verify drafter and target BPE merges agree. Picked to
-/// hit common BPE seams (whitespace, mixed case, punctuation, code-shape
-/// tokens, a multi-byte glyph). If both tokenizers produce the same id sequence
-/// then they share a vocab and merges and are interchangeable for compression.
+/// Probe phrase exercised after the structural compatibility check. Hits
+/// common BPE seams (whitespace, mixed case, punctuation, code-shape tokens,
+/// a multi-byte glyph) so a same-sized but merge-divergent vocab still gets
+/// caught. Two tokenizers that match on signature AND produce the same
+/// probe encoding can be used interchangeably for compression.
 const TOKENIZER_COMPAT_PROBE: &str = "Hello, world! 0xCAFEf00d def fn() {} \u{2014}";
 
 /// Compare drafter vs target tokenizers for compression compatibility.
-/// Returns `true` only if both tokenizers have the same `vocab_size` AND
-/// produce the same encoding for `TOKENIZER_COMPAT_PROBE`.
+///
+/// PRD §5.3 contract: same vocab size, same token byte strings, same
+/// special token ids. The implementation uses
+/// `Tokenizer::signature()` (full-vocab + specials + bos/eos/eot fold)
+/// for the structural part, and a probe-encoding cross-check as belt and
+/// braces against any signature-mixing collisions. Both must match.
 pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
     if target.vocab_size() != draft.vocab_size() {
         return false;
     }
-    let a = target.encode(TOKENIZER_COMPAT_PROBE);
-    let b = draft.encode(TOKENIZER_COMPAT_PROBE);
-    a == b
+    if target.signature() != draft.signature() {
+        return false;
+    }
+    // Probe-encoding cross-check. The signature already captures vocab
+    // identity; this catches the residual case where two tokenizers
+    // ship identical vocabs but apply BPE merge rules in a different
+    // order. Any divergence is fatal for cross-encoding.
+    target.encode(TOKENIZER_COMPAT_PROBE) == draft.encode(TOKENIZER_COMPAT_PROBE)
 }
 
 /// Load a Qwen3-family drafter from `path` (HFQ artifact) onto `gpu` and

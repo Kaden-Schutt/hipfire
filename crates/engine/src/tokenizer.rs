@@ -523,6 +523,54 @@ impl Tokenizer {
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
     }
+
+    /// Read-only view of the full vocabulary by token id. Index `i` is the
+    /// canonical byte string for token id `i`. Used for cross-tokenizer
+    /// equivalence checks (PFlash drafter / target compatibility gate).
+    pub fn vocab(&self) -> &[String] {
+        &self.vocab
+    }
+
+    /// Read-only view of `(string, id)` for every special token (chat / EOT
+    /// / image markers, etc.). Sorted longest-first by `Tokenizer::from_*`
+    /// constructors. Used for cross-tokenizer equivalence checks.
+    pub fn special_tokens(&self) -> &[(String, u32)] {
+        &self.special_tokens
+    }
+
+    /// Stable 64-bit signature derived from the full vocab + every special
+    /// token + bos/eos/eot ids. Two tokenizers with equal signatures are
+    /// guaranteed to produce identical encodings for any input drawn from
+    /// the shared vocab. Uses fxhash-style mixing — collision resistance
+    /// is enough for the equivalence-check use case.
+    ///
+    /// Cost: O(N) over the vocab, called once per drafter load.
+    pub fn signature(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        let mut mix = |bytes: &[u8]| {
+            for &b in bytes {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= 0xff;
+            h = h.wrapping_mul(0x100000001b3);
+        };
+        // Vocab in id order (canonical).
+        for tok in &self.vocab {
+            mix(tok.as_bytes());
+        }
+        // Specials in their stored order (longest-first; deterministic per
+        // constructor).
+        for (s, id) in &self.special_tokens {
+            mix(s.as_bytes());
+            mix(&id.to_le_bytes());
+        }
+        // Sentinel ids.
+        mix(&self.bos_id.to_le_bytes());
+        mix(&self.eos_id.to_le_bytes());
+        mix(&self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        h
+    }
 }
 
 /// GPT-2 byte-to-char mapping (matches OpenAI's bytes_to_unicode() exactly).
