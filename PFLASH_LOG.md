@@ -455,3 +455,46 @@ The contract now matches what callers depend on: a draft-target pair
 that passes `tokenizers_compatible` produces byte-identical encodings
 for any input the daemon will ever feed PFlash (chat template + EOT
 boundaries match, all merge-reachable slots are byte-equal).
+
+### Phase 5 milestone: PFlash NIAH end-to-end retrieval (e2be4a2)
+
+`pflash_niah_bench` now takes optional `--pflash <drafter.hfq>` plus
+`--keep-ratio / --block-size / --sink-tokens / --recent-tokens`. With the
+flag, the harness loads the drafter into PflashState, asserts
+tokenizer_compat=true (fail fast otherwise), runs maybe_compress_prompt
+on the chatml-wrapped prompt, frees drafter VRAM, then prefills the
+compressed stream through the target.
+
+Results on 7900 XTX, target qwen3.5-4b.mq4 + drafter qwen3.5-0.8b.mq4,
+asym3 KV, keep_ratio=0.30, block_size=64:
+
+| fixture     | source | kept | compress ms | prefill ms | needle |
+|-------------|--------|------|-------------|------------|--------|
+| niah_8k.jsonl  |  5487 | 1647 | 751 (score 748)  | 452 (3644 t/s)  | PASS  |
+| niah_16k.jsonl | 10881 | 3265 | 2243 (score 2240)| 961 (3398 t/s)  | PASS  |
+
+Baseline (no --pflash) on the same fixtures:
+
+| fixture     | tokens | prefill ms | tok/s | needle |
+|-------------|--------|------------|-------|--------|
+| niah_8k.jsonl  |  5487 | 1803 | 3043 | PASS |
+| niah_16k.jsonl | 10881 | 4615 | 2358 | PASS |
+
+Wall-clock excluding tokenize (the engine's known-slow O(N²) encoder):
+
+| ctx | baseline (prefill+decode) | PFlash (compress+prefill+decode) | savings |
+|-----|---------------------------|----------------------------------|---------|
+|  8K | 1939 ms                   | 1332 ms                          | -31%    |
+| 16K | 4825 ms                   | 3333 ms                          | -31%    |
+
+Win source: drafter-attended scoring + 30%-kept compressed prefill is
+materially cheaper than full target prefill on the same source. Score
+kernel is the dominant compress cost (>99 %) and scales with drafter
+forward, not with target size, so the relative win grows as the target
+grows. Needle survives compression in every tested case (sink covers
+the chatml header, recent covers the question + assistant scaffolding,
+selection picks up the body span containing the needle by score).
+
+Phase 5 NIAH gate: PASS at 8K and 16K. 32K/64K/128K need either an
+async tokenizer or pre-encoded fixture artifacts (the encoder takes
+~10 minutes at 32K end-to-end), tracked in DEFERRED.md.
