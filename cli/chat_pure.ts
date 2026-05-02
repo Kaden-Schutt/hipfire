@@ -116,6 +116,25 @@ export function renderMarkdown(text: string, fenceWidth: number = 60): string {
   text = text.replace(/^### +(.+)$/gm, (_m: string, inner: string) => `\x1b[1;2m${inner}\x1b[0m`);
   text = text.replace(/^## +(.+)$/gm, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
   text = text.replace(/^# +(.+)$/gm, (_m: string, inner: string) => `\x1b[1;36m${inner}\x1b[0m`);
+  // Block quotes: `> body` → dim `>`, italic body. Anchored to start-of-line.
+  text = text.replace(/^> +(.+)$/gm, (_m: string, inner: string) => `\x1b[2m>\x1b[0m \x1b[3m${inner}\x1b[0m`);
+  // Bullet lists: `- item` or `* item` (with leading whitespace) → `• item`
+  // with the bullet dimmed. Indentation preserved. Anchored to line start.
+  text = text.replace(/^(\s*)[-*] +(.+)$/gm, (_m: string, indent: string, inner: string) => `${indent}\x1b[2m•\x1b[0m ${inner}`);
+  // Numbered lists: `1. foo`, `12. bar` → dim the digits + dot.
+  text = text.replace(/^(\s*)(\d+\.) +(.+)$/gm, (_m: string, indent: string, num: string, inner: string) => `${indent}\x1b[2m${num}\x1b[0m ${inner}`);
+  // Markdown links: [text](url) → underline text, dim parens with raw URL.
+  // OSC 8 hyperlink: `\x1b]8;;url\x1b\\text\x1b]8;;\x1b\\` makes text
+  // clickable in iTerm2/kitty/Wezterm/modern xterm; degrades to underline
+  // in non-supporting terminals.
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m: string, label: string, url: string) =>
+    `\x1b]8;;${url}\x1b\\\x1b[4m${label}\x1b[0m\x1b]8;;\x1b\\ \x1b[2m(${url})\x1b[0m`,
+  );
+  // Bare URLs (http/https/file) not already inside [..](..) — underline +
+  // OSC 8 hyperlink. Stops at whitespace or common trailing punctuation.
+  text = text.replace(/(?<![(\[])\b(https?:\/\/[^\s)\]]+|file:\/\/[^\s)\]]+)/g, (_m: string, url: string) =>
+    `\x1b]8;;${url}\x1b\\\x1b[4m${url}\x1b[0m\x1b]8;;\x1b\\`,
+  );
   text = text.replace(/`([^`]+)`/g, (_m: string, code: string) => `\x1b[7m${code}\x1b[0m`);
   text = text.replace(/\*\*([^*]+)\*\*/g, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
   text = text.replace(/(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g, (_m: string, inner: string) => `\x1b[3m${inner}\x1b[0m`);

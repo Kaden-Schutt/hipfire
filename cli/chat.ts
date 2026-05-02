@@ -504,7 +504,10 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
           }
 
           if (firstChunk) {
-            w("\r\x1b[K");
+            // Dim "Assistant:" role prefix so a copy-pasted transcript
+            // shows roles unambiguously (matches the bright "You:" on
+            // the user side).
+            w("\r\x1b[K\x1b[2mAssistant:\x1b[0m ");
             firstChunk = false;
           }
 

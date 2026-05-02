@@ -348,6 +348,87 @@ describe("renderMarkdown", () => {
     expect(out).toContain("\x1b[7mfoo()\x1b[0m");
     expect(out).toContain("\x1b[1m");
   });
+
+  test("bullet list with - dims the bullet, replaces with •", () => {
+    const out = renderMarkdown("- item one");
+    expect(out).toBe("\x1b[2m•\x1b[0m item one");
+  });
+
+  test("bullet list with * dims the bullet", () => {
+    const out = renderMarkdown("* item two");
+    expect(out).toBe("\x1b[2m•\x1b[0m item two");
+  });
+
+  test("bullet list preserves indentation (nested lists)", () => {
+    const out = renderMarkdown("  - nested");
+    expect(out).toBe("  \x1b[2m•\x1b[0m nested");
+  });
+
+  test("dash mid-text is NOT a bullet", () => {
+    expect(renderMarkdown("a - b - c")).toBe("a - b - c");
+  });
+
+  test("numbered list dims the number + period", () => {
+    const out = renderMarkdown("1. first");
+    expect(out).toBe("\x1b[2m1.\x1b[0m first");
+  });
+
+  test("numbered list with multi-digit number", () => {
+    const out = renderMarkdown("12. twelfth");
+    expect(out).toBe("\x1b[2m12.\x1b[0m twelfth");
+  });
+
+  test("numbered list preserves indentation", () => {
+    const out = renderMarkdown("  3. nested item");
+    expect(out).toBe("  \x1b[2m3.\x1b[0m nested item");
+  });
+
+  test("digit + period mid-text is NOT a numbered list", () => {
+    expect(renderMarkdown("see fig 3.5 above")).toBe("see fig 3.5 above");
+  });
+
+  test("block quote dims the > and italicizes the body", () => {
+    const out = renderMarkdown("> a quote");
+    expect(out).toBe("\x1b[2m>\x1b[0m \x1b[3ma quote\x1b[0m");
+  });
+
+  test("> mid-text is NOT a block quote", () => {
+    expect(renderMarkdown("a > b")).toBe("a > b");
+  });
+
+  test("markdown link emits OSC 8 hyperlink + underline + dim raw URL", () => {
+    const out = renderMarkdown("see [docs](https://example.com)");
+    expect(out).toContain("\x1b]8;;https://example.com\x1b\\");
+    expect(out).toContain("\x1b[4mdocs\x1b[0m");
+    expect(out).toContain("(https://example.com)");
+  });
+
+  test("bare URL gets OSC 8 + underline", () => {
+    const out = renderMarkdown("visit https://example.com today");
+    expect(out).toContain("\x1b]8;;https://example.com\x1b\\");
+    expect(out).toContain("\x1b[4mhttps://example.com\x1b[0m");
+  });
+
+  test("bare URL stops at trailing whitespace, not at fragment chars", () => {
+    const out = renderMarkdown("https://example.com/path?q=1#frag end");
+    // Must include the full URL with query + fragment, but stop before " end"
+    expect(out).toContain("\x1b[4mhttps://example.com/path?q=1#frag\x1b[0m");
+    expect(out).toContain(" end");
+  });
+
+  test("URL inside markdown link is NOT double-wrapped as bare URL", () => {
+    // The [..](..) regex runs first; the bare-URL regex's negative lookbehind
+    // for `(` and `[` skips URLs that follow `(`.
+    const out = renderMarkdown("[label](https://example.com)");
+    // Should contain exactly one OSC 8 open marker for the URL.
+    const matches = out.match(/\x1b\]8;;https:\/\/example\.com\x1b\\/g);
+    expect(matches?.length).toBe(1);
+  });
+
+  test("file:// URL is supported", () => {
+    const out = renderMarkdown("see file:///tmp/log.txt for details");
+    expect(out).toContain("\x1b]8;;file:///tmp/log.txt\x1b\\");
+  });
 });
 
 // ─── detectFenceLine + renderFence{Open,Close} ──────────────────────────────
