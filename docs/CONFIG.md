@@ -224,24 +224,28 @@ coherence) clears.
 | `prefill_profile` | false | true / false | Per-stage timing logs (`score_ms / select_ms / gather_ms / total_ms`). |
 | `prefill_sparse_threshold` | 32768 | 0–524288 | Phase 3 plumbing for the sparse drafter forward (kernel not yet shipped). |
 
-Compression bypass cases (always emit a `pflash_bypass` event keyed by
-request id):
+Bypass / status events (only emitted when PFlash actually had a chance
+to fire -- i.e. drafter loaded successfully + request reached the
+generate path that wires PFlash):
 
-| Reason | Trigger |
-|---|---|
-| `mode_off` | `prefill_compression=off` (silent; no event emitted). |
-| `below_threshold` | `auto` mode + source tokens below `prefill_threshold`. |
-| `vision_request` | Image-bearing requests always bypass. |
-| `tool_call_request` | Either user or system prompt contains the `<tool_call>` token. |
-| `drafter_unavailable` | `prefill_drafter` unset or load failed. |
-| `tokenizer_mismatch` | Drafter and target tokenizer signatures differ. |
-| `dflash_decode_active` | DFlash spec-decode path doesn't yet route through PFlash. Disable `dflash_mode` if compression is required. |
-| `scoring_degenerate` | Scorer returned non-finite or all-zero scores. |
+| Reason | Event | Trigger |
+|---|---|---|
+| `mode_off` | (none, silent) | `prefill_compression=off`. |
+| `below_threshold` | `pflash_bypass` | `auto` mode + source tokens below `prefill_threshold`. |
+| `tool_call_request` | `pflash_bypass` | User or system prompt contains the `<tool_call>` token. |
+| `tokenizer_mismatch` | `pflash_bypass` | Drafter and target tokenizers differ at runtime (this is rejected at load already, but the per-request gate is still in place). |
+| `dflash_decode_active` | `pflash_bypass` | DFlash spec-decode took the fast path; PFlash compression on that path is a follow-up. Disable `dflash_mode` if compression is required. |
+| `scoring_degenerate` | `pflash_bypass` | Scorer returned non-finite or all-zero scores. |
+| (drafter load failure) | `pflash_load_failed` | Drafter HFQ open / config / weights / tokenizer failed at load. PflashState stays `None` for the session; subsequent generate requests run uncompressed with no further event. Re-load with a corrected `prefill_drafter` path to retry. |
+| (drafter unset) | (none, silent) | `prefill_compression != off` but `prefill_drafter` empty. CLI prints a single warning at load; no per-request event. |
+| (vision request) | (none, silent) | Image-bearing requests route to `generate_vl` which does not yet wire PFlash. PFlash is implicitly bypassed for vision. |
 
 When compression fires, `done` events embed a `pflash` field:
 `{source_tokens, kept_tokens, keep_ratio, alpha, score_ms, total_ms,
 source_md5, compressed_md5}`. When PFlash bypassed (skipped), the
-field is `{bypass_reason, alpha}`.
+field is `{bypass_reason, alpha}` (only on the `pflash_bypass` rows
+above; the silent / load-failure rows produce a `done` event without a
+`pflash` field).
 
 CLI usage:
 
@@ -250,9 +254,11 @@ CLI usage:
 hipfire config set prefill_compression auto
 hipfire config set prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
 
-# Per-target override (recommended -- different drafters per target)
-hipfire config set-model qwen3.5:9b prefill_compression auto
-hipfire config set-model qwen3.5:9b prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
+# Per-target override (recommended -- different drafters per target).
+# CLI shape: `hipfire config <model-tag> set <key> <value>` (the tag
+# slots in BEFORE the action, matching the existing cask / dflash UX).
+hipfire config qwen3.5:9b set prefill_compression auto
+hipfire config qwen3.5:9b set prefill_drafter ~/.hipfire/models/qwen3-0.6b.hf4
 
 # Per-request env override (research / one-shot benchmarking)
 HIPFIRE_PREFILL_COMPRESSION=always \
