@@ -233,7 +233,7 @@ generate path that wires PFlash):
 | `mode_off` | (none, silent) | `prefill_compression=off`. |
 | `below_threshold` | `pflash_bypass` | `auto` mode + source tokens below `prefill_threshold`. |
 | `tool_call_request` | `pflash_bypass` | User or system prompt contains the `<tool_call>` token. |
-| `tokenizer_mismatch` | `pflash_bypass` | Drafter and target tokenizers differ at runtime (this is rejected at load already, but the per-request gate is still in place). |
+| `tokenizer_mismatch` | `pflash_bypass` | Drafter and target tokenizer signatures differ. Load still succeeds with `tokenizer_compat:false` in the `pflash` status line; the per-request gate is what bypasses. Reload with a matched-tokenizer drafter to compress. |
 | `dflash_decode_active` | `pflash_bypass` | DFlash spec-decode took the fast path; PFlash compression on that path is a follow-up. Disable `dflash_mode` if compression is required. |
 | `scoring_degenerate` | `pflash_bypass` | Scorer returned non-finite or all-zero scores. |
 | (drafter load failure) | `pflash_load_failed` | Drafter HFQ open / config / weights / tokenizer failed at load. PflashState stays `None` for the session; subsequent generate requests run uncompressed with no further event. Re-load with a corrected `prefill_drafter` path to retry. |
