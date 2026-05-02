@@ -98,24 +98,57 @@ struct CaskConfig {
 ///
 /// Returns the File handle; caller MUST keep it alive for the process
 /// lifetime (on Unix, dropping it closes the fd and releases the lock).
-/// GPU-side single-token attractor block for the AR generate path (#111).
+/// GPU-side attractor blockers for the AR generate path (#111).
 ///
 /// MQ4 quant pressure makes structured-output special tokens (`<tool_call>`,
 /// `<think>`) into self-reinforcing attractors: the model emits the same
-/// special token hundreds of times in a row, never reaching the JSON body.
-/// The CPU-side `apply_ngram_block` is not in this path (its per-token D2H
-/// + H2D would tank decode tok/s) and the GPU sampler's repeat-penalty
-/// alone doesn't break a strong single-token loop fast enough.
+/// special token hundreds of times in a row, never reaching the JSON body
+/// (or in stacked-opener shapes that downstream regex parsers cannot
+/// recover). The CPU-side `apply_ngram_block` is not in this path (its
+/// per-token D2H + H2D would tank decode tok/s) and the GPU sampler's
+/// repeat-penalty alone doesn't break a strong single-token loop fast
+/// enough at the user-validated `RP=1.05` floor.
 ///
-/// This helper is the cheapest possible surgical fix: scan the recent
-/// `window` generated tokens (CPU-side u32 comparisons over ~20 tokens);
-/// if `tok_id` appears `threshold`+ times, write a single 4-byte `-INF`
-/// into the GPU logits buffer at offset `tok_id * 4`. No D2H, no kernel
-/// change, ~5 µs only on the rare turns that trip the attractor.
+/// Both helpers below scan the recent `window` generated tokens
+/// (CPU-side u32 comparisons over ~20 tokens) and, when tripped, write
+/// a single 4-byte `-INF` into the GPU logits buffer at offset
+/// `open_id * 4` via `memcpy_htod_offset`. No D2H, no kernel change,
+/// ~5 µs only on turns that trip; zero cost otherwise.
 ///
-/// Threshold=3 in window=20 catches any pathological loop (the bug report
-/// shows 9-100+ in a row) without harming legitimate multi-tool turns —
-/// real per-call content runs ≥10 tokens of JSON between openers.
+/// `gpu_block_attractor_unclosed` is the right call for paired
+/// open/close special tokens (`<tool_call>` / `</tool_call>`,
+/// `<think>` / `</think>`). It blocks the next emission when there
+/// are ≥ `threshold` opens minus closes in the window — i.e. unclosed
+/// nested openers. With `threshold = 2`, the helper trips before the
+/// model can emit a third nested opener; a second opener is still
+/// possible (we can only block the *next* token), but the parser-side
+/// strip in `parseToolCalls` (#111 stopgap) recovers from a single
+/// nested opener.
+///
+/// `gpu_block_attractor_token` is the simpler fallback for unpaired
+/// tokens: trips on `count >= threshold` regardless of structure.
+fn gpu_block_attractor_unclosed(
+    gpu: &rdna_compute::Gpu,
+    logits_buf: &hip_bridge::DeviceBuffer,
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 { return; }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
+        let _ = gpu.hip.memcpy_htod_offset(logits_buf, (open_id as usize) * 4, &bytes);
+    }
+}
+
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
     logits_buf: &hip_bridge::DeviceBuffer,
@@ -1887,11 +1920,24 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     // Special-token attractor blocking (#111). Resolve the token IDs once;
-    // each is `Some` only when the tokenizer registers it as a single
-    // special token (Qwen3+ vocabs) — older vocabs return `None` and the
-    // block is silently skipped.
-    let tool_call_token = tokenizer.special_token_id("<tool_call>");
-    let think_open_token = tokenizer.special_token_id("<think>");
+    // each pair is `Some` only when the tokenizer registers both opener
+    // and closer as single special tokens (Qwen3+ vocabs). Older vocabs
+    // return `None` and the block is silently skipped — no behavior
+    // change.
+    let tool_call_pair = match (
+        tokenizer.special_token_id("<tool_call>"),
+        tokenizer.special_token_id("</tool_call>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+    let think_pair = match (
+        tokenizer.special_token_id("<think>"),
+        tokenizer.special_token_id("</think>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
@@ -1979,14 +2025,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
         }
         // #111 attractor block: empty `ngram_scope` on first sample (no
-        // generated tokens yet), so the count is always 0 and this is a
-        // no-op here. Still call it for symmetry with the loop body, in
-        // case a future change moves this block into a multi-step warmup.
-        if let Some(t) = tool_call_token {
-            gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+        // generated tokens yet), so the unclosed-depth is always 0 and
+        // this is a no-op here. Still call it for symmetry with the
+        // loop body, in case a future change moves this block into a
+        // multi-step warmup.
+        if let Some((open, close)) = tool_call_pair {
+            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
         }
-        if let Some(t) = think_open_token {
-            gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+        if let Some((open, close)) = think_pair {
+            gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
         }
         let (tok0, rng0) = gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -2155,11 +2202,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     if !bytes.is_empty() {
                         gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
                     }
-                    if let Some(t) = tool_call_token {
-                        gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+                    if let Some((open, close)) = tool_call_pair {
+                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
                     }
-                    if let Some(t) = think_open_token {
-                        gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+                    if let Some((open, close)) = think_pair {
+                        gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
                     }
                     let (tok, rng) = gpu.sample_top_p(
                         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -2225,14 +2272,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             if !bytes.is_empty() {
                 gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
             }
-            // #111 attractor block — see helper docstring. Counts in 20-token
-            // window; trips at 3+ occurrences. Cheap when not tripped, ~5 µs
-            // when tripped (single 4-byte H2D into the logits buffer).
-            if let Some(t) = tool_call_token {
-                gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+            // #111 attractor block — see helper docstrings. Counts unclosed
+            // opens in a 20-token window; trips at depth ≥ 2. Cheap when
+            // not tripped, ~5 µs when tripped (single 4-byte H2D into the
+            // logits buffer).
+            if let Some((open, close)) = tool_call_pair {
+                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
             }
-            if let Some(t) = think_open_token {
-                gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+            if let Some((open, close)) = think_pair {
+                gpu_block_attractor_unclosed(gpu, &scratch.logits.buf, ngram_scope, open, close, 20, 2);
             }
             // GPU sample: reads scratch.logits (already on GPU), writes token+rng
             // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.

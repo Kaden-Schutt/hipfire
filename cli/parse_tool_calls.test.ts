@@ -159,3 +159,54 @@ test("escaped quotes inside JSON strings are handled", () => {
   expect(r).not.toBeNull();
   expect(r!.arguments).toEqual({ path: "/tmp/x", content: 'say "hi"' });
 });
+
+// Mirror of the nested-stripping logic in parseToolCalls (cli/index.ts).
+// Keep in sync.
+function parseToolCallsBlock(raw: string) {
+  let r = raw.trim();
+  let stripped = 0;
+  while (r.startsWith("<tool_call>")) {
+    r = r.slice("<tool_call>".length).trimStart();
+    stripped++;
+  }
+  if (!r) return null;
+  const parsed = parseOneToolCall(r);
+  return parsed ? { ...parsed, nestedStripped: stripped } : null;
+}
+
+test("nested <tool_call> opener is stripped, payload still parses (#111)", () => {
+  // The shape that broke v0.1.9-alpha: model emits two stacked openers
+  // before the JSON body lands. Outer regex captures content starting
+  // with another `<tool_call>`; the parser must strip that prefix.
+  const raw = '<tool_call>\n{"name": "write", "arguments": {"path": "/tmp/x", "content": "y"}}';
+  const r = parseToolCallsBlock(raw);
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("write");
+  expect(r!.arguments).toEqual({ path: "/tmp/x", content: "y" });
+  expect(r!.nestedStripped).toBe(1);
+});
+
+test("multiple nested <tool_call> openers all get stripped (#111)", () => {
+  const raw = '<tool_call>\n<tool_call>\n<tool_call>\n{"name": "read", "arguments": {"path": "/etc"}}';
+  const r = parseToolCallsBlock(raw);
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("read");
+  expect(r!.nestedStripped).toBe(3);
+});
+
+test("no nested opener leaves payload unmodified (#111)", () => {
+  const raw = '{"name": "bash", "arguments": {"command": "ls"}}';
+  const r = parseToolCallsBlock(raw);
+  expect(r).not.toBeNull();
+  expect(r!.nestedStripped).toBe(0);
+  expect(r!.repaired).toBe(false);
+});
+
+test("nested openers with empty body returns null (no false-positive call)", () => {
+  // Pure attractor with no JSON behind the openers — must NOT emit a
+  // bogus tool call. The handler should let this fall through to the
+  // "no tool calls" path.
+  const raw = '<tool_call>\n<tool_call>\n<tool_call>';
+  const r = parseToolCallsBlock(raw);
+  expect(r).toBeNull();
+});

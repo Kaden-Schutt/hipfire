@@ -1584,11 +1584,24 @@ async function serve(port: number) {
           const tool_calls: any[] = [];
           let repaired = 0;
           for (const m of matches) {
-            const raw = (m[1] || m[2] || "").trim();
+            let raw = (m[1] || m[2] || "").trim();
+            if (!raw) continue;
+            // MQ4 single-token attractor (#111) sometimes stacks 1-2 nested
+            // `<tool_call>` openers before the JSON body lands. The engine
+            // blocks the third+ via the unclosed-depth gate in daemon.rs,
+            // but the second still ships in the visible stream. Strip any
+            // leading nested-opener artifacts before parsing — if the
+            // first non-whitespace bytes are another `<tool_call>`,
+            // discard them and use the inner content.
+            let nestedStripped = 0;
+            while (raw.startsWith("<tool_call>")) {
+              raw = raw.slice("<tool_call>".length).trimStart();
+              nestedStripped++;
+            }
             if (!raw) continue;
             const parsed = parseOneToolCall(raw);
             if (!parsed) continue;
-            if (parsed.repaired) repaired++;
+            if (parsed.repaired || nestedStripped > 0) repaired++;
             tool_calls.push({
               id: `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
               type: "function",
