@@ -1,0 +1,553 @@
+# PFlash-style speculative prefill for hipfire
+
+**Status:** Draft PRD  
+**Last updated:** 2026-05-02  
+**Owner:** hipfire research  
+**Upstream inspiration:** Lucebox PFlash by @pupposandro / Sandro and @davideciffa, MIT source at `Luce-Org/lucebox-hub`; algorithms from Speculative Prefill / Cross-Family Speculative Prefill and FlashPrefill.
+
+---
+
+## 1. Executive summary
+
+Long-context prefill is the next visible latency wall for hipfire's 27B path. DFlash makes decode fast once the KV cache exists, but a 64K-128K prompt still requires the target to ingest every token before the first streamed output token. Lucebox PFlash demonstrates a clean product shape for this problem: run a small in-process drafter over the long prompt, score which source spans matter, feed only those spans to the heavy target, then let normal DFlash speculative decode continue.
+
+This PRD proposes a ROCm-native, Rust + HIP integration of the same idea in hipfire:
+
+1. **Drafter scorer:** load a small Qwen3-family drafter, initially Qwen3-0.6B, inside the daemon.
+2. **Importance scoring:** use drafter attention statistics to score source blocks / tokens.
+3. **Prompt compression:** keep the highest-scoring source spans, preserving original order and mandatory anchors.
+4. **Target prefill:** run existing hipfire target prefill on the compressed token stream.
+5. **Decode:** hand off to existing DFlash / DDTree / AR decode unchanged.
+
+The desired first product is not a CUDA port and not a wrapper around Lucebox. It is a hipfire-native implementation that reuses hipfire's tokenizer, model loading, KV formats, DFlash state, and ROCm kernel stack. No Python, Triton, CUDA, or Vulkan runtime path.
+
+---
+
+## 2. Why this exists
+
+### 2.1 Current hipfire bottleneck
+
+hipfire's 27B decode path is already strong once generation starts:
+
+- MQ4 / MQ3 target weights fit on a 24 GB RDNA card.
+- DFlash drafts are small relative to Lucebox's BF16 draft path.
+- DFlash decode has published strong code-prompt numbers, subject to the usual prompt-shape and coherence-gate rules.
+
+But target prefill still scales with prompt length. For long prompts, TTFT becomes dominated by full target prefill rather than decode throughput. A user with a 64K-128K source document can still wait tens of seconds or minutes before seeing the first token, even if decode after that is fast.
+
+### 2.2 Upstream external anchor
+
+The Lucebox PFlash result is the concrete external signal:
+
+- Target: Qwen3.6-27B Q4_K_M on RTX 3090.
+- Drafter: Qwen3-0.6B BF16, loaded in-process.
+- Algorithm stack:
+  - Cross-Family Speculative Prefill for attention-based importance scoring and prompt selection.
+  - FlashPrefill for making the long-context drafter forward itself fast.
+- Runtime: C++/CUDA only, no Python/Triton/PyTorch in the inference loop.
+- Reported single-shot NIAH numbers:
+  - 64K: 13.5 s TTFT vs 134.95 s llama.cpp, about 10.0x.
+  - 128K: 24.8 s TTFT vs about 257 s llama.cpp, about 10.4x.
+  - NIAH single-needle retrieved at all tested context sizes with `keep_ratio=0.05`, `DFLASH_FP_ALPHA=0.85`.
+
+Those numbers are **not** hipfire claims. They are CUDA / RTX 3090 reference points showing that the product shape is viable and worth porting.
+
+### 2.3 Why hipfire is well-positioned
+
+hipfire already has several ingredients that make a native version plausible:
+
+| Need | Existing hipfire surface |
+|---|---|
+| Quantized 27B target | HFQ / MQ4 / MQ3 target loading in `crates/engine/src/qwen35.rs` and daemon load path |
+| Fast prefill chunks | `qwen35::forward_prefill_batch` / `forward_prefill_batch_with_pbs` |
+| Spec-decode handoff | `crates/engine/src/dflash.rs`, `crates/engine/src/speculative.rs`, `crates/engine/src/ddtree.rs` |
+| Long-context KV formats | `llama::KvCache` asym2/asym3/asym4/q8 paths in `crates/engine/src/llama.rs` |
+| KV / hidden compaction concepts | TriAttention / CASK scaffolding in `crates/engine/src/triattn.rs` and `crates/engine/src/cask.rs` |
+| HIP kernel pipeline | `kernels/src/*.hip`, `crates/rdna-compute/src/kernels.rs`, `crates/rdna-compute/src/dispatch.rs` |
+| Daemon state machine | `crates/engine/examples/daemon.rs` |
+
+PFlash should be treated as a **front-of-prefill compression stage**, not as a replacement for DFlash decode. It should produce a shorter token stream that the target prefills normally.
+
+---
+
+## 3. Product requirements
+
+### 3.1 User-visible behavior
+
+1. **Default safe behavior:** prefill compression is off by default until validation passes.
+2. **Auto mode:** when enabled, compression only triggers above a token threshold, initially 32K.
+3. **Always mode:** for benchmarking and research, compression can be forced for any prompt length.
+4. **Bypass cases:** compression must bypass:
+   - prompts below threshold in `auto` mode,
+   - vision requests,
+   - tool-calling requests / prompts with large JSON tool definitions,
+   - any tokenizer incompatibility between target and drafter,
+   - unsupported drafter model architecture or KV mode.
+5. **Determinism:** compression must be deterministic for a fixed prompt, drafter, `alpha`, `keep_ratio`, block size, and build.
+6. **Streaming semantics:** once compression finishes, the downstream generation path should stream tokens normally.
+7. **No silent quality degradation:** compressed generation must report compression metadata in logs and daemon `done` objects: source tokens, kept tokens, keep ratio, alpha, scorer wall time, target prefill wall time, bypass reason if skipped.
+
+### 3.2 Operator knobs
+
+Proposed config / load params / env names:
+
+| Knob | Type | Default | Meaning |
+|---|---:|---:|---|
+| `prefill_compression` | `off|auto|always` | `off` | Top-level mode |
+| `prefill_threshold` | tokens | `32768` | Minimum source tokens for `auto` |
+| `prefill_keep_ratio` | float | `0.05` | Fraction of source tokens to keep after selection |
+| `prefill_alpha` | float | `0.85` | Block-selection strictness for scoring kernel |
+| `prefill_drafter` | path | none | Qwen3-0.6B drafter `.hfq` path |
+| `prefill_min_keep` | tokens | `2048` | Floor on retained token count |
+| `prefill_recent_tokens` | tokens | `1024` | Always keep tail context before answer |
+| `prefill_sink_tokens` | tokens | `256` | Always keep prefix / system region |
+| `prefill_profile` | bool | `false` | Per-stage timing logs |
+
+Environment aliases for bench work can mirror hipfire style:
+
+```bash
+HIPFIRE_PREFILL_COMPRESSION=auto
+HIPFIRE_PREFILL_THRESHOLD=32768
+HIPFIRE_PREFILL_KEEP_RATIO=0.05
+HIPFIRE_PREFILL_ALPHA=0.85
+HIPFIRE_PREFILL_DRAFTER=~/.hipfire/models/qwen3-0.6b-bf16.hfq
+HIPFIRE_PREFILL_PROFILE=1
+```
+
+### 3.3 Success criteria
+
+Initial acceptance target, before any public performance claim:
+
+1. **Correctness / retrieval:** NIAH single-needle pass at 8K, 16K, 32K, 64K, and 128K with committed, md5-stamped cases.
+2. **Compression stability:** retained token count within ±1% of requested `keep_ratio` after mandatory anchors, unless the prompt is below `min_keep`.
+3. **TTFT win:** at 64K, median TTFT at least 2x faster than full target prefill on the same model / prompt / binary. This is the first internal bar, not the final target.
+4. **No DFlash regression:** after compressed prefill, existing DFlash decode path still passes `./scripts/coherence-gate-dflash.sh` on the canonical matrix.
+5. **No hidden attractors:** decoded output must be eyeballed for the long-context tests. Tight stddev or high acceptance is not sufficient.
+6. **Reproducibility:** every benchmark records source prompt md5, compressed token md5, binary md5, model md5s, drafter md5, `keep_ratio`, `alpha`, and source/kept token counts.
+
+Longer-term target after HIP FlashPrefill lands:
+
+- 64K and 128K TTFT should approach the Lucebox order-of-magnitude result, adjusted for AMD target hardware and hipfire's target/draft quant formats.
+
+---
+
+## 4. Non-goals
+
+- No CUDA dependency.
+- No Triton dependency.
+- No PyTorch or Python in the runtime daemon path.
+- No Vulkan path.
+- No public claim that hipfire gets Lucebox's 10x number until measured on hipfire with md5-stamped prompts and binaries.
+- No compression of tool definitions or structured JSON control blocks in the first release.
+- No attempt to combine PFlash with TriAttention / CASK eviction in the first correctness milestone.
+- No support for arbitrary drafter families until Qwen3-family tokenizer / position semantics are validated.
+
+---
+
+## 5. Proposed architecture
+
+### 5.1 High-level pipeline
+
+```text
+request prompt text
+   │
+   ▼
+target tokenizer + prompt normalization
+   │ token_ids[S]
+   ▼
+PFlash gate
+   ├─ bypass → existing full target prefill
+   │
+   └─ compress:
+        1. run drafter scorer over token_ids[S]
+        2. compute importance score per block/token
+        3. keep mandatory anchors + top-scoring spans
+        4. emit compressed_ids[K] in original order
+          │
+          ▼
+existing target prefill on compressed_ids[K]
+          │
+          ▼
+existing DFlash / DDTree / AR decode
+```
+
+The target sees the compressed stream as the actual prompt. Positions are contiguous in compressed-prompt space. The first implementation should not try to preserve original absolute positions via sparse position sidebands. That is a separate research track and will change model semantics.
+
+### 5.2 New module
+
+Add a new module:
+
+```text
+crates/engine/src/pflash.rs
+```
+
+Suggested API:
+
+```rust
+pub struct PflashConfig {
+    pub mode: PflashMode,
+    pub threshold_tokens: usize,
+    pub keep_ratio: f32,
+    pub alpha: f32,
+    pub min_keep_tokens: usize,
+    pub sink_tokens: usize,
+    pub recent_tokens: usize,
+    pub block_size: usize,
+    pub profile: bool,
+}
+
+pub enum PflashMode { Off, Auto, Always }
+
+pub struct PflashState {
+    pub drafter_path: String,
+    pub drafter_tokenizer_hash: String,
+    // drafter config / weights / scratch / kv go here
+}
+
+pub struct CompressedPrompt {
+    pub source_tokens: usize,
+    pub kept_tokens: usize,
+    pub token_ids: Vec<u32>,
+    pub kept_spans: Vec<(usize, usize)>,
+    pub source_md5: String,
+    pub compressed_md5: String,
+    pub timings: PflashTimings,
+}
+
+pub fn maybe_compress_prompt(
+    gpu: &mut rdna_compute::Gpu,
+    state: &mut PflashState,
+    cfg: &PflashConfig,
+    token_ids: &[u32],
+    request_kind: RequestKind,
+) -> HipResult<PflashDecision>;
+```
+
+`PflashDecision` should be either `Bypass { reason }` or `Compressed(CompressedPrompt)`.
+
+### 5.3 Drafter model path
+
+Initial drafter target: Qwen3-0.6B.
+
+Because `crates/engine/examples/daemon.rs` currently loads target models from HFQ, the cleanest first implementation is:
+
+1. Add or extend quantizer support so `hipfire-quantize` can produce a Qwen3-0.6B BF16 or MQ4 HFQ drafter artifact.
+2. Require tokenizer compatibility with the target:
+   - same vocab size,
+   - same token byte strings,
+   - same special token IDs for chat templates and EOT tokens.
+3. Refuse compression if tokenizer compatibility fails.
+
+BF16 drafter is the quality-first MVP. MQ4 drafter is a later memory / speed optimization after selection quality is established.
+
+### 5.4 Scoring semantics
+
+Use the cross-family speculative-prefill shape:
+
+1. Run the drafter over the full prompt, or over a FlashPrefill-sparse approximation once Phase 3 lands.
+2. Capture attention-relevant Q/K summaries from drafter layers and heads.
+3. Score source blocks using tail-query attention against source key blocks.
+4. Aggregate scores across layers / heads, then across tail query positions.
+5. Convert block scores into token / span survival.
+6. Keep:
+   - prefix sink tokens,
+   - recent tail tokens,
+   - selected high-score spans,
+   - any chat boundary tokens needed to keep the prompt parseable.
+
+A reasonable initial block size is 128 tokens to match the Lucebox PFlash writeup. Keep it configurable.
+
+Important implementation detail: selection should be **span-preserving**, not just top-K individual tokens. Single-token scatter destroys syntax and BPE-local continuity. Select blocks, coalesce adjacent blocks, then emit tokens in original order.
+
+---
+
+## 6. Phased implementation plan
+
+### Phase 0 — repo-local bench and harness scaffolding
+
+Goal: make the long-context target measurable before changing runtime behavior.
+
+Add:
+
+```text
+benchmarks/longctx/niah/
+  niah_8k.jsonl
+  niah_16k.jsonl
+  niah_32k.jsonl
+  niah_64k.jsonl
+  niah_128k.jsonl
+
+crates/engine/examples/pflash_niah_bench.rs
+```
+
+Requirements:
+
+- NIAH cases are committed or generated from a committed script with fixed seeds. Do not place canonical cases under `/tmp`.
+- Bench output prints source prompt md5 and binary md5.
+- Baseline path runs full target prefill + AR or DFlash decode.
+- Compression can be simulated from a sidecar list of spans so later phases can compare apples-to-apples.
+
+Exit criteria:
+
+- Full-prefill NIAH baseline passes at every target context supported by available VRAM / KV mode.
+- Bench reports TTFT broken into tokenize, prefill, first decode step, and total.
+
+### Phase 1 — dense drafter compression MVP
+
+Goal: prove attention-based compression quality before optimizing drafter cost.
+
+Add:
+
+```text
+crates/engine/src/pflash.rs
+crates/engine/examples/pflash_compress_demo.rs
+```
+
+Modify:
+
+```text
+crates/engine/src/lib.rs
+crates/engine/src/llama.rs
+crates/engine/examples/daemon.rs   # only enough to load / debug the drafter, not auto-enable
+```
+
+Work:
+
+1. Load Qwen3-0.6B drafter HFQ into `PflashState`.
+2. Add optional Q/K capture hooks to the Qwen3 / LLaMA-family drafter prefill path.
+3. Implement CPU or simple GPU scoring for 8K-16K first.
+4. Emit compressed token IDs and span metadata.
+5. Feed compressed IDs to existing target prefill.
+
+Exit criteria:
+
+- NIAH passes at 8K and 16K with at least two keep ratios: 0.10 and 0.05.
+- Compressed prompt is deterministic and logged.
+- Target output after compression is semantically plausible, not just needle-containing.
+
+This phase is allowed to be slower than full prefill. It exists to validate quality and integration shape.
+
+### Phase 2 — HIP scoring and selection kernels
+
+Goal: move scoring / selection onto the GPU and remove host bottlenecks.
+
+Add kernels:
+
+```text
+kernels/src/pflash_mean_k.hip
+kernels/src/pflash_score_blocks.hip
+kernels/src/pflash_select_blocks.hip
+kernels/src/pflash_gather_tokens.hip
+```
+
+Modify dispatch wrappers:
+
+```text
+crates/rdna-compute/src/kernels.rs
+crates/rdna-compute/src/dispatch.rs
+```
+
+Work:
+
+1. `pflash_mean_k`: per layer/head/block mean of K.
+2. `pflash_score_blocks`: tail Q blocks score K blocks with `alpha` threshold support.
+3. `pflash_select_blocks`: reduce per-query block selections to source-token survival.
+4. `pflash_gather_tokens`: compact selected spans into an output token buffer or survival bitmap.
+5. Add CPU reference tests for all kernels.
+
+Exit criteria:
+
+- GPU scores match CPU reference within tolerance for deterministic synthetic Q/K tensors.
+- GPU-selected spans exactly match CPU selection on fixed seeds.
+- 32K NIAH passes with dense drafter + GPU scoring.
+
+### Phase 3 — FlashPrefill-style sparse drafter forward on HIP
+
+Goal: make the drafter scorer fast enough at 64K-128K.
+
+Add:
+
+```text
+kernels/src/attention_pflash_sparse_fwd.hip
+```
+
+Potentially modify:
+
+```text
+crates/engine/src/llama.rs
+crates/engine/src/pflash.rs
+crates/rdna-compute/src/kernels.rs
+crates/rdna-compute/src/dispatch.rs
+```
+
+Work:
+
+1. Port the FlashPrefill idea, not Lucebox's CUDA/BSA implementation.
+2. Use RDNA-native tiling and wave scheduling.
+3. Support sink blocks, recent-window blocks, and dynamic selected blocks.
+4. Fall back to dense drafter attention below a configurable threshold, initially 32K.
+5. Profile on gfx1100 first; add gfx12 path after correctness.
+
+Exit criteria:
+
+- Sparse drafter logits / scores are close enough to dense drafter scores that selected spans are stable on NIAH cases.
+- 64K NIAH passes at `keep_ratio=0.05`.
+- Drafter scoring no longer dominates TTFT so severely that full target prefill wins.
+
+### Phase 4 — daemon and CLI integration
+
+Goal: make PFlash a user-facing, opt-in feature.
+
+Modify:
+
+```text
+crates/engine/examples/daemon.rs
+crates/engine/examples/run.rs
+# CLI/config crates if present in the active branch
+# docs/CONFIG.md or equivalent config docs
+```
+
+Daemon load params:
+
+```json
+{
+  "type": "load",
+  "model": "~/.hipfire/models/qwen3.6-27b.mq4",
+  "params": {
+    "max_seq": 131072,
+    "draft": "~/.hipfire/models/qwen36-27b-dflash-mq4.hfq",
+    "prefill_compression": "auto",
+    "prefill_threshold": 32768,
+    "prefill_keep_ratio": 0.05,
+    "prefill_alpha": 0.85,
+    "prefill_drafter": "~/.hipfire/models/qwen3-0.6b-bf16.hfq"
+  }
+}
+```
+
+Request-time behavior:
+
+1. Tokenize and normalize prompt as today.
+2. Decide `Bypass` vs `Compressed`.
+3. If compressed, replace the prompt token slice passed to prefill with `compressed_ids`.
+4. Preserve `conversation_tokens` semantics carefully:
+   - repeat penalty should probably use generated tokens + compressed prompt in the first version,
+   - logs should retain original source length for observability,
+   - future work can track full-source history separately.
+5. Do not auto-enable DFlash. If DFlash is disabled, PFlash may still compress AR prefill, but the logs must say decode is AR.
+
+Memory lifecycle:
+
+- First attempt: load drafter alongside target on 24 GB only if VRAM allows.
+- If OOM, add a `ModelParking` path analogous to Lucebox's `park/unpark`:
+  - park DFlash draft if present,
+  - run drafter scorer,
+  - free drafter state,
+  - unpark target / DFlash draft,
+  - run target prefill + decode.
+- Reuse the existing cache-invalidation lessons from `Gpu::unload_model`: drain pointer-keyed caches and captured graphs when weights are unloaded or reloaded.
+
+Exit criteria:
+
+- `hipfire run` can opt into PFlash with config/env and gets a compressed-prefill log line.
+- Bypass cases are explicit and correct.
+- Existing non-PFlash generation is byte-equivalent to pre-change behavior when the feature is off.
+
+### Phase 5 — validation gates and release readiness
+
+Required gates before any release note / public claim:
+
+```bash
+cargo build --release --features deltanet \
+  --example daemon \
+  --example dflash_spec_demo \
+  --example encode_prompt \
+  --example run \
+  -p engine
+
+./scripts/coherence-gate-dflash.sh
+```
+
+Additional PFlash-specific gates:
+
+- NIAH single-needle: 8K, 16K, 32K, 64K, 128K.
+- Multi-needle sanity: at least 16K and 64K.
+- Long code retrieval prompt: committed under `benchmarks/prompts/` with md5 recorded.
+- Long prose / multi-doc prompt: committed under `benchmarks/prompts/` with md5 recorded.
+- 3 fresh-process TTFT runs for each claimed context length.
+- Human eyeball of decoded outputs, especially when compressed prompt is very small or DFlash acceptance is unusually high.
+
+Report fields:
+
+| Field | Required |
+|---|---|
+| GPU + arch | yes |
+| ROCm version | yes |
+| target model path + md5 | yes |
+| DFlash draft path + md5 | if used |
+| PFlash drafter path + md5 | yes |
+| binary md5 | yes |
+| source prompt md5 | yes |
+| compressed token md5 | yes |
+| source tokens / kept tokens | yes |
+| keep ratio / alpha / block size | yes |
+| TTFT breakdown | yes |
+| NIAH answer found | yes |
+| decoded output excerpt | yes |
+
+---
+
+## 7. Risks and mitigations
+
+| Risk | Why it matters | Mitigation |
+|---|---|---|
+| Cross-family attention transfer is weaker on hipfire's target/drafter pair | NIAH may pass but code/prose tasks may lose details | Validate beyond NIAH; tune keep ratio per genre; start conservative at 0.10 before 0.05 |
+| Tokenizer mismatch | A compressed token stream from drafter tokens may not be valid target tokens | Require identical tokenizer or implement explicit retokenization; refuse otherwise |
+| Position semantics change after compression | Dropping tokens makes target positions contiguous, not original absolute positions | Accept as first-product semantics; log clearly; investigate absolute-position sideband later |
+| Syntax destruction from sparse token selection | Top individual tokens can destroy code and JSON structure | Select and coalesce spans/blocks; always keep sink, recency, chat boundaries |
+| Drafter scoring dominates TTFT | Dense drafter can be slower than target prefill at long ctx | Phase 3 HIP FlashPrefill sparse drafter path before performance claims |
+| VRAM pressure on 24 GB | Target + DFlash draft + drafter + scratch may not coexist | Add model parking / staged loading; free drafter before target prefill |
+| Graph capture stale pointers | Prior hipfire graph bugs produced plausible tok/s with garbage output | Use `launch_maybe_blob` patterns; coherence-gate and eyeball under graph mode |
+| Tool calling breaks | Compression can drop schema text | Bypass tool-calling requests in first release |
+| Interaction with CASK/TriAttention | Two compression mechanisms can compound quality loss | Do not stack in MVP; test PFlash alone first |
+
+---
+
+## 8. Open questions
+
+1. **Drafter format:** should the first drafter be BF16 HFQ for quality, or MQ4 for VRAM? Recommendation: BF16 first, MQ4 only after quality parity.
+2. **Drafter architecture path:** can current `llama.rs` Qwen3 support load Qwen3-0.6B from HFQ cleanly, or do we need a small dedicated loader?
+3. **RoPE scaling:** does the converted Qwen3-0.6B drafter preserve the long-context RoPE / YaRN metadata needed for 64K-128K scoring?
+4. **Compression target:** should `keep_ratio=0.05` be global, or should hipfire use a budget function such as `max(min_keep, min(8192, ratio*S))`?
+5. **DFlash hidden ring:** after compressed prefill, should DFlash's target-hidden ring represent only compressed context, or do we need a future sparse-position hidden ring?
+6. **Repeat penalty / conversation state:** should repeat penalty see original prompt tokens, compressed tokens, or only generated tokens? MVP should use compressed tokens for consistency with target state.
+7. **Public UX:** should this be exposed as `pflash_mode`, `prefill_compression`, or folded under `dflash_mode`? Recommendation: keep it separate because it also helps AR prefill.
+
+---
+
+## 9. References
+
+- Lucebox PFlash README: `https://github.com/Luce-Org/lucebox-hub/tree/main/pflash`
+- Lucebox daemon-side spec prefill docs: `https://github.com/Luce-Org/lucebox-hub/blob/main/dflash/docs/SPEC_PREFILL.md`
+- Announcement thread by @pupposandro / Sandro, co-author @davideciffa: `https://x.com/pupposandro/status/2050213728298185029`
+- Cross-Family Speculative Prefill: `https://arxiv.org/abs/2603.02631`
+- Speculative Prefill: `https://arxiv.org/abs/2502.02789`
+- FlashPrefill: `https://arxiv.org/abs/2603.06199`
+- FlashPrefill original implementation: `https://github.com/qhfan/FlashPrefill`
+- Block-Sparse-Attention: `https://github.com/mit-han-lab/Block-Sparse-Attention`
+
+---
+
+## 10. Recommended first task breakdown
+
+1. Add committed NIAH generator / fixtures under `benchmarks/longctx/niah/`.
+2. Add `pflash_compress_demo.rs` that accepts a token span sidecar and runs target prefill on compressed IDs.
+3. Convert / load Qwen3-0.6B as a hipfire drafter artifact and validate tokenizer identity.
+4. Add dense drafter Q/K capture for 8K-16K.
+5. Implement CPU selector and establish quality curves for `keep_ratio={0.20,0.10,0.05}`.
+6. Port scoring / selection to HIP kernels.
+7. Port sparse drafter attention.
+8. Wire daemon opt-in mode and memory lifecycle.
+9. Run coherence + long-context validation gates.
+
+Do not skip the quality curve. A 10x TTFT number is only meaningful if the compressed prompt still supports retrieval and normal answer quality across more than single-needle NIAH.
