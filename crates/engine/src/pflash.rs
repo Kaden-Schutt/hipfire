@@ -296,8 +296,17 @@ fn is_audio_tts_padding(s: &str) -> bool {
 /// consumed by qwen3.5-27b's tokenizer because both produce the same encoding
 /// for any reachable text).
 ///
-/// Cost: O(vocab_size) plus a one-time sort of specials. Called once per
-/// drafter load and once per pretok read, so the cost is amortized.
+/// To catch foreign tokenizers that happen to match on a vocab subset, the
+/// hash also incorporates:
+///   - `vocab_size()` — different total counts always diverge.
+///   - encode(TOKENIZER_COMPAT_PROBE) — the same probe used by
+///     `tokenizers_compatible`'s structural check, baked into the static
+///     signature. A foreign tokenizer would have to produce the same probe
+///     encoding AND the same non-padding vocab to falsely match.
+///
+/// Cost: O(vocab_size) plus a one-time sort of specials and one probe
+/// encoding (~20 byte input). Called once per drafter load and once per
+/// pretok read.
 pub fn tokenizer_compat_signature(t: &Tokenizer) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     fn mix(bytes: &[u8], h: &mut u64) {
@@ -308,6 +317,10 @@ pub fn tokenizer_compat_signature(t: &Tokenizer) -> u64 {
         *h ^= 0xff;
         *h = h.wrapping_mul(0x100000001b3);
     }
+    // Vocab size is part of the §5.3 contract; folding it in catches a
+    // foreign tokenizer that happens to share a vocab prefix but differs in
+    // total slot count.
+    mix(&(t.vocab_size() as u64).to_le_bytes(), &mut h);
     // Vocab in id order, skipping the documented padding band.
     for tok in t.vocab() {
         if is_audio_tts_padding(tok) {
@@ -332,6 +345,15 @@ pub fn tokenizer_compat_signature(t: &Tokenizer) -> u64 {
     mix(&t.bos_id.to_le_bytes(), &mut h);
     mix(&t.eos_id.to_le_bytes(), &mut h);
     mix(&t.eot_id.unwrap_or(u32::MAX).to_le_bytes(), &mut h);
+    // Bake the probe encoding into the signature so a structural BPE
+    // divergence (different merges yielding different token sequences for
+    // common text) is caught even if the static vocab/specials happen to
+    // match. This mirrors the probe step in `tokenizers_compatible`.
+    let probe_tokens = t.encode(TOKENIZER_COMPAT_PROBE);
+    mix(&(probe_tokens.len() as u64).to_le_bytes(), &mut h);
+    for tok in &probe_tokens {
+        mix(&tok.to_le_bytes(), &mut h);
+    }
     h
 }
 
