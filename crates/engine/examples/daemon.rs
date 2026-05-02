@@ -412,6 +412,11 @@ fn main() {
         Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
     };
     let mut model: Option<LoadedModel> = None;
+    // PFlash speculative-prefill state. None unless the load message
+    // includes a `prefill_drafter` path AND `prefill_compression` != "off".
+    // Lives alongside `model` so unload_model + this state are paired
+    // teardowns. Phase 4.0: load only; request-path wiring lands in Phase 4.1.
+    let mut pflash_state: Option<engine::pflash::PflashState> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -436,9 +441,15 @@ fn main() {
 
         match msg_type {
             "load" => {
-                // Unload previous if any
+                // Unload previous if any.
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
+                }
+                // PFlash drafter outlives a single load; if a previous
+                // session had a drafter resident, free its VRAM now so
+                // the new target gets the headroom.
+                if let Some(mut pf) = pflash_state.take() {
+                    pf.unload_drafter(&mut gpu);
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -532,6 +543,34 @@ fn main() {
                     gpu.mmq_screen_threshold = v as f32;
                 }
 
+                // ── PFlash load-time params (Phase 4.0 #93) ──────────────
+                //
+                // Parse compression knobs per PRD §5.3.2. None of these
+                // affect the target load itself; they only configure the
+                // optional drafter that PFlash uses for prompt scoring.
+                // Drafter loading happens AFTER target load succeeds so
+                // we can use the target's tokenizer for the compat check.
+                let pflash_mode_str = msg.get("params").and_then(|p| p.get("prefill_compression"))
+                    .and_then(|v| v.as_str()).unwrap_or("off").to_string();
+                let pflash_threshold = msg.get("params").and_then(|p| p.get("prefill_threshold"))
+                    .and_then(|v| v.as_u64()).unwrap_or(32768) as usize;
+                let pflash_keep_ratio = msg.get("params").and_then(|p| p.get("prefill_keep_ratio"))
+                    .and_then(|v| v.as_f64()).unwrap_or(0.05) as f32;
+                let pflash_alpha = msg.get("params").and_then(|p| p.get("prefill_alpha"))
+                    .and_then(|v| v.as_f64()).unwrap_or(0.85) as f32;
+                let pflash_min_keep = msg.get("params").and_then(|p| p.get("prefill_min_keep"))
+                    .and_then(|v| v.as_u64()).unwrap_or(2048) as usize;
+                let pflash_sink = msg.get("params").and_then(|p| p.get("prefill_sink"))
+                    .and_then(|v| v.as_u64()).unwrap_or(256) as usize;
+                let pflash_recent = msg.get("params").and_then(|p| p.get("prefill_recent"))
+                    .and_then(|v| v.as_u64()).unwrap_or(1024) as usize;
+                let pflash_block = msg.get("params").and_then(|p| p.get("prefill_block"))
+                    .and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let pflash_drafter = msg.get("params").and_then(|p| p.get("prefill_drafter"))
+                    .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                let pflash_profile = msg.get("params").and_then(|p| p.get("prefill_profile"))
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
@@ -546,6 +585,63 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else { (0, 0, 0) };
                         let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
+
+                        // ── PFlash drafter load (Phase 4.0) ──────────────
+                        //
+                        // Only attempt when mode != off AND a drafter path
+                        // was provided. Failures here are NON-FATAL: log
+                        // the reason and continue with PFlash disabled so
+                        // the operator gets a clear "model is up, but
+                        // compression isn't" signal rather than losing
+                        // the entire session.
+                        if let Some(ref pf_drafter_path) = pflash_drafter {
+                            if pflash_mode_str != "off" {
+                                let pf_cfg = engine::pflash::PflashConfig {
+                                    mode: engine::pflash::PflashMode::parse(&pflash_mode_str)
+                                        .unwrap_or(engine::pflash::PflashMode::Off),
+                                    threshold_tokens: pflash_threshold,
+                                    keep_ratio: pflash_keep_ratio,
+                                    alpha: pflash_alpha,
+                                    min_keep_tokens: pflash_min_keep,
+                                    sink_tokens: pflash_sink,
+                                    recent_tokens: pflash_recent,
+                                    block_size: pflash_block,
+                                    profile: pflash_profile,
+                                    drafter_path: Some(pf_drafter_path.clone()),
+                                };
+                                let mut pf_state = engine::pflash::PflashState::new(&pf_cfg);
+                                // Pull the target tokenizer out of the loaded model
+                                // for the compat check. Both Qwen3.5 and plain
+                                // Qwen3 paths expose `tokenizer` on LoadedModel.
+                                let tgt_tok_ref = m.tokenizer.as_ref();
+                                if let Some(tok) = tgt_tok_ref {
+                                    let pf_max_kv = max_seq.max(2048);
+                                    match engine::pflash::load_drafter(
+                                        &mut pf_state, &mut gpu,
+                                        std::path::Path::new(pf_drafter_path),
+                                        tok, pf_max_kv,
+                                    ) {
+                                        Ok(()) => {
+                                            let _ = writeln!(stdout,
+                                                r#"{{"type":"pflash","mode":"{}","drafter":"{}","tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
+                                                pflash_mode_str, pf_drafter_path,
+                                                pf_state.tokenizer_compat,
+                                                pflash_keep_ratio, pflash_threshold);
+                                            pflash_state = Some(pf_state);
+                                        }
+                                        Err(e) => {
+                                            let _ = writeln!(stdout,
+                                                r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
+                                                e.to_string().replace('"', "'"));
+                                        }
+                                    }
+                                } else {
+                                    let _ = writeln!(stdout,
+                                        r#"{{"type":"pflash_load_failed","reason":"target tokenizer unavailable"}}"#);
+                                }
+                            }
+                        }
+
                         model = Some(m);
                     }
                     Err(e) => {

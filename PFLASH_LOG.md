@@ -229,3 +229,35 @@ fraction of total wall time at this size. The kernel scales O(N) and
 the GPU win will grow at long context (where Phase 2.0 leaves CPU
 dequant + reduce as the residual cost). 17/17 module tests still
 green.
+
+### Phase 4.0: daemon load-time PFlash params (DONE)
+
+Daemon now parses PFlash knobs from the load message per PRD §3.2:
+
+  prefill_compression / prefill_threshold / prefill_keep_ratio /
+  prefill_alpha / prefill_min_keep / prefill_sink / prefill_recent /
+  prefill_block / prefill_drafter / prefill_profile
+
+After successful target load (Qwen3.5 hybrid OR plain Qwen3), if
+mode != off and a drafter path is supplied, the daemon calls
+`pflash::load_drafter` against the target's tokenizer for the compat
+check, stashes a `PflashState` for the lifetime of the load, and
+emits a status line:
+
+  {"type":"pflash","mode":"...","drafter":"...","tokenizer_compat":...,
+   "keep_ratio":...,"threshold":...}
+
+Drafter load failures are NON-FATAL: emit "pflash_load_failed" with a
+reason and continue with PFlash disabled rather than tearing down the
+target. Drafter VRAM is freed when the next load arrives or when the
+daemon exits (paired with `unload_model`).
+
+Smoke (qwen3-0.6b.hf4 self-pair, daemon stdio):
+  load → "loaded" {arch:qwen3, dim:1024, layers:28, ...}
+  pflash status → tokenizer_compat:true, keep_ratio:0.3, threshold:32768
+
+Phase 4.0 is load-only; the request handler still routes through the
+existing forward path. Phase 4.1 adds the `decide_bypass +
+maybe_compress_prompt` call inside the request handler so a
+compressed prompt actually reaches the target prefill. Phase 4.2
+enriches the streaming `done` object with compression metadata.
