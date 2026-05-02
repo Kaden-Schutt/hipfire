@@ -1,22 +1,28 @@
-//! Full-prefill NIAH baseline harness (PFlash Phase 0).
+//! NIAH harness with optional PFlash compression (PRD §6 Phase 5 gate).
 //!
 //! Loads a Qwen3.5-family target model (4B/9B/27B; dense or hybrid),
 //! ingests a NIAH fixture from `benchmarks/longctx/niah/niah_<N>k.jsonl`,
-//! runs `qwen35::forward_prefill_batch` to populate the KV cache, then
-//! decodes up to `max_gen` tokens via `qwen35::forward_scratch`. Reports
-//! TTFT broken into tokenize / prefill / first decode step / total.
-//! Records source prompt md5, binary md5, model md5, and token counts.
+//! optionally runs PFlash compression via a matched-tokenizer drafter
+//! (e.g. qwen3.5-0.8b → qwen3.5-27b), then prefills + decodes through
+//! the target. Reports TTFT broken into tokenize / compress / prefill /
+//! first decode / total, plus source/kept token counts when PFlash ran.
+//! Records source prompt md5, binary md5, model md5.
 //!
-//! PASS = the expected substring appears in the decoded answer.
+//! PASS = the expected substring appears in the decoded answer (so a
+//! PFlash-on PASS proves the needle survived the compression).
 //!
 //! Usage:
 //!   cargo run --release --features deltanet --example pflash_niah_bench -- \
-//!     <model.hfq> <fixture.jsonl> [--maxgen 64] [--q8kv|--asym3]
+//!     <model.hfq> <fixture.jsonl> [--maxgen N] [--q8kv|--asym3] \
+//!     [--pflash <drafter.hfq> [--keep-ratio K] [--block-size B] \
+//!      [--sink-tokens N] [--recent-tokens N]]
 //!
-//! Defaults: --maxgen 64, --asym3 (best for long-ctx K).
+//! Defaults: --maxgen 64, --asym3 (best for long-ctx K), no PFlash.
+//! When --pflash is given: keep-ratio 0.30, block-size 64, sink 16, recent 32.
 
 use engine::hfq::HfqFile;
 use engine::llama::{self, KvCache};
+use engine::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
 use engine::qwen35::{self, DeltaNetState};
 use std::fs;
 use std::path::Path;
@@ -107,25 +113,42 @@ fn wrap_chatml(tokenizer: &engine::tokenizer::Tokenizer, prompt: &str) -> Vec<u3
     out
 }
 
+fn parse_arg<T: std::str::FromStr>(args: &[String], flag: &str) -> Option<T> {
+    args.iter().position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse().ok())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> [--maxgen N] [--q8kv|--asym3]");
+        eprintln!("Usage: pflash_niah_bench <model.hfq> <fixture.jsonl> \
+                   [--maxgen N] [--q8kv|--asym3] [--pflash <drafter.hfq> \
+                   [--keep-ratio K] [--block-size B] [--sink-tokens N] [--recent-tokens N]]");
         std::process::exit(2);
     }
     let model_path = &args[1];
     let fixture_path = &args[2];
-    let max_gen: usize = args.iter().position(|a| a == "--maxgen")
-        .and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok())
-        .unwrap_or(64);
+    let max_gen: usize = parse_arg(&args, "--maxgen").unwrap_or(64);
     let use_q8 = args.iter().any(|a| a == "--q8kv");
     let kv_label = if use_q8 { "q8" } else { "asym3" };
+    let drafter_path: Option<String> = args.iter().position(|a| a == "--pflash")
+        .and_then(|i| args.get(i + 1)).cloned();
+    let keep_ratio: f32 = parse_arg(&args, "--keep-ratio").unwrap_or(0.30);
+    let block_size: usize = parse_arg(&args, "--block-size").unwrap_or(64);
+    let sink_tokens: usize = parse_arg(&args, "--sink-tokens").unwrap_or(16);
+    let recent_tokens: usize = parse_arg(&args, "--recent-tokens").unwrap_or(32);
 
-    eprintln!("=== PFlash NIAH baseline (full prefill) ===");
+    let mode_label = if drafter_path.is_some() { "PFlash compressed" } else { "full prefill" };
+    eprintln!("=== PFlash NIAH ({mode_label}) ===");
     eprintln!("model:   {model_path}");
     eprintln!("fixture: {fixture_path}");
     eprintln!("maxgen:  {max_gen}");
     eprintln!("kv mode: {kv_label}");
+    if let Some(d) = &drafter_path {
+        eprintln!("drafter: {d}");
+        eprintln!("pflash:  keep_ratio={keep_ratio} block={block_size} sink={sink_tokens} recent={recent_tokens}");
+    }
 
     // Binary md5 — required by PRD §6 / §5.3.3 report fields. Reads the
     // running executable from /proc/self/exe so reruns of the same binary
@@ -157,12 +180,89 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads);
 
     let t_tok = Instant::now();
-    let tokens = wrap_chatml(&tokenizer, &prompt_text);
+    let source_tokens = wrap_chatml(&tokenizer, &prompt_text);
     let tok_ms = t_tok.elapsed().as_millis();
-    eprintln!("tokenize:    {tok_ms} ms ({} tokens)", tokens.len());
+    eprintln!("tokenize:    {tok_ms} ms ({} tokens)", source_tokens.len());
+    let source_bytes: Vec<u8> = source_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let source_md5 = md5_hex(&source_bytes);
+    eprintln!("source tokens md5: {source_md5}");
+
+    // ── PFlash compression (optional) ────────────────────────────────────
+    // Drafter is loaded transiently after target weights, before target KV
+    // alloc, then unloaded so its VRAM goes back to the pool for the
+    // target's KV cache. This matches pflash_compress_demo's load order.
+    let mut compress_ms: u128 = 0;
+    let mut score_ms: u128 = 0;
+    let mut select_ms: u128 = 0;
+    let mut gather_ms: u128 = 0;
+    let tokens: Vec<u32> = if let Some(drafter_path_str) = &drafter_path {
+        let pflash_cfg = PflashConfig {
+            mode: PflashMode::Always,
+            keep_ratio,
+            block_size,
+            sink_tokens,
+            recent_tokens,
+            min_keep_tokens: 0,
+            drafter_path: Some(drafter_path_str.clone()),
+            ..Default::default()
+        };
+        let mut state = PflashState::new(&pflash_cfg);
+        let drafter_max_kv = source_tokens.len() + 64;
+        let t_load_drafter = Instant::now();
+        pflash::load_drafter(
+            &mut state, &mut gpu, Path::new(drafter_path_str), &tokenizer, drafter_max_kv,
+        ).expect("load_drafter");
+        eprintln!("drafter loaded: {:.1}s | tokenizer_compat={}",
+            t_load_drafter.elapsed().as_secs_f64(), state.tokenizer_compat);
+        if !state.tokenizer_compat {
+            eprintln!("FAIL: drafter tokenizer incompatible with target -- cannot compress safely");
+            state.unload_drafter(&mut gpu);
+            std::process::exit(2);
+        }
+
+        let t_compress = Instant::now();
+        let decision = pflash::maybe_compress_prompt(
+            &mut gpu, &mut state, &pflash_cfg, &source_tokens, RequestKind::Text, &[],
+        ).expect("maybe_compress_prompt");
+        compress_ms = t_compress.elapsed().as_millis();
+
+        let kept = match decision {
+            PflashDecision::Compressed(cp) => {
+                score_ms = cp.timings.score_ms as u128;
+                select_ms = cp.timings.select_ms as u128;
+                gather_ms = cp.timings.gather_ms as u128;
+                eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
+                eprintln!("compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",
+                    cp.source_tokens, cp.kept_tokens,
+                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+                eprintln!("source_md5:    {}", cp.source_md5);
+                eprintln!("compressed_md5:{}", cp.compressed_md5);
+                eprintln!("kept_spans:  {} ranges (first={:?} last={:?})",
+                    cp.kept_spans.len(), cp.kept_spans.first(), cp.kept_spans.last());
+                cp.token_ids
+            }
+            PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens: st, threshold } } => {
+                eprintln!("bypass(BelowThreshold): {st} tokens, threshold {threshold}");
+                eprintln!("(compression would keep entire prompt -- running full prefill)");
+                source_tokens.clone()
+            }
+            PflashDecision::Bypass { reason } => {
+                eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
+                state.unload_drafter(&mut gpu);
+                std::process::exit(2);
+            }
+        };
+
+        // Free drafter VRAM before allocating target KV.
+        state.unload_drafter(&mut gpu);
+        kept
+    } else {
+        source_tokens.clone()
+    };
+
     let tokens_bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
     let tokens_md5 = md5_hex(&tokens_bytes);
-    eprintln!("tokens md5:  {tokens_md5}");
+    eprintln!("prefill tokens md5: {tokens_md5} ({} tokens)", tokens.len());
 
     let kv_seq = (tokens.len() + max_gen + 256).next_power_of_two().max(2048);
     let mut kv = if use_q8 {
@@ -228,10 +328,13 @@ fn main() {
     let answer = tokenizer.decode(&generated);
     eprintln!("decode:      {decode_ms} ms ({decode_steps} forward_scratch calls, {decode_tok_s:.1} tok/s)");
 
-    let ttft_ms = tok_ms + prefill_ms + first_decode_ms;
+    let ttft_ms = tok_ms + compress_ms + prefill_ms + first_decode_ms;
     let total_ms = ttft_ms + decode_ms;
     eprintln!("--- TTFT ---");
     eprintln!("tokenize:    {tok_ms} ms");
+    if drafter_path.is_some() {
+        eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
+    }
     eprintln!("prefill:     {prefill_ms} ms");
     eprintln!("first dec:   {first_decode_ms} ms");
     eprintln!("ttft:        {ttft_ms} ms");
