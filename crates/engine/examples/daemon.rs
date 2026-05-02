@@ -98,6 +98,41 @@ struct CaskConfig {
 ///
 /// Returns the File handle; caller MUST keep it alive for the process
 /// lifetime (on Unix, dropping it closes the fd and releases the lock).
+/// GPU-side single-token attractor block for the AR generate path (#111).
+///
+/// MQ4 quant pressure makes structured-output special tokens (`<tool_call>`,
+/// `<think>`) into self-reinforcing attractors: the model emits the same
+/// special token hundreds of times in a row, never reaching the JSON body.
+/// The CPU-side `apply_ngram_block` is not in this path (its per-token D2H
+/// + H2D would tank decode tok/s) and the GPU sampler's repeat-penalty
+/// alone doesn't break a strong single-token loop fast enough.
+///
+/// This helper is the cheapest possible surgical fix: scan the recent
+/// `window` generated tokens (CPU-side u32 comparisons over ~20 tokens);
+/// if `tok_id` appears `threshold`+ times, write a single 4-byte `-INF`
+/// into the GPU logits buffer at offset `tok_id * 4`. No D2H, no kernel
+/// change, ~5 µs only on the rare turns that trip the attractor.
+///
+/// Threshold=3 in window=20 catches any pathological loop (the bug report
+/// shows 9-100+ in a row) without harming legitimate multi-tool turns —
+/// real per-call content runs ≥10 tokens of JSON between openers.
+fn gpu_block_attractor_token(
+    gpu: &rdna_compute::Gpu,
+    logits_buf: &hip_bridge::DeviceBuffer,
+    history: &[u32],
+    tok_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 { return; }
+    let start = history.len().saturating_sub(window);
+    let count = history[start..].iter().filter(|&&t| t == tok_id).count();
+    if count >= threshold {
+        let bytes: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
+        let _ = gpu.hip.memcpy_htod_offset(logits_buf, (tok_id as usize) * 4, &bytes);
+    }
+}
+
 fn acquire_daemon_lock() -> std::fs::File {
     use std::io::{Seek, Write};
 
@@ -1851,6 +1886,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    // Special-token attractor blocking (#111). Resolve the token IDs once;
+    // each is `Some` only when the tokenizer registers it as a single
+    // special token (Qwen3+ vocabs) — older vocabs return `None` and the
+    // block is silently skipped.
+    let tool_call_token = tokenizer.special_token_id("<tool_call>");
+    let think_open_token = tokenizer.special_token_id("<think>");
     let prefill_tokens = new_tokens.len();
     let t0 = Instant::now();
 
@@ -1936,6 +1977,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let bytes0: Vec<u8> = scope0.iter().flat_map(|t| t.to_ne_bytes()).collect();
         if !bytes0.is_empty() {
             gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes0).unwrap();
+        }
+        // #111 attractor block: empty `ngram_scope` on first sample (no
+        // generated tokens yet), so the count is always 0 and this is a
+        // no-op here. Still call it for symmetry with the loop body, in
+        // case a future change moves this block into a multi-step warmup.
+        if let Some(t) = tool_call_token {
+            gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+        }
+        if let Some(t) = think_open_token {
+            gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
         }
         let (tok0, rng0) = gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
@@ -2104,6 +2155,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     if !bytes.is_empty() {
                         gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
                     }
+                    if let Some(t) = tool_call_token {
+                        gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+                    }
+                    if let Some(t) = think_open_token {
+                        gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+                    }
                     let (tok, rng) = gpu.sample_top_p(
                         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
                         vocab_size, temp, top_p, rng_state, scope.len(), repeat_penalty,
@@ -2167,6 +2224,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             let bytes: Vec<u8> = scope.iter().flat_map(|t| t.to_ne_bytes()).collect();
             if !bytes.is_empty() {
                 gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &bytes).unwrap();
+            }
+            // #111 attractor block — see helper docstring. Counts in 20-token
+            // window; trips at 3+ occurrences. Cheap when not tripped, ~5 µs
+            // when tripped (single 4-byte H2D into the logits buffer).
+            if let Some(t) = tool_call_token {
+                gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
+            }
+            if let Some(t) = think_open_token {
+                gpu_block_attractor_token(gpu, &scratch.logits.buf, ngram_scope, t, 20, 3);
             }
             // GPU sample: reads scratch.logits (already on GPU), writes token+rng
             // to scratch.sample_buf. Blocks only on the 8-byte D2H readback.

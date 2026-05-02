@@ -2525,6 +2525,39 @@ pub fn apply_ngram_block(logits: &mut [f32], history: &[u32]) {
     }
 }
 
+/// Single-token attractor block for special tokens. Counts how many times
+/// `token_id` appears in the last `window` tokens of `history`; if it is
+/// at or above `threshold`, sets that token's logit to `-INF` so the
+/// next sample picks something else. Targets the specific failure mode
+/// in #111 where MQ4 quant pressure makes a structured-output token
+/// (e.g. `<tool_call>`) into a self-reinforcing attractor — the model
+/// emits the same special token hundreds of times in a row, never
+/// reaching the JSON body. The general n-gram block does not catch this
+/// pattern reliably because the surrounding tokens vary (newline, blank,
+/// repeats) so the n-gram suffix rarely matches an earlier window
+/// verbatim.
+///
+/// Why a count gate instead of a hard ban: legitimate multi-tool turns
+/// can emit 2 `<tool_call>` openers within a short stretch when the
+/// per-call content is short. Threshold=3 in window=20 lets normal
+/// multi-call flows through but breaks any actual single-token loop.
+pub fn apply_special_token_attractor_block(
+    logits: &mut [f32],
+    history: &[u32],
+    token_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if (token_id as usize) >= logits.len() || threshold == 0 || window == 0 {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let count = history[start..].iter().filter(|&&t| t == token_id).count();
+    if count >= threshold {
+        logits[token_id as usize] = f32::NEG_INFINITY;
+    }
+}
+
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {
     if temperature <= 0.0 {
         return argmax(logits);
@@ -2801,4 +2834,58 @@ fn simple_rand() -> f32 {
     s ^= s << 5;
     SAMPLER_STATE.store(s, Ordering::Relaxed);
     (s as f32) / (u32::MAX as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attractor_block_below_threshold() {
+        // 2 occurrences of token 7 in window=20, threshold=3 → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![1, 2, 7, 3, 4, 7, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 7, 20, 3);
+        assert!(logits[7].is_finite(), "below threshold should leave logit untouched");
+    }
+
+    #[test]
+    fn attractor_block_at_threshold() {
+        // 3 occurrences of token 5 in last 20 → block fires.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![5, 1, 5, 2, 5];
+        apply_special_token_attractor_block(&mut logits, &history, 5, 20, 3);
+        assert_eq!(logits[5], f32::NEG_INFINITY, "threshold met should -INF the logit");
+    }
+
+    #[test]
+    fn attractor_block_window_scoped() {
+        // 3 occurrences of token 9, but only 1 in the last 5 tokens (window=5,
+        // threshold=3) → no block.
+        let mut logits = vec![1.0f32; 16];
+        let history: Vec<u32> = vec![9, 9, 1, 2, 3, 4, 5, 9, 6];
+        apply_special_token_attractor_block(&mut logits, &history, 9, 5, 3);
+        assert!(logits[9].is_finite(), "older occurrences must not count");
+    }
+
+    #[test]
+    fn attractor_block_pure_repeat() {
+        // Worst case: model emits the same special token 5x in a row. Block
+        // must fire.
+        let mut logits = vec![0.5f32; 16];
+        let history: Vec<u32> = vec![11, 11, 11, 11, 11];
+        apply_special_token_attractor_block(&mut logits, &history, 11, 20, 3);
+        assert_eq!(logits[11], f32::NEG_INFINITY);
+        // Other logits untouched.
+        assert!((logits[10] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn attractor_block_oob_token_is_noop() {
+        let mut logits = vec![1.0f32; 4];
+        let history: Vec<u32> = vec![999, 999, 999];
+        // token_id past vocab size — should not panic, leave logits untouched.
+        apply_special_token_attractor_block(&mut logits, &history, 999, 20, 3);
+        for &v in &logits { assert!(v.is_finite()); }
+    }
 }

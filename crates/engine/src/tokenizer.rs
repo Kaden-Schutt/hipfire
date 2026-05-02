@@ -308,6 +308,15 @@ impl Tokenizer {
         id == self.eos_id || self.eot_id == Some(id)
     }
 
+    /// Look up a special token's ID by literal content. Returns `None`
+    /// when the token is not registered as a special token in this
+    /// tokenizer (e.g. an older Qwen vocab without `<tool_call>`).
+    pub fn special_token_id(&self, content: &str) -> Option<u32> {
+        self.special_tokens.iter()
+            .find(|(s, _)| s == content)
+            .map(|(_, id)| *id)
+    }
+
     /// Decode a sequence of token IDs to text.
     /// Handles both GPT-2 BPE (Ġ=space, Ċ=newline) and SentencePiece (▁=space).
     /// For GPT-2 BPE: collects all bytes first, then does UTF-8 conversion once
