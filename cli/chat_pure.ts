@@ -111,10 +111,56 @@ export function renderMarkdown(text: string, fenceWidth: number = 60): string {
     const label = lang ? `\x1b[2m[${lang}]\x1b[0m` : "\x1b[2m[code]\x1b[0m";
     return `\n${border}\n${label}\n${code}\n${border}`;
   });
+  // Headings: # / ## / ### at start of line. Bold + bright cyan for #, bold
+  // for ##, dim-bold for ###. Whole line gets the styling so wrap looks ok.
+  text = text.replace(/^### +(.+)$/gm, (_m: string, inner: string) => `\x1b[1;2m${inner}\x1b[0m`);
+  text = text.replace(/^## +(.+)$/gm, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
+  text = text.replace(/^# +(.+)$/gm, (_m: string, inner: string) => `\x1b[1;36m${inner}\x1b[0m`);
   text = text.replace(/`([^`]+)`/g, (_m: string, code: string) => `\x1b[7m${code}\x1b[0m`);
   text = text.replace(/\*\*([^*]+)\*\*/g, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
   text = text.replace(/(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g, (_m: string, inner: string) => `\x1b[3m${inner}\x1b[0m`);
   return text;
+}
+
+// ─── Streaming-friendly code-fence detection ────────────────────────────────
+//
+// Detects the open/close lines of a fenced code block (` ```python `, ` ``` `)
+// during line-by-line streaming. The full `renderMarkdown` regex needs the
+// whole fence in one pass, which doesn't work when each committed line is
+// rendered independently. This helper lets the streaming path style fence
+// boundaries per-line without buffering the whole code block.
+
+export interface FenceLineInfo {
+  isFenceOpen: boolean;   // line is the opening ```lang
+  isFenceClose: boolean;  // line is the closing ```
+  lang: string;           // language tag from the open fence (empty if none)
+}
+
+export function detectFenceLine(line: string, currentlyInFence: boolean): FenceLineInfo {
+  const trimmed = line.trimStart();
+  if (!trimmed.startsWith("```")) {
+    return { isFenceOpen: false, isFenceClose: false, lang: "" };
+  }
+  if (currentlyInFence) {
+    // Inside a fence, ``` always closes (we don't try to handle ` ```lang `
+    // mid-fence as a nested open — markdown doesn't support nesting either)
+    return { isFenceOpen: false, isFenceClose: true, lang: "" };
+  }
+  // Outside a fence: ` ```python ` opens, language is whatever follows the ticks
+  const lang = trimmed.slice(3).trim().split(/\s+/)[0] ?? "";
+  return { isFenceOpen: true, isFenceClose: false, lang };
+}
+
+// Render a fence-open line as a dim rule + language label.
+export function renderFenceOpen(lang: string, fenceWidth: number = 60): string {
+  const border = "\x1b[2m" + "─".repeat(Math.max(1, fenceWidth)) + "\x1b[0m";
+  const label = lang ? `\x1b[2m[${lang}]\x1b[0m` : "\x1b[2m[code]\x1b[0m";
+  return `${border}\n${label}`;
+}
+
+// Render a fence-close line as a dim rule.
+export function renderFenceClose(fenceWidth: number = 60): string {
+  return "\x1b[2m" + "─".repeat(Math.max(1, fenceWidth)) + "\x1b[0m";
 }
 
 // ─── Bracketed paste state machine ──────────────────────────────────────────

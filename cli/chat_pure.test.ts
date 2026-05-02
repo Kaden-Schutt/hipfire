@@ -15,6 +15,9 @@ import {
   trimTokenWindow,
   trimMessages,
   renderMarkdown,
+  detectFenceLine,
+  renderFenceOpen,
+  renderFenceClose,
   feedPasteParser,
   historyUp,
   historyDown,
@@ -315,6 +318,106 @@ describe("renderMarkdown", () => {
   test("multiple inline codes on one line", () => {
     const out = renderMarkdown("`a` and `b`");
     expect(out).toBe("\x1b[7ma\x1b[0m and \x1b[7mb\x1b[0m");
+  });
+
+  test("# heading is bold + cyan", () => {
+    expect(renderMarkdown("# Top")).toBe("\x1b[1;36mTop\x1b[0m");
+  });
+
+  test("## heading is bold", () => {
+    expect(renderMarkdown("## Section")).toBe("\x1b[1mSection\x1b[0m");
+  });
+
+  test("### heading is dim-bold", () => {
+    expect(renderMarkdown("### Sub")).toBe("\x1b[1;2mSub\x1b[0m");
+  });
+
+  test("heading regex anchored to start of line — '#' mid-text untouched", () => {
+    expect(renderMarkdown("not a # heading")).toBe("not a # heading");
+  });
+
+  test("heading without space after # is not transformed", () => {
+    // `#tag` is a hashtag, not a heading.
+    expect(renderMarkdown("#nothashtag")).toBe("#nothashtag");
+  });
+
+  test("heading with inline code styles both", () => {
+    const out = renderMarkdown("## Use `foo()` here");
+    // The ## regex captures the full line content; inline code regex then
+    // applies inside the bold-wrapped span.
+    expect(out).toContain("\x1b[7mfoo()\x1b[0m");
+    expect(out).toContain("\x1b[1m");
+  });
+});
+
+// ─── detectFenceLine + renderFence{Open,Close} ──────────────────────────────
+
+describe("detectFenceLine", () => {
+  test("plain text outside fence is not detected", () => {
+    const r = detectFenceLine("hello world", false);
+    expect(r.isFenceOpen).toBe(false);
+    expect(r.isFenceClose).toBe(false);
+  });
+
+  test("```python opens a fence with language", () => {
+    const r = detectFenceLine("```python", false);
+    expect(r.isFenceOpen).toBe(true);
+    expect(r.isFenceClose).toBe(false);
+    expect(r.lang).toBe("python");
+  });
+
+  test("``` (no lang) opens with empty lang", () => {
+    const r = detectFenceLine("```", false);
+    expect(r.isFenceOpen).toBe(true);
+    expect(r.lang).toBe("");
+  });
+
+  test("``` while inside fence closes it", () => {
+    const r = detectFenceLine("```", true);
+    expect(r.isFenceClose).toBe(true);
+    expect(r.isFenceOpen).toBe(false);
+  });
+
+  test("```rust while inside fence still treated as close (no nesting)", () => {
+    const r = detectFenceLine("```rust", true);
+    expect(r.isFenceClose).toBe(true);
+    expect(r.isFenceOpen).toBe(false);
+  });
+
+  test("indented ``` opens a fence (LLMs sometimes indent)", () => {
+    const r = detectFenceLine("    ```typescript", false);
+    expect(r.isFenceOpen).toBe(true);
+    expect(r.lang).toBe("typescript");
+  });
+
+  test("body line that starts with backtick but not ``` is not a fence", () => {
+    const r = detectFenceLine("`single backtick line", false);
+    expect(r.isFenceOpen).toBe(false);
+    expect(r.isFenceClose).toBe(false);
+  });
+});
+
+describe("renderFenceOpen / renderFenceClose", () => {
+  test("renderFenceOpen with language emits border + label", () => {
+    const out = renderFenceOpen("python", 10);
+    expect(out).toContain("[python]");
+    expect(out).toContain("─".repeat(10));
+  });
+
+  test("renderFenceOpen without language uses [code]", () => {
+    const out = renderFenceOpen("", 10);
+    expect(out).toContain("[code]");
+  });
+
+  test("renderFenceClose emits just the dim border", () => {
+    const out = renderFenceClose(10);
+    expect(out).toContain("─".repeat(10));
+    expect(out).toContain("\x1b[2m");
+  });
+
+  test("fenceWidth controls border length", () => {
+    expect(renderFenceOpen("py", 5)).toContain("─".repeat(5));
+    expect(renderFenceOpen("py", 5)).not.toContain("─".repeat(6));
   });
 });
 

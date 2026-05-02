@@ -4,6 +4,7 @@ import {
   graphemes, sanitizePaste, estimateTokens,
   computeTokPerSec, trimTokenWindow,
   trimMessages, renderMarkdown,
+  detectFenceLine, renderFenceOpen, renderFenceClose,
   feedPasteParser, type PasteParserState,
   historyUp, historyDown, historySubmit, type HistoryState,
   type ChatMessage,
@@ -438,6 +439,11 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     let incompleteLineWritten = 0;  // chars of incompleteLine already on screen
     let fullResponse = "";
     let firstChunk = true;
+    // Tracks whether we're inside a ```fence```. Streaming line-by-line, the
+    // full-block fence regex in renderMarkdown can never match — we detect
+    // the open/close lines explicitly and style them per-line.
+    let inFence = false;
+    const fenceWidth = Math.min(60, stdout.columns ?? 60);
 
     // ASCII spinner — works on every terminal, including older xterm and the
     // plain Linux console (braille pattern chars don't render there).
@@ -510,31 +516,50 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
             const cols = stdout.columns ?? 80;
             for (let i = 0; i < parts.length - 1; i++) {
               const p = parts[i]!;
-              if (i === 0) {
-                // First commit: the raw tail is already on screen. Decide
-                // whether to re-emit with markdown styling.
-                //
-                // Re-emitting via `\r\x1b[K` only clears the CURRENT visual
-                // row — if the raw tail soft-wrapped onto multiple terminal
-                // rows, the rows above stay, and the re-emitted line then
-                // wraps again, producing visible duplication. So we only
-                // re-emit when the line fits on a single visual row.
+              const fence = detectFenceLine(p, inFence);
+
+              // Decide what string to write for this committed line.
+              // - Fence open: dim rule + [lang] label
+              // - Fence close: dim rule
+              // - Inside fence: raw text (no markdown rendering applied)
+              // - Outside fence: markdown-rendered, with the wrap-aware
+              //   re-emit guard (don't \r\x1b[K a soft-wrapped line)
+              let toEmit: string;
+              let needsClearTail: boolean;
+              if (fence.isFenceOpen) {
+                toEmit = renderFenceOpen(fence.lang, fenceWidth);
+                needsClearTail = true;
+                inFence = true;
+              } else if (fence.isFenceClose) {
+                toEmit = renderFenceClose(fenceWidth);
+                needsClearTail = true;
+                inFence = false;
+              } else if (inFence) {
+                // Inside a code block: don't apply markdown to body lines.
+                toEmit = p;
+                needsClearTail = false;
+              } else {
                 const rendered = md(p);
                 const wrapped = p.length >= cols;
-                if (rendered === p) {
-                  // No markdown transform happened — just terminate the line.
-                  w("\n");
-                } else if (wrapped) {
-                  // Markdown changed the line, but it's wrapped. Skip the
-                  // re-emit to avoid the duplication bug; user sees raw
-                  // delimiters. Acceptable for Phase 1.
-                  w("\n");
+                if (rendered === p || wrapped) {
+                  toEmit = p;
+                  needsClearTail = false;
                 } else {
-                  // Single visual row, has markdown — safe to re-emit styled.
-                  w("\r\x1b[K" + rendered + "\n");
+                  toEmit = rendered;
+                  needsClearTail = true;
                 }
+              }
+
+              if (i === 0 && needsClearTail) {
+                // First commit and we need to redraw — clear the raw tail
+                // first. Safe only when the toEmit fits on one visual row,
+                // which we've already gated on above.
+                w("\r\x1b[K" + toEmit + "\n");
+              } else if (i === 0) {
+                // Tail is already on screen as raw text; just terminate it.
+                w("\n");
               } else {
-                w(md(p) + "\n");
+                w(toEmit + "\n");
               }
               state.committedLines.push(p);
             }
@@ -567,16 +592,40 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
 
     if (spinInterval) { clearInterval(spinInterval); spinInterval = null; }
 
-    // Flush the trailing incomplete line. Same wrap-aware re-emit logic as
-    // the per-chunk commit path: only re-emit styled if the line fits on a
-    // single visual row, otherwise just terminate.
+    // Flush the trailing incomplete line. Apply the same fence-aware
+    // commit logic as the per-chunk path: detect fence open/close, skip
+    // markdown inside fences, wrap-aware re-emit otherwise.
     if (incompleteLine && !firstChunk) {
-      const rendered = md(incompleteLine);
       const cols = stdout.columns ?? 80;
-      if (rendered === incompleteLine || incompleteLine.length >= cols) {
-        w("\n");
+      const fence = detectFenceLine(incompleteLine, inFence);
+      let toEmit: string;
+      let needsClearTail: boolean;
+      if (fence.isFenceOpen) {
+        toEmit = renderFenceOpen(fence.lang, fenceWidth);
+        needsClearTail = true;
+        inFence = true;
+      } else if (fence.isFenceClose) {
+        toEmit = renderFenceClose(fenceWidth);
+        needsClearTail = true;
+        inFence = false;
+      } else if (inFence) {
+        toEmit = incompleteLine;
+        needsClearTail = false;
       } else {
-        w("\r\x1b[K" + rendered + "\n");
+        const rendered = md(incompleteLine);
+        const wrapped = incompleteLine.length >= cols;
+        if (rendered === incompleteLine || wrapped) {
+          toEmit = incompleteLine;
+          needsClearTail = false;
+        } else {
+          toEmit = rendered;
+          needsClearTail = true;
+        }
+      }
+      if (needsClearTail) {
+        w("\r\x1b[K" + toEmit + "\n");
+      } else {
+        w("\n");
       }
       state.committedLines.push(incompleteLine);
     }
