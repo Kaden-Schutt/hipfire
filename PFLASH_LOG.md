@@ -296,3 +296,37 @@ End-to-end smoke (qwen3-0.6b self-pair, 565-token prompt with needle):
 Phase 4 is feature-complete for plumbing. Phase 4.2 / 5 next: streaming
 `done` enrichment with compression metadata, end-to-end NIAH bench
 through the daemon, and validation gate runs.
+
+### Phase 4.2: done object enrichment (DONE)
+
+`done` event now embeds a `pflash` field per PRD §3.1's "compression
+metadata in done objects" requirement. The field is present only when
+compression actually fired (Compressed branch); bypassed / off requests
+emit the original `done` shape so existing clients aren't broken:
+
+  done {... ,
+    "pflash":{
+      "source_tokens": ...,
+      "kept_tokens": ...,
+      "keep_ratio": ...,
+      "score_ms": ...,
+      "total_ms": ...,
+      "source_md5": ...,
+      "compressed_md5": ...,
+    }
+  }
+
+Stashed `pflash_summary: Option<CompressedPrompt>` after the compress
+decision; helper closure renders the JSON fragment and both `done`
+emit sites in `generate()` (Qwen3.5 + plain Qwen3) interpolate it.
+
+Smoke (qwen3-0.6b self-pair, 271-token prompt, threshold=1):
+  done {"tokens":8, "prefill_tokens":91, "prefill_ms":297.8, ...,
+        "pflash":{"source_tokens":271,"kept_tokens":83,"keep_ratio":0.306,
+                  "score_ms":31, "total_ms":31, "source_md5":"19baf8...",
+                  "compressed_md5":"b31c1a..."}}
+
+Phase 5 next: run the full coherence-gate to verify PFlash off-by-default
+keeps Qwen3.5 byte-identical to master, plus end-to-end NIAH bench at
+larger contexts (blocked on matched-tokenizer Qwen3.5 drafter; see
+MANUAL_REVIEW.md).

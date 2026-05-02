@@ -2124,6 +2124,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         None => engine::pflash::RequestKind::Text,
     };
 
+    // Stashed CompressedPrompt summary (when compression actually fired);
+    // appended to the `done` event later so a streaming client gets one
+    // consolidated line. None means no compression happened on this request.
+    let mut pflash_summary: Option<engine::pflash::CompressedPrompt> = None;
+    // Helper closure: render the JSON field fragment to inject into `done`.
+    // Empty string when no compression fired so backwards-compatible clients
+    // see the original done shape; populated otherwise per PRD §3.1's
+    // "compression metadata in done objects" requirement.
+    fn pflash_done_fragment(s: &Option<engine::pflash::CompressedPrompt>) -> String {
+        match s {
+            Some(cp) => format!(
+                r#","pflash":{{"source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"score_ms":{},"total_ms":{},"source_md5":"{}","compressed_md5":"{}"}}"#,
+                cp.source_tokens, cp.kept_tokens,
+                cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                cp.timings.score_ms, cp.timings.total_ms,
+                cp.source_md5, cp.compressed_md5,
+            ),
+            None => String::new(),
+        }
+    }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
             let decision = engine::pflash::maybe_compress_prompt(
@@ -2141,7 +2161,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         cp.timings.gather_ms, cp.timings.total_ms,
                     );
                     let _ = stdout.flush();
-                    cp.token_ids
+                    let token_ids = cp.token_ids.clone();
+                    pflash_summary = Some(cp);
+                    token_ids
                 }
                 Ok(engine::pflash::PflashDecision::Bypass { reason }) => {
                     // Only emit bypass events for non-trivial reasons.
@@ -2632,13 +2654,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
             id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+            pflash_done_fragment(&pflash_summary),
         );
         let _ = stdout.flush();
     } else {
-        // Qwen3 / LLaMA path — multi-turn aware
+        // Qwen3 / LLaMA path -- multi-turn aware
         let config = m.llama_config.as_ref().unwrap();
         let weights = m.llama_weights.as_ref().unwrap();
         let scratch = m.llama_scratch.as_ref().unwrap();
@@ -2725,9 +2748,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
             id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+            pflash_done_fragment(&pflash_summary),
         );
         let _ = stdout.flush();
     }
