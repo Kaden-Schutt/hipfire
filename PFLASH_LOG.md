@@ -614,3 +614,49 @@ trusted; under 5% is methodology-clean.
 All claimed PFlash perf numbers on 27B now have 3-fresh-process median
 + spread methodology behind them. Spreads under 1% on the 16K rows
 confirm the win is reproducible, not a one-shot artifact.
+
+### Long-code + long-prose Phase 5 fixtures (c96a2be)
+
+PRD §6 Phase 5 also mandates "Long code retrieval prompt" and "Long
+prose / multi-doc prompt" both committed under `benchmarks/prompts/`
+with md5 recorded. Generators live alongside the NIAH generator at
+`benchmarks/longctx/niah/generate_longcode.py` and
+`generate_longprose.py`; both produce byte-identical fixtures across
+re-runs (seeded RNG / deterministic source-file truncation).
+
+| fixture                                    | tokens | mode      | total ms | needle | verdict |
+|--------------------------------------------|--------|-----------|----------|--------|---------|
+| longcode_pflash.jsonl (md5 568e7669ba3c)   | 13031  | baseline  |  33251   | NOT recovered | FAIL |
+| longcode_pflash.jsonl                      | 13031  | PFlash 30%|  12422   | recovered     | PASS |
+| longprose_multidoc.jsonl (md5 c54f0bd3fd94)|  8145  | baseline  |  18453   | recovered     | PASS |
+| longprose_multidoc.jsonl                   |  8145  | PFlash 30%|   6230   | recovered     | PASS |
+
+Long-code: real production source (first 45K chars of pflash.rs)
+truncated to stay below the 16K drafter NaN boundary. The needle is
+the value of `TOKENIZER_COMPAT_PROBE` (`"0xCAFEf00d"`), embedded ~16%
+into the file. 27B baseline FAILS to retrieve it at 13K tokens;
+PFlash 30% PASSes at -63% wall clock. Same retrieval-improvement
+pattern observed on NIAH 16K.
+
+Long-prose: three deterministic narrative documents (monastery rule
+book, trade ledger, starship manual), 4200 tokens each, with a unique
+fact at depth 0.5 of the monastery doc. Question targets only the
+monastery fact; the other two docs are distractors. Both baseline
+and PFlash PASS; PFlash is 3× faster (-66% wall clock). The value
+is proving compression preserves document boundaries (the 14 kept
+spans cover sink + recent + the relevant monastery middle blocks).
+
+Phase 5 release-readiness checklist (excluding 32K+ work blocked on
+ScoringDegenerate):
+  [x] NIAH single-needle 8K, 16K (3-fresh-process)
+  [x] Multi-needle 16K
+  [x] Long code retrieval prompt
+  [x] Long prose / multi-doc prompt
+  [x] 3 fresh-process TTFT methodology
+  [x] Human eyeball (visible in commit messages and per-needle dumps)
+  [-] NIAH 32K, 64K, 128K -- blocked on drafter NaN at ~16K source
+  [-] Multi-needle 64K -- blocked, same reason
+
+The unblocked items all PASS on the production target (qwen3.5-27b.mq3)
+with the matched-tokenizer 0.8B drafter. The 32K+ block is a drafter
+forward issue, not a PFlash plumbing issue, and is escalated.
