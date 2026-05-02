@@ -49,6 +49,16 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
 
   const modelTag = resolveModelTag(tag);
 
+  // Chat-shaped floor for max_tokens. The global default (cli/index.ts:148) is
+  // 512, tuned for one-shot `hipfire run` invocations; in chat that truncates
+  // mid-sentence with no user-visible warning. Floor only — a deliberate
+  // higher value from `hipfire config set max_tokens` or mid-session
+  // `/set max_tokens N` still wins.
+  const CHAT_MIN_MAX_TOKENS = 8192;
+  if (cfg.max_tokens < CHAT_MIN_MAX_TOKENS) {
+    cfg.max_tokens = CHAT_MIN_MAX_TOKENS;
+  }
+
   const state: ChatState = {
     messages: [],
     inputBuf: "",
