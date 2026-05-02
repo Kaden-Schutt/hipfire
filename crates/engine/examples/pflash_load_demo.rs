@@ -84,7 +84,7 @@ fn main() {
 
     // Demonstrate the gating result that the daemon will see.
     use engine::pflash::{decide_bypass, PflashMode, RequestKind};
-    let demo_cfg = PflashConfig { mode: PflashMode::Always, ..cfg };
+    let demo_cfg = PflashConfig { mode: PflashMode::Always, ..cfg.clone() };
     let probe_tokens = vec![1u32; 100];
     let bypass = decide_bypass(&state, &demo_cfg, &probe_tokens, RequestKind::Text);
     eprintln!("decide_bypass (Always, 100 tok, Text): {bypass:?}");
@@ -104,45 +104,57 @@ fn main() {
     // caught that hiding scoring errors behind tokenizer-pass would let
     // regressions ship undetected.
     let scoring_ok = if compat {
+        // 32-token toy prompt. Build a PflashConfig with Always mode +
+        // small block/sink/recent so the budget actually compresses on
+        // such a tiny prompt. Drive maybe_compress_prompt end-to-end.
         let toy_prompt: Vec<u32> = (0..32u32).map(|i| 100 + i).collect();
-        let block_size = 8usize;
-        match engine::pflash::compute_scores_cpu(
-            &mut state, &mut gpu, &toy_prompt, block_size,
+        let demo_cfg2 = PflashConfig {
+            mode: PflashMode::Always,
+            keep_ratio: 0.5,
+            sink_tokens: 4,
+            recent_tokens: 4,
+            block_size: 8,
+            min_keep_tokens: 0,
+            ..cfg.clone()
+        };
+        match engine::pflash::maybe_compress_prompt(
+            &mut gpu, &mut state, &demo_cfg2, &toy_prompt, RequestKind::Text, &[],
         ) {
-            Ok(bs) => {
-                eprintln!("compute_scores_cpu: {} blocks of {} tokens, scores {:?}",
-                    bs.n_blocks, bs.block_size, bs.scores);
-                let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
-                let any_finite = bs.scores.iter().all(|s| s.is_finite());
-                eprintln!("scores any_nonzero={any_nonzero}, all_finite={any_finite}");
+            Ok(engine::pflash::PflashDecision::Compressed(cp)) => {
+                eprintln!("maybe_compress_prompt: source={} kept={} ratio={:.3}",
+                    cp.source_tokens, cp.kept_tokens,
+                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+                eprintln!("source_md5    = {}", cp.source_md5);
+                eprintln!("compressed_md5= {}", cp.compressed_md5);
+                eprintln!("kept_spans    = {:?}", cp.kept_spans);
+                eprintln!("timings: score={}ms select={}ms gather={}ms total={}ms",
+                    cp.timings.score_ms, cp.timings.select_ms,
+                    cp.timings.gather_ms, cp.timings.total_ms);
 
-                // Phase 1.3: drive scores → select_spans → emit_compressed.
-                // Targets: keep_ratio=0.5, sink=4, recent=4 → at least 16
-                // tokens survive on a 32-token toy prompt. Verify span list
-                // is non-empty, in-order, and the emitted token slice is
-                // length-consistent with the spans.
-                let spans = engine::pflash::select_spans(&bs, 4, 4, 0.5, 0, &[]);
-                let compressed = engine::pflash::emit_compressed(&toy_prompt, &spans);
-                let span_total: usize = spans.iter().map(|(s, e)| e - s).sum();
-                eprintln!("select_spans: {} spans = {:?}", spans.len(), spans);
-                eprintln!("emit_compressed: {} tokens (vs source {})", compressed.len(), toy_prompt.len());
-                let span_in_order = spans.windows(2).all(|w| w[0].1 <= w[1].0);
-                let length_ok = compressed.len() == span_total && compressed.len() <= toy_prompt.len();
-                let monotone_tokens = spans.iter()
+                let span_total: usize = cp.kept_spans.iter().map(|(s, e)| e - s).sum();
+                let length_ok = cp.kept_tokens == span_total
+                    && cp.kept_tokens == cp.token_ids.len()
+                    && cp.kept_tokens < cp.source_tokens;
+                let spans_disjoint = cp.kept_spans.windows(2).all(|w| w[0].1 < w[1].0);
+                let monotone_tokens = cp.kept_spans.iter()
                     .flat_map(|&(s, e)| (s..e).map(|i| toy_prompt[i]))
-                    .eq(compressed.iter().copied());
-                eprintln!("spans_in_order={span_in_order} length_ok={length_ok} monotone_tokens={monotone_tokens}");
-
-                any_nonzero && any_finite && span_in_order && length_ok && monotone_tokens
-                    && !spans.is_empty() && !compressed.is_empty()
+                    .eq(cp.token_ids.iter().copied());
+                let md5_present = !cp.source_md5.is_empty() && !cp.compressed_md5.is_empty();
+                eprintln!("length_ok={length_ok} spans_disjoint={spans_disjoint} \
+                           monotone={monotone_tokens} md5_present={md5_present}");
+                length_ok && spans_disjoint && monotone_tokens && md5_present
+            }
+            Ok(engine::pflash::PflashDecision::Bypass { reason }) => {
+                eprintln!("maybe_compress_prompt unexpectedly bypassed: {reason:?}");
+                false
             }
             Err(e) => {
-                eprintln!("compute_scores_cpu failed: {e:?}");
+                eprintln!("maybe_compress_prompt failed: {e:?}");
                 false
             }
         }
     } else {
-        // Skipped — not a regression, scoring requires matched tokenizers.
+        // Skipped: not a regression, scoring requires matched tokenizers.
         true
     };
 

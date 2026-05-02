@@ -95,7 +95,32 @@ Smoke `pflash_load_demo qwen3-0.6b.hf4 qwen3-0.6b.hf4` extended:
     [(0, 4), (16, 24), (28, 32)] = 16 tokens = exactly 0.5 ratio
   emit_compressed: 16 tokens, monotonic, length-consistent.
 
-Phase 1.4 next: full pflash entry — compute_scores → select_spans →
+Phase 1.4 next: full pflash entry, compute_scores → select_spans →
 emit_compressed, returning a CompressedPrompt. Then end-to-end
 verification: source → compress → re-prefill on target → check the
 compressed prompt produces a coherent next-token continuation.
+
+### Phase 1.4: maybe_compress_prompt full pipeline (DONE)
+
+Wired compute_scores_cpu → select_spans → emit_compressed inside
+maybe_compress_prompt. Returns PflashDecision::Compressed(CompressedPrompt)
+with source_tokens, kept_tokens, kept_spans, source_md5, compressed_md5,
+and PflashTimings (score / select / gather / total ms). Falls back to
+Bypass(BelowThreshold) when budget would keep the entire prompt (no
+point recompressing the same tokens through the target).
+
+Smoke (qwen3-0.6b self-pair, 32-tok toy, sink=4 recent=4 keep=0.5):
+  source=32 kept=20 ratio=0.625
+  source_md5 42b2f9af7e3b6b0e94a58ca91cf7780a
+  compressed_md5 c4400d6802977a0bf1bed2f2a8b120e9
+  kept_spans = [(0, 4), (16, 32)]
+  timings: score=96ms select=0ms gather=0ms total=96ms
+  invariants: length_ok=true spans_disjoint=true monotone=true md5_present=true
+
+Phase 1.5 next: end-to-end retrieval verification. Encode a small
+filler+needle+question prompt with qwen3-0.6b's tokenizer, run
+maybe_compress_prompt, then prefill the COMPRESSED stream through the
+SAME qwen3-0.6b as a target stand-in and decode greedily. PASS if the
+needle text appears in the answer despite compression. Real Qwen3.5
+target retrieval blocks on the matched-tokenizer drafter availability
+(MANUAL_REVIEW.md).

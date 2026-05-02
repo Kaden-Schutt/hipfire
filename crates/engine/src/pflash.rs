@@ -683,29 +683,110 @@ pub fn decide_bypass(
     None
 }
 
+/// Stable hex md5 of a slice of u32 token ids (LE bytes). Used for the
+/// `source_md5` and `compressed_md5` fields in `CompressedPrompt` per PRD
+/// §5.3.3 reproducibility contract.
+fn token_md5(tokens: &[u32]) -> String {
+    use std::process::Command;
+    let bytes: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let mut child = match Command::new("md5sum")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return String::new(), // Best-effort: empty hash if md5sum missing.
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(&bytes);
+    }
+    match child.wait_with_output() {
+        Ok(out) => {
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.split_whitespace().next().unwrap_or("").to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
 /// Top-level compression entry point. Decides bypass vs compress and
 /// dispatches accordingly.
 ///
-/// Phase 1.0: only the bypass paths are wired. When `decide_bypass` returns
-/// `None` (mode==Always or Auto-over-threshold + drafter loaded), we fall
-/// through to a placeholder that returns `UnsupportedDrafter` so callers
-/// log honestly. Drafter scoring lands in Phase 1.1+.
+/// Compress path:
+///   1. score blocks via `compute_scores_cpu` (drafter K-capture)
+///   2. `select_spans` with cfg's sink/recent/ratio/min_keep + caller
+///      `must_keep_spans` (chat boundaries / role markers / tool defs)
+///   3. `emit_compressed` to materialize the kept token stream
+///   4. populate `CompressedPrompt` with md5s + per-stage timings
+///
+/// Returns `Bypass(reason)` whenever the gating logic in `decide_bypass`
+/// short-circuits, AND when scoring/selection cannot meaningfully
+/// compress (e.g., budget would keep the whole prompt). Caller hands the
+/// `Compressed` variant's `token_ids` to the target prefill path.
 pub fn maybe_compress_prompt(
-    _gpu: &mut rdna_compute::Gpu,
+    gpu: &mut rdna_compute::Gpu,
     state: &mut PflashState,
     cfg: &PflashConfig,
     token_ids: &[u32],
     request_kind: RequestKind,
+    must_keep_spans: &[(usize, usize)],
 ) -> HipResult<PflashDecision> {
     if let Some(reason) = decide_bypass(state, cfg, token_ids, request_kind) {
         return Ok(PflashDecision::Bypass { reason });
     }
-    // Phase 1.0: scoring not yet implemented.
-    Ok(PflashDecision::Bypass {
-        reason: BypassReason::UnsupportedDrafter {
-            reason: "drafter scoring not yet implemented (Phase 1.1+)".to_string(),
+    let n = token_ids.len();
+    let t_total = std::time::Instant::now();
+
+    // 1. Score blocks.
+    let t_score = std::time::Instant::now();
+    let bs = compute_scores_cpu(state, gpu, token_ids, cfg.block_size)?;
+    let score_ms = t_score.elapsed().as_millis();
+
+    // 2. Select spans.
+    let t_select = std::time::Instant::now();
+    let kept_spans = select_spans(
+        &bs, cfg.sink_tokens, cfg.recent_tokens, cfg.keep_ratio,
+        cfg.min_keep_tokens, must_keep_spans,
+    );
+    let select_ms = t_select.elapsed().as_millis();
+
+    // 3. Gather.
+    let t_gather = std::time::Instant::now();
+    let compressed: Vec<u32> = emit_compressed(token_ids, &kept_spans);
+    let gather_ms = t_gather.elapsed().as_millis();
+
+    let total_ms = t_total.elapsed().as_millis();
+
+    // If budget kept (effectively) the whole prompt, bypass downstream so
+    // the daemon doesn't double-prefill the same tokens.
+    if compressed.len() >= n {
+        return Ok(PflashDecision::Bypass {
+            reason: BypassReason::BelowThreshold {
+                source_tokens: n,
+                threshold: cfg.threshold_tokens,
+            },
+        });
+    }
+
+    let source_md5 = token_md5(token_ids);
+    let compressed_md5 = token_md5(&compressed);
+
+    Ok(PflashDecision::Compressed(CompressedPrompt {
+        source_tokens: n,
+        kept_tokens: compressed.len(),
+        token_ids: compressed,
+        kept_spans,
+        source_md5,
+        compressed_md5,
+        timings: PflashTimings {
+            drafter_prefill_ms: 0, // counted inside score_ms; no separate clock yet
+            score_ms,
+            select_ms,
+            gather_ms,
+            total_ms,
         },
-    })
+    }))
 }
 
 #[cfg(test)]
