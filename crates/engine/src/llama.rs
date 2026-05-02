@@ -1315,6 +1315,14 @@ pub fn forward_prefill_batch(
 /// `hipStreamBeginCapture`. The eligibility check still runs; on a non-eligible
 /// model the function asserts rather than silently falling back, since the
 /// fallback would issue uploads that violate capture semantics.
+///
+/// Capture-mode constraint: in capture mode `max_ctx_len` is baked to
+/// `kv_cache.physical_cap`. For Q8 KV at `physical_cap > LDS_CTX_LIMIT`
+/// (15000), `forward_prefill_chunk` would enter the per-position
+/// long-context fallback that issues `hip.malloc` + `memcpy_htod` per row
+/// — both capture-illegal. Reject that combination up-front; the asym KV
+/// modes have their own batched flash-masked kernels with no per-position
+/// uploads, so they are capture-safe at any context length.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_batch_chunk_captured(
     gpu: &mut Gpu,
@@ -1345,6 +1353,21 @@ pub fn forward_prefill_batch_chunk_captured(
         is_batchable_la(l.w_down.gpu_dtype, arch));
     assert!(kv_ok && weights_ok,
         "forward_prefill_batch_chunk_captured requires batched-eligible weights + KV");
+
+    // The Q8 long-context fallback in `forward_prefill_chunk` issues
+    // `hip.malloc` + per-row `memcpy_htod` inside the layer loop, which
+    // would error or bake stale data under capture. The threshold is
+    // baked from `physical_cap` in capture mode, not the live seq_len, so
+    // we have to gate on the cap regardless of how many tokens this chunk
+    // carries. Asym KV paths run pure-batched kernels and stay safe.
+    const LDS_CTX_LIMIT: usize = 15000;
+    assert!(
+        !(kv_cache.quant_q8 && kv_cache.physical_cap > LDS_CTX_LIMIT),
+        "Q8 KV with physical_cap {} > {} hits the per-position long-context fallback, \
+         which issues hip.malloc + memcpy_htod inside the captured region. \
+         Use asym3 KV for capture at long context, or shrink physical_cap.",
+        kv_cache.physical_cap, LDS_CTX_LIMIT,
+    );
 
     forward_prefill_chunk(gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, true)
 }
