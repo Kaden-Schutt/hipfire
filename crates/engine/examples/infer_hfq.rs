@@ -129,18 +129,20 @@ fn main() {
     let repeat_penalty: f32 = 1.1;
     let repeat_window: usize = 64;
 
-    // Prefill: try batched (skip for non-standard KV formats), fallback to sequential
+    // Prefill: WMMA-fused batched path via llama::forward_prefill_batch when
+    // weights + KV qualify; per-token forward_scratch fallback otherwise. The
+    // batched path natively supports Q8 + asym{2,3,4}; HFQ4 KV stays sequential.
     let t1 = Instant::now();
-    let prefill_logits = if use_givens4 || use_givens2 || use_hfq4kv {
-        Err(hip_bridge::HipError::new(0, "quantized KV requires sequential prefill"))
-    } else {
-        llama::prefill_forward(&mut gpu, &weights, &config, &prompt_tokens, &mut kv_cache)
-    };
-    let mut next_token = if let Ok(logits) = prefill_logits {
+    let batched_ok = !use_hfq4kv;
+    let mut next_token = if batched_ok {
+        llama::forward_prefill_batch(
+            &mut gpu, &weights, &config, &prompt_tokens, 0, &mut kv_cache, &scratch, None,
+        ).expect("forward_prefill_batch failed");
         let prompt_ms = t1.elapsed().as_millis();
         eprintln!("Prompt: {}ms ({} tokens, {:.0} tok/s) [batched]",
             prompt_ms, prompt_tokens.len(),
             prompt_tokens.len() as f64 / (prompt_ms as f64 / 1000.0));
+        let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         llama::argmax(&logits)
     } else {
         for (pos, &token) in prompt_tokens.iter().enumerate() {
