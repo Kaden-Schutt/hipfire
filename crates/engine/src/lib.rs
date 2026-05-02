@@ -19,3 +19,4 @@ pub mod triattn;
 pub mod cask;
 pub mod image;
 pub mod tokenizer;
+pub mod pflash;
