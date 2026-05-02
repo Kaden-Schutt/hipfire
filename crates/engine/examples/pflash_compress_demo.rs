@@ -17,7 +17,7 @@
 
 use engine::hfq::{self, HfqFile};
 use engine::llama::{self, ForwardScratch, KvCache};
-use engine::pflash::{self, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
+use engine::pflash::{self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind};
 use engine::tokenizer::Tokenizer;
 use std::path::Path;
 use std::time::Instant;
@@ -125,8 +125,21 @@ fn main() {
     let compress_ms = t_compress.elapsed().as_millis();
     let cp = match decision {
         PflashDecision::Compressed(cp) => cp,
+        PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens, threshold } } => {
+            // Documented behavior: when the budget would keep every source
+            // token (e.g., keep_ratio=1.0, or min_keep_tokens >= source),
+            // maybe_compress_prompt returns BelowThreshold so the daemon
+            // doesn't double-prefill the same stream. Smoke this as PASS
+            // since the pipeline did the right thing -- there is no
+            // compressed prompt to feed downstream.
+            eprintln!("bypass(BelowThreshold): {source_tokens} tokens, threshold {threshold}");
+            eprintln!("(compression budget would keep the entire prompt -- pipeline is a no-op for this config)");
+            eprintln!("PASS (documented bypass: nothing to compress)");
+            state.unload_drafter(&mut gpu);
+            std::process::exit(0);
+        }
         PflashDecision::Bypass { reason } => {
-            eprintln!("FAIL: bypass when compression expected: {reason:?}");
+            eprintln!("FAIL: unexpected bypass: {reason:?}");
             state.unload_drafter(&mut gpu);
             std::process::exit(2);
         }
