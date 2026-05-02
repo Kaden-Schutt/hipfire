@@ -59,6 +59,7 @@ cli/CLAUDE.md
 artifacts/
 .codeinsight
 .codeinsight+research/
+.local-bench-scratch/
 .gm/rs-learn.db
 findings/
 .plugkit-browser-profile/
