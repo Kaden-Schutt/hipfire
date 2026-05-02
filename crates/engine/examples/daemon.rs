@@ -579,6 +579,18 @@ fn main() {
                 let pflash_profile = msg.get("params").and_then(|p| p.get("prefill_profile"))
                     .and_then(|v| v.as_bool()).unwrap_or(false);
 
+                // Validate load-time PFlash params before they reach
+                // PflashConfig + load_drafter. Same range rules the
+                // per-request override path uses; without these, a
+                // bad load-time value would silently be accepted and
+                // panic the daemon at the first generate request.
+                let pflash_load_err: Option<String> =
+                    if !(pflash_keep_ratio > 0.0 && pflash_keep_ratio <= 1.0) {
+                        Some(format!("prefill_keep_ratio={pflash_keep_ratio} not in (0, 1]"))
+                    } else if pflash_block == 0 {
+                        Some("prefill_block must be > 0".to_string())
+                    } else { None };
+
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
@@ -604,6 +616,14 @@ fn main() {
                         // the entire session.
                         if let Some(ref pf_drafter_path) = pflash_drafter {
                             if pflash_mode_str != "off" {
+                                if let Some(ref reason) = pflash_load_err {
+                                    let _ = writeln!(stdout,
+                                        r#"{{"type":"pflash_load_failed","reason":"invalid load param: {}"}}"#,
+                                        reason.replace('"', "'"));
+                                    let _ = stdout.flush();
+                                    model = Some(m);
+                                    continue;
+                                }
                                 let pf_cfg = engine::pflash::PflashConfig {
                                     mode: engine::pflash::PflashMode::parse(&pflash_mode_str)
                                         .unwrap_or(engine::pflash::PflashMode::Off),
@@ -2077,12 +2097,31 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // that the parser uses for structure. Compressing those tokens away
     // would corrupt the response shape, so we surface a ToolCall request
     // kind to the gate and let `decide_bypass` reject the request loudly.
+    //
+    // Two scan locations:
+    //   1. raw_q_tokens (the user message itself).
+    //   2. system_prompt -- the OpenAI serve path puts tool definitions
+    //      and the `<tool_call>` format example in the system prompt
+    //      when `body.tools` is present (cli/index.ts buildSystem). A
+    //      first-turn user message with tools therefore needs a system-
+    //      prompt scan or it would slip through as Text and get its
+    //      schema text mangled by compression.
+    //
     // Detection is best-effort -- the special-token id is missing on
     // older vocabs, in which case the gate just routes through Text.
     let request_kind = match tokenizer.special_token_id("<tool_call>") {
-        Some(tid) if raw_q_tokens.iter().any(|&t| t == tid) =>
-            engine::pflash::RequestKind::ToolCall,
-        _ => engine::pflash::RequestKind::Text,
+        Some(tid) => {
+            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
+            let in_system = system_prompt
+                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
+                .unwrap_or(false);
+            if in_user || in_system {
+                engine::pflash::RequestKind::ToolCall
+            } else {
+                engine::pflash::RequestKind::Text
+            }
+        }
+        None => engine::pflash::RequestKind::Text,
     };
 
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
