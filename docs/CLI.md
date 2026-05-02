@@ -17,6 +17,7 @@ flag-level detail; this page is the index.
 | Command | Purpose |
 |---|---|
 | `hipfire run <tag\|path> [prompt...]` | Generate. Auto-pulls if missing. Routes through the running `serve` daemon if one is up; otherwise spawns a one-shot daemon. |
+| `hipfire chat <tag>` | Interactive TUI chat with streaming, markdown, multi-line input. Reuses running serve or spawns a dedicated daemon. |
 | `hipfire serve [port] [-d]` | Start the OpenAI-compatible HTTP server. `-d` detaches into the background and writes a pid file. Default port `11435`. |
 | `hipfire stop` | Graceful shutdown of the background daemon. |
 | `hipfire bench <tag>` | Measure prefill + decode tok/s on a fixed prompt set. |

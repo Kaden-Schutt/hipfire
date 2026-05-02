@@ -20,7 +20,7 @@ const TEMP_CORRECTION = 0.82;
 mkdirSync(MODELS_DIR, { recursive: true });
 
 // ─── Persistent config ─────────────────────────────────
-interface HipfireConfig {
+export interface HipfireConfig {
   kv_cache: string;       // "auto" (per-arch default), "q8", "asym4", "asym3", "asym2"
   flash_mode: string;     // "auto" (ctx-gated), "always", "never" — only affects Q8 path
   default_model: string;  // model tag for serve pre-warm, e.g. "qwen3.5:9b"
@@ -587,7 +587,7 @@ import registryData from "./registry.json" with { type: "json" };
 const REGISTRY: Record<string, ModelEntry> = registryData.models as Record<string, ModelEntry>;
 const ALIASES: Record<string, string>    = registryData.aliases as Record<string, string>;
 
-function resolveModelTag(input: string): string {
+export function resolveModelTag(input: string): string {
   // Backward compat: old hfq4/hfq6 tags → hf4/hf6
   const normalized = input.replace(/-hfq(\d)/, "-hf$1").replace(/\.hfq$/, ".hf4");
   // Direct registry match
@@ -767,7 +767,7 @@ function readServePid(): number | null {
 }
 
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
-async function isServeUp(port: number): Promise<boolean> {
+export async function isServeUp(port: number): Promise<boolean> {
   try {
     const ctl = AbortSignal.timeout(500);
     const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctl });
@@ -1189,10 +1189,18 @@ async function serve(port: number) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
-  try {
-    require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
-  } catch {}
-  const cleanupPid = () => { try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {} };
+  // HIPFIRE_NO_PID_FILE=1 suppresses the write — used by `hipfire chat` when it
+  // spawns an ephemeral daemon, so it doesn't clobber a long-lived `serve -d`.
+  const ownsPidFile = !process.env.HIPFIRE_NO_PID_FILE;
+  if (ownsPidFile) {
+    try {
+      require("fs").writeFileSync(SERVE_PID_FILE, String(process.pid));
+    } catch {}
+  }
+  const cleanupPid = () => {
+    if (!ownsPidFile) return;
+    try { require("fs").unlinkSync(SERVE_PID_FILE); } catch {}
+  };
   process.on("exit", cleanupPid);
   process.on("SIGTERM", () => { cleanupPid(); process.exit(0); });
   process.on("SIGINT", () => { cleanupPid(); process.exit(0); });
@@ -2151,7 +2159,7 @@ function loadUserAliases(): Record<string, UserAlias> {
   } catch { return {}; }
 }
 
-function findModel(name: string): string | null {
+export function findModel(name: string): string | null {
   // Direct file path
   if (existsSync(name)) return resolve(name);
 
@@ -3835,6 +3843,16 @@ switch (cmd) {
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
     await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    break;
+  }
+  case "chat": {
+    const chatTag = rest[0];
+    if (!chatTag) {
+      console.error("Usage: hipfire chat <tag>  (e.g. hipfire chat qwen3.5:9b)");
+      process.exit(1);
+    }
+    const { chatTui } = await import("./chat.ts");
+    await chatTui(chatTag, cfg);
     break;
   }
   case "pull": {
