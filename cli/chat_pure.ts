@@ -1,0 +1,221 @@
+// Pure helpers for cli/chat.ts. Lifted to a side-effect-free module so they can
+// be unit-tested directly without loading the full CLI module graph (which has
+// top-level side effects from `cli/index.ts`).
+//
+// Run tests: `bun test cli/chat_pure.test.ts`
+
+// ─── Grapheme handling ──────────────────────────────────────────────────────
+
+const SEGMENTER: any = (typeof (globalThis as any).Intl !== "undefined" && (Intl as any).Segmenter)
+  ? new (Intl as any).Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
+export function graphemes(s: string): string[] {
+  if (!s) return [];
+  if (SEGMENTER) {
+    const out: string[] = [];
+    for (const seg of SEGMENTER.segment(s)) out.push(seg.segment);
+    return out;
+  }
+  return Array.from(s);
+}
+
+// ─── Paste sanitization ─────────────────────────────────────────────────────
+
+// Strip control bytes < 0x20 except \n (LF) and \t (TAB). Prevents pasted ANSI
+// escape sequences from being interpreted by downstream renderers and prevents
+// stray BEL/NUL/etc. from corrupting the input buffer.
+export function sanitizePaste(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c >= 32 || c === 0x0a || c === 0x09) out += s[i];
+  }
+  return out;
+}
+
+// ─── Token estimation ───────────────────────────────────────────────────────
+
+// Rough English+code heuristic. Real tokenization happens server-side; this is
+// only used for client-side context-fill warnings and tok/s display.
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
+}
+
+// ─── Tok/s sliding-window math ──────────────────────────────────────────────
+
+// Pure sliding-window rate calculator. `times` is a list of token-arrival
+// timestamps (ms); the caller is responsible for trimming entries older than
+// `windowMs` before calling. Returns 0 for fewer than 2 samples.
+export function computeTokPerSec(times: number[]): number {
+  if (times.length < 2) return 0;
+  const span = ((times[times.length - 1] ?? 0) - (times[0] ?? 0)) / 1000;
+  if (span <= 0) return 0;
+  return times.length / span;
+}
+
+// Trim out-of-window entries from `times` in place. Returns the modified array.
+export function trimTokenWindow(times: number[], now: number, windowMs: number = 2000): number[] {
+  const cutoff = now - windowMs;
+  while (times.length > 0 && (times[0] ?? 0) < cutoff) {
+    times.shift();
+  }
+  return times;
+}
+
+// ─── /trim logic ────────────────────────────────────────────────────────────
+
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  content: string;
+}
+
+export interface TrimResult {
+  kept: ChatMessage[];
+  dropped: number;
+  remainingTokens: number;
+}
+
+// Drop oldest user/assistant turns until the conversation fits under
+// `targetPct` of `ctxLimit`. Always preserves a leading system message if
+// present at index 0. Always keeps at least one message after the system slot.
+export function trimMessages(
+  messages: ChatMessage[],
+  ctxLimit: number,
+  targetPct: number = 0.5,
+): TrimResult {
+  const out = [...messages];
+  const target = ctxLimit * (Number.isFinite(targetPct) && targetPct > 0 ? targetPct : 0.5);
+  let used = out.reduce((s, m) => s + estimateTokens(m.content), 0);
+  let dropped = 0;
+  const firstIdx = (out[0]?.role === "system") ? 1 : 0;
+  while (used > target && out.length > firstIdx + 1) {
+    const removed = out.splice(firstIdx, 1)[0]!;
+    used -= estimateTokens(removed.content);
+    dropped++;
+  }
+  return { kept: out, dropped, remainingTokens: used };
+}
+
+// ─── Markdown rendering ─────────────────────────────────────────────────────
+
+// Phase 1 markdown: fenced code blocks, inline code, bold, italic. ANSI SGR
+// codes only; no syntax highlighting. Render at commit-time only — never on
+// the streaming tail (partial delimiters cause styling pop-in).
+//
+// `fenceWidth` controls the horizontal-rule width above/below code fences;
+// callers pass `Math.min(60, stdout.columns)` when rendering to a TTY.
+export function renderMarkdown(text: string, fenceWidth: number = 60): string {
+  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_m: string, lang: string, code: string) => {
+    const border = "\x1b[2m" + "─".repeat(Math.max(1, fenceWidth)) + "\x1b[0m";
+    const label = lang ? `\x1b[2m[${lang}]\x1b[0m` : "\x1b[2m[code]\x1b[0m";
+    return `\n${border}\n${label}\n${code}\n${border}`;
+  });
+  text = text.replace(/`([^`]+)`/g, (_m: string, code: string) => `\x1b[7m${code}\x1b[0m`);
+  text = text.replace(/\*\*([^*]+)\*\*/g, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
+  text = text.replace(/(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g, (_m: string, inner: string) => `\x1b[3m${inner}\x1b[0m`);
+  return text;
+}
+
+// ─── Bracketed paste state machine ──────────────────────────────────────────
+//
+// Bracketed paste arrives as: `\x1b[200~ ...content... \x1b[201~`. Both
+// markers may be split across stdin chunks. This is a pure transducer: feed
+// it stdin chunks, get back either { paste: string } when a complete paste is
+// assembled, or { keystroke: string } for normal input. State persists across
+// calls via the returned object.
+
+export interface PasteParserState {
+  inPaste: boolean;
+  buf: string;
+}
+
+export interface PasteParseResult {
+  state: PasteParserState;
+  paste: string | null;       // non-null when a complete paste was assembled
+  passthrough: string | null; // non-null for non-paste input to be handled normally
+}
+
+const PASTE_START = "\x1b[200~";
+const PASTE_END = "\x1b[201~";
+
+export function feedPasteParser(state: PasteParserState, chunk: string): PasteParseResult {
+  if (!state.inPaste) {
+    if (chunk.startsWith(PASTE_START)) {
+      const rest = chunk.slice(PASTE_START.length);
+      const endIdx = rest.indexOf(PASTE_END);
+      if (endIdx !== -1) {
+        // Whole paste arrived in one chunk.
+        const paste = sanitizePaste(rest.slice(0, endIdx).replace(/\r\n?/g, "\n"));
+        return { state: { inPaste: false, buf: "" }, paste, passthrough: null };
+      }
+      return {
+        state: { inPaste: true, buf: sanitizePaste(rest.replace(/\r\n?/g, "\n")) },
+        paste: null,
+        passthrough: null,
+      };
+    }
+    return { state, paste: null, passthrough: chunk };
+  }
+
+  // In paste mode: keep accumulating until we see PASTE_END.
+  const endIdx = chunk.indexOf(PASTE_END);
+  if (endIdx !== -1) {
+    const paste = state.buf + sanitizePaste(chunk.slice(0, endIdx).replace(/\r\n?/g, "\n"));
+    return { state: { inPaste: false, buf: "" }, paste, passthrough: null };
+  }
+  return {
+    state: { inPaste: true, buf: state.buf + sanitizePaste(chunk.replace(/\r\n?/g, "\n")) },
+    paste: null,
+    passthrough: null,
+  };
+}
+
+// ─── Input history with draft preservation ─────────────────────────────────
+//
+// readline-style history navigation. Saves the in-progress draft on first
+// up-arrow, restores it when the user navigates back past the most recent
+// entry with down-arrow. Pure state machine; caller owns rendering.
+
+export interface HistoryState {
+  history: string[];
+  index: number;          // points at history entry to restore; == history.length means "draft"
+  draft: string | null;   // saved in-progress buffer
+}
+
+export function historyUp(state: HistoryState, currentBuffer: string): { state: HistoryState; buffer: string } {
+  if (state.index === 0 || state.history.length === 0) {
+    return { state, buffer: currentBuffer };
+  }
+  const draft = (state.index === state.history.length && state.draft === null) ? currentBuffer : state.draft;
+  const newIndex = state.index - 1;
+  return {
+    state: { history: state.history, index: newIndex, draft },
+    buffer: state.history[newIndex] ?? "",
+  };
+}
+
+export function historyDown(state: HistoryState, currentBuffer: string): { state: HistoryState; buffer: string } {
+  if (state.index >= state.history.length) {
+    return { state, buffer: currentBuffer };
+  }
+  const newIndex = state.index + 1;
+  if (newIndex === state.history.length) {
+    return {
+      state: { history: state.history, index: newIndex, draft: null },
+      buffer: state.draft ?? "",
+    };
+  }
+  return {
+    state: { history: state.history, index: newIndex, draft: state.draft },
+    buffer: state.history[newIndex] ?? "",
+  };
+}
+
+export function historySubmit(state: HistoryState, submitted: string): HistoryState {
+  return {
+    history: [...state.history, submitted],
+    index: state.history.length + 1,
+    draft: null,
+  };
+}

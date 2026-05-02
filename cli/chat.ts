@@ -1,18 +1,19 @@
 import type { HipfireConfig } from "./index.ts";
 import { findModel, resolveModelTag, isServeUp } from "./index.ts";
-
-interface ChatMessage {
-  role: "user" | "assistant" | "system";
-  content: string;
-}
+import {
+  graphemes, sanitizePaste, estimateTokens,
+  computeTokPerSec, trimTokenWindow,
+  trimMessages, renderMarkdown,
+  feedPasteParser, type PasteParserState,
+  historyUp, historyDown, historySubmit, type HistoryState,
+  type ChatMessage,
+} from "./chat_pure.ts";
 
 interface ChatState {
   messages: ChatMessage[];
   inputBuf: string;
   inputCursor: number;            // grapheme index, not code-unit index
-  inputDraft: string | null;      // saved draft when navigating history
-  inputHistory: string[];
-  historyIndex: number;
+  history: HistoryState;          // input history with draft preservation
   streaming: boolean;
   committedLines: string[];
   tokPerSec: number;
@@ -21,39 +22,13 @@ interface ChatState {
   modelTag: string;
   daemonPid: number | null;
   daemonPort: number;
-  pasteMode: boolean;
-  pasteBuf: string;
+  paste: PasteParserState;        // bracketed-paste accumulator
   escBuf: string;
   tokenTimes: number[];
   totalTokens: number;
   thinking: boolean;
   ctxLimit: number;
   cleanedUp: boolean;
-}
-
-// Grapheme-aware split. Falls back to Array.from for runtimes without Intl.Segmenter.
-const SEGMENTER: any = (typeof (globalThis as any).Intl !== "undefined" && (Intl as any).Segmenter)
-  ? new (Intl as any).Segmenter(undefined, { granularity: "grapheme" })
-  : null;
-
-function graphemes(s: string): string[] {
-  if (!s) return [];
-  if (SEGMENTER) {
-    const out: string[] = [];
-    for (const seg of SEGMENTER.segment(s)) out.push(seg.segment);
-    return out;
-  }
-  return Array.from(s);
-}
-
-function sanitizePaste(s: string): string {
-  // Strip control bytes < 0x20 except \n and \t.
-  let out = "";
-  for (let i = 0; i < s.length; i++) {
-    const c = s.charCodeAt(i);
-    if (c >= 32 || c === 0x0a || c === 0x09) out += s[i];
-  }
-  return out;
 }
 
 export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
@@ -78,9 +53,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     messages: [],
     inputBuf: "",
     inputCursor: 0,
-    inputDraft: null,
-    inputHistory: [],
-    historyIndex: 0,
+    history: { history: [], index: 0, draft: null },
     streaming: false,
     committedLines: [],
     tokPerSec: 0,
@@ -89,8 +62,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     modelTag,
     daemonPid: null,
     daemonPort: cfg.port,
-    pasteMode: false,
-    pasteBuf: "",
+    paste: { inPaste: false, buf: "" },
     escBuf: "",
     tokenTimes: [],
     totalTokens: 0,
@@ -208,17 +180,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
   // final flush of the response. Never to the streaming tail — partial markdown
   // delimiters cause flicker as styling pops in/out.
 
-  function renderMarkdown(text: string): string {
-    text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_m: string, lang: string, code: string) => {
-      const border = "\x1b[2m" + "─".repeat(Math.min(60, stdout.columns ?? 60)) + "\x1b[0m";
-      const label = lang ? `\x1b[2m[${lang}]\x1b[0m` : "\x1b[2m[code]\x1b[0m";
-      return `\n${border}\n${label}\n${code}\n${border}`;
-    });
-    text = text.replace(/`([^`]+)`/g, (_m: string, code: string) => `\x1b[7m${code}\x1b[0m`);
-    text = text.replace(/\*\*([^*]+)\*\*/g, (_m: string, inner: string) => `\x1b[1m${inner}\x1b[0m`);
-    text = text.replace(/(?<!\*)\*(?!\*)([^*]+)\*(?!\*)/g, (_m: string, inner: string) => `\x1b[3m${inner}\x1b[0m`);
-    return text;
-  }
+  const md = (text: string): string => renderMarkdown(text, Math.min(60, stdout.columns ?? 60));
 
   // ─── Input line rendering ───────────────────────────────
   // Uses real terminal cursor (\x1b[?25h + position reporting) instead of
@@ -315,20 +277,10 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
       }
 
       case "trim": {
-        // Trim only enough to fall under target % of REAL context limit,
-        // preserving any leading system message.
         const targetPct = args[0] ? parseFloat(args[0]) / 100 : 0.5;
-        const target = state.ctxLimit * (Number.isFinite(targetPct) ? targetPct : 0.5);
-        let used = state.messages.reduce((s, m) => s + estimateTokens(m.content), 0);
-        let dropped = 0;
-        // Find first non-system message; preserve system at index 0 if present.
-        const firstIdx = (state.messages[0]?.role === "system") ? 1 : 0;
-        while (used > target && state.messages.length > firstIdx + 1) {
-          const removed = state.messages.splice(firstIdx, 1)[0]!;
-          used -= estimateTokens(removed.content);
-          dropped++;
-        }
-        w(`\nTrimmed ${dropped} message(s); ${state.messages.length} remain (~${used} tok).\n\n`);
+        const result = trimMessages(state.messages, state.ctxLimit, targetPct);
+        state.messages = result.kept;
+        w(`\nTrimmed ${result.dropped} message(s); ${state.messages.length} remain (~${result.remainingTokens} tok).\n\n`);
         break;
       }
 
@@ -370,8 +322,8 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
 
     state.inputBuf = "";
     state.inputCursor = 0;
-    state.inputDraft = null;
-    state.historyIndex = state.inputHistory.length;
+    // Reset history navigation cursor to the bottom; clear any saved draft.
+    state.history = { ...state.history, index: state.history.history.length, draft: null };
     renderInputLine();
   }
 
@@ -385,18 +337,8 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     const now = Date.now();
     for (let i = 0; i < tokAdded; i++) state.tokenTimes.push(now);
     state.totalTokens += tokAdded;
-    const cutoff = now - 2000;
-    while (state.tokenTimes.length > 0 && (state.tokenTimes[0] ?? 0) < cutoff) {
-      state.tokenTimes.shift();
-    }
-    if (state.tokenTimes.length >= 2) {
-      const span = ((state.tokenTimes[state.tokenTimes.length - 1] ?? 0) - (state.tokenTimes[0] ?? 0)) / 1000;
-      if (span > 0) state.tokPerSec = state.tokenTimes.length / span;
-    }
-  }
-
-  function estimateTokens(text: string): number {
-    return Math.ceil(text.length / 3.5);
+    trimTokenWindow(state.tokenTimes, now);
+    state.tokPerSec = computeTokPerSec(state.tokenTimes);
   }
 
   function checkContextOverflow() {
@@ -563,9 +505,9 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
               const p = parts[i]!;
               if (i === 0) {
                 // First commit needs to clear the raw tail and re-emit styled.
-                w("\r\x1b[K" + renderMarkdown(p) + "\n");
+                w("\r\x1b[K" + md(p) + "\n");
               } else {
-                w(renderMarkdown(p) + "\n");
+                w(md(p) + "\n");
               }
               state.committedLines.push(p);
             }
@@ -601,7 +543,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     // Flush the trailing incomplete line: re-render with markdown so any
     // closing delimiters that arrived in the final chunk get styled.
     if (incompleteLine && !firstChunk) {
-      w("\r\x1b[K" + renderMarkdown(incompleteLine) + "\n");
+      w("\r\x1b[K" + md(incompleteLine) + "\n");
       state.committedLines.push(incompleteLine);
     }
 
@@ -625,9 +567,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
     const msg = state.inputBuf.trim();
     if (!msg) return;
 
-    state.inputHistory.push(state.inputBuf);
-    state.historyIndex = state.inputHistory.length;
-    state.inputDraft = null;
+    state.history = historySubmit(state.history, state.inputBuf);
     state.inputBuf = "";
     state.inputCursor = 0;
 
@@ -693,25 +633,19 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
       return;
     }
 
-    // Bracketed paste start.
-    if (chunk.startsWith("\x1b[200~")) {
-      state.pasteMode = true;
-      state.pasteBuf = sanitizePaste(chunk.slice(6).replace(/\r\n?/g, "\n"));
-      return;
-    }
-
-    if (state.pasteMode) {
-      const endIdx = chunk.indexOf("\x1b[201~");
-      if (endIdx !== -1) {
-        state.pasteBuf += sanitizePaste(chunk.slice(0, endIdx).replace(/\r\n?/g, "\n"));
-        insertText(state.pasteBuf);
-        state.pasteMode = false;
-        state.pasteBuf = "";
+    // Bracketed paste — pure state-machine in chat_pure.ts handles all the
+    // start/end-marker-split-across-chunks and CRLF-normalization edge cases.
+    {
+      const r = feedPasteParser(state.paste, chunk);
+      state.paste = r.state;
+      if (r.paste !== null) {
+        insertText(r.paste);
         renderInputLine();
-      } else {
-        state.pasteBuf += sanitizePaste(chunk.replace(/\r\n?/g, "\n"));
+        return;
       }
-      return;
+      if (r.passthrough === null) return;          // still mid-paste, swallow
+      // Otherwise fall through to keystroke handling with r.passthrough.
+      chunk = r.passthrough;
     }
 
     switch (chunk) {
@@ -747,8 +681,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
           if (state.inputBuf.length > 0) {
             state.inputBuf = "";
             state.inputCursor = 0;
-            state.inputDraft = null;
-            state.historyIndex = state.inputHistory.length;
+            state.history = { ...state.history, index: state.history.history.length, draft: null };
             w("^C\n");
             renderInputLine();
           }
@@ -796,30 +729,26 @@ export async function chatTui(tag: string, cfg: HipfireConfig): Promise<void> {
         break;
 
       case "\x1b[A": // Up arrow — history back
-        if (!state.streaming && state.historyIndex > 0) {
-          // Save in-progress draft on first up-arrow.
-          if (state.historyIndex === state.inputHistory.length && state.inputDraft === null) {
-            state.inputDraft = state.inputBuf;
+        if (!state.streaming) {
+          const r = historyUp(state.history, state.inputBuf);
+          if (r.buffer !== state.inputBuf || r.state !== state.history) {
+            state.history = r.state;
+            state.inputBuf = r.buffer;
+            state.inputCursor = bufferGraphemeLength();
+            renderInputLine();
           }
-          state.historyIndex--;
-          state.inputBuf = state.inputHistory[state.historyIndex] ?? "";
-          state.inputCursor = bufferGraphemeLength();
-          renderInputLine();
         }
         break;
 
       case "\x1b[B": // Down arrow — history forward
-        if (!state.streaming && state.historyIndex < state.inputHistory.length) {
-          state.historyIndex++;
-          if (state.historyIndex === state.inputHistory.length) {
-            // Restore the in-progress draft (if any).
-            state.inputBuf = state.inputDraft ?? "";
-            state.inputDraft = null;
-          } else {
-            state.inputBuf = state.inputHistory[state.historyIndex] ?? "";
+        if (!state.streaming) {
+          const r = historyDown(state.history, state.inputBuf);
+          if (r.buffer !== state.inputBuf || r.state !== state.history) {
+            state.history = r.state;
+            state.inputBuf = r.buffer;
+            state.inputCursor = bufferGraphemeLength();
+            renderInputLine();
           }
-          state.inputCursor = bufferGraphemeLength();
-          renderInputLine();
         }
         break;
 
