@@ -140,9 +140,41 @@ fn main() {
                     .flat_map(|&(s, e)| (s..e).map(|i| toy_prompt[i]))
                     .eq(cp.token_ids.iter().copied());
                 let md5_present = !cp.source_md5.is_empty() && !cp.compressed_md5.is_empty();
+                // Re-run compute_scores_cpu in isolation as a scorer-health
+                // probe. maybe_compress_prompt already filters degenerate
+                // scores via BlockScores::well_formed, but the demo still
+                // surfaces the raw scores so a regression that makes
+                // scoring meaningless (all-zero, all-nan) is visible to
+                // anyone running the smoke. NOTE: this re-prefills the
+                // drafter; safe because the scoring path tolerates an
+                // already-advanced cache via state.unload_drafter on exit.
+                let scorer_health_ok = {
+                    let mut probe_state = state.drafter_loaded;
+                    if probe_state {
+                        match engine::pflash::compute_scores_cpu(
+                            &mut state, &mut gpu, &toy_prompt, demo_cfg2.block_size,
+                        ) {
+                            Ok(bs) => {
+                                let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
+                                let all_finite = bs.scores.iter().all(|s| s.is_finite());
+                                eprintln!("scorer health: any_nonzero={any_nonzero} all_finite={all_finite}");
+                                any_nonzero && all_finite
+                            }
+                            Err(e) => {
+                                eprintln!("scorer health probe errored: {e:?}");
+                                probe_state = false;
+                                false
+                            }
+                        }
+                    } else {
+                        eprintln!("scorer health probe skipped: drafter not loaded");
+                        false
+                    }
+                };
                 eprintln!("length_ok={length_ok} spans_disjoint={spans_disjoint} \
-                           monotone={monotone_tokens} md5_present={md5_present}");
-                length_ok && spans_disjoint && monotone_tokens && md5_present
+                           monotone={monotone_tokens} md5_present={md5_present} \
+                           scorer_health_ok={scorer_health_ok}");
+                length_ok && spans_disjoint && monotone_tokens && md5_present && scorer_health_ok
             }
             Ok(engine::pflash::PflashDecision::Bypass { reason }) => {
                 eprintln!("maybe_compress_prompt unexpectedly bypassed: {reason:?}");

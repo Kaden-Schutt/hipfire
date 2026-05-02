@@ -594,6 +594,10 @@ pub enum BypassReason {
     TokenizerMismatch,
     /// Architecture / KV / model shape unsupported by the current drafter.
     UnsupportedDrafter { reason: String },
+    /// Scorer returned non-finite or all-zero scores. Compressing on those
+    /// would silently corrupt span selection (NaN sorts unstably, all-zero
+    /// gives meaningless ranking), so we bypass loudly instead.
+    ScoringDegenerate { detail: String },
 }
 
 impl BypassReason {
@@ -608,7 +612,41 @@ impl BypassReason {
             BypassReason::TokenizerMismatch => "tokenizer_mismatch".to_string(),
             BypassReason::UnsupportedDrafter { reason } =>
                 format!("unsupported_drafter: {reason}"),
+            BypassReason::ScoringDegenerate { detail } =>
+                format!("scoring_degenerate: {detail}"),
         }
+    }
+}
+
+impl BlockScores {
+    /// Cheap health check: scores must be finite and at least one must be
+    /// nonzero. Returns `Err(reason)` describing the failure, `Ok(())` on
+    /// healthy output. Used by `maybe_compress_prompt` to bypass loudly
+    /// rather than ship a CompressedPrompt built from junk scores (NaN
+    /// sorts unstably, all-zero gives ill-defined ranking).
+    pub fn well_formed(&self) -> Result<(), String> {
+        if self.scores.is_empty() {
+            return Err("scores vector is empty".to_string());
+        }
+        let mut n_nan = 0usize;
+        let mut n_inf = 0usize;
+        let mut any_nonzero = false;
+        for &s in &self.scores {
+            if s.is_nan() {
+                n_nan += 1;
+            } else if s.is_infinite() {
+                n_inf += 1;
+            } else if s.abs() > 0.0 {
+                any_nonzero = true;
+            }
+        }
+        if n_nan > 0 || n_inf > 0 {
+            return Err(format!("non-finite scores: {n_nan} NaN, {n_inf} inf"));
+        }
+        if !any_nonzero {
+            return Err("all scores are exactly 0.0".to_string());
+        }
+        Ok(())
     }
 }
 
@@ -742,6 +780,15 @@ pub fn maybe_compress_prompt(
     let t_score = std::time::Instant::now();
     let bs = compute_scores_cpu(state, gpu, token_ids, cfg.block_size)?;
     let score_ms = t_score.elapsed().as_millis();
+    if let Err(detail) = bs.well_formed() {
+        // Bypass loudly: select_spans treats NaN as Equal, so a broken
+        // scorer would otherwise produce plausible-looking output that's
+        // actually meaningless ranking. Surface the concrete failure so
+        // operators can spot scorer regressions in logs.
+        return Ok(PflashDecision::Bypass {
+            reason: BypassReason::ScoringDegenerate { detail },
+        });
+    }
 
     // 2. Select spans.
     let t_select = std::time::Instant::now();
@@ -998,6 +1045,25 @@ mod tests {
         // Block 7 is the highest-scored, so it should appear.
         assert!(spans.iter().any(|&(a, b)| a <= 56 && 64 <= b),
             "block 7 (highest score) must survive despite anchor overlap, got {spans:?}");
+    }
+
+    #[test]
+    fn block_scores_well_formed_rejects_nan_inf_and_all_zero() {
+        // NaN -> reject.
+        let bs = synthetic_scores(vec![0.5, f32::NAN, 0.3, 0.1], 8);
+        assert!(bs.well_formed().unwrap_err().contains("non-finite"));
+        // Inf -> reject.
+        let bs = synthetic_scores(vec![0.5, f32::INFINITY, 0.3, 0.1], 8);
+        assert!(bs.well_formed().unwrap_err().contains("non-finite"));
+        // All-zero -> reject.
+        let bs = synthetic_scores(vec![0.0; 4], 8);
+        assert!(bs.well_formed().unwrap_err().contains("all scores"));
+        // Empty -> reject.
+        let bs = BlockScores { scores: vec![], block_size: 8, n_blocks: 0, source_tokens: 0 };
+        assert!(bs.well_formed().unwrap_err().contains("empty"));
+        // Healthy -> ok.
+        let bs = synthetic_scores(vec![0.1, 0.2, 0.3, 0.4], 8);
+        assert!(bs.well_formed().is_ok());
     }
 
     #[test]
