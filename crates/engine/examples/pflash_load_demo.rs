@@ -98,11 +98,12 @@ fn main() {
     // prompt so the Phase 1.2 scoring path gets one end-to-end smoke per
     // demo run. Skip if the drafter was not the matching pair (compat=false)
     // since the scoring fn assumes drafter handles the target's token ids.
-    if compat {
-        // 32-token synthetic prompt. Pick low ids that exist in any vocab
-        // (token 0..31 are typically control tokens but encode/decode round-
-        // trips; the goal here is just to exercise forward_scratch_compute
-        // 32 times and verify scores come back nonzero).
+    //
+    // Track scoring outcome as a separate exit-code component so the demo
+    // FAILs when scoring is broken even if tokenizer-compat is fine — Codex
+    // caught that hiding scoring errors behind tokenizer-pass would let
+    // regressions ship undetected.
+    let scoring_ok = if compat {
         let toy_prompt: Vec<u32> = (0..32u32).map(|i| 100 + i).collect();
         let block_size = 8usize;
         match engine::pflash::compute_scores_cpu(
@@ -112,13 +113,19 @@ fn main() {
                 eprintln!("compute_scores_cpu: {} blocks of {} tokens, scores {:?}",
                     bs.n_blocks, bs.block_size, bs.scores);
                 let any_nonzero = bs.scores.iter().any(|s| s.abs() > 1e-6);
-                eprintln!("scores are non-degenerate: {any_nonzero}");
+                let any_finite = bs.scores.iter().all(|s| s.is_finite());
+                eprintln!("scores any_nonzero={any_nonzero}, all_finite={any_finite}");
+                any_nonzero && any_finite
             }
             Err(e) => {
                 eprintln!("compute_scores_cpu failed: {e:?}");
+                false
             }
         }
-    }
+    } else {
+        // Skipped — not a regression, scoring requires matched tokenizers.
+        true
+    };
 
     // Free GPU resources before exit so the next bench/test sees a clean pool.
     state.unload_drafter(&mut gpu);
@@ -126,6 +133,10 @@ fn main() {
     if !compat {
         eprintln!("FAIL: tokenizer_compat = false (drafter and target tokenizers diverge)");
         std::process::exit(1);
+    }
+    if !scoring_ok {
+        eprintln!("FAIL: compute_scores_cpu errored or returned degenerate / non-finite scores");
+        std::process::exit(2);
     }
     eprintln!("PASS");
 }
