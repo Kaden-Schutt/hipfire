@@ -800,29 +800,131 @@ pub fn collapse_newline_runs(s: &str) -> String {
     out
 }
 
+/// Replace `\r\n` and bare `\r` with `\n`.
+///
+/// Cold zone in BPE merges: Qwen3.x training corpora are LF-normalized.
+/// `\r` (byte 0x0D) is a non-printable byte that maps to GPT-2 escape
+/// `Č` (U+010C); merges containing it have very high rank. Windows-pasted
+/// or git-line-ending-mishandled prompts therefore tokenize through cold
+/// `\r`/`\r\n` paths instead of the hot `\n` (id 198) / `\n\n` (id 271).
+///
+/// Order matters: `\r\n` is collapsed first to a single `\n`. A bare `\r`
+/// (rare, Mac-classic line endings) is then mapped to `\n` so it doesn't
+/// silently survive as a cold byte. `\n\r` (extremely rare, looks like a
+/// blank line under reverse-CR convention) becomes `\n\n`.
+pub fn normalize_line_endings(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            out.push('\n');
+            // Skip an immediately-following \n to avoid CRLF → \n\n.
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Replace U+00A0 NO-BREAK SPACE with regular ASCII space.
+///
+/// Cold zone in BPE merges: NBSP is rare in code/instruction corpora but
+/// shows up via copy-paste from word processors, PDFs, and some Markdown
+/// renderers. UTF-8 encodes NBSP as two bytes (0xC2 0xA0) which BPE
+/// tokenizes as a high-rank merge (often `Â ` artifacts) rather than the
+/// hot ` ` (id 220). Visually identical, semantically equivalent.
+pub fn replace_nbsp_with_space(s: &str) -> String {
+    s.replace('\u{00A0}', " ")
+}
+
+/// Strip trailing whitespace runs (` ` and `\t`) that immediately precede a `\n`.
+///
+/// Style-only: does not strip trailing whitespace at end-of-string, since
+/// completion-mode prompts (e.g. `"def foo():\n    return "`) intentionally
+/// end with whitespace and the model is meant to continue from there.
+///
+/// Cold zone in BPE merges: trailing space/tab before `\n` produces tokens
+/// like ` \n` (often cold) or `\t\n` (very cold) instead of clean `\n`.
+/// Codebases run through formatters strip these — but copy-pasted snippets
+/// or hand-edited prompts often retain them.
+pub fn strip_trailing_line_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut pending_ws = 0usize;
+    for ch in s.chars() {
+        match ch {
+            ' ' | '\t' => pending_ws += 1,
+            '\n' => {
+                // Drop pending whitespace before the newline.
+                pending_ws = 0;
+                out.push('\n');
+            }
+            _ => {
+                // Flush pending whitespace — it's mid-line, keep it.
+                for _ in 0..pending_ws {
+                    out.push(' ');
+                }
+                pending_ws = 0;
+                out.push(ch);
+            }
+        }
+    }
+    // End-of-string trailing whitespace: PRESERVE for completion-style prompts.
+    for _ in 0..pending_ws {
+        out.push(' ');
+    }
+    out
+}
+
 /// Prompt normalization for higher DFlash τ.
 ///
-/// **Default ON since 2026-04-26.** Empirical: collapsing `\n{3,}` → `\n\n`
-/// at engine entry lifts 27B-3.5 LRU DFlash from 159 → 196 tok/s (+24%) by
-/// putting the BPE tokenizer on a tighter τ trajectory. Tested across
-/// PEP-8-strict (3-newline) prompts that are dominant in real-world code.
-/// Set `HIPFIRE_NORMALIZE_PROMPT=0` to opt out (rare cases where the raw
-/// `\n{3,}` whitespace is semantically load-bearing).
+/// **Default ON since 2026-04-26.** Phase 1 (commit 8a4a211) shipped only
+/// `\n{3,}` → `\n\n`, which lifted 27B-3.5 LRU DFlash from 159 → 196 tok/s
+/// (+24%) on PEP-8-strict prompts. Phase 3 (issue #40) extends the rule
+/// table with more rare-token rewrites. Set `HIPFIRE_NORMALIZE_PROMPT=0`
+/// to opt out (rare cases where the raw whitespace/encoding is semantically
+/// load-bearing).
 ///
-/// Returns Cow::Borrowed when input has no `\n{3,}` runs or when explicitly
-/// disabled; Cow::Owned only on actual rewrite.
+/// Pipeline (in order):
+///   1. `normalize_line_endings` — `\r\n` / `\r` → `\n`
+///   2. `replace_nbsp_with_space` — U+00A0 → ` `
+///   3. `strip_trailing_line_ws` — drop ` `/`\t` runs before `\n`
+///   4. `collapse_newline_runs` — `\n{3,}` → `\n\n`
+///
+/// Order matters: line-ending normalization first so trailing `\r` doesn't
+/// survive as bytes that downstream rules don't recognize. Newline collapse
+/// runs last so trailing-ws-stripping can expose adjacent newlines that
+/// then collapse (e.g. `"a   \n\n   \n   b"` → `"a\nb"`).
+///
+/// Returns `Cow::Borrowed` when input is already clean or when explicitly
+/// disabled; `Cow::Owned` only on actual rewrite. Each step in the pipeline
+/// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
-    // Default ON. Explicit "0" / "false" / "off" opts out.
+    use std::borrow::Cow;
+    // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
     if let Ok(v) = std::env::var("HIPFIRE_NORMALIZE_PROMPT") {
         let v = v.to_ascii_lowercase();
         if v == "0" || v == "false" || v == "off" || v == "no" {
-            return std::borrow::Cow::Borrowed(s);
+            return Cow::Borrowed(s);
         }
     }
-    if !needs_newline_collapse(s) {
-        return std::borrow::Cow::Borrowed(s);
+
+    let mut cur: Cow<'_, str> = Cow::Borrowed(s);
+    if needs_line_ending_normalize(&cur) {
+        cur = Cow::Owned(normalize_line_endings(&cur));
     }
-    std::borrow::Cow::Owned(collapse_newline_runs(s))
+    if needs_nbsp_replace(&cur) {
+        cur = Cow::Owned(replace_nbsp_with_space(&cur));
+    }
+    if needs_trailing_ws_strip(&cur) {
+        cur = Cow::Owned(strip_trailing_line_ws(&cur));
+    }
+    if needs_newline_collapse(&cur) {
+        cur = Cow::Owned(collapse_newline_runs(&cur));
+    }
+    cur
 }
 
 fn needs_newline_collapse(s: &str) -> bool {
@@ -835,6 +937,38 @@ fn needs_newline_collapse(s: &str) -> bool {
             }
         } else {
             nl_run = 0;
+        }
+    }
+    false
+}
+
+fn needs_line_ending_normalize(s: &str) -> bool {
+    s.as_bytes().contains(&b'\r')
+}
+
+fn needs_nbsp_replace(s: &str) -> bool {
+    // UTF-8 of U+00A0 is 0xC2 0xA0. Cheap two-byte scan beats Unicode-aware
+    // contains() for the common no-NBSP case.
+    let b = s.as_bytes();
+    for i in 0..b.len().saturating_sub(1) {
+        if b[i] == 0xC2 && b[i + 1] == 0xA0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn needs_trailing_ws_strip(s: &str) -> bool {
+    // True iff any line in `s` has ` ` or `\t` immediately before `\n`.
+    // (End-of-string trailing whitespace is preserved by `strip_trailing_line_ws`,
+    // so it doesn't count as "needs strip".)
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'\n' && i > 0 {
+            let prev = bytes[i - 1];
+            if prev == b' ' || prev == b'\t' {
+                return true;
+            }
         }
     }
     false
@@ -925,5 +1059,208 @@ mod prompt_norm_tests {
         let out = maybe_normalize_prompt(s);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\nb");
+    }
+
+    // ---- normalize_line_endings ----
+
+    #[test]
+    fn line_endings_crlf_to_lf() {
+        assert_eq!(normalize_line_endings("a\r\nb"), "a\nb");
+    }
+
+    #[test]
+    fn line_endings_bare_cr_to_lf() {
+        // Mac-classic line endings: bare \r between content.
+        assert_eq!(normalize_line_endings("a\rb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn line_endings_no_op_pure_lf() {
+        assert_eq!(normalize_line_endings("a\nb\n\nc"), "a\nb\n\nc");
+    }
+
+    #[test]
+    fn line_endings_mixed_crlf_and_lf() {
+        // git-attributes mishap: some lines CRLF, some LF.
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc\r\nd"),
+            "a\nb\nc\nd"
+        );
+    }
+
+    #[test]
+    fn line_endings_lonely_cr_at_end() {
+        assert_eq!(normalize_line_endings("a\r"), "a\n");
+    }
+
+    #[test]
+    fn line_endings_preserves_multibyte_utf8() {
+        // Regression: an earlier impl used `out.push(byte as char)`, which
+        // re-encoded each UTF-8 byte as a separate codepoint and mangled
+        // multi-byte sequences (e.g. NBSP 0xC2 0xA0 → orphan 0xC2 byte
+        // surviving as `Â`). Make sure CRLF rewriting and arbitrary multi-byte
+        // chars compose correctly.
+        let nbsp_with_crlf = "Use\u{00A0}foo\r\nbar";
+        let out = normalize_line_endings(nbsp_with_crlf);
+        assert_eq!(out, "Use\u{00A0}foo\nbar");
+        // NBSP must be exactly one char (2 UTF-8 bytes), not 2 chars.
+        assert_eq!(out.chars().filter(|&c| c == '\u{00A0}').count(), 1);
+        // Composed pipeline must end up with NBSP gone, CRLF gone.
+        let composed = replace_nbsp_with_space(&out);
+        assert_eq!(composed, "Use foo\nbar");
+        assert!(!composed.as_bytes().contains(&0xC2));
+    }
+
+    #[test]
+    fn line_endings_preserves_emoji() {
+        // 4-byte UTF-8 sequence (🦀 = 0xF0 0x9F 0xA6 0x80) must survive.
+        let s = "rust 🦀 \r\nis fast";
+        assert_eq!(normalize_line_endings(s), "rust 🦀 \nis fast");
+    }
+
+    #[test]
+    fn line_endings_detector() {
+        assert!(needs_line_ending_normalize("a\r\nb"));
+        assert!(needs_line_ending_normalize("a\rb"));
+        assert!(!needs_line_ending_normalize("a\nb"));
+        assert!(!needs_line_ending_normalize("plain text"));
+    }
+
+    // ---- replace_nbsp_with_space ----
+
+    #[test]
+    fn nbsp_replaced_with_space() {
+        // PDF/word-processor copy-paste artifact: NBSP between words.
+        let s = "hello\u{00A0}world";
+        assert_eq!(replace_nbsp_with_space(s), "hello world");
+    }
+
+    #[test]
+    fn nbsp_no_op_on_plain_ascii() {
+        assert_eq!(replace_nbsp_with_space("hello world"), "hello world");
+    }
+
+    #[test]
+    fn nbsp_detector() {
+        assert!(needs_nbsp_replace("a\u{00A0}b"));
+        assert!(!needs_nbsp_replace("a b"));
+        // Other Latin-1 chars starting with 0xC2 must not false-positive.
+        assert!(!needs_nbsp_replace("caf\u{00E9}")); // é = 0xC3 0xA9
+        assert!(!needs_nbsp_replace("\u{00A2}"));    // ¢ = 0xC2 0xA2
+    }
+
+    // ---- strip_trailing_line_ws ----
+
+    #[test]
+    fn strip_trailing_spaces_before_newline() {
+        assert_eq!(strip_trailing_line_ws("a   \nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_trailing_tabs_before_newline() {
+        assert_eq!(strip_trailing_line_ws("a\t\t\nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_trailing_mixed_ws_before_newline() {
+        assert_eq!(strip_trailing_line_ws("a \t \t\nb"), "a\nb");
+    }
+
+    #[test]
+    fn strip_preserves_eos_whitespace() {
+        // Completion-style prompt — model is meant to continue from the trailing space.
+        // We MUST NOT strip it.
+        assert_eq!(
+            strip_trailing_line_ws("def foo():\n    return "),
+            "def foo():\n    return "
+        );
+    }
+
+    #[test]
+    fn strip_preserves_midline_whitespace() {
+        // Spaces between words / leading indent stay.
+        assert_eq!(
+            strip_trailing_line_ws("    def foo():\n        return 1\n"),
+            "    def foo():\n        return 1\n"
+        );
+    }
+
+    #[test]
+    fn strip_handles_multiple_lines() {
+        let dirty = "line one   \nline two\t\nline three  \n";
+        assert_eq!(
+            strip_trailing_line_ws(dirty),
+            "line one\nline two\nline three\n"
+        );
+    }
+
+    #[test]
+    fn strip_blank_line_with_indent() {
+        // Whitespace-only "blank" line between code blocks — strip the indent.
+        assert_eq!(
+            strip_trailing_line_ws("a\n    \nb"),
+            "a\n\nb"
+        );
+    }
+
+    #[test]
+    fn strip_detector() {
+        assert!(needs_trailing_ws_strip("a \nb"));
+        assert!(needs_trailing_ws_strip("a\t\nb"));
+        assert!(!needs_trailing_ws_strip("a\nb"));
+        // EOS whitespace alone does not trigger.
+        assert!(!needs_trailing_ws_strip("a "));
+        assert!(!needs_trailing_ws_strip("a\nb "));
+    }
+
+    // ---- composition through maybe_normalize_prompt ----
+
+    #[test]
+    fn pipeline_crlf_and_trailing_ws() {
+        // Windows-pasted snippet with trailing whitespace.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "def foo():   \r\n    return 1   \r\n";
+        let out = maybe_normalize_prompt(s);
+        assert_eq!(out.as_ref(), "def foo():\n    return 1\n");
+    }
+
+    #[test]
+    fn pipeline_blank_line_indent_then_collapse() {
+        // Indented blank line between top-level defs:
+        //   "a\n    \n\nb" — line 2 is whitespace-only, lines 2-3 form a `\n\n\n`
+        //   run after stripping. Collapse should reduce to `\n\n`.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "a\n    \n\nb";
+        let out = maybe_normalize_prompt(s);
+        assert_eq!(out.as_ref(), "a\n\nb");
+    }
+
+    #[test]
+    fn pipeline_nbsp_in_prose() {
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "Use\u{00A0}foo()\u{00A0}for\u{00A0}this.";
+        let out = maybe_normalize_prompt(s);
+        assert_eq!(out.as_ref(), "Use foo() for this.");
+    }
+
+    #[test]
+    fn pipeline_clean_input_is_borrowed() {
+        // No CRLF, no NBSP, no trailing ws, no \n{3,} — must stay Borrowed.
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        let s = "Plain prompt.\nSecond line.\n\nThird paragraph.\n";
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), s);
+    }
+
+    #[test]
+    fn pipeline_explicit_opt_out_skips_all_rules() {
+        // Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse.
+        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
+        let s = "a\r\nb\u{00A0}c   \nd\n\n\ne";
+        let out = maybe_normalize_prompt(s);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.as_ref(), s);
+        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
     }
 }
