@@ -47,8 +47,34 @@ if [ ! -f "$BASELINE" ]; then
 fi
 
 EXE="./target/release/examples/pflash_niah_bench"
+
+# Rebuild if the binary is missing OR any relevant source is newer than it.
+# Without this freshness check, the gate would run against a stale binary
+# whenever someone forgot to rebuild after editing pflash.rs / qwen35.rs /
+# llama.rs / the bench itself / the score kernel and silently report a
+# pass on outdated code. Mirror the pattern from scripts/coherence-gate.sh.
+rebuild=0
 if [ ! -x "$EXE" ]; then
-    echo "pflash-gate: building pflash_niah_bench..."
+    rebuild=1
+else
+    for src in \
+        crates/engine/src/pflash.rs \
+        crates/engine/src/qwen35.rs \
+        crates/engine/src/llama.rs \
+        crates/engine/src/hfq.rs \
+        crates/engine/src/tokenizer.rs \
+        crates/engine/examples/pflash_niah_bench.rs \
+        crates/rdna-compute/src/dispatch.rs \
+        kernels/src/pflash_score_q8_kv.hip \
+    ; do
+        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
+            rebuild=1
+            break
+        fi
+    done
+fi
+if [ "$rebuild" -eq 1 ]; then
+    echo "pflash-gate: rebuilding pflash_niah_bench (binary missing or stale)..."
     if ! cargo build --release --features deltanet --example pflash_niah_bench -p engine >&2; then
         echo "pflash-gate: build failed" >&2
         exit 2
