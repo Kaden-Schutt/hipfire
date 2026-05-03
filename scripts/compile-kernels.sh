@@ -63,6 +63,17 @@ for arch in "${ARCHS[@]}"; do
             esac
         fi
 
+        # gfx906-specific kernels (sdot4 dp4a, etc.) only build on gfx906.
+        # Match by suffix `_gfx906` in the file stem.
+        if [ "$arch" != "gfx906" ]; then
+            case "$name" in
+                *_gfx906)
+                    echo "  - $name SKIP (gfx906-only)"
+                    continue
+                    ;;
+            esac
+        fi
+
         # Variant precedence:
         #   1. ${name}.${arch}.hip          (chip-specific, e.g. .gfx1100.)
         #   2. ${name}.${arch_family}.hip   (family, e.g. .gfx12.)

@@ -213,6 +213,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../k
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+// gfx906-specific dp4a MMQ residual kernel (Phase 1, plans/gfx906_mmq_plan.md).
+// Symbols: gemm_hfq4g256_residual_mmq_gfx906[_full_add|_full_set]. Block (64,2,1),
+// 128×64 tile, +1 LDS padding. Uses __builtin_amdgcn_sdot4 — gfx906-only.
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

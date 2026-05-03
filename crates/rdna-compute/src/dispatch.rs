@@ -118,40 +118,58 @@ fn has_wave64_native(arch: &str) -> bool {
     matches!(arch, "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942")
 }
 
-fn has_mmq_i8_wmma(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
+/// Architectures that have an integer-MMQ prefill path:
+/// - RDNA3/3.5 (gfx1100..gfx1152): i8 WMMA via `__builtin_amdgcn_wmma_i32_16x16x16_iu8`
+/// - gfx906 (Vega 20, MI50/MI60): dp4a via `__builtin_amdgcn_sdot4`
+///
+/// The two share the kernel symbol name (`gemm_hfq4g256_residual_mmq`) but
+/// dispatch through different Rust routines because the launch shape and
+/// LDS budget differ — see `gemm_hfq4g256_residual_mmq` (RDNA3, 32×8 block,
+/// 128×128 tile) vs `gemm_hfq4g256_residual_mmq_gfx906` (64×2 block,
+/// 128×64 tile, dp4a-specific +1 padding).
+fn has_mmq_dp4a_or_wmma(arch: &str) -> bool {
+    matches!(arch,
+        "gfx906"
+        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+        | "gfx1150" | "gfx1151" | "gfx1152")
 }
 
-/// Decide whether the i8-WMMA MMQ prefill path should be used for a given
+/// Decide whether an integer-MMQ prefill path should be used for a given
 /// GEMM call. Combines the arch gate, the env override, and an empirical
 /// batch-size threshold.
 ///
-/// The MMQ kernel uses a 128×128 batch tile (vs the fp16 WMMA path's 16×16),
-/// so it amortizes its high per-launch fixed cost only when batch_size is
-/// large enough to fill multiple tiles. Empirical sweep on Qwen 3.5 9B
-/// (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
-///
+/// **RDNA3 i8-WMMA MMQ:** uses a 128×128 batch tile (vs the fp16 WMMA path's
+/// 16×16), so it amortizes its high per-launch fixed cost only when
+/// batch_size is large enough to fill multiple tiles. Empirical sweep on
+/// Qwen 3.5 9B (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
 ///   pp32-pp192: MMQ regresses 23-69% (per-launch overhead dominates).
 ///   pp224:      within noise (-8%).
 ///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
+/// Default RDNA3 threshold is 256.
 ///
-/// Default threshold is 256 — captures the pp256/pp384/pp512 wins (the
-/// pp512 case is the one issue #60 was filed about) while avoiding the
-/// catastrophic small-batch regression. Set `HIPFIRE_MMQ_MIN_BATCH=N` to
-/// override (e.g. 128 for aggressive routing, 384 for conservative).
+/// **gfx906 dp4a MMQ:** uses a 128×64 batch tile (LDS-budget-constrained
+/// per llama.cpp-gfx906 reference). Default threshold is 64 (one tile),
+/// will be re-tuned in P2 once we have measurements. Currently behind
+/// `HIPFIRE_MMQ=1` (default off) while we validate correctness — see
+/// plans/gfx906_mmq_plan.md Phase 1.
 ///
 /// `HIPFIRE_MMQ` env override:
 ///   `0` / `off`            — force MMQ off (debug / regression bisect)
 ///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
 ///   `auto` / unset / other — auto-route by batch_size threshold (default)
 fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
-    if !has_mmq_i8_wmma(arch) {
+    if !has_mmq_dp4a_or_wmma(arch) {
         return false;
     }
     match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
         Some("0") | Some("off") => false,
         Some("1") | Some("on") => true,
         _ => {
+            // Default OFF on gfx906 during Phase 1 validation. Once correctness
+            // and perf are confirmed, switch to a batch-threshold default.
+            if arch == "gfx906" {
+                return false;
+            }
             let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
@@ -5682,6 +5700,39 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // gfx906 dp4a MMQ — opt-in via HIPFIRE_MMQ=1 during Phase 1
+            // validation. Once correctness + perf are confirmed, this will
+            // take over from the FP16 wave64 path by default. Falls through
+            // to the wave64 path when MMQ is off or screening rejects.
+            // gfx906 dp4a MMQ — Phase 1 path, **default OFF**.
+            //
+            // Status (2026-05-03): the kernel is numerically correct in
+            // isolation (see test_gfx906_mmq_correctness — NRMSE <0.5% at
+            // all production shapes), but produces incoherent model output
+            // when wired into the model's full prefill. Diagnostic flags
+            // localized the bug to the dp4a kernel body (HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1
+            // produces coherent output). Suspected: weight-distribution
+            // edge case the standalone test doesn't cover.
+            //
+            // Opt-in via HIPFIRE_MMQ=1. **Output is currently incorrect**
+            // — this gate is here for debug/iteration only.
+            if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_raw, m, k)
+                } else {
+                    true
+                };
+                // HIPFIRE_MMQ_K_FILTER=N restricts MMQ to calls where k==N.
+                let k_filter = std::env::var("HIPFIRE_MMQ_K_FILTER").ok().and_then(|s| s.parse::<usize>().ok());
+                let k_match = k_filter.map_or(true, |kf| k == kf);
+                if use_mmq && k_match {
+                    if std::env::var("HIPFIRE_MMQ_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!("  [mmq-trace] residual_mmq_gfx906 m={m} k={k} bs={batch_size}");
+                    }
+                    return self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, x, y, m, k, batch_size);
+                }
+                // else: screening rejected this weight, fall through to wave64
+            }
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
@@ -5942,6 +5993,111 @@ impl Gpu {
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx906 dp4a MMQ residual GEMM. Wave-native topology (block 64×2,
+    /// tile 128×64) per llama.cpp-gfx906 reference. Distinct from the
+    /// RDNA3 i8-WMMA variant above — different block dim, different
+    /// LDS layout, different kernel symbols.
+    ///
+    /// Phase 1 implementation; opt-in via `HIPFIRE_MMQ=1` while correctness
+    /// is being validated. See plans/gfx906_mmq_plan.md and
+    /// plans/p1.2_dp4a_mmq_design.md.
+    pub fn gemm_hfq4g256_residual_mmq_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
+        // wave64 kernel instead of running the dp4a kernel. Used to verify
+        // that the dispatch wiring is correct independently of the kernel.
+        if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
+            return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
+        }
+        // Quantize activations to Q8_1 (shared with the RDNA3 path).
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1 runs the Q8_1 quantize
+        // (writing to scratch) but then forwards to the FP16 wave64 kernel
+        // for the actual GEMM. If output is coherent under this flag,
+        // the bug is in the dp4a kernel; if not, the quantize kernel is suspect.
+        if std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1") {
+            return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
+        }
+
+        // Pick boundary-checked vs full-tile variant.
+        let kernel_name = if m % 128 == 0 && batch_size % 64 == 0 {
+            "gemm_hfq4g256_residual_mmq_gfx906_full_add"
+        } else {
+            "gemm_hfq4g256_residual_mmq_gfx906"
+        };
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mmq_gfx906",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC,
+            kernel_name,
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // Tile shape per kernel constants (must match the .hip file).
+        const MMQ_X: usize = 64;
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 65;  // 2*MMQ_TILE_NE_K + 1 = 65 ints/row, dp4a +1 padding
+        const Y_STRIDE: usize = 36;  // MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4
+        const X_DM_HALF2: usize = 128;  // one half2 per row of x
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+
+        // LDS: x_qs (i32) + x_dm (half2) + tile_y (i32). half2 is 4 B; i32 is 4 B.
+        let shared_mem = (
+            (MMQ_Y * X_STRIDE * std::mem::size_of::<i32>())  // x_qs
+            + (X_DM_HALF2 * 4)                                // x_dm (half2 = 4 B)
+            + (MMQ_X * Y_STRIDE * std::mem::size_of::<i32>())// tile_y
+        ) as u32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm",
+            "gemm_hfq4g256_residual_mmq_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 2, 1],
             shared_mem,
             &mut params,
             || {
