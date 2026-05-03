@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
 /// Copy .hsaco and .hash files from the persistent install location (cold)
 /// into the tmpfs hot path. Used once at KernelCompiler startup to seed the
 /// hot path after reboot (when /tmp gets cleared) without forcing a full
@@ -243,7 +246,8 @@ impl KernelCompiler {
         // 8.3 alias. Subprocess approach avoids pulling in a winapi crate dep
         // for this single call site.
         let out = Command::new("cmd")
-            .args(["/c", &format!("for %A in (\"{}\") do @echo %~sA", p)])
+            .raw_arg("/c")
+            .raw_arg(&format!("for %A in (\"{}\") do @echo %~sA", p))
             .output();
         match out {
             Ok(o) if o.status.success() => {
