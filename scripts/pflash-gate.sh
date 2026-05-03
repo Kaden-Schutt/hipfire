@@ -58,11 +58,17 @@ EXE="./target/release/examples/pflash_niah_bench"
 # anywhere in the dispatch path forces a rebuild:
 #   - engine logic (pflash.rs, qwen35.rs, llama.rs, hfq.rs, tokenizer.rs)
 #   - bench harness (pflash_niah_bench.rs)
-#   - rdna-compute Rust wrappers + HIP-source registrations
-#       (lib.rs, kernels.rs which `include_str!`s the .hip files,
-#        dispatch.rs which holds `pflash_score_q8_kv`, compiler.rs which
-#        builds .hsaco from the .hip source)
-#   - hip-bridge FFI layer
+#   - rdna-compute layer:
+#       lib.rs       (Gpu struct, top-level exports)
+#       kernels.rs   (include_str! site for every kernel HIP source)
+#       dispatch.rs  (the `pflash_score_q8_kv` Rust wrapper)
+#       compiler.rs  (builds .hsaco from .hip source)
+#       pool.rs      (GPU memory pool the kernel allocates from)
+#   - hip-bridge layer (the actual GPU launch primitives the wrapper calls):
+#       lib.rs       (top-level FFI exports)
+#       ffi.rs       (launch_kernel + launch_kernel_blob primitives)
+#       kernarg.rs   (kernel-argument packing for the launch)
+#       error.rs     (HipResult / HipError types in every signature)
 #   - the .hip kernel source itself
 rebuild=0
 if [ ! -x "$EXE" ]; then
@@ -79,7 +85,11 @@ else
         crates/rdna-compute/src/kernels.rs \
         crates/rdna-compute/src/dispatch.rs \
         crates/rdna-compute/src/compiler.rs \
+        crates/rdna-compute/src/pool.rs \
         crates/hip-bridge/src/lib.rs \
+        crates/hip-bridge/src/ffi.rs \
+        crates/hip-bridge/src/kernarg.rs \
+        crates/hip-bridge/src/error.rs \
         kernels/src/pflash_score_q8_kv.hip \
     ; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
