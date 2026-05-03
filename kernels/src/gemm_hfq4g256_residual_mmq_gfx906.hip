@@ -220,15 +220,21 @@ static __device__ __forceinline__ void load_q8_1_tile(
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;  // 0..127
     const int j = tid / 2;                  // col index, 0..63
     const int half = tid & 1;               // 0 or 1: which 18-int half of the col
-    const int col = (col0 + j < N) ? (col0 + j) : (N - 1);
+    const bool valid = (col0 + j) < N;
+    const int col = valid ? (col0 + j) : (N - 1);
 
     // Q8_1 block layout: Xq[kb * N + col] is one block (36 ints).
     const int* src = (const int*)(Xq + (long long)kb * N + col);
 
+    // Zero OOB columns (rather than duplicating last valid col's data).
+    // Matches the Strix Halo MMQ kernel pattern (gemm_hfq4g256_residual_mmq.hip:367).
+    // Without this, vec_dot's j-loop reads junk for OOB cols and accumulates
+    // garbage into per-thread sum[] cells that, while never written, can
+    // create issues if compiler aliasing or similar register effects occur.
     #pragma unroll
     for (int u = 0; u < 18; ++u) {
         const int slot = half * 18 + u;     // 0..35
-        tile_y[j * Y_STRIDE + slot] = src[slot];
+        tile_y[j * Y_STRIDE + slot] = valid ? src[slot] : 0;
     }
 }
 

@@ -5704,6 +5704,124 @@ impl Gpu {
             // validation. Once correctness + perf are confirmed, this will
             // take over from the FP16 wave64 path by default. Falls through
             // to the wave64 path when MMQ is off or screening rejects.
+            // DEBUG: HIPFIRE_MMQ_DUMP=N dumps the inputs (a_raw, x) and the
+            // FP16 wave64 reference output (y_after - y_before) for the
+            // 0-indexed Nth residual call to /tmp/mmq_dump_<call_idx>/.
+            // Used to feed real production data into the standalone
+            // correctness test. Forces non-MMQ path so we get the FP16
+            // reference Y; rerun without the env var to test the MMQ path.
+            //
+            // Files written:
+            //   /tmp/mmq_dump_<n>/a_raw.bin    — HFQ4 weights (raw bytes)
+            //   /tmp/mmq_dump_<n>/x.f32        — FP32 activations [N × K]
+            //   /tmp/mmq_dump_<n>/y_in.f32     — FP32 Y (input residual stream)
+            //   /tmp/mmq_dump_<n>/y_out.f32    — FP32 Y after FP16 wave64
+            //   /tmp/mmq_dump_<n>/shape.txt    — "M K N" line
+            if let Ok(dump_n) = std::env::var("HIPFIRE_MMQ_DUMP")
+                .map(|s| s.parse::<usize>().unwrap_or(usize::MAX)) {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static DUMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+                let cur = DUMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                if cur == dump_n && self.arch == "gfx906" && batch_size > 1 {
+                    let dir = format!("/tmp/mmq_dump_{cur}");
+                    std::fs::create_dir_all(&dir).ok();
+
+                    // Weights: HFQ4 group bytes count = m * (k/256) * 136
+                    let weight_bytes = m * (k / 256) * 136;
+                    let mut a_host = vec![0u8; weight_bytes];
+                    self.hip.memcpy_dtoh(&mut a_host, &a_raw.buf).ok();
+                    std::fs::write(format!("{dir}/a_raw.bin"), &a_host).ok();
+
+                    // Activations: FP32 [N × K]
+                    let mut x_host = vec![0f32; batch_size * k];
+                    let x_bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            x_host.as_mut_ptr() as *mut u8, x_host.len() * 4)
+                    };
+                    self.hip.memcpy_dtoh(x_bytes, &x.buf).ok();
+                    std::fs::write(format!("{dir}/x.f32"),
+                        unsafe { std::slice::from_raw_parts(
+                            x_host.as_ptr() as *const u8, x_host.len() * 4) }).ok();
+
+                    // Y before residual GEMM
+                    let mut y_host = vec![0f32; batch_size * m];
+                    let y_bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            y_host.as_mut_ptr() as *mut u8, y_host.len() * 4)
+                    };
+                    self.hip.memcpy_dtoh(y_bytes, &y.buf).ok();
+                    std::fs::write(format!("{dir}/y_in.f32"),
+                        unsafe { std::slice::from_raw_parts(
+                            y_host.as_ptr() as *const u8, y_host.len() * 4) }).ok();
+
+                    std::fs::write(format!("{dir}/shape.txt"),
+                        format!("{m} {k} {batch_size}\n")).ok();
+
+                    // Run the FP16 wave64 path normally, then dump y_out.
+                    let _ = self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
+                    self.hip.device_synchronize().ok();
+
+                    let mut y_out_host = vec![0f32; batch_size * m];
+                    let y_out_bytes = unsafe {
+                        std::slice::from_raw_parts_mut(
+                            y_out_host.as_mut_ptr() as *mut u8, y_out_host.len() * 4)
+                    };
+                    self.hip.memcpy_dtoh(y_out_bytes, &y.buf).ok();
+                    std::fs::write(format!("{dir}/y_out.f32"),
+                        unsafe { std::slice::from_raw_parts(
+                            y_out_host.as_ptr() as *const u8, y_out_host.len() * 4) }).ok();
+
+                    // ALSO run the dp4a kernel into a scratch Y (starting from
+                    // the same y_in we already saved) and dump that output as
+                    // y_mmq.f32. This lets us compare MMQ output IN-PROCESS vs
+                    // OUT-OF-PROCESS to detect cross-kernel state corruption.
+                    let y_mmq_scratch = self.zeros(&[batch_size * m], DType::F32).ok();
+                    if let Some(y_mmq) = y_mmq_scratch {
+                        // Restore y_in into the scratch buffer (we have it on host)
+                        let y_in_bytes = unsafe {
+                            std::slice::from_raw_parts(y_host.as_ptr() as *const u8, y_host.len() * 4)
+                        };
+                        self.hip.memcpy_htod(&y_mmq.buf, y_in_bytes).ok();
+                        let _ = self.gemm_hfq4g256_residual_mmq_gfx906(
+                            a_raw, x, &y_mmq, m, k, batch_size);
+                        self.hip.device_synchronize().ok();
+
+                        let mut y_mmq_host = vec![0f32; batch_size * m];
+                        let y_mmq_bytes = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                y_mmq_host.as_mut_ptr() as *mut u8, y_mmq_host.len() * 4)
+                        };
+                        self.hip.memcpy_dtoh(y_mmq_bytes, &y_mmq.buf).ok();
+                        std::fs::write(format!("{dir}/y_mmq.f32"),
+                            unsafe { std::slice::from_raw_parts(
+                                y_mmq_host.as_ptr() as *const u8, y_mmq_host.len() * 4) }).ok();
+
+                        // Quick numerical compare
+                        let mut max_err = 0f32;
+                        let mut sum_sq_err = 0f64;
+                        let mut sum_sq_ref = 0f64;
+                        for i in 0..(batch_size * m) {
+                            let r = y_out_host[i];
+                            let q = y_mmq_host[i];
+                            let e = (r - q).abs();
+                            if e > max_err { max_err = e; }
+                            sum_sq_err += (e as f64).powi(2);
+                            sum_sq_ref += (r as f64).powi(2);
+                        }
+                        let rms_err = (sum_sq_err / (batch_size * m) as f64).sqrt() as f32;
+                        let rms_ref = (sum_sq_ref / (batch_size * m) as f64).sqrt() as f32;
+                        let nrmse = rms_err / rms_ref.max(1e-12);
+                        eprintln!("  [mmq-dump] in-process MMQ vs FP16: \
+                            max_abs={max_err:.4e} NRMSE={:.4}%", nrmse * 100.0);
+
+                        self.free_tensor(y_mmq).ok();
+                    }
+
+                    eprintln!("  [mmq-dump] wrote {dir}/{{a_raw.bin,x.f32,y_in.f32,y_out.f32,y_mmq.f32,shape.txt}}");
+                    return Ok(());
+                }
+            }
+
             // gfx906 dp4a MMQ — Phase 1 path, **default OFF**.
             //
             // Status (2026-05-03): the kernel is numerically correct in
@@ -5725,9 +5843,28 @@ impl Gpu {
                 // HIPFIRE_MMQ_K_FILTER=N restricts MMQ to calls where k==N.
                 let k_filter = std::env::var("HIPFIRE_MMQ_K_FILTER").ok().and_then(|s| s.parse::<usize>().ok());
                 let k_match = k_filter.map_or(true, |kf| k == kf);
-                if use_mmq && k_match {
+                // HIPFIRE_MMQ_CALL_FILTER=N:M activates MMQ only for residual
+                // calls whose 0-indexed call number is in [N, M). Used to
+                // bisect which call corrupts the model. Call counter resets
+                // per process (not per prefill — keeping it simple for now).
+                let call_filter = std::env::var("HIPFIRE_MMQ_CALL_FILTER").ok();
+                let call_idx = {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                };
+                let call_match = match &call_filter {
+                    None => true,
+                    Some(s) => {
+                        let parts: Vec<&str> = s.split(':').collect();
+                        let lo: usize = parts.first().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        let hi: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
+                        call_idx >= lo && call_idx < hi
+                    }
+                };
+                if use_mmq && k_match && call_match {
                     if std::env::var("HIPFIRE_MMQ_TRACE").ok().as_deref() == Some("1") {
-                        eprintln!("  [mmq-trace] residual_mmq_gfx906 m={m} k={k} bs={batch_size}");
+                        eprintln!("  [mmq-trace] call={call_idx} residual_mmq_gfx906 m={m} k={k} bs={batch_size}");
                     }
                     return self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, x, y, m, k, batch_size);
                 }
