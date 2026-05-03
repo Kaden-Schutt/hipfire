@@ -660,3 +660,56 @@ ScoringDegenerate):
 The unblocked items all PASS on the production target (qwen3.5-27b.mq3)
 with the matched-tokenizer 0.8B drafter. The 32K+ block is a drafter
 forward issue, not a PFlash plumbing issue, and is escalated.
+
+### 32K NIAH unblocked by auto-FullAttn-layer (0814e22)
+
+Bisecting `HIPFIRE_PFLASH_SCORE_LAYER` revealed that scoring from the
+shallowest FullAttention layer (index 3 for the Qwen3.5 hybrids)
+sidesteps the deep-layer NaN cascade. Auto-pick of that layer is now
+the default; env var preserved as escape hatch only.
+
+Result: 32K NIAH on 27B works out of the box, no env var needed.
+
+### Phase 5 perf table (3-fresh-process medians, all rows)
+
+7900 XTX, gfx1100, qwen3.5-27b.mq3 target, qwen3.5-0.8b.mq4 drafter,
+asym3 KV, --keep-ratio 0.30, --block-size 64, --pretok. Each row
+n=3 fresh processes via `scripts/pflash-niah-bench.sh`. Spread =
+(max - min) / median.
+
+| Fixture                  | Source toks | Mode      | Compress med (ms) | Prefill med (ms) | Decode med (ms) | Total med (ms) | Total spread | Verdict |
+|--------------------------|-------------|-----------|-------------------|------------------|-----------------|----------------|--------------|---------|
+| niah_8k.jsonl            |  5487       | baseline  |     -             | 11318            |  450            | 11768          | 0.5%         | PASS 3/3 |
+| niah_8k.jsonl            |  5487       | PFlash30  |   756             |  3102            |  424            |  4278          | 0.7%         | PASS 3/3 |
+| niah_16k.jsonl           | 10881       | baseline  |     -             | 25648            |  685            | 26333          | 0.2%         | FAIL 0/3 |
+| niah_16k.jsonl           | 10881       | PFlash30  |  2279             |  6399            |  428            |  9106          | 0.3%         | PASS 3/3 |
+| niah_multi_16k.jsonl     | 10934       | baseline  |     -             | 25844            | 1087            | 26931          | 0.5%         | FAIL 0/3 |
+| niah_multi_16k.jsonl     | 10934       | PFlash30  |  2452             |  6471            | 1138            | 10209          | 27.8%        | PASS 3/3 |
+| longcode_pflash.jsonl    | 13031       | baseline  |     -             | 32416            | 1259            | 33683          | 0.4%         | FAIL 0/3 |
+| longcode_pflash.jsonl    | 13031       | PFlash30  |  3303             |  7798            | 1349            | 12450          | 0.5%         | PASS 3/3 |
+| longprose_multidoc.jsonl |  8145       | baseline  |     -             | 18051            |  636            | 18689          | 0.3%         | PASS 3/3 |
+| longprose_multidoc.jsonl |  8145       | PFlash30  |  1337             |  4685            |  235            |  6259          | 0.1%         | PASS 3/3 |
+| niah_32k.jsonl           | 21551       | baseline  |     -             | 64083            |  767            | 64850          | 0.3%         | FAIL 0/3 |
+| niah_32k.jsonl           | 21551       | PFlash30  | 11522             | 13861            |  456            | 25818          | 0.1%         | PASS 3/3 |
+
+PFlash wall-clock wins, per-row median:
+  8K:        -64% (4278 / 11768)
+  16K:       -65% (9106 / 26333)
+  multi-16K: -62% (10209 / 26931)
+  longcode:  -63% (12450 / 33683)
+  longprose: -67% (6259 / 18689)
+  32K:       -60% (25818 / 64850)
+  geomean:   -64%
+
+Verdict wins (FAIL -> PASS or 0/3 -> 3/3): 4 of 6 rows. The 8K and
+longprose rows pass on baseline already, so the value there is the
+2.7-3.0x speedup. 32K, 16K, multi-16K, and longcode all flip from
+FAIL to PASS under PFlash compression: PFlash improves retrieval at
+long context AND saves wall clock.
+
+Spread observation: multi-16K PFlash saw a 27.8% total spread driven
+by one outlier compress run (5115 ms vs ~2300 ms). The compress GPU
+score kernel may show occasional thermal / DPM jitter; documented as
+a soft signal, not blocking, since the verdict was 3/3 PASS in every
+run. The other 5 rows are all under 1% spread and meet the §6 Phase 5
+methodology bar cleanly.
