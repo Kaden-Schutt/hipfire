@@ -1,0 +1,151 @@
+{
+  "_meta": {
+    "captured_on": "2026-05-02",
+    "gpu": "gfx1100 (7900 XTX)",
+    "rocm": "system default",
+    "target": "qwen3.5-27b.mq3",
+    "drafter": "qwen3.5-0.8b.mq4",
+    "kv_mode": "asym3",
+    "keep_ratio": 0.30,
+    "block_size": 64,
+    "runs_per_row": 3,
+    "captured_via": "scripts/pflash-niah-bench.sh",
+    "captured_in_commit": "94fbd76",
+    "tolerance_pct": 10.0,
+    "_note": "Medians of 3 fresh-process runs. Tolerance is ±10% on total ms. Verdict must match exactly. Baseline rows have null compress_ms by definition."
+  },
+  "fixtures": [
+    {
+      "fixture": "benchmarks/longctx/niah/niah_8k.jsonl",
+      "label": "niah_8k_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 11318,
+      "decode_ms": 450,
+      "total_ms": 11768,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_8k.jsonl",
+      "label": "niah_8k_pflash30",
+      "mode": "pflash",
+      "compress_ms": 756,
+      "prefill_ms": 3102,
+      "decode_ms": 424,
+      "total_ms": 4278,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_16k.jsonl",
+      "label": "niah_16k_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 25648,
+      "decode_ms": 685,
+      "total_ms": 26333,
+      "verdict": "FAIL",
+      "passes": "0/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_16k.jsonl",
+      "label": "niah_16k_pflash30",
+      "mode": "pflash",
+      "compress_ms": 2279,
+      "prefill_ms": 6399,
+      "decode_ms": 428,
+      "total_ms": 9106,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+      "label": "niah_multi_16k_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 25844,
+      "decode_ms": 1087,
+      "total_ms": 26931,
+      "verdict": "FAIL",
+      "passes": "0/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_multi_16k.jsonl",
+      "label": "niah_multi_16k_pflash30",
+      "mode": "pflash",
+      "compress_ms": 2452,
+      "prefill_ms": 6471,
+      "decode_ms": 1138,
+      "total_ms": 10209,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/prompts/longcode_pflash.jsonl",
+      "label": "longcode_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 32416,
+      "decode_ms": 1259,
+      "total_ms": 33683,
+      "verdict": "FAIL",
+      "passes": "0/3"
+    },
+    {
+      "fixture": "benchmarks/prompts/longcode_pflash.jsonl",
+      "label": "longcode_pflash30",
+      "mode": "pflash",
+      "compress_ms": 3303,
+      "prefill_ms": 7798,
+      "decode_ms": 1349,
+      "total_ms": 12450,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/prompts/longprose_multidoc.jsonl",
+      "label": "longprose_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 18051,
+      "decode_ms": 636,
+      "total_ms": 18689,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/prompts/longprose_multidoc.jsonl",
+      "label": "longprose_pflash30",
+      "mode": "pflash",
+      "compress_ms": 1337,
+      "prefill_ms": 4685,
+      "decode_ms": 235,
+      "total_ms": 6259,
+      "verdict": "PASS",
+      "passes": "3/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_32k.jsonl",
+      "label": "niah_32k_baseline",
+      "mode": "baseline",
+      "compress_ms": null,
+      "prefill_ms": 64083,
+      "decode_ms": 767,
+      "total_ms": 64850,
+      "verdict": "FAIL",
+      "passes": "0/3"
+    },
+    {
+      "fixture": "benchmarks/longctx/niah/niah_32k.jsonl",
+      "label": "niah_32k_pflash30",
+      "mode": "pflash",
+      "compress_ms": 11522,
+      "prefill_ms": 13861,
+      "decode_ms": 456,
+      "total_ms": 25818,
+      "verdict": "PASS",
+      "passes": "3/3"
+    }
+  ]
+}

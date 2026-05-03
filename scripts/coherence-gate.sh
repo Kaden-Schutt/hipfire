@@ -236,4 +236,35 @@ if [ "$hard_errors" -gt 0 ]; then
     exit 1
 fi
 echo "no hard errors — review $OUT for coherence, then commit if satisfied"
+
+# ── PFlash regression stage ─────────────────────────────────────────────
+# Optional follow-up stage that asserts PFlash bench wall-clock and
+# verdicts haven't regressed against the committed baseline. Skipped
+# when target/drafter aren't present or when HIPFIRE_SKIP_PFLASH_GATE=1.
+# Release the daemon GPU lock first so pflash-gate.sh can acquire its own.
+gpu_release 2>/dev/null || true
+trap - EXIT
+
+if [ "${HIPFIRE_SKIP_PFLASH_GATE:-0}" = "1" ]; then
+    echo
+    echo "pflash-gate: SKIPPED (HIPFIRE_SKIP_PFLASH_GATE=1)"
+    exit 0
+fi
+PFLASH_TARGET="${HIPFIRE_PFLASH_TARGET:-$MODELS_DIR/qwen3.5-27b.mq3}"
+PFLASH_DRAFTER="${HIPFIRE_PFLASH_DRAFTER:-$MODELS_DIR/qwen3.5-0.8b.mq4}"
+if [ ! -f "$PFLASH_TARGET" ] || [ ! -f "$PFLASH_DRAFTER" ]; then
+    echo
+    echo "pflash-gate: SKIPPED (target or drafter not present)"
+    exit 0
+fi
+
+echo
+echo "── pflash regression stage ────────────────────────────────────────"
+HIPFIRE_PFLASH_TARGET="$PFLASH_TARGET" HIPFIRE_PFLASH_DRAFTER="$PFLASH_DRAFTER" \
+    ./scripts/pflash-gate.sh
+pflash_rc=$?
+if [ "$pflash_rc" -ne 0 ]; then
+    echo "pflash-gate: FAILED (exit $pflash_rc) — combined gate FAILED"
+    exit 1
+fi
 exit 0
