@@ -53,6 +53,17 @@ EXE="./target/release/examples/pflash_niah_bench"
 # whenever someone forgot to rebuild after editing pflash.rs / qwen35.rs /
 # llama.rs / the bench itself / the score kernel and silently report a
 # pass on outdated code. Mirror the pattern from scripts/coherence-gate.sh.
+#
+# Coverage extends through the full PFlash kernel wiring chain so a change
+# anywhere in the dispatch path forces a rebuild:
+#   - engine logic (pflash.rs, qwen35.rs, llama.rs, hfq.rs, tokenizer.rs)
+#   - bench harness (pflash_niah_bench.rs)
+#   - rdna-compute Rust wrappers + HIP-source registrations
+#       (lib.rs, kernels.rs which `include_str!`s the .hip files,
+#        dispatch.rs which holds `pflash_score_q8_kv`, compiler.rs which
+#        builds .hsaco from the .hip source)
+#   - hip-bridge FFI layer
+#   - the .hip kernel source itself
 rebuild=0
 if [ ! -x "$EXE" ]; then
     rebuild=1
@@ -64,7 +75,11 @@ else
         crates/engine/src/hfq.rs \
         crates/engine/src/tokenizer.rs \
         crates/engine/examples/pflash_niah_bench.rs \
+        crates/rdna-compute/src/lib.rs \
+        crates/rdna-compute/src/kernels.rs \
         crates/rdna-compute/src/dispatch.rs \
+        crates/rdna-compute/src/compiler.rs \
+        crates/hip-bridge/src/lib.rs \
         kernels/src/pflash_score_q8_kv.hip \
     ; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
