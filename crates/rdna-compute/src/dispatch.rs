@@ -1101,12 +1101,20 @@ impl Gpu {
             let saved_capture = self.capture_mode;
             self.capture_mode = true;
 
-            // f16 WMMA reference
-            self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+            // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
+            if self.arch == "gfx906" {
+                self.gemm_hfq4g256_residual_fp16_wave64(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+            } else {
+                self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
+            }
 
             // MMQ path
             let xq = self.ensure_q8_1_mmq_x(&x_gpu, screen_batch, k)?;
-            self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
+            if self.arch == "gfx906" {
+                self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, &x_gpu, &y_mmq, m, k, screen_batch)?;
+            } else {
+                self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
+            }
 
             self.capture_mode = saved_capture;
             self.hip.device_synchronize()?;
@@ -5848,6 +5856,10 @@ impl Gpu {
                 // bisect which call corrupts the model. Call counter resets
                 // per process (not per prefill — keeping it simple for now).
                 let call_filter = std::env::var("HIPFIRE_MMQ_CALL_FILTER").ok();
+                // HIPFIRE_MMQ_LAYER_FILTER=lo:hi maps to call indices via
+                // 2 residual calls per layer (attn-out + mlp-down). Layer N
+                // → calls [2N, 2N+1].
+                let layer_filter = std::env::var("HIPFIRE_MMQ_LAYER_FILTER").ok();
                 let call_idx = {
                     use std::sync::atomic::{AtomicUsize, Ordering};
                     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -5862,7 +5874,17 @@ impl Gpu {
                         call_idx >= lo && call_idx < hi
                     }
                 };
-                if use_mmq && k_match && call_match {
+                let layer_match = match &layer_filter {
+                    None => true,
+                    Some(s) => {
+                        let parts: Vec<&str> = s.split(':').collect();
+                        let lo: usize = parts.first().and_then(|x| x.parse().ok()).unwrap_or(0);
+                        let hi: usize = parts.get(1).and_then(|x| x.parse().ok()).unwrap_or(usize::MAX);
+                        let layer = call_idx / 2;
+                        layer >= lo && layer < hi
+                    }
+                };
+                if use_mmq && k_match && call_match && layer_match {
                     if std::env::var("HIPFIRE_MMQ_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("  [mmq-trace] call={call_idx} residual_mmq_gfx906 m={m} k={k} bs={batch_size}");
                     }
@@ -6219,10 +6241,10 @@ impl Gpu {
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
         let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
 
-        // LDS: x_qs (i32) + x_dm (half2) + tile_y (i32). half2 is 4 B; i32 is 4 B.
+        // LDS: x_qs (i32) + x_dm (float2) + tile_y (i32). float2 is 8 B; i32 is 4 B.
         let shared_mem = (
             (MMQ_Y * X_STRIDE * std::mem::size_of::<i32>())  // x_qs
-            + (X_DM_HALF2 * 4)                                // x_dm (half2 = 4 B)
+            + (X_DM_HALF2 * 8)                                // x_dm (float2 = 8 B)
             + (MMQ_X * Y_STRIDE * std::mem::size_of::<i32>())// tile_y
         ) as u32;
 
@@ -6334,6 +6356,14 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.arch == "gfx906" {
+            // gfx906 has its own dispatcher (`gemm_hfq4g256_residual_mmq_gfx906`)
+            // that handles its own quantize internally, called directly from
+            // mmq_screen_weight on gfx906. _set_prequant is RDNA3-only.
+            return Err(hip_bridge::HipError::new(0,
+                "gemm_hfq4g256_mmq_set_prequant is not supported on gfx906; \
+                 callers should route to gemm_hfq4g256_residual_mmq_gfx906 directly"));
+        }
         let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
             "gemm_hfq4g256_residual_mmq_full_set"
         } else {

@@ -84,7 +84,7 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 static __device__ __forceinline__ void load_hfq4_tile_dp4a(
     const char* __restrict__ A,
     int* __restrict__ x_qs,
-    half2* __restrict__ x_dm,
+    float2* __restrict__ x_dm,
     int row0, int kg, int M, int groups_per_row
 ) {
     // Block has 128 threads; X tile has 128 rows × 64 ints to fill.
@@ -149,7 +149,7 @@ static __device__ __forceinline__ void load_hfq4_tile_dp4a(
     // Load scale and zp once per row (broadcast across all 256 K-elements).
     const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
     const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-    x_dm[i] = make_half2((_Float16)sc, (_Float16)zp);
+    x_dm[i] = make_float2(sc, zp);
 
     // Load 32 chunks of 4 bytes each = 128 bytes of nibbles per row.
     // Each chunk produces 2 sequential x_qs ints.
@@ -181,8 +181,11 @@ static __device__ __forceinline__ void load_hfq4_tile_dp4a(
         const unsigned int n6 = (qs0 >> 24) & 0xFu;
         const unsigned int n7 = (qs0 >> 28) & 0xFu;
 
-        const int int_a = (int)(n0 | (n1 << 8) | (n2 << 16) | (n3 << 24));
-        const int int_b = (int)(n4 | (n5 << 8) | (n6 << 16) | (n7 << 24));
+        // Symmetric weight trick: center nibbles in [-8, 7] for sdot4.
+        // This reduces systematic bias when multiplied by (potentially)
+        // biased activation quantization errors.
+        const int int_a = (int)(((n0 - 8) & 0xFF) | (((n1 - 8) & 0xFF) << 8) | (((n2 - 8) & 0xFF) << 16) | (((n3 - 8) & 0xFF) << 24));
+        const int int_b = (int)(((n4 - 8) & 0xFF) | (((n5 - 8) & 0xFF) << 8) | (((n6 - 8) & 0xFF) << 16) | (((n7 - 8) & 0xFF) << 24));
 
         x_qs[i * X_STRIDE + 2 * chunk + 0] = int_a;
         x_qs[i * X_STRIDE + 2 * chunk + 1] = int_b;
@@ -246,7 +249,7 @@ static __device__ __forceinline__ void load_q8_1_tile(
 // k_offset = 0 or 32 to select which half.)
 static __device__ __forceinline__ void vec_dot_dp4a(
     const int* __restrict__ x_qs,
-    const half2* __restrict__ x_dm,
+    const float2* __restrict__ x_dm,
     const int* __restrict__ tile_y,
     float* __restrict__ sum,
     int k_offset
@@ -298,17 +301,18 @@ static __device__ __forceinline__ void vec_dot_dp4a(
                 }
 
                 // Scale/zp correction (HFQ4 affine × Q8_1 symmetric → 2 terms).
-                // Bias divisor (QI8_1 / vdr) = 8 / 8 = 1 → omitted.
-                const half2 dm_i = x_dm[i];
-                const float2 dmf = __half22float2(dm_i);
+                // Symmetric weight adjustment: since we subtracted 8 from each nibble
+                // in load_hfq4_tile_dp4a, we must add back 8 * scale_w * sum_x.
+                // Formula: s_w * d_x * sumi_sym + (z_w + 8 * s_w) * sum_x.
+                const float2 dm_i = x_dm[i];
                 const float2 dsf = __half22float2(ds_j);
-                const float scale_w = dmf.x;
-                const float zp_w    = dmf.y;
+                const float scale_w = dm_i.x;
+                const float zp_w    = dm_i.y;
                 const float d_x     = dsf.x;
                 const float sum_x   = dsf.y;
 
                 const int idx = (j0 / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE) + (i0 / WAVE_SIZE);
-                sum[idx] += scale_w * d_x * (float)sumi + zp_w * sum_x;
+                sum[idx] += scale_w * d_x * (float)sumi + (zp_w + 8.0f * scale_w) * sum_x;
             }
         }
     }
@@ -373,7 +377,7 @@ static __device__ __forceinline__ void mmq_body(
     //   tile_y: MMQ_X × Y_STRIDE (= 64 × 36) ints  =  9,216 B
     extern __shared__ int smem[];
     int*  x_qs   = smem;
-    half2* x_dm  = (half2*)(x_qs + MMQ_Y * X_STRIDE);
+    float2* x_dm  = (float2*)(x_qs + MMQ_Y * X_STRIDE);
     int*  tile_y = (int*)(x_dm + MMQ_Y);
 
     // Per-thread accumulators: 64 floats = 256 B = 64 VGPRs.
