@@ -1,0 +1,12 @@
+# Phase 0 root-cause profiling: are FP16 wave64 GEMM kernels compute- or memory-bound?
+# Per gfx906_mmq_plan.md §Phase 0 — go/no-go for the dp4a MMQ effort.
+#
+# rocprof samples one set of counters per dispatch group; needs separate
+# runs for groups that don't fit in the HW counter file. Keep groups <= 8.
+#
+# Group 1: VALU/memory pressure + LDS bank conflicts (split per rocprof HW limit)
+pmc: FetchSize MemUnitBusy MemUnitStalled VALUBusy LDSBankConflict
+# Group 2: L2 cache (run separately because of HW counter limit)
+pmc: L2CacheHit
+# Filter to the FP16 wave64 GEMM kernels we're trying to displace
+kernel: gemm_gate_up_hfq4g256_fp16_wave64 gemm_hfq4g256_residual_fp16_wave64 gemm_qkv_hfq4g256_fp16_wave64 gemm_qkvza_hfq4g256_fp16_wave64

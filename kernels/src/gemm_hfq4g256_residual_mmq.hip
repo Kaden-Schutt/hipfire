@@ -35,15 +35,59 @@ struct block_q8_1_mmq {
 
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
+// Q8_1 activation quantize: arch-portable, used by RDNA3 (this file's WMMA
+// MMQ kernel) and gfx906 (the dp4a MMQ kernel in
+// gemm_hfq4g256_residual_mmq.gfx906.hip). The body uses only width=32
+// shuffles which Phase 0 §3.5 verified are wave64-safe (each 32-lane
+// half-wave reduces independently). Block dim is (256, 1, 1); each thread
+// processes 4 float inputs. Per-32-lane group computes amax + sum over its
+// 128-element Q8_1 sub-block. See plans/phase0_complete.md.
+extern "C" __global__ void quantize_q8_1_mmq_ds4(
+    const float* __restrict__ X,
+    block_q8_1_mmq* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int token = blockIdx.y;
+    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (token >= N || i0 >= K) return;
+
+    const float4 xi = (i0 + 3 < K)
+        ? *(const float4*)(X + (long long)token * K + i0)
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, WARP_SIZE));
+    }
+
+    float sum = xi.x + xi.y + xi.z + xi.w;
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        sum += __shfl_xor(sum, offset, WARP_SIZE);
+    }
+
+    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
+    const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    char4 q;
+    q.x = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.x * id)));
+    q.y = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.y * id)));
+    q.z = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.z * id)));
+    q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.w * id)));
+
+    const int kblock = i0 / 128;
+    const int iqs = i0 & 127;
+    block_q8_1_mmq* out = Y + (long long)kblock * N + token;
+    ((char4*)out->qs)[iqs / 4] = q;
+
+    if ((iqs & 31) == 0) {
+        out->ds4[iqs / 32] = make_half2((_Float16)d, (_Float16)sum);
+    }
+}
+
 #if !HIPFIRE_RDNA3
 
-extern "C" __global__ void quantize_q8_1_mmq_ds4(
-    const float*,
-    block_q8_1_mmq*,
-    int,
-    int
-) {}
-
+// MMQ compute kernels — RDNA3 only (use WMMA i8 builtin). gfx906 dp4a
+// implementation lives in gemm_hfq4g256_residual_mmq.gfx906.hip.
 extern "C" __global__ void gemm_hfq4g256_residual_mmq(
     const char*,
     const block_q8_1_mmq*,
@@ -181,47 +225,8 @@ static __device__ __forceinline__ void mma_i8(
     acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a_vec[1], true, b_vec[1], acc[0], true);
 }
 
-extern "C" __global__ void quantize_q8_1_mmq_ds4(
-    const float* __restrict__ X,
-    block_q8_1_mmq* __restrict__ Y,
-    int K,
-    int N
-) {
-    const int token = blockIdx.y;
-    const int i0 = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
-    if (token >= N || i0 >= K) return;
-
-    const float4 xi = (i0 + 3 < K)
-        ? *(const float4*)(X + (long long)token * K + i0)
-        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-
-    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, offset, WARP_SIZE));
-    }
-
-    float sum = xi.x + xi.y + xi.z + xi.w;
-    for (int offset = 4; offset > 0; offset >>= 1) {
-        sum += __shfl_xor(sum, offset, WARP_SIZE);
-    }
-
-    const float d = amax > 1.0e-20f ? amax / 127.0f : 0.0f;
-    const float id = d > 0.0f ? 1.0f / d : 0.0f;
-    char4 q;
-    q.x = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.x * id)));
-    q.y = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.y * id)));
-    q.z = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.z * id)));
-    q.w = (char)lrintf(fmaxf(-127.0f, fminf(127.0f, xi.w * id)));
-
-    const int kblock = i0 / 128;
-    const int iqs = i0 & 127;
-    block_q8_1_mmq* out = Y + (long long)kblock * N + token;
-    ((char4*)out->qs)[iqs / 4] = q;
-
-    if ((iqs & 31) == 0) {
-        out->ds4[iqs / 32] = make_half2((_Float16)d, (_Float16)sum);
-    }
-}
+// quantize_q8_1_mmq_ds4 hoisted above the HIPFIRE_RDNA3 split (line ~38)
+// because the body is wave-portable. Phase 0 §3.5 verified.
 
 template <bool FULL>
 static __device__ __forceinline__ void load_hfq4_tile(

@@ -1,0 +1,3 @@
+# Group 1 only — rerun after L2 captured separately
+pmc: FetchSize MemUnitBusy MemUnitStalled VALUBusy LDSBankConflict
+kernel: gemm_gate_up_hfq4g256_fp16_wave64 gemm_hfq4g256_residual_fp16_wave64 gemm_qkv_hfq4g256_fp16_wave64 gemm_qkvza_hfq4g256_fp16_wave64
