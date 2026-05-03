@@ -82,6 +82,8 @@ fn main() {
     if let Some(ref m) = state.drafter_model {
         eprintln!("drafter variant: {} (layers={} kv_heads={} head_dim={})",
             m.variant_name(), m.n_layers(), m.n_kv_heads(), m.head_dim());
+        eprintln!("auto score_layer_idx: {:?} (None = no FullAttention layer)",
+            m.score_layer_idx());
     }
     if let Some(ref t) = state.drafter_tokenizer {
         eprintln!("drafter tokenizer: {} tokens", t.vocab_size());

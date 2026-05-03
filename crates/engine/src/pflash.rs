@@ -197,6 +197,34 @@ impl DrafterModel {
             DrafterModel::Hybrid { .. } => "hybrid",
         }
     }
+
+    /// Smallest layer index whose K cache is populated by the drafter
+    /// forward (i.e. a FullAttention layer for hybrids; any layer for
+    /// plain since plain is FullAttention everywhere).
+    ///
+    /// Used by `compute_scores_batched_gpu` as the source layer for
+    /// scoring. Picking the SHALLOWEST FullAttention layer dodges the
+    /// long-context RoPE-OOD NaN cascade observed on small drafters
+    /// (MANUAL_REVIEW.md): deep layers accumulate NaN once positions
+    /// exceed the drafter's trained window, but the first FullAttn
+    /// layer's K is still finite at 21K source tokens. The shallow
+    /// layer carries enough positional + content signal for the cosine
+    /// scoring math the PRD specifies.
+    ///
+    /// Returns `None` only on the pathological case of a hybrid drafter
+    /// with zero FullAttention layers, which would mean no Q8 K cache
+    /// to score against; caller should refuse load there.
+    pub fn score_layer_idx(&self) -> Option<usize> {
+        match self {
+            DrafterModel::Plain { .. } => Some(0),
+            #[cfg(feature = "deltanet")]
+            DrafterModel::Hybrid { config, .. } => {
+                config.layer_types.iter().enumerate()
+                    .find(|(_, t)| **t == qwen35::LayerType::FullAttention)
+                    .map(|(i, _)| i)
+            }
+        }
+    }
     pub fn free_gpu(self, gpu: &mut Gpu) {
         match self {
             DrafterModel::Plain { weights, scratch, .. } => {
@@ -640,9 +668,18 @@ pub fn compute_scores_batched(
     assert!(state.drafter_loaded, "compute_scores_batched: drafter not loaded");
 
     let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
+    // Same auto-pick + env-override policy as compute_scores_batched_gpu so
+    // the CPU reference path scores from the same layer as the GPU path.
+    let auto_layer = state.drafter_model.as_ref()
+        .and_then(|m| m.score_layer_idx())
+        .unwrap_or(n_layers - 1);
+    let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&i| i < n_layers)
+        .unwrap_or(auto_layer);
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
 
-    let layer_idx = n_layers - 1;
     let blocks_per_head = head_dim / 32;
     let bytes_per_head = blocks_per_head * 34;
     let bytes_per_pos = n_kv_heads * bytes_per_head;
@@ -716,18 +753,26 @@ pub fn compute_scores_batched_gpu(
 
     let (n_layers, n_kv_heads, head_dim) = drafter_prefill(state, gpu, source_tokens)?;
     let kv = state.drafter_kv.as_ref().expect("loaded -> kv");
-    // Source layer for scoring. Default = last layer (most semantic content
-    // for cross-family transfer per the PRD). HIPFIRE_PFLASH_SCORE_LAYER lets
-    // operators bisect the long-context drafter NaN issue
-    // (MANUAL_REVIEW.md): if the last layer's RoPE positions go OOD on a
-    // small drafter at 21K source tokens, picking an earlier layer with
-    // shorter effective context might still give finite K. Documented
-    // experimental knob, not part of the production contract.
+    // Source layer for scoring. Default: shallowest FullAttention layer
+    // returned by `DrafterModel::score_layer_idx` (layer 0 for plain
+    // Qwen3, the first FullAttn slot in the hybrid layer pattern for
+    // Qwen3.5/3.6). This dodges the long-context RoPE-OOD NaN cascade
+    // documented in MANUAL_REVIEW.md: deep layers accumulate NaN once
+    // positions exceed the small drafter's trained window, but the
+    // shallowest FullAttn layer's K is still finite at 21K source.
+    //
+    // HIPFIRE_PFLASH_SCORE_LAYER preserves an escape hatch for
+    // operators bisecting the issue further or experimenting with
+    // alternative scoring layers; if set and in range it overrides the
+    // auto-pick.
+    let auto_layer = state.drafter_model.as_ref()
+        .and_then(|m| m.score_layer_idx())
+        .unwrap_or(n_layers - 1);
     let layer_idx = std::env::var("HIPFIRE_PFLASH_SCORE_LAYER")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&i| i < n_layers)
-        .unwrap_or(n_layers - 1);
+        .unwrap_or(auto_layer);
     let n_blocks = (n + block_size - 1) / block_size;
 
     let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
