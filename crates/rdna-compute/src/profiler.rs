@@ -80,16 +80,21 @@ impl GpuCapability {
     pub fn detect(arch: &str, vram_bytes: u64) -> Self {
         let spec = arch_spec(arch);
 
-        // CU count from sysfs (try multiple paths)
+        // CU count from sysfs (try multiple paths). On Linux+KFD this is the only
+        // path that fires in practice — KFD `simd_count / 2` is exact per SKU.
+        // The fallback below only fires when sysfs/KFD is unavailable (Windows,
+        // restricted containers). Each gfx ID covers multiple SKUs, so we pick the
+        // smallest CU count in the family to avoid overestimating occupancy.
         let cu_count = read_sysfs_cu_count().unwrap_or_else(|| {
-            // Fallback: common defaults per arch
             match arch {
-                "gfx906" => 60,   // Vega 20 / Radeon VII / MI50 class
+                "gfx906" => 60,    // Vega 20 / Radeon VII / MI50 class
                 "gfx1010" => 40,   // RX 5700 XT
                 "gfx1030" => 60,   // RX 6800
                 "gfx1100" => 48,   // RX 7800 XT
-                "gfx1200" => 56,   // RX 9070
-                "gfx1201" => 64,   // RX 9070 XT / Radeon AI PRO R9700
+                // gfx1200: RX 9060 (28 CU) / RX 9060 XT (32 CU)
+                "gfx1200" => 28,
+                // gfx1201: RX 9070 (56 CU) / RX 9070 XT / Radeon AI PRO R9700 (64 CU)
+                "gfx1201" => 56,
                 _ => 40,
             }
         });
