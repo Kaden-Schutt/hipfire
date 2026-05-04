@@ -1,49 +1,47 @@
 # hipfire speed-gate baseline — gfx1201
-# Captured 2026-04-29 against issue #65 K4 unroll (this branch).
-# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug),
-#         HIPFIRE_DPM_WARMUP_SECS=10 (the bench's pre-prefill DPM ramp added
-#         in this branch — without it the GPU starts at DPM step 0/1 and the
-#         first ~50ms of prefill measures clock-ramp, not steady-state),
-#         R9700 with no other concurrent GPU consumers (bench-cold.sh handles
-#         this via the gpu-lock).
-# Tolerance: 0.05 (fail if any metric drops below baseline × (1 - tolerance))
+# Captured 2026-05-04 against commit 06296cf on hiptrx.
+# Hardware: 4x AMD Radeon AI PRO R9700 (one used for capture), Threadripper
+#           9970X, 128 GB RAM, ROCm 7.2.2, Ubuntu 26.04. Closes #137.
+#
+# This supersedes the 2026-04-29 capture made on a different physical R9700
+# board. The prior numbers were ~5-10% higher on small-model pp128 prefill;
+# investigation (#137) traced that to inter-board / inter-host variance
+# plus a high-tail outlier in the prior capture's distribution, not a
+# software regression. Pre-#135 (28d3d85) measured 7639-9228 on 0.8B pp128
+# across 3 samples vs 7689-7806 post-#135; the diff is purely additive at
+# the dispatch level on RDNA4, ruling out a real code regression.
+#
+# Config: KV=asym3, HIPFIRE_GRAPH=1 for 4B/9B/27B (0.8B has known hipGraph bug)
+# Tolerance: 0.05 (fail if any metric drops below baseline x (1 - tolerance))
 #
 # Measurements: best-of-2 via bench_qwen35_mq4. Two prefill sizes per model:
 #   pp32  — short-context / launch-overhead regression detector
 #   pp128 — realistic prompt / GEMM-efficiency detector
 # Decode numbers are taken from the pp32 run (warmup+50 gen is enough to settle).
+# DFlash anchors recaptured on hiptrx using qwen35-{9b,27b}-dflash-mq4.hfq drafts.
 # GROUND FLOOR — no commit may regress below these numbers.
-#
-# Prefill numbers on this gate roughly DOUBLE the prior gfx1201 floor
-# (0.8B pp128 +48%, 4B pp128 +75%, 9B pp128 +84%, 27B pp128 first capture).
-# The lift comes from K4 unroll applied to all six gfx12 WMMA GEMM kernels
-# plus the residual variant — see kernels/src/gemm_*_wmma.gfx12.hip for
-# the K-tile inner loop. Channel-tests (43/43 across hfq4 + hfq6),
-# coherence-gate (4/4 fluent outputs), and the DFlash anchors below all
-# validate.
 
-0.8b_mq4_pp32_prefill_tok_s=3967.8
-0.8b_mq4_gen_tok_s=361.0
-0.8b_mq4_pp128_prefill_tok_s=9511.5
+0.8b_mq4_pp32_prefill_tok_s=3701.7
+0.8b_mq4_gen_tok_s=374.7
+0.8b_mq4_pp128_prefill_tok_s=7701.1
 
-4b_mq4_pp32_prefill_tok_s=1977.9
-4b_mq4_gen_tok_s=150.4
-4b_mq4_pp128_prefill_tok_s=3268.7
+4b_mq4_pp32_prefill_tok_s=1654.5
+4b_mq4_gen_tok_s=149.8
+4b_mq4_pp128_prefill_tok_s=3255.7
 
-9b_mq4_pp32_prefill_tok_s=1403.9
-9b_mq4_gen_tok_s=102.0
-9b_mq4_pp128_prefill_tok_s=1894.9
+9b_mq4_pp32_prefill_tok_s=1262.2
+9b_mq4_gen_tok_s=101.5
+9b_mq4_pp128_prefill_tok_s=1794.7
 
-27b_mq4_pp32_prefill_tok_s=516.2
-27b_mq4_gen_tok_s=36.0
-27b_mq4_pp128_prefill_tok_s=566.6
+27b_mq4_pp32_prefill_tok_s=501.1
+27b_mq4_gen_tok_s=35.8
+27b_mq4_pp128_prefill_tok_s=574.3
 
-27b_3.5_dflash_lru_code_tok_s=140.48
+27b_3.5_dflash_lru_code_tok_s=138.02
 27b_3.5_dflash_lru_code_tau=9.500
-27b_3.5_dflash_merge_sort_tok_s=195.00
+27b_3.5_dflash_merge_sort_tok_s=192.69
 27b_3.5_dflash_merge_sort_tau=13.2727
-27b_3.5_dflash_merge_sort_ttft_ms=135.39
-9b_3.5_dflash_merge_sort_tok_s=360.77
+27b_3.5_dflash_merge_sort_ttft_ms=142.18
+9b_3.5_dflash_merge_sort_tok_s=354.61
 9b_3.5_dflash_merge_sort_tau=13.1538
-9b_3.5_dflash_merge_sort_ttft_ms=63.41
-
+9b_3.5_dflash_merge_sort_ttft_ms=70.84
