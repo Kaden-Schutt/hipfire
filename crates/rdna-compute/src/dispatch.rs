@@ -6209,32 +6209,55 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
-        // wave64 kernel instead of running the dp4a kernel. Used to verify
-        // that the dispatch wiring is correct independently of the kernel.
+        // wave64 kernel instead of running the dp4a kernel.
         if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
-        // Quantize activations to Q8_1 (shared with the RDNA3 path).
+        // Quantize activations to Q8_1.
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1 runs the Q8_1 quantize
-        // (writing to scratch) but then forwards to the FP16 wave64 kernel
-        // for the actual GEMM. If output is coherent under this flag,
-        // the bug is in the dp4a kernel; if not, the quantize kernel is suspect.
         if std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1") {
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
 
-        // Pick boundary-checked vs full-tile variant.
-        let kernel_name = if m % 128 == 0 && batch_size % 8 == 0 {
-            "gemm_hfq4g256_residual_mmq_gfx906_full_add"
+        // Greedy mmq_x selection matching stock.
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
+
+        // Pick variant name and source.
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfq4g256_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_add_x{}", base_name, mmq_x)
         } else {
-            "gemm_hfq4g256_residual_mmq_gfx906"
+            format!("{}_x{}", base_name, mmq_x)
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq_gfx906",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC,
-            kernel_name,
-        )?;
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC,
+            64 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        // Inline the body .cuh: the runtime hipcc compiles from cache_dir,
+        // which doesn't have kernels/src on its -I path. Strip the
+        // `#include "..._body.cuh"` line and prepend the body content.
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfq4g256_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -6253,41 +6276,40 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        // Tile shape per kernel constants (must match the .hip file).
-        const MMQ_X: usize = 8;
+        // Option B streaming topology — KEEP IN SYNC WITH body.cuh:
+        //   x_qs   : MMQ_Y * X_STRIDE ints
+        //   x_dm   : MMQ_Y float2
+        //   tile_y : mmq_x * Y_STRIDE ints
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 65;  // 2*MMQ_TILE_NE_K + 1 = 65 ints/row, dp4a +1 padding
-        const Y_STRIDE: usize = 36;  // MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4
-        const X_DM_HALF2: usize = 128;  // one half2 per row of x
+        const X_STRIDE: usize = 8;   // 32-K stream window, 8 ints/row
+        const Y_STRIDE: usize = 36;
+        const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
-        // LDS: x_qs (i32) + x_dm (float2) + tile_y (i32). float2 is 8 B; i32 is 4 B.
         let shared_mem = (
-            (MMQ_Y * X_STRIDE * std::mem::size_of::<i32>())  // x_qs
-            + (X_DM_HALF2 * 8)                                // x_dm (float2 = 8 B)
-            + (MMQ_X * Y_STRIDE * std::mem::size_of::<i32>())// tile_y
+            (MMQ_Y * X_STRIDE * 4)
+            + (X_DM_HALF2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
         ) as u32;
+        // 2 WGs/CU on gfx906 needs ≤32 KiB/WG (64 KiB cap).
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
             + batch_size * k
             + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm",
-            "gemm_hfq4g256_residual_mmq_gfx906", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", base_name, bytes);
         let result = self.launch_maybe_blob(
-            kernel_name,
+            &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [64, 2, 1],
+            [64, 4, 1], // nwarps=4
             shared_mem,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
                 b.push_i32(add_val);
                 b
             },
@@ -6296,11 +6318,7 @@ impl Gpu {
         result
     }
 
-    /// Set-mode (add=0) variant of the gfx906 dp4a MMQ kernel, reusing the
-    /// caller's pre-quantized Q8_1 X pointer. Used by fused gate_up / qkv /
-    /// qkvza dispatch on gfx906 to amortize the Q8_1 quantize across multiple
-    /// weight matrices that share the same activation. Mirrors the RDNA3
-    /// `gemm_hfq4g256_mmq_set_prequant` pattern.
+    /// Set-mode (add=0) variant of the gfx906 MMQ kernel.
     pub fn gemm_hfq4g256_mmq_set_gfx906(
         &mut self,
         a_raw: &GpuTensor,
@@ -6310,19 +6328,40 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // Pick boundary-checked vs full-tile variant. _full_set selects the
-        // add=0 entry symbol; the bounds-checked entry takes `add` as a
-        // runtime parameter.
-        let kernel_name = if m % 128 == 0 && batch_size % 8 == 0 {
-            "gemm_hfq4g256_residual_mmq_gfx906_full_set"
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 24 { 24 }
+            else if batch_size <= 32 { 32 }
+            else if batch_size <= 40 { 40 }
+            else if batch_size <= 48 { 48 }
+            else if batch_size <= 56 { 56 }
+            else { 64 };
+
+        let is_full = m % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_hfq4g256_residual_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_set_x{}", base_name, mmq_x)
         } else {
-            "gemm_hfq4g256_residual_mmq_gfx906"
+            format!("{}_x{}", base_name, mmq_x)
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq_gfx906",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC,
-            kernel_name,
-        )?;
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X16_SRC,
+            24 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X24_SRC,
+            32 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X32_SRC,
+            40 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC,
+            48 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC,
+            56 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC,
+            64 => kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_hfq4g256_residual_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_BODY_CUH,
+        );
+
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -6341,39 +6380,36 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        // Tile shape per kernel constants (must match the .hip file).
-        const MMQ_X: usize = 8;
+        // Option B streaming topology — KEEP IN SYNC WITH body.cuh
+        // (same layout invariant as residual variant above).
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 65;
+        const X_STRIDE: usize = 8;
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let shared_mem = (
-            (MMQ_Y * X_STRIDE * std::mem::size_of::<i32>())
+            (MMQ_Y * X_STRIDE * 4)
             + (X_DM_HALF2 * 8)
-            + (MMQ_X * Y_STRIDE * std::mem::size_of::<i32>())
+            + (mmq_x * Y_STRIDE * 4)
         ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
             + batch_size * m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm",
-            "gemm_hfq4g256_mmq_set_gfx906", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set_gfx906", bytes);
         let result = self.launch_maybe_blob(
-            kernel_name,
+            &kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [64, 2, 1],
+            [64, 4, 1], // nwarps=4
             shared_mem,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
+                b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
                 b.push_i32(add_val);
                 b
             },

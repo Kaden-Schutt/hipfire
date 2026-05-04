@@ -217,6 +217,18 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/
 // Symbols: gemm_hfq4g256_residual_mmq_gfx906[_full_add|_full_set]. Block (64,2,1),
 // 128×64 tile, +1 LDS padding. Uses __builtin_amdgcn_sdot4 — gfx906-only.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906.hip");
+
+// gfx906 MMQ redesign (Phase 2, plans/gfx906_mmq_redesign.md)
+// Shared body and per-mmq_x variants.
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x8.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x16.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X24_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x24.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x32.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x40.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

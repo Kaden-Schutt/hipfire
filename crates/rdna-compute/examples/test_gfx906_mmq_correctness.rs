@@ -1,12 +1,13 @@
-//! Numerical correctness test for the gfx906 dp4a MMQ residual kernel.
+//! Numerical correctness test for the gfx906 dp4a MMQ kernel.
 //!
-//! Runs `gemm_hfq4g256_residual_mmq_gfx906` and `gemm_hfq4g256_residual_fp16_wave64`
-//! on the same HFQ4 weights + same activations starting from Y=0, then
-//! reports element-wise abs error statistics.
-//!
-//! With both Y init = 0 and add=1 (residual), both kernels effectively
-//! compute Y = AX. Differences come only from quantization noise (Q8_1
-//! vs FP16 activations) and any kernel bugs.
+//! Modes (selected via `MMQ_TEST_MODE` env var):
+//!   residual (default): `gemm_hfq4g256_residual_mmq_gfx906` (add=1) vs
+//!                       `gemm_hfq4g256_residual_fp16_wave64`. Both start
+//!                       from the same non-zero Y; differences come from
+//!                       Q8_1 vs FP16 quantization noise.
+//!   set:                `gemm_hfq4g256_mmq_set_gfx906` (add=0) vs the
+//!                       same FP16 wave64 reference started from Y=0.
+//!                       Both produce Y = A·X^T.
 //!
 //! Usage: cargo run --release -p rdna-compute --example test_gfx906_mmq_correctness \
 //!        -- [M] [K] [N]
@@ -22,7 +23,9 @@ fn main() {
     let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(64);
 
     assert!(k % 256 == 0, "K must be a multiple of 256");
-    assert!(m % 128 == 0, "M must be a multiple of 128 (MMQ_Y)");
+    // M does not need to be a multiple of 128 — the bounds-checked
+    // gfx906 MMQ entry guards on row index. Allow partial-M runs to
+    // exercise the bounds-checked path.
 
     let groups_per_row = k / 256;
     let row_bytes = groups_per_row * 136;
@@ -53,18 +56,30 @@ fn main() {
 
     let x_tensor = gpu.upload_f32(&x_host, &[n * k]).expect("upload x");
 
-    // Both kernels use add=1 semantics (residual): Y += A·X^T.
-    // Initialize Y with non-zero residual content to exercise the add path
-    // the way the production model's forward pass does (Y is the residual
-    // stream coming in already populated). Same init for both kernels so
-    // any divergence comes from the GEMM, not the residual.
-    let y_init_host: Vec<f32> = (0..n * m)
-        .map(|i| {
-            let v = ((i as i64).wrapping_mul(2147483647).wrapping_add(7)) as f32;
-            (v * 1e-7) % 1.0
-        })
-        .collect();
-    let y_mmq = gpu.upload_f32(&y_init_host, &[n * m]).expect("alloc y_mmq");
+    let mode = std::env::var("MMQ_TEST_MODE").unwrap_or_else(|_| "residual".to_string());
+    let set_mode = mode == "set";
+    eprintln!("test mode: {mode}");
+
+    // residual: Y += A·X^T, both kernels start from non-zero y_init.
+    // set:      Y  = A·X^T, FP16 ref starts from zero, MMQ from garbage.
+    let y_init_host: Vec<f32> = if set_mode {
+        vec![0.0f32; n * m]
+    } else {
+        (0..n * m)
+            .map(|i| {
+                let v = ((i as i64).wrapping_mul(2147483647).wrapping_add(7)) as f32;
+                (v * 1e-7) % 1.0
+            })
+            .collect()
+    };
+    // For set-mode, prefill the MMQ output with garbage so we can verify
+    // it actually overwrites (catches a "write-back skipped" bug).
+    let y_mmq_init: Vec<f32> = if set_mode {
+        (0..n * m).map(|i| 1e3 * ((i as f32) * 0.123).sin()).collect()
+    } else {
+        y_init_host.clone()
+    };
+    let y_mmq = gpu.upload_f32(&y_mmq_init, &[n * m]).expect("alloc y_mmq");
     let y_fp16 = gpu.upload_f32(&y_init_host, &[n * m]).expect("alloc y_fp16");
 
     let n_iter = std::env::var("HFQ_TEST_N_ITER")
@@ -80,10 +95,20 @@ fn main() {
     }
     gpu.hip.device_synchronize().expect("sync after fp16");
 
-    eprintln!("--- Running gemm_hfq4g256_residual_mmq_gfx906 ---");
-    for _ in 0..n_iter {
-        gpu.gemm_hfq4g256_residual_mmq_gfx906(&a_raw, &x_tensor, &y_mmq, m, k, n)
-            .expect("mmq gfx906 launch");
+    if set_mode {
+        eprintln!("--- Running gemm_hfq4g256_mmq_set_gfx906 (set, add=0) ---");
+        // gemm_hfq4g256_mmq_set_gfx906 takes a pre-quantized Q8_1 X pointer.
+        let xq_ptr = gpu.ensure_q8_1_mmq_x(&x_tensor, n, k).expect("quantize x → q8_1");
+        for _ in 0..n_iter {
+            gpu.gemm_hfq4g256_mmq_set_gfx906(&a_raw, xq_ptr, &y_mmq, m, k, n)
+                .expect("mmq set gfx906 launch");
+        }
+    } else {
+        eprintln!("--- Running gemm_hfq4g256_residual_mmq_gfx906 ---");
+        for _ in 0..n_iter {
+            gpu.gemm_hfq4g256_residual_mmq_gfx906(&a_raw, &x_tensor, &y_mmq, m, k, n)
+                .expect("mmq gfx906 launch");
+        }
     }
     gpu.hip.device_synchronize().expect("sync after mmq");
 

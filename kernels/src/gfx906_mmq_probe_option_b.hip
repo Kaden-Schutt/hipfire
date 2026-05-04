@@ -7,26 +7,14 @@
 #define WAVE_SIZE 64
 #define MMQ_TILE_NE_K 32
 
-// Option B: 32-K streaming x_qs
-// (128 rows * 32 K-elements / 4 elements-per-int) = 1024 ints.
-// But we need padding for ds_read_b128 alignment (X_STRIDE=68)
-// Wait, 32 K-elements is 32/4 = 8 ints.
-// If X_STRIDE is 68, it covers 68 * 4 = 272 K-elements.
-// My previous calc for Option B: "x_qs = 128 rows * 32 K-elements... no"
-// Stock's Q4_0 x_qs size = mmq_y * MMQ_TILE_NE_K = 128 * 32 = 4096 ints?
-// No, K elements are nibbles. 128 rows * 32 K-elements = 4096 nibbles = 2048 bytes.
-// Wait, stock's calc for Q4_0: mmq_y * MMQ_TILE_NE_K + mmq_y.
-// 128 * 32 + 128 = 4224 ints.
-// Why ints? Because they unpack into ints for dp4a.
-// So 128 rows * 32 elements * 1 int/element (if unpacked) = 4096 ints.
-// Our unpacked x_qs stride was 68. 128 * 68 = 8704 ints.
-// 8704 * 4 = 34,816 B. (This was the 256-K case).
-// 32-K case: 128 rows * 8 ints-per-row (since 32/4 = 8).
-// 128 * 8 = 1024 ints = 4096 B.
-// Plus padding for alignment? If we use X_STRIDE=68 we are back to 34KB.
-// If we want to stream 32-K, we only need X_STRIDE=8 or 12 or 16.
-// Let's use X_STRIDE=16 (64 bytes, 16-byte aligned).
-// 128 * 16 * 4 = 8192 B = 8 KiB.
+// Option B: 32-K streaming x_qs.
+// 32 K-elements unpacked = 8 ints/row. With X_STRIDE_STREAM=16 the per-row
+// LDS footprint is 16 ints × 4 B = 64 B (16-byte aligned, headroom for
+// ds_read_b128). Total x_qs = 128 rows × 16 ints × 4 B = 8 KiB.
+//
+// NOTE (2026-05-04): the shipping body.cuh uses X_STRIDE=8 (no headroom)
+// because the dp4a path only reads 8 ints/row. This probe stub keeps =16
+// for historical comparison with phase2a_probe_results.md.
 
 #define X_STRIDE_STREAM 16
 #define Y_STRIDE 36
