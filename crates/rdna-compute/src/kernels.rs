@@ -208,6 +208,27 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../
 // the residual-GEMM gap on 9B prefill (42% of decode-batch GEMM time was
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+// gfx12 (RDNA4) iu4 K=32 variant of HFQ4-G256 residual GEMM (v1 / PR #140).
+// Quality-fails on coherence gate at d6ef999 — kept as the foundation that
+// the v4 path supersedes. See gemm_hfq4v4_residual_iu4.gfx12.hip.
+pub const GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_iu4.gfx12.hip");
+// Q4_1 (signed INT4 in [-7,7], per-K=32 d/sum metadata) activation quantizer
+// for gfx12. Sister of `quantize_q8_1_mmq_ds4_gfx12` but produces INT4
+// instead of INT8. Output layout `block_q4_1_mmq` is 80 B per K=128 of one
+// token. Used by both `ensure_q4_1_x` (for v1 iu4 path) and the new HFQ4v4
+// iu4 path.
+pub const QUANTIZE_Q4_1_GFX12_SRC: &str = include_str!("../../../kernels/src/quantize_q4_1.gfx12.hip");
+// gfx12 (RDNA4) HFQ4v4 iu4 K=32 residual GEMM. Sister of
+// GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC (the v1 quality-fail path) but with
+// a redesigned weight format: per-K=32-group FP16 d (no per-group m),
+// per-row FP16 mu sidecar (the SmoothQuant transfer). Activations are
+// signed Q4 (Q4_1) just like v1, but the kernel applies a final
+// `mu_w[r] * sum_q_a[c]` correction that absorbs the per-channel
+// activation×weight mean back into the output, recovering the signal that
+// v1's symmetric-Q4 activation clipping destroyed. Quality-validated on
+// gfx1201 (hiptrx) at branch feat/hfq4v4-gfx12-iu4-wmma. Both A and B
+// inputs to the iu4 wmma are signed (a_signed=true, b_signed=true).
+pub const GEMM_HFQ4V4_RESIDUAL_IU4_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4v4_residual_iu4.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
 // Pre-quantizes activations to Q8_1 + uses i8 WMMA over 128×128 tiles. Targets
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100

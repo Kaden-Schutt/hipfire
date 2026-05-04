@@ -89,6 +89,14 @@ fn has_wmma_f16_gfx12(arch: &str) -> bool {
     arch.starts_with("gfx12")
 }
 
+/// True for gfx12 RDNA4 archs that ship the iu4 K=32 wmma builtin and the
+/// HFQ4v4 / Q4_1 dispatch path. Equivalent to `has_wmma_f16_gfx12` today
+/// but kept as a separate predicate so that any future arch split between
+/// "supports gfx12 WMMA" and "supports iu4 K=32 wmma" is one-line to add.
+fn is_gfx12(arch: &str) -> bool {
+    arch.starts_with("gfx12")
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -369,6 +377,21 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Q4_1/MMQ scratch for prefill activations (gfx12 iu4 path). Layout
+    /// matches `block_q4_1_mmq` (80 B per K=128 of one token), ordered by
+    /// [K/128 block, batch column]. Used by both v1 (HFQ4-G256 + iu4) and
+    /// v4 (HFQ4v4 + iu4) GEMM paths via `ensure_q4_1_x`.
+    q4_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
+    q4_1_mmq_x_scratch_bytes: usize,
+
+    /// Per-row mu sidecar registry for HFQ4v4 weights. Key: HFQ4v4 weight
+    /// device pointer (usize). Value: device-side FP16 mu tensor (M FP16
+    /// values, indexed by row). Populated by the engine model loader at
+    /// load time — the GEMM dispatch fn looks up by the weight pointer.
+    /// Memory is not freed until `Gpu` drops (weights are immutable for
+    /// a model's lifetime).
+    pub hfq4v4_mu_cache: HashMap<usize, GpuTensor>,
 }
 
 impl Gpu {
@@ -484,6 +507,9 @@ impl Gpu {
             replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            q4_1_mmq_x_scratch: None,
+            q4_1_mmq_x_scratch_bytes: 0,
+            hfq4v4_mu_cache: HashMap::new(),
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -4831,6 +4857,249 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
                 b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Ensure prefill activations are quantized into the `block_q4_1_mmq`
+    /// layout (gfx12 iu4 path). Sister of `ensure_q8_1_mmq_x` — same
+    /// [K/128 block, batch] ordering, but each block is 80 B (4 half2 ds +
+    /// 64 INT4 qs) instead of 144 B for Q8_1.
+    ///
+    /// Arch-gated to gfx1200/gfx1201 (the kernel stubs out elsewhere). Used
+    /// by both v1 (HFQ4-G256 + iu4) and v4 (HFQ4v4 + iu4) GEMM paths.
+    pub fn ensure_q4_1_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+        self.ensure_kernel(
+            "quantize_q4_1_mmq_ds4_gfx12",
+            kernels::QUANTIZE_Q4_1_GFX12_SRC,
+            "quantize_q4_1_mmq_ds4_gfx12",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let block_q4_1_mmq_bytes = 80usize;
+        let needed = blocks_k * batch_size * block_q4_1_mmq_bytes;
+        if self.q4_1_mmq_x_scratch_bytes < needed {
+            self.q4_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.q4_1_mmq_x_scratch_bytes = needed;
+        }
+
+        let src_ptr = x.buf.as_ptr();
+        let out_ptr = self.q4_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let mut xp = src_ptr;
+        let mut yp = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((k + 1023) / 1024) as u32;
+        let grid_y = batch_size as u32;
+        self.launch_maybe_blob(
+            "quantize_q4_1_mmq_ds4_gfx12",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+
+        Ok(self.q4_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// gfx12 HFQ4-G256 + iu4 K=32 residual GEMM (v1 path, PR #140).
+    ///
+    /// QUALITY-FAILS on coherence gate (PR #140 / project_gfx12_iu4_breakthrough_2026_05_04.md).
+    /// Kept in tree as the foundation that the v4 path supersedes — gated
+    /// behind `HIPFIRE_GFX12_IU4=1` for research only. DO NOT flip the
+    /// default; the per-element Q4_1 noise compounds across layers into
+    /// unintelligible output. Use `gemm_hfq4v4_residual_iu4_gfx12` instead.
+    pub fn gemm_hfq4g256_residual_iu4_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "gemm_hfq4g256_residual_iu4_gfx12 requires gfx1200/gfx1201, got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_iu4_gfx12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC,
+            "gemm_hfq4g256_residual_iu4_gfx12",
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = if add { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_X_K_QS: usize = 32;
+        const MMQ_TILE_Y_K_Q4_1: usize = 20;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let shared_mem = ((MMQ_X * MMQ_TILE_Y_K_Q4_1
+                          + MMQ_Y * MMQ_TILE_X_K_QS) * std::mem::size_of::<i32>()
+                         + MMQ_Y * std::mem::size_of::<u32>()) as u32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_hfq4g256_residual_iu4_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_iu4_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 HFQ4v4 + iu4 K=32 residual GEMM (v4, the quality-corrected path).
+    ///
+    /// Sister of `gemm_hfq4g256_residual_iu4_gfx12` (v1 / PR #140) but with
+    /// the redesigned weight format (per-K=32 FP16 d only, per-row FP16 mu
+    /// sidecar) and a SmoothQuant-style mu-correction term. The activation
+    /// distribution per-channel is mean-centered → symmetric Q4 [-7, 7]
+    /// captures real dynamic range instead of clipping fat tails. See
+    /// `kernels/src/gemm_hfq4v4_residual_iu4.gfx12.hip` for the math.
+    ///
+    /// Args:
+    ///   - `a_raw`: HFQ4v4 weight blob (m × row_bytes_w bytes; raw byte tensor)
+    ///   - `mu`:    per-row FP16 mu sidecar (m FP16 values, raw byte tensor)
+    ///   - `xq`:    pre-quantized Q4_1 activations (`block_q4_1_mmq` layout,
+    ///              from `ensure_q4_1_x`)
+    ///   - `y`:    output [N × M] FP32 column-major
+    ///   - `add`:   if true, y += result; if false, y = result
+    pub fn gemm_hfq4v4_residual_iu4_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        mu: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "gemm_hfq4v4_residual_iu4_gfx12 requires gfx1200/gfx1201, got {}",
+                self.arch
+            )));
+        }
+        assert!(k % 32 == 0, "HFQ4v4 requires k % 32 == 0, got {k}");
+        self.ensure_kernel(
+            "gemm_hfq4v4_residual_iu4_gfx12",
+            kernels::GEMM_HFQ4V4_RESIDUAL_IU4_GFX12_SRC,
+            "gemm_hfq4v4_residual_iu4_gfx12",
+        )?;
+
+        // row_bytes_w = (k / 32) * 18
+        let row_bytes_w = (k / 32) * 18;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut mu_ptr = mu.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut row_bytes_val = row_bytes_w as i32;
+        let mut add_val = if add { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut mu_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut row_bytes_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_X_K_QS: usize = 16;  // i32 per row (= K=128 / 8)
+        const MMQ_TILE_X_K_DM: usize = 4;   // half d per row per kb iter
+        const MMQ_TILE_Y_K_Q4_1: usize = 20;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        // LDS:
+        //   tile_y    : 128 × 20 i32  = 10 KB
+        //   tile_x_qs : 128 × 16 i32  = 8 KB
+        //   tile_x_dm : 128 × 4 half  = 1 KB
+        let shared_mem = (MMQ_X * MMQ_TILE_Y_K_Q4_1 * std::mem::size_of::<i32>()
+                          + MMQ_Y * MMQ_TILE_X_K_QS * std::mem::size_of::<i32>()
+                          + MMQ_Y * MMQ_TILE_X_K_DM * 2) as u32;
+
+        let bytes = (m * row_bytes_w) + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_hfq4v4_residual_iu4_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4v4_residual_iu4_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(mu_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(row_bytes_val);
+                b.push_i32(add_val);
                 b
             },
         );

@@ -2,6 +2,7 @@
 
 pub mod gguf;
 pub mod hfq;
+pub mod hfq4v4;
 pub mod llama;
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
