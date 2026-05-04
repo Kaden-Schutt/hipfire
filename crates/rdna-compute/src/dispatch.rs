@@ -274,6 +274,12 @@ pub struct Gpu {
     /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
     q8_1_mmq_x_scratch_bytes: usize,
+    /// Q4_1/MMQ scratch for prefill activations (gfx12 iu4 path). Layout
+    /// matches `block_q4_1_mmq` (80 B per K=128 of one token), ordered by
+    /// [K/128 block, batch column]. Sister of `q8_1_mmq_x_scratch` for the
+    /// iu4 K=32 wmma GEMM path.
+    q4_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
+    q4_1_mmq_x_scratch_bytes: usize,
 
     // ── MMQ per-weight screening (#87) ──────────────────────────────────
     // When enabled, each weight matrix is screened on first MMQ use: a
@@ -484,6 +490,8 @@ impl Gpu {
             fp16_x_source_ptr: std::ptr::null_mut(),
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
+            q4_1_mmq_x_scratch: None,
+            q4_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
                 .map(|v| v == "1")
@@ -1083,6 +1091,65 @@ impl Gpu {
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure prefill activations are quantized into the `block_q4_1_mmq`
+    /// layout (gfx12 iu4 path). Sister of `ensure_q8_1_mmq_x` — same
+    /// [K/128 block, batch] ordering, but each block is 80 B (4 half2 ds +
+    /// 64 INT4 qs) instead of 144 B for Q8_1.
+    ///
+    /// Arch-gated to gfx1200/gfx1201 (the kernel stubs out elsewhere). The
+    /// caller is responsible for routing the iu4 GEMM path conditionally —
+    /// this helper does NOT enforce the arch guard.
+    pub fn ensure_q4_1_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+        self.ensure_kernel(
+            "quantize_q4_1_mmq_ds4_gfx12",
+            kernels::QUANTIZE_Q4_1_GFX12_SRC,
+            "quantize_q4_1_mmq_ds4_gfx12",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let block_q4_1_mmq_bytes = 80usize;  // 4 half2 ds + 64 INT4 qs
+        let needed = blocks_k * batch_size * block_q4_1_mmq_bytes;
+        if self.q4_1_mmq_x_scratch_bytes < needed {
+            self.q4_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
+            self.q4_1_mmq_x_scratch_bytes = needed;
+        }
+
+        let src_ptr = x.buf.as_ptr();
+        // Same convention as ensure_q8_1_mmq_x: re-quantize on every call.
+        // Higher-level fused callers can skip the re-quant by calling the
+        // GEMM with the already-returned pointer.
+        let out_ptr = self.q4_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        let mut xp = src_ptr;
+        let mut yp = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((k + 1023) / 1024) as u32;
+        let grid_y = batch_size as u32;
+        self.launch_maybe_blob(
+            "quantize_q4_1_mmq_ds4_gfx12",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+
+        Ok(self.q4_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -5264,6 +5331,112 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 (RDNA4) iu4 K=32 HFQ4-G256 residual GEMM.
+    ///
+    /// Sister of the `_mmq_gfx12` (iu8 K=16) and `_fp8_gfx12` paths. Uses
+    /// `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12` — 4x FP16 throughput
+    /// per AMD spec, vs 2x for iu8/FP8. HFQ4 nibbles map natively to iu4
+    /// unsigned indices (no weight conversion / no LDS staging round-trip),
+    /// the most structurally different from FP8/iu8 (which stage FP8 or INT8
+    /// in LDS via per-thread cast).
+    ///
+    /// Activation is consumed as a pre-quantized `block_q4_1_mmq` buffer
+    /// (signed INT4 in [-7,7] with per-K=32 (d, d*sum_q) metadata). Caller
+    /// owns the prequant — typical usage:
+    ///   let xq = self.ensure_q4_1_x(&x_gpu, batch, k)?;
+    ///   self.gemm_hfq4g256_residual_iu4_gfx12(a_raw, xq, y, m, k, batch, add)?;
+    /// `xq` is a `*mut c_void` pointing into `q4_1_mmq_x_scratch`.
+    ///
+    /// Arch-gated to gfx1200/gfx1201. NOT wired into production prefill
+    /// dispatch — opt-in only via direct call until correctness lands.
+    /// Layout contract validated on hiptrx by `probe_wmma_iu4_k32_layout`
+    /// (commit 03a5856 on `feat/probe-gfx12-wmma-iu4-k32`).
+    pub fn gemm_hfq4g256_residual_iu4_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        xq: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "gemm_hfq4g256_residual_iu4_gfx12 requires gfx1200/gfx1201, got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_iu4_gfx12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC,
+            "gemm_hfq4g256_residual_iu4_gfx12",
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = if add { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // Kernel constants from gemm_hfq4g256_residual_iu4.gfx12.hip:
+        //   MMQ_X = 128, MMQ_Y = 128
+        //   tile_x_qs row stride = 32 i32 (= K=256 nibbles, 8 per i32)
+        //   tile_x_dm row stride = 1 half2 (HFQ4 sc/zp per row)
+        //   tile_y     row stride = 20 i32 (= sizeof(block_q4_1_mmq) / 4)
+        //
+        // LDS budget:
+        //   tile_y:    128 cols × 20 i32 × 4 B = 10 KB
+        //   tile_x_qs: 128 rows × 32 i32 × 4 B = 16 KB
+        //   tile_x_dm: 128 half2               = 512 B
+        //   total ~ 26.5 KB (well under gfx12's ~64 KB ceiling)
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const MMQ_TILE_X_K_QS: usize = 32;
+        const MMQ_TILE_Y_K_Q4_1: usize = 20;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let shared_mem = ((MMQ_X * MMQ_TILE_Y_K_Q4_1
+                          + MMQ_Y * MMQ_TILE_X_K_QS) * std::mem::size_of::<i32>()
+                         + MMQ_Y * std::mem::size_of::<u32>()) as u32;  // half2 = 4 B = u32
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_hfq4g256_residual_iu4_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_iu4_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
                 b.push_ptr(y_ptr);
                 b.push_i32(m_val);
                 b.push_i32(k_val);

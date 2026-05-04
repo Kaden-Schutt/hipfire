@@ -264,6 +264,28 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str = include_str!("../../../ke
 // cut variant only: basic `_residual_fp8` with runtime `add` flag — no
 // `_full_add` / `_full_set` boundary-elided variants yet.
 pub const GEMM_HFQ4G256_RESIDUAL_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp8.gfx12.hip");
+// gfx12 (RDNA4) iu4 K=32 variant of the HFQ4-G256 residual GEMM. Sister of
+// GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC (the iu8 K=16 path). Uses
+// __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12 — 4x FP16 throughput per
+// AMD spec, vs 2x for iu8. HFQ4 nibbles map natively to iu4 unsigned indices
+// (no weight conversion / no LDS staging round-trip), so this variant is
+// the most structurally different from FP8/iu8 (which stage FP8 or INT8 in
+// LDS via a per-thread cast). Activation pre-quantizes via Q4_1 (signed
+// INT4 in [-7,7] with per-K=32 (d, d*sum_q) metadata) — see the sibling
+// QUANTIZE_Q4_1_GFX12_SRC. K=256 per kb iter (full HFQ4 group), 8 K=32 wmma
+// calls per (n-tile, m-tile). Layout contract validated by
+// probe_wmma_iu4_k32_layout.gfx12.hip on hiptrx silicon (commit 03a5856 on
+// `feat/probe-gfx12-wmma-iu4-k32`). First-cut variant only: basic
+// `_residual_iu4` with runtime `add` flag — no `_full_add`/`_full_set`.
+pub const GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_iu4.gfx12.hip");
+// Q4_1 (signed INT4 in [-7,7], per-K=32 d/sum metadata) activation quantizer
+// for gfx12. Sister of `quantize_q8_1_mmq_ds4_gfx12` (in
+// GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC) but produces INT4 instead of INT8 to
+// feed the iu4 K=32 wmma path. Output layout `block_q4_1_mmq` is 80 B per
+// K=128 of one token (16 B half2[4] ds + 64 B INT4 qs[64]). Used by
+// `ensure_q4_1_x` in dispatch.rs to populate the prequant cache before each
+// iu4 GEMM call.
+pub const QUANTIZE_Q4_1_GFX12_SRC: &str = include_str!("../../../kernels/src/quantize_q4_1.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 // gfx12 sister of DEQUANT_HFQ4G256_TO_F16_SRC. One-shot HFQ4-G256 -> FP8
