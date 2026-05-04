@@ -1355,6 +1355,39 @@ impl Gpu {
         }
     }
 
+    /// gfx12 (RDNA4) iu4 K=32 WMMA layout-discovery probe — issue #136 part B.
+    /// Single-wave probe that runs three patterns (A=ones B=ones, A=row-id B=ones,
+    /// A=ones B=col-id) in one launch and dumps each pattern's 32*8=256 i32 acc
+    /// to consecutive 256-i32 regions of `out`. `out` must have capacity for at
+    /// least 3*256 = 768 i32 elements.
+    pub fn probe_wmma_iu4_k32_layout(&mut self, out: &GpuTensor) -> HipResult<()> {
+        if !(self.arch == "gfx1200" || self.arch == "gfx1201") {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "probe_wmma_iu4_k32_layout requires gfx1200/gfx1201; got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "probe_wmma_iu4_k32_layout",
+            kernels::PROBE_WMMA_IU4_K32_LAYOUT_GFX12_SRC,
+            "probe_wmma_iu4_k32_layout",
+        )?;
+        let func = &self.functions["probe_wmma_iu4_k32_layout"];
+        let mut out_ptr = out.buf.as_ptr();
+        let mut params: Vec<*mut c_void> =
+            vec![&mut out_ptr as *mut _ as *mut c_void];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Wave-cooperative Q4 GEMV (Q4_F16_G32 format, 0.625 B/w). Shuffle-based nibble distribution.
     pub fn gemv_q4wave(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,

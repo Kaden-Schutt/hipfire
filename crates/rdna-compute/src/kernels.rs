@@ -218,6 +218,12 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/
 // and accumulates correctly on gfx1201 silicon. Used by the
 // `probe_wmma_iu4_k32` example (rdna-compute), not by any production path.
 pub const PROBE_WMMA_IU4_K32_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu4_k32.gfx12.hip");
+// gfx12 layout-discovery probe — three patterns (A=ones B=ones, A=row-id B=ones,
+// A=ones B=col-id) packed into one wave. Discovered the wave32 acc layout for
+// gfx12 iu4 K=32 wmma is **8-row-block** (lane l, slot j → C[8*(l>>4) + j][l & 0xF]),
+// NOT the RDNA3 stride-2 interleave. The production iu4 GEMM port writes acc
+// using this 8-row-block formula. See `probe_wmma_iu4_k32_layout` example.
+pub const PROBE_WMMA_IU4_K32_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu4_k32_layout.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
