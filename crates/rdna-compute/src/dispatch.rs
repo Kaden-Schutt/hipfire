@@ -2817,6 +2817,48 @@ impl Gpu {
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
+                // gfx906 dp4a MMQ split: qkv + z route through the new MMQ
+                // kernel (large-M outputs); beta + alpha keep the fused
+                // wave64 kernel because their M (=linear_num_value_heads,
+                // typically 32) is far below MMQ_Y=128 — bounds-checked
+                // MMQ would waste ~75% of each row-tile.
+                //
+                // The fused wave64 kernel accepts qkv_m=0, z_m=0 to handle
+                // the beta+alpha tail alone (its row-routing logic skips
+                // the qkv/z branches when those Ms are zero). See
+                // kernels/src/gemm_qkvza_hfq4g256_fp16_wave64.hip:54-61.
+                //
+                // Behind HIPFIRE_MMQ=1 (opt-in during validation). Falls
+                // through to the fused wave64 if any of qkv/z screening
+                // rejects (matches gate_up's behavior in
+                // gemm_gate_up_hfq4g256).
+                if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                    let qz_safe = if self.mmq_screen {
+                        self.mmq_screen_weight(a_qkv, qkv_m, k)
+                            && self.mmq_screen_weight(a_z, z_m, k)
+                    } else { true };
+                    if qz_safe {
+                        let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                        let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                        let r2 = if r1.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_gfx906(a_z, xq, y_z, z_m, k, batch_size)
+                        } else { Ok(()) };
+                        // Tail: beta+alpha through the fused wave64 with
+                        // qkv_m=0, z_m=0. a_qkv/a_z pointers are passed but
+                        // unread because no thread satisfies gid<qkv_m or
+                        // gid<qkv_m+z_m when both are zero.
+                        let r3 = if r2.is_ok() {
+                            self.gemm_qkvza_hfq4g256_fp16_wave64(
+                                a_qkv, a_z, a_beta, a_alpha, x,
+                                y_qkv, y_z, y_beta, y_alpha,
+                                0, 0, beta_m, alpha_m, k, batch_size,
+                            )
+                        } else { Ok(()) };
+                        return r1.and(r2).and(r3);
+                    }
+                    // else: qkv or z screening rejected — fall through
+                    // to fused wave64 (handles all 4 outputs together).
+                }
                 return self.gemm_qkvza_hfq4g256_fp16_wave64(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             if should_use_mmq(&self.arch, batch_size) {

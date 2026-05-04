@@ -99,6 +99,20 @@ Reviews integrated:
   for §Q8 deferred ds_read_b128: low expected gain since LDS issue
   is not on the critical path. Largest remaining lever: qkvza
   fused-4-output MMQ (28.87 % of GEMM time still on FP16 wave64).
+- v2.9 (2026-05-04): qkvza split — gfx906 dispatch routes qkv+z
+  through `gemm_hfq4g256_mmq_set_gfx906`, leaves beta+alpha
+  (linear_num_value_heads M=32, too narrow for MMQ_Y=128) on the
+  fused FP16 wave64 kernel called with `qkv_m=z_m=0` so its
+  row-routing handles only the small tail. **pp128: 287 → 352
+  tok/s (1.23× over the residual+gate_up commit, 2.50× over
+  baseline).** Full sweep: pp32 1.85×, pp64 2.21×, pp128 2.50×,
+  pp256 2.77× over baseline. rocprof attribution:
+  qkvza_fp16_wave64 6.30→1.15 ms/call (5.5× per-call), share
+  28.87 %→5.04 %. End-to-end correctness: 9B-reason coherence
+  prompt produces fluent identical output. This was Path A from the
+  pre-implementation analysis; Path B (true fused 4-output MMQ
+  kernel) remains §Phase 6 deferred but the gap above the plan's
+  ≥260 target after qkvza port is now 35 %.
 
 ## Goal (revised v2)
 
@@ -549,22 +563,28 @@ JIT cache correctly.
 | Prefill pp128 (within-session) | 287 tok/s, 2.04× baseline ✅ |
 | Prefill pp128 (cross-process A/B) | 2.04× confirmed, B spread 0.04% ✅ |
 
-**Optional follow-ups (priority-reordered after rocprof, 2026-05-04):**
-- **(P1)** qkvza fused-4-output MMQ kernel (Phase 6 separate plan).
-  rocprof shows qkvza_hfq4g256_fp16_wave64 at **28.87 % of GEMM time
-  ** — bigger than the entire new MMQ contribution combined (35.3 %).
-  Estimated end-to-end gain: ~14 % at 2× per-call speedup.
-- **(P2)** qkv MMQ port (currently FP16 wave64 at 8.02 %). Smaller
-  but lower-risk than qkvza (no fusion required).
-- (P3, speculative) reduce sync frequency from 8/HFQ4-group to
+**Optional follow-ups (re-prioritized after qkvza split, 2026-05-04):**
+- **(P1)** qkv MMQ port (still FP16 wave64 at 7.74 % post-split).
+  Standalone qkv kernel at K=hidden_size=4096, M=10240. Lower-risk
+  than the qkvza split since no row-routing tail. Estimated
+  end-to-end gain: ~3-4 %.
+- **(P2)** Investigate `residual_fp16_wave64` share at 32.5 % —
+  this is screening-fallback. Either screening threshold is too
+  aggressive (rejecting safe weights) or some weight matrices have
+  legitimate quant-noise issues with our kernel that shouldn't
+  exist after the redesign. Worth a closer look.
+- (P3) Path B — true fused 4-output MMQ kernel (§Phase 6).
+  Path A's split now delivers 2.50×; the marginal value of Path B
+  shrinks but isn't zero (saves the 1.15 ms beta+alpha wave64 tail).
+- (P4, speculative) reduce sync frequency from 8/HFQ4-group to
   2/HFQ4-group à la stock. Needs LDS-budget analysis — likely
   pushes back over the 32 KiB cap; revisit alongside b128.
-- (P4) ds_read_b128 vectorization (§Q8 deferred). rocprof says
+- (P5) ds_read_b128 vectorization (§Q8 deferred). rocprof says
   this lever is small — VALUBusy is at 27–41 % (not LDS-issue
   saturated) and MemUnitStalled is ~0. Expected gain ≤ 5 %.
-- (P5) Parameterize the test harness on mmq_x for repeatable
+- (P6) Parameterize the test harness on mmq_x for repeatable
   matrix runs. Polish, lowest priority.
-- (P6) Default-on flip — flip `should_use_mmq()` gfx906 branch from
+- (P7) Default-on flip — flip `should_use_mmq()` gfx906 branch from
   opt-in to default-on once stability is confirmed in the field.
 
 ### Phase 2b: full kernel rewrite (3–5 days)
