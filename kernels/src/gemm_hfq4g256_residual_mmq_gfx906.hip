@@ -280,8 +280,15 @@ static __device__ __forceinline__ void vec_dot_dp4a(
         const int kx = k01 + k_offset;  // offset into x_qs row
         const int ky = k01;             // offset into y_qs col
 
-        #pragma unroll
-        for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_NWARPS) {  // 32 iters when MMQ_X=64
+        // j0 un-unroll: serializes 4 j0 iterations to cut live-range
+        // pressure 4×. At MMQ_X=8, fully-unrolled this loop holds 64
+        // live (x_int, y_int, sumi, dm_i, dsf, ds_j, ...) sites in flight
+        // simultaneously, forcing 144 spilled VGPRs and 0.067 VMEM_WR/VALU
+        // (vs 0.001 for FP16). Serializing j0 cuts that to ~16 live sites
+        // per iter. Keeps inner v loop fully unrolled to preserve dp4a ILP4.
+        // See docs/perf-checkpoints/2026-05-04-gfx906-mmq-attribution.md.
+        #pragma unroll 1
+        for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_NWARPS) {
             const int j = j0 + threadIdx.y;
 
             // Read the (d, sum) pair for this 32-K sub-block of column j.
