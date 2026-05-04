@@ -147,11 +147,11 @@ fn has_mmq_dp4a_or_wmma(arch: &str) -> bool {
 ///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
 /// Default RDNA3 threshold is 256.
 ///
-/// **gfx906 dp4a MMQ:** uses a 128×64 batch tile (LDS-budget-constrained
-/// per llama.cpp-gfx906 reference). Default threshold is 64 (one tile),
-/// will be re-tuned in P2 once we have measurements. Currently behind
-/// `HIPFIRE_MMQ=1` (default off) while we validate correctness — see
-/// plans/gfx906_mmq_plan.md Phase 1.
+/// **gfx906 dp4a MMQ:** uses runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64}
+/// per the post-redesign kernel (plans/gfx906_mmq_redesign.md, commit
+/// c022682). Default-on at batch_size ≥ 16 — pp128 hits 462 tok/s on
+/// Qwen 9B mq4 (3.28× over FP16 wave64); below pp16 the Q8_1 quantize +
+/// per-output launch overhead dominates so FP16 wave64 wins.
 ///
 /// `HIPFIRE_MMQ` env override:
 ///   `0` / `off`            — force MMQ off (debug / regression bisect)
@@ -165,15 +165,20 @@ fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
         Some("0") | Some("off") => false,
         Some("1") | Some("on") => true,
         _ => {
-            // Default OFF on gfx906 during Phase 1 validation. Once correctness
-            // and perf are confirmed, switch to a batch-threshold default.
-            if arch == "gfx906" {
-                return false;
-            }
+            // Per-arch default min_batch:
+            //   gfx906: 16 — the post-redesign dp4a kernel beats FP16 wave64
+            //     from pp16 upward (1.46× → 3.89×). Below pp16 the Q8_1
+            //     quantize + per-output launch overhead dominates and FP16
+            //     wave64 wins. Validated by full pp sweep on Qwen 9B mq4
+            //     (commit 7972c19 follow-up).
+            //   other archs: 256 — RDNA3+ has WMMA which is genuinely faster
+            //     than MMQ at small batches; flip only when MMQ amortization
+            //     dominates.
+            let arch_min_batch: usize = if arch == "gfx906" { 16 } else { 256 };
             let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(256);
+                .unwrap_or(arch_min_batch);
             batch_size >= min_batch
         }
     }
@@ -460,8 +465,9 @@ impl Gpu {
 
         let compiler = KernelCompiler::new(&arch)?;
 
-        // Per-arch default for MMQ screening threshold. See the
-        // mmq_screen_threshold field below for rationale.
+        // Per-arch defaults for MMQ screening. See the mmq_screen and
+        // mmq_screen_threshold fields below for rationale.
+        let mmq_screen_default: bool = arch == "gfx906";
         let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
 
         Ok(Self {
@@ -485,9 +491,16 @@ impl Gpu {
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
+            // Per-arch default for MMQ per-weight screening:
+            //   gfx906: on (paired with the 0.50 threshold default below).
+            //     Acts as a regression safety net; expected to reject 0
+            //     weights at 0.50 threshold but catches future distribution
+            //     issues. Cached per weight pointer, so cost is amortized.
+            //   other archs: off — preserves prior behavior; flip only after
+            //     similar validation.
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
                 .map(|v| v == "1")
-                .unwrap_or(false),
+                .unwrap_or(mmq_screen_default),
             // Default screening threshold: 0.10 absolute error per row,
             // measured against synthetic uniform [-2, 2] activations.
             // The 0.10 default was set when the gfx906 dp4a kernel was

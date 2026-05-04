@@ -142,6 +142,33 @@ Reviews integrated:
   **pp128: 355 → 462 tok/s (+30%, 3.28× over baseline).**
   pp512: 554 tok/s = 74 % of stock llama.cpp's 750 tok/s pp512
   baseline (was 19 % before the redesign).
+- v2.12 (2026-05-04): MMQ now **default-on for gfx906** at
+  batch_size ≥ 16. `should_use_mmq()` removed the gfx906
+  unconditional return-false; now follows the same auto-routing
+  as other archs but with a gfx906-specific min_batch=16 (vs 256
+  for RDNA3+ which has WMMA). `mmq_screen` also defaults to true
+  on gfx906 (was env-only opt-in) as a regression safety net at
+  the 0.50 threshold.
+
+  Small-batch sanity sweep confirmed MMQ should NOT fire at
+  pp<16: pp2 measured 0.44× (MMQ much slower) due to per-launch
+  overhead dominating; pp8 was 0.94× (roughly even). Cutover
+  threshold of 16 is the safe choice — pp16 is already 1.46×.
+
+  Default-on full sweep with no env vars set:
+  pp2 69, pp8 120, pp16 192, pp32 276, pp64 365, **pp128 461**,
+  pp256 561, pp512 554 tok/s. Coherence gate passes all 6 rows.
+
+  rocprof attribution post-default-on:
+  - MMQ family (residual + gate_up + qkv) share 35.3 % → 66.4 %
+  - qkvza_fp16_wave64 share 28.87 % → 0.30 % (just beta+alpha tail)
+  - qkv_fp16_wave64 share 8.02 % → 0.00 %
+  - residual_fp16_wave64 share 21.55 % → 25.61 % (now mostly
+    decode-side batch=1 calls, which correctly fall below
+    min_batch=16 and use FP16 wave64)
+
+  Doc comment in dispatch.rs updated: gfx906 dp4a MMQ section
+  no longer says "default off behind HIPFIRE_MMQ=1".
 
 ## Goal (revised v2)
 
@@ -592,29 +619,29 @@ JIT cache correctly.
 | Prefill pp128 (within-session) | 287 tok/s, 2.04× baseline ✅ |
 | Prefill pp128 (cross-process A/B) | 2.04× confirmed, B spread 0.04% ✅ |
 
-**Optional follow-ups (re-prioritized after threshold bump, 2026-05-04):**
-- **(P1)** Default-on flip — flip `should_use_mmq()` gfx906 branch
-  from opt-in to default-on. 3.28× pp128 speedup with no coherence
-  regression (across 4 mq4 rows × multiple thresholds) and the
-  threshold work demonstrates the headroom is screening
-  conservatism, not real precision issues. Lowest-effort,
-  highest-impact next step — exposes the redesign's gains to
-  default-config users without requiring HIPFIRE_MMQ=1.
-- (P2) Re-profile post-threshold-bump with rocprof to see what
-  the new bottleneck is. residual_fp16_wave64 share should have
-  collapsed; new top kernels are likely _full_set_x64 +
-  _full_add_x64 + qkvza tail. Path B (true fused 4-output MMQ)
-  becomes the candidate again if the qkvza tail is now visible.
-- (P3) Investigate why pp256 ≈ pp512 (560 vs 554 tok/s) — saturation
-  at large batches suggests launch overhead or HBM ceiling, not
-  kernel inefficiency. Profile pp512 specifically.
-- (P4) Path B — true fused 4-output MMQ kernel (§Phase 6).
+**Optional follow-ups (re-prioritized after default-on, 2026-05-04):**
+- **(P1)** Investigate daemon CPU usage capping at ~200%. During
+  prefill the GPU appears starved at large batches — pp512 and
+  pp256 produce nearly identical tok/s (554 vs 561) suggesting
+  CPU dispatch is the bottleneck. Two threads = launch_kernel
+  + completion. Check whether stream-graph capture or thread
+  pinning would help.
+- (P2) Investigate why pp256 ≈ pp512 (561 vs 554 tok/s).
+  Plateau at large batches suggests launch overhead or HBM
+  ceiling. Related to P1 if the bottleneck is CPU-side.
+- (P3) Path B — true fused 4-output MMQ kernel (§Phase 6).
+  qkvza_fp16_wave64 is now down to 0.3 % share (just the tiny
+  beta+alpha tail), so Path B's marginal value is small. Revisit
+  only if it solves a launch-overhead problem.
+- (P4) The two large MMQ kernels (`_full_set_x64` 31.76 % and
+  `_full_add_x64` 19.03 %) are now 50.8 % of GEMM time. Per-call
+  improvements here would have outsized impact. Levers: sync
+  frequency reduction (P5) and/or ds_read_b128 (P6).
 - (P5, speculative) reduce sync frequency from 8/HFQ4-group to
-  2/HFQ4-group à la stock. Likely pushes back over the 32 KiB cap;
-  revisit alongside b128.
-- (P6) ds_read_b128 vectorization (§Q8 deferred). rocprof says
-  this lever is small — VALUBusy is at 27–41 % (not LDS-issue
-  saturated) and MemUnitStalled is ~0. Expected gain ≤ 5 %.
+  2/HFQ4-group à la stock. Needs LDS-budget review — likely
+  pushes back over the 32 KiB cap; revisit alongside b128.
+- (P6) ds_read_b128 vectorization (§Q8 deferred). Small per-rocprof
+  but worth retesting now that the bottleneck has shifted.
 - (P7) Parameterize the test harness on mmq_x. Polish.
 
 ### Phase 2b: full kernel rewrite (3–5 days)
