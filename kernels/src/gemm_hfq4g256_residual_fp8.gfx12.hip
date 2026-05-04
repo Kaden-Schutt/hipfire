@@ -72,6 +72,16 @@ extern "C" __global__ void gemm_hfq4g256_residual_fp8_gfx12(
     int
 ) {}
 
+extern "C" __global__ void gemm_hfq4g256_residual_fp8_preconv_gfx12(
+    const unsigned char*,
+    const float*,
+    float*,
+    int,
+    int,
+    int,
+    int
+) {}
+
 #else
 
 // E4M3 max representable magnitude (per OCP / IEEE FP8 spec).
@@ -334,7 +344,131 @@ static __device__ __forceinline__ void vec_dot_fp8_fp8_mma_gfx12(
 }
 
 // ---------------------------------------------------------------------------
-// Main FP8 residual GEMM kernel for gfx12.
+// FP8 weight tile loader — preconv variant.
+//
+// Reads pre-converted FP8 weights from a [M × K] byte buffer (1 byte per
+// element, populated by ensure_fp8_shadow at model load via
+// dequant_hfq4g256_to_fp8.gfx12.hip). Unlike load_hfq4_tile_fp8, no in-kernel
+// dequant — just a direct global → LDS memcpy. Eliminates the per-prefill
+// 8 cvt_pk_fp8_f32 calls + 8 FP32 mul-adds per thread per kb iter.
+//
+// Same LDS layout as the dequant variant: tile_x[row * 32 + k_i32] where
+// k_i32 in [0..32) covers K=[0..128) of this kb iter. 4 FP8 bytes per i32.
+// kb iter k covers FP8 bytes [k*128, (k+1)*128) per row.
+//
+// 256 threads = 16 rows-per-iter × 16 chunks-per-row. Each thread loads 8
+// FP8 bytes (= 2 int32) from global, writes 2 int32 to LDS.
+// ---------------------------------------------------------------------------
+template <bool FULL>
+static __device__ __forceinline__ void load_fp8_tile_preconv(
+    const unsigned char* __restrict__ A_fp8,
+    int* __restrict__ tile_x,
+    int row0,
+    int kb,
+    int M,
+    int K
+) {
+    const int tid = (int)(threadIdx.y * WARP_SIZE + threadIdx.x);
+    const int row_in_iter = tid >> 4;          // 0..15
+    const int k_chunk = tid & 0xF;             // 0..15, indexes 8-byte FP8 chunk in K=128
+
+    #pragma unroll
+    for (int i0 = 0; i0 < MMQ_Y; i0 += 16) {
+        const int i = i0 + row_in_iter;
+        const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+        // Direct FP8 read: row stride = K bytes, kb stride = 128 bytes,
+        // chunk stride = 8 bytes. 8-byte aligned (k_chunk * 8).
+        const int* fp8_i32 = (const int*)(A_fp8 + (long long)row * K
+                                           + kb * FP8_K_PER_KB
+                                           + k_chunk * 8);
+        tile_x[i * FP8_K_I32_STRIDE + 2 * k_chunk + 0] = fp8_i32[0];
+        tile_x[i * FP8_K_I32_STRIDE + 2 * k_chunk + 1] = fp8_i32[1];
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main FP8 residual GEMM kernel for gfx12 — preconv variant.
+//
+// Consumes pre-converted FP8 weights (from ensure_fp8_shadow). Identical to
+// gemm_hfq4g256_residual_fp8_gfx12 except for the weight load path:
+//   - that variant: HFQ4 packed (136 B / 256 elements) -> in-kernel dequant
+//     -> FP8 LDS. Costs 8 cvt + 8 muladd per thread per kb iter.
+//   - this variant: FP8 byte buffer (1 B / element) -> direct LDS memcpy.
+// All other code (activation cast, wmma inner loop, C-store) is shared.
+//
+// Trade-off vs the dequant variant:
+//   (+) eliminates the dequant arithmetic in the inner kb loop
+//   (-) doubles weight bandwidth (FP8 1.0 B/w vs HFQ4 0.531 B/w on disk)
+// Net win on compute-bound regimes; depends on bw saturation otherwise.
+// ---------------------------------------------------------------------------
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_hfq4g256_residual_fp8_preconv_gfx12(
+    const unsigned char* __restrict__ A_fp8,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    const int row0 = blockIdx.x * MMQ_Y;
+    const int col0 = blockIdx.y * MMQ_X;
+    if (row0 >= M || col0 >= N) return;
+
+    const int kb_iters = K / FP8_K_PER_KB;
+
+    extern __shared__ int smem[];
+    int* tile_x = smem;
+    int* tile_y = tile_x + MMQ_Y * FP8_K_I32_STRIDE;
+    float* tile_idS = (float*)(tile_y + MMQ_X * FP8_K_I32_STRIDE);
+
+    float sum[MMQ_X * MMQ_Y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
+
+    for (int kb = 0; kb < kb_iters; ++kb) {
+        load_fp8_tile_preconv<false>(A_fp8, tile_x, row0, kb, M, K);
+        load_activation_tile_fp8<false>(X, tile_y, tile_idS, col0, kb, K, N);
+        __syncthreads();
+        vec_dot_fp8_fp8_mma_gfx12(tile_x, tile_y, tile_idS, sum);
+        __syncthreads();
+    }
+
+    // C-store identical to dequant variant.
+    constexpr int tile_C_I = 16;
+    constexpr int tile_C_J = 16;
+    constexpr int tile_C_ne = 8;
+    constexpr int rows_per_warp = 32;
+    constexpr int ntx = rows_per_warp / tile_C_I;
+
+    const int tid = (int)threadIdx.x;
+    const int m_lane = tid & 0xF;
+    const int k_grp = tid >> 4;
+
+    const int i0 = (int)(threadIdx.y / ntx) * rows_per_warp;
+    const int j_offset_in_warp = (int)(threadIdx.y % ntx) * tile_C_J;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < MMQ_X; j0 += ntx * tile_C_J) {
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C_ne; ++l) {
+                const int i = i0 + n * tile_C_I + 8 * k_grp + l;
+                const int j = j0 + j_offset_in_warp + m_lane;
+                if (row0 + i < M && col0 + j < N) {
+                    float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+                    const float v = sum[(j0 / tile_C_J + n) * tile_C_ne + l];
+                    if (add) { *yp += v; } else { *yp = v; }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main FP8 residual GEMM kernel for gfx12 — original (in-kernel dequant) variant.
+// Kept for the case where ensure_fp8_shadow isn't pre-warmed and we want a
+// one-launch path that doesn't need the FP8 shadow buffer. Production callers
+// should prefer the _preconv variant above when the shadow is available.
 // ---------------------------------------------------------------------------
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
 void gemm_hfq4g256_residual_fp8_gfx12(

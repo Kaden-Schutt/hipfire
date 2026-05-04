@@ -5186,6 +5186,93 @@ impl Gpu {
         result
     }
 
+    /// gfx12 (RDNA4) FP8 (E4M3) HFQ4 residual GEMM — preconv variant.
+    /// Sister of `gemm_hfq4g256_residual_fp8_gfx12` that consumes pre-converted
+    /// FP8 weights from the `fp8_shadow_cache` (populated by `ensure_fp8_shadow`)
+    /// instead of dequanting HFQ4 in the inner kb loop. Eliminates the per-prefill
+    /// dequant arithmetic that was eating most of the matrix-unit throughput
+    /// edge in the bench at commit 26a5ae5 (-21% on 9B vs FP16 baseline).
+    pub fn gemm_hfq4g256_residual_fp8_preconv_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "gemm_hfq4g256_residual_fp8_preconv_gfx12 requires gfx1200/gfx1201, got {}",
+                self.arch
+            )));
+        }
+        // Lazily build (or fetch cached) the FP8 shadow of the HFQ4 weight.
+        let fp8_ptr = self.ensure_fp8_shadow(a_raw, m, k)?
+            .expect("ensure_fp8_shadow must return Some on gfx12");
+
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_fp8_gfx12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP8_GFX12_SRC,
+            "gemm_hfq4g256_residual_fp8_preconv_gfx12",
+        )?;
+
+        let mut a_ptr = fp8_ptr;
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const FP8_K_I32_STRIDE: usize = 32;
+        const TILE_IDS_FLOATS: usize = 128;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let shared_mem = ((MMQ_Y * FP8_K_I32_STRIDE
+            + MMQ_X * FP8_K_I32_STRIDE) * std::mem::size_of::<i32>()
+            + TILE_IDS_FLOATS * std::mem::size_of::<f32>()) as u32;
+
+        // Note: bytes counts the FP8 weight read (m*k bytes) instead of HFQ4
+        // (≈ 0.531 m*k). Roughly 1.9× the weight bw of HFQ4.
+        let bytes = m * k
+            + batch_size * k * 4
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_hfq4g256_residual_fp8_preconv_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_fp8_preconv_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -6044,16 +6131,29 @@ impl Gpu {
             // (#87). Unsafe weights fall through to WMMA instead.
             // gfx12 FP8 (E4M3) opt-in path. Bypasses MMQ entirely. Gated behind
             // HIPFIRE_GFX12_FP8=1 until correctness validated against coherence
-            // gate. The FP8 GEMM kernel does in-kernel HFQ4 dequant + per-tile
-            // activation FP8 cast — no Q8_1 quant pre-pass kernel, no per-K=32
-            // scale-correction loop. Targets the standalone wo + w_down path
-            // where the iu8 MMQ port regresses 27B by -8% (per
-            // project_gfx12_mmq_bench_2026_05_04.md).
+            // gate. Uses the preconv variant: HFQ4 weights are pre-converted to
+            // FP8 once at first use (cached in fp8_shadow_cache via
+            // ensure_fp8_shadow); subsequent prefills read directly from the
+            // FP8 buffer with no in-kernel dequant. Eliminates the per-kb
+            // cvt_pk_fp8_f32 work that ate the matrix-unit throughput edge in
+            // the first-cut bench (per project_gfx12_fp8_bench_2026_05_04.md).
+            //
+            // HIPFIRE_GFX12_FP8=2 falls back to the in-kernel dequant variant
+            // (no shadow cache build, no extra VRAM) for VRAM-tight scenarios.
             if is_gfx12(&self.arch)
-                && std::env::var("HIPFIRE_GFX12_FP8").ok().as_deref() == Some("1")
                 && batch_size > 1
             {
-                return self.gemm_hfq4g256_residual_fp8_gfx12(a_raw, x, y, m, k, batch_size);
+                match std::env::var("HIPFIRE_GFX12_FP8").ok().as_deref() {
+                    Some("1") => {
+                        return self.gemm_hfq4g256_residual_fp8_preconv_gfx12(
+                            a_raw, x, y, m, k, batch_size);
+                    }
+                    Some("2") => {
+                        return self.gemm_hfq4g256_residual_fp8_gfx12(
+                            a_raw, x, y, m, k, batch_size);
+                    }
+                    _ => {}
+                }
             }
             if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
                 || should_use_mmq(&self.arch, batch_size)
