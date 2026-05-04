@@ -383,6 +383,14 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+    /// Cached FP8 (E4M3) dequant of HFQ4-G256 weights. Sister of
+    /// fp16_shadow_cache. Populated lazily by ensure_fp8_shadow() on the first
+    /// MMQ-class call that wants pre-converted FP8 weights, or eagerly at
+    /// model load time if the engine pre-warms it. 2× VRAM blow-up vs HFQ4
+    /// (1.0 vs 0.531 B/w) — half the FP16-shadow tax. Used by the gfx12 FP8
+    /// GEMM path (`gemm_hfq4g256_residual_fp8_gfx12`) to skip per-prefill
+    /// in-kernel dequant.
+    fp8_shadow_cache: HashMap<usize, GpuTensor>,
 }
 
 impl Gpu {
@@ -498,6 +506,7 @@ impl Gpu {
             replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            fp8_shadow_cache: HashMap::new(),
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -1169,6 +1178,83 @@ impl Gpu {
         });
         self.mmq_screen_cache.insert(key, safe);
         safe
+    }
+
+    /// Dequant an HFQ4-G256 weight tensor [M × K] to FP8 (E4M3) [M × K] bytes
+    /// row-major. Output buffer must be pre-allocated to M*K bytes.
+    ///
+    /// Companion of `dequantize_hfq4g256_to_f16` but writes FP8 output, which
+    /// the gfx12 FP8 wmma GEMM consumes directly. Used by `ensure_fp8_shadow`
+    /// for the one-shot model-load preconversion. Arch-gated to gfx1200/1201.
+    ///
+    /// Cost is O(MK) — for a 27B model, ~27 GB written; on R9700 that runs at
+    /// PCIe-feed-from-system-RAM-or-VRAM-write-BW so it's a fraction of a
+    /// second.
+    pub fn dequantize_hfq4g256_to_fp8_gfx12(
+        &mut self,
+        w_mq4: &DeviceBuffer,
+        w_fp8: &DeviceBuffer,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "dequantize_hfq4g256_to_fp8_gfx12 requires gfx1200/gfx1201; got {}",
+                self.arch
+            )));
+        }
+        assert!(k % 256 == 0, "hfq4g256_to_fp8: K must be multiple of 256 (got {k})");
+        self.ensure_kernel(
+            "dequant_hfq4g256_to_fp8_gfx12",
+            kernels::DEQUANT_HFQ4G256_TO_FP8_GFX12_SRC,
+            "dequant_hfq4g256_to_fp8_gfx12",
+        )?;
+        let func = &self.functions["dequant_hfq4g256_to_fp8_gfx12"];
+        let mut w_in = w_mq4.as_ptr();
+        let mut w_out = w_fp8.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(func, [m as u32, groups, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params)
+        }
+    }
+
+    /// Ensure an FP8 (E4M3) shadow of `w_mq4` (HFQ4-G256, [M × K]) exists in
+    /// `fp8_shadow_cache`. Sister of `ensure_fp16_shadow` for the gfx12 FP8
+    /// wmma GEMM path.
+    ///
+    /// First call allocates M*K bytes on device and runs the FP8 dequant
+    /// kernel; subsequent calls return the cached pointer. Cache is keyed
+    /// on the MQ4 device pointer.
+    ///
+    /// Returns `Ok(None)` on non-gfx12 archs — the caller should fall back
+    /// to the FP16 dequant path. On gfx12 returns `Ok(Some(ptr))`.
+    pub fn ensure_fp8_shadow(
+        &mut self,
+        w_mq4: &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<Option<*mut c_void>> {
+        if !is_gfx12(&self.arch) { return Ok(None); }
+        let key = w_mq4.buf.as_ptr() as usize;
+        if let Some(shadow) = self.fp8_shadow_cache.get(&key) {
+            return Ok(Some(shadow.buf.as_ptr()));
+        }
+        // 1 byte per FP8 element. The GpuTensor uses Raw dtype (byte-level);
+        // the actual semantic is E4M3 — see DEQUANT_HFQ4G256_TO_FP8_GFX12_SRC
+        // docstring. Raw is the existing byte-level storage type used for
+        // quantized weight buffers (HFQ4, MQ4, etc. — see DType.size()).
+        let fp8 = self.alloc_tensor(&[m * k], DType::Raw)?;
+        self.dequantize_hfq4g256_to_fp8_gfx12(&w_mq4.buf, &fp8.buf, m, k)?;
+        let ptr = fp8.buf.as_ptr();
+        self.fp8_shadow_cache.insert(key, fp8);
+        Ok(Some(ptr))
     }
 
     /// Ensure an FP16 shadow of `w_mq4` (HFQ4-G256 format, [M × K]) exists in

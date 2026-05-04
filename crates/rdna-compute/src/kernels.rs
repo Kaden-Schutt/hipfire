@@ -266,6 +266,13 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str = include_str!("../../../ke
 pub const GEMM_HFQ4G256_RESIDUAL_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp8.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
+// gfx12 sister of DEQUANT_HFQ4G256_TO_F16_SRC. One-shot HFQ4-G256 -> FP8
+// (E4M3) dequant for model-load-time conversion. Used by ensure_fp8_shadow
+// to populate a pre-converted FP8 weight tensor that the FP8 wmma GEMM path
+// consumes directly, eliminating the per-prefill in-kernel dequant cost.
+// Storage delta vs HFQ4: 0.531 -> 1.0 B/w. 27B model expands 13.5 -> 27 GB
+// (still fits R9700's 32 GB with ~5 GB KV-cache headroom for short ctx).
+pub const DEQUANT_HFQ4G256_TO_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_fp8.gfx12.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
 // LDS-staged X variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldsx for
 // Gate 1 microbench measurement. See
