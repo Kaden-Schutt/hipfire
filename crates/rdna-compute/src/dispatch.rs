@@ -197,6 +197,22 @@ impl GpuTensor {
             dtype: self.dtype,
         }
     }
+
+    /// Build a non-owning GpuTensor handle from a raw device pointer.
+    ///
+    /// SAFETY: caller must ensure the pointer is valid for `shape.iter().product()`
+    /// elements of `dtype`, and that the underlying memory outlives this
+    /// tensor handle. The returned tensor MUST be `std::mem::forget`-ed
+    /// or wrapped in `ManuallyDrop` — do not let it run free_tensor / drop
+    /// the buffer it doesn't own.
+    pub unsafe fn from_raw_ptr(ptr: *mut std::ffi::c_void, shape: &[usize], dtype: DType) -> GpuTensor {
+        let nbytes = shape.iter().product::<usize>() * dtype.size();
+        GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, nbytes) },
+            shape: shape.to_vec(),
+            dtype,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +408,26 @@ pub struct Gpu {
     /// Memory is not freed until `Gpu` drops (weights are immutable for
     /// a model's lifetime).
     pub hfq4v4_mu_cache: HashMap<usize, GpuTensor>,
+
+    /// HFQ4v4 shadow cache: keyed by the HFQ4-G256 device pointer, stores
+    /// the pre-built v4 weight + mu sidecar tensors. Engine populates this
+    /// via `register_hfq4v4_shadow` at model-load (or first-use) time.
+    /// The dispatch path (`HIPFIRE_GFX12_HFQ4V4=1`) looks up by v1 pointer
+    /// and routes through the v4 GEMM kernel.
+    ///
+    /// We don't do the conversion in `rdna-compute` itself (would create a
+    /// circular dep on `engine::hfq4v4`) — engine owns the conversion code
+    /// and pushes shadows here.
+    pub hfq4v4_shadow_cache: HashMap<usize, (GpuTensor, GpuTensor)>,
+
+    /// Counter of standalone-residual gemm calls. Used by the iu4 / v4
+    /// dispatch gate to support layer-isolation experiments via
+    /// HIPFIRE_GFX12_IU4_MAX_CALL. Resets to 0 per Gpu instance (= per
+    /// process). For Qwen3.5 each layer makes 2 calls through this
+    /// dispatcher (wo + w_down), so MAX_CALL=2 = "iu4/v4 on layer 0
+    /// only". Diagnostic for whether quality failure cascades from one
+    /// layer or compounds across many.
+    pub iu4_call_counter: std::cell::Cell<usize>,
 }
 
 impl Gpu {
@@ -510,6 +546,8 @@ impl Gpu {
             q4_1_mmq_x_scratch: None,
             q4_1_mmq_x_scratch_bytes: 0,
             hfq4v4_mu_cache: HashMap::new(),
+            hfq4v4_shadow_cache: HashMap::new(),
+            iu4_call_counter: std::cell::Cell::new(0),
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -4864,6 +4902,32 @@ impl Gpu {
         result
     }
 
+    /// Register an HFQ4v4 shadow for the given HFQ4-G256 weight pointer.
+    /// The v4 weight blob and per-row mu sidecar must already be uploaded
+    /// to device (engine builds them via `engine::hfq4v4::convert_hfq4g256_to_hfq4v4`
+    /// + `gpu.upload_raw(...)`). The dispatch path uses the v1 pointer as
+    /// the cache key, so subsequent `gemm_hfq4g256_residual` calls with that
+    /// same v1 weight will route through the v4 kernel.
+    pub fn register_hfq4v4_shadow(
+        &mut self,
+        v1_weight: &GpuTensor,
+        v4_weight: GpuTensor,
+        v4_mu: GpuTensor,
+    ) {
+        let key = v1_weight.buf.as_ptr() as usize;
+        self.hfq4v4_shadow_cache.insert(key, (v4_weight, v4_mu));
+    }
+
+    /// Look up an HFQ4v4 shadow by its v1 (HFQ4-G256) device pointer. Returns
+    /// (v4_weight_ptr, mu_ptr) if registered. Used by the gemm dispatcher
+    /// when `HIPFIRE_GFX12_HFQ4V4=1`.
+    pub fn lookup_hfq4v4_shadow(&self, v1_weight: &GpuTensor) -> Option<(*mut c_void, *mut c_void)> {
+        let key = v1_weight.buf.as_ptr() as usize;
+        self.hfq4v4_shadow_cache
+            .get(&key)
+            .map(|(w, mu)| (w.buf.as_ptr(), mu.buf.as_ptr()))
+    }
+
     /// Ensure prefill activations are quantized into the `block_q4_1_mmq`
     /// layout (gfx12 iu4 path). Sister of `ensure_q8_1_mmq_x` — same
     /// [K/128 block, batch] ordering, but each block is 80 B (4 half2 ds +
@@ -5951,6 +6015,50 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // gfx12 HFQ4v4 + iu4 K=32 path (the quality-corrected sister of
+            // PR #140's iu4 path). Opt-in via HIPFIRE_GFX12_HFQ4V4=1; only
+            // routes if the engine has registered a v4 shadow for this v1
+            // weight pointer (via `register_hfq4v4_shadow`). If no shadow
+            // is registered, falls through to the FP16 path silently.
+            //
+            // Layer-isolation gate: HIPFIRE_GFX12_IU4_MAX_CALL=N limits v4
+            // to the first N calls per process (Qwen3.5: 2 calls/layer =
+            // wo + w_down). MAX=2 = "v4 on layer 0 only" — the falsifying
+            // bar before scaling to the full model.
+            if is_gfx12(&self.arch)
+                && std::env::var("HIPFIRE_GFX12_HFQ4V4").ok().as_deref() == Some("1")
+            {
+                if let Some((v4_w_ptr, mu_ptr)) = self.lookup_hfq4v4_shadow(a_raw) {
+                    let max_call: usize = std::env::var("HIPFIRE_GFX12_IU4_MAX_CALL")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                    let call_idx = self.iu4_call_counter.get();
+                    self.iu4_call_counter.set(call_idx + 1);
+                    if call_idx < max_call {
+                        let xq = self.ensure_q4_1_x(x, batch_size, k)?;
+                        // The v4 dispatch fn takes &GpuTensor, not raw ptrs.
+                        // Build temporary GpuTensor handles.
+                        let v4_w_tensor = unsafe {
+                            GpuTensor::from_raw_ptr(v4_w_ptr, &[(m * k / 32) * 18], DType::Raw)
+                        };
+                        let v4_mu_tensor = unsafe {
+                            GpuTensor::from_raw_ptr(mu_ptr, &[m * 2], DType::Raw)
+                        };
+                        let result = self.gemm_hfq4v4_residual_iu4_gfx12(
+                            &v4_w_tensor, &v4_mu_tensor, xq, y, m, k, batch_size, /*add=*/true,
+                        );
+                        std::mem::forget(v4_w_tensor);
+                        std::mem::forget(v4_mu_tensor);
+                        return result;
+                    }
+                    // else: falls through (MAX_CALL gate exceeded)
+                } else if std::env::var("HIPFIRE_GFX12_HFQ4V4_WARN").ok().as_deref() == Some("1") {
+                    eprintln!(
+                        "[hfq4v4] no shadow registered for weight @ {:p} (m={m}, k={k}); falling back",
+                        a_raw.buf.as_ptr()
+                    );
+                }
+            }
+
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
