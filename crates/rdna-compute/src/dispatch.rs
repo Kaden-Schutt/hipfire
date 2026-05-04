@@ -6575,6 +6575,12 @@ impl Gpu {
             let max_call: usize = std::env::var("HIPFIRE_GFX12_IU4_MAX_CALL")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
             if site_id < max_call {
+                // Optional diagnostic trace.
+                if std::env::var("HIPFIRE_IU4_CAL_DEBUG").ok().as_deref() == Some("1") {
+                    eprintln!(
+                        "[iu4-cal] site_id={site_id} m={m} k={k} n={batch_size}"
+                    );
+                }
                 if self.iu4_calibration.is_none() {
                     return Err(hip_bridge::HipError::new(0,
                         "HIPFIRE_GFX12_IU4_CALIBRATED=1 set but no .iu4cal sidecar loaded — \

@@ -69,13 +69,21 @@ fn main() {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((state >> 33) as f32) / (u32::MAX as f32)
     };
+    // Two regimes:
+    //   - REGIME=normal (default): synthetic data with ±1 typical, ±5 outliers.
+    //     Tests the math at the favorable activation scale.
+    //   - REGIME=tiny: synthetic data scaled to ±0.03 range (mimicking real
+    //     post-rmsnorm activations entering wo). Tests the bake math when
+    //     inv_s ≈ 33 (huge per-channel scale).
+    let regime = std::env::var("REGIME").unwrap_or_else(|_| "normal".to_string());
+    let act_scale: f32 = if regime == "tiny" { 0.03 } else { 1.0 };
     let x_host: Vec<f32> = (0..n * k)
         .map(|_| {
             let u = nrand();
             let v = nrand() * 2.0 - 1.0;
             // 1% outliers at ±5×, the rest within ±1.
             let mag = if u > 0.99 { 5.0 } else { 1.0 };
-            v * mag
+            v * mag * act_scale
         })
         .collect();
     let y_init_host: Vec<f32> = (0..n * m)

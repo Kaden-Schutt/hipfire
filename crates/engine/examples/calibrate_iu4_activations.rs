@@ -318,6 +318,12 @@ fn real_main() {
         let hs = hists.lock().unwrap();
         for (&sid, h) in hs.iter() {
             let s = match strategy.as_str() {
+                "center" => {
+                    // No s_a scaling — preshift is `(x - mu)` only. Math
+                    // is exact (no group-bake approximation), but Q4_1
+                    // dynamic-range pressure is unchanged from raw iu4.
+                    vec![1.0f32; h.n_channels()]
+                }
                 "mean" => h.mean_abs(),
                 _ => h.percentile_abs(99.0),
             };
