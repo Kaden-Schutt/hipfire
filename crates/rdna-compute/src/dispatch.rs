@@ -6319,6 +6319,17 @@ impl Gpu {
             if is_gfx12(&self.arch)
                 && batch_size > 1
             {
+                // gfx12 iu4 K=32 opt-in. HIPFIRE_GFX12_IU4=1. Bypasses MMQ +
+                // FP16 entirely. Q4_1 prequant + iu4 K=32 wmma — 4× FP16
+                // matrix throughput per AMD spec, HFQ4 nibbles consumed
+                // AS-IS as iu4 (no in-kernel dequant). Q4_1 activation has
+                // ~14% per-elem precision (looser than Q8_1's ~0.8%); ship
+                // requires coherence-gate validation on real models.
+                if std::env::var("HIPFIRE_GFX12_IU4").ok().as_deref() == Some("1") {
+                    let xq = self.ensure_q4_1_x(x, batch_size, k)?;
+                    return self.gemm_hfq4g256_residual_iu4_gfx12(
+                        a_raw, xq, y, m, k, batch_size, /*add=*/true);
+                }
                 match std::env::var("HIPFIRE_GFX12_FP8").ok().as_deref() {
                     Some("1") => {
                         return self.gemm_hfq4g256_residual_fp8_preconv_gfx12(
