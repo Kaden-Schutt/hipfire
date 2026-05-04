@@ -231,6 +231,19 @@ pub const PROBE_WMMA_IU4_K32_LAYOUT_GFX12_SRC: &str = include_str!("../../../ker
 // uses the same 8-row-block acc layout as iu4 K=32 before porting the MMQ
 // kernel from RDNA3 to gfx12. See `probe_wmma_iu8_k16_layout` example.
 pub const PROBE_WMMA_IU8_K16_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu8_k16_layout.gfx12.hip");
+// gfx12 (RDNA4) port of the HFQ4-G256 MMQ residual GEMM. Sister of
+// GEMM_HFQ4G256_RESIDUAL_MMQ_SRC — same 128×128 MMQ tile recipe, Q8_1
+// activation pre-quant, scale/zero correction at sub-block granularity.
+// Differences vs the RDNA3 reference (validated via the iu8 K=16 layout
+// probe above): __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12 (with the
+// _gfx12 suffix — the unsuffixed builtin compiles but won't lower on gfx12),
+// int32x2 per-lane operands (8 INT8 = K-half of one row, vs RDNA3's int32x4
+// = K=16 of one row), 2 WMMA calls per Q8_1 sub-block (one per K=16 sub-tile),
+// and the 8-row-block acc layout (lane l, slot j → C[8*(l>>4) + j][l & 0xF]).
+// Exposes `quantize_q8_1_mmq_ds4_gfx12` and `gemm_hfq4g256_residual_mmq_gfx12`;
+// skips the `_full_add` / `_full_set` boundary-elided variants for the first
+// cut (those are an easy follow-up once correctness lands on gfx1201).
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
