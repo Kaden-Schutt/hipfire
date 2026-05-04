@@ -1425,6 +1425,38 @@ impl Gpu {
         }
     }
 
+    /// gfx12 (RDNA4) FP8 (E4M3) WMMA layout-discovery probe — issue #136
+    /// part B. Same three-pattern shape as the iu4/iu8 probes but exercises
+    /// `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`. Acc is FP32
+    /// (8 floats per lane). `out` capacity: 3*256 = 768 f32 elements.
+    pub fn probe_wmma_fp8_layout(&mut self, out: &GpuTensor) -> HipResult<()> {
+        if !(self.arch == "gfx1200" || self.arch == "gfx1201") {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "probe_wmma_fp8_layout requires gfx1200/gfx1201; got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "probe_wmma_fp8_layout",
+            kernels::PROBE_WMMA_FP8_LAYOUT_GFX12_SRC,
+            "probe_wmma_fp8_layout",
+        )?;
+        let func = &self.functions["probe_wmma_fp8_layout"];
+        let mut out_ptr = out.buf.as_ptr();
+        let mut params: Vec<*mut c_void> =
+            vec![&mut out_ptr as *mut _ as *mut c_void];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// gfx12 (RDNA4) iu8 K=16 WMMA layout-discovery probe — issue #136 part B.
     /// Same shape as probe_wmma_iu4_k32_layout but exercises
     /// __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32 to discover whether the

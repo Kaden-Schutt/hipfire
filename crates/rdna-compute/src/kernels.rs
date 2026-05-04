@@ -231,6 +231,13 @@ pub const PROBE_WMMA_IU4_K32_LAYOUT_GFX12_SRC: &str = include_str!("../../../ker
 // uses the same 8-row-block acc layout as iu4 K=32 before porting the MMQ
 // kernel from RDNA3 to gfx12. See `probe_wmma_iu8_k16_layout` example.
 pub const PROBE_WMMA_IU8_K16_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu8_k16_layout.gfx12.hip");
+// gfx12 FP8 (E4M3) WMMA layout-discovery probe — three-pattern shape against
+// __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12. FP8 has 2× the matrix
+// throughput of FP16 wmma on RDNA4 (1024 vs 512 ops/cycle/CU per AMD spec)
+// — the architectural ceiling that iu8 MMQ doesn't have. Probe locks the
+// wave32 layout (first guess confirmed: same 8-row-block as iu4/iu8) before
+// writing the FP8 GEMM port. See `probe_wmma_fp8_layout` example.
+pub const PROBE_WMMA_FP8_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_fp8_layout.gfx12.hip");
 // gfx12 (RDNA4) port of the HFQ4-G256 MMQ residual GEMM. Sister of
 // GEMM_HFQ4G256_RESIDUAL_MMQ_SRC — same 128×128 MMQ tile recipe, Q8_1
 // activation pre-quant, scale/zero correction at sub-block granularity.
