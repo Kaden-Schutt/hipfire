@@ -1190,6 +1190,43 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             );
         }
 
+        // iu4 activation calibration sidecar (gfx12 SmoothQuant). When
+        // `<model>.iu4cal` is present, parse + upload to GPU and arm the
+        // calibrated dispatch path. The dispatcher only takes the
+        // calibrated path when HIPFIRE_GFX12_IU4_CALIBRATED=1, so this
+        // is a no-op cost when the env var is unset.
+        let iu4cal_path = std::path::PathBuf::from(format!("{path}.iu4cal"));
+        if iu4cal_path.exists() {
+            let t0 = std::time::Instant::now();
+            match engine::quant::iu4_calibration::Iu4Calibration::read_path(&iu4cal_path) {
+                Ok(cal) => {
+                    let n_sites = cal.n_sites();
+                    match engine::quant::iu4_calibration::upload_to_gpu(&cal, gpu) {
+                        Ok(gpu_cal) => {
+                            gpu.load_iu4_calibration(gpu_cal);
+                            eprintln!(
+                                "  iu4 calibration: loaded {n_sites} sites from {} ({:.1}ms)",
+                                iu4cal_path.display(),
+                                t0.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "  iu4 calibration: GPU upload failed: {e} \
+                                 (continuing without calibration)"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  iu4 calibration: parse {} failed: {e} (continuing without)",
+                        iu4cal_path.display()
+                    );
+                }
+            }
+        }
+
         // KV cache modes (RotorQuant-style asymmetric: K rotated + V Q8):
         //   asym3 (default) — K at 3-bit rotated, V at Q8_0. 5.5× vs fp32.
         //                     Best quality/compression tradeoff — RotorQuant "planar3".

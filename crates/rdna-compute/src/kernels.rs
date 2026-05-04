@@ -286,6 +286,19 @@ pub const GEMM_HFQ4G256_RESIDUAL_IU4_GFX12_SRC: &str = include_str!("../../../ke
 // `ensure_q4_1_x` in dispatch.rs to populate the prequant cache before each
 // iu4 GEMM call.
 pub const QUANTIZE_Q4_1_GFX12_SRC: &str = include_str!("../../../kernels/src/quantize_q4_1.gfx12.hip");
+// SmoothQuant-style per-channel activation preshift for the gfx12 iu4 path.
+// `y[t][c] = (x[t][c] - mu[c]) * inv_s[c]`. Applied BEFORE Q4_1 quant when
+// the iu4 calibration sidecar is loaded. mu / inv_s are FP16, x / y are FP32
+// (matching the Q4_1 quantizer's input shape). See
+// crates/engine/src/quant/iu4_calibration.rs for the sidecar format and math
+// derivation.
+pub const ACTIVATION_PRESHIFT_GFX12_SRC: &str = include_str!("../../../kernels/src/activation_preshift.gfx12.hip");
+// SmoothQuant weight-side bake for the gfx12 iu4 path. Walks an HFQ4-G256
+// weight in place and multiplies each (row, K=256-group) scale field by
+// `s_group[g]` from the iu4 calibration sidecar. One-shot: applied at
+// calibrated-dispatch first-touch per weight, cached thereafter. See
+// crates/engine/src/quant/iu4_calibration.rs for the math derivation.
+pub const IU4_BAKE_WEIGHT_SCALES_GFX12_SRC: &str = include_str!("../../../kernels/src/iu4_bake_weight_scales.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 // gfx12 sister of DEQUANT_HFQ4G256_TO_F16_SRC. One-shot HFQ4-G256 -> FP8

@@ -24,3 +24,4 @@ pub mod weight_pager;
 pub mod image;
 pub mod tokenizer;
 pub mod pflash;
+pub mod quant;

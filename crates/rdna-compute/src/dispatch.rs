@@ -404,6 +404,43 @@ pub struct Gpu {
     /// "iu4 on layer 0 wo+w_down only". Diagnostic for whether Q4_1 quality
     /// failure cascades from one layer or compounds across many.
     iu4_call_counter: std::cell::Cell<usize>,
+
+    // ── iu4 activation-calibration plumbing (gfx12) ───────────────────────
+    /// SmoothQuant-style runtime activation calibration sidecar. Loaded by
+    /// the engine at model-load time (`<model>.iu4cal`) and uploaded to the
+    /// GPU as one set of FP16 mu/inv_s + FP32 bias buffers per call site.
+    /// `None` means no calibration available; the iu4 dispatch gate
+    /// (`HIPFIRE_GFX12_IU4_CALIBRATED=1`) errors out with a clear message
+    /// when the sidecar is missing.
+    pub iu4_calibration: Option<crate::iu4_calibration::GpuIu4Calibration>,
+    /// FP32 scratch for the centered activation buffer:
+    ///   x_centered[t][c] = (x[t][c] - mu[c]) * inv_s[c]
+    /// Sized to `max(batch_size × k)` floats so any iu4 call site fits.
+    /// Reused across calls; resized on demand.
+    iu4_preshift_scratch: Option<DeviceBuffer>,
+    iu4_preshift_scratch_bytes: usize,
+    /// Per-weight cache of s-baked HFQ4 weights. Keyed by the original
+    /// weight pointer (usize). On first iu4-calibrated dispatch for a
+    /// given weight, we clone it into a new buffer and apply the
+    /// `iu4_bake_weight_scales_gfx12` kernel to multiply each (row,
+    /// K=256-group) scale field by `s_group[g]` — the activation-scale
+    /// migration of SmoothQuant. Subsequent calls reuse the cached pointer
+    /// directly (no re-bake cost).
+    iu4_baked_weight_cache: HashMap<usize, DeviceBuffer>,
+    /// Per-call dispatch counter for iu4 calibration site lookup. Increments
+    /// on every entry to `gemm_hfq4g256_residual` regardless of arch / mode,
+    /// so calibration-capture and calibrated-inference paths use the SAME
+    /// site ordering. Keep separate from `iu4_call_counter` (which only
+    /// increments on the iu4-gated branch).
+    pub iu4_dispatch_call_idx: std::cell::Cell<usize>,
+    /// When `Some`, `gemm_hfq4g256_residual` will download the FP32 input
+    /// activation `x` for the current dispatch site and hand it to the
+    /// closure along with `(site_id, batch_size, k, m)`. Used by the
+    /// offline calibration binary to accumulate per-site activation
+    /// statistics. `None` during normal inference (zero overhead).
+    #[allow(clippy::type_complexity)]
+    pub iu4_capture_hook:
+        Option<Box<dyn FnMut(usize, &[f32], usize, usize, usize) + Send + 'static>>,
 }
 
 impl Gpu {
@@ -522,6 +559,12 @@ impl Gpu {
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             fp8_shadow_cache: HashMap::new(),
+            iu4_calibration: None,
+            iu4_preshift_scratch: None,
+            iu4_preshift_scratch_bytes: 0,
+            iu4_baked_weight_cache: HashMap::new(),
+            iu4_dispatch_call_idx: std::cell::Cell::new(0),
+            iu4_capture_hook: None,
             iu4_call_counter: std::cell::Cell::new(0),
         }).map(|mut gpu| {
             if gpu.force_blob_path {
@@ -1158,6 +1201,206 @@ impl Gpu {
         )?;
 
         Ok(self.q4_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the iu4 preshift scratch buffer is at least `batch_size × k × 4`
+    /// bytes. Returns the device pointer to the scratch.
+    fn ensure_iu4_preshift_scratch(&mut self, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
+        let needed = batch_size * k * std::mem::size_of::<f32>();
+        if self.iu4_preshift_scratch_bytes < needed {
+            self.iu4_preshift_scratch = Some(self.hip.malloc(needed)?);
+            self.iu4_preshift_scratch_bytes = needed;
+        }
+        Ok(self.iu4_preshift_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Run the SmoothQuant per-channel preshift kernel:
+    ///   y[t][c] = (x[t][c] - mu_a[c]) * inv_s_a[c]
+    ///
+    /// `x` is FP32 [batch_size × k]. `mu_a` and `inv_s_a` are FP16 [k].
+    /// Output is written into the iu4 preshift scratch and returned as a
+    /// raw device pointer (caller treats it as FP32 [batch_size × k]).
+    ///
+    /// Arch-gated to gfx1200/gfx1201 (the kernel stubs out elsewhere).
+    fn iu4_preshift(
+        &mut self,
+        x_ptr: *mut c_void,
+        mu_a_ptr: *mut c_void,
+        inv_s_a_ptr: *mut c_void,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        self.ensure_kernel(
+            "activation_preshift_gfx12",
+            kernels::ACTIVATION_PRESHIFT_GFX12_SRC,
+            "activation_preshift_gfx12",
+        )?;
+        let out_ptr = self.ensure_iu4_preshift_scratch(batch_size, k)?;
+
+        let mut xp = x_ptr;
+        let mut mp = mu_a_ptr;
+        let mut isp = inv_s_a_ptr;
+        let mut yp = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut mp as *mut _ as *mut c_void,
+            &mut isp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((k + 1023) / 1024) as u32;
+        let grid_y = batch_size as u32;
+        self.launch_maybe_blob(
+            "activation_preshift_gfx12",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(mp);
+                b.push_ptr(isp);
+                b.push_ptr(yp);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        Ok(out_ptr)
+    }
+
+    /// Engine-side accessor: install a calibration sidecar (uploaded to GPU
+    /// memory) into this Gpu instance. After this returns, calling
+    /// `gemm_hfq4g256_residual` with `HIPFIRE_GFX12_IU4_CALIBRATED=1` will
+    /// route the call through the SmoothQuant-style preshift + iu4 GEMM
+    /// path. Replaces any previously loaded calibration.
+    pub fn load_iu4_calibration(&mut self, cal: crate::iu4_calibration::GpuIu4Calibration) {
+        self.iu4_calibration = Some(cal);
+        // Drop any previously baked weights — the new sidecar's s_group
+        // values are different.
+        self.iu4_baked_weight_cache.clear();
+        // Reset the dispatch counter so site lookup stays aligned even if
+        // the engine swapped models.
+        self.iu4_dispatch_call_idx.set(0);
+    }
+
+    /// Run the s-bake kernel on a freshly cloned HFQ4 weight buffer, in
+    /// place. `weight_ptr` points to a [m × groups_per_row × 136 B] HFQ4
+    /// weight clone we just allocated; `s_group_ptr` points to a [groups_per_row]
+    /// FP16 group-scale vector from the calibration sidecar.
+    fn iu4_bake_weight_scales(
+        &mut self,
+        weight_ptr: *mut c_void,
+        s_group_ptr: *mut c_void,
+        m: usize,
+        groups_per_row: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "iu4_bake_weight_scales_gfx12",
+            kernels::IU4_BAKE_WEIGHT_SCALES_GFX12_SRC,
+            "iu4_bake_weight_scales_gfx12",
+        )?;
+        let mut wp = weight_ptr;
+        let mut sp = s_group_ptr;
+        let mut m_val = m as i32;
+        let mut g_val = groups_per_row as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut g_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m + 255) / 256) as u32;
+        let grid_y = groups_per_row as u32;
+        self.launch_maybe_blob(
+            "iu4_bake_weight_scales_gfx12",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(m_val);
+                b.push_i32(g_val);
+                b
+            },
+        )
+    }
+
+    /// Look up or materialize the s-baked weight clone for a given
+    /// (original weight pointer, calibration site). On first touch we
+    /// allocate a buffer the same size as the original weight,
+    /// hipMemcpy(d2d) into it, then apply the bake kernel. Returned
+    /// pointer is owned by `iu4_baked_weight_cache` and persists until
+    /// the cache is cleared (model unload / new calibration loaded).
+    fn iu4_get_or_bake_weight(
+        &mut self,
+        a_raw: &GpuTensor,
+        site_idx: usize,
+    ) -> HipResult<*mut c_void> {
+        let key = a_raw.buf.as_ptr() as usize;
+        if let Some(buf) = self.iu4_baked_weight_cache.get(&key) {
+            return Ok(buf.as_ptr());
+        }
+        let cal = self.iu4_calibration.as_ref().ok_or_else(|| {
+            hip_bridge::HipError::new(0, "iu4 calibration not loaded but bake requested")
+        })?;
+        let site = cal.sites.get(site_idx).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "iu4 site index out of range during bake")
+        })?;
+        let s_group_ptr = site.s_group.as_ptr();
+        let m_rows = site.n_output_rows as usize;
+        let groups_per_row = site.groups_per_row as usize;
+        let nbytes = m_rows * groups_per_row * 136;
+
+        // Allocate clone + d2d copy of the original weight.
+        let baked = self.hip.malloc(nbytes)?;
+        let baked_ptr = baked.as_ptr();
+        self.hip.memcpy_dtod(&baked, &a_raw.buf, nbytes)?;
+
+        // Apply the bake kernel in place on the clone.
+        self.iu4_bake_weight_scales(baked_ptr, s_group_ptr, m_rows, groups_per_row)?;
+        self.hip.device_synchronize()?;
+
+        self.iu4_baked_weight_cache.insert(key, baked);
+        // Re-borrow to return the stable pointer (the buffer just moved
+        // into the HashMap).
+        Ok(self.iu4_baked_weight_cache.get(&key).unwrap().as_ptr())
+    }
+
+    /// Engine-side accessor: clear any installed calibration.
+    pub fn clear_iu4_calibration(&mut self) {
+        self.iu4_calibration = None;
+    }
+
+    /// Engine-side accessor: install a capture hook that fires before each
+    /// `gemm_hfq4g256_residual` dispatch with the FP32 input activation. The
+    /// hook receives `(site_id, x_fp32_host, batch_size, k, m)`. Used by the
+    /// offline calibration binary; `None` during normal inference.
+    pub fn set_iu4_capture_hook(
+        &mut self,
+        hook: Option<Box<dyn FnMut(usize, &[f32], usize, usize, usize) + Send + 'static>>,
+    ) {
+        self.iu4_capture_hook = hook;
+    }
+
+    /// Reset the iu4 dispatch call counter to zero. The calibration binary
+    /// calls this between forward passes so site IDs stay deterministic
+    /// across the calibration corpus.
+    pub fn reset_iu4_dispatch_counter(&self) {
+        self.iu4_dispatch_call_idx.set(0);
+    }
+
+    /// Read the current dispatch counter (useful for assertions in tests
+    /// and for the calibration binary to check site count).
+    pub fn iu4_dispatch_count(&self) -> usize {
+        self.iu4_dispatch_call_idx.get()
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -6277,6 +6520,152 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // ── iu4 calibration plumbing (gfx12) ────────────────────────────
+        // Site index for this call. Increments BEFORE any path selection so
+        // both calibration capture and calibrated dispatch use the same
+        // ordering (capture mode runs the FP16 path, calibrated mode runs
+        // the iu4 path — both rely on `site_id` being the i-th call to
+        // gemm_hfq4g256_residual through the dense forward).
+        let site_id = self.iu4_dispatch_call_idx.get();
+        self.iu4_dispatch_call_idx.set(site_id + 1);
+
+        // Calibration capture hook: when set, download the FP32 input
+        // activation `x` and pass to the hook for stat accumulation. This
+        // is offline-only (the calibration binary turns it on) — the
+        // hipMemcpy + host alloc would be a regression in the inference
+        // hot path. Skip during graph capture mode (capture_mode==true)
+        // because hipMemcpy is illegal under stream capture.
+        if self.iu4_capture_hook.is_some() && !self.capture_mode {
+            // Read activation back to host. `x` is FP32 [batch_size × k].
+            let n_floats = batch_size * k;
+            let mut host_buf = vec![0.0f32; n_floats];
+            let host_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    host_buf.as_mut_ptr() as *mut u8,
+                    n_floats * std::mem::size_of::<f32>(),
+                )
+            };
+            // Synchronize before the read so any pending pre-GEMM kernel
+            // (rmsnorm / silu_mul / rotate) has flushed its output.
+            self.hip.device_synchronize()?;
+            self.hip.memcpy_dtoh(host_bytes, &x.buf)?;
+            // Take/replace the hook to satisfy the borrow checker — we
+            // need &mut self for memcpy AND for invoking the closure. The
+            // hook is restored before returning.
+            let mut hook = self.iu4_capture_hook.take();
+            if let Some(ref mut h) = hook {
+                (h)(site_id, &host_buf, batch_size, k, m);
+            }
+            self.iu4_capture_hook = hook;
+        }
+
+        // Calibrated iu4 path: gfx12 only, env-gated, requires sidecar.
+        // Runs SmoothQuant-style preshift → Q4_1 prequant → iu4 GEMM →
+        // bias_add. Falls through to the regular dispatch on missing
+        // sidecar / wrong arch / batch_size==1.
+        if batch_size > 1
+            && is_gfx12(&self.arch)
+            && std::env::var("HIPFIRE_GFX12_IU4_CALIBRATED").ok().as_deref() == Some("1")
+        {
+            // Optional layer-isolation gate: same shape as
+            // HIPFIRE_GFX12_IU4_MAX_CALL but for the calibrated path. Use
+            // for falsification ("does layer-0 alone stay coherent under
+            // calibration?"). Default = MAX so all sites use calibrated
+            // path.
+            let max_call: usize = std::env::var("HIPFIRE_GFX12_IU4_MAX_CALL")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+            if site_id < max_call {
+                if self.iu4_calibration.is_none() {
+                    return Err(hip_bridge::HipError::new(0,
+                        "HIPFIRE_GFX12_IU4_CALIBRATED=1 set but no .iu4cal sidecar loaded — \
+                         the engine should auto-load <model>.iu4cal at load time. \
+                         Either generate it via `cargo run --release -p engine \
+                         --example calibrate_iu4_activations -- --model <path>` or \
+                         unset the env var to fall back to FP16/MMQ."));
+                }
+                // Look up site. If the sidecar has fewer sites than dispatch
+                // calls (e.g. corpus didn't cover all layers), error rather
+                // than silently take a different path — this is a config
+                // bug we want operators to see.
+                let cal = self.iu4_calibration.as_ref().unwrap();
+                let site = cal.site_at(site_id).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, &format!(
+                        "iu4 calibration sidecar has {} sites but dispatch \
+                         call {} requested — calibration corpus must have \
+                         covered all gemm_hfq4g256_residual call sites.",
+                        cal.n_sites(), site_id
+                    ))
+                })?;
+                if site.n_channels as usize != k || site.n_output_rows as usize != m {
+                    return Err(hip_bridge::HipError::new(0, &format!(
+                        "iu4 calibration site {} shape mismatch: sidecar has \
+                         (n_channels={}, n_output_rows={}) but dispatch saw \
+                         (k={}, m={}) — recapture the sidecar against this \
+                         model.", site_id, site.n_channels, site.n_output_rows, k, m
+                    )));
+                }
+                let mu_a_ptr = site.mu_a.as_ptr();
+                let inv_s_a_ptr = site.inv_s_a.as_ptr();
+                let bias_ptr = site.w_mu_bias_f32.as_ptr();
+                let m_rows = site.n_output_rows as usize;
+                let groups_per_row = site.groups_per_row as usize;
+
+                // 0. Get or materialize the s-baked weight clone for this
+                //    site. First call allocates + d2d copies + applies the
+                //    bake kernel; subsequent calls return the cached
+                //    pointer with no extra work.
+                let baked_w_ptr = self.iu4_get_or_bake_weight(a_raw, site_id)?;
+
+                // 1. Preshift x → x_centered = (x - mu) * inv_s.
+                let preshift_ptr = self.iu4_preshift(
+                    x.buf.as_ptr(), mu_a_ptr, inv_s_a_ptr, batch_size, k)?;
+                let x_centered_buf = unsafe {
+                    DeviceBuffer::from_raw(preshift_ptr, batch_size * k * 4)
+                };
+                let x_centered = GpuTensor {
+                    buf: x_centered_buf,
+                    shape: vec![batch_size, k],
+                    dtype: DType::F32,
+                };
+                // 2. Q4_1 prequant of the centered activation.
+                let xq = self.ensure_q4_1_x(&x_centered, batch_size, k)?;
+                std::mem::forget(x_centered);  // borrow only — no free
+
+                // 3. iu4 K=32 wmma GEMM. The baked weight pointer wraps a
+                //    DeviceBuffer view that we explicitly forget at end of
+                //    scope so the cached buffer is not freed.
+                let baked_buf = unsafe {
+                    DeviceBuffer::from_raw(baked_w_ptr, m_rows * groups_per_row * 136)
+                };
+                let baked_w = GpuTensor {
+                    buf: baked_buf,
+                    shape: vec![m_rows * groups_per_row * 136],
+                    dtype: DType::Raw,
+                };
+                let gemm_res = self.gemm_hfq4g256_residual_iu4_gfx12(
+                    &baked_w, xq, y, m, k, batch_size, /*add=*/true);
+                std::mem::forget(baked_w);
+                gemm_res?;
+
+                // 4. Add the precomputed W·mu_a bias to every column of y.
+                //    y is laid out as [N × M] column-major (linear index =
+                //    col*M + row), so `bias_add_f32(y, bias, batch=N, n=M)`
+                //    does y[col*M + row] += bias[(col*M + row) % M] = bias[row].
+                let bias_buf = unsafe {
+                    DeviceBuffer::from_raw(bias_ptr, m_rows * 4)
+                };
+                let bias_t = GpuTensor {
+                    buf: bias_buf,
+                    shape: vec![m_rows],
+                    dtype: DType::F32,
+                };
+                let res = self.bias_add_f32(y, &bias_t, batch_size, m_rows);
+                std::mem::forget(bias_t);
+                return res;
+            }
+            // else: site_id >= max_call → fall through to FP16/MMQ
+        }
+
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
