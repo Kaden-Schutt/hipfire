@@ -171,6 +171,7 @@ pub struct HipRuntime {
         unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32,
     fn_device_synchronize: unsafe extern "C" fn() -> u32,
     fn_get_device_properties: unsafe extern "C" fn(*mut u8, c_int) -> u32,
+    fn_get_device_attribute: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
     fn_mem_get_info: unsafe extern "C" fn(*mut usize, *mut usize) -> u32,
 }
 
@@ -282,6 +283,7 @@ impl HipRuntime {
                     unsafe extern "C" fn(HipStream, *mut c_void, u32, c_uint) -> u32),
                 fn_device_synchronize: load_fn!(lib, "hipDeviceSynchronize", unsafe extern "C" fn() -> u32),
                 fn_get_device_properties: load_fn!(lib, "hipGetDeviceProperties", unsafe extern "C" fn(*mut u8, c_int) -> u32),
+                fn_get_device_attribute: load_fn!(lib, "hipDeviceGetAttribute", unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
                 fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
                 _lib: lib,
             })
@@ -919,6 +921,16 @@ impl HipRuntime {
                 Ok("unknown".to_string())
             }
         }
+    }
+
+    /// Query a HIP device attribute by enum ID. See `hipDeviceAttribute_t` in
+    /// `hip_runtime_api.h` for valid IDs. Used by the profiler to read CU count
+    /// when sysfs/KFD is unavailable (Windows, restricted containers).
+    pub fn get_device_attribute(&self, attr_id: i32, device_id: i32) -> HipResult<i32> {
+        let mut value: c_int = 0;
+        let code = unsafe { (self.fn_get_device_attribute)(&mut value, attr_id as c_int, device_id as c_int) };
+        self.check(code, "hipDeviceGetAttribute")?;
+        Ok(value as i32)
     }
 
     /// Get VRAM info: (free_bytes, total_bytes).

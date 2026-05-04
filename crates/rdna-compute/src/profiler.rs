@@ -75,29 +75,60 @@ fn arch_spec(arch: &str) -> ArchSpec {
     }
 }
 
+/// HIP `hipDeviceAttribute_t` enum value for `hipDeviceAttributeMultiprocessorCount`.
+/// Position 63 in the cuda-compatible block (anchored at `hipDeviceAttributeCudaCompatibleBegin = 0`).
+/// Verified stable across ROCm 5.x / 6.x / 7.x by counting non-aliased entries up through the
+/// MultiprocessorCount line. The CUDA-compatible block reserves explicit `Unused1`/`Unused2`/...
+/// slots when fields are deprecated to keep numeric values pinned.
+///
+/// Per HIP doc: "When the GPU works in CU mode, this value equals the number of CUs; when in
+/// WGP mode, this value equals half of CUs (one WGP = two CUs)." Empirically AMD's HIP
+/// runtime on RDNA1+ wave32 reports WGP count (gfx1100 / RX 7900 XTX: 48 = 96 CU / 2).
+/// Use [`hip_mp_count_to_cu_count`] to convert per arch.
+pub const HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT: i32 = 63;
+
+/// Convert `hipDeviceAttributeMultiprocessorCount` value to physical CU count.
+/// On RDNA wave32 (gfx10xx / gfx11xx / gfx12xx) HIP reports WGP count; one WGP holds two CUs.
+/// On wave64 archs (GCN5 gfx906 / CDNA) WGPs don't exist; HIP reports CU count directly.
+pub fn hip_mp_count_to_cu_count(arch: &str, mp_count: u32) -> u32 {
+    let is_rdna_wave32 = arch.starts_with("gfx10")
+        || arch.starts_with("gfx11")
+        || arch.starts_with("gfx12");
+    if is_rdna_wave32 { mp_count.saturating_mul(2) } else { mp_count }
+}
+
 impl GpuCapability {
-    /// Build from arch string + runtime queries.
+    /// Build from arch string + runtime queries. Accepts an optional CU hint from
+    /// `hipDeviceGetAttribute(hipDeviceAttributeMultiprocessorCount)` for callers
+    /// that hold a HIP runtime handle.
     pub fn detect(arch: &str, vram_bytes: u64) -> Self {
+        Self::detect_with_hint(arch, vram_bytes, None)
+    }
+
+    /// Build from arch string + runtime queries, with an optional CU count hint.
+    /// CU resolution order: KFD sysfs (`simd_count / 2`, exact per SKU regardless of
+    /// CU/WGP mode) → caller-supplied hint (typically HIP runtime) → arch-keyed const.
+    pub fn detect_with_hint(arch: &str, vram_bytes: u64, cu_count_hint: Option<u32>) -> Self {
         let spec = arch_spec(arch);
 
-        // CU count from sysfs (try multiple paths). On Linux+KFD this is the only
-        // path that fires in practice — KFD `simd_count / 2` is exact per SKU.
-        // The fallback below only fires when sysfs/KFD is unavailable (Windows,
-        // restricted containers). Each gfx ID covers multiple SKUs, so we pick the
-        // smallest CU count in the family to avoid overestimating occupancy.
-        let cu_count = read_sysfs_cu_count().unwrap_or_else(|| {
-            match arch {
-                "gfx906" => 60,    // Vega 20 / Radeon VII / MI50 class
-                "gfx1010" => 40,   // RX 5700 XT
-                "gfx1030" => 60,   // RX 6800
-                "gfx1100" => 48,   // RX 7800 XT
-                // gfx1200: RX 9060 (28 CU) / RX 9060 XT (32 CU)
-                "gfx1200" => 28,
-                // gfx1201: RX 9070 (56 CU) / RX 9070 XT / Radeon AI PRO R9700 (64 CU)
-                "gfx1201" => 56,
-                _ => 40,
-            }
-        });
+        // KFD primary; HIP-runtime hint secondary; arch const last resort. The arch const
+        // is conservative (smallest in family) so we never overestimate occupancy when both
+        // upstream sources fail (Windows + non-HIP environment).
+        let cu_count = read_sysfs_cu_count()
+            .or(cu_count_hint.filter(|&c| (4..=256).contains(&c)))
+            .unwrap_or_else(|| {
+                match arch {
+                    "gfx906" => 60,    // Vega 20 / Radeon VII / MI50 class
+                    "gfx1010" => 40,   // RX 5700 XT
+                    "gfx1030" => 60,   // RX 6800
+                    "gfx1100" => 48,   // RX 7800 XT
+                    // gfx1200: RX 9060 (28 CU) / RX 9060 XT (32 CU)
+                    "gfx1200" => 28,
+                    // gfx1201: RX 9070 (56 CU) / RX 9070 XT / Radeon AI PRO R9700 (64 CU)
+                    "gfx1201" => 56,
+                    _ => 40,
+                }
+            });
 
         // Clock speeds from sysfs
         let (boost_mhz, mem_mhz) = read_sysfs_clocks().unwrap_or((1800, 875));
@@ -176,7 +207,18 @@ pub fn profile_kernels(
     vram_bytes: u64,
     compiled_kernels: &HashMap<String, std::path::PathBuf>,
 ) -> (GpuCapability, Vec<KernelProfile>) {
-    let cap = GpuCapability::detect(arch, vram_bytes);
+    profile_kernels_with_hint(arch, vram_bytes, compiled_kernels, None)
+}
+
+/// Profile with an optional runtime CU count hint (typically from
+/// `HipRuntime::get_device_attribute(HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev)`).
+pub fn profile_kernels_with_hint(
+    arch: &str,
+    vram_bytes: u64,
+    compiled_kernels: &HashMap<String, std::path::PathBuf>,
+    cu_count_hint: Option<u32>,
+) -> (GpuCapability, Vec<KernelProfile>) {
+    let cap = GpuCapability::detect_with_hint(arch, vram_bytes, cu_count_hint);
     let mut profiles = Vec::new();
 
     for (name, path) in compiled_kernels {

@@ -13281,6 +13281,17 @@ impl Gpu {
     /// Profile all compiled kernels: hardware caps + ISA metadata + occupancy.
     pub fn profile(&self) -> (crate::profiler::GpuCapability, Vec<crate::profiler::KernelProfile>) {
         let vram = self.hip.get_vram_info().map(|(_, t)| t as u64).unwrap_or(0);
-        crate::profiler::profile_kernels(&self.arch, vram, self.compiler.compiled_kernels())
+        let cu_hint = self.hip
+            .get_device_attribute(crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 0)
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32))
+            .filter(|&v| (4..=256).contains(&v));
+        crate::profiler::profile_kernels_with_hint(
+            &self.arch,
+            vram,
+            self.compiler.compiled_kernels(),
+            cu_hint,
+        )
     }
 }
