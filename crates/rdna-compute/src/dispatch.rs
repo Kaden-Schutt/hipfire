@@ -6319,12 +6319,25 @@ impl Gpu {
             if is_gfx12(&self.arch)
                 && batch_size > 1
             {
-                // gfx12 iu4 K=32 opt-in. HIPFIRE_GFX12_IU4=1. Bypasses MMQ +
-                // FP16 entirely. Q4_1 prequant + iu4 K=32 wmma — 4× FP16
-                // matrix throughput per AMD spec, HFQ4 nibbles consumed
-                // AS-IS as iu4 (no in-kernel dequant). Q4_1 activation has
-                // ~14% per-elem precision (looser than Q8_1's ~0.8%); ship
-                // requires coherence-gate validation on real models.
+                // gfx12 iu4 K=32 opt-in. HIPFIRE_GFX12_IU4=1.
+                //
+                // ⚠️  PERF WIN BUT QUALITY-FAIL: bench shows +13% on 27B
+                //     prefill vs FP16 (+25% vs MMQ), but coherence-gate at
+                //     d6ef999 produced **complete garbage** on all 4 model
+                //     sizes (0.8B/4B/9B with HIPFIRE_GFX12_IU4=1). Q4_1
+                //     activation has ~14% per-elem precision; that compounds
+                //     across 64 transformer layers + softmax into unintelligible
+                //     output. Native gfx12 wmma is type-symmetric (iu4 forces
+                //     Q4_1 on activations) so we can't mix iu4 weights with
+                //     Q8_1 activations to recover signal.
+                //
+                // Path stays in the tree as opt-in for future research (e.g.,
+                // QAT models trained for INT4 activations, or layer-selective
+                // routing where quality-tolerant projections use iu4). DO NOT
+                // flip the default; HIPFIRE_GFX12_IU4=1 is destructive on
+                // standard FP16-trained Qwen3.5-class models. See
+                // project_gfx12_iu4_breakthrough_2026_05_04.md for the
+                // perf-vs-quality tradeoff in detail.
                 if std::env::var("HIPFIRE_GFX12_IU4").ok().as_deref() == Some("1") {
                     let xq = self.ensure_q4_1_x(x, batch_size, k)?;
                     return self.gemm_hfq4g256_residual_iu4_gfx12(
