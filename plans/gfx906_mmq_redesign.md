@@ -86,6 +86,19 @@ Reviews integrated:
   (spread 0.1). B/A = 2.04× identical across all 3 iterations.
   Confirms the speedup is not within-session noise. Phase 4
   acceptance gate ✅.
+- v2.8 (2026-05-04): Phase 5 commit landed (`c022682`). Pushed.
+  Followed up with rocprofv3 kernel-trace + rocprof PMC
+  attribution: see
+  `docs/perf-checkpoints/2026-05-04-gfx906-mmq-redesign-rocprof.md`.
+  Key findings: VALUBusy 27–41 % on the new MMQ kernel,
+  VALUUtilization 100 % (zero wave divergence), MemUnitStalled ≤
+  0.25 (~14× less than FP16 wave64), FetchSize 24 KB/call vs FP16
+  wave64's 69 KB/call. The kernel is **neither compute- nor
+  memory-bound**; the remaining headroom is inter-warp
+  synchronization (Option B's 8 syncs per HFQ4 group). Implication
+  for §Q8 deferred ds_read_b128: low expected gain since LDS issue
+  is not on the critical path. Largest remaining lever: qkvza
+  fused-4-output MMQ (28.87 % of GEMM time still on FP16 wave64).
 
 ## Goal (revised v2)
 
@@ -536,12 +549,23 @@ JIT cache correctly.
 | Prefill pp128 (within-session) | 287 tok/s, 2.04× baseline ✅ |
 | Prefill pp128 (cross-process A/B) | 2.04× confirmed, B spread 0.04% ✅ |
 
-**Optional follow-ups (not blocking this commit):**
-- rocprof `--hip-trace` per-kernel timing vs stock llama.cpp;
-  verify VALUBusy during X-load <15% per [glm-5 M3]. Useful for
-  the follow-up b128 / VALUBusy tuning.
-- Parameterize the test harness on mmq_x for repeatable matrix runs.
-- ds_read_b128 vectorization (Phase 2b §Q8 deferred item).
+**Optional follow-ups (priority-reordered after rocprof, 2026-05-04):**
+- **(P1)** qkvza fused-4-output MMQ kernel (Phase 6 separate plan).
+  rocprof shows qkvza_hfq4g256_fp16_wave64 at **28.87 % of GEMM time
+  ** — bigger than the entire new MMQ contribution combined (35.3 %).
+  Estimated end-to-end gain: ~14 % at 2× per-call speedup.
+- **(P2)** qkv MMQ port (currently FP16 wave64 at 8.02 %). Smaller
+  but lower-risk than qkvza (no fusion required).
+- (P3, speculative) reduce sync frequency from 8/HFQ4-group to
+  2/HFQ4-group à la stock. Needs LDS-budget analysis — likely
+  pushes back over the 32 KiB cap; revisit alongside b128.
+- (P4) ds_read_b128 vectorization (§Q8 deferred). rocprof says
+  this lever is small — VALUBusy is at 27–41 % (not LDS-issue
+  saturated) and MemUnitStalled is ~0. Expected gain ≤ 5 %.
+- (P5) Parameterize the test harness on mmq_x for repeatable
+  matrix runs. Polish, lowest priority.
+- (P6) Default-on flip — flip `should_use_mmq()` gfx906 branch from
+  opt-in to default-on once stability is confirmed in the field.
 
 ### Phase 2b: full kernel rewrite (3–5 days)
 
