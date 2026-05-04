@@ -53,12 +53,29 @@
 #define HIPFIRE_GFX12 0
 #endif
 
-#define MMQ_X 128
+// K=256 per kb (full HFQ4 group) bumped from K=128 in commit pending.
+// Halves the kb-iter count + activation-cast pass count; the per-kb
+// __shfl_xor amax + per-col scale + cast was the dominant overhead in
+// the K=128 first-cut bench (per project_gfx12_fp8_bench_2026_05_04.md).
+//
+// LDS budget (gfx12 ~64 KB ceiling):
+//   tile_x: MMQ_Y rows × FP8_K_I32_STRIDE i32 = 128 × 64 i32 = 32 KB
+//   tile_y: MMQ_X cols × FP8_K_I32_STRIDE i32 = 64  × 64 i32 = 16 KB
+//   tile_idS: MMQ_X floats = 64 × 4 = 256 B
+//   total = 48.25 KB — fits.
+//
+// MMQ_X halved to 64 to make room for the doubled FP8_K_I32_STRIDE. Each
+// workgroup processes 64 batch tokens (vs 128). Workgroup count doubles
+// in the N direction. Total activation cast work is unchanged (same N×K
+// elements cast, redundantly across M-row-blocks; halving MMQ_X doesn't
+// add redundancy in M, only spreads same N-cast-work over more workgroups
+// in N — same net cast count).
+#define MMQ_X 64
 #define MMQ_Y 128
 #define MMQ_NWARPS 8
 #define WARP_SIZE 32
-#define FP8_K_PER_KB 128       // K positions covered per kb iteration (= half-group)
-#define FP8_K_I32_STRIDE 32    // K=128 / 4 fp8-per-i32
+#define FP8_K_PER_KB 256       // K positions covered per kb iteration (= full group)
+#define FP8_K_I32_STRIDE 64    // K=256 / 4 fp8-per-i32
 
 #if !HIPFIRE_GFX12
 
@@ -107,30 +124,28 @@ static __device__ __forceinline__ void load_hfq4_tile_fp8(
     int M,
     int groups_per_row
 ) {
-    // 256 threads = 16 rows-per-iter x 16 nibble-u32-per-row.
-    // Each thread loads 1 u32 of nibbles (= 8 nibbles = K=8 worth) and writes
-    // 2 i32 of FP8 (= 8 FP8 bytes) at tile_x[row * 32 + 2 * k_chunk + 0..1].
+    // K_PER_KB=256 = full HFQ4 group per kb iter. 256 threads partitioned as
+    // 8 rows-per-iter × 32 nibble-u32-per-row (each thread loads 1 u32 = 8
+    // nibbles = K=8). Each row spans 32 i32 of input nibbles (= K=256).
+    //
+    // Layout in LDS: tile_x[row * FP8_K_I32_STRIDE + 2*k_chunk + 0..1]
+    // where k_chunk in [0..32) covers K=[0..256) of this kb iter.
     const int tid = (int)(threadIdx.y * WARP_SIZE + threadIdx.x);
-    const int row_in_iter = tid >> 4;          // 0..15
-    const int k_chunk = tid & 0xF;             // 0..15, indexes 4-byte nibble cluster within K=128
-    const int kb_group = kb >> 1;              // HFQ4 group index on disk
-    const int kb_half = kb & 1;                // 0 = K=[0..127], 1 = K=[128..255] within group
+    const int row_in_iter = tid >> 5;          // 0..7
+    const int k_chunk = tid & 0x1F;            // 0..31, indexes 4-byte nibble cluster within K=256
 
     #pragma unroll
-    for (int i0 = 0; i0 < MMQ_Y; i0 += 16) {
+    for (int i0 = 0; i0 < MMQ_Y; i0 += 8) {
         const int i = i0 + row_in_iter;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
-        const char* gp = A + ((long long)row * groups_per_row + kb_group) * 136;
+        // kb iter k covers HFQ4 group k (full group, no half-split).
+        const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
 
-        // Group metadata is constant per row across all k_chunks. Compiler
-        // hoists this out via a uniform-sub-warp-dispatch pattern; if not, the
-        // duplicated loads land in L0 anyway.
         const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
         const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
 
-        // Nibble offset within the group: skip 8B header, then 64 B for the
-        // low half if we want the high half.
-        const int nibble_offset = 8 + kb_half * 64 + k_chunk * 4;
+        // Nibble offset within the group: skip 8B header, then k_chunk*4 bytes.
+        const int nibble_offset = 8 + k_chunk * 4;
         const unsigned int qs0 = *(const unsigned int*)(gp + nibble_offset);
 
         // Dequant 8 nibbles -> 8 FP32 (BAKE scale + zero into the FP8 value).
@@ -143,7 +158,7 @@ static __device__ __forceinline__ void load_hfq4_tile_fp8(
         const float v6 = sc * (float)((qs0 >> 24) & 0xFu) + zp;
         const float v7 = sc * (float)((qs0 >> 28) & 0xFu) + zp;
 
-        // Cast 8 FP32 -> 2 i32 (= 8 FP8 bytes, low-byte-order: v0,v1,...,v7).
+        // Cast 8 FP32 -> 2 i32 (= 8 FP8 bytes).
         unsigned int w0 = 0u;
         w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, w0, false);
         w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, w0, true);
@@ -188,18 +203,26 @@ static __device__ __forceinline__ void load_activation_tile_fp8(
     const int col_in_warp = lane & 0xF;
     const int k_half = lane >> 4;
     const int col = warp_id * 16 + col_in_warp;
+    // With MMQ_X=64 and 8 warps × 16 cols = 128, warps 4-7 produce col ≥ 64
+    // which is OUT OF MMQ_X RANGE. Early-exit those threads — their tile_y
+    // writes would corrupt the adjacent tile_idS region. (The 4 active warps
+    // do all the work; the inactive 4 warps are unused for cast but still
+    // contribute to the wmma compute below via vec_dot's warp partition.)
+    if (col >= MMQ_X) return;
     const int col_global = col0 + col;
-    const int kb_K_offset = kb * FP8_K_PER_KB;  // base K offset for this kb iter
-    const int k_base = kb_K_offset + k_half * 64;
+    // K_PER_LANE = K_PER_KB/2 (each lane handles half of the kb K-chunk).
+    constexpr int K_PER_LANE = FP8_K_PER_KB / 2;
+    const int kb_K_offset = kb * FP8_K_PER_KB;
+    const int k_base = kb_K_offset + k_half * K_PER_LANE;
 
     const bool col_in_range = FULL ? true : (col_global < N);
 
-    // ---- Pass 1: amax over 64 K positions of one (col, k_half).
+    // ---- Pass 1: amax over K_PER_LANE positions of one (col, k_half).
     float amax = 0.0f;
     if (col_in_range) {
         const float* xp = X + (long long)col_global * K + k_base;
         #pragma unroll
-        for (int j = 0; j < 64; ++j) {
+        for (int j = 0; j < K_PER_LANE; ++j) {
             const int k = k_base + j;
             const float v = (k < K) ? xp[j] : 0.0f;
             amax = fmaxf(amax, fabsf(v));
@@ -222,13 +245,14 @@ static __device__ __forceinline__ void load_activation_tile_fp8(
         tile_idS[col] = col_in_range ? inv_scale_b : 0.0f;
     }
 
-    // ---- Pass 2: scale + cast + store. 64 floats / 4 fp32-per-pack = 16
-    // packs per lane, each producing 1 i32 of FP8. Stored at
-    //   tile_y[col * 32 + k_half * 16 + j]  for j in [0..16).
+    // ---- Pass 2: scale + cast + store. K_PER_LANE floats / 4 fp32-per-pack
+    // = PACKS_PER_LANE packs per lane, each producing 1 i32 of FP8. Stored at
+    //   tile_y[col * FP8_K_I32_STRIDE + k_half * PACKS_PER_LANE + j].
+    constexpr int PACKS_PER_LANE = K_PER_LANE / 4;  // 32 for K_PER_KB=256
     if (col_in_range) {
         const float* xp = X + (long long)col_global * K + k_base;
         #pragma unroll
-        for (int j = 0; j < 16; ++j) {
+        for (int j = 0; j < PACKS_PER_LANE; ++j) {
             const int kbase = k_base + 4 * j;
             float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
             if (kbase + 0 < K) v0 = xp[4 * j + 0];
@@ -238,12 +262,12 @@ static __device__ __forceinline__ void load_activation_tile_fp8(
             unsigned int w = 0u;
             w = __builtin_amdgcn_cvt_pk_fp8_f32(v0 * scale_b, v1 * scale_b, w, false);
             w = __builtin_amdgcn_cvt_pk_fp8_f32(v2 * scale_b, v3 * scale_b, w, true);
-            tile_y[col * FP8_K_I32_STRIDE + k_half * 16 + j] = (int)w;
+            tile_y[col * FP8_K_I32_STRIDE + k_half * PACKS_PER_LANE + j] = (int)w;
         }
     } else {
         #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            tile_y[col * FP8_K_I32_STRIDE + k_half * 16 + j] = 0;
+        for (int j = 0; j < PACKS_PER_LANE; ++j) {
+            tile_y[col * FP8_K_I32_STRIDE + k_half * PACKS_PER_LANE + j] = 0;
         }
     }
 }
@@ -368,16 +392,18 @@ static __device__ __forceinline__ void load_fp8_tile_preconv(
     int M,
     int K
 ) {
+    // K_PER_KB=256: 256 threads partitioned 8 rows × 32 chunks per row,
+    // each thread loads 8 FP8 bytes (= 2 int32) for a 256-byte row.
     const int tid = (int)(threadIdx.y * WARP_SIZE + threadIdx.x);
-    const int row_in_iter = tid >> 4;          // 0..15
-    const int k_chunk = tid & 0xF;             // 0..15, indexes 8-byte FP8 chunk in K=128
+    const int row_in_iter = tid >> 5;          // 0..7
+    const int k_chunk = tid & 0x1F;            // 0..31, indexes 8-byte FP8 chunk in K=256
 
     #pragma unroll
-    for (int i0 = 0; i0 < MMQ_Y; i0 += 16) {
+    for (int i0 = 0; i0 < MMQ_Y; i0 += 8) {
         const int i = i0 + row_in_iter;
         const int row = FULL ? row0 + i : min(row0 + i, M - 1);
-        // Direct FP8 read: row stride = K bytes, kb stride = 128 bytes,
-        // chunk stride = 8 bytes. 8-byte aligned (k_chunk * 8).
+        // Direct FP8 read: row stride = K bytes, kb stride = K_PER_KB bytes,
+        // chunk stride = 8 bytes. 8-byte aligned.
         const int* fp8_i32 = (const int*)(A_fp8 + (long long)row * K
                                            + kb * FP8_K_PER_KB
                                            + k_chunk * 8);

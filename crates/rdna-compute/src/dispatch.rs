@@ -5147,15 +5147,18 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_X: usize = 128;
+        // K_PER_KB=256, MMQ_X=64 (kernel constants in
+        // gemm_hfq4g256_residual_fp8.gfx12.hip). LDS budget:
+        //   tile_x: 128 rows × 64 i32 = 32 KB
+        //   tile_y: 64  cols × 64 i32 = 16 KB
+        //   tile_idS: 64 floats        = 256 B
+        //   total ~48.25 KB (gfx12 ~64 KB ceiling)
+        const MMQ_X: usize = 64;
         const MMQ_Y: usize = 128;
-        const FP8_K_I32_STRIDE: usize = 32;  // K=128 / 4 fp8-per-i32
-        const TILE_IDS_FLOATS: usize = 128;  // per-col activation idScale
+        const FP8_K_I32_STRIDE: usize = 64;  // K=256 / 4 fp8-per-i32
+        const TILE_IDS_FLOATS: usize = MMQ_X;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
         let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
-        // tile_x: 128 rows x 32 i32 = 16 KB
-        // tile_y: 128 cols x 32 i32 = 16 KB
-        // tile_idS: 128 floats     = 0.5 KB
         let shared_mem = ((MMQ_Y * FP8_K_I32_STRIDE
             + MMQ_X * FP8_K_I32_STRIDE) * std::mem::size_of::<i32>()
             + TILE_IDS_FLOATS * std::mem::size_of::<f32>()) as u32;
