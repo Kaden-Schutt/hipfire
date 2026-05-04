@@ -268,6 +268,13 @@ impl HfqFile {
         self.tensor_map.get(name).map(|&i| &self.tensors[i])
     }
 
+    /// Iterate all tensor names in index order. Used by tools that need to
+    /// scan the archive (e.g. find a candidate tensor for a one-off test
+    /// that doesn't know the exact naming convention).
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.iter().map(|t| t.name.as_str())
+    }
+
     /// Returns the name of the first tensor whose `quant_type` matches `qt`,
     /// or `None` if none match. Used by the daemon's DFlash-refusal guard to
     /// detect MQ3/MQ2 body weights without iterating the index outside this

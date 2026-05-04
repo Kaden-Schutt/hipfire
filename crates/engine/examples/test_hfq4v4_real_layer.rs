@@ -40,8 +40,7 @@ fn main() {
             std::process::exit(0);
         });
     let model = std::env::var("MODEL").unwrap_or_else(|_| "qwen3.5-9b.mq4".to_string());
-    let tensor = std::env::var("TENSOR")
-        .unwrap_or_else(|_| "model.layers.0.self_attn.o_proj.weight".to_string());
+    let tensor_env = std::env::var("TENSOR").ok();
     let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(128);
     let rotate = std::env::var("ROTATE").ok().as_deref() == Some("1");
 
@@ -61,10 +60,37 @@ fn main() {
 
     eprintln!("=== gfx12 HFQ4v4 real-weight correctness test ===");
     eprintln!("model: {}", path.display());
+
+    let hfq = HfqFile::open(&path).expect("open hfq");
+
+    // If no tensor given, auto-find layer-0 wo / w_down with quant_type
+    // HFQ4-G256 (6) or MQ4-G256 (13). Print top candidates so user can
+    // override via TENSOR=...
+    let tensor = if let Some(t) = tensor_env {
+        t
+    } else {
+        let candidates: Vec<&str> = hfq
+            .tensor_names()
+            .filter(|n| {
+                n.contains("layers.0")
+                    && (n.ends_with("o_proj.weight")
+                        || n.ends_with("down_proj.weight")
+                        || n.ends_with("attention.wo.weight"))
+            })
+            .collect();
+        if candidates.is_empty() {
+            eprintln!("no candidate tensor found in layer 0; available samples:");
+            for n in hfq.tensor_names().take(20) {
+                eprintln!("  {n}");
+            }
+            std::process::exit(1);
+        }
+        eprintln!("candidates: {:?}", candidates);
+        candidates[0].to_string()
+    };
     eprintln!("tensor: {tensor}");
     eprintln!("N={n}, rotate={rotate}");
 
-    let hfq = HfqFile::open(&path).expect("open hfq");
     let (info, data) = hfq.tensor_data(&tensor).unwrap_or_else(|| {
         eprintln!("tensor not found: {tensor}");
         std::process::exit(1);
