@@ -213,6 +213,11 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../k
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
+// gfx12 (RDNA4) iu4 K=32 WMMA probe — POC for issue #136 part B.
+// Validates that __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12 dispatches
+// and accumulates correctly on gfx1201 silicon. Used by the
+// `probe_wmma_iu4_k32` example (rdna-compute), not by any production path.
+pub const PROBE_WMMA_IU4_K32_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu4_k32.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");

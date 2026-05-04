@@ -1321,6 +1321,40 @@ impl Gpu {
         }
     }
 
+    /// gfx12 (RDNA4) iu4 K=32 WMMA probe — POC for issue #136 part B.
+    /// Single-wave probe: launches a 32-thread workgroup that runs one
+    /// `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12` instruction with
+    /// A=B=all-ones (every INT4 = 1) and dumps each lane's 8-int accumulator.
+    /// `out` must have capacity for at least 32*8 = 256 i32 elements.
+    /// Expected: every entry of `out` reads 32 (sum of 32 ones-times-ones).
+    pub fn probe_wmma_iu4_k32_allones(&mut self, out: &GpuTensor) -> HipResult<()> {
+        if !(self.arch == "gfx1200" || self.arch == "gfx1201") {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "probe_wmma_iu4_k32_allones requires gfx1200/gfx1201; got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "probe_wmma_iu4_k32",
+            kernels::PROBE_WMMA_IU4_K32_GFX12_SRC,
+            "probe_wmma_iu4_k32_allones",
+        )?;
+        let func = &self.functions["probe_wmma_iu4_k32_allones"];
+        let mut out_ptr = out.buf.as_ptr();
+        let mut params: Vec<*mut c_void> =
+            vec![&mut out_ptr as *mut _ as *mut c_void];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Wave-cooperative Q4 GEMV (Q4_F16_G32 format, 0.625 B/w). Shuffle-based nibble distribution.
     pub fn gemv_q4wave(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
