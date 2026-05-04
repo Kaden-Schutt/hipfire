@@ -21,11 +21,20 @@
 //   2. Load Y first half (32 K-elements), compute, sync
 //   3. Load Y second half (32 K-elements), compute, sync
 //
-// LDS budget at (mmq_y=128, mmq_x=64):
+// LDS budget at (mmq_y=128, mmq_x=8):
 //   x_qs:  128 × 65 ints   = 33,280 B  (64 ints data + 1 int padding/row)
-//   x_dm:  128 half2       =    512 B
-//   tile_y: 64 × 36 ints   =  9,216 B  (4 ints inlined ds + 32 qs/col)
-//   TOTAL                  = 43,008 B  (42.0 KiB / 64 KiB cap)
+//   x_dm:  128 float2      =  1,024 B
+//   tile_y: 8 × 36 ints    =  1,152 B  (4 ints inlined ds + 32 qs/col)
+//   TOTAL                  = 35,456 B  (34.6 KiB / 64 KiB cap)
+//
+// MMQ_X reduced 64 → 32 → 16 → 8 to shrink the j-loop unroll in
+// vec_dot_dp4a. At MMQ_X=8 the unrolled dp4a-site count is
+// 4 (k01) × 4 (j0) × 2 (i0) × 8 (vdr) = 256, with sum[] = 8 floats.
+// MMQ_X=4 was tested and gave identical perf with 2× WG count, so we
+// stop at 8 (saturation point — the spill-reduction lever is exhausted).
+// Trade: 8× workgroup count vs MMQ_X=64 (Qwen 9B pp128 N=128 → 16
+// col tiles instead of 2). Per Phase 0 §6.6, llama.cpp-gfx906 picks
+// mmq_x dynamically per N.
 //
 // L2 prefetch: NOT included in this commit. To be added in a follow-up.
 //
@@ -41,7 +50,7 @@
 // without biasing. Q8_1 is symmetric (no zp on activations) — only one
 // correction term needed: scale_w * d_x * sumi + zp_w * sum_x.
 
-#define MMQ_X 64
+#define MMQ_X 8
 #define MMQ_Y 128
 #define MMQ_NWARPS 2
 #define WAVE_SIZE 64
@@ -147,9 +156,14 @@ static __device__ __forceinline__ void load_hfq4_tile_dp4a(
     const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
 
     // Load scale and zp once per row (broadcast across all 256 K-elements).
+    // Pre-fold the symmetric-weight bias correction into zp:
+    //   zp_eff = zp + 8 * scale
+    // so that vec_dot_dp4a can use a single FMA per site instead of
+    // recomputing 8*scale at every dp4a call. Algebraic identity — no
+    // numerical change in the final accumulation.
     const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
     const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-    x_dm[i] = make_float2(sc, zp);
+    x_dm[i] = make_float2(sc, zp + 8.0f * sc);
 
     // Load 32 chunks of 4 bytes each = 128 bytes of nibbles per row.
     // Each chunk produces 2 sequential x_qs ints.
@@ -208,36 +222,26 @@ static __device__ __forceinline__ void load_q8_1_tile(
     int* __restrict__ tile_y,
     int col0, int kb, int N
 ) {
-    // 64 cols × 36 ints/col = 2304 ints. 128 threads → 18 ints/thread.
-    // Distribute: tid → flat index in tile_y (col-major).
-    //   col = tid / 36, slot = tid % 36 — but 128 threads × 18 ints isn't
-    //   uniformly aligned to col boundaries. Easier: 128 threads load 64
-    //   cols × 36 ints = 2304 ints via flat-strided iteration.
-    //
-    // Each col is 36 ints = exactly one block_q8_1_mmq cast as int*.
-    // Load by col: each col handled by 36/k threads if k threads per col.
-    //   With 128 threads / 64 cols = 2 threads per col → each loads 18 ints.
-    // tid = col_pair * 2 + thread_in_col. col_pair = tid / 2, thread = tid % 2.
-    // thread 0 of pair loads ints [0..17], thread 1 loads ints [18..35].
+    // 8 cols × 36 ints/col = 288 ints. 128 threads — 4 threads per col
+    // × 8 cols = 32 active threads, each loads 9 ints; threads 32..127
+    // idle. Load phase is small (288 ints) so the idle threads are cheap
+    // relative to the dp4a body.
 
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;  // 0..127
-    const int j = tid / 2;                  // col index, 0..63
-    const int half = tid & 1;               // 0 or 1: which 18-int half of the col
-    const bool valid = (col0 + j) < N;
-    const int col = valid ? (col0 + j) : (N - 1);
+    if (tid < 32) {
+        const int j = tid / 4;              // col index, 0..7
+        const int quad = tid & 3;           // 0..3: which 9-int quarter of the col
+        const bool valid = (col0 + j) < N;
+        const int col = valid ? (col0 + j) : (N - 1);
 
-    // Q8_1 block layout: Xq[kb * N + col] is one block (36 ints).
-    const int* src = (const int*)(Xq + (long long)kb * N + col);
+        // Q8_1 block layout: Xq[kb * N + col] is one block (36 ints).
+        const int* src = (const int*)(Xq + (long long)kb * N + col);
 
-    // Zero OOB columns (rather than duplicating last valid col's data).
-    // Matches the Strix Halo MMQ kernel pattern (gemm_hfq4g256_residual_mmq.hip:367).
-    // Without this, vec_dot's j-loop reads junk for OOB cols and accumulates
-    // garbage into per-thread sum[] cells that, while never written, can
-    // create issues if compiler aliasing or similar register effects occur.
-    #pragma unroll
-    for (int u = 0; u < 18; ++u) {
-        const int slot = half * 18 + u;     // 0..35
-        tile_y[j * Y_STRIDE + slot] = valid ? src[slot] : 0;
+        #pragma unroll
+        for (int u = 0; u < 9; ++u) {
+            const int slot = quad * 9 + u;  // 0..35
+            tile_y[j * Y_STRIDE + slot] = valid ? src[slot] : 0;
+        }
     }
 }
 
@@ -301,18 +305,19 @@ static __device__ __forceinline__ void vec_dot_dp4a(
                 }
 
                 // Scale/zp correction (HFQ4 affine × Q8_1 symmetric → 2 terms).
-                // Symmetric weight adjustment: since we subtracted 8 from each nibble
-                // in load_hfq4_tile_dp4a, we must add back 8 * scale_w * sum_x.
-                // Formula: s_w * d_x * sumi_sym + (z_w + 8 * s_w) * sum_x.
+                // x_dm.y holds zp_eff = zp_w + 8 * scale_w (pre-folded at
+                // load time, see load_hfq4_tile_dp4a) so the symmetric
+                // weight bias is absorbed without a per-site FMA.
+                // Formula: scale_w * d_x * sumi_sym + zp_eff * sum_x.
                 const float2 dm_i = x_dm[i];
                 const float2 dsf = __half22float2(ds_j);
                 const float scale_w = dm_i.x;
-                const float zp_w    = dm_i.y;
+                const float zp_eff  = dm_i.y;
                 const float d_x     = dsf.x;
                 const float sum_x   = dsf.y;
 
                 const int idx = (j0 / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE) + (i0 / WAVE_SIZE);
-                sum[idx] += scale_w * d_x * (float)sumi + (zp_w + 8.0f * scale_w) * sum_x;
+                sum[idx] += scale_w * d_x * (float)sumi + zp_eff * sum_x;
             }
         }
     }
@@ -371,10 +376,10 @@ static __device__ __forceinline__ void mmq_body(
 
     const int groups_per_row = K / 256;
 
-    // LDS layout (43 KiB total):
+    // LDS layout (35 KiB total):
     //   x_qs: 128 × X_STRIDE (= 65) ints           = 33,280 B
-    //   x_dm: 128 half2                             =    512 B
-    //   tile_y: MMQ_X × Y_STRIDE (= 64 × 36) ints  =  9,216 B
+    //   x_dm: 128 float2                            =  1,024 B
+    //   tile_y: MMQ_X × Y_STRIDE (= 8 × 36) ints   =  1,152 B
     extern __shared__ int smem[];
     int*  x_qs   = smem;
     float2* x_dm  = (float2*)(x_qs + MMQ_Y * X_STRIDE);

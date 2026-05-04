@@ -6204,7 +6204,7 @@ impl Gpu {
         }
 
         // Pick boundary-checked vs full-tile variant.
-        let kernel_name = if m % 128 == 0 && batch_size % 64 == 0 {
+        let kernel_name = if m % 128 == 0 && batch_size % 8 == 0 {
             "gemm_hfq4g256_residual_mmq_gfx906_full_add"
         } else {
             "gemm_hfq4g256_residual_mmq_gfx906"
@@ -6233,7 +6233,7 @@ impl Gpu {
         ];
 
         // Tile shape per kernel constants (must match the .hip file).
-        const MMQ_X: usize = 64;
+        const MMQ_X: usize = 8;
         const MMQ_Y: usize = 128;
         const X_STRIDE: usize = 65;  // 2*MMQ_TILE_NE_K + 1 = 65 ints/row, dp4a +1 padding
         const Y_STRIDE: usize = 36;  // MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI8_1 = 32 + 4
