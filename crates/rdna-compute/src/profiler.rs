@@ -88,8 +88,8 @@ impl GpuCapability {
                 "gfx1010" => 40,   // RX 5700 XT
                 "gfx1030" => 60,   // RX 6800
                 "gfx1100" => 48,   // RX 7800 XT
-                "gfx1200" => 32,   // RX 9070
-                "gfx1201" => 32,   // RX 9070 XT
+                "gfx1200" => 56,   // RX 9070
+                "gfx1201" => 64,   // RX 9070 XT / Radeon AI PRO R9700
                 _ => 40,
             }
         });
