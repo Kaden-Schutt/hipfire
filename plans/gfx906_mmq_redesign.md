@@ -199,6 +199,22 @@ Reviews integrated:
   budget) was insufficient to predict perf regression — bank-
   conflict counters are the right diagnostic for LDS layout
   changes.
+- v2.15 (2026-05-04): **ds_read_b128 landed at mmq_x≥64 only**.
+  Replaced the inner 8× b32 LDS reads in `vec_dot_dp4a_streaming`
+  with 2× int4 (b128) reads, gated by `if constexpr (mmq_x >= 64)`.
+  ELF: 108× ds_read_b128 + 24× b32-quad fallbacks emitted in `_x64`
+  variants (X_STRIDE=33 row stride 132 B is 16-B aligned every 4th
+  row only; compiler degrades misaligned rows). Sweep across
+  thresholds:
+  - `mmq_x >= 32`: pp32 312→304 (-2.6%, regression on small-batch
+    residual `_full_add_x16` and gate_up `_full_set_x32` paths)
+  - **`mmq_x >= 64`: pp32 312→312 (no regression), pp64 365→410
+    (+12%), pp128 512→522 (+2%), pp256 592→630 (+6%),
+    pp512 584→623 (+7%, 83% of stock).**
+  Threshold of 64 is the empirically right line because only the
+  _x64 variants have enough j0 iterations to amortize the int4
+  unpack overhead. Correctness preserved bit-exact (NRMSE
+  identical: 0.0407–0.2881%).
 
 ## Goal (revised v2)
 
@@ -669,9 +685,10 @@ modern HIP.
   + 1 pad int to defeat LDS bank conflicts). pp128 462 → 512
   (+10.8%); pp512 554 → 584 (+5.4%). Diagnostic perf-checkpoint:
   `docs/perf-checkpoints/2026-05-04-gfx906-mmq-window-streaming.md`.
-  The two large MMQ kernels still dominate but per-call dropped
-  meaningfully (no rocprof yet at the post-padding state — would
-  be a useful follow-up if we're chasing more).
+- ~~(P3)~~ **DONE in v2.15** (2026-05-04): ds_read_b128 at mmq_x≥64.
+  pp512 584→623 (+7%, 83% of stock). Threshold of 64 chosen
+  empirically — at mmq_x=32 the int4 unpack overhead exceeds the
+  win.
 - (P3) ds_read_b128 vectorization (§Q8 deferred). Small per
   prior rocprof analysis (VALUBusy not LDS-issue saturated) but
   worth retesting now that the bottleneck is per-call MMQ work.

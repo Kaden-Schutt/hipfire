@@ -175,11 +175,38 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
             const int i = i0 + threadIdx.x;
 
             int sumi = 0;
-            #pragma unroll
-            for (int v = 0; v < vdr; ++v) {
-                const int x_int = x_qs[i * X_STRIDE + kx_start + v];
-                const int y_int = tile_y[j * Y_STRIDE + ky_start + v];
-                sumi = __builtin_amdgcn_sdot4(x_int, y_int, sumi, false);
+            if constexpr (mmq_x >= 64) {
+                // b128 path: issue 8 ints per operand as 2× int4 (b128)
+                // reads. Compiler emits 108× ds_read_b128 + 24× b32-quad
+                // fallbacks for misaligned rows (X_STRIDE=33: row stride
+                // 132 B aligns every 4th row). Threshold mmq_x≥64
+                // empirically determined: at mmq_x=32 the int4-unpack
+                // overhead (especially in _full_add_x16/x32 small-batch
+                // residual calls) exceeds the issue-rate win. Only the
+                // _x64 variants amortize b128 across enough j0 iters to
+                // pay off.
+                const int4 x_v0 = *(const int4*)&x_qs[i * X_STRIDE + kx_start + 0];
+                const int4 x_v1 = *(const int4*)&x_qs[i * X_STRIDE + kx_start + 4];
+                const int4 y_v0 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 0];
+                const int4 y_v1 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 4];
+                sumi = __builtin_amdgcn_sdot4(x_v0.x, y_v0.x, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v0.y, y_v0.y, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v0.z, y_v0.z, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v0.w, y_v0.w, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v1.x, y_v1.x, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v1.y, y_v1.y, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v1.z, y_v1.z, sumi, false);
+                sumi = __builtin_amdgcn_sdot4(x_v1.w, y_v1.w, sumi, false);
+            } else {
+                // Scalar (b32) path for small mmq_x where b128 unpack
+                // overhead exceeds the issue-rate win. Empirically:
+                // mmq_x=8/16/24 regress under b128, mmq_x≥32 wins.
+                #pragma unroll
+                for (int v = 0; v < vdr; ++v) {
+                    const int x_int = x_qs[i * X_STRIDE + kx_start + v];
+                    const int y_int = tile_y[j * Y_STRIDE + ky_start + v];
+                    sumi = __builtin_amdgcn_sdot4(x_int, y_int, sumi, false);
+                }
             }
 
             const float2 dm_i = x_dm[i];
