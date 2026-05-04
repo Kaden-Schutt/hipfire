@@ -6042,6 +6042,19 @@ impl Gpu {
             // screened on first use: a small synthetic comparison detects
             // outlier rows where Q8_1 precision loss exceeds the threshold
             // (#87). Unsafe weights fall through to WMMA instead.
+            // gfx12 FP8 (E4M3) opt-in path. Bypasses MMQ entirely. Gated behind
+            // HIPFIRE_GFX12_FP8=1 until correctness validated against coherence
+            // gate. The FP8 GEMM kernel does in-kernel HFQ4 dequant + per-tile
+            // activation FP8 cast — no Q8_1 quant pre-pass kernel, no per-K=32
+            // scale-correction loop. Targets the standalone wo + w_down path
+            // where the iu8 MMQ port regresses 27B by -8% (per
+            // project_gfx12_mmq_bench_2026_05_04.md).
+            if is_gfx12(&self.arch)
+                && std::env::var("HIPFIRE_GFX12_FP8").ok().as_deref() == Some("1")
+                && batch_size > 1
+            {
+                return self.gemm_hfq4g256_residual_fp8_gfx12(a_raw, x, y, m, k, batch_size);
+            }
             if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
                 || should_use_mmq(&self.arch, batch_size)
             {
