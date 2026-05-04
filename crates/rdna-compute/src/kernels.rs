@@ -224,6 +224,13 @@ pub const PROBE_WMMA_IU4_K32_GFX12_SRC: &str = include_str!("../../../kernels/sr
 // NOT the RDNA3 stride-2 interleave. The production iu4 GEMM port writes acc
 // using this 8-row-block formula. See `probe_wmma_iu4_k32_layout` example.
 pub const PROBE_WMMA_IU4_K32_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu4_k32_layout.gfx12.hip");
+// gfx12 iu8 K=16 WMMA layout-discovery probe — same three-pattern shape, but
+// exercises __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32 (the K=16 iu8 form
+// that exists on gfx12; the K=32 iu8 form does NOT exist there per the
+// probe-1 commit msg — K=32 is iu4 only). Used to confirm whether iu8 K=16
+// uses the same 8-row-block acc layout as iu4 K=32 before porting the MMQ
+// kernel from RDNA3 to gfx12. See `probe_wmma_iu8_k16_layout` example.
+pub const PROBE_WMMA_IU8_K16_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels/src/probe_wmma_iu8_k16_layout.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
