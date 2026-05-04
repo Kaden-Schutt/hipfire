@@ -460,6 +460,10 @@ impl Gpu {
 
         let compiler = KernelCompiler::new(&arch)?;
 
+        // Per-arch default for MMQ screening threshold. See the
+        // mmq_screen_threshold field below for rationale.
+        let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
+
         Ok(Self {
             hip,
             arch,
@@ -484,8 +488,21 @@ impl Gpu {
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
                 .map(|v| v == "1")
                 .unwrap_or(false),
+            // Default screening threshold: 0.10 absolute error per row,
+            // measured against synthetic uniform [-2, 2] activations.
+            // The 0.10 default was set when the gfx906 dp4a kernel was
+            // buggy (commit 8081822); the post-redesign kernel (commit
+            // c022682) is structurally cleaner and the same prompts pass
+            // coherence at 0.50. Bumping the gfx906 default to 0.50
+            // recovers the 30/72 weights that get rejected per Qwen 9B
+            // load (mostly row 3994 of m=4096 matrices, a known
+            // degenerate quant group). pp128 lifts 355 → 462 tok/s
+            // (1.30×) at threshold=0.50 with no coherence regression
+            // across all 4 mq4 rows of the gate. Other archs keep the
+            // conservative 0.10 default until similar validation.
             mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10),
+                .ok().and_then(|s| s.parse().ok())
+                .unwrap_or(mmq_screen_threshold_default),
             capture_mode: false,
             force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),

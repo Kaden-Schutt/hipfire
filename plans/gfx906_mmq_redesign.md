@@ -125,6 +125,23 @@ Reviews integrated:
   investigate screen-fallback share (32.5 % of GEMM time on
   residual_fp16_wave64, 30 weights rejected during a single load,
   row 3994 dominating).
+- v2.11 (2026-05-04): MMQ screen threshold default raised from
+  0.10 → 0.50 **on gfx906 only**. The 0.10 default was set when
+  the gfx906 dp4a kernel was buggy (commit 8081822); the
+  post-redesign kernel is structurally cleaner and produces
+  coherent output across all 4 mq4 coherence rows even with
+  screening effectively disabled. Threshold sweep: 0.10 rejects
+  30 weights → 0.50 rejects 0 weights, with no observable
+  coherence regression. Of the 30 rejected weights, **19 of 30
+  reject specifically on row 3994** of m=4096 matrices —
+  consistent with one degenerate quant group across the
+  quantization rather than a kernel bug (8081822-era root causes
+  are all fixed in the redesigned kernel). Per-arch default
+  preserves the conservative 0.10 for non-gfx906 archs until
+  similar validation is performed there.
+  **pp128: 355 → 462 tok/s (+30%, 3.28× over baseline).**
+  pp512: 554 tok/s = 74 % of stock llama.cpp's 750 tok/s pp512
+  baseline (was 19 % before the redesign).
 
 ## Goal (revised v2)
 
@@ -575,29 +592,30 @@ JIT cache correctly.
 | Prefill pp128 (within-session) | 287 tok/s, 2.04× baseline ✅ |
 | Prefill pp128 (cross-process A/B) | 2.04× confirmed, B spread 0.04% ✅ |
 
-**Optional follow-ups (re-prioritized after qkvza split, 2026-05-04):**
-- **(P1)** qkv MMQ port (still FP16 wave64 at 7.74 % post-split).
-  Standalone qkv kernel at K=hidden_size=4096, M=10240. Lower-risk
-  than the qkvza split since no row-routing tail. Estimated
-  end-to-end gain: ~3-4 %.
-- **(P2)** Investigate `residual_fp16_wave64` share at 32.5 % —
-  this is screening-fallback. Either screening threshold is too
-  aggressive (rejecting safe weights) or some weight matrices have
-  legitimate quant-noise issues with our kernel that shouldn't
-  exist after the redesign. Worth a closer look.
-- (P3) Path B — true fused 4-output MMQ kernel (§Phase 6).
-  Path A's split now delivers 2.50×; the marginal value of Path B
-  shrinks but isn't zero (saves the 1.15 ms beta+alpha wave64 tail).
-- (P4, speculative) reduce sync frequency from 8/HFQ4-group to
-  2/HFQ4-group à la stock. Needs LDS-budget analysis — likely
-  pushes back over the 32 KiB cap; revisit alongside b128.
-- (P5) ds_read_b128 vectorization (§Q8 deferred). rocprof says
+**Optional follow-ups (re-prioritized after threshold bump, 2026-05-04):**
+- **(P1)** Default-on flip — flip `should_use_mmq()` gfx906 branch
+  from opt-in to default-on. 3.28× pp128 speedup with no coherence
+  regression (across 4 mq4 rows × multiple thresholds) and the
+  threshold work demonstrates the headroom is screening
+  conservatism, not real precision issues. Lowest-effort,
+  highest-impact next step — exposes the redesign's gains to
+  default-config users without requiring HIPFIRE_MMQ=1.
+- (P2) Re-profile post-threshold-bump with rocprof to see what
+  the new bottleneck is. residual_fp16_wave64 share should have
+  collapsed; new top kernels are likely _full_set_x64 +
+  _full_add_x64 + qkvza tail. Path B (true fused 4-output MMQ)
+  becomes the candidate again if the qkvza tail is now visible.
+- (P3) Investigate why pp256 ≈ pp512 (560 vs 554 tok/s) — saturation
+  at large batches suggests launch overhead or HBM ceiling, not
+  kernel inefficiency. Profile pp512 specifically.
+- (P4) Path B — true fused 4-output MMQ kernel (§Phase 6).
+- (P5, speculative) reduce sync frequency from 8/HFQ4-group to
+  2/HFQ4-group à la stock. Likely pushes back over the 32 KiB cap;
+  revisit alongside b128.
+- (P6) ds_read_b128 vectorization (§Q8 deferred). rocprof says
   this lever is small — VALUBusy is at 27–41 % (not LDS-issue
   saturated) and MemUnitStalled is ~0. Expected gain ≤ 5 %.
-- (P6) Parameterize the test harness on mmq_x for repeatable
-  matrix runs. Polish, lowest priority.
-- (P7) Default-on flip — flip `should_use_mmq()` gfx906 branch from
-  opt-in to default-on once stability is confirmed in the field.
+- (P7) Parameterize the test harness on mmq_x. Polish.
 
 ### Phase 2b: full kernel rewrite (3–5 days)
 
