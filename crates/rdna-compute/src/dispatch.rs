@@ -119,7 +119,11 @@ fn has_wave64_native(arch: &str) -> bool {
 }
 
 fn has_mmq_i8_wmma(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152")
+    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152" | "gfx1200" | "gfx1201")
+}
+
+fn is_gfx12(arch: &str) -> bool {
+    matches!(arch, "gfx1200" | "gfx1201")
 }
 
 /// Decide whether the i8-WMMA MMQ prefill path should be used for a given
@@ -146,6 +150,16 @@ fn has_mmq_i8_wmma(arch: &str) -> bool {
 ///   `auto` / unset / other — auto-route by batch_size threshold (default)
 fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
     if !has_mmq_i8_wmma(arch) {
+        return false;
+    }
+    // gfx12 (RDNA4) MMQ port is fresh — gate behind explicit opt-in via
+    // HIPFIRE_GFX12_MMQ=1 until numeric correctness vs the FP16 reference
+    // path is validated. Once validated, flip the default and remove this
+    // guard. The kernel itself (commit 5757283 on PR #140) compiles + dispatches
+    // on gfx1201 silicon; this guard is a safety belt while we ship.
+    if is_gfx12(arch)
+        && std::env::var("HIPFIRE_GFX12_MMQ").ok().as_deref() != Some("1")
+    {
         return false;
     }
     match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
@@ -997,11 +1011,22 @@ impl Gpu {
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
     pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            "quantize_q8_1_mmq_ds4",
-        )?;
+        // gfx12 (RDNA4) uses a sister kernel with the same byte layout but the
+        // _gfx12-suffixed symbol — separate .hsaco compile from the RDNA3 one.
+        let (module_name, src, fn_name) = if is_gfx12(&self.arch) {
+            (
+                "gemm_hfq4g256_residual_mmq_gfx12",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC,
+                "quantize_q8_1_mmq_ds4_gfx12",
+            )
+        } else {
+            (
+                "gemm_hfq4g256_residual_mmq",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+                "quantize_q8_1_mmq_ds4",
+            )
+        };
+        self.ensure_kernel(module_name, src, fn_name)?;
 
         let blocks_k = (k + 127) / 128;
         let block_q8_1_mmq_bytes = 144usize;
@@ -1032,7 +1057,7 @@ impl Gpu {
             let grid_x = ((k + 1023) / 1024) as u32;
             let grid_y = batch_size as u32;
             self.launch_maybe_blob(
-                "quantize_q8_1_mmq_ds4",
+                fn_name,
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
                 0,
@@ -1059,6 +1084,18 @@ impl Gpu {
     /// Returns `true` if MMQ is safe for this weight, `false` if it should
     /// fall back to WMMA.
     pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
+        // gfx12 (RDNA4) MMQ is fresh and not yet hooked through the screen path
+        // (the screen reference compares against gemm_hfq4g256_residual_wmma_gfx12,
+        // which exists, but the screen's internal MMQ call routes through the
+        // gfx12 dispatch we just wired — needs end-to-end validation before we
+        // trust the threshold). For now, accept all weights when running on
+        // gfx12 with the explicit MMQ opt-in (HIPFIRE_GFX12_MMQ=1). After
+        // numeric correctness is validated against the FP16 reference, this
+        // bypass should be removed and gfx12 weights screened normally.
+        if is_gfx12(&self.arch) {
+            return true;
+        }
+
         let key = a_raw.buf.as_ptr() as usize;
         if let Some(&safe) = self.mmq_screen_cache.get(&key) {
             return safe;
@@ -5998,16 +6035,28 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
-            "gemm_hfq4g256_residual_mmq_full_add"
+        // gfx12 path: use the basic _residual_mmq variant only (boundary-elided
+        // _full_add / _full_set variants haven't been ported yet — first-cut
+        // ships only the basic variant with the runtime add flag).
+        let (module_name, src, kernel_name) = if is_gfx12(&self.arch) {
+            (
+                "gemm_hfq4g256_residual_mmq_gfx12",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC,
+                "gemm_hfq4g256_residual_mmq_gfx12",
+            )
         } else {
-            "gemm_hfq4g256_residual_mmq"
+            let name = if m % 128 == 0 && batch_size % 128 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_add"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            };
+            (
+                "gemm_hfq4g256_residual_mmq",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+                name,
+            )
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -6070,16 +6119,27 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
-            "gemm_hfq4g256_residual_mmq_full_set"
+        // gfx12 path: single basic variant with runtime add=0; the boundary-elided
+        // _full_set fast path is RDNA3-only for now (see _residual_mmq above).
+        let (module_name, src, kernel_name) = if is_gfx12(&self.arch) {
+            (
+                "gemm_hfq4g256_residual_mmq_gfx12",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC,
+                "gemm_hfq4g256_residual_mmq_gfx12",
+            )
         } else {
-            "gemm_hfq4g256_residual_mmq"
+            let name = if m % 128 == 0 && batch_size % 128 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_set"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            };
+            (
+                "gemm_hfq4g256_residual_mmq",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+                name,
+            )
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
@@ -6141,16 +6201,26 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        let kernel_name = if m % 128 == 0 && batch_size % 128 == 0 {
-            "gemm_hfq4g256_residual_mmq_full_set"
+        // gfx12: basic variant only (see _residual_mmq above for rationale).
+        let (module_name, src, kernel_name) = if is_gfx12(&self.arch) {
+            (
+                "gemm_hfq4g256_residual_mmq_gfx12",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC,
+                "gemm_hfq4g256_residual_mmq_gfx12",
+            )
         } else {
-            "gemm_hfq4g256_residual_mmq"
+            let name = if m % 128 == 0 && batch_size % 128 == 0 {
+                "gemm_hfq4g256_residual_mmq_full_set"
+            } else {
+                "gemm_hfq4g256_residual_mmq"
+            };
+            (
+                "gemm_hfq4g256_residual_mmq",
+                kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
+                name,
+            )
         };
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            kernel_name,
-        )?;
+        self.ensure_kernel(module_name, src, kernel_name)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_q8_ptr;
