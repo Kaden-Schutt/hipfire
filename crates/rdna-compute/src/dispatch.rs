@@ -3559,6 +3559,27 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+            // gfx906 dp4a MMQ — opt-in via HIPFIRE_MMQ=1. Path A §A2 of
+            // plans/gfx906_mmq_l2.md. Per the prefill trace, gate_up takes
+            // ~33% of total prefill on Qwen 9B, so a 38% per-call speedup
+            // (matching the residual MMQ vs FP16 wave64 ratio) translates to
+            // ~12% end-to-end. Quantize once, screen both weights, dispatch
+            // MMQ for each in set mode (add=0).
+            if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                let use_mmq = if self.mmq_screen {
+                    self.mmq_screen_weight(a_gate, gate_m, k)
+                        && self.mmq_screen_weight(a_up, up_m, k)
+                } else { true };
+                if use_mmq {
+                    let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                    let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_gate, xq, y_gate, gate_m, k, batch_size);
+                    let r2 = if r1.is_ok() {
+                        self.gemm_hfq4g256_mmq_set_gfx906(a_up, xq, y_up, up_m, k, batch_size)
+                    } else { Ok(()) };
+                    return r1.and(r2);
+                }
+                // else: screening rejected at least one weight — fall through to wave64.
+            }
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_fp16_wave64(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
@@ -6253,6 +6274,92 @@ impl Gpu {
             + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm",
             "gemm_hfq4g256_residual_mmq_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [64, 2, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Set-mode (add=0) variant of the gfx906 dp4a MMQ kernel, reusing the
+    /// caller's pre-quantized Q8_1 X pointer. Used by fused gate_up / qkv /
+    /// qkvza dispatch on gfx906 to amortize the Q8_1 quantize across multiple
+    /// weight matrices that share the same activation. Mirrors the RDNA3
+    /// `gemm_hfq4g256_mmq_set_prequant` pattern.
+    pub fn gemm_hfq4g256_mmq_set_gfx906(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Pick boundary-checked vs full-tile variant. _full_set selects the
+        // add=0 entry symbol; the bounds-checked entry takes `add` as a
+        // runtime parameter.
+        let kernel_name = if m % 128 == 0 && batch_size % 8 == 0 {
+            "gemm_hfq4g256_residual_mmq_gfx906_full_set"
+        } else {
+            "gemm_hfq4g256_residual_mmq_gfx906"
+        };
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mmq_gfx906",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_SRC,
+            kernel_name,
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 0i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        // Tile shape per kernel constants (must match the .hip file).
+        const MMQ_X: usize = 8;
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 65;
+        const Y_STRIDE: usize = 36;
+        const X_DM_HALF2: usize = 128;
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+
+        let shared_mem = (
+            (MMQ_Y * X_STRIDE * std::mem::size_of::<i32>())
+            + (X_DM_HALF2 * 8)
+            + (MMQ_X * Y_STRIDE * std::mem::size_of::<i32>())
+        ) as u32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm",
+            "gemm_hfq4g256_mmq_set_gfx906", bytes);
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
