@@ -169,6 +169,22 @@ Reviews integrated:
 
   Doc comment in dispatch.rs updated: gfx906 dp4a MMQ section
   no longer says "default off behind HIPFIRE_MMQ=1".
+- v2.13 (2026-05-04): CPU usage investigation — see
+  `docs/perf-checkpoints/2026-05-04-gfx906-mmq-cpu-investigation.md`.
+  User's "200 % CPU max" observation correct but misattributed: the
+  200 % peak is *post-prefill housekeeping* (logits download +
+  sample + JSON emit + unload), not the prefill throughput floor.
+  During actual prefill the CPU sits at 20-40 % in `D`-state most
+  of the time — GPU-bound, not CPU-bound. pp256/pp512 wallclock
+  scales linearly (456 → 923 ms; per-token cost 1.78 → 1.80 ms),
+  confirming we're in the linear-scaling regime. Setting an
+  explicit `active_stream` produced no perf change, ruling out
+  default-stream synchronization as a factor on modern HIP.
+  Conclusion: the 554 tok/s pp512 floor is per-call MMQ kernel
+  cost (`_full_set_x64` 1.94 ms vs stock's ~0.85 ms extrapolated
+  for K=4096 — about 2× longer). Suspected cause: Option B's 8
+  `__syncthreads()` per HFQ4 group vs stock's ~2/group. Plan §P2
+  re-prioritized to attack sync frequency.
 
 ## Goal (revised v2)
 
@@ -619,30 +635,44 @@ JIT cache correctly.
 | Prefill pp128 (within-session) | 287 tok/s, 2.04× baseline ✅ |
 | Prefill pp128 (cross-process A/B) | 2.04× confirmed, B spread 0.04% ✅ |
 
-**Optional follow-ups (re-prioritized after default-on, 2026-05-04):**
-- **(P1)** Investigate daemon CPU usage capping at ~200%. During
-  prefill the GPU appears starved at large batches — pp512 and
-  pp256 produce nearly identical tok/s (554 vs 561) suggesting
-  CPU dispatch is the bottleneck. Two threads = launch_kernel
-  + completion. Check whether stream-graph capture or thread
-  pinning would help.
-- (P2) Investigate why pp256 ≈ pp512 (561 vs 554 tok/s).
-  Plateau at large batches suggests launch overhead or HBM
-  ceiling. Related to P1 if the bottleneck is CPU-side.
-- (P3) Path B — true fused 4-output MMQ kernel (§Phase 6).
-  qkvza_fp16_wave64 is now down to 0.3 % share (just the tiny
-  beta+alpha tail), so Path B's marginal value is small. Revisit
-  only if it solves a launch-overhead problem.
-- (P4) The two large MMQ kernels (`_full_set_x64` 31.76 % and
-  `_full_add_x64` 19.03 %) are now 50.8 % of GEMM time. Per-call
-  improvements here would have outsized impact. Levers: sync
-  frequency reduction (P5) and/or ds_read_b128 (P6).
-- (P5, speculative) reduce sync frequency from 8/HFQ4-group to
-  2/HFQ4-group à la stock. Needs LDS-budget review — likely
-  pushes back over the 32 KiB cap; revisit alongside b128.
-- (P6) ds_read_b128 vectorization (§Q8 deferred). Small per-rocprof
-  but worth retesting now that the bottleneck has shifted.
-- (P7) Parameterize the test harness on mmq_x. Polish.
+**Optional follow-ups (re-prioritized after CPU investigation, 2026-05-04):**
+
+The "daemon never exceeds 200% CPU" hypothesis investigated — see
+`docs/perf-checkpoints/2026-05-04-gfx906-mmq-cpu-investigation.md`.
+Conclusion: **not a CPU bottleneck**. CPU sits at 20-40 % in `D`
+state during prefill, with brief 100 % bursts at launch loops.
+The 200 % peak observed is *post-prefill* housekeeping (logits
+download + sample + JSON emit + unload), not the prefill
+throughput floor. pp256/pp512 nearly identical tok/s is the real
+linear-scaling regime — wallclock per token is ~1.8 ms of GPU
+work and won't drop without faster MMQ kernels. Setting
+`active_stream` explicitly in the bench did not change perf,
+confirming default-stream synchronization isn't the issue on
+modern HIP.
+
+- **(P1)** The two large MMQ kernels (`_full_set_x64` 38.57 % at
+  pp256, 44.75 % at pp512; `_full_add_x64` 21.78 % / 25.66 %) are
+  the dominant cost. Per-call timings flat at ~1.93 ms / ~2.36 ms
+  regardless of pp; this is the per-token MMQ work that limits
+  pp512 to 554 tok/s. Stock llama.cpp's mul_mat_q runs at ~0.85
+  ms/call extrapolated for K=4096 — so each of our calls is ~2×
+  longer than stock at this M, suggesting the inter-warp
+  synchronization overhead is the long pole.
+- **(P2, speculative)** Reduce sync frequency from 8/HFQ4-group
+  to 2/HFQ4-group à la stock. Needs LDS-budget review — likely
+  pushes back over the 32 KiB cap. Most directly attacks P1.
+- (P3) ds_read_b128 vectorization (§Q8 deferred). Small per
+  prior rocprof analysis (VALUBusy not LDS-issue saturated) but
+  worth retesting now that the bottleneck is per-call MMQ work.
+- (P4) Path B — true fused 4-output MMQ kernel (§Phase 6).
+  qkvza_fp16_wave64 is now 0.3 % share (just beta+alpha tail);
+  Path B's marginal value is small unless paired with broader
+  fusion gains.
+- (P5) Investigate `attention_q8_0_kv_batched` per-call doubling
+  from pp256 (0.66 ms) → pp512 (1.29 ms). 2× per-call as
+  sequence doubles is suspicious; should be flat per-call if
+  KV is being amortized properly.
+- (P6) Parameterize the test harness on mmq_x. Polish.
 
 ### Phase 2b: full kernel rewrite (3–5 days)
 
