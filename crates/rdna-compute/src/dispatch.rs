@@ -397,6 +397,13 @@ pub struct Gpu {
     /// GEMM path (`gemm_hfq4g256_residual_fp8_gfx12`) to skip per-prefill
     /// in-kernel dequant.
     fp8_shadow_cache: HashMap<usize, GpuTensor>,
+    /// Counter of standalone-residual gemm calls. Used by the iu4 dispatch
+    /// gate to support layer-isolation experiments via HIPFIRE_GFX12_IU4_MAX_CALL.
+    /// Resets to 0 per Gpu instance (= per process). For Qwen3.5 each layer
+    /// makes 2 calls through this dispatcher (wo + w_down), so MAX_CALL=2 =
+    /// "iu4 on layer 0 wo+w_down only". Diagnostic for whether Q4_1 quality
+    /// failure cascades from one layer or compounds across many.
+    iu4_call_counter: std::cell::Cell<usize>,
 }
 
 impl Gpu {
@@ -515,6 +522,7 @@ impl Gpu {
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             fp8_shadow_cache: HashMap::new(),
+            iu4_call_counter: std::cell::Cell::new(0),
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
@@ -6339,9 +6347,22 @@ impl Gpu {
                 // project_gfx12_iu4_breakthrough_2026_05_04.md for the
                 // perf-vs-quality tradeoff in detail.
                 if std::env::var("HIPFIRE_GFX12_IU4").ok().as_deref() == Some("1") {
-                    let xq = self.ensure_q4_1_x(x, batch_size, k)?;
-                    return self.gemm_hfq4g256_residual_iu4_gfx12(
-                        a_raw, xq, y, m, k, batch_size, /*add=*/true);
+                    // Layer-isolation diagnostic: HIPFIRE_GFX12_IU4_MAX_CALL=N
+                    // limits iu4 to the first N calls of this dispatcher per
+                    // process (Qwen3.5: 2 calls/layer = wo + w_down). MAX=2 =
+                    // "layer 0 only". Counter persists for the Gpu lifetime
+                    // (= per-process), naturally resetting per fresh daemon
+                    // invocation by coherence-gate.
+                    let max_call: usize = std::env::var("HIPFIRE_GFX12_IU4_MAX_CALL")
+                        .ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+                    let call_idx = self.iu4_call_counter.get();
+                    self.iu4_call_counter.set(call_idx + 1);
+                    if call_idx < max_call {
+                        let xq = self.ensure_q4_1_x(x, batch_size, k)?;
+                        return self.gemm_hfq4g256_residual_iu4_gfx12(
+                            a_raw, xq, y, m, k, batch_size, /*add=*/true);
+                    }
+                    // else: fall through to FP16 / MMQ for this call
                 }
                 match std::env::var("HIPFIRE_GFX12_FP8").ok().as_deref() {
                     Some("1") => {
