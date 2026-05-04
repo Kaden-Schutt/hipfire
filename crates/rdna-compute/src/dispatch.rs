@@ -5007,6 +5007,99 @@ impl Gpu {
         result
     }
 
+    /// gfx12 (RDNA4) FP8 (E4M3) HFQ4-G256 residual GEMM.
+    ///
+    /// Sister of the `_mmq_gfx12` i8 path. Same 128x128 MMQ outer recipe but
+    /// uses `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` with FP32
+    /// accumulation, eliminating the i8 MMQ overheads (separate Q8_1 pre-
+    /// quant kernel + per-K=32 dmA*dsB scale-correction loop). HFQ4 dequant
+    /// is baked into the FP8 cast inline; activations are cast FP32->FP8
+    /// with a per-tile-col dynamic scale computed in-kernel, so no separate
+    /// activation-quant kernel launch is needed.
+    ///
+    /// Arch-gated to gfx1200/gfx1201. NOT wired into production prefill
+    /// dispatch — opt-in only via direct call until correctness lands.
+    /// Layout contract validated on R9700 by `probe_wmma_fp8_layout`.
+    ///
+    /// Args mirror `gemm_hfq4g256_residual_mmq_gfx12` except `x` is FP32
+    /// (not pre-quantized).
+    pub fn gemm_hfq4g256_residual_fp8_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !is_gfx12(&self.arch) {
+            return Err(hip_bridge::HipError::new(0, &format!(
+                "gemm_hfq4g256_residual_fp8_gfx12 requires gfx1200/gfx1201, got {}",
+                self.arch
+            )));
+        }
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_fp8_gfx12",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP8_GFX12_SRC,
+            "gemm_hfq4g256_residual_fp8_gfx12",
+        )?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_X: usize = 128;
+        const MMQ_Y: usize = 128;
+        const FP8_K_I32_STRIDE: usize = 32;  // K=128 / 4 fp8-per-i32
+        const TILE_IDS_FLOATS: usize = 128;  // per-col activation idScale
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let batch_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        // tile_x: 128 rows x 32 i32 = 16 KB
+        // tile_y: 128 cols x 32 i32 = 16 KB
+        // tile_idS: 128 floats     = 0.5 KB
+        let shared_mem = ((MMQ_Y * FP8_K_I32_STRIDE
+            + MMQ_X * FP8_K_I32_STRIDE) * std::mem::size_of::<i32>()
+            + TILE_IDS_FLOATS * std::mem::size_of::<f32>()) as u32;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 4    // FP32 X read (twice — pass 1 amax + pass 2 cast — but profile counts it once)
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_fp8_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_fp8_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 8, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the

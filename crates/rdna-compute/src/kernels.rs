@@ -251,6 +251,19 @@ pub const PROBE_WMMA_FP8_LAYOUT_GFX12_SRC: &str = include_str!("../../../kernels
 // skips the `_full_add` / `_full_set` boundary-elided variants for the first
 // cut (those are an easy follow-up once correctness lands on gfx1201).
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx12.hip");
+// gfx12 (RDNA4) FP8 (E4M3) variant of the HFQ4-G256 residual GEMM. Same
+// 128x128 MMQ tile recipe as the i8 sister but uses
+// __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12 with FP32 acc — drops
+// the i8 MMQ overheads (separate Q8_1 pre-quant kernel + per-K=32 dmA*dsB
+// scale-correction loop) by baking HFQ4 dequant into the FP8 cast inline
+// and casting activations FP32->FP8 with a per-(tile_y col) dynamic scale
+// computed in-kernel. K=128 per kb iter (half of an HFQ4 group) keeps LDS
+// at ~32.5 KB (16 KB tile_x + 16 KB tile_y + 0.5 KB per-col idScale), well
+// under the gfx12 ~64 KB ceiling. Layout contract validated by
+// probe_wmma_fp8_layout.gfx12.hip on R9700 silicon (commit 7984e38). First-
+// cut variant only: basic `_residual_fp8` with runtime `add` flag — no
+// `_full_add` / `_full_set` boundary-elided variants yet.
+pub const GEMM_HFQ4G256_RESIDUAL_FP8_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_fp8.gfx12.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
