@@ -49,6 +49,34 @@ landed; prefill 125.2 tk/s on Qwen 3.5 9B pp128 with screening on,
     pressure release was real.
   - **Distance to llama.cpp reference** (~235 tk/s) closes from
     0.53× → 0.62×.
+- v5 (2026-05-04): four post-commit follow-ups, all negative for the
+  residual kernel. Recorded in
+  `docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md` §"Post-
+  commit follow-up". Highlights:
+  - **MMQ_X=16/32 sweep** with j0 un-unroll: both regress 3% (MMQ_X=8
+    is the genuine optimum; barrier-amortization hypothesis was wrong).
+  - **ds_read_b128 conversion**: cut LDS-issue waits 36%; regressed
+    wallclock 2.7%. Compiler was already absorbing the waits.
+  - **Y-twice barrier collapse**: cut s_barrier 50% (12 → 6) at +10
+    VGPRs cost; recovered exactly 0 tk/s. Barrier overhead was not
+    the dominant cost either.
+  - **HIP+HSA trace** overturned the framing: rocprof's per-call
+    durations (3.4 ms / 6.7 ms for K=4096/12288) were inflated ~50%
+    by counter-sampling. Real per-call: **1.3 ms / 6.6 ms for MMQ vs
+    2.1 ms / 6.7 ms for FP16** — MMQ is 38% faster per call at
+    K=4096, equal at K=12288. The "78% idle" framing was a profiling
+    artifact, not real headroom on this kernel.
+  - Screening costs **−1.3 tk/s** measured directly. With screen=0
+    we hit 146.7 tk/s (+3.8% vs FP16), but screen is a correctness
+    requirement.
+  - **The residual kernel is now near-optimal.** Further inner-loop
+    work won't move prefill meaningfully — residual GEMM is only
+    ~30% of total prefill, and even halving 30% only buys 3%.
+  - **Re-direction:** the right next move is **porting MMQ to
+    `gemm_gate_up_hfq4g256`** (~33% of prefill — bigger opportunity
+    than anything left in residual). This was Path A §A2 of the
+    original plan; the residual-side work overshot what was
+    achievable on this kernel.
 
 ## Why the v1 plan was rejected
 
