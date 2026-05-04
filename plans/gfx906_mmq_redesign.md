@@ -185,6 +185,20 @@ Reviews integrated:
   for K=4096 — about 2× longer). Suspected cause: Option B's 8
   `__syncthreads()` per HFQ4 group vs stock's ~2/group. Plan §P2
   re-prioritized to attack sync frequency.
+- v2.14 (2026-05-04): **Sync-frequency reduction landed**, with a
+  detour through an LDS bank-conflict diagnostic. Option C window
+  streaming (4 syncs/group) initially regressed pp128 462 → 293
+  tok/s (-37%) — turned out to be a 47% LDS bank-conflict rate
+  caused by `X_STRIDE = 32` (a multiple of 32 banks → 64-way
+  conflict). Adding 1 int of row padding (X_STRIDE 32 → 33)
+  rotates banks per row, collapsing conflicts to 0%. **pp128
+  462 → 512 tok/s (+10.8%); pp512 554 → 584 (+5.4%, 78% of stock
+  llama.cpp).** PMC validation (LDSBankConflict, ALUStalledByLDS,
+  VALUBusy) is in `docs/perf-checkpoints/2026-05-04-gfx906-mmq-
+  window-streaming.md`. Lesson: ELF metadata (vgpr/spill/lds
+  budget) was insufficient to predict perf regression — bank-
+  conflict counters are the right diagnostic for LDS layout
+  changes.
 
 ## Goal (revised v2)
 
@@ -650,17 +664,14 @@ work and won't drop without faster MMQ kernels. Setting
 confirming default-stream synchronization isn't the issue on
 modern HIP.
 
-- **(P1)** The two large MMQ kernels (`_full_set_x64` 38.57 % at
-  pp256, 44.75 % at pp512; `_full_add_x64` 21.78 % / 25.66 %) are
-  the dominant cost. Per-call timings flat at ~1.93 ms / ~2.36 ms
-  regardless of pp; this is the per-token MMQ work that limits
-  pp512 to 554 tok/s. Stock llama.cpp's mul_mat_q runs at ~0.85
-  ms/call extrapolated for K=4096 — so each of our calls is ~2×
-  longer than stock at this M, suggesting the inter-warp
-  synchronization overhead is the long pole.
-- **(P2, speculative)** Reduce sync frequency from 8/HFQ4-group
-  to 2/HFQ4-group à la stock. Needs LDS-budget review — likely
-  pushes back over the 32 KiB cap. Most directly attacks P1.
+- ~~(P1)~~ ~~(P2)~~ **DONE in v2.14** (2026-05-04): sync-frequency
+  reduction landed (8/group → 4/group, Option C window streaming
+  + 1 pad int to defeat LDS bank conflicts). pp128 462 → 512
+  (+10.8%); pp512 554 → 584 (+5.4%). Diagnostic perf-checkpoint:
+  `docs/perf-checkpoints/2026-05-04-gfx906-mmq-window-streaming.md`.
+  The two large MMQ kernels still dominate but per-call dropped
+  meaningfully (no rocprof yet at the post-padding state — would
+  be a useful follow-up if we're chasing more).
 - (P3) ds_read_b128 vectorization (§Q8 deferred). Small per
   prior rocprof analysis (VALUBusy not LDS-issue saturated) but
   worth retesting now that the bottleneck is per-call MMQ work.

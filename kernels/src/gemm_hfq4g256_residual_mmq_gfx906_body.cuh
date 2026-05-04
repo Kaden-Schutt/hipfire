@@ -9,16 +9,22 @@
 //   mmq_y = 128
 //   mmq_x = templated {8, 16, 24, 32, 40, 48, 56, 64}
 //
-// Option B (Streaming) Pattern:
-//   HFQ4 group = 256 K-elements.
-//   We stream 32 K-elements at a time (8 sub-iterations per HFQ4 group).
-//   One HFQ4 group = 2 Q8_1 blocks (128 K-elements each).
-//   One Q8_1 block = 4 sub-blocks of 32 K-elements (each with its own d, sum).
+// Option C+pad (Window Streaming, supersedes Option B):
+//   HFQ4 group = 256 K-elements = 2 Q8_1 blocks = 2 windows.
+//   Each window covers 128 K-elements (= one Q8_1 block, = 4 sub-blocks
+//   of 32 K-elements each).
 //
-// K-iter mapping:
-//   sub_iter (0..7) covers the 256 elements.
-//   sub_iter 0..3: use Q8_1 block A (2*kg), sub-block (0..3).
-//   sub_iter 4..7: use Q8_1 block B (2*kg+1), sub-block (0..3).
+// Per-window pipeline (= 4 syncs/group total, vs Option B's 16):
+//   1. Load 128-K of x_qs (32 data ints + 1 pad int per row) + Q8_1
+//      block of tile_y
+//   2. __syncthreads
+//   3. 4 sub-blocks computed back-to-back (no syncs between)
+//   4. __syncthreads
+//
+// LDS bank-conflict guard: X_STRIDE=33 (not 32). At stride 32, all 64
+// lanes of a warp hit the same LDS bank → 47% bank-conflict rate.
+// 33 % 32 = 1 rotates the bank index by 1 each row → 0% conflicts.
+// PMC-validated.
 
 #define MMQ_Y 128
 #define MMQ_NWARPS 4
@@ -27,18 +33,21 @@
 #define QK8_1 32
 #define QI8_1 8
 
-// LDS stride for Option B streaming. Each sub_iter loads 32 K-elements
-// per row = 8 ints. No padding: 8 ints × 4 B = 32 B/row, already 16-byte
-// aligned for any future ds_read_b128 use, and bank-conflict-safe at
-// nwarps=4 (each warp's 64 lanes hit 64 distinct banks).
-#define X_STRIDE 8
+// Option C window: 32 data ints/row + 1 pad int → stride 33.
+// 33 % 32 = 1 ensures lane-stride visits 32 distinct LDS banks per
+// warp, eliminating the 64-way bank conflict that makes the unpadded
+// stride-32 layout pathological. PMC measured LDSBankConflict=37%
+// at stride=32 vs ~14% at stride=8 (Option B); the +1 pad recovers
+// to the same conflict regime as B while keeping the 4-window
+// streaming structure.
+#define X_STRIDE 33
 #define Y_STRIDE 36
 
 // LDS layout invariant — KEEP IN SYNC WITH dispatch.rs:
-//   [x_qs:   i32    × MMQ_Y * X_STRIDE      ]  = 128 * 8 * 4 = 4096 B
-//   [x_dm:   float2 × MMQ_Y                 ]  = 128 * 8     = 1024 B
+//   [x_qs:   i32    × MMQ_Y * X_STRIDE      ]  = 128 * 33 * 4 = 16,896 B
+//   [x_dm:   float2 × MMQ_Y                 ]  = 128 * 8      =  1,024 B
 //   [tile_y: i32    × mmq_x * Y_STRIDE      ]  = mmq_x * 144 B
-// Total per WG ≤ 4096 + 1024 + 64*144 = 14,336 B at mmq_x=64.
+// Total per WG ≤ 16,896 + 1,024 + 64*144 = 27,136 B at mmq_x=64.
 // Budget: ≤ 32 KiB/WG so 2 WGs/CU fit in 64 KiB cap. Verified ✅.
 
 struct block_q8_1_mmq {
@@ -49,20 +58,18 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
 // ─── Tile loaders ─────────────────────────────────────────────────────────
 
-// Load 32 K-elements of X (unpacked) for a specific sub_iter.
-// sub_iter ∈ [0, 7]. Each sub_iter loads 16 bytes of nibbles per row.
-// 16 bytes = 32 elements = 8 ints in x_qs.
+// Load 128 K-elements of X (unpacked) for one window.
+// window ∈ [0, 1]. Each window loads 64 bytes of nibbles per row
+// = 128 K-elements = 32 ints in x_qs (4 sub-blocks × 8 ints each).
 static __device__ __forceinline__ void load_hfq4_tile_streaming(
     const char* __restrict__ A,
     int* __restrict__ x_qs,
     float2* __restrict__ x_dm,
-    int row0, int kg, int sub_iter, int M, int groups_per_row
+    int row0, int kg, int window, int M, int groups_per_row
 ) {
     const int tid = threadIdx.y * WAVE_SIZE + threadIdx.x; // 0..255
 
-    // X-dm (scale, zp_eff) is loaded once per HFQ4 group (sub_iter 0).
-    if (sub_iter == 0) {
-        // distribute 128 rows across 256 threads
+    if (window == 0) {
         if (tid < 128) {
             const int i = tid;
             const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
@@ -73,21 +80,19 @@ static __device__ __forceinline__ void load_hfq4_tile_streaming(
         }
     }
 
-    // X-qs streaming load: 128 rows × 4 uints/row = 512 uint reads,
-    // distributed across 256 threads → 2 uints/thread. Chunk-major layout
-    // so adjacent tids hit consecutive 4-byte chunks of the same row
-    // (coalesced HBM access).
+    // X-qs window load: 128 rows × 16 uints/row = 2048 uint reads,
+    // distributed across 256 threads → 8 uints/thread. Chunk-major layout.
     #pragma unroll
-    for (int loop = 0; loop < 2; ++loop) {
-        const int task_id = tid * 2 + loop; // 0..511
-        const int i = task_id / 4;          // row, 0..127
-        const int chunk = task_id % 4;      // which uint in row, 0..3
-        
+    for (int loop = 0; loop < 8; ++loop) {
+        const int task_id = tid * 8 + loop; // 0..2047
+        const int i = task_id / 16;         // row, 0..127
+        const int chunk = task_id % 16;     // which uint in row, 0..15
+
         const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
         const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
-        
-        // Offset into HFQ4 nibbles: 8 (header) + sub_iter * 16 (streaming offset) + chunk * 4.
-        const unsigned int qs0 = *(const unsigned int*)(gp + 8 + sub_iter * 16 + chunk * 4);
+
+        // Offset: 8 (header) + window * 64 (block A vs B) + chunk * 4.
+        const unsigned int qs0 = *(const unsigned int*)(gp + 8 + window * 64 + chunk * 4);
         
         // Decompose 8 nibbles into 2 ints.
         const unsigned int n0 = (qs0 >>  0) & 0xFu;
@@ -155,6 +160,7 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
     int sub_block
 ) {
     constexpr int vdr = 8; // 8 ints cover 32 K-elements.
+    const int kx_start = sub_block * 8;
     const int ky_start = 4 + sub_block * 8;
 
     #pragma unroll
@@ -171,7 +177,7 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
             int sumi = 0;
             #pragma unroll
             for (int v = 0; v < vdr; ++v) {
-                const int x_int = x_qs[i * X_STRIDE + v];
+                const int x_int = x_qs[i * X_STRIDE + kx_start + v];
                 const int y_int = tile_y[j * Y_STRIDE + ky_start + v];
                 sumi = __builtin_amdgcn_sdot4(x_int, y_int, sumi, false);
             }
@@ -248,20 +254,15 @@ static __device__ __forceinline__ void mmq_body_templated(
     float sum[(mmq_x / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE)] = {0.0f};
 
     for (int kg = 0; kg < groups_per_row; ++kg) {
-        // One HFQ4 group = 256 K-elements = 2 Q8_1 blocks × 4 sub-blocks.
-        // Sub-iters 0..3 consume Q8_1 block A (= 2*kg); 4..7 consume B.
-        // Do NOT unroll: 8× unroll inflates live ranges and causes massive
-        // VGPR spills (986 at mmq_x=64) — keep the loop rolled.
-        for (int sub_iter = 0; sub_iter < 8; ++sub_iter) {
-            if (sub_iter == 0) {
-                load_q8_1_tile_coalesced<mmq_x>(Xq, tile_y, col0, 2*kg, N);
-            } else if (sub_iter == 4) {
-                load_q8_1_tile_coalesced<mmq_x>(Xq, tile_y, col0, 2*kg + 1, N);
-            }
-            load_hfq4_tile_streaming(A, x_qs, x_dm, row0, kg, sub_iter, M, groups_per_row);
-
+        // Option C: 2 windows × 4 sub-blocks each, 4 syncs/group total.
+        for (int window = 0; window < 2; ++window) {
+            load_q8_1_tile_coalesced<mmq_x>(Xq, tile_y, col0, 2*kg + window, N);
+            load_hfq4_tile_streaming(A, x_qs, x_dm, row0, kg, window, M, groups_per_row);
             __syncthreads();
-            vec_dot_dp4a_streaming<mmq_x>(x_qs, x_dm, tile_y, sum, sub_iter % 4);
+            #pragma unroll 1
+            for (int sub = 0; sub < 4; ++sub) {
+                vec_dot_dp4a_streaming<mmq_x>(x_qs, x_dm, tile_y, sum, sub);
+            }
             __syncthreads();
         }
     }

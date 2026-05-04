@@ -6380,7 +6380,7 @@ impl Gpu {
         //   x_dm   : MMQ_Y float2
         //   tile_y : mmq_x * Y_STRIDE ints
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 8;   // 32-K stream window, 8 ints/row
+        const X_STRIDE: usize = 33;  // 128-K window: 32 data + 1 pad (LDS bank-conflict)
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
@@ -6482,7 +6482,7 @@ impl Gpu {
         // Option B streaming topology — KEEP IN SYNC WITH body.cuh
         // (same layout invariant as residual variant above).
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 8;
+        const X_STRIDE: usize = 33;
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
