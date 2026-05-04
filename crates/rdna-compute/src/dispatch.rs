@@ -3245,6 +3245,33 @@ impl Gpu {
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
+                // gfx906 dp4a MMQ: route q+k+v through the new MMQ kernel.
+                // Unlike qkvza, all three qkv outputs have M well above
+                // MMQ_Y=128 (Qwen 9B full-attn: q_m=4096, k_m=v_m=1024),
+                // so no tail kernel is needed — straight 3× MMQ-set.
+                //
+                // Behind HIPFIRE_MMQ=1 (opt-in during validation). Falls
+                // through to the fused wave64 if any of q/k/v screening
+                // rejects.
+                if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                    let qkv_safe = if self.mmq_screen {
+                        self.mmq_screen_weight(a_q, q_m, k)
+                            && self.mmq_screen_weight(a_k, k_m, k)
+                            && self.mmq_screen_weight(a_v, v_m, k)
+                    } else { true };
+                    if qkv_safe {
+                        let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+                        let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_q, xq, y_q, q_m, k, batch_size);
+                        let r2 = if r1.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_gfx906(a_k, xq, y_k, k_m, k, batch_size)
+                        } else { Ok(()) };
+                        let r3 = if r2.is_ok() {
+                            self.gemm_hfq4g256_mmq_set_gfx906(a_v, xq, y_v, v_m, k, batch_size)
+                        } else { Ok(()) };
+                        return r1.and(r2).and(r3);
+                    }
+                    // else: fall through to fused wave64
+                }
                 return self.gemm_qkv_hfq4g256_fp16_wave64(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             if should_use_mmq(&self.arch, batch_size) {

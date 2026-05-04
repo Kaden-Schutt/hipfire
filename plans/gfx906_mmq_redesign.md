@@ -113,6 +113,18 @@ Reviews integrated:
   pre-implementation analysis; Path B (true fused 4-output MMQ
   kernel) remains §Phase 6 deferred but the gap above the plan's
   ≥260 target after qkvza port is now 35 %.
+- v2.10 (2026-05-04): qkv MMQ port — gfx906 full-attn qkv dispatch
+  routes q+k+v through `gemm_hfq4g256_mmq_set_gfx906`. All three M
+  dims (q_m=4096, k_m=v_m=1024) are above MMQ_Y=128, no tail
+  needed. **pp128: 352 → 355 tok/s (+0.9 %).** Modest because **7
+  of 8 qkv calls hit screen-fallback** at threshold 0.10. Per-call
+  attribution: gemm_qkv_hfq4g256_fp16_wave64 still at 5.32 ms/call
+  on the unrejected calls (dispatch wiring confirmed via the 1
+  call that does fire MMQ). End-to-end correctness: 9B-reason
+  coherence prompt fluent and identical. Real opportunity now:
+  investigate screen-fallback share (32.5 % of GEMM time on
+  residual_fp16_wave64, 30 weights rejected during a single load,
+  row 3994 dominating).
 
 ## Goal (revised v2)
 
