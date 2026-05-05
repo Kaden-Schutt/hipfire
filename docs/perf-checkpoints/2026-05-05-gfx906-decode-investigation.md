@@ -1,0 +1,248 @@
+# gfx906 decode investigation — gap to llama.cpp
+
+Date: 2026-05-05
+Hardware: MI50 / gfx906 / HBM2 1024 GB/s peak.
+Model: Qwen 3.5 9B (hipfire MQ4 / stock Q4_K_M).
+Workload: AR decode at batch=1, 128 tokens, asym3 KV.
+
+## Headline
+
+| Implementation | tg128 tok/s | ms/token | Effective BW |
+|---|---:|---:|---:|
+| **hipfire (this branch, MQ4)** | **50.7** | 19.7 | ~250 GiB/s |
+| Stock llama.cpp (Q4_K_M) | 61.55 | 16.2 | ~305 GiB/s |
+| skyne98 fork (Q4_K_M) | 63.48 | 15.7 | ~315 GiB/s |
+| Stock 27B Q4_K_M | (not measured) | — | — |
+| **hipfire 27B MQ4** | **17.0** | 58.8 | ~238 GiB/s |
+
+We're **3.5 ms/tok behind stock**, **4 ms/tok behind the unverbraucht/skyne98 fork**, **~25% of HBM2 peak**. Decode is HBM-bound but not saturated.
+
+## Decode hot path (rocprof, hipfire 9B AR)
+
+Per-token, 128-token gen, 32-layer 9B:
+
+| Kernel | Calls | Avg | Share |
+|---|---:|---:|---:|
+| `fused_gate_up_hfq4g256_wave64` | 4096 | 173 µs | **25.5 %** |
+| `gemv_hfq4g256_residual_wave64` | 8192 | 78 µs | **23.1 %** |
+| `fused_qkvza_hfq4g256_wave64` | 3072 | 88 µs | 9.8 % |
+| `fused_qkv_hfq4g256_wave64` | 1024 | 74 µs | 2.7 % |
+| `gemv_hfq4g256_wide` (lm_head) | 129 | 1730 µs | 8.0 % |
+| `fused_rmsnorm_mq_rotate` | 8256 | 17 µs | 5.2 % |
+| `attention_flash_asym3_tile` | 1024 | 116 µs | 4.3 % |
+| `sample_top_p` | 129 | 729 µs | 3.4 % |
+
+**61 % of decode is GEMV**: `fused_gate_up + gemv_residual + fused_qkvza + fused_qkv = 61.1 %`.
+
+## PMC — what's limiting the GEMVs
+
+| Kernel | VALUBusy | MemUnitStalled | FetchSize/call | LDSBankConflict |
+|---|---:|---:|---:|---:|
+| `fused_gate_up_*_wave64` | **41.4 %** | **4.12** | 52 KB | 0.0 |
+| `fused_qkv_*_wave64` | 37.2 % | 4.00 | 22 KB | 0.0 |
+| `fused_qkvza_*_wave64` | 37.9 % | 4.23 | 26 KB | 0.0 |
+| `gemv_residual_*_wave64` | 25.9 % | 0.95 | 18 KB | 0.0 |
+
+VALUBusy 26-41 % means ALU is mostly idle. MemUnitStalled 0.95-4.23 says memory **is** the limiting factor on `fused_gate_up/qkv/qkvza` (>4 % stall is non-trivial), but **not** on `gemv_residual` (<1 % stall — that one is *compute-light* / per-row work too small to amortize launch overhead).
+
+Computed effective BW per kernel:
+- `fused_gate_up` 52 KB × 4096 calls / 0.71 s ≈ **300 MB/s effective per kernel**
+- That's ~0.03 % of peak HBM2 — clearly memory parallelism, not raw bandwidth, is the bottleneck.
+
+The gap is **memory-level parallelism (MLP)**: not enough in-flight HBM transactions per CU to hide latency. The kernels do already split each wave64 into 2× 32-lane half-waves on different output rows (`row = blockIdx.x * 2 + warp_id`) and interleave 4 quads per inner iter — so the obvious "double the row count per WG" lever is already applied. The remaining gap is something subtler than topology — see the lever audit below.
+
+## What llama.cpp-gfx906 (iacopPBK fork, commit `eec153c`) does differently
+
+Inspecting the fork's `ggml/src/ggml-cuda/gfx906/` directory reveals 29 gfx906-specific kernel files. Key decode-relevant differences:
+
+### 1. `mmvq-q4_0.cuh` / `mmvq-q4_1.cuh` / `mmvq-q8_0.cuh` — warp-cooperative GEMV
+
+```c
+__launch_bounds__(64, 1)
+__global__ void gfx906_mul_mat_vec_q4_0_warp_coop(...) {
+    const int half_lane = lane_id % 32;
+    const int row_offset = lane_id / 32;
+    const int row = blockIdx.x * 2 + row_offset;
+    ...
+    for (int ib = half_lane; ib < blocks_per_row; ib += 32) {
+        // 8 dp4a per iter, 4 nibble-decoded ints
+    }
+    sumf = warp_reduce_sum<32>(sumf);  // half-warp reduction
+}
+```
+
+Two key tricks:
+- **2 rows per WG** via half-wave split (`lane_id / 32`). One wave64 computes two output rows simultaneously, **doubling memory parallelism per CU**.
+- **No LDS staging at all** — direct HBM → register → dp4a. 64 threads × 2 rows × 1 wave/CU × 60 CUs × launch_bounds(64,1) = lots of waves competing for HBM, fully saturating the bandwidth.
+- Reduction via `warp_reduce_sum<32>` keeps the two row-results in different half-waves.
+
+### 2. `mmq-prefetch.cuh` — explicit Y-tile prefetch (software pipelining)
+
+```c
+template<int mmq_x, int mmq_tile_y_k, int nwarps, int warp_size>
+__device__ __forceinline__ int gfx906_prefetch_y_tile_v4(
+    const int * y, const int ncols_y,
+    const int kb0, const int kb0_stop, const int qk, const int blocks_per_iter) {
+    ...
+    // 16 lanes from warp 0 prefetch 16 cache lines (1KB) for next iteration
+    asm volatile(
+        "global_load_dword %0, %1, off\n"
+        : "=v"(prefetch_data) : "v"(prefetch_addr) : "memory"
+    );
+    return prefetch_data;
+}
+```
+
+Issues `global_load_dword` for the *next* iteration's data while current iteration computes. The compiler doesn't reorder these into the critical path because they're inline-asm'd. **L2 cache gets warmed for the next iter's HBM fetches.** This is the prefetch lever the original gfx906 plan considered (see PRD §3.3) — and *they* use it on the prefill MMQ path, not on the GEMV decode path.
+
+### 3. `mmq.cuh` — load-defer via separate cache phase
+
+```c
+// LOAD phase: each iter's HBM data → per-thread register cache
+GFX906_LOAD_TILES_Q8_0_ASYNC(cache_size, ..., qs0_cache, qs1_cache, ...)
+
+// STORE phase (separate, later): register cache → LDS
+GFX906_STORE_TILES_Q8_0_LDS_MMA(cache_size, x_qs, qs0_cache, qs1_cache, ...)
+```
+
+The HBM load and the LDS store occupy different instruction issue slots. The compiler pipelines `cache_size` HBM transactions in flight while the LDS unit is idle (during compute), then drains to LDS in a quick burst. This is **load-defer software pipelining** — orthogonal to (1) and (2).
+
+### 4. `gfx906-common.cuh` — utility primitives
+
+- `sgpr_broadcast_*` via `__builtin_amdgcn_readfirstlane` to free up VGPRs by hoisting wave-uniform values to scalar registers.
+- `fast_exp_f32`, `fast_log2_f32`, `fast_rcp_f32`, `fast_tanh_f32` via single-instruction `v_exp_f32` / `v_log_f32` / `v_rcp_f32`.
+- DPP-based `hip_add_xor*_f32` and `hip_max_xor*_f32` reductions.
+
+These would help any kernel doing softmax, layer-norm reduction, or warp reductions. We have hand-rolled equivalents for some of these.
+
+## Implications for hipfire
+
+### Correction: P1 (2 rows per WG) is already applied
+
+When attempting to prototype a 2-rows-per-WG variant, inspection of the existing kernels showed the half-wave-split topology is **already in place** in all four hot-path decode kernels:
+
+- `gemv_hfq4g256_residual_wave64.hip:7` — *"block=[64,1,1] packs two rows per block (one per warp); grid halves from M to (M + 1) / 2"* — `row = blockIdx.x * 2 + warp_id`.
+- `fused_gate_up_hfq4g256_wave64.hip` — same pattern, `gid = blockIdx.x * 2 + warp_id`.
+- `fused_qkv_hfq4g256_wave64.hip` — same pattern.
+- `fused_qkvza_hfq4g256_wave64.hip` — same pattern.
+
+Furthermore, our GEMV inner loop already does a **4-quad interleave** (`acc0..acc3` over 4 consecutive HFQ4 groups, 4 packed-int loads from 4 different group rows per inner iter). That's strictly *more* MLP per WG than iacopPBK's `mmvq_q4_0_warp_coop` 8-dp4a-per-iter pattern.
+
+So the headline lever the original analysis pointed at is moot. The MemUnitStalled 4 % / VALUBusy 26-41 % numbers were measured *with* this topology already in flight. The gap to llama.cpp must come from somewhere else.
+
+### Remaining levers to investigate
+
+### P1' — Y-tile prefetch on decode (was P2)
+
+Issue `global_load_dword` for the next layer's input activation while the current GEMV computes. Decode is sequential per-token but per-layer there's spatial locality (next layer reads previous layer's output, which we just computed). **Estimated impact: 1.05-1.1× speedup** by warming L2. iacopPBK uses this on prefill MMQ; the same pattern is unused on our decode path.
+
+### P2' — Per-WG occupancy and `__launch_bounds__`
+
+iacopPBK uses `__launch_bounds__(64, 1)` to force one wave per CU at compile time, which is the gfx906 sweet spot for memory-bound GEMVs. Worth checking what `--save-temps`-emitted register pressure / occupancy actually is on our kernels and whether HIP is choosing a different occupancy than is optimal for HBM throughput.
+
+### P3' — `v_dot4_i32_i8` for the mantissa multiply
+
+Our HFQ4 GEMVs decode 4-bit nibbles into FP and run a scalar FMA chain (the `DOG` macro). iacopPBK's mmvq path uses dp4a (`v_dot4_i32_i8`) on packed int8 values: 4 multiply-adds per instruction in 1 issue slot. We sidestepped it because HFQ4 is dequant-then-FMA, not int8-MMA. But we could pre-quantize x to int8 per-block (mirroring Q8_1 activations from MMQ prefill) and run the *decode-time* GEMV through dp4a too. **Estimated impact: 1.3-1.6× on ALU throughput**, useful even on memory-bound kernels because lower issue rate → less time the load unit is contended.
+
+Risk: changes the math — needs FP-equivalence validation against current GEMV.
+
+### P4' — `sgpr_broadcast` / `readfirstlane` for wave-uniform values
+
+iacopPBK's `gfx906-common.cuh` hoists wave-uniform values (group scale, zero-point) to scalar registers via `__builtin_amdgcn_readfirstlane`. Our GEMV reloads `sc0..sc3, zp0..zp3` per lane every quad iteration. If the compiler isn't already promoting these to SGPRs, manual hoisting would free up VGPRs (helping occupancy) and cut redundant register reads. Estimated impact: <5 % per kernel, but cheap to apply.
+
+## Recommended next investigation
+
+Two parallel probes, in this order:
+
+1. **Audit register pressure & occupancy** of the 4 decode kernels via `--save-temps` or rocm-objdump on the cached binaries. We need to know if we're at 1 wave/CU or 2, and whether VGPR pressure is the constraint. This is data-cheap and reframes whether P1' or P2' is the right next lever.
+
+2. **Profile L2 hit rate** on the activation-x reads with `L2CacheHit` PMC counter on a clean run. iacopPBK's prefetch only helps if our L2 hit rate on `x[]` is currently <90 %. If we're already at 95 %+, P1' is small.
+
+If both come back uninformative, the dp4a port (P3') is the single biggest lever — but it's also the most invasive and needs careful FP-equivalence work.
+
+## Probe results (2026-05-05)
+
+### Phase 1: Occupancy audit (kernel-descriptor metadata)
+
+Extracted via `clang-offload-bundler` + `llvm-readelf --notes` from the cached `.hsaco` binaries. See `docs/skills/gfx-kernel-metadata/SKILL.md` for the procedure.
+
+| Kernel | VGPR | SGPR | LDS | Spills | Theoretical waves/SIMD |
+|---|---:|---:|---:|---:|---:|
+| `gemv_hfq4g256_residual_wave64` | 29 | 14 | 0 | 0 | **8** (cap 32) |
+| `fused_gate_up_hfq4g256_wave64` | 29 | 20 | 0 | 0 | **8** |
+| `fused_qkv_hfq4g256_wave64` | 46 | 20 | 0 | 0 | **5** (cap 51) |
+| `fused_qkvza_hfq4g256_wave64` | 46 | 22 | 0 | 0 | **5** |
+
+Zero spills, zero LDS, well under the VGPR ceiling. **P2' (`__launch_bounds__` tuning) is not worth pursuing** — we already have plenty of in-flight wave headroom; the limiter is HBM-side, not occupancy-side.
+
+### Phase 2: L2 hit rate (PMC `L2CacheHit`)
+
+Single-counter rocprof pass, AR decode of 9B MQ4, 128 generated tokens, 17000+ contexts collected for the 4 hot-path decode kernels:
+
+| Kernel | Calls | L2 Hit % | HBM-miss % |
+|---|---:|---:|---:|
+| `gemv_hfq4g256_residual_wave64` | 8256 | **39.5** | 60.5 |
+| `fused_gate_up_hfq4g256_wave64` | 4128 | **40.2** | 59.8 |
+| `fused_qkvza_hfq4g256_wave64` | 3096 | **47.1** | 52.9 |
+| `fused_qkv_hfq4g256_wave64` | 1032 | **44.3** | 55.7 |
+
+For comparison: `attention_flash_asym3_tile` hits **78.8 %** (KV-cache reuse working), small per-token utility kernels 56–62 %.
+
+### Interpretation
+
+The hot-path GEMVs run at **~40-47 % L2 hit**. The activation `x[]` (≤18 KB at 9B hidden_dim) easily fits L2 and should be ~100 % hit, so the miss volume is the **weights**: 256-element-per-group HFQ4 streamed once per WG, no reuse across WGs within a token, no reuse across tokens (next token reads next-layer weights).
+
+This validates iacopPBK's prefetch lever as **legitimately applicable**: shifting even half of the 60 % miss rate to L2-hit by issuing `global_load_dword` for the next quad's `pk0..pk3 / sc0..sc3 / zp0..zp3` while the current quad's compute runs would meaningfully reduce HBM-bus stalls. Estimated lift: 1.10-1.15× on the 4 hot-path kernels (memory-bound regime, ~10-15 % of HBM traffic shifted to L2 latency).
+
+### Revised lever ranking
+
+1. **P3' — dp4a port** (1.3-1.6× ALU throughput, also implicitly halves weight fetch volume by quantizing x to int8 — biggest theoretical lift; most invasive)
+2. **P1' — across-quad weight prefetch** in the GEMV inner loop (1.10-1.15×; medium effort; data-supported by 40 % L2 hit)
+3. **P4' — `readfirstlane` SGPR hoisting** (<5 %; cheap sweep; consider rolling in alongside any other change)
+4. ~~P2' — `__launch_bounds__` tuning~~ — ruled out by occupancy audit
+
+## Reproducing
+
+```sh
+# AR decode bench
+hipfire bench qwen3.5:9b --runs 3
+
+# rocprof kernel-trace
+rocprofv3 --kernel-trace --stats -d ./run -o trace --output-format csv -- \
+    target/release/examples/daemon < decode_input.jl
+
+# PMC (one counter per pass on gfx906)
+for ctr in VALUBusy MemUnitStalled FetchSize VALUUtilization L2CacheHit; do
+    printf 'pmc: %s\ngpu: 0\n' "$ctr" > pmc.txt
+    rocprof -i pmc.txt -o "run_${ctr}.csv" \
+        target/release/examples/daemon < decode_input.jl
+done
+
+# L2CacheHit pass on bench_qwen35_mq4 (validated working command)
+HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
+HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
+rocprof -i pmc_l2.txt -o decode_l2.csv \
+    target/release/examples/bench_qwen35_mq4 \
+    $HOME/.hipfire/models/qwen3.5-9b.mq4 \
+    --prefill 16 --warmup 1 --gen 128
+
+# Occupancy / register-pressure audit — see
+# docs/skills/gfx-kernel-metadata/SKILL.md for the full procedure.
+
+# Stock llama.cpp comparison (constrain to MI50, the iGPU breaks rocprofv3)
+HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
+    /tmp/llama-stock/build/bin/llama-bench \
+    -m /data/models/.../Qwen3.5-9B-Q4_K_M.gguf \
+    -ngl 99 -p 0 -n 128 -r 3 -ctk q8_0 -ctv q8_0 -fa 1
+```
+
+## References
+
+- iacopPBK fork: https://github.com/iacopPBK/llama.cpp-gfx906
+- The commit with all gfx906 optimizations: `eec153c086df6a9e7a69499bea3639597c085fff` ("2602.01 version")
+- Skyne98 / unverbraucht fork (in our local checkout): `~/mygit/llama.cpp-gfx906`
+- Our hipfire decode kernels:
+  - `kernels/src/gemv_hfq4g256_residual_wave64.hip`
+  - `kernels/src/fused_gate_up_hfq4g256_wave64.hip`
+  - `kernels/src/fused_qkv_hfq4g256_wave64.hip`
+  - `kernels/src/fused_qkvza_hfq4g256_wave64.hip`
