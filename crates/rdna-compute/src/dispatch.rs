@@ -2679,6 +2679,73 @@ impl Gpu {
         result
     }
 
+    /// dp4a-port of fused_qkv_hfq4g256 for gfx906. Pre-quantizes x to
+    /// Q8_1 via the shared MMQ scratch, then runs the dp4a-based GEMV.
+    /// Math is identical modulo Q8_1 quant noise. Targets gfx906's
+    /// memory-bound regime per the per-kernel PMC pass at 2026-05-05.
+    pub fn fused_qkv_hfq4g256_dp4a(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_qkv_hfq4g256_wave64_dp4a",
+            kernels::FUSED_QKV_HFQ4G256_WAVE64_DP4A_SRC,
+            "fused_qkv_hfq4g256_wave64_dp4a",
+        )?;
+
+        let aq = a_q.buf.as_ptr();
+        let ak = a_k.buf.as_ptr();
+        let av = a_v.buf.as_ptr();
+        let yq = y_q.buf.as_ptr();
+        let yk = y_k.buf.as_ptr();
+        let yv = y_v.buf.as_ptr();
+        let q_m_val = q_m as i32;
+        let k_m_val = k_m as i32;
+        let v_m_val = v_m as i32;
+        let k_val = k as i32;
+        let total = (q_m + k_m + v_m) as u32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void,
+            &ak as *const _ as *mut c_void,
+            &av as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void,
+            &yk as *const _ as *mut c_void,
+            &yv as *const _ as *mut c_void,
+            &q_m_val as *const _ as *mut c_void,
+            &k_m_val as *const _ as *mut c_void,
+            &v_m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(v_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "fused_qkv_hfq4g256_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av); b.push_ptr(xq);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val);
+                b.push_i32(v_m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     // HFQ2 GEMV dispatch already exists at line ~521 from the HFQ family
 
     /// 3-way fused HFQ4-G256 projection — cross-arch.
@@ -2694,6 +2761,12 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        if gemv_dp4a_enabled(&self.arch) {
+            return self.fused_qkv_hfq4g256_dp4a(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k,
+            );
+        }
+
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -2777,6 +2850,13 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        if gemv_dp4a_enabled(&self.arch) {
+            return self.fused_qkvza_hfq4g256_dp4a(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k,
+            );
+        }
         // gfx906/gfx908/gfx94x wave64-native path:
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
@@ -2837,6 +2917,75 @@ impl Gpu {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
                 b.push_ptr(xp); b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
+                b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
+                b.push_i32(k_i);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// dp4a-port of fused_qkvza_hfq4g256 for gfx906. Pre-quantizes x to
+    /// Q8_1 via the shared MMQ scratch, then runs the dp4a-based GEMV.
+    /// Math is identical modulo Q8_1 quant noise. Targets gfx906's
+    /// memory-bound regime per the per-kernel PMC pass at 2026-05-05.
+    pub fn fused_qkvza_hfq4g256_dp4a(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_qkvza_hfq4g256_wave64_dp4a",
+            kernels::FUSED_QKVZA_HFQ4G256_WAVE64_DP4A_SRC,
+            "fused_qkvza_hfq4g256_wave64_dp4a",
+        )?;
+
+        let aq = a_qkv.buf.as_ptr();
+        let az = a_z.buf.as_ptr();
+        let ab = a_beta.buf.as_ptr();
+        let aa = a_alpha.buf.as_ptr();
+        let yq = y_qkv.buf.as_ptr();
+        let yz = y_z.buf.as_ptr();
+        let yb = y_beta.buf.as_ptr();
+        let ya = y_alpha.buf.as_ptr();
+        let q_m_i = qkv_m as i32;
+        let z_m_i = z_m as i32;
+        let b_m_i = beta_m as i32;
+        let a_m_i = alpha_m as i32;
+        let k_i = k as i32;
+        let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+        let mut xq = xq_ptr;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", "fused_qkvza_hfq4g256_dp4a", bytes);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &aq as *const _ as *mut c_void, &az as *const _ as *mut c_void,
+            &ab as *const _ as *mut c_void, &aa as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yq as *const _ as *mut c_void, &yz as *const _ as *mut c_void,
+            &yb as *const _ as *mut c_void, &ya as *const _ as *mut c_void,
+            &q_m_i as *const _ as *mut c_void, &z_m_i as *const _ as *mut c_void,
+            &b_m_i as *const _ as *mut c_void, &a_m_i as *const _ as *mut c_void,
+            &k_i as *const _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            "fused_qkvza_hfq4g256_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(az); b.push_ptr(ab); b.push_ptr(aa);
+                b.push_ptr(xq);
+                b.push_ptr(yq); b.push_ptr(yz); b.push_ptr(yb); b.push_ptr(ya);
                 b.push_i32(q_m_i); b.push_i32(z_m_i); b.push_i32(b_m_i); b.push_i32(a_m_i);
                 b.push_i32(k_i);
                 b
