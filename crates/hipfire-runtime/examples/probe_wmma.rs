@@ -27,15 +27,13 @@ __global__ void probe_wmma(float* __restrict__ out) {
 }
 "#;
 
-    gpu.ensure_kernel("probe_wmma", src, "probe_wmma").unwrap();
+    gpu.ensure_kernel_public("probe_wmma", src, "probe_wmma").unwrap();
 
     let d_out = gpu.zeros(&[32 * 8], rdna_compute::DType::F32).unwrap();
-    let func = &gpu.functions["probe_wmma"];
-    let mut out_ptr = d_out.buf.as_ptr();
-    let mut params: Vec<*mut std::ffi::c_void> = vec![
-        &mut out_ptr as *mut _ as *mut std::ffi::c_void,
-    ];
-    unsafe { gpu.hip.launch_kernel(func, [1, 1, 1], [32, 1, 1], 0, gpu.stream_ref(), &mut params).unwrap(); }
+    let mut kernargs = hip_bridge::KernargBlob::new();
+    kernargs.push_ptr(d_out.buf.as_ptr());
+    gpu.launch_kernel_blob("probe_wmma", [1, 1, 1], [32, 1, 1], 0, kernargs.as_mut_slice())
+        .unwrap();
 
     let out = gpu.download_f32(&d_out).unwrap();
 
