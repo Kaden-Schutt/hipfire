@@ -353,10 +353,13 @@ pub struct Gpu {
     //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
     //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
     mmq_screen_cache: HashMap<usize, bool>,
-    /// Whether MMQ per-weight screening is enabled. Default: true.
+    /// Whether MMQ per-weight screening is enabled.
+    /// Per-arch default (set in `Gpu::init`): true on gfx906, false elsewhere.
     pub mmq_screen: bool,
     /// Max per-row abs error threshold for screening. Weights with any row
-    /// exceeding this fall back to WMMA. Default: 0.10.
+    /// exceeding this fall back to WMMA.
+    /// Per-arch default (set in `Gpu::init`): 0.50 on gfx906, 0.10 elsewhere.
+    /// Override via env: `HIPFIRE_MMQ_SCREEN_THRESHOLD`.
     pub mmq_screen_threshold: f32,
 
     // ── hipGraph capture state ────────────────────────────────────────────

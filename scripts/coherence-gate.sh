@@ -91,6 +91,11 @@ SHORT_TESTS=(
     # drift between bit-widths is comparable.
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
+    # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
+    # defaults don't disturb the mq6 dispatch routing. Skipped if model
+    # absent (download via `hipfire pull qwen3.5-9b.mq6`).
+    "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
