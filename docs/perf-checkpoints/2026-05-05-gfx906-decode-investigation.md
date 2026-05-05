@@ -201,6 +201,43 @@ This validates iacopPBK's prefetch lever as **legitimately applicable**: shiftin
 3. **P4' — `readfirstlane` SGPR hoisting** (<5 %; cheap sweep; consider rolling in alongside any other change)
 4. ~~P2' — `__launch_bounds__` tuning~~ — ruled out by occupancy audit
 
+## Phase 3: prefetch result (2026-05-05)
+
+Implemented across-quad weight prefetch (P1') as software-pipelined
+prologue/steady/epilogue in `gemv_hfq4g256_residual_wave64_prefetch.hip`:
+
+| Kernel | Decode share | Result |
+|---|---:|---|
+| `gemv_hfq4g256_residual_wave64` | 23.1 % | **+4.8 %** end-to-end (51.9 → 54.4 tok/s, 3-run median) |
+| `fused_gate_up_hfq4g256_wave64` | 25.5 % | flat-to-noise (within ±0.3 tok/s, undistinguishable from residual-only) |
+| `fused_qkv_hfq4g256_wave64` | 2.7 %  | flat (combined with qkvza, ~0 % additional lift) |
+| `fused_qkvza_hfq4g256_wave64` | 9.8 %  | flat (combined with qkv, ~0 % additional lift) |
+
+Direct measurement, holding all else equal:
+- residual prefetch only:           54.4 tok/s median
+- residual + gate_up prefetch:      54.3 tok/s median
+- all four prefetch:                54.1 tok/s median
+
+**Only `gemv_residual` benefits.** The other three kernels show no
+additional lift despite identical inner-loop structure and matching
+40-47 % L2 hit rates. Plausible reasons:
+
+- `fused_qkv` and `fused_qkvza` cross a wave64 occupancy boundary on
+  prefetch: 46 → 53 VGPR moves them from 5 → 4 waves/SIMD (gfx906
+  granule table). The 25 % occupancy drop offsets the L2 win.
+- `fused_gate_up` stays at 5 waves/SIMD (29 → 46 VGPR, same band as
+  residual) but still doesn't measurably improve. Possibly the
+  warp-id row routing (warp 0 = gate row k, warp 1 = up row k) gives
+  the existing kernel implicit MLP that the prefetch can't add to.
+- The PMC L2 hit rates are kernel-aggregate; different rows within
+  one launch may have different patterns and the average masks the
+  variance.
+
+**Decision: ship only the residual variant** (commit 3ef127d). The
+three rolled-out variants were reverted because they ship +17 VGPR of
+dead weight without lift. The dp4a port (P3') is the next single
+biggest lever.
+
 ## Reproducing
 
 ```sh
