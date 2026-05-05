@@ -72,6 +72,26 @@ else
     PFLASH_GATE_NOTE="(skipped — no pflash path in diff; force with HIPFIRE_FORCE_PFLASH_GATE=1)"
 fi
 
+# ── bind_thread invariant on dispatch.rs ────────────────────────────────
+# Multi-GPU plan (issue #58) requires every pub fn in `impl Gpu` to either
+# call `self.bind_thread()` first, or carry a `// bind_thread: skip` marker.
+# Silent mis-bind = malloc-on-wrong-device → cross-device pointer corruption.
+if echo "$CHANGED" | grep -qE 'crates/rdna-compute/src/dispatch\.rs'; then
+    if ! ./scripts/verify-bind-thread.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: dispatch.rs has pub fn missing bind_thread()."
+        echo "========================================================================"
+        echo
+        echo 'Add `self.bind_thread()?;` (or `self.bind_thread_or_warn();` for'
+        echo 'non-HipResult fn) as the first statement, OR add a'
+        echo '`// bind_thread: skip — <reason>` comment for pure-state queries.'
+        echo
+        exit 1
+    fi
+    echo
+fi
+
 # ── Coherence battery ────────────────────────────────────────────────────
 echo "=== Coherence Battery (short) ==="
 echo "Engine code changed. Running coherence battery (~2-4 min)..."
