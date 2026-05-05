@@ -314,6 +314,53 @@ future PMC pass shows a clearer ALU-bound regime.
   the spec-decode batch sweet spot, dp4a-GEMV at smaller batches
   becomes the natural bridge between batch=1 FP and batch=16 MMQ.
 
+## Phase 5: P4' SGPR hoisting — ruled out (structural)
+
+Tried P4' (readfirstlane / readlane SGPR hoisting of the wave-uniform
+sc/zp values per HFQ4 group) as a cheap probe. Two variants:
+
+1. `if (lane == 0) load; __shfl(val, 0, 32)` — width-32 intra-warp
+   broadcast.
+2. Plain global load + `__builtin_amdgcn_readlane(val, warp_id<<5)`
+   — keep the divergent load, hint that the value collapses per-warp.
+
+**Both variants showed 0 % net (within noise across 3 runs).**
+Expected <5 %; got 0.
+
+Disassembly diagnostic explained why:
+
+| Variant | VGPR | SGPR | global_load | extra |
+|---|---:|---:|---:|---|
+| Prefetch baseline | 46 | 14 | 37 | — |
+| Prefetch + P4 (`__shfl`) | 53 | 16 | 41 | 27× `ds_bpermute` (LDS round-trip per shuffle) |
+| Prefetch + P4 (`readlane`) | 47 | 31 | 41 | 22× `v_readlane` |
+
+The `__shfl` variant lowered to `ds_bpermute_b32`, an LDS-permute
+that adds ~4-cycle latency per call and contends with LDS bandwidth.
+That's *worse* than the original divergent load. The `readlane`
+variant correctly promoted values to SGPRs (14 → 31) but global
+loads still went *up* by 4 — the compiler couldn't fuse adjacent
+sc/zp dwords into a single `dwordx2` because their post-readlane
+destinations diverge.
+
+**Structural reason:** the lever assumed wave = warp. On wave64
+with 2-rows-per-WG (warp 0 = row k, warp 1 = row k+1), each warp
+sees a *different* sc/zp address — so the wave-uniformity needed
+for `s_load_dword` doesn't hold. The compiler's vector-to-scalar
+pass (`SIWholeQuadMode` / `AMDGPUOptimizeUniformIntrinsics`) only
+fires when the *whole wave* is uniform, not the per-warp half.
+
+To make readfirstlane help here we'd need to drop back to wave32
+or restructure to 1 row per WG (giving up the half-wave-split MLP
+gain). Neither is appealing. Cleaner fix would be a backend pass
+that recognizes per-warp uniformity, but that's an LLVM project,
+not a hipfire one.
+
+**Decision: P4' ruled out for our 2-rows-per-WG topology.** The
+lever stays on the table for any future kernel that runs 1 row
+per WG (e.g., the wide-LM-head GEMV) but is moot for the four
+hot-path decode GEMVs.
+
 ## Reproducing
 
 ```sh
