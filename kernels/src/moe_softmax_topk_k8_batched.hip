@@ -127,8 +127,16 @@ __global__ void moe_softmax_topk_renorm_k8_batched(
     __syncthreads();
 
     // ── 5. Write output ──
+    // Clamp the winner to a valid expert range before write-out. See the
+    // single-token kernel for the full rationale (closes #152).
     if (tid < K_TOP) {
-        row_idx[tid] = picked_idx[tid];
-        row_w[tid]   = picked_w[tid];
+        int   safe_idx = picked_idx[tid];
+        float safe_w   = picked_w[tid];
+        if (safe_idx < 0 || safe_idx >= n_exp) {
+            safe_idx = 0;
+            safe_w   = 0.0f;
+        }
+        row_idx[tid] = safe_idx;
+        row_w[tid]   = safe_w;
     }
 }

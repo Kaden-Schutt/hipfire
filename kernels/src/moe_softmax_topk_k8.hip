@@ -137,8 +137,22 @@ __global__ void moe_softmax_topk_renorm_k8(
     __syncthreads();
 
     // ── 5. Write output ──
+    // Clamp the winner to a valid expert range before write-out. Under MQ4
+    // expert quant on 122B-A10B, a NaN in the softmax can cause the argmax
+    // reduction to select the sentinel `-1` (or any garbage); without this
+    // guard the dispatch picks an out-of-bounds expert and the matmul
+    // either GPU-faults (aperture violation) or reads stale weights.
+    // Clamp: if invalid, route to expert 0 with weight 0 — output stays
+    // mathematically correct (zero contribution) and dispatch stays in-bounds.
+    // Closes #152.
     if (tid < K_TOP) {
-        topk_idx[tid] = picked_idx[tid];
-        topk_w[tid]   = picked_w[tid];
+        int   safe_idx = picked_idx[tid];
+        float safe_w   = picked_w[tid];
+        if (safe_idx < 0 || safe_idx >= n_exp) {
+            safe_idx = 0;
+            safe_w   = 0.0f;
+        }
+        topk_idx[tid] = safe_idx;
+        topk_w[tid]   = safe_w;
     }
 }

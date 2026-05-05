@@ -100,7 +100,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "pflash-gate: rebuilding pflash_niah_bench (binary missing or stale)..."
-    if ! cargo build --release --features deltanet --example pflash_niah_bench -p engine >&2; then
+    if ! cargo build --release --features deltanet --example pflash_niah_bench -p hipfire-runtime >&2; then
         echo "pflash-gate: build failed" >&2
         exit 2
     fi
