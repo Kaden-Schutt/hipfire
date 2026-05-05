@@ -428,6 +428,8 @@ if (-not (Test-Path "$RepoDir\cli\registry.json") -or -not (Test-Path "$RepoDir\
 Copy-Item "$RepoDir\cli\registry.json" "$CliDir\registry.json" -Force
 Copy-Item "$RepoDir\cli\package.json"  "$CliDir\package.json"  -Force
 Copy-Item "$RepoDir\cli\index.ts"      "$CliDir\index.ts"      -Force
+Copy-Item "$RepoDir\cli\chat.ts"       "$CliDir\chat.ts"       -Force
+Copy-Item "$RepoDir\cli\chat_pure.ts"  "$CliDir\chat_pure.ts"  -Force
 
 # Create hipfire.cmd wrapper
 $CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"
