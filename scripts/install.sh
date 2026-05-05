@@ -407,6 +407,8 @@ fi
 cp "$REPO_DIR/cli/registry.json" "$HIPFIRE_DIR/cli/registry.json"
 cp "$REPO_DIR/cli/package.json"  "$HIPFIRE_DIR/cli/package.json"
 cp "$REPO_DIR/cli/index.ts"      "$HIPFIRE_DIR/cli/index.ts"
+cp "$REPO_DIR/cli/chat.ts"       "$HIPFIRE_DIR/cli/chat.ts"
+cp "$REPO_DIR/cli/chat_pure.ts"  "$HIPFIRE_DIR/cli/chat_pure.ts"
 
 # Create hipfire wrapper. The shim resolves `bun` even when it isn't on
 # $PATH — rustup and bun both install to under-home bindirs that shell
