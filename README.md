@@ -61,6 +61,42 @@ concrete published numbers to target, n_gen-aware bench methodology,
 and pointers at where the fat is. Cached snapshot at
 `.research-cache/lucebox-dflash27b.html` for forensic reproducibility.
 
+## Inspiration: gfx906 (MI50/MI60) optimizations
+
+hipfire's gfx906 prefill MMQ kernel and AR-decode optimizations were
+shaped by two community forks of `llama.cpp` that target Vega 20:
+
+- **[iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)**
+  — the original fork that ported and tuned gfx906-specific code paths
+  (warp-cooperative GEMV via half-wave split, Y-tile prefetch via
+  inline-asm `global_load_dword`, `__builtin_amdgcn_readfirstlane`-based
+  SGPR hoisting, separate HBM-load → register-cache → LDS-store
+  pipelining in the MMQ body). The "2602.01 version" commit
+  `eec153c086df6a9e7a69499bea3639597c085fff` was the canonical reference
+  we audited against.
+- **[skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)**
+  — fork-of-fork that propagates iacop's optimizations (commit
+  `42c298c` "port iacop optimizations") and tracks upstream more
+  aggressively. The accompanying
+  [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
+  is the best public reference for gfx906 ISA quirks (LDS bank-conflict
+  patterns at stride 32, dp4a issue-rate ceiling, Q8_1 activation
+  layout) — we used it as a sanity-check for several PMC-driven
+  redesign decisions.
+
+Stock [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp)
+(`mul_mat_q.cu`) provided the architectural template for our gfx906
+MMQ body: templated `mmq_x` ladder, per-thread accumulator layout,
+`MMQ_TILE_NE_K=32` sub-block factoring, and the Q8_1 activation
+quantize/dequantize math. We rewrote the inner loop for gfx906 (no
+WMMA, no MFMA, dp4a-only) but the outer scaffold is structurally
+descendant.
+
+A standalone gfx906 perf investigation log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
+the prefill MMQ redesign log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`](docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
+
 ## Documentation
 
 | Page | Topic |

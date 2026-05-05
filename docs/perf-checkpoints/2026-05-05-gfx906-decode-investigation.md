@@ -689,11 +689,26 @@ HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
 
 ## References
 
-- iacopPBK fork: https://github.com/iacopPBK/llama.cpp-gfx906
-- The commit with all gfx906 optimizations: `eec153c086df6a9e7a69499bea3639597c085fff` ("2602.01 version")
-- Skyne98 / unverbraucht fork (in our local checkout): `~/mygit/llama.cpp-gfx906`
+- **iacopPBK/llama.cpp-gfx906**: https://github.com/iacopPBK/llama.cpp-gfx906
+  — original gfx906 fork. The "2602.01 version" commit
+  `eec153c086df6a9e7a69499bea3639597c085fff` was audited for warp-coop
+  GEMV, Y-tile prefetch, and load-defer pipelining patterns.
+- **skyne98/llama.cpp-gfx906**: https://github.com/skyne98/llama.cpp-gfx906
+  — fork-of-fork that propagates iacop's optimizations (commit
+  `42c298c` "port iacop optimizations") + tracks upstream master.
+- **skyne98/wiki-gfx906**: https://skyne98.github.io/wiki-gfx906/intro.html
+  — public gfx906 ISA reference (LDS bank-conflict patterns, dp4a
+  issue rate, Q8_1 layout). Used as a sanity-check for PMC-driven
+  redesign decisions.
+- **ggml-org/llama.cpp** (`mul_mat_q.cu`):
+  https://github.com/ggml-org/llama.cpp — architectural template for
+  our gfx906 MMQ body (templated `mmq_x` ladder, Q8_1 quantize math).
 - Our hipfire decode kernels:
   - `kernels/src/gemv_hfq4g256_residual_wave64.hip`
-  - `kernels/src/fused_gate_up_hfq4g256_wave64.hip`
-  - `kernels/src/fused_qkv_hfq4g256_wave64.hip`
-  - `kernels/src/fused_qkvza_hfq4g256_wave64.hip`
+  - `kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip`
+  - `kernels/src/fused_gate_up_hfq4g256_wave64.hip` /
+    `kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip`
+  - `kernels/src/fused_qkv_hfq4g256_wave64.hip` /
+    `kernels/src/fused_qkv_hfq4g256_wave64_dp4a.hip`
+  - `kernels/src/fused_qkvza_hfq4g256_wave64.hip` /
+    `kernels/src/fused_qkvza_hfq4g256_wave64_dp4a.hip`

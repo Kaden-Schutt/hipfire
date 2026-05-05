@@ -278,5 +278,13 @@ follow-ups above.
 - Stock comparison: `docs/perf-checkpoints/2026-05-04-llamacpp-stock-comparison.md`
 - Pre-redesign j0-unroll: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md`
 - Pre-redesign spill reduction: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-spill-reduction.md`
-- skyne98 wiki (gfx906 ISA reference): https://skyne98.github.io/wiki-gfx906/
-- llama.cpp-gfx906 fork: https://github.com/skyne98/llama.cpp-gfx906
+- iacopPBK/llama.cpp-gfx906 (original gfx906 fork; canonical reference
+  for warp-coop GEMV, Y-tile prefetch, load-defer pipelining):
+  https://github.com/iacopPBK/llama.cpp-gfx906
+- skyne98/llama.cpp-gfx906 (fork-of-iacopPBK that ports iacop opts +
+  tracks upstream): https://github.com/skyne98/llama.cpp-gfx906
+- skyne98/wiki-gfx906 (gfx906 ISA reference — LDS bank-conflict
+  patterns, dp4a issue rate, Q8_1 layout):
+  https://skyne98.github.io/wiki-gfx906/intro.html
+- ggml-org/llama.cpp (`mul_mat_q.cu` — architectural template for
+  the templated MMQ body): https://github.com/ggml-org/llama.cpp
