@@ -269,13 +269,28 @@ $RepoDir = $SrcDir
 Write-Host ""
 Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
 
+# Resolve cargo's actual target directory. Honors CARGO_TARGET_DIR and any
+# workspace target overrides — without this, users with a shared target
+# directory (common when juggling several Rust projects) would see install
+# fail because the binaries we expect at $RepoDir\target\... actually live
+# elsewhere. Falls back to the conventional location when cargo is not yet
+# installed, since pre-built binaries can only sit at the default path in
+# that case.
+$TargetDir = "$RepoDir\target"
+if (Get-Command cargo -ErrorAction SilentlyContinue) {
+    try {
+        $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
+        if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
+    } catch {}
+}
+
 # Source preference order — the prior install's $BinDir\daemon.exe is NOT
 # a source. Including it would re-use stale binaries forever. The repo-side
 # paths (only meaningful when running install.ps1 from a checkout) are
 # treated as developer-authoritative and used if present; everyone else
 # always pulls the latest release asset.
 $PreBuilt = @(
-    "$RepoDir\target\release\examples\daemon.exe",
+    "$TargetDir\release\examples\daemon.exe",
     "$RepoDir\bin\daemon.exe"
 ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 
@@ -365,7 +380,15 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         Pop-Location
     }
 
-    $BuiltExe = "$RepoDir\target\release\examples\daemon.exe"
+    # Re-resolve TargetDir now that cargo is guaranteed available — covers the
+    # case where rustup was just installed above and the initial probe fell
+    # back to the default path.
+    try {
+        $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
+        if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
+    } catch {}
+
+    $BuiltExe = "$TargetDir\release\examples\daemon.exe"
     if (-not (Test-Path $BuiltExe)) {
         Write-Host ""
         Write-Host "  BUILD FAILED." -ForegroundColor Red
@@ -384,7 +407,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
 
 # Copy optional helper binaries if present
 foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
-    $src = "$RepoDir\target\release\examples\$exe"
+    $src = "$TargetDir\release\examples\$exe"
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
 }
 
