@@ -6375,19 +6375,19 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        // Option B streaming topology — KEEP IN SYNC WITH body.cuh:
-        //   x_qs   : MMQ_Y * X_STRIDE ints
+        // Option C streaming topology — KEEP IN SYNC WITH body.cuh:
+        //   x_qs   : MMQ_Y * x_stride ints  (per-mmq_x: 40 if mmq_x≥64 else 33)
         //   x_dm   : MMQ_Y float2
         //   tile_y : mmq_x * Y_STRIDE ints
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 33;  // 128-K window: 32 data + 1 pad (LDS bank-conflict)
+        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
         let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let shared_mem = (
-            (MMQ_Y * X_STRIDE * 4)
+            (MMQ_Y * x_stride * 4)
             + (X_DM_HALF2 * 8)
             + (mmq_x * Y_STRIDE * 4)
         ) as u32;
@@ -6479,17 +6479,17 @@ impl Gpu {
             &mut add_val as *mut _ as *mut c_void,
         ];
 
-        // Option B streaming topology — KEEP IN SYNC WITH body.cuh
+        // Option C streaming topology — KEEP IN SYNC WITH body.cuh
         // (same layout invariant as residual variant above).
         const MMQ_Y: usize = 128;
-        const X_STRIDE: usize = 33;
+        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
         let batch_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let shared_mem = (
-            (MMQ_Y * X_STRIDE * 4)
+            (MMQ_Y * x_stride * 4)
             + (X_DM_HALF2 * 8)
             + (mmq_x * Y_STRIDE * 4)
         ) as u32;

@@ -21,10 +21,12 @@
 //   3. 4 sub-blocks computed back-to-back (no syncs between)
 //   4. __syncthreads
 //
-// LDS bank-conflict guard: X_STRIDE=33 (not 32). At stride 32, all 64
-// lanes of a warp hit the same LDS bank → 47% bank-conflict rate.
-// 33 % 32 = 1 rotates the bank index by 1 each row → 0% conflicts.
-// PMC-validated.
+// LDS bank-conflict guard + b128 alignment: X_STRIDE=40.
+// 40 × 4 = 160 B → 16-B aligned every row → 100% ds_read_b128
+// (no b32-quad fallback). 40 % 32 = 8 → 4-way bank conflict per
+// warp. Tradeoff vs stride 33 (0-way conflict, 25% b128 align):
+// the 100% b128 alignment win dominates the 4-way conflict cost.
+// PMC validation: see 2026-05-04 docs/perf-checkpoints/.
 
 #define MMQ_Y 128
 #define MMQ_NWARPS 4
@@ -33,21 +35,27 @@
 #define QK8_1 32
 #define QI8_1 8
 
-// Option C window: 32 data ints/row + 1 pad int → stride 33.
-// 33 % 32 = 1 ensures lane-stride visits 32 distinct LDS banks per
-// warp, eliminating the 64-way bank conflict that makes the unpadded
-// stride-32 layout pathological. PMC measured LDSBankConflict=37%
-// at stride=32 vs ~14% at stride=8 (Option B); the +1 pad recovers
-// to the same conflict regime as B while keeping the 4-window
-// streaming structure.
-#define X_STRIDE 33
+// X_STRIDE chosen per-mmq_x to balance two LDS effects:
+//   - mmq_x >= 64: stride 40 (32 data ints + 8 pad). 40 × 4 = 160 B
+//     is 16-B aligned every row → 100% ds_read_b128. 40 % 32 = 8 →
+//     4-way bank conflict, but the b128 issue rate dominates.
+//   - mmq_x < 64: stride 33 (32 data ints + 1 pad). 33 × 4 = 132 B
+//     is 16-B aligned every 4th row only. 33 % 32 = 1 → 0-way bank
+//     conflict. Smaller-mmq_x kernels (used at small batch sizes,
+//     e.g. _full_add_x16 in attn-out residual) regressed under
+//     stride-40 due to the bank conflict cost outweighing the b128
+//     win when j0 has few iterations. PMC-validated.
+template <int mmq_x>
+constexpr int x_stride_for() { return mmq_x >= 64 ? 40 : 33; }
+
 #define Y_STRIDE 36
 
 // LDS layout invariant — KEEP IN SYNC WITH dispatch.rs:
-//   [x_qs:   i32    × MMQ_Y * X_STRIDE      ]  = 128 * 33 * 4 = 16,896 B
-//   [x_dm:   float2 × MMQ_Y                 ]  = 128 * 8      =  1,024 B
-//   [tile_y: i32    × mmq_x * Y_STRIDE      ]  = mmq_x * 144 B
-// Total per WG ≤ 16,896 + 1,024 + 64*144 = 27,136 B at mmq_x=64.
+//   [x_qs:   i32    × MMQ_Y * x_stride       ]  = 128 * x_stride * 4
+//   [x_dm:   float2 × MMQ_Y                  ]  = 128 * 8     =  1,024 B
+//   [tile_y: i32    × mmq_x * Y_STRIDE       ]  = mmq_x * 144 B
+// At mmq_x=64 (stride 40):  20,480 + 1,024 + 9,216 = 30,720 B per WG.
+// At mmq_x=8  (stride 33):  16,896 + 1,024 + 1,152 = 19,072 B per WG.
 // Budget: ≤ 32 KiB/WG so 2 WGs/CU fit in 64 KiB cap. Verified ✅.
 
 struct block_q8_1_mmq {
@@ -61,6 +69,7 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 // Load 128 K-elements of X (unpacked) for one window.
 // window ∈ [0, 1]. Each window loads 64 bytes of nibbles per row
 // = 128 K-elements = 32 ints in x_qs (4 sub-blocks × 8 ints each).
+template <int x_stride>
 static __device__ __forceinline__ void load_hfq4_tile_streaming(
     const char* __restrict__ A,
     int* __restrict__ x_qs,
@@ -107,8 +116,8 @@ static __device__ __forceinline__ void load_hfq4_tile_streaming(
         const int int_a = (int)(((n0 - 8) & 0xFF) | (((n1 - 8) & 0xFF) << 8) | (((n2 - 8) & 0xFF) << 16) | (((n3 - 8) & 0xFF) << 24));
         const int int_b = (int)(((n4 - 8) & 0xFF) | (((n5 - 8) & 0xFF) << 8) | (((n6 - 8) & 0xFF) << 16) | (((n7 - 8) & 0xFF) << 24));
 
-        x_qs[i * X_STRIDE + 2 * chunk + 0] = int_a;
-        x_qs[i * X_STRIDE + 2 * chunk + 1] = int_b;
+        x_qs[i * x_stride + 2 * chunk + 0] = int_a;
+        x_qs[i * x_stride + 2 * chunk + 1] = int_b;
     }
 }
 
@@ -160,6 +169,7 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
     int sub_block
 ) {
     constexpr int vdr = 8; // 8 ints cover 32 K-elements.
+    constexpr int x_stride = x_stride_for<mmq_x>();
     const int kx_start = sub_block * 8;
     const int ky_start = 4 + sub_block * 8;
 
@@ -177,16 +187,13 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
             int sumi = 0;
             if constexpr (mmq_x >= 64) {
                 // b128 path: issue 8 ints per operand as 2× int4 (b128)
-                // reads. Compiler emits 108× ds_read_b128 + 24× b32-quad
-                // fallbacks for misaligned rows (X_STRIDE=33: row stride
-                // 132 B aligns every 4th row). Threshold mmq_x≥64
-                // empirically determined: at mmq_x=32 the int4-unpack
-                // overhead (especially in _full_add_x16/x32 small-batch
-                // residual calls) exceeds the issue-rate win. Only the
-                // _x64 variants amortize b128 across enough j0 iters to
-                // pay off.
-                const int4 x_v0 = *(const int4*)&x_qs[i * X_STRIDE + kx_start + 0];
-                const int4 x_v1 = *(const int4*)&x_qs[i * X_STRIDE + kx_start + 4];
+                // reads. With X_STRIDE=40 (160 B/row, 16-B aligned every
+                // row) the compiler emits 100% ds_read_b128 — no b32-quad
+                // fallback. Threshold mmq_x≥64 empirically determined
+                // (see plan v2.16): at smaller mmq_x the int4-unpack
+                // overhead exceeds the issue-rate win.
+                const int4 x_v0 = *(const int4*)&x_qs[i * x_stride + kx_start + 0];
+                const int4 x_v1 = *(const int4*)&x_qs[i * x_stride + kx_start + 4];
                 const int4 y_v0 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 0];
                 const int4 y_v1 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 4];
                 sumi = __builtin_amdgcn_sdot4(x_v0.x, y_v0.x, sumi, false);
@@ -203,7 +210,7 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
                 // mmq_x=8/16/24 regress under b128, mmq_x≥32 wins.
                 #pragma unroll
                 for (int v = 0; v < vdr; ++v) {
-                    const int x_int = x_qs[i * X_STRIDE + kx_start + v];
+                    const int x_int = x_qs[i * x_stride + kx_start + v];
                     const int y_int = tile_y[j * Y_STRIDE + ky_start + v];
                     sumi = __builtin_amdgcn_sdot4(x_int, y_int, sumi, false);
                 }
@@ -270,12 +277,13 @@ static __device__ __forceinline__ void mmq_body_templated(
     const int add = (add_mode == -1) ? add_param : add_mode;
 
     // LDS layout (must match dispatch.rs shared_mem calc):
-    //   x_qs   : MMQ_Y * X_STRIDE ints
+    //   x_qs   : MMQ_Y * x_stride ints
     //   x_dm   : MMQ_Y float2
     //   tile_y : mmq_x * Y_STRIDE ints
+    constexpr int x_stride = x_stride_for<mmq_x>();
     extern __shared__ int smem[];
     int*    x_qs   = smem;
-    float2* x_dm   = (float2*)(x_qs + MMQ_Y * X_STRIDE);
+    float2* x_dm   = (float2*)(x_qs + MMQ_Y * x_stride);
     int*    tile_y = (int*)(x_dm + MMQ_Y);
 
     float sum[(mmq_x / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE)] = {0.0f};
@@ -284,7 +292,7 @@ static __device__ __forceinline__ void mmq_body_templated(
         // Option C: 2 windows × 4 sub-blocks each, 4 syncs/group total.
         for (int window = 0; window < 2; ++window) {
             load_q8_1_tile_coalesced<mmq_x>(Xq, tile_y, col0, 2*kg + window, N);
-            load_hfq4_tile_streaming(A, x_qs, x_dm, row0, kg, window, M, groups_per_row);
+            load_hfq4_tile_streaming<x_stride>(A, x_qs, x_dm, row0, kg, window, M, groups_per_row);
             __syncthreads();
             #pragma unroll 1
             for (int sub = 0; sub < 4; ++sub) {

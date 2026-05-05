@@ -199,6 +199,21 @@ Reviews integrated:
   budget) was insufficient to predict perf regression — bank-
   conflict counters are the right diagnostic for LDS layout
   changes.
+- v2.16 (2026-05-05): **Per-mmq_x X_STRIDE for full b128 alignment**.
+  Templated `x_stride` on mmq_x at compile time:
+  - mmq_x ≥ 64: stride 40 (32 data + 8 pad). 40 × 4 = 160 B is
+    16-B aligned every row → 100% ds_read_b128. 40 % 32 = 8 →
+    4-way bank conflict, but b128 issue rate dominates.
+  - mmq_x < 64: stride 33 (kept from v2.14). 0-way bank conflict;
+    smaller-mmq_x kernels regressed under stride-40 due to bank
+    conflict cost without enough j0 iters to amortize the b128 win.
+  Sweep: stride=40-everywhere gave pp32 312→269 (-14%), pp512
+  584→713 (+22%). Hybrid keeps pp32 at 313 (no regression) and
+  delivers all the pp64+ wins:
+  **pp32 312→313, pp64 410→463 (+13%), pp128 522→598 (+15%),
+  pp256 630→723 (+15%), pp512 623→713 (+14%).**
+  vs stock llama.cpp pp512 (750): 83% → **95%**. Correctness
+  preserved bit-exact.
 - v2.15 (2026-05-04): **ds_read_b128 landed at mmq_x≥64 only**.
   Replaced the inner 8× b32 LDS reads in `vec_dot_dp4a_streaming`
   with 2× int4 (b128) reads, gated by `if constexpr (mmq_x >= 64)`.
