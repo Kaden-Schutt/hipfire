@@ -47,6 +47,14 @@ works, what to measure, what counts as pass/fail.
    or a heredoc inside a committed script.
 5. **No grep / find / glob inside `exec:bash`.** Use the `Grep` tool
    directly, or `exec:nodejs` with `execSync('rg -n PATTERN')`.
+6. **`scripts/install.{sh,ps1}` copy the whole `cli/` directory recursively
+   and prune dev/test artifacts by pattern.** New `.ts` files in `cli/`
+   are auto-installed — no install-script edit required. Tests must
+   follow `*.test.ts` / `test_*.ts` / `bench_*.ts` naming so the prune
+   step excludes them; if you add a runtime helper that *looks* like a
+   test name, rename it. The previous per-file enumeration grew stale
+   silently after PR #129 (issue #163, naive fix #165, structural fix
+   in this rule's enforcing PR).
 
 ---
 

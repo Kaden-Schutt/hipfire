@@ -417,19 +417,35 @@ Write-Host "Installing CLI..." -ForegroundColor Cyan
 
 $CliDir = "$HipfireDir\cli"
 New-Item -ItemType Directory -Force -Path $CliDir | Out-Null
-# Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
-# if we wrote the new index.ts first and the JSON copy then failed, the install
-# would be stranded — new TS unable to resolve its own data file.
+# Recursive copy of the whole cli\ directory, then prune dev/test artifacts.
+# New .ts files added to cli\ (next chat helper, future slash-command module)
+# are picked up automatically — no install-script edit required. Replaces
+# the previous per-file enumeration that grew stale after PR #129 added
+# chat.ts/chat_pure.ts (issue #163, patched in #165; this is the structural
+# follow-up that PR left for later).
 if (-not (Test-Path "$RepoDir\cli\registry.json") -or -not (Test-Path "$RepoDir\cli\index.ts")) {
     Write-Host "ERROR: cli\registry.json or cli\index.ts missing in $RepoDir" -ForegroundColor Red
     Write-Host "       Repo checkout may be incomplete; aborting install." -ForegroundColor Red
     exit 1
 }
-Copy-Item "$RepoDir\cli\registry.json" "$CliDir\registry.json" -Force
-Copy-Item "$RepoDir\cli\package.json"  "$CliDir\package.json"  -Force
-Copy-Item "$RepoDir\cli\index.ts"      "$CliDir\index.ts"      -Force
-Copy-Item "$RepoDir\cli\chat.ts"       "$CliDir\chat.ts"       -Force
-Copy-Item "$RepoDir\cli\chat_pure.ts"  "$CliDir\chat_pure.ts"  -Force
+# Robocopy mirrors better than Copy-Item -Recurse for this case (handles
+# permissions, exit-code semantics, and is on every Windows installation),
+# but Copy-Item is more portable across PowerShell core / Windows PS / pwsh
+# on macOS-via-PS-remoting; sticking with Copy-Item for parity with the rest
+# of the script.
+Copy-Item "$RepoDir\cli\*" $CliDir -Recurse -Force
+# Prune dev artifacts. Patterns mirror install.sh — tests follow
+# `*.test.ts` / `test_*.ts` / `bench_*.ts` Bun conventions; node_modules
+# and dotfiles are dev-only. Adding a new test file with the same naming
+# requires no install-script change.
+$prunePaths = @("node_modules", ".gitignore", "tsconfig.json", "README.md", "bun.lock")
+foreach ($p in $prunePaths) {
+    $target = Join-Path $CliDir $p
+    if (Test-Path $target) { Remove-Item $target -Recurse -Force -ErrorAction SilentlyContinue }
+}
+Get-ChildItem -Path $CliDir -File | Where-Object {
+    $_.Name -like "*.test.ts" -or $_.Name -like "test_*.ts" -or $_.Name -like "bench_*.ts"
+} | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # Create hipfire.cmd wrapper
 $CmdWrapper = "@echo off`r`nbun run `"%USERPROFILE%\.hipfire\cli\index.ts`" %*`r`n"

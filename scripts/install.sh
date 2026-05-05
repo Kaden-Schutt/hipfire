@@ -394,21 +394,35 @@ cp "$TARGET_DIR/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
 
 # Copy CLI
+# Recursive copy of the whole cli/ directory, then prune dev/test artifacts
+# that don't belong in a runtime install. New .ts files added to cli/ (a new
+# slash-command module, the next chat helper) are picked up automatically —
+# no install-script edit required. Replaces the previous per-file enumeration
+# that grew stale after PR #129 added chat.ts/chat_pure.ts (issue #163,
+# patched in #165 by adding two more cp lines; this is the structural fix
+# that PR #165 left as a follow-up).
 mkdir -p "$HIPFIRE_DIR/cli"
-# Order: registry.json BEFORE index.ts. The CLI imports the JSON at startup;
-# if we wrote the new index.ts before the JSON and the JSON copy then failed,
-# the install would be stranded — new TS that can't resolve its own data file.
-# JSON-first means a partial-failure window leaves a recoverable state.
+# Sanity check: required runtime files must exist before we touch the
+# install dir. JSON-first ordering is preserved at the verification step
+# so a half-pulled checkout fails fast, not mid-copy.
 if [ ! -f "$REPO_DIR/cli/registry.json" ] || [ ! -f "$REPO_DIR/cli/index.ts" ]; then
     echo "ERROR: cli/registry.json or cli/index.ts missing in $REPO_DIR" >&2
     echo "       Repo checkout may be incomplete; aborting install." >&2
     exit 1
 fi
-cp "$REPO_DIR/cli/registry.json" "$HIPFIRE_DIR/cli/registry.json"
-cp "$REPO_DIR/cli/package.json"  "$HIPFIRE_DIR/cli/package.json"
-cp "$REPO_DIR/cli/index.ts"      "$HIPFIRE_DIR/cli/index.ts"
-cp "$REPO_DIR/cli/chat.ts"       "$HIPFIRE_DIR/cli/chat.ts"
-cp "$REPO_DIR/cli/chat_pure.ts"  "$HIPFIRE_DIR/cli/chat_pure.ts"
+cp -R "$REPO_DIR/cli/." "$HIPFIRE_DIR/cli/"
+# Prune dev artifacts. The patterns are stable: tests follow `*.test.ts`
+# / `test_*.ts` / `bench_*.ts` (Bun test conventions) and `node_modules`
+# / `.gitignore` are dev-only. Adding a new test file with the same naming
+# requires no install-script change.
+rm -rf "$HIPFIRE_DIR/cli/node_modules" \
+       "$HIPFIRE_DIR/cli/.gitignore" \
+       "$HIPFIRE_DIR/cli/tsconfig.json" \
+       "$HIPFIRE_DIR/cli/README.md" \
+       "$HIPFIRE_DIR/cli/bun.lock"
+find "$HIPFIRE_DIR/cli/" -maxdepth 1 -type f \
+     \( -name '*.test.ts' -o -name 'test_*.ts' -o -name 'bench_*.ts' \) \
+     -delete 2>/dev/null || true
 
 # Create hipfire wrapper. The shim resolves `bun` even when it isn't on
 # $PATH — rustup and bun both install to under-home bindirs that shell
