@@ -82,11 +82,14 @@ Decode tok/s, default config:
 | RDNA2 (gfx1030) | V620 Pro, RX 6800 XT | 250 | — | 65 | 22 |
 | RDNA1 (gfx1010) | RX 5700 XT | 190 | 61 | 43 (HF4) | OOM |
 | APU (gfx1013) | BC-250 | 207 | 77 | 47 | OOM |
+| GCN5 (gfx906) | MI50 / MI60 | 191 | 58 | 51 | 17 |
 | MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
 
 MI300X is wave64 + MFMA — different kernel family. RDNA4 (gfx1200 /
 gfx1201) ships a dispatch fallback to dot2 today; per-arch WMMA
-kernels are in progress (issue #54).
+kernels are in progress (issue #54). gfx906 (Vega 20) uses the
+nwarps=4 dp4a MMQ kernel (`docs/plans/gfx906-mmq-prd.md`); decode at
+batch=1 stays on the FP16 wave64 path and is HBM-bound.
 
 ## Reproducing
 
