@@ -1,26 +1,36 @@
 #!/usr/bin/env bash
-# pre-commit hook: coherence battery + speed gate.
+# pre-commit hook: fast-track gates every commit + heavy gates only when
+# the relevant feature is touched.
 #
 # Install with:
 #   git config core.hooksPath .githooks
 #
-# Two barriers:
+# Always (when the staged diff touches kernel/forward-pass/dispatch code):
 #
-#   1) Coherence battery: runs a small fixed matrix of prompts through the
-#      daemon and writes a markdown report. Fails only on HARD errors
-#      (daemon panic / zero tokens / timeout). Soft output changes do NOT
-#      block — the committer (human or agent) is expected to read the
-#      report and confirm coherence before the commit lands.
+#   1) Coherence battery (~2-4 min): fixed prompt matrix through the daemon.
+#      Fails only on HARD errors (panic / zero tokens / timeout). Soft
+#      output changes don't block — the committer reads the report and
+#      confirms coherence before the commit lands. Replaces the old
+#      byte-exact quality-gate that blocked legitimate norm-convention fixes.
 #
-#      This replaces the prior byte-exact `quality-gate.sh` barrier, which
-#      blocked legitimate numerical-correctness changes (e.g., norm
-#      convention fixes that change output for the better).
+#   2) Speed gate (~30s): prefill/decode tok/s must stay within tolerance
+#      of the committed ground-floor baselines. Failure = perf regression.
 #
-#   2) Speed gate: prefill/decode tok/s must stay within tolerance of the
-#      committed ground-floor baselines. Failure = performance regression.
+# Path-gated heavy gates (only fire when the matching feature is touched):
 #
-# Both gates run only when the staged diff touches kernel, forward-pass,
-# dispatch, or engine code. Docs/readmes don't trigger the gates.
+#   3) DFlash + DDTree coherence (~3 min): spec-decode attractor guard.
+#      Fires on `dflash|ddtree|spec_step|...` filename / path matches.
+#      Skips otherwise — spec decode rarely breaks from non-spec changes.
+#
+#   4) PFlash regression (~5 min): long-context bench against the
+#      committed gfx1100 baseline. Fires on any path containing `pflash`.
+#      Skips otherwise — implemented by setting HIPFIRE_SKIP_PFLASH_GATE=1
+#      so the pflash regression stage at the tail of coherence-gate.sh
+#      no-ops.
+#
+# Force-run heavy gates regardless of paths:
+#   HIPFIRE_FORCE_PFLASH_GATE=1 git commit ...   # run pflash anyway
+#   HIPFIRE_FORCE_SPEC_GATE=1   git commit ...   # run dflash anyway
 #
 # Do NOT bypass with --no-verify unless you have a plan to fix in the same
 # commit.
@@ -46,12 +56,29 @@ if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 
+# Path-gate the PFlash regression stage that lives at the tail of
+# coherence-gate.sh. Skip by default and only run when a `pflash` path
+# is staged (or HIPFIRE_FORCE_PFLASH_GATE=1 is set). Saves ~5 min/commit
+# when the diff doesn't touch PFlash. Match is intentionally loose
+# (`pflash` substring) so it covers the kernel, the arch impl, the bench
+# example, and the gate scripts themselves.
+PFLASH_HOTSPOT='pflash'
+if [ "${HIPFIRE_FORCE_PFLASH_GATE:-0}" = "1" ] \
+   || echo "$CHANGED" | grep -qE "$PFLASH_HOTSPOT"; then
+    PFLASH_GATE_ENV=""
+    PFLASH_GATE_NOTE="(diff touches pflash — running)"
+else
+    PFLASH_GATE_ENV="HIPFIRE_SKIP_PFLASH_GATE=1"
+    PFLASH_GATE_NOTE="(skipped — no pflash path in diff; force with HIPFIRE_FORCE_PFLASH_GATE=1)"
+fi
+
 # ── Coherence battery ────────────────────────────────────────────────────
 echo "=== Coherence Battery (short) ==="
 echo "Engine code changed. Running coherence battery (~2-4 min)..."
+echo "PFlash regression stage: $PFLASH_GATE_NOTE"
 echo
 
-if ! ./scripts/coherence-gate.sh; then
+if ! env $PFLASH_GATE_ENV ./scripts/coherence-gate.sh; then
     echo
     echo "========================================================================"
     echo "COMMIT BLOCKED: coherence battery hit a HARD error."
@@ -86,11 +113,14 @@ echo
 # target/draft aren't installed.
 SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write'
 # File-name alternation tracks the spec-decode pieces of the runtime
-# AND the qwen35 arch crate (post-PR-8, speculative.rs + pflash.rs
-# moved into crates/hipfire-arch-qwen35/src/). dflash.rs + ddtree.rs
-# stay in crates/hipfire-runtime/src/. File-name matches catch both.
-if echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
-   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|pflash\.rs'; then
+# AND the qwen35 arch crate (post-PR-8, speculative.rs moved into
+# crates/hipfire-arch-qwen35/src/). dflash.rs + ddtree.rs stay in
+# crates/hipfire-runtime/src/. File-name matches catch both.
+# pflash.rs is intentionally NOT here — PFlash is a different feature
+# (long-context bench), gated separately via PFLASH_HOTSPOT above.
+if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
+   || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
+   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
     echo "=== DFlash/DDTree Coherence Battery ==="
     echo "Spec-decode path changed. Running dflash coherence battery (~3 min)..."
     echo
