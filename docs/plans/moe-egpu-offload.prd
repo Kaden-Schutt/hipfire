@@ -1,226 +1,141 @@
-# MoE Expert Offload to eGPU — Design (PRD)
-
-## Mission
-
-Decode-time speedup on Qwen3.5-MoE family (A3B, A10B) by running per-token routed-expert FFN on the 9070 XT eGPU (gfx1201, RDNA4) while keeping the rest of the model resident on the Strix Halo iGPU (gfx1151, RDNA 3.5). Target: 30-50% decode tok/s lift on A10B; A3B may benefit less because its baseline is already tighter.
-
-Implicitly overrides the earlier project-memory note "NOT MoE expert offload" — that was decided before Path B (commit 43d7ccb) landed and before measured expert-utilization data is available.
-
-## Non-goals
-
-- Full multi-GPU tensor parallelism (TP). Out of scope.
-- Cross-vendor portability. Single-vendor HIP-only.
-- Prefill speedup. Prefill is GEMM-dominated and saturates iGPU compute; offload there is dominated by sync overhead. Decode-only.
-- Replacing PFlash/DFlash speculative decoding. This is orthogonal and stacks on top.
-
-## Architecture
-
-```
-                    iGPU (gfx1151, 96 GB UMA)
-        +---------------------------------------------+
-        | Embed → Layer 0 ... Layer 39                |
-        |   Self-attn, LinearAttn (DeltaNet)          |
-        |   Router GEMV, Top-K, Renorm                |
-        |   Shared-expert FFN                         |
-        |   ↕ residual, KV cache, DeltaNet state      |
-        |   ↑ pre-MoE hidden via dmabuf               |
-        +---------------------------------------------+
-                            ║
-                            ║  USB4 v2, ~20 GB/s, dmabuf zero-copy
-                            ║  Per token per layer:
-                            ║    iGPU → eGPU: 12 KB (pre-MoE hidden)
-                            ║                + 32 B (topk_idx) + 32 B (topk_w)
-                            ║    eGPU → iGPU: 12 KB (MoE result)
-                            ║
-        +---------------------------------------------+
-        | eGPU (gfx1201, 16 GB VRAM)                  |
-        |   Routed-expert FFN compute only            |
-        |   Hot-expert LRU cache (~32 experts/layer)  |
-        |   Cold-miss path: pull weights from iGPU    |
-        +---------------------------------------------+
-```
-
-The router decision (top-K argmax + renorm) stays on iGPU because it needs the full 256-expert prob distribution which the iGPU is already carrying. The eGPU only sees the 8 chosen indices + weights and returns the per-token MoE contribution.
-
-## Phasing
-
-### Phase 0: Profile expert hit-rate (instrumentation, no kernel changes)
-
-Question: does an LRU cache of 32 (or 16) experts per layer cover >80% of routing decisions over a representative corpus?
-
-- `HIPFIRE_MOE_EXPERT_HEATMAP=1` on the daemon (shipped). Dumps a `[n_layers, n_experts]` hit-count matrix on unload to `/tmp/hipfire-moe-debug/dumps/`.
-- Driver: `scripts/run_moe_heatmap_corpus.sh <model.mq4>` runs 5 diverse prompts × 200 tokens (~1100 tokens total) through the daemon and pipes the dump to `scripts/analyze_moe_heatmap.py`.
-- Run on A3B mq4 (k9lin / 7900 XTX) and A10B mq4 (host with ≥96 GB UMA — hipx Strix Halo 88 GB on disk OOMs at layer 37/48 with linattn-MQ6 quant; needs a fresh quantize or a larger box).
-- Decision: 32-cache hit rate ≥80% → proceed; ≤70% → scrap cache, switch to per-token pull or different design.
-
-**A3B Phase 0 measurement (k9lin gfx1100, 1105 tokens, 353,600 routed decisions, 2026-05-05):**
-
-| cache | mean hit | min(layer) | verdict at threshold |
-|-------|----------|-----------:|----------------------|
-|   8   |   19.3%  |    9.5%    |                      |
-|  16   |   31.2%  |   17.2%    |                      |
-|  32   |   48.0%  |   29.7%    | **SCRAP** (<70%)     |
-|  64   |   70.0%  |   48.3%    | borderline           |
-|  128  |   91.3%  |   74.7%    | proceed but VRAM-infeasible |
-
-Per-layer entropy is 7.00 / 8.00 max — A3B routing is very flat. 32 experts × 9 MB × 40 layers = 11.5 GB cache budget at the PRD's plan covers under half of routing decisions; cold-miss transfer (52% × 72 MB / 20 GB/s ≈ 1.9 ms/token) is the same order as in-iGPU compute, so the cache stops being a cache.
-
-**Implication:** A3B is not a Phase-1 target with the cache-LRU design. A10B may have stronger locality; profile separately before deciding A10B's path. If A10B is also flat, switch design to (a) per-token pull from iGPU dmabuf with no cache (bandwidth-bound), or (b) decode-only offload of FA layers + shared-expert FFN where the routing decision is fixed.
-
-Time: instrumentation done; A10B measurement pending appropriate host.
-
-### Phase 1: PoC with no caching
-
-Goal: validate cross-device dispatch path. Every routed-expert GEMV pulls weights from iGPU per-token. Slow, but proves correctness.
-
-- New env var `HIPFIRE_MOE_EGPU=1` in `crates/hipfire-arch-qwen35/src/qwen35.rs::moe_ffn_decode_impl`.
-- New crate `crates/hipfire-egpu-bridge` that owns:
-  - eGPU `Gpu` instance (HIP_VISIBLE_DEVICES=1).
-  - `MoEDispatchCache` struct: per-layer LRU keyed by expert_id, value is dmabuf'd weight handle.
-  - `dispatch_moe_layer(pre_norm, topk_idx, topk_w, layer_idx) -> moe_result` synchronous API.
-- Reuse Phase 1.4 `dmabuf_import` infrastructure from `crates/hipx`.
-- Fall back to in-iGPU compute if `HIPFIRE_MOE_EGPU` unset (normal path).
-
-The PoC stub: `dispatch_moe_layer` always pulls 8 expert weights via dmabuf, runs gate_up/silu_mul/down on eGPU, copies result back. Measure decode tok/s. Expect regression vs iGPU-only (transfer dominates) but validate the dispatch is byte-exact vs iGPU baseline.
-
-Time: 1 week.
-
-### Phase 2: Layer-resident hot cache
-
-Goal: amortize per-token weight transfer.
-
-- `MoEDispatchCache` becomes a real LRU per layer.
-- Cache size auto-tuned from Phase 0 hit-rate data, default 32 experts per layer.
-- Eviction: LRU on per-layer basis. Hot-expert pinning (top-N most-used) bypasses LRU.
-- Cache fill is on-demand via dmabuf (not preloaded). Cache stays warm across token boundaries.
-- Two-tier: a "hot tier" of pinned top-8 experts/layer that never evicts, plus an LRU pool below.
-
-Measurement criterion: decode tok/s on A10B with `HIPFIRE_MOE_EGPU=1` matches or beats iGPU-only.
-
-Time: 1-2 weeks.
-
-### Phase 3: Pipelining + async transfers
-
-Goal: hide remaining transfer latency under iGPU compute.
-
-- Prefetch the NEXT layer's expert weights while THIS layer's MoE compute runs.
-- Cross-stream sync via shared HSA signal.
-- Worth 5-10% speedup on top of Phase 2 if Phase 2 results are already net-positive.
-
-Time: 3-4 days.
-
-## Specific design decisions
-
-### Where does the routed-expert dispatch split happen?
-
-Inside `moe_ffn_decode_impl` (decode) and `moe_ffn_prefill_chunk_impl` (prefill, eventually). Right after the top-K and renorm: the router output (topk_idx, topk_w) gets broadcast to the eGPU along with the pre-norm hidden, eGPU runs the routed-experts contribution, returns the per-token vector that gets atomicAdd'd into x_residual.
-
-Shared-expert FFN stays on iGPU. Router and topk stay on iGPU. So the cross-device dispatch is purely the routed-experts piece.
-
-### What buffer format crosses the bus?
-
-- `pre_norm_hidden`: F32 [hidden]. iGPU has it post-rmsnorm.
-- `topk_idx`: i32 [8]. iGPU has it from `gpu.moe_topk_renorm_k8`.
-- `topk_w`: F32 [8]. Same.
-- Return: F32 [hidden] = sum_k topk_w[k] * expert[topk_idx[k]](x).
-
-All small, all dmabuf-able as one struct.
-
-### How does the eGPU know which experts to pull?
-
-Per-layer `expert_ptrs: [n_experts]` table on iGPU contains device pointers to MQ4 weight blobs. eGPU receives the topk_idx array and:
-1. For each idx, check the per-layer LRU. Cache hit → use cached eGPU pointer.
-2. Cache miss → request `dmabuf_import` on the iGPU expert weight, install in LRU, evict LRU tail.
-
-Critical: the iGPU expert weight must stay valid across token boundaries. It does — weights are static post-load.
-
-### Cache size budget
-
-Per A10B layer: 8 active experts × ~9 MB/expert = 72 MB minimum working set (one token's worth). Target 32 experts × 9 MB = 288 MB per layer × 40 layers = ~11.5 GB cache. eGPU has 16 GB; ~3 GB headroom for activations, scratch, runtime overhead. Tight but workable.
-
-A3B layer: 9 MB/expert similar; 256 MB/layer × 40 = ~10 GB. Same fit.
-
-### Synchronization model
-
-Per-token MoE compute is fully synchronous: iGPU stalls on eGPU completion before continuing the residual stream. This is required because the residual depends on the MoE output.
-
-Optimization: pipeline ACROSS tokens (Phase 3) — eGPU can start computing token N while iGPU runs token N-1's attention. Adds complexity, deferred to post-PoC.
-
-### What if the eGPU fails or detaches mid-decode?
-
-Fall back to iGPU MoE compute on the next token. The cache is invalidated. Persistent state: none beyond the cache, which is recoverable. Decode tok/s drops back to iGPU-only baseline; correctness preserved.
-
-## File touch surface
-
-- `crates/hipfire-egpu-bridge/` — new crate, ~500-1000 LOC
-  - `Cargo.toml`
-  - `src/lib.rs` — `MoEDispatchCache`, `dispatch_moe_layer`, dmabuf import wrappers
-  - Initialization on first daemon load if `HIPFIRE_MOE_EGPU=1`
-- `crates/hipfire-arch-qwen35/src/qwen35.rs::moe_ffn_decode_impl` — add env-var-gated branch that calls `egpu_bridge::dispatch_moe_layer` instead of the iGPU routed-experts path. ~30 LOC
-- `crates/hipfire-arch-qwen35/src/qwen35.rs::moe_ffn_prefill_chunk_impl` — same pattern (Phase 4 stretch goal)
-- `crates/rdna-compute/src/dispatch.rs` — expose `dmabuf_export_mq4_expert(layer_idx, expert_idx)` API
-- `Cargo.toml` workspace — add `hipfire-egpu-bridge` member
-- `crates/hipfire-runtime/examples/daemon.rs` — env-var setup + cache initialization on load
-
-Existing infrastructure to reuse:
-- `crates/hipx` — Phase 1.4 dmabuf primitives
-- `crates/rdna-compute::Gpu` — already supports multiple instances per device
-- `gemv_hfq4g256_moe_*` family — same kernels, just dispatched on eGPU's Gpu instance
-
-No new HIP kernels needed. The existing routed-experts kernels work on any RDNA arch.
-
-## Measurement plan
-
-Baseline (Path B + iGPU-only): A10B greedy 34.2 tok/s, A10B RP=1.05 34.1 tok/s.
-
-Targets:
-- Phase 1 PoC: byte-exact vs iGPU baseline (correctness gate). Speed regression OK.
-- Phase 2: ≥40 tok/s on A10B greedy (≥17% lift). Plus byte-exact vs Phase 1 PoC and iGPU baseline.
-- Phase 3: ≥45 tok/s on A10B greedy (≥30% lift).
-
-Latency budget breakdown to validate at Phase 1:
-- iGPU compute (routed-experts only) per token: estimate ~25 ms at A10B
-- eGPU compute per token: estimate ~5-8 ms (depending on FP8/iu4 wmma utilization)
-- USB4 transfer per token (no cache): 8 experts × 9 MB = 72 MB / 20 GB/s = 3.6 ms
-- Per-layer sync overhead: ~10 µs × 40 layers = 0.4 ms
-- Phase 1 expected: 8 + 3.6 + 0.4 ≈ 12 ms vs 25 ms iGPU = 50% speedup hypothetical
-- Phase 1 ACTUAL likely: dominated by USB4 sync overhead and PCIe stutter; may regress
-
-Phase 0 hit-rate data feeds directly into Phase 2 ROI: at 80% hit rate, Phase 2 transfer cost drops to 0.8 ms per token (vs 3.6 ms in PoC). At 90% it's 0.4 ms.
-
-## Open questions to resolve before Phase 1
-
-1. **Does Strix Halo iGPU even allow eGPU coexistence at decode bandwidth?** USB4 v2 plug + iGPU compute simultaneous load may degrade either side. Run a baseline microbench: `redline` cross-device dmabuf bandwidth while iGPU runs A3B inference.
-2. **dmabuf import on gfx1201 from gfx1151:** Phase 1.4 was iGPU↔NPU. iGPU↔eGPU may use different KFD paths. Verify before committing to Phase 1.
-3. **Layout of `expert_ptrs` table on eGPU:** mirroring the iGPU table or using offset-into-base-pointer? The latter is simpler if dmabuf gives a contiguous view.
-
-## Sequencing vs spec-decode
-
-Project memory's "spec decode + activation TP" path is a different lever — it adds a draft model on the eGPU that proposes tokens and the iGPU verifies. Speedup comes from accept ratio, not per-token compute reduction.
-
-The two are orthogonal:
-- **MoE offload** lifts per-token cost on the iGPU's bottleneck (routed-experts GEMV).
-- **Spec-decode** reduces the number of iGPU forward passes via draft+verify.
-
-They can stack: spec-decode wins ~2x on accept-ratio-favorable prompts; MoE offload would wins ~30% on top of that. The combined ceiling is ~2.5-3x A10B decode tok/s.
-
-For now, start with MoE offload because:
-1. Lower implementation risk (same model, no draft training).
-2. Wins on greedy decode (where spec-decode also operates but with weaker accept).
-3. Validates the dmabuf cross-device dispatch infrastructure that spec-decode would also use.
-
-## Risks
-
-- **USB4 v2 link instability:** memory documents the JHL9580 runtime-PM trap. Already mitigated via tmpfiles.d but remains a cold-start risk.
-- **Cache thrash on flat expert distributions:** if Phase 0 hit-rate is <70%, the cache approach fails. Need per-token pull design instead, which is bandwidth-bound.
-- **eGPU VRAM contention with display:** the 9070 XT may also drive a monitor. Decoding while a game/renderer runs would compete. Document as a known limitation; not solving it.
-- **Cross-arch quant compatibility:** MQ4 weights pre-rotated for FWHT. Both gfx1151 and gfx1201 must dequant identically. Already validated by Path B (same kernels run on both per cross-arch baselines).
-
-## Success criteria
-
-Phase 0 done: heatmap dumped, hit-rate at 32-cache > 80% confirmed on real prompts.
-Phase 1 done: env-var-gated dispatch produces byte-exact output vs baseline. Tok/s acceptable (regression OK).
-Phase 2 done: A10B decode ≥40 tok/s greedy with cache, byte-exact vs baseline. PR ready.
-Phase 3 done: A10B decode ≥45 tok/s greedy. Stretch.
-
-Stop conditions: hit rate too low at Phase 0, dmabuf import broken at Phase 1, or net regression at Phase 2 measurement after correct dispatch is verified.
+# MoE Expert Offload to eGPU — Phase 0 Outcome (PRD)
+
+## Status: SCRAPPED on Phase 0 data (2026-05-05)
+
+This PRD was originally a multi-phase implementation plan (Phase 0 measurement
+gate → Phases 1/2/3 cache build-out). Phase 0 fired the original stop condition
+("hit rate too low at Phase 0") on **both** Qwen3.5-A3B and Qwen3.5-122B-A10B,
+so the cache-based design that motivated Phases 1–3 is dead. The original
+content was committed at `8e99a51`; reach for `git show 8e99a51:docs/plans/moe-egpu-offload.prd`
+if you want to read the killed design.
+
+What this PRD now is: a Phase 0 outcome document. It records the measurement,
+the verdict, and the live pivot options. Nothing in the rest of this file
+should be implemented as-is — any next-step PRD must be authored fresh.
+
+## Original mission (no longer pursuable as written)
+
+> Decode-time speedup on Qwen3.5-MoE family (A3B, A10B) by running per-token
+> routed-expert FFN on the 9070 XT eGPU (gfx1201, RDNA4) while keeping the
+> rest of the model resident on the Strix Halo iGPU (gfx1151, RDNA 3.5).
+> Target: 30-50% decode tok/s lift on A10B.
+
+The decode-time-speedup-via-eGPU intent survives. The mechanism (routed-expert
+offload behind a per-layer LRU cache) does not. Project memory's earlier
+"NOT MoE expert offload" note turned out to be correct after all; that
+memory should stand, with this PRD's Phase 0 data as the supporting evidence.
+
+## Phase 0 — Profile expert hit-rate (DONE)
+
+Hypothesis under test (original gate clause): an LRU cache of 32 experts per
+layer covers ≥80% of routing decisions over a representative corpus. The
+gate had two outcomes: ≥80% → original Phase 1 would have started; ≤70% →
+scrap. The measurement returned 48% (A3B) and 42% (A10B), so the scrap
+outcome fired.
+
+### Instrumentation (shipped)
+
+- Daemon env-var gate: `HIPFIRE_MOE_EXPERT_HEATMAP=1`. Records per-layer
+  per-expert routing decisions into a process-global counter; dumps a
+  `[n_layers, n_experts]` matrix CSV to `/tmp/hipfire-moe-debug/dumps/` on
+  unload AND on stdin EOF.
+- Driver: `scripts/run_moe_heatmap_corpus.sh <model.mq4> [tokens=200]` runs 5
+  diverse prompts × N tokens through the daemon and pipes the dump to the
+  analyzer.
+- Analyzer: `scripts/analyze_moe_heatmap.py` — per-layer entropy + hit-rate
+  table at cache sizes 8/16/32/64/128 + automatic Phase 0 gate verdict.
+- Recording cost: per-layer D2H of `topk_indices` (128 B). Silent when env
+  var unset; never enters the hot path on production runs.
+
+### A3B measurement (k9lin gfx1100, qwen3.5-35b-a3b.mq4, 1105 tokens, 353,600 routed decisions)
+
+| cache | mean hit | min(layer) |
+|-------|---------:|-----------:|
+|   8   |  19.3%   |   9.5%     |
+|  16   |  31.2%   |  17.2%     |
+| **32** | **48.0%** | **29.7%**  |
+|  64   |  70.0%   |  48.3%     |
+| 128   |  91.3%   |  74.7%     |
+
+Per-layer entropy 7.00 / 8.00 max.
+
+### A10B measurement (hipx gfx1151, qwen3.5-122b-a10b.mq4)
+
+860-token short run, then a 1506-token confirmation run (1.75× sample size):
+
+| cache | 860-tok mean | 1506-tok mean | min(layer)@1506 |
+|-------|-------------:|--------------:|----------------:|
+|   8   |  16.7%       |   17.3%       |   9.2%          |
+|  16   |  26.9%       |   27.1%       |  16.5%          |
+| **32**| **41.9%**    | **41.7%**     | **28.1%**       |
+|  64   |  62.3%       |   61.6%       |  46.4%          |
+| 128   |  85.4%       |   85.0%       |  71.9%          |
+
+Per-layer entropy 7.26 / 8.00 max — A10B routing is even flatter than A3B's.
+The 1506-token confirmation reproduces every cache-size cell within ≤1
+percentage point, so the verdict is not a small-sample artifact. There is
+**no convergence to a hot set with more decode steps**.
+
+### Verdict: SCRAP
+
+Both models miss the ≥80% gate at the planned 32-cache size; both fall
+under even the relaxed ≤70% scrap threshold (A3B 48%, A10B 42%). At those
+hit rates, cold-miss transfer over USB4 v2 (~2 ms / token) is the same
+order of magnitude as the in-iGPU compute path it was supposed to replace.
+The cache stops being a cache.
+
+VRAM-wise: A10B at 48 layers × 32 experts × ~9 MB = 13.8 GB cache fits
+the 16 GB eGPU but covers <42% of routings. Going to 64-cache (~28 GB)
+overflows the eGPU; 128-cache (~55 GB) is unreachable. There is no cache
+size that is both VRAM-feasible and hit-rate-sufficient.
+
+## Pivot options (for any next PRD)
+
+1. **Per-token pull, no cache.** 8 experts × 9 MB × 48 layers = 3.4 GB / token
+   on A10B; over USB4 v2 ~20 GB/s = 170 ms / token = 6 tok/s ceiling.
+   Catastrophic regression vs the 34 tok/s iGPU baseline. **Dead.**
+2. **Decode-only FA-layer offload.** gfx1201 runs only the 12 FullAttention
+   layers' QKV+attn+wO; KV cache stays on iGPU; per-token transfer ~12 KB.
+   ~25% of decode compute movable, no MoE involvement. **Live option** for
+   a future PRD.
+3. **Other-compute offload (lm_head, embeds, full prefill).** Move
+   bulk-GEMM-shaped work to eGPU; leave decode on iGPU. Different speedup
+   target (prefill, not decode). **Live option** for a future PRD.
+
+A separate live lever, untouched by this verdict: spec-decode-on-eGPU
+(draft model on gfx1201, target verify on gfx1151). Speedup comes from
+draft accept ratio, not per-token compute reduction. ~2× ceiling on
+accept-favorable prompts.
+
+## Materialized risks
+
+- **Cache thrash on flat expert distributions:** **MATERIALIZED.** This was
+  the headline risk in the original PRD; the data confirms it. Both A3B
+  and A10B have entropy ≥87.5% of the maximum possible — the routers are
+  using the experts they have, not converging on a hot set.
+- **USB4 v2 link instability:** still latent (carries forward). JHL9580
+  runtime-PM trap mitigated via tmpfiles.d on hipx. See
+  `feedback_jhl9580_runtime_pm_trap.md` in project memory.
+- **eGPU VRAM contention with display:** still latent (carries forward).
+
+## Artifacts that landed in the repo
+
+- `crates/hipfire-arch-qwen35/src/moe_heatmap.rs` — heatmap module
+- `crates/hipfire-arch-qwen35/src/qwen35.rs` — `layer_idx` threaded through
+  the four MoE entry points + record-call sites
+- `crates/hipfire-runtime/examples/daemon.rs` — init on load (MoE only),
+  dump on unload + stdin EOF
+- `scripts/run_moe_heatmap_corpus.sh` — driver
+- `scripts/analyze_moe_heatmap.py` — analyzer
+- This PRD documenting why nothing further was built
+
+The instrumentation is generic over Qwen3.5-MoE family models; if a future
+arch (Qwen4-MoE, etc.) is added, the same env-var profile workflow applies
+without code changes.
+
+## Outcome
+
+- **Phase 0:** done. Stop condition fired on Phase 0 data, exactly as the
+  original stop-conditions clause anticipated.
+- **Phase 1, 2, 3:** not started; will not start under this PRD.
+- This document is closed. Any next eGPU-offload effort gets its own PRD.

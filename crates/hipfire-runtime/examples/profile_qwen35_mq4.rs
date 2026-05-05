@@ -182,4 +182,52 @@ fn main() {
     println!("  wall time:   {:.2}ms (profiling serializes launches)", profile_wall_ms / profile_steps as f64);
     println!("  kernel/wall overhead factor: {:.2}x",
         (profile_wall_ms / profile_steps as f64) / (per_step_us / 1000.0));
+
+    // ── Per-(device, layer-type) breakdown — for iGPU / eGPU split sizing ──
+    //
+    // Slices the same entries by (device, layer_type) so we can answer:
+    // "what fraction of decode wallclock is spent in FullAttention layers vs
+    // LinearAttention layers vs MoE-FFN ops outside the layer scope?". Entries
+    // outside any layer scope (embedding, lm_head) get layer_type = "outside".
+    #[derive(Default)]
+    struct LayerAgg { total_us: f64, calls: usize }
+    let mut by_layer_type: BTreeMap<(&'static str, &'static str), LayerAgg> = BTreeMap::new();
+    for e in &entries {
+        let lt = e.layer_type.unwrap_or("outside");
+        let a = by_layer_type.entry((e.device, lt)).or_default();
+        a.total_us += e.time_us;
+        a.calls += 1;
+    }
+    println!();
+    println!("Per-(device, layer-type) breakdown:");
+    println!("{:<8} {:<20} {:>10} {:>10} {:>8}", "device", "layer_type", "total_us", "per_step", "%");
+    println!("{:-<60}", "");
+    let mut lt_sorted: Vec<_> = by_layer_type.into_iter().collect();
+    lt_sorted.sort_by(|a, b| b.1.total_us.partial_cmp(&a.1.total_us).unwrap());
+    for ((dev, lt), a) in &lt_sorted {
+        let pct = a.total_us * 100.0 / total_us;
+        println!(
+            "{:<8} {:<20} {:>9.1}us {:>8.2}ms {:>7.1}%",
+            dev, lt, a.total_us, (a.total_us / profile_steps as f64) / 1000.0, pct
+        );
+    }
+
+    // ── Per-layer breakdown — finds outlier layers (e.g., a single MoE
+    //     layer routing through a degenerate set of experts).
+    let dump_layers = std::env::var("HIPFIRE_PROFILE_LAYERS").ok().as_deref() == Some("1");
+    if dump_layers {
+        let mut by_layer: BTreeMap<(u16, &'static str, &'static str), f64> = BTreeMap::new();
+        for e in &entries {
+            if let (Some(idx), Some(lt)) = (e.layer_idx, e.layer_type) {
+                *by_layer.entry((idx, lt, e.device)).or_default() += e.time_us;
+            }
+        }
+        println!();
+        println!("Per-layer wallclock (HIPFIRE_PROFILE_LAYERS=1):");
+        println!("{:<5} {:<20} {:<8} {:>10} {:>10}", "layer", "type", "device", "total_us", "per_step");
+        for ((idx, lt, dev), us) in &by_layer {
+            println!("{:<5} {:<20} {:<8} {:>9.1}us {:>8.2}ms",
+                idx, lt, dev, us, (us / profile_steps as f64) / 1000.0);
+        }
+    }
 }

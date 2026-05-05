@@ -2387,6 +2387,7 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let _profile_stage = rdna_compute::profile::StageGuard::new("decode");
     let dim = config.dim;
     // hipGraph capture is currently DISABLED for MoE configs. Single-shot
     // replay looks fine for short sequences, but state diverges from the
@@ -2909,6 +2910,7 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
+    let _profile_stage = rdna_compute::profile::StageGuard::new("prefill");
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
@@ -3494,6 +3496,13 @@ fn forward_prefill_chunk(
     let mut fa_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
+        let _profile_layer = rdna_compute::profile::LayerGuard::new(
+            layer_idx as u16,
+            match config.layer_types[layer_idx] {
+                LayerType::LinearAttention => "LinearAttention",
+                LayerType::FullAttention => "FullAttention",
+            },
+        );
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
@@ -4862,6 +4871,13 @@ fn forward_scratch_layers(
     let mut kv_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
+        let _profile_layer = rdna_compute::profile::LayerGuard::new(
+            layer_idx as u16,
+            match config.layer_types[layer_idx] {
+                LayerType::LinearAttention => "LinearAttention",
+                LayerType::FullAttention => "FullAttention",
+            },
+        );
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Fused RMSNorm + FWHT rotation (Phase 3.6). For MQ4 weights this
