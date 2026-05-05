@@ -359,19 +359,22 @@ fi
 echo ""
 echo "Installing hipfire..."
 
-if [ -f "$REPO_DIR/target/release/examples/daemon" ]; then
+if ! command -v cargo &>/dev/null; then
+    echo "  Installing Rust..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>/dev/null
+    . "$HOME/.cargo/env"
+fi
+
+TARGET_DIR=$(cd "$REPO_DIR" && cargo metadata --format-version 1 | grep -oE '"target_directory" *: *"[^"]+"' | cut -d ':' -f 2- | tr -d '"')
+
+if [ -f "$TARGET_DIR/release/examples/daemon" ]; then
     echo "  Pre-built binaries found ✓"
 else
     echo "  No pre-built binaries. Building from source..."
-    if ! command -v cargo &>/dev/null; then
-        echo "  Installing Rust..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y 2>/dev/null
-        . "$HOME/.cargo/env"
-    fi
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
         cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime 2>&1 | tail -5)
-    if [ ! -f "$REPO_DIR/target/release/examples/daemon" ]; then
+    if [ ! -f "$TARGET_DIR/release/examples/daemon" ]; then
         echo ""
         echo "  BUILD FAILED."
         echo "  Common causes:"
@@ -386,9 +389,9 @@ else
 fi
 
 # Copy binaries
-cp "$REPO_DIR/target/release/examples/daemon" "$BIN_DIR/daemon"
-cp "$REPO_DIR/target/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
-cp "$REPO_DIR/target/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
+cp "$TARGET_DIR/release/examples/daemon" "$BIN_DIR/daemon"
+cp "$TARGET_DIR/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
+cp "$TARGET_DIR/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
 
 # Copy CLI
 mkdir -p "$HIPFIRE_DIR/cli"
