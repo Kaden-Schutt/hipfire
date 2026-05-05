@@ -2,6 +2,7 @@
 //! Supports loading from GGUF files and running inference.
 
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
+use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
@@ -3028,6 +3029,350 @@ impl KvCache {
         gpu.hip.memcpy_htod_offset(&self.v_gpu[layer].buf, byte_offset, v_bytes)?;
         Ok(())
     }
+
+    // ── Multi-GPU constructors (Stage 5 of issue #58) ───────────────────
+    //
+    // Each `_multi` variant places the per-layer K/V slot on
+    // `gpus.devices[gpus.device_for_layer(i)]`. asym{2,3,4} variants
+    // additionally replicate the rotation tables to every device by
+    // populating `gpus.givens_cos_per_dev` / `gpus.givens_sin_per_dev`.
+    //
+    // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
+    // — Stage 6 forward dispatch reads from the per-device replicas in
+    // `Gpus` instead.
+
+    /// Free all per-layer GPU tensors on their owning devices. Mirror of
+    /// `free_gpu` for the multi-GPU layout. Givens replicas stay owned by
+    /// `Gpus`; freeing them is the orchestrator's responsibility.
+    pub fn free_gpu_multi(self, gpus: &mut Gpus) {
+        for (i, t) in self.k_gpu.into_iter().enumerate() {
+            let dev_idx = gpus.device_for_layer(i);
+            let _ = gpus.devices[dev_idx].free_tensor(t);
+        }
+        for (i, t) in self.v_gpu.into_iter().enumerate() {
+            let dev_idx = gpus.device_for_layer(i);
+            let _ = gpus.devices[dev_idx].free_tensor(t);
+        }
+        for (i, t) in self.k_scales.into_iter().enumerate() {
+            let dev_idx = gpus.device_for_layer(i);
+            let _ = gpus.devices[dev_idx].free_tensor(t);
+        }
+        for (i, t) in self.v_scales.into_iter().enumerate() {
+            let dev_idx = gpus.device_for_layer(i);
+            let _ = gpus.devices[dev_idx].free_tensor(t);
+        }
+    }
+
+    pub fn new_gpu_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_size = max_seq_len * kv_dim;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_size, cache_size)?;
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: false, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_q4_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bytes_per_head = 8 + head_dim / 2;
+        let bytes_per_pos = n_kv_heads * bytes_per_head;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_q8_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_q8_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let cache_bytes = physical_cap * total_blocks * 34;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim, quantized: true, quant_q8: true, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_int8c_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bph = 8 + head_dim;
+        let bpp = n_kv_heads * bph;
+        let cache_bytes = max_seq_len * bpp;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_hfq4kv_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bytes_per_block = 8 + head_dim / 2;
+        let bytes_per_pos = n_kv_heads * bytes_per_block;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, cache_elems, cache_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: true, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_hfq8_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let val_elems = (max_seq_len * kv_dim + 3) / 4;
+        let scale_elems = max_seq_len * n_kv_heads * 2;
+        let (k_gpu, v_gpu, k_scales, v_scales) =
+            alloc_kv_with_scales_per_layer_multi(gpus, n_layers, val_elems, val_elems, scale_elems, scale_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_int8_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let val_elems = (max_seq_len * kv_dim + 3) / 4;
+        let scale_elems = max_seq_len * n_kv_heads;
+        let (k_gpu, v_gpu, k_scales, v_scales) =
+            alloc_kv_with_scales_per_layer_multi(gpus, n_layers, val_elems, val_elems, scale_elems, scale_elems)?;
+        Ok(Self { k_gpu, v_gpu, k_scales, v_scales, kv_dim, max_seq: max_seq_len, physical_cap: max_seq_len, n_kv_heads, head_dim, quantized: true, quant_q8: false, quant_int8: true, quant_hfq4: false, quant_asym4: false, quant_asym3: false, quant_asym2: false, boundary_layers: 0, givens_cos: None, givens_sin: None, layer_is_boundary: vec![], compact_offset: 0 })
+    }
+
+    pub fn new_gpu_asym4_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym4_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_asym4_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "asym4 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: true, quant_asym3: false, quant_asym2: false,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
+
+    pub fn new_gpu_asym3_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_asym3_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 256, "asym3 currently requires head_dim=256 (Qwen 3.5)");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: true, quant_asym2: false,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
+
+    pub fn new_gpu_asym2_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym2_capped_multi(gpus, n_layers, n_kv_heads, head_dim, max_seq_len, max_seq_len)
+    }
+
+    pub fn new_gpu_asym2_capped_multi(
+        gpus: &mut Gpus,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim == 128 || head_dim == 256, "asym2 requires head_dim=128 or 256");
+        assert!(head_dim % 32 == 0);
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len);
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = alloc_kv_per_layer_multi(gpus, n_layers, k_elems, v_elems)?;
+        replicate_givens_to_all_devices(gpus, head_dim / 2, 42)?;
+        Ok(Self {
+            k_gpu, v_gpu, k_scales: vec![], v_scales: vec![], kv_dim,
+            max_seq: max_seq_len, physical_cap, n_kv_heads, head_dim,
+            quantized: true, quant_q8: false, quant_int8: false, quant_hfq4: false,
+            quant_asym4: false, quant_asym3: false, quant_asym2: true,
+            boundary_layers: 0, givens_cos: None, givens_sin: None,
+            layer_is_boundary: vec![], compact_offset: 0,
+        })
+    }
+}
+
+// ── Stage 5 helpers: per-device KV alloc + givens replication ────────
+
+fn alloc_kv_per_layer_multi(
+    gpus: &mut Gpus,
+    n_layers: usize,
+    k_elems: usize,
+    v_elems: usize,
+) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>)> {
+    let mut k_gpu = Vec::with_capacity(n_layers);
+    let mut v_gpu = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        let dev_idx = gpus.device_for_layer(i);
+        let g = &mut gpus.devices[dev_idx];
+        k_gpu.push(g.zeros(&[k_elems], DType::F32)?);
+        v_gpu.push(g.zeros(&[v_elems], DType::F32)?);
+    }
+    Ok((k_gpu, v_gpu))
+}
+
+fn alloc_kv_with_scales_per_layer_multi(
+    gpus: &mut Gpus,
+    n_layers: usize,
+    k_elems: usize,
+    v_elems: usize,
+    k_scale_elems: usize,
+    v_scale_elems: usize,
+) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>, Vec<GpuTensor>, Vec<GpuTensor>)> {
+    let mut k_gpu = Vec::with_capacity(n_layers);
+    let mut v_gpu = Vec::with_capacity(n_layers);
+    let mut k_scales = Vec::with_capacity(n_layers);
+    let mut v_scales = Vec::with_capacity(n_layers);
+    for i in 0..n_layers {
+        let dev_idx = gpus.device_for_layer(i);
+        let g = &mut gpus.devices[dev_idx];
+        k_gpu.push(g.zeros(&[k_elems], DType::F32)?);
+        v_gpu.push(g.zeros(&[v_elems], DType::F32)?);
+        k_scales.push(g.zeros(&[k_scale_elems], DType::F32)?);
+        v_scales.push(g.zeros(&[v_scale_elems], DType::F32)?);
+    }
+    Ok((k_gpu, v_gpu, k_scales, v_scales))
+}
+
+/// Asym{2,3,4} KV-rotation tables replicated to every device. Replaces any
+/// previous contents of `gpus.givens_*_per_dev`. Stage 6 forward dispatch
+/// reads `gpus.givens_*_per_dev[layer_to_device[i]]` per layer.
+fn replicate_givens_to_all_devices(
+    gpus: &mut Gpus,
+    n_blocks: usize,
+    seed: u32,
+) -> HipResult<()> {
+    let (cos_vals, sin_vals) = KvCache::gen_givens_angles(seed, n_blocks);
+    let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+
+    let prev_cos = std::mem::take(&mut gpus.givens_cos_per_dev);
+    let prev_sin = std::mem::take(&mut gpus.givens_sin_per_dev);
+    for (i, t) in prev_cos.into_iter().enumerate() {
+        if i < gpus.devices.len() { let _ = gpus.devices[i].free_tensor(t); }
+    }
+    for (i, t) in prev_sin.into_iter().enumerate() {
+        if i < gpus.devices.len() { let _ = gpus.devices[i].free_tensor(t); }
+    }
+
+    for dev_idx in 0..gpus.devices.len() {
+        let g = &mut gpus.devices[dev_idx];
+        let ct = g.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = g.alloc_tensor(&[n_blocks], DType::F32)?;
+        g.hip.memcpy_htod(&ct.buf, &cb)?;
+        g.hip.memcpy_htod(&st.buf, &sb)?;
+        gpus.givens_cos_per_dev.push(ct);
+        gpus.givens_sin_per_dev.push(st);
+    }
+    Ok(())
 }
 
 // attention_cpu removed — GPU attention is now used
