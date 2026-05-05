@@ -1269,6 +1269,7 @@ fn moe_ffn_decode(
     x_norm: &GpuTensor,
     x_residual: &GpuTensor,
     config: &Qwen35Config,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -1306,7 +1307,7 @@ fn moe_ffn_decode(
         topk_indices:  &topk_indices,
         topk_weights:  &topk_weights,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, layer_idx);
 
     for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
               up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
@@ -1353,9 +1354,10 @@ fn moe_ffn_decode_with_scratch(
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     scratch: &Qwen35Scratch,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, layer_idx)
 }
 
 /// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
@@ -1370,9 +1372,10 @@ fn moe_ffn_decode_with_scratch_prerotated(
     x_residual: &GpuTensor,
     config: &Qwen35Config,
     scratch: &Qwen35Scratch,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, layer_idx)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -1385,6 +1388,7 @@ fn moe_ffn_decode_impl(
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -1479,6 +1483,11 @@ fn moe_ffn_decode_impl(
             router_logits, s.topk_indices, s.topk_weights,
             n_exp, config.norm_topk_prob,
         )?;
+        if crate::moe_heatmap::is_active() {
+            let raw = gpu.download_f32(s.topk_indices)?;
+            let idx_i32: Vec<i32> = raw.iter().map(|f| f.to_bits() as i32).collect();
+            crate::moe_heatmap::record_decode(layer_idx, &idx_i32);
+        }
         (None, None)
     } else {
         // Fallback: GPU softmax → CPU download → CPU top-K + renorm.
@@ -1498,6 +1507,10 @@ fn moe_ffn_decode_impl(
             if sum > 0.0 {
                 for w in topk_weights.iter_mut() { *w /= sum; }
             }
+        }
+        if crate::moe_heatmap::is_active() {
+            let idx_i32: Vec<i32> = topk_indices.iter().map(|&i| i as i32).collect();
+            crate::moe_heatmap::record_decode(layer_idx, &idx_i32);
         }
         (Some(topk_indices), Some(topk_weights))
     };
@@ -2010,7 +2023,7 @@ fn forward_from_x_gpu(
 
                 // ── MoE FFN (only difference from dense) ──
                 gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config, layer_idx)?;
 
                 for t in [qkv, z, beta_out, alpha_out, conv_out, q_part, k_part, v_part, q_gdn, k_gdn, attn_out, normed_out, o] {
                     gpu.free_tensor(t)?;
@@ -2072,7 +2085,7 @@ fn forward_from_x_gpu(
 
                 // ── MoE FFN (only difference from dense) ──
                 gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
-                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config)?;
+                moe_ffn_decode(gpu, &layer.ffn, &tmp, &x, config, layer_idx)?;
 
                 for t in [q_full, q, gate_vec, k, v, attn_out, o] {
                     gpu.free_tensor(t)?;
@@ -3212,6 +3225,7 @@ fn prefill_moe_ffn_body_batched(
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     n: usize,
+    layer_idx: usize,
 ) -> HipResult<()> {
     let dim = config.dim;
     let mi = config.moe_intermediate_size;
@@ -3282,6 +3296,11 @@ fn prefill_moe_ffn_body_batched(
         router_logits, topk_indices, topk_weights,
         n_exp, config.norm_topk_prob, n,
     )?;
+    if crate::moe_heatmap::is_active() {
+        let raw = gpu.download_f32(topk_indices)?;
+        let idx_i32: Vec<i32> = raw.iter().take(n * k_top).map(|f| f.to_bits() as i32).collect();
+        crate::moe_heatmap::record_prefill(layer_idx, &idx_i32, n, k_top);
+    }
 
     // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
     //
@@ -4318,7 +4337,7 @@ fn forward_prefill_chunk(
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
                 // accumulates the FFN output residual back into it via the
                 // batched indexed down kernel's atomicAdd path.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, layer_idx)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -4547,7 +4566,7 @@ fn forward_prefill_chunk(
                 )?;
 
                 // Batched MoE FFN.
-                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n)?;
+                prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n, layer_idx)?;
 
                 // Post-layer hidden extract for the DFlash draft path.
                 if let Some(rb) = hidden_rb {
@@ -5282,10 +5301,10 @@ fn forward_scratch_layers(
                         s.moe_x_rot.as_ref().expect("MoE scratch"),
                         config.dim, config.norm_eps,
                     )?;
-                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx)?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx)?;
                 }
 
                 if let Some(ref rb) = hidden_rb {
@@ -5441,10 +5460,10 @@ fn forward_scratch_layers(
                         s.moe_x_rot.as_ref().expect("MoE scratch"),
                         config.dim, config.norm_eps,
                     )?;
-                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s, layer_idx)?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                    moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s, layer_idx)?;
                 }
 
                 if let Some(ref rb) = hidden_rb {

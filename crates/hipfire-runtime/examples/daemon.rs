@@ -834,6 +834,9 @@ fn main() {
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                // Phase 0 MoE offload: dump expert hit-count matrix if
+                // HIPFIRE_MOE_EXPERT_HEATMAP=1 was set at load time.
+                hipfire_arch_qwen35::moe_heatmap::dump_and_clear();
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }
@@ -989,6 +992,11 @@ fn main() {
             }
         }
     }
+
+    // EOF (e.g. CLI closed the pipe without sending unload): still dump the
+    // heatmap if we collected any data, so a SIGHUP-style shutdown doesn't
+    // lose the profile.
+    hipfire_arch_qwen35::moe_heatmap::dump_and_clear();
 }
 
 fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
@@ -1282,6 +1290,18 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 }
             }
         } else { None };
+
+        // MoE expert hit-count profiling (Phase 0 of MoE eGPU offload).
+        // Gated on HIPFIRE_MOE_EXPERT_HEATMAP=1; no-op otherwise. Records
+        // per-layer per-expert routing decisions for offline cache-fit
+        // analysis. Dumped to disk in the unload handler.
+        if config.num_experts > 0 {
+            hipfire_arch_qwen35::moe_heatmap::init(
+                config.n_layers,
+                config.num_experts,
+                path.to_string(),
+            );
+        }
 
         Ok(LoadedModel {
             arch_id: hfq.arch_id,

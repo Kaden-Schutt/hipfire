@@ -29,6 +29,8 @@ pub mod speculative;
 pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod arch;
+#[cfg(feature = "deltanet")]
+pub mod moe_heatmap;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
