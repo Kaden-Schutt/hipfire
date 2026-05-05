@@ -580,6 +580,15 @@ pub const FUSED_GATE_UP_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/
 /// block=[64,1,1] with 2 rows per block (one per warp); grid halves from
 /// gate_m + up_m to (total + 1) / 2. Byte-exact with the wave32 base.
 pub const FUSED_GATE_UP_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip
+// for the math + lane-mapping invariants. Per-kernel PMC at 2026-05-05
+// showed this kernel was memory-bound (3.86 % MemUnitStalled, 41 %
+// VALUBusy) so dp4a's 75 % x-traffic reduction lands on the right
+// bottleneck. Activations must be pre-quantized to block_q8_1_mmq
+// (use ensure_q8_1_mmq_x). Skip on gemv_residual — it was ILP-bound
+// and got its win from the prefetch variant instead.
+pub const FUSED_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_wave64_dp4a.hip");
+
 
 
 /// INT8 co-located KV v2: [f16 scale (2B)][padding (2B)][int8 × head_dim] = 132 bytes per head.

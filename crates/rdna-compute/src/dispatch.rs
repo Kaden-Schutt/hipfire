@@ -23,6 +23,33 @@ fn gemv_rows_override() -> Option<u32> {
     })
 }
 
+/// gfx906 dp4a-port toggle for memory-bound fused GEMVs.
+///
+/// `fused_gate_up_hfq4g256_dp4a` pre-quantizes x to Q8_1 and uses
+/// v_dot4_i32_i8 for the inner-loop multiply. Per the per-kernel PMC
+/// pass at 2026-05-05, this kernel was memory-bound (3.86 % MemUnit
+/// stall, 41 % VALUBusy) — dp4a's 75 % x-traffic reduction lands on
+/// the actual bottleneck.
+///
+/// Measured on MI50 / qwen3.5-9b.mq4 AR decode: +7.1 % tok/s
+/// (54.6 → 58.5 median, 3-run; BW 270 → 290 GiB/s) on top of the
+/// prefetch win on gemv_residual. Coherence gate clean.
+///
+/// Default-on for gfx906 only. Override with HIPFIRE_GEMV_DP4A={0,1}.
+/// fused_qkv / fused_qkvza ports are pending; same lever, same
+/// estimated +1-2 % per kernel.
+fn gemv_dp4a_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMV_DP4A").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    override_.unwrap_or(arch == "gfx906")
+}
+
 /// Weight-prefetch variant of the wave64 residual-GEMV.
 ///
 /// The prefetch kernel does software-pipelined across-quad weight loads —
@@ -9613,6 +9640,16 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        // gfx906 dp4a opt-in: pre-quantize x to Q8_1 and use the
+        // v_dot4_i32_i8 path. PMC at 2026-05-05 showed this kernel
+        // was memory-bound; dp4a's 75% x-traffic reduction lands on
+        // the actual bottleneck.
+        if gemv_dp4a_enabled(&self.arch) {
+            return self.fused_gate_up_hfq4g256_dp4a(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k,
+            );
+        }
+
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
@@ -9649,6 +9686,61 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xp);
+                b.push_ptr(yg); b.push_ptr(yu);
+                b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
+                b
+            },
+        )
+    }
+
+    /// dp4a-port of fused_gate_up_hfq4g256 for gfx906. Pre-quantizes
+    /// `x` to Q8_1 (block_q8_1_mmq, 144 B per 128-K block) using the
+    /// shared MMQ x-scratch buffer, then runs the dp4a-based GEMV. Math
+    /// is identical modulo Q8_1 quant noise (~1 % per-element relative).
+    /// Targeted at gfx906 where the FP wave64 fused_gate_up sat at
+    /// 41 % VALUBusy + 3.86 % MemUnitStalled — memory-bound, so dp4a's
+    /// 75 % x-traffic reduction lands on the actual bottleneck.
+    pub fn fused_gate_up_hfq4g256_dp4a(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor, x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize,
+    ) -> HipResult<()> {
+        // Quantize x → Xq[K/128] block_q8_1_mmq via the existing shared
+        // scratch path. Batch=1 for GEMV.
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
+
+        self.ensure_kernel(
+            "fused_gate_up_hfq4g256_wave64_dp4a",
+            kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC,
+            "fused_gate_up_hfq4g256_wave64_dp4a",
+        )?;
+
+        let ag = a_gate.buf.as_ptr();
+        let au = a_up.buf.as_ptr();
+        let yg = y_gate.buf.as_ptr();
+        let yu = y_up.buf.as_ptr();
+        let gm = gate_m as i32;
+        let um = up_m as i32;
+        let kv = k as i32;
+        let total = (gate_m + up_m) as u32;
+        let mut xq = xq_ptr;
+        let mut params: Vec<*mut c_void> = vec![
+            &ag as *const _ as *mut c_void,
+            &au as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &yg as *const _ as *mut c_void,
+            &yu as *const _ as *mut c_void,
+            &gm as *const _ as *mut c_void,
+            &um as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "fused_gate_up_hfq4g256_wave64_dp4a",
+            [(total + 1) / 2, 1, 1], [64, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag); b.push_ptr(au); b.push_ptr(xq);
                 b.push_ptr(yg); b.push_ptr(yu);
                 b.push_i32(gm); b.push_i32(um); b.push_i32(kv);
                 b
