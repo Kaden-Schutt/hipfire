@@ -23,6 +23,35 @@ fn gemv_rows_override() -> Option<u32> {
     })
 }
 
+/// Weight-prefetch variant of the wave64 residual-GEMV.
+///
+/// The prefetch kernel does software-pipelined across-quad weight loads —
+/// quad q+1's 12 dwords are issued before quad q's compute chain runs, so
+/// L2 fills overlap with the FMA chain instead of stalling the load unit.
+///
+/// Measured on gfx906 (MI50) AR decode of qwen3.5-9b.mq4: +4.8% tok/s
+/// (51.9 → 54.4 median, 3-run; BW 256.7 → 269.1 GiB/s). PMC L2CacheHit
+/// pass showed ~40 % L2 hit on the non-prefetched kernel — this lever
+/// shifts a fraction of those misses into the L2-hit regime while
+/// compute is in flight. Coherence gate clean (b37068c).
+///
+/// **Default-on for gfx906 only.** Other wave64-native archs
+/// (gfx908/MI100, gfx940-942/MI300x) take the original kernel until
+/// measured. Override with HIPFIRE_GEMV_PREFETCH={0,1}.
+///
+/// See docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md.
+fn gemv_prefetch_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMV_PREFETCH").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    override_.unwrap_or(arch == "gfx906")
+}
+
 /// Per-arch default R for the multi-row HFQ4 GEMV kernel family.
 ///
 /// - RDNA3 (gfx1100/1101/1102): R=1. Measured negative on 7900 XTX —
@@ -5032,14 +5061,21 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
         let result = if cdna3 {
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_wave64",
-                kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
-                "gemv_hfq4g256_residual_wave64",
-            )?;
+            let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+                (
+                    "gemv_hfq4g256_residual_wave64_prefetch",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                )
+            } else {
+                (
+                    "gemv_hfq4g256_residual_wave64",
+                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                )
+            };
+            self.ensure_kernel(kname, ksrc, kname)?;
             let grid = ((m as u32) + 1) / 2;
             self.launch_maybe_blob(
-                "gemv_hfq4g256_residual_wave64",
+                kname,
                 [grid, 1, 1], [64, 1, 1], 0, &mut params,
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
