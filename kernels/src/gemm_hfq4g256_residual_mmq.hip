@@ -37,11 +37,12 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
 // Q8_1 activation quantize: arch-portable, used by RDNA3 (this file's WMMA
 // MMQ kernel) and gfx906 (the dp4a MMQ kernel in
-// gemm_hfq4g256_residual_mmq.gfx906.hip). The body uses only width=32
-// shuffles which Phase 0 §3.5 verified are wave64-safe (each 32-lane
-// half-wave reduces independently). Block dim is (256, 1, 1); each thread
+// kernels/src/gemm_hfq4g256_residual_mmq_gfx906_*.hip). The body uses only
+// width=32 shuffles, which are wave64-safe: each 32-lane half-wave reduces
+// independently within the wave, and the kernel's amax+sum are per-32-lane
+// (one Q8_1 sub-block per 32 lanes). Block dim is (256, 1, 1); each thread
 // processes 4 float inputs. Per-32-lane group computes amax + sum over its
-// 128-element Q8_1 sub-block. See plans/phase0_complete.md.
+// 128-element Q8_1 sub-block.
 extern "C" __global__ void quantize_q8_1_mmq_ds4(
     const float* __restrict__ X,
     block_q8_1_mmq* __restrict__ Y,
