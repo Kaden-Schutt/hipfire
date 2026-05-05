@@ -236,7 +236,83 @@ additional lift despite identical inner-loop structure and matching
 **Decision: ship only the residual variant** (commit 3ef127d). The
 three rolled-out variants were reverted because they ship +17 VGPR of
 dead weight without lift. The dp4a port (P3') is the next single
-biggest lever.
+biggest lever — but see the design sketch below for why we deferred
+it and pivoted to P4'.
+
+## Phase 4: dp4a port — design sketch (deferred)
+
+Sketched the port before starting it; the cost/value math came out
+ambiguous enough to defer rather than plunge in. Captured here so a
+future revisit doesn't redo the analysis.
+
+### Math (proven; lifted from existing MMQ kernel)
+
+The gfx906 MMQ body (`gemm_hfq4g256_residual_mmq_gfx906_body.cuh`) already
+runs HFQ4 weights × Q8_1 activations with dp4a (`v_dot4_i32_i8`). Per
+32-K sub-block:
+
+```
+sumi   = 0   // int32, dp4a accumulator
+for v in 0..8:
+    sumi = __builtin_amdgcn_sdot4(x_int8_packed[v], w_nibbles_as_int8[v], sumi, false)
+sum   += scale_w * d_x * (float)sumi + zp_eff * sum_x
+```
+
+Where `scale_w` = HFQ4 group scale, `zp_eff = zp + 8*scale_w` (compensates
+for nibbles stored as `(n - 8) & 0xFF` in the int8 lane), `d_x` = Q8_1
+quantize scale per 32-block, `sum_x` = sum of the 32 ungquantized x
+values in that sub-block (Q8_1 stores both as `half2`).
+
+For batch=1 GEMV: drop the LDS staging that MMQ uses for the y-tile,
+keep the streaming x-tile pattern. Each warp = 1 output row; 4-quad
+interleave equivalent maps onto the dp4a path as 8 sub-blocks per
+HFQ4-G256 group (256 K-elements / 32 sub-block = 8).
+
+### Implementation cost
+
+1. New kernel `gemv_hfq4g256_residual_dp4a_wave64.hip` (~150 LoC).
+2. Rust dispatch:
+   - Pre-call: invoke `quantize_q8_1_mmq_ds4` on the float `x_rot_alias`
+     input with N=1 (single token), output to a per-process staging
+     buffer of size `K/128 * 144` bytes. Quantize kernel already
+     exists in `gemm_hfq4g256_residual_mmq.hip:46`.
+   - GEMV call: pass quantized buffer as `block_q8_1_mmq*` instead of
+     `float*`.
+3. Correctness: build a reference test comparing dp4a output to
+   FP path on random inputs. Q8_1 introduces ~1 % per-element error.
+   Coherence gate must still pass.
+
+### Why we deferred
+
+The predicted +1.3-1.6× lift comes from iacopPBK's `mmvq` kernels,
+which are ALU-bound. **Our kernels are not ALU-bound:**
+
+- VALUBusy 26-41 %, sub-1 % MemUnitStalled on `gemv_residual` —
+  the kernel sits in the small slice between memory-saturation and
+  ALU-saturation where neither is the dominant limiter.
+- The prefetch experiment confirmed there's *some* memory headroom
+  to absorb (residual responded +4.8 %, gate_up didn't). Adding dp4a
+  trades ALU instruction count for memory bandwidth (Q8_1 x fits in
+  ~4.6 KB vs 18 KB float — 75 % reduction in x-traffic).
+- BUT weights are ~90 % of fetched bytes per the L2 analysis, so the
+  *total* HBM-side savings from cheaper x are ~10 %, not 75 %.
+
+Net: ~0-5 % expected lift on our system, against ~1 work-session of
+cost (kernel + dispatch wiring + reference correctness test +
+quantizer overhead bench). The asymmetry favored pivoting to P4'
+(SGPR hoisting, smaller probe cost) and revisiting dp4a only if a
+future PMC pass shows a clearer ALU-bound regime.
+
+### Conditions under which dp4a becomes attractive again
+
+- If we ship something that pushes VALUBusy above ~70 %, then dp4a's
+  ALU-throughput lift translates to wall clock and the port pays off.
+  Candidate triggers: another round of weight-prefetch tuning that
+  shifts the bottleneck back to ALU; or a future kernel-fusion pass.
+- DFlash-decode at batch≥4 already crosses into ALU-busier territory
+  per the MMQ data (we use MMQ at batch≥16 on gfx906). If we widen
+  the spec-decode batch sweet spot, dp4a-GEMV at smaller batches
+  becomes the natural bridge between batch=1 FP and batch=16 MMQ.
 
 ## Reproducing
 
