@@ -84,6 +84,8 @@ fn main() {
             match layer {
                 qwen35::LayerWeights::DeltaNet(_) => eprint!("D"),
                 qwen35::LayerWeights::FullAttn(_) => eprint!("F"),
+                qwen35::LayerWeights::DeltaNetMoe(_) => eprint!("d"),
+                qwen35::LayerWeights::FullAttnMoe(_) => eprint!("f"),
             }
         }
         eprintln!("\nWeight loading: OK");
