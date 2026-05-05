@@ -700,9 +700,6 @@ HIP_VISIBLE_DEVICES=0 ROCR_VISIBLE_DEVICES=0 \
   — public gfx906 ISA reference (LDS bank-conflict patterns, dp4a
   issue rate, Q8_1 layout). Used as a sanity-check for PMC-driven
   redesign decisions.
-- **ggml-org/llama.cpp** (`mul_mat_q.cu`):
-  https://github.com/ggml-org/llama.cpp — architectural template for
-  our gfx906 MMQ body (templated `mmq_x` ladder, Q8_1 quantize math).
 - Our hipfire decode kernels:
   - `kernels/src/gemv_hfq4g256_residual_wave64.hip`
   - `kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip`

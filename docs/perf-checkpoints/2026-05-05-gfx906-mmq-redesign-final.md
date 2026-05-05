@@ -529,9 +529,9 @@ $HIPFIRE/target/release/examples/test_gfx906_mmq_realdata /tmp/mmq_dump_0
 - Pre-redesign attribution: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-attribution.md`
 - Pre-redesign j0-unroll experiments: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md`
 - Pre-redesign spill reduction: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-spill-reduction.md`
-- Stock kernel reference (architectural template for templated `mmq_x`
-  body and Q8_1 quantize math): `ggml/src/ggml-cuda/mmq.cuh` in
-  https://github.com/ggml-org/llama.cpp
+- Stock kernel reference: `ggml/src/ggml-cuda/mmq.cuh` in
+  https://github.com/ggml-org/llama.cpp (architectural template for
+  the templated `mmq_x` body and Q8_1 quantize math)
 - iacopPBK/llama.cpp-gfx906 (original gfx906 fork): https://github.com/iacopPBK/llama.cpp-gfx906
 - skyne98/llama.cpp-gfx906 (fork-of-iacopPBK + upstream-tracking): https://github.com/skyne98/llama.cpp-gfx906
 - skyne98/wiki-gfx906 (gfx906 ISA reference): https://skyne98.github.io/wiki-gfx906/intro.html

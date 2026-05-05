@@ -286,5 +286,3 @@ follow-ups above.
 - skyne98/wiki-gfx906 (gfx906 ISA reference — LDS bank-conflict
   patterns, dp4a issue rate, Q8_1 layout):
   https://skyne98.github.io/wiki-gfx906/intro.html
-- ggml-org/llama.cpp (`mul_mat_q.cu` — architectural template for
-  the templated MMQ body): https://github.com/ggml-org/llama.cpp

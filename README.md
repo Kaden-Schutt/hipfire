@@ -84,13 +84,11 @@ shaped by two community forks of `llama.cpp` that target Vega 20:
   layout) — we used it as a sanity-check for several PMC-driven
   redesign decisions.
 
-Stock [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp)
-(`mul_mat_q.cu`) provided the architectural template for our gfx906
-MMQ body: templated `mmq_x` ladder, per-thread accumulator layout,
-`MMQ_TILE_NE_K=32` sub-block factoring, and the Q8_1 activation
-quantize/dequantize math. We rewrote the inner loop for gfx906 (no
-WMMA, no MFMA, dp4a-only) but the outer scaffold is structurally
-descendant.
+And of course an extra shout-out to `ggml-org/llama.cpp` itself: the
+templated `mmq_x` body in `mul_mat_q.cu` was the architectural scaffold
+we ported to gfx906 (templated mmq_x ladder, per-thread accumulator
+layout, MMQ_TILE_NE_K=32 sub-block factoring, Q8_1 quantize math). The
+inner loop is gfx906-specific; the outer shape is descendant.
 
 A standalone gfx906 perf investigation log is at
 [`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
