@@ -18,18 +18,22 @@
 
 use hip_bridge::{
     DeviceBuffer, Event, HipError, HipResult,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 use rdna_compute::{Gpu, GpuTensor};
 
-/// Stream-event handoff returned by `Gpus::boundary_copy`. The src stream
-/// records `completion` after the copy lands; `Gpus::wait_boundary` makes
-/// the dst stream wait on it before the next dispatch on dst_dev. The
-/// `Option` is consumed (set to `None`) by `wait_boundary` after
-/// `event_destroy`; if a `BoundaryEvent` is dropped without going through
-/// `wait_boundary`, the `Drop` impl logs a leak warning. The actual HIP
-/// event handle still leaks in that case — destroying it requires a HIP
-/// runtime reference we don't store.
+/// Stream-event handoff returned by `Gpus::boundary_copy`. When the src
+/// device has an active stream, `completion` holds a HIP event recorded
+/// after the async peer copy; `Gpus::wait_boundary` makes the dst stream
+/// wait on it. When the src device has no active stream, the sync
+/// `memcpy_peer` already serializes the copy on the host and `completion`
+/// is `None` — `wait_boundary` returns immediately in that case.
+///
+/// The `Option` is consumed (set to `None`) by `wait_boundary`; if a
+/// `BoundaryEvent` with `completion: Some` is dropped without going through
+/// `wait_boundary`, the `Drop` impl logs a leak warning. The HIP event
+/// handle leaks in that case — destroying it requires a runtime reference
+/// we don't store here.
 pub struct BoundaryEvent {
     pub dst_dev: usize,
     completion: Option<Event>,
@@ -178,6 +182,10 @@ impl Gpus {
                 }
                 match self.devices[i].hip.enable_peer_access(self.devices[j].device_id) {
                     Ok(()) => {}
+                    // ffi.rs already converts 704 → Ok(()); this arm is
+                    // belt-and-suspenders against ROCm versions where the
+                    // driver returns 704 through a different code path.
+                    Err(e) if e.code == HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED => {}
                     Err(e) if e.code == HIP_ERROR_PEER_ACCESS_UNSUPPORTED => {
                         all_ok = false;
                     }
@@ -238,30 +246,30 @@ impl Gpus {
             ));
         }
         let src_gpu = &self.devices[src_dev];
-        let dst_gpu = &self.devices[dst_dev];
         src_gpu.bind_thread()?;
-        let event = src_gpu.hip.event_create()?;
         let src_dev_id = src_gpu.device_id;
-        let dst_dev_id = dst_gpu.device_id;
-        let copy_result: HipResult<()> = match src_gpu.active_stream.as_ref() {
+        let dst_dev_id = self.devices[dst_dev].device_id;
+        match src_gpu.active_stream.as_ref() {
             Some(stream) => {
                 src_gpu.hip.memcpy_peer_async(
                     dst, dst_dev_id, src, src_dev_id, n_bytes, stream,
                 )?;
-                src_gpu.hip.event_record(&event, Some(stream))
+                let event = src_gpu.hip.event_create()?;
+                match src_gpu.hip.event_record(&event, Some(stream)) {
+                    Ok(()) => Ok(BoundaryEvent { dst_dev, completion: Some(event) }),
+                    Err(e) => {
+                        let _ = src_gpu.hip.event_destroy(event);
+                        Err(e)
+                    }
+                }
             }
             None => {
+                // Sync path: memcpy_peer blocks on host until the copy
+                // lands. No event needed — recording into the HIP null
+                // stream is fragile across ROCm versions; skip it and
+                // signal "already done" via completion: None.
                 src_gpu.hip.memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
-                src_gpu.hip.event_record(&event, None)
-            }
-        };
-        match copy_result {
-            Ok(()) => Ok(BoundaryEvent { dst_dev, completion: Some(event) }),
-            Err(e) => {
-                // Best-effort: destroy the freshly-created event before
-                // surfacing the original error to the caller.
-                let _ = src_gpu.hip.event_destroy(event);
-                Err(e)
+                Ok(BoundaryEvent { dst_dev, completion: None })
             }
         }
     }
@@ -269,7 +277,8 @@ impl Gpus {
     /// Stream-event handoff: makes dst's active stream (or null) wait on
     /// the completion event recorded by `boundary_copy`. Consumes the
     /// `BoundaryEvent` and destroys the underlying HIP event regardless
-    /// of the wait result.
+    /// of the wait result. If `completion` is `None` (sync copy already
+    /// serialized on host), returns immediately without touching HIP.
     pub fn wait_boundary(&self, mut evt: BoundaryEvent) -> HipResult<()> {
         if evt.dst_dev >= self.devices.len() {
             return Err(HipError::new(
@@ -281,9 +290,9 @@ impl Gpus {
                 ),
             ));
         }
-        let event = evt.completion.take().expect(
-            "BoundaryEvent::completion is Some until wait_boundary takes it",
-        );
+        let Some(event) = evt.completion.take() else {
+            return Ok(());
+        };
         let dst_gpu = &self.devices[evt.dst_dev];
         dst_gpu.bind_thread()?;
         let wait_result = if let Some(stream) = dst_gpu.active_stream.as_ref() {

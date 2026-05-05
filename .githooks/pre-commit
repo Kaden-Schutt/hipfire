@@ -50,11 +50,13 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - The 4 PR1-4 modules (loop_guard, sampler, prompt_frame, eos_filter)
 #   are all hot-path; touching any of them affects every model load.
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs'
+# multi_gpu\.rs is listed here so that touching the PP dispatch path
+# triggers the coherence battery (same contract as single-GPU forward).
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs'
 
-# Multi-GPU PP hotspots — different bucket than the single-GPU forward
-# bucket above. pp-gate.sh runs only when one of these is touched AND
-# 2+ GPUs are visible; otherwise it skips (CI / single-GPU dev box).
+# Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
+# runs only when one of these is touched AND 2+ GPUs are visible; otherwise
+# it skips (CI / single-GPU dev box).
 PP_HOTSPOT='multi_gpu\.rs|peer_access|pp_|pipeline|stages|forward_prefill_batch_multi|forward_scratch_multi|Gpus|init_uniform|init_layers|boundary_copy'
 
 PP_TOUCHED=0
@@ -62,7 +64,7 @@ if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
     PP_TOUCHED=1
 fi
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT" && [ "$PP_TOUCHED" -eq 0 ]; then
+if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
 fi
 

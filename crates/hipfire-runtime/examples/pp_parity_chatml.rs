@@ -162,6 +162,10 @@ fn run_multi_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>)
 }
 
 fn main() {
+    // Force deterministic WMMA reduction so parity holds regardless of
+    // whether the caller (pp-gate.sh) sets the var in the environment.
+    // PP FP16 reduction order is non-deterministic without this flag.
+    std::env::set_var("HIPFIRE_DETERMINISTIC", "1");
     let path = std::env::args().nth(1).expect("Usage: ... <model.mq4>");
     let hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
     let tokenizer =
