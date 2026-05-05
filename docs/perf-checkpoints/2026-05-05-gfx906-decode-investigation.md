@@ -592,6 +592,35 @@ chain depth. Options:
    pass to see if any kernels regressed to the memory-or-ILP
    boundary on the larger / smaller models.
 
+7. **DFlash drafter & verify-specific kernels.** This session was
+   AR-decode scoped. DFlash speculative decode runs two distinct
+   workloads that have *not* been profiled here:
+
+   - **Drafter forward pass** (e.g. 0.8B drafting for 27B target).
+     The drafter inherits today's wins automatically — its decode
+     uses the same fused-GEMV kernel family with `arch == "gfx906"`
+     gating. So no work needed there *unless* a specific drafter
+     ships a different kernel mix.
+   - **Target's verify pass** at batch 12-16. Goes through MMQ
+     (covered by this PR's prefill redesign) but is *not* covered
+     by Phase 8's ALU-side levers — those got ruled out for the
+     pp512-style large-tile shape. The smaller mmq_x variants
+     (e.g. mmq_x=16 for batch=16) sat at 26 % VALUBusy in PMC,
+     suggesting more headroom than full_set_x64 — the levers that
+     failed at x64 might land for x16. Re-probe.
+   - **DFlash-only kernels** (`attention_dflash`, tree-mode FA,
+     linearization-slot ops, `gated_delta_net_q8` tree variants).
+     Never PMC'd this session. Likely candidates for the same
+     diagnostic-first methodology — find the bottleneck per kernel
+     before picking a lever.
+
+   Note: today's AR-decode wins shrink the *measured* DFlash
+   speedup ratio (since the AR-only baseline lifted 17 → 21 on 27B
+   mq4) without changing absolute DFlash tok/s. If the bench tables
+   in `docs/BENCHMARKS.md` and the PR are re-measured, the 27B
+   1.74× speedup column would shrink to ~1.40× — same DFlash
+   throughput, smaller numerator gap.
+
 ## Reproducing
 
 ```sh
