@@ -248,7 +248,7 @@ fn profile_token(
     let (tok_id, new_rng) = gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
-        repeat_window, repeat_penalty,
+        repeat_window, repeat_penalty, 0, 0.0,
     ).unwrap();
     timings.sampling_us = sync_us(gpu, t);
 

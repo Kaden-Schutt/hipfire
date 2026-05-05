@@ -680,6 +680,13 @@ fn main() {
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                // top_k: HF generation_config recommends 20 for Qwen3.5/3.6 MoE
+                // thinkers. 0 = disabled (use kernel's built-in TOP_K=20 buffer
+                // cap). The kernel clamps to [1, 20].
+                let top_k = msg.get("top_k").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+                // min_p: drop any candidate whose probability is below
+                // `min_p × P(top_token)`. 0.0 = disabled. Typical 0.05.
+                let min_p = msg.get("min_p").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
@@ -782,7 +789,7 @@ fn main() {
                     }
                     generate(
                         m, &mut gpu, &mut stdout, id, prompt, system,
-                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
@@ -2065,7 +2072,7 @@ fn generate_dflash(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: i32, min_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
@@ -2437,6 +2444,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             &mut blocked0,
         );
         let cfg0 = SamplerConfig {
+            top_k,
+            min_p,
             temperature: temp,
             top_p,
             repeat_penalty,
@@ -2654,6 +2663,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         &mut blocked,
                     );
                     let cfg = SamplerConfig {
+                        top_k,
+                        min_p,
                         temperature: temp,
                         top_p,
                         repeat_penalty,
@@ -2734,6 +2745,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 &mut blocked,
             );
             let cfg = SamplerConfig {
+                top_k,
+                min_p,
                 temperature: temp,
                 top_p,
                 repeat_penalty,
@@ -3028,6 +3041,8 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     // rather than going through the SamplerConfig path.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let vl_cfg_first = SamplerConfig {
+        top_k: 0,
+        min_p: 0.0,
         temperature: temp,
         top_p,
         repeat_penalty: 1.0,
@@ -3035,6 +3050,8 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         blocked_tokens: Vec::new(),
     };
     let vl_cfg = SamplerConfig {
+        top_k: 0,
+        min_p: 0.0,
         temperature: temp,
         top_p,
         repeat_penalty,

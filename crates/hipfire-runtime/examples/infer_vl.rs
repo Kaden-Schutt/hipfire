@@ -235,7 +235,7 @@ fn main() {
         let (tok, rng) = gpu.sample_top_p(
             &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
             text_config.vocab_size, temp, sc.top_p, rng_state,
-            hist_slice.len(), sc.repeat_penalty,
+            hist_slice.len(), sc.repeat_penalty, 0, 0.0,
         ).expect("sample_top_p failed");
         next_token = tok;
         rng_state = rng;

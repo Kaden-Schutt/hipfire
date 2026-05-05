@@ -2039,7 +2039,7 @@ pub fn forward_scratch_layers(
     gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
-        repeat_window, repeat_penalty,
+        repeat_window, repeat_penalty, 0, 0.0,
     )
 }
 
@@ -2159,7 +2159,7 @@ pub fn forward_early_exit(
                 let (tok, rng) = gpu.sample_top_p(
                     &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
                     config.vocab_size, temperature, top_p, rng_state,
-                    repeat_window, repeat_penalty,
+                    repeat_window, repeat_penalty, 0, 0.0,
                 )?;
                 return Ok((tok, rng, exit_layer));
             }
@@ -2172,7 +2172,7 @@ pub fn forward_early_exit(
     let (tok, rng) = gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
-        repeat_window, repeat_penalty,
+        repeat_window, repeat_penalty, 0, 0.0,
     )?;
     Ok((tok, rng, exit_layer))
 }
@@ -2459,7 +2459,7 @@ pub fn forward_sample(
     let result = gpu.sample_top_p(
         &logits_on_gpu, sample_buf, repeat_buf,
         config.vocab_size, temperature, top_p, rng_state,
-        repeat_window, repeat_penalty,
+        repeat_window, repeat_penalty, 0, 0.0,
     )?;
     gpu.free_tensor(logits_on_gpu)?;
     Ok(result)

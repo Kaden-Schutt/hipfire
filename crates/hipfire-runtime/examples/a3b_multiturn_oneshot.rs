@@ -76,7 +76,7 @@ fn main() {
     let mut rng_state: u32 = 0x13579BDFu32;
     let (tok0, rng0) = if use_sample {
         gpu.sample_top_p(&scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            vocab_size, 0.0, 1.0, rng_state, 0, 1.0).unwrap()
+            vocab_size, 0.0, 1.0, rng_state, 0, 1.0, 0, 0.0).unwrap()
     } else {
         let l = gpu.download_f32(&scratch.logits).unwrap();
         (llama::argmax(&l), rng_state)
@@ -94,7 +94,7 @@ fn main() {
         if t1_tokens >= 200 { break; }
         if use_sample {
             let (tok, rng) = gpu.sample_top_p(&scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                vocab_size, 0.0, 1.0, rng_state, 0, 1.0).unwrap();
+                vocab_size, 0.0, 1.0, rng_state, 0, 1.0, 0, 0.0).unwrap();
             next = tok; rng_state = rng;
         } else {
             let l = gpu.download_f32(&scratch.logits).unwrap();
@@ -118,7 +118,7 @@ fn main() {
     // ── Turn 2 decode (same sampler choice as turn 1) ──
     let (tok2, rng2) = if use_sample {
         gpu.sample_top_p(&scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            vocab_size, 0.0, 1.0, rng_state, 0, 1.0).unwrap()
+            vocab_size, 0.0, 1.0, rng_state, 0, 1.0, 0, 0.0).unwrap()
     } else {
         let l = gpu.download_f32(&scratch.logits).unwrap();
         (llama::argmax(&l), rng_state)
@@ -133,7 +133,7 @@ fn main() {
         pos += 1;
         if use_sample {
             let (tok, rng) = gpu.sample_top_p(&scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-                vocab_size, 0.0, 1.0, rng_state, 0, 1.0).unwrap();
+                vocab_size, 0.0, 1.0, rng_state, 0, 1.0, 0, 0.0).unwrap();
             next = tok; rng_state = rng;
         } else {
             let l = gpu.download_f32(&scratch.logits).unwrap();

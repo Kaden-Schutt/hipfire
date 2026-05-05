@@ -11193,6 +11193,8 @@ impl Gpu {
         rng_state: u32,
         repeat_window: usize,
         repeat_penalty: f32,
+        top_k: i32,
+        min_p: f32,
     ) -> HipResult<(u32, u32)> {
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
@@ -11206,6 +11208,8 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        let mut tk = top_k;
+        let mut mp = min_p;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -11217,6 +11221,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
+            &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;
@@ -11253,6 +11259,8 @@ impl Gpu {
         rng_state: u32,
         repeat_window: usize,
         repeat_penalty: f32,
+        top_k: i32,
+        min_p: f32,
     ) -> HipResult<()> {
         self.ensure_kernel("sample_top_p", kernels::SAMPLE_TOP_P_SRC, "sample_top_p")?;
         let func = &self.functions["sample_top_p"];
@@ -11266,6 +11274,8 @@ impl Gpu {
         let mut rng = rng_state;
         let mut rw = repeat_window as i32;
         let mut rp = repeat_penalty;
+        let mut tk = top_k;
+        let mut mp = min_p;
 
         let mut params: Vec<*mut std::ffi::c_void> = vec![
             &mut logits_ptr as *mut _ as *mut std::ffi::c_void,
@@ -11277,6 +11287,8 @@ impl Gpu {
             &mut rng as *mut _ as *mut std::ffi::c_void,
             &mut rw as *mut _ as *mut std::ffi::c_void,
             &mut rp as *mut _ as *mut std::ffi::c_void,
+            &mut tk as *mut _ as *mut std::ffi::c_void,
+            &mut mp as *mut _ as *mut std::ffi::c_void,
         ];
 
         let block_size = 256u32;

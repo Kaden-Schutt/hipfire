@@ -27,7 +27,9 @@ extern "C" __global__ void sample_top_p(
     float top_p,
     unsigned int rand_seed,
     int repeat_window,
-    float repeat_penalty
+    float repeat_penalty,
+    int top_k_eff,                                  // 0 = disabled (use full TOP_K); else clamped to [1, TOP_K]
+    float min_p                                     // 0.0 = disabled; else drop any prob < min_p * max_prob
 ) {
     const int TOP_K = 20;
     extern __shared__ char smem[];
@@ -182,11 +184,34 @@ extern "C" __global__ void sample_top_p(
         unsigned int rng = rand_seed;
         rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
 
-        // Top-p filtering: find cutoff where cumulative mass reaches top_p * sum.
-        float p_thresh = top_p * sum;
+        // top-K cap (HF generation_config: typically 20). 0 = disabled,
+        // negative-or-out-of-range clamped. After this point only the first
+        // `k_cap` slots of `order[]` are eligible candidates.
+        int k_cap = TOP_K;
+        if (top_k_eff > 0 && top_k_eff < TOP_K) k_cap = top_k_eff;
+
+        // min-p: drop any candidate whose normalized probability is below
+        // `min_p * max_prob`. Applied after top_k, before top_p, so it
+        // tightens the tail without competing with top_p's cumulative cap.
+        // probs[] are unnormalized post-softmax mass (summing to `sum`).
+        // Top of `order[]` after the descending sort is the modal element.
+        if (min_p > 0.0f && k_cap > 0) {
+            float top_prob = probs[order[0]];
+            float cutoff = min_p * top_prob;
+            int kp = 1;
+            while (kp < k_cap && probs[order[kp]] >= cutoff) kp++;
+            k_cap = kp;
+        }
+
+        // Top-p filtering: find cutoff where cumulative mass reaches top_p * sub_sum,
+        // restricted to the first `k_cap` slots after top_k + min_p tightening.
+        float sub_sum = 0.0f;
+        for (int i = 0; i < k_cap; i++) sub_sum += probs[order[i]];
+        if (sub_sum <= 0.0f) sub_sum = sum;
+        float p_thresh = top_p * sub_sum;
         float trunc_sum = 0.0f;
-        int trunc_k = TOP_K;
-        for (int i = 0; i < TOP_K; i++) {
+        int trunc_k = k_cap;
+        for (int i = 0; i < k_cap; i++) {
             trunc_sum += probs[order[i]];
             if (trunc_sum >= p_thresh) { trunc_k = i + 1; break; }
         }

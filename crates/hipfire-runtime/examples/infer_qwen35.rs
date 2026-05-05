@@ -227,6 +227,8 @@ fn main() {
         // capacity so we don't outrun the on-device buffer.
         let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
         let cfg = SamplerConfig {
+            top_k: 0,
+            min_p: 0.0,
             temperature: sc.think_temp,
             top_p: sc.top_p,
             repeat_penalty: sc.repeat_penalty,
@@ -319,6 +321,8 @@ fn main() {
             // daemon's per-step sampler call exactly.
             let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
             let cfg = SamplerConfig {
+                top_k: 0,
+                min_p: 0.0,
                 temperature: temp,
                 top_p: sc.top_p,
                 repeat_penalty: sc.repeat_penalty,

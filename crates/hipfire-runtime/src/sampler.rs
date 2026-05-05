@@ -61,6 +61,16 @@ pub struct SamplerConfig {
     pub temperature: f32,
     /// 1.0 = no nucleus truncation.
     pub top_p: f32,
+    /// Top-k cap on candidate count BEFORE top-p / min-p truncation.
+    /// `0` = disabled (kernel uses its built-in TOP_K=20 buffer cap).
+    /// Otherwise clamped to `[1, 20]` by the kernel.
+    /// HF generation_config recommends 20 for Qwen3.5/3.6 MoE.
+    pub top_k: i32,
+    /// Minimum probability relative to the modal token's probability
+    /// (i.e. `min_p × P(top_token)`). `0.0` = disabled. Typical 0.05 for
+    /// thinkers — drops the long tail without competing with top_p's
+    /// cumulative cap. Applied after top_k, before top_p.
+    pub min_p: f32,
     /// 1.0 = repeat-penalty disabled.
     pub repeat_penalty: f32,
     /// Tokens of recent history visible to the repeat-penalty kernel.
@@ -79,6 +89,25 @@ impl SamplerConfig {
         Self {
             temperature: 0.0,
             top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            blocked_tokens: Vec::new(),
+        }
+    }
+
+    /// HuggingFace-recommended sampling for Qwen3.5/3.6 MoE thinkers,
+    /// matching `generation_config.json` (`temperature=1.0, top_k=20,
+    /// top_p=0.95`) plus a conservative `min_p=0.05` to suppress the
+    /// long-tail trash candidates that show up at MQ4 quant. No repeat
+    /// penalty (HF doesn't recommend one for these models).
+    pub fn hf_thinker() -> Self {
+        Self {
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 20,
+            min_p: 0.05,
             repeat_penalty: 1.0,
             repeat_window: 0,
             blocked_tokens: Vec::new(),
@@ -91,10 +120,15 @@ impl Default for SamplerConfig {
     /// Mirrors the user-validated `RP=1.05` floor (CLAUDE.md memory:
     /// `feedback_repeat_penalty_default.md`). `repeat_window=128`
     /// matches `hipfire_runtime::llama::SamplingConfig::text_thinking()`.
+    /// `top_k=0` and `min_p=0.0` keep current pre-top_k/min_p behavior;
+    /// callers that want HF-recommended sampling should use
+    /// `SamplerConfig::hf_thinker()` or set the fields explicitly.
     fn default() -> Self {
         Self {
             temperature: 0.3,
             top_p: 0.95,
+            top_k: 0,
+            min_p: 0.0,
             repeat_penalty: 1.05,
             repeat_window: 128,
             blocked_tokens: Vec::new(),
@@ -184,6 +218,8 @@ pub fn sample(
             *rng_state,
             scope.len(),
             cfg.repeat_penalty,
+            cfg.top_k,
+            cfg.min_p,
         )
         .expect("sample_top_p kernel launch / readback failed");
     *rng_state = new_rng;

@@ -196,6 +196,8 @@ fn main() {
     let make_sampler_cfg = |t: f32| SamplerConfig {
         temperature: t,
         top_p,
+        top_k: 0,
+        min_p: 0.0,
         repeat_penalty,
         repeat_window: repeat_buf_cap.min(repeat_window),
         blocked_tokens: Vec::new(),
