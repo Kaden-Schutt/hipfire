@@ -99,6 +99,31 @@ type HipGraphExec = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
 
+/// `hipPointerAttribute_t` per ROCm 6.4.3 layout. ROCm 5.x not supported.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct HipPointerAttribute {
+    pub mem_type: u32,
+    pub device: c_int,
+    pub device_pointer: *mut c_void,
+    pub host_pointer: *mut c_void,
+    pub is_managed: c_int,
+    pub allocation_flags: c_uint,
+}
+
+impl Default for HipPointerAttribute {
+    fn default() -> Self {
+        Self {
+            mem_type: 0,
+            device: -1,
+            device_pointer: ptr::null_mut(),
+            host_pointer: ptr::null_mut(),
+            is_managed: 0,
+            allocation_flags: 0,
+        }
+    }
+}
+
 /// Loaded HIP runtime — holds the dlopen'd library and resolved function pointers.
 pub struct HipRuntime {
     _lib: Library,
@@ -109,6 +134,17 @@ pub struct HipRuntime {
     // Device management
     fn_get_device_count: unsafe extern "C" fn(*mut c_int) -> u32,
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
+    fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
+
+    // Multi-device / peer access
+    fn_device_can_access_peer: unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32,
+    fn_device_enable_peer_access: unsafe extern "C" fn(c_int, c_uint) -> u32,
+    fn_memcpy_peer:
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32,
+    fn_memcpy_peer_async:
+        unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, HipStream) -> u32,
+    fn_pointer_get_attributes:
+        unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32,
 
     // Memory
     fn_malloc: unsafe extern "C" fn(*mut *mut c_void, usize) -> u32,
@@ -252,6 +288,17 @@ impl HipRuntime {
                 fn_runtime_get_version: load_fn!(lib, "hipRuntimeGetVersion", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_get_device_count: load_fn!(lib, "hipGetDeviceCount", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
+                fn_get_device: load_fn!(lib, "hipGetDevice", unsafe extern "C" fn(*mut c_int) -> u32),
+                fn_device_can_access_peer: load_fn!(lib, "hipDeviceCanAccessPeer",
+                    unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
+                fn_device_enable_peer_access: load_fn!(lib, "hipDeviceEnablePeerAccess",
+                    unsafe extern "C" fn(c_int, c_uint) -> u32),
+                fn_memcpy_peer: load_fn!(lib, "hipMemcpyPeer",
+                    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize) -> u32),
+                fn_memcpy_peer_async: load_fn!(lib, "hipMemcpyPeerAsync",
+                    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, usize, HipStream) -> u32),
+                fn_pointer_get_attributes: load_fn!(lib, "hipPointerGetAttributes",
+                    unsafe extern "C" fn(*mut HipPointerAttribute, *const c_void) -> u32),
                 fn_malloc: load_fn!(lib, "hipMalloc", unsafe extern "C" fn(*mut *mut c_void, usize) -> u32),
                 fn_free: load_fn!(lib, "hipFree", unsafe extern "C" fn(*mut c_void) -> u32),
                 fn_memcpy: load_fn!(lib, "hipMemcpy", unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32),
@@ -327,6 +374,91 @@ impl HipRuntime {
     pub fn set_device(&self, id: i32) -> HipResult<()> {
         let code = unsafe { (self.fn_set_device)(id) };
         self.check(code, "hipSetDevice")
+    }
+
+    pub fn current_device(&self) -> HipResult<i32> {
+        let mut id: c_int = 0;
+        let code = unsafe { (self.fn_get_device)(&mut id) };
+        self.check(code, "hipGetDevice")?;
+        Ok(id)
+    }
+
+    // ── Multi-device / peer access ──────────────────────────────
+
+    pub fn can_access_peer(&self, device: i32, peer_device: i32) -> HipResult<bool> {
+        let mut can: c_int = 0;
+        let code = unsafe { (self.fn_device_can_access_peer)(&mut can, device, peer_device) };
+        self.check(code, "hipDeviceCanAccessPeer")?;
+        Ok(can != 0)
+    }
+
+    /// Idempotent: hipErrorPeerAccessAlreadyEnabled (704) → Ok. Caller must
+    /// have bound the source device first (`set_device`).
+    pub fn enable_peer_access(&self, peer_device: i32) -> HipResult<()> {
+        let code = unsafe { (self.fn_device_enable_peer_access)(peer_device, 0) };
+        if code == HIP_SUCCESS || code == crate::HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED {
+            Ok(())
+        } else {
+            Err(HipError::from_code(
+                code,
+                "hipDeviceEnablePeerAccess",
+                Some(&self.fn_get_error_string),
+            ))
+        }
+    }
+
+    pub fn memcpy_peer(
+        &self,
+        dst: &DeviceBuffer,
+        dst_device: i32,
+        src: &DeviceBuffer,
+        src_device: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        assert!(size <= dst.size(), "size ({size}) exceeds dst ({})", dst.size());
+        assert!(size <= src.size(), "size ({size}) exceeds src ({})", src.size());
+        let code = unsafe {
+            (self.fn_memcpy_peer)(
+                dst.as_ptr(),
+                dst_device,
+                src.as_ptr() as *const c_void,
+                src_device,
+                size,
+            )
+        };
+        self.check(code, "hipMemcpyPeer")
+    }
+
+    /// Stream must belong to one of the two devices involved.
+    pub fn memcpy_peer_async(
+        &self,
+        dst: &DeviceBuffer,
+        dst_device: i32,
+        src: &DeviceBuffer,
+        src_device: i32,
+        size: usize,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        assert!(size <= dst.size(), "size ({size}) exceeds dst ({})", dst.size());
+        assert!(size <= src.size(), "size ({size}) exceeds src ({})", src.size());
+        let code = unsafe {
+            (self.fn_memcpy_peer_async)(
+                dst.as_ptr(),
+                dst_device,
+                src.as_ptr() as *const c_void,
+                src_device,
+                size,
+                stream.0,
+            )
+        };
+        self.check(code, "hipMemcpyPeerAsync")
+    }
+
+    pub fn pointer_get_attributes(&self, buf: &DeviceBuffer) -> HipResult<HipPointerAttribute> {
+        let mut attr = HipPointerAttribute::default();
+        let code = unsafe { (self.fn_pointer_get_attributes)(&mut attr, buf.as_ptr()) };
+        self.check(code, "hipPointerGetAttributes")?;
+        Ok(attr)
     }
 
     // ── Memory management ───────────────────────────────────────
