@@ -233,3 +233,15 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "triattn_validate"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity_chatml"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
+required-features = ["arch-qwen35", "deltanet"]

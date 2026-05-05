@@ -52,7 +52,17 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
 HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs'
 
-if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
+# Multi-GPU PP hotspots — different bucket than the single-GPU forward
+# bucket above. pp-gate.sh runs only when one of these is touched AND
+# 2+ GPUs are visible; otherwise it skips (CI / single-GPU dev box).
+PP_HOTSPOT='multi_gpu\.rs|peer_access|pp_|pipeline|stages|forward_prefill_batch_multi|forward_scratch_multi|Gpus|init_uniform|init_layers|boundary_copy'
+
+PP_TOUCHED=0
+if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
+    PP_TOUCHED=1
+fi
+
+if ! echo "$CHANGED" | grep -qE "$HOTSPOT" && [ "$PP_TOUCHED" -eq 0 ]; then
     exit 0
 fi
 
@@ -171,6 +181,31 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
 fi
 
 echo
+
+# ── Multi-GPU PP gate ────────────────────────────────────────────────────
+# Skips silently when fewer than 2 GPU are visible — single-GPU CI and
+# dev boxes don't block on multi-GPU regressions. When 2+ GPU AND a
+# multi_gpu/pp_/peer_access hotspot is touched, run the parity battery.
+if [ "$PP_TOUCHED" -eq 1 ]; then
+    echo "=== Multi-GPU PP Gate ==="
+    echo "Multi-GPU code changed. Running pp-gate (skips if <2 GPU)..."
+    echo
+    if ! ./scripts/pp-gate.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: pp-gate.sh hit a HARD failure."
+        echo "========================================================================"
+        echo
+        echo "Multi-GPU pp=2 ≢ pp=1 byte-identical, refusal contract broken,"
+        echo "or daemon panic. Investigation:"
+        echo "  ./scripts/pp-gate.sh                       # full battery"
+        echo "  ./scripts/pp-gate.sh --skip-end-to-end     # parity-only"
+        echo
+        echo "Refer to docs/multi-gpu.md for the validation contract."
+        exit 1
+    fi
+    echo
+fi
 
 # ── Speed gate ────────────────────────────────────────────────────────────
 echo "=== MQ4 Speed Gate (fast) ==="
