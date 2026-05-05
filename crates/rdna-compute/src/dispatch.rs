@@ -5328,6 +5328,52 @@ impl Gpu {
         result
     }
 
+    /// MoE top-K + renorm given pre-softmaxed probs. Companion to the
+    /// regular `softmax_f32`. The dispatch site runs `softmax_f32` first,
+    /// then this kernel — same softmax math everywhere, no 1-ULP
+    /// divergence between the routing path and a CPU reference.
+    pub fn moe_topk_renorm_k8(
+        &mut self,
+        probs: &GpuTensor,        // [n_exp] f32, pre-softmaxed
+        topk_idx: &GpuTensor,     // i32 [k_top]
+        topk_w:   &GpuTensor,     // f32 [k_top]
+        n_exp: usize,
+        norm_topk: bool,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "moe_topk_renorm_k8",
+            kernels::MOE_TOPK_RENORM_K8_SRC,
+            "moe_topk_renorm_k8",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n  = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n  as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = n_exp * 4 + 8 * 8;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_topk_renorm_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8", [1, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_i32(n); b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Index-aware MoE gate_up GEMV. Reads expert_ids from a device-side
     /// topk_indices buffer and weight bases from expert_ptrs[expert_id].
     /// hipGraph-capture-safe replacement for the kernarg-pointer variant.
@@ -5491,6 +5537,55 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             "moe_softmax_topk_renorm_k8_batched",
+            [batch_size as u32, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp); b.push_ptr(ip); b.push_ptr(wp);
+                b.push_i32(n); b.push_i32(nr);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched companion of `moe_topk_renorm_k8` for the prefill path.
+    /// Takes pre-softmaxed probs of shape `[batch_size × n_exp]` and writes
+    /// `[batch_size × K_TOP]` indices and weights. Caller must run a batched
+    /// softmax (`gpu.softmax_f32` on a [batch_size × n_exp] tensor) before
+    /// calling this kernel.
+    pub fn moe_topk_renorm_k8_batched(
+        &mut self,
+        probs: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w:   &GpuTensor,
+        n_exp: usize,
+        norm_topk: bool,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(
+            "moe_topk_renorm_k8_batched",
+            kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
+            "moe_topk_renorm_k8_batched",
+        )?;
+        let lp = probs.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let n  = n_exp as i32;
+        let nr = if norm_topk { 1i32 } else { 0i32 };
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &n  as *const _ as *mut c_void,
+            &nr as *const _ as *mut c_void,
+        ];
+        let bytes = (n_exp * 4 + 8 * 8) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_topk_renorm_k8_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_topk_renorm_k8_batched",
             [batch_size as u32, 1, 1], [256, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -8739,32 +8834,38 @@ impl Gpu {
     /// In-place softmax over last dimension
     pub fn softmax_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.ensure_kernel("softmax", kernels::SOFTMAX_SRC, "softmax_f32")?;
-        let func = &self.functions["softmax_f32"];
 
         let rows = if x.shape.len() > 1 { x.shape[0] } else { 1 };
         let n = x.shape.last().copied().unwrap() as i32;
 
-        let mut x_ptr = x.buf.as_ptr();
-        let mut n_val = n;
+        let x_ptr = x.buf.as_ptr();
+        let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut n_val as *mut _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
         ];
 
         let block = 256u32.min(n as u32);
         let shared_mem = block * 4;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [rows as u32, 1, 1],
-                [block, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // Graph-safe launch via launch_maybe_blob. Path B inserts this
+        // call into the MoE forward path which gets captured under the
+        // verify/HIPFIRE_GRAPH path; raw self.hip.launch_kernel would
+        // capture stack-borne kernarg pointers that go dangling on replay.
+        self.launch_maybe_blob(
+            "softmax_f32",
+            [rows as u32, 1, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )
     }
 
     /// GPU-side RoPE (rotary positional embedding) applied in-place to Q and K.

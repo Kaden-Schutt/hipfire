@@ -121,6 +121,21 @@ pub const GEMV_HFQ4G256_MOE_DOWN_SRC: &str = include_str!("../../../kernels/src/
 /// to need — required for hipGraph capture of MoE decode.
 pub const MOE_SOFTMAX_TOPK_K8_SRC: &str = include_str!("../../../kernels/src/moe_softmax_topk_k8.hip");
 
+/// MoE top-K + renorm only, given pre-softmaxed probs. Companion to
+/// the regular softmax_f32 kernel; the dispatch site runs softmax_f32
+/// first, then this kernel for top-K + renorm. Avoids the 1-ULP
+/// precision divergence that the fused softmax+topk variant exhibits
+/// on MQ4 MoE: in-kernel softmax order + mul-by-reciprocal renorm
+/// produced weights that differed from gpu.softmax_f32 + manual
+/// division by 1 LSB per element, which compounds to a structural
+/// attractor on Qwen3.5-A3B / 122B-A10B.
+pub const MOE_TOPK_RENORM_K8_SRC: &str = include_str!("../../../kernels/src/moe_topk_renorm_k8.hip");
+
+/// Batched companion of MOE_TOPK_RENORM_K8_SRC for the prefill path.
+/// Same per-block algorithm; one workgroup per token row.
+pub const MOE_TOPK_RENORM_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_topk_renorm_k8_batched.hip");
+
 /// Index-aware MoE gate_up GEMV — reads expert IDs from a device-side
 /// topk_indices buffer and the per-expert weight base from an
 /// expert-pointers table. hipGraph-capture-safe replacement for the
