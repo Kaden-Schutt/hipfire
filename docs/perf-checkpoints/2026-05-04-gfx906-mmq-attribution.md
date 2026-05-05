@@ -104,8 +104,8 @@ need to do first":
 1. **L2 prefetch is wrong axis.** The kernel does very few global
    loads (FLAT=0.21 M/call vs FP16's 5.77 M). HBM→L2 latency for
    weight loads is not the bottleneck. The L2 hit rate problem is on
-   the *spill* path (writes to scratch), not the *weight* path. This
-   confirms the adversarial reviews of `plans/gfx906_mmq_l2.md` v1.
+   the *spill* path (writes to scratch), not the *weight* path —
+   confirmed in `docs/plans/gfx906-mmq-prd.md` §3.3.
 2. **LDS issue / barrier waits are zero** — the `__syncthreads()`
    pattern in `mmq_body` is not stalling. Restructuring the X-once +
    Y-twice barrier pattern won't help.
@@ -214,9 +214,8 @@ In order, gating each on the previous failing:
 
 ## Cross-reference
 
-- L2 prefetch plan v2 (this work executes step 1 of):
-  `plans/gfx906_mmq_l2.md`
-- Adversarial reviews that drove the v2 reframing:
-  `gfx906_l2_rev_claude.md`, `plans/gfx906_l2_rev_glm5.md`
+- Final outcome (L2 prefetch rejected, redesign supersedes this
+  thread): `docs/plans/gfx906-mmq-prd.md` §3.3,
+  `docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`
 - Prior dev log (MMQ_X reduction):
   `docs/perf-checkpoints/2026-05-04-gfx906-mmq-spill-reduction.md`

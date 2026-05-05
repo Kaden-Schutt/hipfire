@@ -406,10 +406,10 @@ shape are now exhausted; further gains need architectural work.
 
 ## Cross-reference
 
-- Plan: `plans/gfx906_mmq_l2.md` v4
+- Final outcome (this work was superseded by the redesign):
+  `docs/plans/gfx906-mmq-prd.md`,
+  `docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`
 - Attribution that picked this lever:
   `docs/perf-checkpoints/2026-05-04-gfx906-mmq-attribution.md`
-- Adversarial reviews of the original L2 prefetch v1:
-  `gfx906_l2_rev_claude.md` v2, `plans/gfx906_l2_rev_glm5.md`
 - Prior session (MMQ_X reduction):
   `docs/perf-checkpoints/2026-05-04-gfx906-mmq-spill-reduction.md`
