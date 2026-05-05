@@ -213,11 +213,12 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../k
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
 // at pp≥256.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.hip");
-// gfx906 MMQ redesign (Phase 2, plans/gfx906_mmq_redesign.md)
-// Supersedes the original gfx906 MMQ kernel (block 64×2, mmq_x=8, 8 syncs/group).
+// gfx906 MMQ kernel (see docs/plans/gfx906-mmq-prd.md and
+// docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
 // Topology: nwarps=4, runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64},
-// per-mmq_x X_STRIDE (33 or 40) for ds_read_b128 alignment / bank-conflict tradeoff.
-// Shared body and per-mmq_x variants.
+// per-mmq_x X_STRIDE (33 or 40) for ds_read_b128 alignment vs
+// bank-conflict tradeoff.
+// Shared body + per-mmq_x wrapper files.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x8.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x16.hip");

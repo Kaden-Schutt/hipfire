@@ -118,8 +118,7 @@ fits 2 WGs/CU comfortably).
 
 llama.cpp-gfx906 emits explicit L2 prefetch for the next k-block
 (`AS_S_LOAD_DWORD` 1024 B ahead). v1 plan proposed the same — gated on
-≥10% prefill gain. Two adversarial reviews (Claude, glm-5-turbo)
-flagged the design as premature.
+≥10% prefill gain.
 
 **rocprof attribution (`docs/perf-checkpoints/2026-05-04-gfx906-mmq-attribution.md`)
 killed the lever:**
@@ -279,8 +278,5 @@ follow-ups above.
 - Stock comparison: `docs/perf-checkpoints/2026-05-04-llamacpp-stock-comparison.md`
 - Pre-redesign j0-unroll: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md`
 - Pre-redesign spill reduction: `docs/perf-checkpoints/2026-05-04-gfx906-mmq-spill-reduction.md`
-- Adversarial reviews of original plan: `plans/gfx906_mmq_redesign_pl_rev_glm5.md`,
-  `plans/gfx906_mmq_redesign_pl_rev_gemini.md`
-- L2 prefetch review: `plans/gfx906_l2_rev_glm5.md`
 - skyne98 wiki (gfx906 ISA reference): https://skyne98.github.io/wiki-gfx906/
 - llama.cpp-gfx906 fork: https://github.com/skyne98/llama.cpp-gfx906

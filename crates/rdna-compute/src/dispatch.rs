@@ -122,11 +122,12 @@ fn has_wave64_native(arch: &str) -> bool {
 /// - RDNA3/3.5 (gfx1100..gfx1152): i8 WMMA via `__builtin_amdgcn_wmma_i32_16x16x16_iu8`
 /// - gfx906 (Vega 20, MI50/MI60): dp4a via `__builtin_amdgcn_sdot4`
 ///
-/// The two share the kernel symbol name (`gemm_hfq4g256_residual_mmq`) but
-/// dispatch through different Rust routines because the launch shape and
-/// LDS budget differ — see `gemm_hfq4g256_residual_mmq` (RDNA3, 32×8 block,
-/// 128×128 tile) vs `gemm_hfq4g256_residual_mmq_gfx906` (64×2 block,
-/// 128×64 tile, dp4a-specific +1 padding).
+/// The two dispatch through different Rust routines because the launch
+/// shape and LDS budget differ — see `gemm_hfq4g256_residual_mmq` (RDNA3,
+/// 32×8 block, 128×128 tile, WMMA) vs the gfx906 redesign
+/// (`gemm_hfq4g256_residual_mmq_gfx906_x{N}` for N ∈ {8..64}, 64×4 block,
+/// 128×mmq_x tile, dp4a, per-mmq_x X_STRIDE; see
+/// `kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh`).
 fn has_mmq_dp4a_or_wmma(arch: &str) -> bool {
     matches!(arch,
         "gfx906"
@@ -2858,10 +2859,10 @@ impl Gpu {
                 // the qkv/z branches when those Ms are zero). See
                 // kernels/src/gemm_qkvza_hfq4g256_fp16_wave64.hip:54-61.
                 //
-                // Behind HIPFIRE_MMQ=1 (opt-in during validation). Falls
-                // through to the fused wave64 if any of qkv/z screening
-                // rejects (matches gate_up's behavior in
-                // gemm_gate_up_hfq4g256).
+                // Routes through MMQ at batch_size ≥ 16 (per
+                // should_use_mmq's gfx906 default). Falls through to the
+                // fused wave64 if any of qkv/z screening rejects (matches
+                // gate_up's behavior in gemm_gate_up_hfq4g256).
                 if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
                     let qz_safe = if self.mmq_screen {
                         self.mmq_screen_weight(a_qkv, qkv_m, k)
@@ -3280,9 +3281,9 @@ impl Gpu {
                 // MMQ_Y=128 (Qwen 9B full-attn: q_m=4096, k_m=v_m=1024),
                 // so no tail kernel is needed — straight 3× MMQ-set.
                 //
-                // Behind HIPFIRE_MMQ=1 (opt-in during validation). Falls
-                // through to the fused wave64 if any of q/k/v screening
-                // rejects.
+                // Routes through MMQ at batch_size ≥ 16 (per
+                // should_use_mmq's gfx906 default). Falls through to the
+                // fused wave64 if any of q/k/v screening rejects.
                 if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
                     let qkv_safe = if self.mmq_screen {
                         self.mmq_screen_weight(a_q, q_m, k)
@@ -3658,12 +3659,11 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            // gfx906 dp4a MMQ — opt-in via HIPFIRE_MMQ=1. Path A §A2 of
-            // plans/gfx906_mmq_l2.md. Per the prefill trace, gate_up takes
-            // ~33% of total prefill on Qwen 9B, so a 38% per-call speedup
-            // (matching the residual MMQ vs FP16 wave64 ratio) translates to
-            // ~12% end-to-end. Quantize once, screen both weights, dispatch
-            // MMQ for each in set mode (add=0).
+            // gfx906 dp4a MMQ — default-on at batch_size ≥ 16 (per
+            // should_use_mmq's gfx906 default). Quantize X once, screen
+            // both weights, dispatch MMQ for each in set mode (add=0).
+            // Falls through to fused FP16 wave64 if either screening
+            // rejects. See docs/plans/gfx906-mmq-prd.md for context.
             if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
@@ -5828,10 +5828,10 @@ impl Gpu {
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
-            // gfx906 dp4a MMQ — opt-in via HIPFIRE_MMQ=1 during Phase 1
-            // validation. Once correctness + perf are confirmed, this will
-            // take over from the FP16 wave64 path by default. Falls through
-            // to the wave64 path when MMQ is off or screening rejects.
+            // gfx906 dp4a MMQ residual path — default-on at batch ≥ 16.
+            // Falls through to FP16 wave64 when MMQ is forced off
+            // (HIPFIRE_MMQ=0) or screening rejects the weight.
+            //
             // DEBUG: HIPFIRE_MMQ_DUMP=N dumps the inputs (a_raw, x) and the
             // FP16 wave64 reference output (y_after - y_before) for the
             // 0-indexed Nth residual call to /tmp/mmq_dump_<call_idx>/.
@@ -5950,18 +5950,14 @@ impl Gpu {
                 }
             }
 
-            // gfx906 dp4a MMQ — Phase 1 path, **default OFF**.
-            //
-            // Status (2026-05-03): the kernel is numerically correct in
-            // isolation (see test_gfx906_mmq_correctness — NRMSE <0.5% at
-            // all production shapes), but produces incoherent model output
-            // when wired into the model's full prefill. Diagnostic flags
-            // localized the bug to the dp4a kernel body (HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1
-            // produces coherent output). Suspected: weight-distribution
-            // edge case the standalone test doesn't cover.
-            //
-            // Opt-in via HIPFIRE_MMQ=1. **Output is currently incorrect**
-            // — this gate is here for debug/iteration only.
+            // gfx906 dp4a MMQ residual path — default-on at
+            // batch_size ≥ 16. The redesigned kernel
+            // (gemm_hfq4g256_residual_mmq_gfx906_x{N}, see
+            // body.cuh) supersedes the original Phase 1 design;
+            // see docs/plans/gfx906-mmq-prd.md and
+            // docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md.
+            // Falls through to FP16 wave64 if mmq_screen rejects this
+            // weight (catches degenerate quant groups like row 3994).
             if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)

@@ -21,12 +21,11 @@
 //   3. 4 sub-blocks computed back-to-back (no syncs between)
 //   4. __syncthreads
 //
-// LDS bank-conflict guard + b128 alignment: X_STRIDE=40.
-// 40 × 4 = 160 B → 16-B aligned every row → 100% ds_read_b128
-// (no b32-quad fallback). 40 % 32 = 8 → 4-way bank conflict per
-// warp. Tradeoff vs stride 33 (0-way conflict, 25% b128 align):
-// the 100% b128 alignment win dominates the 4-way conflict cost.
-// PMC validation: see 2026-05-04 docs/perf-checkpoints/.
+// LDS layout: per-mmq_x X_STRIDE (see x_stride_for<>() below).
+// Trade-off between ds_read_b128 alignment and bank-conflict pattern;
+// the optimum stride differs at small vs large mmq_x. PMC validation
+// is in docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md
+// §5.
 
 #define MMQ_Y 128
 #define MMQ_NWARPS 4
@@ -149,13 +148,12 @@ static __device__ __forceinline__ void load_q8_1_tile_coalesced(
 // Compute one 32-K sub-block's contribution into `sum`.
 //
 // Invariants (caller-enforced):
-//   - x_qs: already streamed for the current 32-K window. The X loader
-//     fills slots [0..7] of every row each sub_iter, so this function
-//     reads from offset 0 unconditionally.
-//   - tile_y: holds ONE Q8_1 block (128 K-elements = 4 sub-blocks of 32).
-//     The caller reloads tile_y at sub_iter==0 and sub_iter==4 to switch
-//     between Q8_1 blocks A and B. `sub_block` (0..3) selects which
-//     32-K sub-block within the loaded Q8_1 block to consume.
+//   - x_qs: holds the current 128-K window (4 sub-blocks resident,
+//     8 ints per sub-block per row). Reads stripe at
+//     `kx_start = sub_block * 8` within each row of stride x_stride.
+//   - tile_y: holds ONE Q8_1 block (128 K-elements = 4 sub-blocks).
+//     Loaded by the caller once per window. `sub_block` (0..3) selects
+//     which 32-K sub-block to consume from both x_qs and tile_y.
 //
 // tile_y layout (Y_STRIDE=36 ints/col):
 //   slots 0..3 : 4 half2 ds values (one per 32-K sub-block)

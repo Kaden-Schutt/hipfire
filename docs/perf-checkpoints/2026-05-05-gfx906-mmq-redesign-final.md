@@ -148,7 +148,7 @@ At nwarps=4 (256 threads/WG) targeting 2 WGs/CU:
 These are tight. Stock fits at exactly 128 VGPRs/thread (zero margin)
 and 28.5 KiB/WG LDS (4 KiB headroom).
 
-### 3.2 Non-negotiables (validated by 3 adversarial reviews)
+### 3.2 Non-negotiables
 
 1. **`nwarps = 4`**, threads per WG = 256, block dim (64, 4, 1).
    Confirmed by stock's ELF `max_flat_workgroup_size = 256` and
