@@ -361,6 +361,78 @@ lever stays on the table for any future kernel that runs 1 row
 per WG (e.g., the wide-LM-head GEMV) but is moot for the four
 hot-path decode GEMVs.
 
+## Phase 6: per-kernel PMC pass — what the prefetch win actually was
+
+Three-counter rocprof (MemUnitStalled / VALUBusy / FetchSize) on
+9B AR decode, baseline vs prefetch, aggregated per kernel:
+
+### Baseline vs prefetch
+
+| Kernel | Δ MemUnitStalled | Δ VALUBusy | Δ FetchSize |
+|---|---:|---:|---:|
+| `gemv_residual` | +0.90 pp (1.0 → 1.9) | **+7.7 pp** (25.6 → **33.3**) | ≈0 |
+| `fused_gate_up`  | -0.11 (3.86 → 3.75) | flat | flat |
+| `fused_qkv`      | -0.22 (3.84 → 3.62) | flat | flat |
+| `fused_qkvza`    | -0.13 (4.67 → 4.54) | flat | flat |
+
+(Last three didn't get prefetch in the shipped state — their
+numbers are baseline-vs-baseline, just confirming run-to-run
+stability.)
+
+### The reframe
+
+I expected prefetch to shift weight fetches from HBM to L2-hit
+(reducing FetchSize) — that was the L2CacheHit-driven hypothesis.
+**FetchSize is unchanged.** The kernel does the same amount of
+HBM-side reading.
+
+What actually changed: **VALUBusy on `gemv_residual` jumped from
+25.6 % to 33.3 % — a 30 % relative increase in ALU utilization**.
+That's where the +4.8 % wall-clock came from.
+
+**The bottleneck in `gemv_residual` was instruction-issue
+serialization, not L2 hits.** Both VALU (25.6 %) and MemUnit
+(0.95 %) were under-utilized — the front end was waiting on
+in-flight loads to retire before issuing the next FMA chain. By
+issuing the next-quad's loads *before* the current quad's
+compute, prefetch gave the scheduler more independent work to
+keep both units busier per cycle.
+
+Prefetch is misnamed in our codebase. It's really
+**instruction-level parallelism injection**.
+
+### Why the other three didn't benefit
+
+The three sister kernels sit at 37-41 % VALUBusy and 3.8-4.7 %
+MemUnitStalled — closer to the memory boundary. Issuing loads
+earlier doesn't help when the memory unit is the bound: the
+loads still have to wait their turn. Their bottleneck is the
+load unit's queue depth / HBM round-trip latency, which prefetch
+can't shorten — only L2-hit-rate or fetch-volume reduction can.
+
+### Real lever ranking (post-PMC)
+
+| Lever | Bottleneck it addresses | Estimated lift |
+|---|---|---:|
+| ILP injection (prefetch / sw pipeline) | inst-issue serialization | already shipped on residual |
+| HBM volume reduction (dp4a, weight repacking) | mem-stall | for gate_up/qkv/qkvza only |
+| Larger weight fetch granule (wider load chunks) | mem-issue rate | open |
+| MoE indexed kernels (already wave64) | n/a — different shape | — |
+
+The dp4a port might actually pay off **on the three kernels
+that didn't benefit from prefetch** (where mem-stall is the
+real limiter), but we ruled it out earlier on a generic-cost
+basis. Reconsider: dp4a's HBM-side savings (75 % x-traffic
+reduction even if x is 10 % of fetch volume = ~7-8 % FetchSize
+reduction) lands directly on the bottleneck for those three
+kernels. **Estimated lift specifically on gate_up: ~5-8 % per
+call**; ~+1.5-2 % end-to-end given 25.5 % decode share.
+
+Updated dp4a verdict: **worth doing on the three sister kernels
+even though it's flat for `gemv_residual`.** That changes the
+cost/value balance — the same quantize_q8_1_mmq_ds4 invocation
+serves all three call sites.
+
 ## Reproducing
 
 ```sh
