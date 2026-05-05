@@ -433,6 +433,85 @@ even though it's flat for `gemv_residual`.** That changes the
 cost/value balance — the same quantize_q8_1_mmq_ds4 invocation
 serves all three call sites.
 
+## Phase 7: outcome and follow-ups (2026-05-05 EOD)
+
+### Final scoreboard (Qwen 3.5 9B AR decode, MI50)
+
+| Stage | tok/s | BW GiB/s | Δ vs prior | Δ vs start |
+|---|---:|---:|---:|---:|
+| Pre-investigation | 50.7 | 250.6 | — | — |
+| + ILP-prefetch on `gemv_residual` (3ef127d) | 54.4 | 269.1 | +7.3 % | +7.3 % |
+| + dp4a on `fused_gate_up` (5a45260) | 58.5 | 289.5 | +7.5 % | +15.4 % |
+| + dp4a on `fused_qkv`, `fused_qkvza` (HEAD) | **58.9** | **291.4** | +0.7 % | **+16.2 %** |
+
+Other sizes also got the dp4a lift (table updated in `BENCHMARKS.md`):
+
+| Model | before | after | Δ |
+|---|---:|---:|---:|
+| 0.8B mq4 | 191 | **231** | +21 % |
+| 4B mq4   |  58 |  **61** | +5 %  |
+| 9B mq4   |  51 |  **59** | +16 % |
+| 27B mq4  |  17 |  **21** | +24 % |
+
+(0.8B and 27B see disproportionate lift because their KV/embedding
+layers are smaller relative to the FFN — the dp4a-optimized fused
+GEMVs are a larger share of decode time on those.)
+
+Closed: gap to **stock llama.cpp** narrowed from 1.21× → 1.04× on
+9B (basically parity). Gap to **skyne98 / iacopPBK fork** narrowed
+from 1.25× → 1.08×.
+
+### Follow-up work for the next perf session
+
+1. **Close the remaining 8 % to skyne98/iacopPBK.** Their fork ships
+   the same dp4a + warp-coop topology we now have, so the remaining
+   gap is in things we haven't ported:
+   - **Y-tile prefetch on the prefill MMQ path** — they apply
+     `mmq-prefetch.cuh` (inline-asm `global_load_dword` for next-iter
+     y-tile during compute). We dropped this lever earlier as
+     "decode-bound only" but PMC reframed prefetch as ILP injection,
+     not a memory lever — so it might also help our prefill MMQ path
+     if the kernel sits in an ILP-bound regime. Worth a PMC pass
+     before porting.
+   - **Load-defer in the gfx906 MMQ body** — they have a separate
+     HBM-load → register-cache → LDS-store phase split. We do all
+     three in one pass; load-defer might give us another ILP
+     injection on prefill MMQ. Investigation cost: same as the
+     decode prefetch (~1 work-session).
+
+2. **dp4a port for `gemv_residual` — re-investigate.** PMC said it
+   was ILP-bound, not memory-bound, so we skipped it. But the
+   prefetch lever already pushed `gemv_residual` from 25.6 % → 33 %
+   VALUBusy — *if* a fresh PMC pass on the prefetched kernel shows
+   it's now memory-bound (which is plausible: shifting compute to
+   ILP can also shift the bottleneck), then dp4a's HBM volume
+   reduction would land on top. Cheap probe.
+
+3. **Other wave64-native archs** (gfx908 MI100, gfx940-942 MI300X).
+   The dp4a + prefetch kernels are gated to `arch == "gfx906"`. They
+   are likely correct on gfx908 (same wave64, same dp4a builtin),
+   maybe correct on gfx94x (CDNA3 with different L2/HBM topology
+   that may not benefit from prefetch). Need bench data on those
+   archs before flipping the gate.
+
+4. **Wider `n_tokens` than 1.** The dp4a kernels are batch=1 GEMV.
+   For DFlash decode at batch=12-16, we already use the MMQ GEMM
+   path. The intermediate range (batch 2-15) currently falls back
+   to single-call GEMV for each token, missing the dp4a x-share
+   amortization. A small `mmq_x` GEMV-batched dp4a kernel would
+   close that gap. Estimated decode-share win: small
+   (<2 %) but helps DFlash speedup robustness.
+
+5. **`readfirstlane` on 1-row-per-WG kernels.** P4' was ruled out
+   for the 2-rows-per-WG topology, but stays valid for any kernel
+   that genuinely uses one row per WG (e.g., `gemv_hfq4g256_wide`
+   for the LM-head). Sweep candidate; ~5 % each.
+
+6. **27B / 0.8B PMC pass.** Current PMC data is all from 9B. The
+   per-kernel bottleneck mix differs by model size. Worth a quick
+   pass to see if any kernels regressed to the memory-or-ILP
+   boundary on the larger / smaller models.
+
 ## Reproducing
 
 ```sh
