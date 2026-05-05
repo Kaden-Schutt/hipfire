@@ -461,23 +461,103 @@ Closed: gap to **stock llama.cpp** narrowed from 1.21× → 1.04× on
 9B (basically parity). Gap to **skyne98 / iacopPBK fork** narrowed
 from 1.25× → 1.08×.
 
+### Phase 8 — prefill MMQ levers (both ruled out, 2026-05-05 PM)
+
+After the decode work landed I came back to look at prefill. PMC pass
+(MemUnitStalled / VALUBusy / FetchSize / L2CacheHit) on the dominant
+prefill kernels:
+
+| Kernel | %time | VALU% | MemStall% | L2 hit |
+|---|---:|---:|---:|---:|
+| `gemm_*_mmq_gfx906_full_set_x64` | 45.2 | 48.5 | 0.3 | 69 |
+| `gemm_*_mmq_gfx906_full_add_x64` | 26.8 | 39.6 | 0.1 | 81 |
+| `gemm_*_mmq_gfx906_full_add_x16` | 2.8  | 26.8 | 0.1 | 44 |
+
+Looked like the same ILP-bound regime that paid off on decode. Tried two
+levers:
+
+#### 8a. Y-tile prefetch (iacopPBK pattern)
+
+Inserted a `gfx906_prefetch_next_y_tile<mmq_x>()` helper into
+`mmq_body_templated`'s inner loop using inline `asm volatile
+"global_load_dword"` plus an anti-DCE `v_mov_b32 same-reg` consume,
+mirroring iacopPBK's `mmq-prefetch.cuh`. 16 lanes of warp 0 prefetch
+16 dwords from next iter's Y-tile.
+
+Disassembly: 1 extra `global_load_dword` per kernel function (16 lanes
+predicated → single instruction stream emit). +4 VGPR, 0 spills.
+
+**Result: -0.4 % prefill** (699.5 → 697.0 tok/s, 3-run median). Net flat
+to slight regression.
+
+Why it didn't help: L2 hit on `full_*_x64` is already 69-81 %, so the
+"warm L2 for next iter" lever has no slack to exploit. The Y-tile is
+already L2-resident due to natural reuse across the 16 row-stripes per
+tile. iacopPBK's lever may have applied to an earlier MMQ revision
+that didn't reuse Y as aggressively.
+
+#### 8b. 2-accumulator split in `vec_dot_dp4a_streaming`
+
+The 8 sequential `__builtin_amdgcn_sdot4` calls form a tight RAW
+dependency chain on a single `sumi` accumulator. Split into
+`sumi_a, sumi_b` to give the scheduler two independent dp4a chains
+(merged via integer add at the end — bit-exact). Same change in both
+the b128 and scalar paths.
+
+Correctness PASS (existing MMQ correctness test). Register profile
+unchanged: 94 VGPR, 0 spills.
+
+**Result: -2.1 % prefill** (699.5 → 684.7 tok/s). VALUBusy moved
+*slightly* in the right direction (full_set_x64: 48.5 → 50.1, +1.6 pp)
+but throughput went down.
+
+Why it didn't help: the compiler was already extracting cross-iter ILP
+from the outer (i, j) loops. At mmq_x=64, the inner kernel runs 16
+independent (j_iter × i_iter) dp4a chains. Adding 2 chains per (i,j)
+gives 32 chains, but gfx906's CU has only 1 dp4a issue port per cycle
+per warp — extra independence didn't unlock more issue rate, and the
+final integer-add merge added latency in the float-FMA chain that
+follows.
+
+### Reframe for the prefill ALU bottleneck
+
+Both levers ruled out: the kernel **looks** ILP-bound by VALUBusy
+metric, but the compiler is already extracting all the parallelism
+the hardware can issue. The 48 % VALUBusy ceiling is a **hardware
+issue-rate limit on dp4a**, not a software ILP limit.
+
+Real path forward (if needed): reduce dp4a *count* per output, not
+chain depth. Options:
+- Fold zp + scale into the weight side at quant time (quant-format
+  change, large blast radius).
+- Use `v_dot8_i32_i4` (gfx906 has it!) — packs 8× int4 × int8 in one
+  instruction vs dp4a's 4× int8 × int8. Would halve dp4a count if
+  weights stay int4. **Bigger lever; worth a future probe.**
+- Lower `MMQ_Y` to reduce the i-loop trip count when N is small —
+  only helps small batches. Probably wins on partial-tile workloads.
+
 ### Follow-up work for the next perf session
 
-1. **Close the remaining 8 % to skyne98/iacopPBK.** Their fork ships
-   the same dp4a + warp-coop topology we now have, so the remaining
-   gap is in things we haven't ported:
-   - **Y-tile prefetch on the prefill MMQ path** — they apply
-     `mmq-prefetch.cuh` (inline-asm `global_load_dword` for next-iter
-     y-tile during compute). We dropped this lever earlier as
-     "decode-bound only" but PMC reframed prefetch as ILP injection,
-     not a memory lever — so it might also help our prefill MMQ path
-     if the kernel sits in an ILP-bound regime. Worth a PMC pass
-     before porting.
-   - **Load-defer in the gfx906 MMQ body** — they have a separate
-     HBM-load → register-cache → LDS-store phase split. We do all
-     three in one pass; load-defer might give us another ILP
-     injection on prefill MMQ. Investigation cost: same as the
-     decode prefetch (~1 work-session).
+1. **`v_dot8_i32_i4` instead of `v_dot4_i32_i8`.** gfx906 ships the
+   8-way int4 dot product, which would halve our dp4a *count* per
+   output (we currently unpack int4 → int8, then call `sdot4`). Phase 8
+   showed the dp4a issue rate is the hardware ceiling we're hitting —
+   reducing count is the only path. Caveat: int4-natively dp doesn't
+   match our int8-packed Q8_1 activations on the y side, so the format
+   change matters: weights stay as 4-bit nibbles (already), and y
+   would need to be int4-quantized too for the symmetric dp8. Probably
+   means a Q4_1 (int4 x_int) activation path *or* a mixed int4×int8
+   builtin if available. Worth a deep dive — biggest remaining lever
+   on prefill.
+
+2. **Skyne98/iacopPBK gap analysis revisited.** Phase 8 ruled out
+   Y-tile prefetch and inner-loop accumulator splits on prefill. The
+   remaining 4-8 % gap likely isn't in the kernel inner loop — it's
+   in either the dispatch overhead, the choice of mmq_x per call, or
+   prefill-only kernel-fusion patterns we don't have. A rocprof pass
+   on stock llama.cpp Q4_K_M prefill on the same hardware would tell
+   us where their time goes per-kernel; we have not done that
+   side-by-side comparison.
 
 2. **dp4a port for `gemv_residual` — re-investigate.** PMC said it
    was ILP-bound, not memory-bound, so we skipped it. But the
