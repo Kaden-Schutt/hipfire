@@ -5,6 +5,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                               weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               weight_gemv_residual, weight_gemv_swiglu_residual};
+use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -419,6 +420,81 @@ impl Qwen35Weights {
             pager_cell.into_inner().free_all(gpu);
         }
     }
+
+    /// Multi-GPU companion to `free_gpu`. Each layer freed on its
+    /// band-owning device per `gpus.device_for_layer(i)`; `token_embd`
+    /// freed on dev 0; `output_norm + output` on `gpus.output_device`.
+    /// Mirror of `load_weights_multi` placement. The `pager` field is
+    /// always `None` on the multi path (paged-experts is not wired into
+    /// pp>1 yet); a non-None pager would need its own per-band drain
+    /// strategy and is rejected at load.
+    pub fn free_gpu_multi(self, gpus: &mut Gpus) {
+        debug_assert!(self.pager.is_none(), "free_gpu_multi: pager must be None on pp>1 path");
+        let _ = gpus.devices[0].free_tensor(self.token_embd);
+        let out_dev = gpus.output_device;
+        let _ = gpus.devices[out_dev].free_tensor(self.output_norm);
+        let _ = gpus.devices[out_dev].free_tensor(self.output.buf);
+        for (i, layer) in self.layers.into_iter().enumerate() {
+            let dev_idx = gpus.device_for_layer(i);
+            let gpu = &mut gpus.devices[dev_idx];
+            match layer {
+                LayerWeights::DeltaNet(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wqkv.buf);
+                    let _ = gpu.free_tensor(l.wz.buf);
+                    let _ = gpu.free_tensor(l.w_alpha.buf);
+                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    let _ = gpu.free_tensor(l.w_gate.buf);
+                    let _ = gpu.free_tensor(l.w_up.buf);
+                    let _ = gpu.free_tensor(l.w_down.buf);
+                }
+                LayerWeights::FullAttn(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wq.buf);
+                    let _ = gpu.free_tensor(l.wk.buf);
+                    let _ = gpu.free_tensor(l.wv.buf);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    let _ = gpu.free_tensor(l.w_gate.buf);
+                    let _ = gpu.free_tensor(l.w_up.buf);
+                    let _ = gpu.free_tensor(l.w_down.buf);
+                }
+                LayerWeights::DeltaNetMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wqkv.buf);
+                    let _ = gpu.free_tensor(l.wz.buf);
+                    let _ = gpu.free_tensor(l.w_alpha.buf);
+                    let _ = gpu.free_tensor(l.w_beta.buf);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_moe_ffn(gpu, l.ffn);
+                }
+                LayerWeights::FullAttnMoe(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    let _ = gpu.free_tensor(l.wq.buf);
+                    let _ = gpu.free_tensor(l.wk.buf);
+                    let _ = gpu.free_tensor(l.wv.buf);
+                    let _ = gpu.free_tensor(l.wo.buf);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    free_moe_ffn(gpu, l.ffn);
+                }
+            }
+        }
+    }
 }
 
 fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
@@ -506,6 +582,77 @@ impl DeltaNetState {
         for t in self.s_matrices { let _ = gpu.free_tensor(t); }
         for t in self.s_scales { let _ = gpu.free_tensor(t); }
         for t in self.conv_states { let _ = gpu.free_tensor(t); }
+    }
+
+    /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is
+    /// allocated on the device that owns the layer in the multi-GPU band
+    /// split: `gpus.devices[gpus.device_for_layer(orig_layer_idx)]` for the
+    /// `orig_layer_idx` of the LA-layer. Returns the state alongside the
+    /// `la_to_device` mapping the daemon needs to route reset memsets to
+    /// the correct device.
+    pub fn new_with_quant_multi(
+        gpus: &mut Gpus,
+        config: &Qwen35Config,
+        quant: StateQuant,
+    ) -> HipResult<(Self, Vec<u8>)> {
+        let s_dim = config.linear_key_head_dim;
+        let n_heads = config.linear_num_value_heads;
+        let s_size = n_heads * s_dim * s_dim;
+        let conv_channels = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                          + config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
+
+        let mut s_matrices = Vec::new();
+        let mut s_scales = Vec::new();
+        let mut conv_states = Vec::new();
+        let mut la_to_device: Vec<u8> = Vec::new();
+
+        for (orig_layer_idx, lt) in config.layer_types.iter().enumerate() {
+            if *lt != LayerType::LinearAttention {
+                continue;
+            }
+            let dev_idx = gpus.device_for_layer(orig_layer_idx);
+            la_to_device.push(dev_idx as u8);
+            let g = &mut gpus.devices[dev_idx];
+            // g.hip.malloc/memset bypass the Stage 2 bind_thread audit
+            // (HipRuntime methods don't carry a device id). Bind explicitly
+            // before any raw HIP ops so allocations land on the right device.
+            g.bind_thread()?;
+            match quant {
+                StateQuant::FP32 => {
+                    s_matrices.push(g.zeros(&[s_size], DType::F32)?);
+                    s_scales.push(g.zeros(&[n_heads], DType::F32)?);
+                }
+                StateQuant::Q8 => {
+                    let buf = g.hip.malloc(s_size)?;
+                    g.hip.memset(&buf, 0, s_size)?;
+                    s_matrices.push(GpuTensor { buf, shape: vec![s_size], dtype: DType::F32 });
+                    s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
+                }
+                StateQuant::Q4 => {
+                    let buf = g.hip.malloc(s_size / 2)?;
+                    g.hip.memset(&buf, 0, s_size / 2)?;
+                    s_matrices.push(GpuTensor { buf, shape: vec![s_size / 2], dtype: DType::F32 });
+                    s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
+                }
+            }
+            conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
+        }
+        Ok((Self { s_matrices, s_scales, conv_states, quant }, la_to_device))
+    }
+
+    /// Free per-LA-layer tensors on the devices listed in `la_to_device`
+    /// (the second tuple element returned by `new_with_quant_multi`).
+    pub fn free_gpu_multi(self, gpus: &mut Gpus, la_to_device: &[u8]) {
+        for (i, t) in self.s_matrices.into_iter().enumerate() {
+            let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
+        }
+        for (i, t) in self.s_scales.into_iter().enumerate() {
+            let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
+        }
+        for (i, t) in self.conv_states.into_iter().enumerate() {
+            let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
+        }
     }
 }
 
@@ -1107,6 +1254,227 @@ pub fn load_weights(hfq: &HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipR
         // The non-paged `load_weights` always returns `None` so today's
         // callers see no behavior change.
         pager: None,
+    })
+}
+
+/// Multi-GPU weight loader. Variant 2 placement: `token_embd` on `gpus.devices[0]`,
+/// `output_norm + output` on `gpus.devices[gpus.output_device]`, each layer on
+/// `gpus.devices[gpus.device_for_layer(i)]`. The single-GPU `load_weights` path is
+/// not consumed by this — keeping it byte-exact for the pp=1 daemon.
+///
+/// `pager` is always `None` on this path: paged-experts (MAD-93) is not wired
+/// for pp>1 yet — would need per-band drain semantics in `WeightPager::free_all`.
+pub fn load_weights_multi(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    gpus: &mut Gpus,
+) -> HipResult<Qwen35Weights> {
+    let (token_embd, embd_fmt) = load_token_embd_into(hfq, config, &mut gpus.devices[0])?;
+    let out_dev = gpus.output_device;
+    let (output_norm, output) =
+        load_output_into(hfq, config, &mut gpus.devices[out_dev])?;
+    let is_moe = config.num_experts > 0;
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for i in 0..config.n_layers {
+        let dev_idx = gpus.device_for_layer(i);
+        eprintln!(
+            "  loading layer {i}/{} on dev {dev_idx} ({:?}{})...",
+            config.n_layers,
+            config.layer_types[i],
+            if is_moe { " + MoE" } else { "" },
+        );
+        let p = format!("layers.{i}");
+        let layer_page_start = hfq.layer_data_range(&p);
+        layers.push(load_layer_into(hfq, config, i, &p, &mut gpus.devices[dev_idx])?);
+        if let Some((start, end)) = layer_page_start {
+            hfq.drop_pages_range(start, end - start);
+        }
+    }
+    Ok(Qwen35Weights {
+        token_embd, embd_format: embd_fmt, output_norm, output, layers,
+        pager: None,
+    })
+}
+
+fn load_token_embd_into(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+    eprintln!("  loading token_embd...");
+    let embd_info = hfq
+        .tensor_data("model.language_model.embed_tokens.weight")
+        .expect("embed_tokens not found");
+    Ok(if embd_info.0.quant_type == 6 {
+        eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
+    } else if embd_info.0.quant_type == 7 {
+        eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
+    } else if embd_info.0.quant_type == 3 {
+        eprintln!("    (Q8_0 raw, {} MB)", embd_info.1.len() / 1_000_000);
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
+    } else {
+        let f32_data: Vec<f32> = embd_info
+            .1
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        (
+            gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?,
+            EmbeddingFormat::F32,
+        )
+    })
+}
+
+fn load_output_into(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+) -> HipResult<(GpuTensor, WeightTensor)> {
+    eprintln!("  loading output_norm...");
+    let output_norm = if config.num_experts > 0 {
+        load_norm_weight_raw(hfq, gpu, "norm.weight", &[config.dim])?
+    } else {
+        load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
+    };
+
+    let lm_head_info = hfq
+        .tensor_data("lm_head.weight")
+        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
+    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+        eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
+        load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
+    } else {
+        let embd_info = hfq
+            .tensor_data("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens not found");
+        eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
+        let embd_data = embd_info.1;
+        if embd_info.0.quant_type == 6 || embd_info.0.quant_type == 7 || embd_info.0.quant_type == 8 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            let dtype = match embd_info.0.quant_type {
+                6 => DType::HFQ4G256,
+                7 => DType::HFQ4G128,
+                8 => DType::HFQ6G256,
+                _ => unreachable!(),
+            };
+            WeightTensor { buf, gpu_dtype: dtype, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 13 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::MQ4G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 14 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::MQ8G256, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else if embd_info.0.quant_type == 3 {
+            let buf = gpu.upload_raw(embd_data, &[embd_data.len()])?;
+            WeightTensor { buf, gpu_dtype: DType::Q8_0, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        } else {
+            let f32_data: Vec<f32> = embd_data
+                .chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+            };
+            let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+            WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        }
+    };
+    Ok((output_norm, output))
+}
+
+/// Build one layer's `LayerWeights` on `gpu`. Extracted for `load_weights_multi`
+/// so the multi-GPU loader can route each layer to its band-owning device
+/// without duplicating the tensor-name table. Master's `load_weights` keeps
+/// its inline body — does not consume this helper.
+fn load_layer_into(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    p: &str,
+    gpu: &mut Gpu,
+) -> HipResult<LayerWeights> {
+    let is_moe = config.num_experts > 0;
+    Ok(match (config.layer_types[layer_idx], is_moe) {
+        (LayerType::LinearAttention, false) => {
+            let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                        + config.linear_num_value_heads * config.linear_value_head_dim;
+            let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+            LayerWeights::DeltaNet(DeltaNetLayerWeights {
+                attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                    config.linear_num_value_heads, config.dim)?,
+                w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                    config.linear_num_value_heads, config.dim)?,
+                a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
+                dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
+                conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
+                    qkv_dim * config.conv_kernel_dim)?,
+                norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
+                wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+            })
+        }
+        (LayerType::FullAttention, false) => {
+            let q_out_dim = config.n_heads * config.head_dim * 2;
+            let kv_dim = config.n_kv_heads * config.head_dim;
+            LayerWeights::FullAttn(FullAttnLayerWeights {
+                attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+            })
+        }
+        (LayerType::LinearAttention, true) => {
+            let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                        + config.linear_num_value_heads * config.linear_value_head_dim;
+            let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+            LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
+                attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                    config.linear_num_value_heads, config.dim)?,
+                w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                    config.linear_num_value_heads, config.dim)?,
+                a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
+                dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
+                conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
+                    qkv_dim * config.conv_kernel_dim)?,
+                norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
+                wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+            })
+        }
+        (LayerType::FullAttention, true) => {
+            let q_out_dim = config.n_heads * config.head_dim * 2;
+            let kv_dim = config.n_kv_heads * config.head_dim;
+            LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
+                attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+            })
+        }
     })
 }
 
@@ -2338,6 +2706,11 @@ impl Qwen35Scratch {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.x);
         let _ = gpu.free_tensor(self.tmp);
+        // pos_buf is held as a raw DeviceBuffer and dropped via gpu.hip.free
+        // directly (free_tensor would have bound the thread internally).
+        // Bind explicitly so HIP affinity doesn't depend on the order of
+        // preceding free_tensor calls.
+        let _ = gpu.bind_thread();
         let _ = gpu.hip.free(self.pos_buf);
         for t in [self.dn_qkv, self.dn_z, self.dn_alpha, self.dn_beta, self.dn_conv_out,
                    self.dn_q, self.dn_k, self.dn_v, self.dn_q_raw, self.dn_k_raw,
@@ -2358,6 +2731,38 @@ impl Qwen35Scratch {
         }
         if let Some(pbs) = self.prefill_batch {
             pbs.free_gpu(gpu);
+        }
+    }
+}
+
+/// Per-device scratch bundle for the multi-GPU forward path. Each device gets
+/// its own `Qwen35Scratch` because the residual stream `s.x` (and `s.logits`)
+/// must live on the device executing the current band's layers — cross-band
+/// boundaries copy `s.x` between devices via `Gpus::boundary_copy`. `s.logits`
+/// is also allocated per-device for simplicity (~600 KB each at vocab=152K)
+/// even though only the output device's `s.logits` is consumed post-loop.
+pub struct Qwen35ScratchSet {
+    pub per_device: Vec<Qwen35Scratch>,
+}
+
+impl Qwen35ScratchSet {
+    pub fn new_with_kv_max_multi(
+        gpus: &mut Gpus,
+        config: &Qwen35Config,
+        repeat_window: usize,
+        kv_max_seq: usize,
+    ) -> HipResult<Self> {
+        let mut per_device = Vec::with_capacity(gpus.devices.len());
+        for dev_idx in 0..gpus.devices.len() {
+            let g = &mut gpus.devices[dev_idx];
+            per_device.push(Qwen35Scratch::new_with_kv_max(g, config, repeat_window, kv_max_seq)?);
+        }
+        Ok(Self { per_device })
+    }
+
+    pub fn free_gpu_multi(self, gpus: &mut Gpus) {
+        for (dev_idx, scratch) in self.per_device.into_iter().enumerate() {
+            scratch.free_gpu(&mut gpus.devices[dev_idx]);
         }
     }
 }
