@@ -621,6 +621,37 @@ chain depth. Options:
    1.74× speedup column would shrink to ~1.40× — same DFlash
    throughput, smaller numerator gap.
 
+8. **Port the prefetch + dp4a levers to HFQ3 / HFQ6 / MQ3 / MQ6.**
+   Today's wins are HFQ4-G256 (MQ4) only. mq3 weights route through
+   `gemv_hfq3g256_residual` and the HFQ3 fused-kernel family;
+   mq6 routes through `gemv_hfq6g256_residual` / the HFQ6 family;
+   none of these got prefetch or dp4a today. The kernel structures
+   are similar (per-group scale + zp + packed nibbles, just 3-bit
+   or 6-bit instead of 4-bit), so the same two levers should apply
+   with minor changes:
+
+   - **HFQ3 (104 B/group, 3-bit nibbles, 256 K/group):** 8 K-elements
+     per lane = 3 bytes packed across 24 bits. The prefetch lever
+     is mechanical (same software-pipeline shape). The dp4a port
+     needs an HFQ3-aware nibble decoder; gfx906 doesn't have a
+     native int3 dot product, so we'd unpack to int8 then dp4a as
+     today. Same cost-of-quantize-x amortizes the same way.
+   - **HFQ6 (200 B/group, 6-bit values):** 6-bit values pack 16/3
+     per int — awkward. Could decode to int8 and dp4a; could also
+     stay FP and just apply the prefetch lever. Probe before
+     committing to a port.
+
+   Estimated win per port: similar to MQ4 (+5-15% per kernel
+   depending on kernel's bottleneck profile — needs PMC to size).
+   Decode share for non-MQ4 quants is workload-dependent
+   (mq3 typically used at 27B/35B-A3B, mq6 for higher-quality
+   smaller models).
+
+   Conditions to revisit: (a) workload measurably uses mq3 or mq6
+   in production paths, AND (b) PMC shows the same ILP-bound or
+   memory-bound regime that gave us the wins on MQ4. If both,
+   port the lever; if neither, leave alone.
+
 ## Reproducing
 
 ```sh
