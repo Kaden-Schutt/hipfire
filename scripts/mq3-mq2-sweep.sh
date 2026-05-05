@@ -34,7 +34,7 @@ PROMPTS_DIR="${HIPFIRE_SWEEP_PROMPTS_DIR:-./benchmarks/prompts/sweep}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 if [ ! -x "$EXE" ]; then
-    echo "$EXE missing — run: cargo build --release --features deltanet --example daemon -p engine" >&2
+    echo "$EXE missing — run: cargo build --release --features deltanet --example daemon -p hipfire-runtime" >&2
     exit 2
 fi
 

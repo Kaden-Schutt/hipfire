@@ -82,7 +82,7 @@ if [ -z "$MODEL" ] || [ ! -f "$MODEL" ]; then
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing — build with:" >&2
-    echo "  cargo build --release --features deltanet -p engine --example bench_qwen35_mq4" >&2
+    echo "  cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4" >&2
     exit 2
 fi
 

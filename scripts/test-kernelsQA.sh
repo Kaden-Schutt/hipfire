@@ -35,7 +35,7 @@ if [[ -n "$ARCH_EXPECTED" ]]; then
 fi
 
 set +e
-timeout "$BUILD_TIMEOUT" cargo build --release --features "$FEATURES" --example "$EXAMPLE" -p engine
+timeout "$BUILD_TIMEOUT" cargo build --release --features "$FEATURES" --example "$EXAMPLE" -p hipfire-runtime
 BUILD_RC=$?
 set -e
 if [[ $BUILD_RC -ne 0 ]]; then

@@ -360,7 +360,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
     Write-Host "  cargo build --release (this may take several minutes)..."
     Push-Location $RepoDir
     try {
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
     } finally {
         Pop-Location
     }
@@ -375,7 +375,7 @@ if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
         Write-Host ""
         Write-Host "  After fixing, re-run this installer or build manually:"
         Write-Host "    cd $RepoDir"
-        Write-Host "    cargo build --release --features deltanet --example daemon -p engine"
+        Write-Host "    cargo build --release --features deltanet --example daemon -p hipfire-runtime"
         exit 1
     }
     Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force

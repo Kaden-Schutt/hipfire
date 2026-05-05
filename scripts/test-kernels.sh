@@ -16,7 +16,7 @@ echo "=== hipfire kernel test harness (${ARCH}) ==="
 
 # Build the test binary
 BUILD_LOG=$(mktemp)
-if cargo build --release --features deltanet --example test_kernels -p engine >"$BUILD_LOG" 2>&1; then
+if cargo build --release --features deltanet --example test_kernels -p hipfire-runtime >"$BUILD_LOG" 2>&1; then
     tail -2 "$BUILD_LOG"
 else
     tail -40 "$BUILD_LOG"

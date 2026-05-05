@@ -122,7 +122,7 @@ fi
 ensure_build() {
     if [ ! -x "$EXE" ]; then
         echo "Building bench_qwen35_mq4 (release)..."
-        cargo build --release -p engine --example bench_qwen35_mq4 --features deltanet 2>&1 \
+        cargo build --release -p hipfire-runtime --example bench_qwen35_mq4 --features deltanet 2>&1 \
             | grep -E '^(error|   Compiling)' | tail -5
         if [ ! -x "$EXE" ]; then
             color red "BUILD FAILED"; echo

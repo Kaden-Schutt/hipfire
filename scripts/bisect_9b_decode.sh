@@ -19,7 +19,7 @@ echo "=== bisect at $commit ==="
 # Incremental build. Also remove the old binary so a silent build-skip
 # can't hand us a stale target/release/examples/bench_qwen35_mq4.
 rm -f target/release/examples/bench_qwen35_mq4
-build_log=$(cargo build --release --features deltanet -p engine --example bench_qwen35_mq4 2>&1)
+build_log=$(cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4 2>&1)
 build_rc=$?
 echo "$build_log" | tail -3
 if [ $build_rc -ne 0 ] || [ ! -x target/release/examples/bench_qwen35_mq4 ]; then

@@ -70,9 +70,9 @@ rebuild=0
 if [ ! -x "$EXE" ]; then
     rebuild=1
 else
-    for src in crates/engine/src/qwen35.rs crates/engine/src/llama.rs \
-               crates/engine/src/dflash.rs crates/engine/src/speculative.rs \
-               crates/engine/src/ddtree.rs crates/engine/examples/dflash_spec_demo.rs \
+    for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
+               crates/hipfire-runtime/src/dflash.rs crates/hipfire-arch-qwen35/src/speculative.rs \
+               crates/hipfire-runtime/src/ddtree.rs crates/hipfire-runtime/examples/dflash_spec_demo.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1

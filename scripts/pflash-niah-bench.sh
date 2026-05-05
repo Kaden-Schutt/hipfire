@@ -83,7 +83,7 @@ if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing -- build with:" >&2
-    echo "  cargo build --release --features deltanet -p engine --example pflash_niah_bench" >&2
+    echo "  cargo build --release --features deltanet -p hipfire-runtime --example pflash_niah_bench" >&2
     exit 2
 fi
 

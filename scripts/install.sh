@@ -370,7 +370,7 @@ else
     fi
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p engine 2>&1 | tail -5)
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime 2>&1 | tail -5)
     if [ ! -f "$REPO_DIR/target/release/examples/daemon" ]; then
         echo ""
         echo "  BUILD FAILED."
@@ -379,7 +379,7 @@ else
         echo "    - Missing system libs (check error above)"
         echo ""
         echo "  After fixing, re-run this installer or build manually:"
-        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon -p engine"
+        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon -p hipfire-runtime"
         exit 1
     fi
     echo "  Build complete ✓"

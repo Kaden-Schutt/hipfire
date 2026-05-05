@@ -21,7 +21,7 @@ for h in "${COMMITS[@]}"; do
         continue
     fi
     rm -f target/release/examples/bench_qwen35_mq4
-    if ! cargo build --release --features deltanet -p engine --example bench_qwen35_mq4 >/tmp/probe_build.log 2>&1; then
+    if ! cargo build --release --features deltanet -p hipfire-runtime --example bench_qwen35_mq4 >/tmp/probe_build.log 2>&1; then
         echo "BUILD_FAIL  $msg"
         continue
     fi
