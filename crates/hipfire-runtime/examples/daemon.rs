@@ -295,6 +295,14 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    /// Upstream HF Jinja chat_template (from .hfq metadata's
+    /// `tokenizer_config.chat_template`). When `Some(_)` and
+    /// `HIPFIRE_JINJA_CHAT=1`, the daemon renders this template via
+    /// `prompt_frame::JinjaChatFrame` instead of the hand-rolled
+    /// ChatML scaffolding — so prompt framing matches the model's
+    /// training-time expectation (default system prompt, `<think>\n`
+    /// opener, etc.). Falls back to `Plain` framing on render failure.
+    chat_template: Option<String>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -303,6 +311,84 @@ struct LoadedModel {
 /// The most common cause on Windows (#112) is HIP SDK present but no
 /// AMD GPU driver visible to the runtime; on Linux it is usually missing
 /// `libamdhip64.so` or kernel-side amdgpu / kfd not loaded.
+/// Pick the prompt-token sequence for a single-turn request. When the
+/// model carries a chat_template AND `HIPFIRE_JINJA_CHAT=1`, render
+/// the upstream Jinja template; otherwise fall back to the hand-rolled
+/// `prompt_frame::ChatFrame` Plain scaffolding. Render failures (parse
+/// error, missing context var, `raise_exception`) also fall back.
+///
+/// Used by single-turn paths that have the user content as a string
+/// (DFlash). The AR path inlines its own gating because PFlash may
+/// have compressed `q_tokens` upstream, in which case Jinja-from-string
+/// would skip the compression — that path checks `pflash_summary` to
+/// decide. The VL path is text+image-pad interleaved at the token level
+/// and stays on the hand-rolled scaffolding for now.
+fn jinja_or_plain(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    chat_template: Option<&str>,
+    system: Option<&str>,
+    user: &str,
+    enable_thinking: bool,
+) -> Vec<u32> {
+    let opted_in = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    if opted_in {
+        if let Some(template) = chat_template {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system,
+                user,
+                enable_thinking,
+            };
+            match frame.render_and_encode() {
+                Ok(t) => return t,
+                Err(e) => {
+                    eprintln!(
+                        "hipfire: jinja chat_template render failed ({}); falling back to Plain framing",
+                        e.replace('\n', " "),
+                    );
+                }
+            }
+        }
+    }
+    hipfire_runtime::prompt_frame::ChatFrame {
+        tokenizer,
+        system,
+        user,
+        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+        raw: false,
+    }
+    .build()
+}
+
+/// Returns `true` iff `prompt_tokens` ends with the Qwen3-family
+/// "open-think" tail `<think>\n` — i.e. the upstream Jinja template
+/// rendered with `enable_thinking=true`. The daemon's `max_think_tokens`
+/// detector in the AR / DFlash decode loops keys off `<think>` in the
+/// OUTPUT text; under Plain framing the model emits `<think>` itself
+/// as the first generated token so the detector observes the opener.
+/// Under Jinja with `enable_thinking=true` the opener is in the prompt
+/// instead, so the detector starts blind. Use this flag to prime
+/// `prev_in_think=true` and to short-circuit the `(None, None)` arm of
+/// the `(open_idx, close_idx)` match — otherwise `max_think_tokens`
+/// silently no-ops on the Jinja path.
+fn prompt_ends_with_open_think(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    prompt_tokens: &[u32],
+) -> bool {
+    let nl = tokenizer.encode("\n");
+    let nl_id = match nl.first().copied() {
+        Some(id) if nl.len() == 1 => id,
+        _ => return false,
+    };
+    let think_id = match tokenizer.special_token_id("<think>") {
+        Some(id) => id,
+        None => return false,
+    };
+    let n = prompt_tokens.len();
+    n >= 2 && prompt_tokens[n - 2] == think_id && prompt_tokens[n - 1] == nl_id
+}
+
 fn report_gpu_init_failure(err: &hip_bridge::HipError) {
     eprintln!();
     eprintln!("hipfire: failed to initialize GPU runtime.");
@@ -689,6 +775,17 @@ fn main() {
                 let min_p = msg.get("min_p").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                // OpenAI-style additive presence penalty: subtract this
+                // from the logit of any token already seen in the
+                // recent window. Distinct from `repeat_penalty` (which
+                // divides). 0.0 = disabled. Qwen3.5/3.6 thinking-mode
+                // generation_config recommends 1.5 for general tasks;
+                // 0.0 for precise coding (WebDev). Implemented as a
+                // host-side download → mutate-uniques → upload pre-
+                // pass; see `hipfire_runtime::sampler::sample` for
+                // the cost note.
+                let presence_penalty = msg.get("presence_penalty")
+                    .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
                 // cache so the model "sees" them as part of its own trajectory,
@@ -728,8 +825,38 @@ fn main() {
                 let max_think_tokens = msg.get("max_think_tokens")
                     .and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
+                // Whether the model's prompt frame should open with
+                // `<think>\n` (Qwen3 family chat_template default).
+                // Matters only on the Jinja path — the hand-rolled
+                // `prompt_frame::ChatFrame` always emits `Plain` and
+                // lets the model decide whether to open `<think>`
+                // itself. Default `true` to match the upstream Qwen3
+                // generation_config default.
+                //
+                // Lookup precedence:
+                //   1. `thinking` (CLI run path + OpenAI translator)
+                //   2. `chat_template_kwargs.enable_thinking` (OpenAI
+                //      compat path direct from clients)
+                //   3. `max_think_tokens == 1` sentinel — the CLI's
+                //      `thinking=off` / `enable_thinking=false` /
+                //      `reasoning.effort=none` translations all
+                //      collapse to a 1-token cap. Without this
+                //      inference, the Jinja path would still render
+                //      `<think>\n` and the cap-1 force-close hack
+                //      would emit a stub thought. Treating cap=1 as
+                //      no-think makes the Jinja template emit the
+                //      empty-think pattern directly, which is the
+                //      cleaner shape the model was trained on.
+                let enable_thinking = msg.get("thinking")
+                    .and_then(|v| v.as_bool())
+                    .or_else(|| msg.get("chat_template_kwargs")
+                        .and_then(|v| v.get("enable_thinking"))
+                        .and_then(|v| v.as_bool()))
+                    .or_else(|| if max_think_tokens == 1 { Some(false) } else { None })
+                    .unwrap_or(true);
+
                 if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window, enable_thinking);
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
                     // and apply any per-request overrides from `params`.
@@ -790,7 +917,9 @@ fn main() {
                     generate(
                         m, &mut gpu, &mut stdout, id, prompt, system,
                         temp, top_p, top_k, min_p, max_tokens, repeat_penalty, repeat_window,
+                        presence_penalty,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                        enable_thinking,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
                     );
@@ -1018,6 +1147,12 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
+    // Pull the upstream HF chat_template (Jinja string) out of the .hfq
+    // metadata once at load time. The runtime renders this when
+    // `HIPFIRE_JINJA_CHAT=1` so prompt framing matches the model's
+    // training-time expectation; absent or failing renders fall back
+    // to the hand-rolled `prompt_frame::ChatFrame` Plain scaffolding.
+    let chat_template = hfq.chat_template();
 
     // DFlash speculative-decode requires the target's lm_head to have a
     // batched-GEMM kernel (used for verify and DDTree top-K). Only
@@ -1321,6 +1456,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            chat_template,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1347,6 +1483,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            chat_template,
         })
     }
 }
@@ -1656,6 +1793,7 @@ fn generate_dflash(
     system_prompt: Option<&str>,
     max_tokens: usize,
     max_think_tokens: usize,
+    enable_thinking: bool,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
 ) {
@@ -1666,15 +1804,21 @@ fn generate_dflash(
 
     // Tokenize with ChatML wrapping (identical to the AR path). System prompt
     // is always prepended because this fast path is single-turn.
+    //
+    // When `HIPFIRE_JINJA_CHAT=1` and the model carries an upstream
+    // chat_template, render the template via `JinjaChatFrame` so prompt
+    // framing matches the model's training-time expectation (default
+    // system prompt, `<think>\n` opener for thinking-mode models, etc.).
+    // On any render failure, fall back to the hand-rolled `Plain`
+    // scaffolding rather than failing the request.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
+    let prompt_tokens = jinja_or_plain(
         tokenizer,
-        system: system_prompt,
-        user: prompt,
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build();
+        m.chat_template.as_deref(),
+        system_prompt,
+        prompt,
+        enable_thinking,
+    );
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -1826,9 +1970,15 @@ fn generate_dflash(
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut stats = SpecStats::new(df.block_size);
-    // max_think_tokens enforcement state (mirrors the AR path).
+    // max_think_tokens enforcement state (mirrors the AR path). Under
+    // Plain framing the model emits its own `<think>` opener as the
+    // first generated token, so the OUTPUT-stream detector below sees
+    // it. Under Jinja with `enable_thinking=true` the opener is in
+    // the prompt instead — prime `prev_in_think=true` so the cap is
+    // armed from the first generated token.
+    let prompt_opens_think = prompt_ends_with_open_think(tokenizer, &prompt_tokens);
     let mut think_count: usize = 0;
-    let mut prev_in_think = false;
+    let mut prev_in_think = prompt_opens_think;
     let mut generated = 0usize;
 
     // Post-prefill compaction (FlashCASK pattern from dflash_spec_demo).
@@ -1986,6 +2136,12 @@ fn generate_dflash(
 
             // max_think_tokens enforcement (mirrors the AR path). Track
             // <think>/<⁄think> in decoded text and count tokens inside.
+            // The `(None, None)` arm honors `prompt_opens_think`: under
+            // Plain framing it's false (no opener in prompt, so no
+            // opener seen yet → not in think), but under Jinja with
+            // `enable_thinking=true` the prompt ends with `<think>\n`
+            // so we ARE in think from token 1 even though no `<think>`
+            // appears in the OUTPUT stream.
             if max_think_tokens > 0 {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
@@ -1994,7 +2150,8 @@ fn generate_dflash(
                 let in_think = match (open_idx, close_idx) {
                     (Some(o), Some(c)) => o > c,
                     (Some(_), None) => true,
-                    _ => false,
+                    (None, Some(_)) => false,
+                    (None, None) => prompt_opens_think,
                 };
                 if in_think && !prev_in_think { think_count = 0; }
                 if in_think { think_count += 1; }
@@ -2072,7 +2229,7 @@ fn generate_dflash(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: i32, min_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, top_k: i32, min_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, presence_penalty: f32, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, enable_thinking: bool, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
     // DFlash fast path -- only when a draft model is loaded AND temperature is
     // effectively 0 (DFlash is greedy-only in this integration). Skip the
     // normal AR sampling setup entirely.
@@ -2101,7 +2258,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, dflash_bypass_reason, dflash_alpha);
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, enable_thinking, dflash_bypass_reason, dflash_alpha);
         // Silence unused-variable warnings for the params we didn't need.
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
@@ -2282,14 +2439,58 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // — subsequent turns continue the conversation in-place. The user
     // body comes in pre-tokenized as `q_tokens` because PFlash may
     // have compressed it upstream.
-    let new_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
-        user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build_with_user_tokens(&q_tokens);
+    //
+    // Jinja path (when `HIPFIRE_JINJA_CHAT=1`) is only safe when:
+    //   - first turn (seq_pos == 0): multi-turn history isn't yet
+    //     plumbed into the JinjaChatFrame messages list.
+    //   - PFlash didn't compress (`pflash_summary.is_none()`):
+    //     compressed q_tokens are a transformed subset of the original
+    //     prompt, so feeding the original `prompt` string to Jinja
+    //     would skip compression.
+    //   - chat_template is present in metadata.
+    // Any miss falls through to the hand-rolled token-level path.
+    let jinja_eligible = m.seq_pos == 0
+        && pflash_summary.is_none()
+        && m.chat_template.is_some()
+        && std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let new_tokens = if jinja_eligible {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template: m.chat_template.as_deref().unwrap(),
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+        };
+        match frame.render_and_encode() {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"jinja_fallback","id":"{}","reason":"{}"}}"#,
+                    id,
+                    e.replace('"', "'").replace('\n', " "),
+                );
+                let _ = stdout.flush();
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: if m.seq_pos == 0 { system_prompt } else { None },
+                    user: "",
+                    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    raw: false,
+                }
+                .build_with_user_tokens(&q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "", // unused: we pass tokens directly via build_with_user_tokens
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build_with_user_tokens(&q_tokens)
+    };
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -2456,6 +2657,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             // sampler::sample do the same `min(window, buf_cap)`
             // internally.
             repeat_window: repeat_buf_cap,
+            presence_penalty,
             blocked_tokens: blocked0,
         };
         let tok0 = sampler::sample(
@@ -2492,8 +2694,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // and commits to an answer with the remaining max_tokens budget.
         // Re-armable: if the model later opens another <think> in the same
         // turn (rare) the counter resets and the cap re-fires.
+        //
+        // Initial state: under Plain framing the prompt ends with
+        // `assistant\n` so the model emits its own `<think>` opener in
+        // OUTPUT — the detector below sees it. Under Jinja with
+        // `enable_thinking=true` the prompt ends with `<think>\n` so
+        // we are inside a think block from token 1 even though no
+        // `<think>` text will appear in the OUTPUT — prime
+        // `prev_in_think=true` and honor the same flag in the
+        // `(None, None)` arm of the in_think match below.
+        let prompt_opens_think = prompt_ends_with_open_think(tokenizer, &new_tokens);
         let mut think_count: usize = 0;
-        let mut prev_in_think: bool = false;
+        let mut prev_in_think: bool = prompt_opens_think;
 
         // N-gram loop detector: track 4-gram token sequences. When any
         // 4-gram repeats more than `ngram_loop_threshold` times in the
@@ -2561,7 +2773,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 let in_think = match (open_idx, close_idx) {
                     (Some(o), Some(c)) => o > c,
                     (Some(_), None) => true,
-                    _ => false,
+                    (None, Some(_)) => false,
+                    (None, None) => prompt_opens_think,
                 };
                 if in_think {
                     if !prev_in_think { think_count = 1; } else { think_count += 1; }
@@ -2669,6 +2882,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         top_p,
                         repeat_penalty,
                         repeat_window: repeat_buf_cap,
+                        presence_penalty,
                         blocked_tokens: blocked,
                     };
                     next_token = sampler::sample(
@@ -2751,6 +2965,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 top_p,
                 repeat_penalty,
                 repeat_window: repeat_buf_cap,
+                presence_penalty,
                 blocked_tokens: blocked,
             };
             // GPU sample: reads scratch.logits (already on GPU), writes
@@ -2903,7 +3118,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, _enable_thinking: bool) {
     // Capacity guard — VL prompts include vision tokens + text + ChatML framing
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
@@ -3047,6 +3262,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         top_p,
         repeat_penalty: 1.0,
         repeat_window: 0,
+        presence_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
     let vl_cfg = SamplerConfig {
@@ -3056,6 +3272,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         top_p,
         repeat_penalty,
         repeat_window,
+        presence_penalty: 0.0,
         blocked_tokens: Vec::new(),
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);

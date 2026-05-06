@@ -1230,14 +1230,19 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  // thinking=off: hard-suppress by capping thinking to 1 token (model still
-  // emits <think> but is immediately force-closed). This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path.
-  // Previous attempts to inject prose directives with <think>/<no_think>
-  // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
-  // reliably because it operates at the daemon level, not in the prompt.
+  // thinking=off: hard-suppress by capping thinking to 1 token AND
+  // signaling enable_thinking=false to the daemon. The cap-1 force-
+  // closes the AR/DFlash path under Plain framing (model emits
+  // <think>, daemon force-emits </think>); the explicit `thinking:
+  // false` flag tells the Jinja path to render the empty-think
+  // pattern directly so the model doesn't waste a token starting
+  // a stub thought. Previous attempts to inject prose directives
+  // with <think>/<no_think> caused Qwen3.5 to halt at 3-4 tokens —
+  // the token-cap approach works reliably because it operates at
+  // the daemon level, not in the prompt.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
+    genMsg.thinking = false;
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
@@ -1634,21 +1639,48 @@ async function serve(port: number) {
         // enable_thinking=false. Overrides any per-model max_think_tokens.
         if (effective.thinking === "off") {
           genParams.max_think_tokens = 1;
+          genParams.thinking = false;
         } else if (effective.max_think_tokens > 0) {
           genParams.max_think_tokens = effective.max_think_tokens;
         }
         // chat_template_kwargs.enable_thinking=false hard-caps thinking to 1
-        // token (model emits <think> then is forced to close). Overrides
-        // per-model max_think_tokens because the request semantics are more
-        // specific than the static config.
-        if (enableThinking === false) genParams.max_think_tokens = 1;
+        // token (model emits <think> then is forced to close) AND signals
+        // the Jinja path to render the empty-think pattern directly.
+        // Overrides per-model max_think_tokens because the request
+        // semantics are more specific than the static config.
+        if (enableThinking === false) {
+          genParams.max_think_tokens = 1;
+          genParams.thinking = false;
+        }
         // reasoning.effort wins over both per-model and enable_thinking
         // when present (it's the most explicit per-request signal). xhigh
         // (0 = uncapped) only applies when set; we don't unconditionally
-        // clobber a per-model max_think_tokens with 0.
+        // clobber a per-model max_think_tokens with 0. `none` collapses
+        // to enable_thinking=false semantics (1-token cap + Jinja
+        // empty-think render).
+        //
+        // Each branch fully owns `genParams.thinking` to prevent
+        // earlier thinking=off / enable_thinking=false passes from
+        // masking a higher reasoning.effort: e.g. without this, a
+        // request with `enable_thinking=false` AND `reasoning.effort=
+        // high` would set max_think_tokens=4096 but leave thinking
+        // false from the earlier pass, so the daemon would render
+        // the empty-think Jinja template and the 4096-token budget
+        // would never be used. Branches that enable thinking
+        // explicitly set thinking=true; the cap-1 branch sets
+        // thinking=false; xhigh deletes both fields so the daemon's
+        // defaults apply (no cap, thinking=true).
         if (reasoningEffort !== null) {
-          if (reasoningEffort === 0) delete genParams.max_think_tokens;
-          else genParams.max_think_tokens = reasoningEffort;
+          if (reasoningEffort === 0) {
+            delete genParams.max_think_tokens;
+            delete genParams.thinking;
+          } else if (reasoningEffort === 1) {
+            genParams.max_think_tokens = 1;
+            genParams.thinking = false;
+          } else {
+            genParams.max_think_tokens = reasoningEffort;
+            genParams.thinking = true;
+          }
         }
         // thinking=off is currently a no-op at the CLI layer. Earlier
         // versions injected a prose system directive ("Respond directly

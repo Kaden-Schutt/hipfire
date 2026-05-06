@@ -77,6 +77,19 @@ pub struct SamplerConfig {
     /// Effective window is `min(history.len(), repeat_window)` and is
     /// also clipped to the GPU `repeat_buf` capacity by the caller.
     pub repeat_window: usize,
+    /// OpenAI-style presence penalty: subtract this constant from the
+    /// logit of any token that has appeared at least once in
+    /// `repeat_window`. Distinct from `repeat_penalty` (which divides
+    /// the logit by RP) — additive, applied once per unique token,
+    /// independent of count and magnitude. `0.0` = disabled.
+    /// Qwen3.5/3.6 generation_config recommends `1.5` for
+    /// general-purpose thinking. Implemented as a host-side
+    /// download → mutate-uniques → upload pre-pass over the full
+    /// logits buffer, so it costs `vocab_size × 4 × 2` bytes of
+    /// PCIe traffic per sample when active. Acceptable for low-
+    /// volume sampling on the AR path; not yet wired into the
+    /// DFlash spec-decode batched verify.
+    pub presence_penalty: f32,
     /// Token IDs whose logit is unconditionally set to `-INF` before
     /// sampling. Used for the unclosed-opener attractor block (#111).
     pub blocked_tokens: Vec<u32>,
@@ -93,6 +106,7 @@ impl SamplerConfig {
             min_p: 0.0,
             repeat_penalty: 1.0,
             repeat_window: 0,
+            presence_penalty: 0.0,
             blocked_tokens: Vec::new(),
         }
     }
@@ -110,6 +124,7 @@ impl SamplerConfig {
             min_p: 0.05,
             repeat_penalty: 1.0,
             repeat_window: 0,
+            presence_penalty: 0.0,
             blocked_tokens: Vec::new(),
         }
     }
@@ -131,6 +146,7 @@ impl Default for SamplerConfig {
             min_p: 0.0,
             repeat_penalty: 1.05,
             repeat_window: 128,
+            presence_penalty: 0.0,
             blocked_tokens: Vec::new(),
         }
     }
@@ -199,6 +215,44 @@ pub fn sample(
         }
     }
 
+    // Step 2.5: presence-penalty host-side pre-pass. Subtract
+    // `presence_penalty` once from the logit of any token that
+    // appears at least once in the recent window. Implemented as
+    // download → mutate → upload of the full logits buffer
+    // because the GPU `sample_top_p` kernel doesn't yet have a
+    // PP slot. Costs `vocab_size × 4 × 2` bytes of PCIe per sample
+    // when active; on the AR path that's ~2 MB / token at vocab
+    // 248k, tolerable for smoke tests at the 100 tok/s rate. Any
+    // future caller wanting PP in the DFlash spec-decode batched
+    // verify will need a kernel-side hook; this CPU path keeps the
+    // patch small enough to validate the magnitude before spending
+    // kernel time.
+    //
+    // The `Vec<u8>` host buffer is touched only at the unique-token
+    // offsets via explicit `f32::from_ne_bytes` / `to_ne_bytes`
+    // round-trips. We do NOT reinterpret the byte buffer as
+    // `&mut [f32]` — `Vec<u8>` is only u8-aligned, and a wider
+    // load through a misaligned pointer is UB. The per-unique-token
+    // byte-juggling cost is negligible (~30 ns each) compared to
+    // the PCIe round-trip that dominates this path.
+    if cfg.presence_penalty != 0.0 && !scope.is_empty() {
+        let logits_bytes = logits.buf.size();
+        let mut host_bytes = vec![0u8; logits_bytes];
+        let _ = gpu.hip.memcpy_dtoh(&mut host_bytes, &logits.buf);
+        let n_logits = logits_bytes / 4;
+        let mut seen = std::collections::HashSet::with_capacity(scope.len());
+        for &t in scope {
+            if seen.insert(t) && (t as usize) < n_logits {
+                let off = (t as usize) * 4;
+                let mut le = [0u8; 4];
+                le.copy_from_slice(&host_bytes[off..off + 4]);
+                let v = f32::from_ne_bytes(le) - cfg.presence_penalty;
+                host_bytes[off..off + 4].copy_from_slice(&v.to_ne_bytes());
+            }
+        }
+        let _ = gpu.hip.memcpy_htod(&logits.buf, &host_bytes);
+    }
+
     // Step 3: GPU sample. The kernel does:
     //   - top-K = 20 from raw logits
     //   - apply repeat_penalty over `repeat_buf[0..scope.len()]`
@@ -238,6 +292,16 @@ pub fn sample(
 pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u32 {
     if cfg.repeat_penalty != 1.0 && cfg.repeat_window > 0 {
         llama::apply_repeat_penalty(logits, history, cfg.repeat_window, cfg.repeat_penalty);
+    }
+    if cfg.presence_penalty != 0.0 && cfg.repeat_window > 0 && !history.is_empty() {
+        let scope_start = history.len().saturating_sub(cfg.repeat_window);
+        let scope = &history[scope_start..];
+        let mut seen = std::collections::HashSet::with_capacity(scope.len());
+        for &t in scope {
+            if seen.insert(t) && (t as usize) < logits.len() {
+                logits[t as usize] -= cfg.presence_penalty;
+            }
+        }
     }
     for &tok in &cfg.blocked_tokens {
         if (tok as usize) < logits.len() {

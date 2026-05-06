@@ -243,6 +243,111 @@ impl<'a> ChatScaffold<'a> {
     }
 }
 
+// ─── Jinja path — render upstream HF chat_template ──────────────────────────
+//
+// `ChatFrame` above is a hand-rolled approximation of ChatML scaffolding.
+// `JinjaChatFrame` renders the actual `chat_template` shipped with the
+// model (via the .hfq metadata blob). When the template is present this
+// is strictly more correct: the model sees the exact prefix shape it
+// was trained on, including default system prompts, `<think>\n` openers
+// gated by `enable_thinking`, tool-call scaffolding, and any other
+// per-arch quirks the upstream tokenizer_config encodes.
+//
+// Failure modes (template parse error, missing context var, explicit
+// `raise_exception`) bubble up as `Err(String)` so the caller can fall
+// back to `ChatFrame::Plain` rather than panicking.
+//
+// The render output is a plain UTF-8 string. Tokenization goes through
+// `Tokenizer::encode` which recognizes registered special tokens
+// (`<|im_start|>`, `<|im_end|>`, `<think>`, etc.) and emits their
+// single-token IDs — so the rendered string round-trips to the same
+// token sequence the model would see under transformers' apply_chat_template.
+
+/// Renders the upstream HF Jinja `chat_template` to produce a prompt
+/// token sequence. Use when the .hfq carries a chat_template; fall back
+/// to `ChatFrame::Plain` when it doesn't or when render fails.
+pub struct JinjaChatFrame<'a> {
+    pub tokenizer: &'a Tokenizer,
+    /// The Jinja template source string from the model's
+    /// `tokenizer_config.json:chat_template` field.
+    pub template: &'a str,
+    /// Optional system message for this turn. `None` = no system block.
+    pub system: Option<&'a str>,
+    /// User content for the new turn.
+    pub user: &'a str,
+    /// Maps to the upstream `enable_thinking` template kwarg. For
+    /// Qwen3.5/3.6 thinking-mode models, `true` (the upstream default)
+    /// emits `<|im_start|>assistant\n<think>\n` at the end; `false`
+    /// emits the empty-think pattern `<think>\n\n</think>\n\n` which
+    /// is known to cause loop pathologies (see
+    /// `feedback_no_think_directive_loops.prd`). Default callers
+    /// should pass `true`.
+    pub enable_thinking: bool,
+}
+
+impl<'a> JinjaChatFrame<'a> {
+    /// Render the template and tokenize the result. Returns `Err` on
+    /// any template-side failure so the caller can fall back to
+    /// `ChatFrame::Plain` framing.
+    pub fn render_and_encode(&self) -> Result<Vec<u32>, String> {
+        let rendered = self.render()?;
+        Ok(self.tokenizer.encode(&rendered))
+    }
+
+    /// Render the template to a string without tokenizing. Exposed
+    /// separately so a diagnostic example can dump the rendered prompt
+    /// for byte-level comparison against transformers' output.
+    pub fn render(&self) -> Result<String, String> {
+        use minijinja::{Environment, Error, ErrorKind, Value};
+        use minijinja_contrib::pycompat::unknown_method_callback;
+
+        let mut env = Environment::new();
+        // Make Python-style str/list/dict methods (`.startswith`,
+        // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
+        // ordinary Jinja values. Required by the Qwen3 family
+        // template — it calls these throughout the assistant-turn
+        // and tool branches.
+        env.set_unknown_method_callback(unknown_method_callback);
+        // The Qwen3 template uses `raise_exception('...')` to fail
+        // fast on malformed inputs (e.g. system message in the
+        // middle of the conversation). minijinja has no builtin
+        // for this, so we register it as a global function that
+        // surfaces the message as a render error.
+        env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
+            Err(Error::new(ErrorKind::InvalidOperation, msg))
+        });
+
+        env.add_template("chat", self.template)
+            .map_err(|e| format!("template parse: {e}"))?;
+        let tmpl = env.get_template("chat")
+            .map_err(|e| format!("template lookup: {e}"))?;
+
+        // Build the messages list the way transformers does: optional
+        // system first, then a single user turn. Multi-turn history is
+        // not yet plumbed through — the daemon's request shape is
+        // single-turn, and the template's `<think>` stripping for
+        // prior assistant turns only matters once that lands.
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        if let Some(sys) = self.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys,
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": self.user,
+        }));
+
+        let ctx = minijinja::context! {
+            messages => Value::from_serialize(&messages),
+            add_generation_prompt => true,
+            enable_thinking => self.enable_thinking,
+        };
+        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
