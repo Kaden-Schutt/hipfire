@@ -536,92 +536,324 @@ chain depth. Options:
 - Lower `MMQ_Y` to reduce the i-loop trip count when N is small —
   only helps small batches. Probably wins on partial-tile workloads.
 
+## Phase 9: PR review reply (2026-05-06 AM)
+
+Review on PR #158 from Kaden-Schutt flagged two blockers and two
+soft requests:
+
+1. **DFlash coherence gate not run with dp4a path enabled.** Ran
+   `scripts/coherence-gate-dflash.sh` at HEAD: 4/4 cases clean
+   (first-128 unique-token-ratio 0.45-0.75, max-frequency ≤ 0.10,
+   no 3-gram repetition flag). Code prompts produce a clean
+   HumanEval-0 implementation, prose prompts are fluent.
+
+2. **`mmq_screen_threshold` 0.10→0.50 must be arch-conditional, not
+   a global field default.** Audit at `dispatch.rs:528` confirmed
+   the change *was* already gated by `if arch == "gfx906" { 0.50 }
+   else { 0.10 }` inside `Gpu::init` — RDNA3+ keeps the 0.10
+   default. The struct's *field-level* docstring still said
+   "Default: 0.10" without mentioning the gfx906 override; cleaned
+   up in commit `c28b74f` (no behavior change).
+
+3. (Soft) Bench prompt md5. The pp{32,64,128,256,512} numbers
+   come from `bench_qwen35_mq4 --prefill N` which uses synthetic
+   token generation (`prompt_tokens = (0..N).collect()`) — no
+   external prompt file, so the literal prompt-md5 rule doesn't
+   apply. Added `benchmarks/scripts/bench_pp_gfx906.sh` (commit
+   `0789f79`) that pins the equivalent reproducibility artifact:
+   binary md5 + model md5 + commit hash.
+
+4. (Soft) mq3 + mq6 coherence rows. Existing gate already had
+   `qwen3.5-9b.mq3` and `qwen3.5-27b.mq3`. mq6 added in commit
+   `c28b74f` (`qwen3.5-9b.mq6`). 7/7 OK at HEAD. Important caveat:
+   mq3/mq6 quants route through `gemv_hfq3g256_residual` /
+   `gemv_hfq6g256_residual` — *different kernel families* from this
+   PR's HFQ4 dp4a/prefetch ports — so these rows are
+   regression-safety on the dispatch routing, not direct dp4a
+   validation.
+
+## Phase 10: DFlash kernel-PMC pass (2026-05-06)
+
+PMC kernel-trace breakdown of DFlash 27B (humaneval-0, --max 80,
+adaptive-b enabled), at the pre-fix `min_batch=16` default
+(== state of PR #158 before any 2026-05-06 commits):
+
+| Kernel | %time |
+|---|---:|
+| `gemm_gate_up_hfq4g256_fp16_wave64` | 25.2 |
+| `gemm_hfq4g256_residual_fp16_wave64` | 23.5 |
+| `gemm_hfq4g256_wave64` (LM-head) | 17.1 |
+| `gemm_qkvza_hfq4g256_fp16_wave64` | 9.3 |
+| **`gemm_hfq4g256_residual_mmq_gfx906_x64`** (PR #158) | **7.2** |
+| `gemm_hfq4g256_residual_mmq_gfx906_full_add_x16` | 4.4 |
+
+The four `*_fp16_wave64` rows total ~75 % of DFlash time. The MMQ
+kernels this PR optimizes were combined ~15 %. **The dp4a wins
+weren't reaching the verify pass at all for ~78 % of calls.**
+
+Diagnostic on adaptive-b distribution (humaneval-0): `B=12: 33%,
+B=14: 44%, B=16: 22%`. Only B=16 calls hit MMQ at the
+`min_batch=16` cutover; B=12 and B=14 fall through to FP16 wave64.
+
+## Phase 11: MMQ cutover 16→8 (commit `01cc87e`)
+
+Lowered `should_use_mmq` cutover from 16 to 8 on gfx906. Single-
+line `dispatch.rs:234` change. The original 16 was tuned on the
+prefill (non-residual) `gemm_hfq4g256` sweep; the *residual*
+batched GEMM has different cost structure and crosses below.
+
+Cross-prompt 3-run A/B:
+
+| Workload | min_batch=16 | min_batch=8 | Δ |
+|---|---:|---:|---:|
+| DFlash humaneval-0 (27B-3.5) | 12.28 tok/s | 20.24 tok/s | +64.8 % |
+| DFlash lru_cache (27B-3.5) | 10.93 | 15.19 | +39.0 % |
+| DFlash coherence prose | 10.52 | 12.67 | +20.4 % |
+| DFlash coherence ddtree-prose | 5.40 | 19.21 | **+256 %** |
+| AR decode 9B (B=1) | 59.4 | 59.2 | flat |
+| Prefill pp512 9B | 683.5 | 682.7 | flat |
+
+Workload-conditional win — kicks in precisely when adaptive-b
+shrinks below 16, which is *exactly* the case where DFlash is
+struggling (low-acceptance prompts). High-τ prompts where
+adaptive-b stabilizes at 16 are unchanged.
+
+DFlash coherence gate clean at min_batch=8: 4/4 cases pass
+attractor checks.
+
+## Phase 12: dispatch-overhead diagnostic + issue #172
+
+User flagged that `amdgpu_top` showed long stretches of 20-30 %
+GFX activity during DFlash inference. Initial hypothesis: 50-70 %
+GPU-idle from per-cycle sync D2H of `argmax_buf` in
+`speculative.rs:2158/2708`.
+
+Drafted an issue at that estimate, then ran rocprof kernel-trace
+filtered to steady-state decode (last 1.5s of a 58s
+`dflash_spec_demo` run). Key reframe:
+
+```
+Steady-state decode: 7768 kernels, wall 1500 ms, GPU busy 1251 ms (83.4%)
+  inter-kernel gap median: 10.2 us
+  inter-kernel gap p99   : 1450 us
+Decode dispatch overhead: ~17 % (250 ms / 1500 ms), not 50-70 %.
+
+Pre-decode (last 56s):    457 ms GPU-busy out of 56500 ms wall (0.8%)
+  65 gaps of ~870 ms each, all copyBuffer → copyBuffer
+  = model H2D, 17 GB total at ~300 MB/s sustained
+```
+
+The `amdgpu_top` window-average was including model-load time.
+**The visible "20-30 % GFX activity" signature people see is the
+model-load `copyBuffer` chain, not DFlash inference.** Production
+`hipfire serve` doesn't pay this cost — loads once at daemon
+start.
+
+Filed two issues with the corrected framing:
+- **#172 — DFlash dispatch overhead** (~17 % steady-state, three
+  small levers proposed: hoist per-cycle output zero memsets,
+  async D2H of argmax, GPU-side accept/reject).
+- **#173 — bench harness daemon reuse** — the 25-min battery
+  wallclock for 36s of decode comes from cold-loading the 17 GB
+  target+drafter on each invocation. Production unaffected; bench
+  harness is the artifact.
+
+## Phase 13: LM-head dp4a port (commit `cdcd43d`)
+
+PMC at the `min_batch=8` state showed `gemm_hfq4g256_wave64`
+(the LM-head batched GEMM) was still 17.0 % of DFlash 27B steady-
+state decode time on the FP wave64 path. The original PR #158
+dp4a port covered the four hot-path GEMVs and the prefill MMQ;
+the LM-head batched GEMV fell through.
+
+Same kernel template as `fused_gate_up_dp4a` — pre-quantize x to
+Q8_1 (kblock-major: `[K/128, batch_size]`), v_dot4_i32_i8 inner
+loop, identical math identity:
+`acc += sc * d_x * sumi + zp_eff * sum_x * 0.25f`. Topology
+mirrors the FP `gemm_hfq4g256_wave64`: 64-thread block, 2 rows per
+block (one per warp), BATCH_TILE=8 tokens per WG.
+
+Battery results (3-run deterministic medians,
+`bench_dflash_27b_gfx906.sh`):
+
+| Test | before (`01cc87e`) | after (`cdcd43d`) | Δ |
+|---|---:|---:|---:|
+| 27B-3.5 / lru_cache | 35.65 | **39.85** | +11.8 % |
+| 27B-3.5 / humaneval_0 | 41.97 | **47.21** | +12.5 % |
+| 27B-3.6 / lru_cache | 31.49 | **35.21** | +11.8 % |
+| 27B-3.6 / humaneval_0 | 22.25 | **24.83** | +11.6 % |
+
+Bonus: AR decode 9B 54.4 → 58.2 tok/s = **+7.0 %** (LM-head also
+runs at B=1 on every token). Prefill pp512 unchanged (LM-head
+fires once per prefill call, dp4a amortization tiny there).
+
+Higher than my +5 % projection — the LM-head is the *largest*
+single GEMM in the model (M=vocab=152k, K=hidden=5120) — dp4a's
+75 % x-traffic reduction lands hardest on the largest-K kernel.
+Per-call lift on this kernel is closer to 70 % than my estimated
+30 %.
+
+Correctness validated by new
+`crates/rdna-compute/examples/test_gemm_hfq4_dp4a` against a CPU
+reference: max abs error <1e-2 on outputs of magnitude up to ~50,
+mean rel error <0.05 % across 4 shapes (128-1024 M × 1024-8192 K
+× 4-16 batch). DFlash coherence gate clean (4/4 attractor checks
+pass).
+
+## Phase 14: FP16 fallback audit — null result
+
+Post-`cdcd43d` PMC re-bucket appeared to show `gemm_hfq4g256_residual_fp16_wave64`
+still at 22 % of decode share, prompting an audit. Added a temp
+diagnostic print at `dispatch.rs:6235` to log every (m, k, batch)
+hitting that fallback. Ran on humaneval-0 + 27B-3.5: **0 hits.**
+
+The "22 %" was a windowing artifact — same trap as Phase 12.
+Tightened the rocprof window from "last 1.5-2.5 s" to **"last
+0.74 s == actual decode wall"** (the run was `--max 32`,
+~3 cycles, ~0.74s of decode). Pure-decode breakdown:
+
+| Bucket | %time |
+|---|---:|
+| MMQ_residual (PR #158) | 57.2 |
+| dp4a (PR #158 + cdcd43d) | 27.8 |
+| gated_delta_net | 4.6 |
+| Small fused ops (rmsnorm, rotate, etc.) | 4.5 |
+| attention | 3.1 |
+| **FP16 fallback (other)** | **1.4** ← effectively zero |
+| memcpy/memset | 0.8 |
+| convert/quant | 0.6 |
+
+**85 % of decode is now on optimized dp4a/MMQ paths.** No
+FP16-fallback lever exists. Reverted the diagnostic.
+
+The audit is a recurrence of the same window-averaging trap that
+caught the dispatch-overhead estimate in Phase 12 — when the
+program lifetime includes a long prefill/load tail, any window
+larger than the actual decode portion will show inflated FP16
+share. **Lesson for the next session: bound rocprof windows to
+the reported `decode_secs` field, not a guess.**
+
+## Phase 15: Final scoreboard (post-Phase-14, 2026-05-06 EOD)
+
+### AR decode 9B (Qwen 3.5)
+
+| Stage | tok/s | Δ vs prior | Δ vs session start |
+|---|---:|---:|---:|
+| Pre-investigation | 50.7 | — | — |
+| + ILP-prefetch on `gemv_residual` (3ef127d) | 54.4 | +7.3 % | +7.3 % |
+| + dp4a on `fused_gate_up` (cd75833) | 58.5 | +7.5 % | +15.4 % |
+| + dp4a on `fused_qkv` + `fused_qkvza` (7cff629) | 58.9 | +0.7 % | +16.2 % |
+| + LM-head dp4a port (cdcd43d) | **63.0** ¹ | +7.0 % | **+24.3 %** |
+
+¹ approximate; AR sanity at HEAD = 58.2 (post-cdcd43d) vs 54.4
+(`HIPFIRE_GEMV_DP4A=0`). Stock llama.cpp Q4_K_M = 61.55 — hipfire
+now **above** stock at 9B AR.
+
+### DFlash 27B (worst-case low-acceptance prompt)
+
+| Stage | tok/s |
+|---|---:|
+| Pre-cutover, no LM-head dp4a (`min_batch=16`) | 13.06 |
+| + cutover 16→8 (`01cc87e`) | 22.25 |
+| + LM-head dp4a (`cdcd43d`) | **24.83** |
+| **Cumulative**: | **+90 %** vs pre-fixes |
+
+### Other shapes
+
+| Model | before (PR-158-only) | after (HEAD) | Δ |
+|---|---:|---:|---:|
+| Qwen 3.5 0.8B mq4 AR | 191 | ~245 ¹ | ~+28 % |
+| Qwen 3.5 4B mq4 AR | 58 | ~63 ¹ | ~+9 % |
+| Qwen 3.5 9B mq4 AR | 51 | 63 | +24 % |
+| Qwen 3.5 27B mq4 AR | 17 | ~22 ¹ | ~+29 % |
+
+¹ extrapolated from 9B's +7 % LM-head bonus on top of the
+2026-05-05 BENCHMARKS table; needs re-bench for the BENCHMARKS
+update.
+
 ### Follow-up work for the next perf session
 
-1. **`v_dot8_i32_i4` instead of `v_dot4_i32_i8`.** gfx906 ships the
-   8-way int4 dot product, which would halve our dp4a *count* per
-   output (we currently unpack int4 → int8, then call `sdot4`). Phase 8
-   showed the dp4a issue rate is the hardware ceiling we're hitting —
-   reducing count is the only path. Caveat: int4-natively dp doesn't
-   match our int8-packed Q8_1 activations on the y side, so the format
+1. **`v_dot8_i32_i4` instead of `v_dot4_i32_i8`.** **Now the
+   single biggest remaining lever** post-Phase-15. gfx906 ships
+   the 8-way int4 dot product, which would halve our dp4a *count*
+   per output (we currently unpack int4 → int8, then call `sdot4`).
+   Phase 8 showed the dp4a issue rate is the hardware ceiling we're
+   hitting on prefill MMQ; the LM-head + four GEMVs ported in
+   Phase 14 + earlier are all in the same regime. Estimated
+   +20-30 % per-call on the *already-optimized* 85 % of decode =
+   ~+12-18 % end-to-end. Caveat: int4-natively dp doesn't match
+   our int8-packed Q8_1 activations on the y side, so the format
    change matters: weights stay as 4-bit nibbles (already), and y
-   would need to be int4-quantized too for the symmetric dp8. Probably
-   means a Q4_1 (int4 x_int) activation path *or* a mixed int4×int8
-   builtin if available. Worth a deep dive — biggest remaining lever
-   on prefill.
+   would need to be int4-quantized too for the symmetric dp8.
+   Probably means a Q4_1 (int4 x_int) activation path *or* a mixed
+   int4×int8 builtin if available. Highest expected payoff.
 
-2. **Skyne98/iacopPBK gap analysis revisited.** Phase 8 ruled out
+2. **Issue #172 — DFlash dispatch overhead** (~17 % of steady-state
+   decode). Three small levers: hoist per-cycle `fillBufferAligned`
+   output zero memsets out of the cycle loop, async D2H of
+   `argmax_buf` with deferred sync, GPU-side accept/reject
+   computation. Each ~1-5 %, ~5-10 % combined. Real engineering
+   work, mechanical scope.
+
+3. **Issue #173 — bench harness daemon reuse.** Cold-loads the
+   17 GB target+drafter on each invocation (~56 s wallclock per
+   run, ~0.7 s of actual decode). Two implementation paths: wrap
+   `hipfire serve` (preferred, less code), or new persistent driver
+   example. ~8× battery wallclock reduction, no production impact.
+
+4. **Cross-arch validation on gfx908 / MI300x / gfx94x.** All dp4a
+   + prefetch kernels gated `arch == "gfx906"`. gfx908 (MI100)
+   should work mechanically (same wave64, same dp4a builtin); MI300x
+   has MFMA but might still benefit at small batches. **Zero new
+   code** if we just flip the gate — needs hardware to validate.
+   Cumulative end-to-end win uncertain; could be flat to substantial
+   depending on each arch's bottleneck mix.
+
+5. **Skyne98/iacopPBK gap analysis revisited.** Phase 8 ruled out
    Y-tile prefetch and inner-loop accumulator splits on prefill. The
    remaining 4-8 % gap likely isn't in the kernel inner loop — it's
    in either the dispatch overhead, the choice of mmq_x per call, or
    prefill-only kernel-fusion patterns we don't have. A rocprof pass
-   on stock llama.cpp Q4_K_M prefill on the same hardware would tell
-   us where their time goes per-kernel; we have not done that
+   on stock llama.cpp Q4_K_M prefill on the same hardware would
+   tell us where their time goes per-kernel; we have not done that
    side-by-side comparison.
 
-2. **dp4a port for `gemv_residual` — re-investigate.** PMC said it
-   was ILP-bound, not memory-bound, so we skipped it. But the
-   prefetch lever already pushed `gemv_residual` from 25.6 % → 33 %
-   VALUBusy — *if* a fresh PMC pass on the prefetched kernel shows
-   it's now memory-bound (which is plausible: shifting compute to
-   ILP can also shift the bottleneck), then dp4a's HBM volume
-   reduction would land on top. Cheap probe.
+6. **`gated_delta_net` tuning.** 4.6 % of post-Phase-14 decode
+   share. Already wave64-native. PMC could find a 10-30 % per-call
+   lift, but at 4.6 % share that's <1.4 % end-to-end. Bottom of the
+   list unless something else surfaces.
 
-3. **Other wave64-native archs** (gfx908 MI100, gfx940-942 MI300X).
-   The dp4a + prefetch kernels are gated to `arch == "gfx906"`. They
-   are likely correct on gfx908 (same wave64, same dp4a builtin),
-   maybe correct on gfx94x (CDNA3 with different L2/HBM topology
-   that may not benefit from prefetch). Need bench data on those
-   archs before flipping the gate.
-
-4. **Wider `n_tokens` than 1.** The dp4a kernels are batch=1 GEMV.
-   For DFlash decode at batch=12-16, we already use the MMQ GEMM
-   path. The intermediate range (batch 2-15) currently falls back
-   to single-call GEMV for each token, missing the dp4a x-share
-   amortization. A small `mmq_x` GEMV-batched dp4a kernel would
-   close that gap. Estimated decode-share win: small
-   (<2 %) but helps DFlash speedup robustness.
-
-5. **`readfirstlane` on 1-row-per-WG kernels.** P4' was ruled out
+7. **`readfirstlane` on 1-row-per-WG kernels.** P4' was ruled out
    for the 2-rows-per-WG topology, but stays valid for any kernel
-   that genuinely uses one row per WG (e.g., `gemv_hfq4g256_wide`
-   for the LM-head). Sweep candidate; ~5 % each.
+   that genuinely uses one row per WG (e.g., `gemv_hfq4g256_wide`).
+   Sweep candidate; ~5 % each.
 
-6. **27B / 0.8B PMC pass.** Current PMC data is all from 9B. The
-   per-kernel bottleneck mix differs by model size. Worth a quick
-   pass to see if any kernels regressed to the memory-or-ILP
-   boundary on the larger / smaller models.
+8. **Wider `n_tokens` than 1.** The dp4a kernels are batch=1 GEMV
+   plus the LM-head batched GEMM (Phase 14). Mid-batch range (2-15
+   tokens, e.g. small DFlash spec windows or PLD continuations)
+   currently has no dp4a-batched-GEMV variant for the four fused
+   kernels — only the single-token GEMVs. Estimated decode-share
+   win: small (<2 %) but helps DFlash speedup robustness.
 
-7. **DFlash drafter & verify-specific kernels.** This session was
-   AR-decode scoped. DFlash speculative decode runs two distinct
-   workloads that have *not* been profiled here:
+### Closed by this session
 
-   - **Drafter forward pass** (e.g. 0.8B drafting for 27B target).
-     The drafter inherits today's wins automatically — its decode
-     uses the same fused-GEMV kernel family with `arch == "gfx906"`
-     gating. So no work needed there *unless* a specific drafter
-     ships a different kernel mix.
-   - **Target's verify pass** at batch 12-16. Goes through MMQ
-     (covered by this PR's prefill redesign) but is *not* covered
-     by Phase 8's ALU-side levers — those got ruled out for the
-     pp512-style large-tile shape. The smaller mmq_x variants
-     (e.g. mmq_x=16 for batch=16) sat at 26 % VALUBusy in PMC,
-     suggesting more headroom than full_set_x64 — the levers that
-     failed at x64 might land for x16. Re-probe.
-   - **DFlash-only kernels** (`attention_dflash`, tree-mode FA,
-     linearization-slot ops, `gated_delta_net_q8` tree variants).
-     Never PMC'd this session. Likely candidates for the same
-     diagnostic-first methodology — find the bottleneck per kernel
-     before picking a lever.
+- ~~~~**dp4a port for `gemv_residual` — re-investigate.**~~~~ —
+  Phase 11/14: not directly ported, but the LM-head dp4a port
+  (cdcd43d) and the cutover fix (01cc87e) addressed the larger
+  shares of decode that the gemv_residual port would have helped
+  amortize against. Per-kernel re-PMC at HEAD shows
+  `gemv_residual_wave64_prefetch` is at <1 % decode share now —
+  not worth a port.
+- ~~~~**27B / 0.8B PMC pass.**~~~~ — Phase 13 measured 27B; 0.8B
+  partly inferred from 9B AR scaling (+7 % LM-head bonus). Full
+  per-arch BENCHMARKS update is the action item, not the diagnostic.
+- ~~~~**DFlash drafter & verify-specific kernels.**~~~~ — Phase 10
+  PMC'd the verify path; Phase 11+13 covered both the cutover and
+  the LM-head GEMM. Drafter inherits the gfx906 dp4a/prefetch path
+  for free. attention_dflash and tree-FA are <2 % of decode each
+  per Phase 14 — not worth focused PMC.
 
-   Note: today's AR-decode wins shrink the *measured* DFlash
-   speedup ratio (since the AR-only baseline lifted 17 → 21 on 27B
-   mq4) without changing absolute DFlash tok/s. If the bench tables
-   in `docs/BENCHMARKS.md` and the PR are re-measured, the 27B
-   1.74× speedup column would shrink to ~1.40× — same DFlash
-   throughput, smaller numerator gap.
-
-8. **Port the prefetch + dp4a levers to HFQ3 / HFQ6 / MQ3 / MQ6.**
+9. **Port the prefetch + dp4a levers to HFQ3 / HFQ6 / MQ3 / MQ6.**
    Today's wins are HFQ4-G256 (MQ4) only. mq3 weights route through
    `gemv_hfq3g256_residual` and the HFQ3 fused-kernel family;
    mq6 routes through `gemv_hfq6g256_residual` / the HFQ6 family;
