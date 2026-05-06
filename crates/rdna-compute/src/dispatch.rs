@@ -223,15 +223,22 @@ fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
         Some("1") | Some("on") => true,
         _ => {
             // Per-arch default min_batch:
-            //   gfx906: 16 — the post-redesign dp4a kernel beats FP16 wave64
-            //     from pp16 upward (1.46× → 3.89×). Below pp16 the Q8_1
-            //     quantize + per-output launch overhead dominates and FP16
-            //     wave64 wins. Validated by full pp sweep on Qwen 9B mq4
-            //     (commit 7972c19 follow-up).
+            //   gfx906: 8 — empirically validated for both prefill (pp512
+            //     within noise of min_batch=16) and DFlash 27B verify
+            //     (B ∈ [12, 14] previously fell to FP16 wave64; lifting
+            //     them to MMQ gives +64.8% tok/s on humaneval-0 prompt,
+            //     +39% on lru_cache prose, 3-run deterministic). Earlier
+            //     min_batch=16 was set on the prefill `gemm_hfq4g256`
+            //     non-residual sweep; the *residual* batched GEMM
+            //     (used by DFlash verify) crosses below that and wins
+            //     down to B=8. AR decode at B=1 stays unchanged
+            //     (well below cutover). PMC pass at 2026-05-06:
+            //     `gemm_hfq4g256_residual_fp16_wave64` was 23.5% of
+            //     DFlash time at min_batch=16 — root cause of the gap.
             //   other archs: 256 — RDNA3+ has WMMA which is genuinely faster
             //     than MMQ at small batches; flip only when MMQ amortization
             //     dominates.
-            let arch_min_batch: usize = if arch == "gfx906" { 16 } else { 256 };
+            let arch_min_batch: usize = if arch == "gfx906" { 8 } else { 256 };
             let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
                 .ok()
                 .and_then(|s| s.parse::<usize>().ok())
