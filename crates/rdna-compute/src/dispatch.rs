@@ -7223,6 +7223,21 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // gfx906 dp4a opt-in for the LM-head batched GEMM. PMC at 2026-05-06
+        // showed gemm_hfq4g256_wave64 was 17 % of DFlash 27B steady-state
+        // decode time on the FP wave64 path. The dp4a port pre-quantizes x
+        // to Q8_1 (shared scratch with the prefill MMQ + the gate_up/qkv/qkvza
+        // GEMV ports) and runs v_dot4_i32_i8.
+        //
+        // Only fires on gfx906 (other wave64-native archs have rocBLAS or
+        // larger MFMA paths that beat dp4a at large batches). Skip in
+        // capture mode (matches the rocBLAS branch's caveat — Q8_1
+        // quantize launch must be reachable from the captured graph or
+        // pre-baked).
+        if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            return self.gemm_hfq4g256_dp4a(a_raw, x, y, m, k, batch_size);
+        }
+
         // CDNA3 MFMA path (task #130): when rocBLAS is loaded and batch is
         // big enough for the launch overhead to amortize, route through the
         // dequantize-once FP16 shadow + rocBLAS GEMM. Expected 20-100× over
@@ -7307,6 +7322,73 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// dp4a-port of gemm_hfq4g256 for gfx906. Pre-quantizes x to Q8_1 via
+    /// the shared MMQ x-scratch (kblock-major: `[K/128, batch_size]`),
+    /// then dispatches the wave64 dp4a GEMM. Math is identical modulo
+    /// Q8_1 quant noise.
+    ///
+    /// Targets the LM-head batched GEMM hot path on DFlash 27B (PMC at
+    /// 2026-05-06 showed 17 % of decode time was here on the FP path).
+    /// Same Q8_1 layout as the prefill MMQ kernel + the four PR-158
+    /// fused GEMVs, so `ensure_q8_1_mmq_x` reuses the existing scratch.
+    pub fn gemm_hfq4g256_dp4a(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // Quantize x → Xq[K/128 * batch_size] block_q8_1_mmq via the
+        // shared scratch. Stride layout: kblock-major (matches
+        // quantize_q8_1_mmq_ds4 at gemm_hfq4g256_residual_mmq.hip:80).
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        self.ensure_kernel(
+            "gemm_hfq4g256_wave64_dp4a",
+            kernels::GEMM_HFQ4G256_WAVE64_DP4A_SRC,
+            "gemm_hfq4g256_wave64_dp4a",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
+        let mut xq = xq_ptr;
+        let grid_x = (m as u32 + 1) / 2;
+        const BATCH_TILE: usize = 8;
+        let grid_y = ((batch_size + BATCH_TILE - 1) / BATCH_TILE) as u32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &bs_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::gemm_hfq4g256_bytes(m, k, batch_size);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemm_hfq4g256_dp4a", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_wave64_dp4a",
+            [grid_x, grid_y, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq); b.push_ptr(y_ptr);
                 b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
                 b
             },

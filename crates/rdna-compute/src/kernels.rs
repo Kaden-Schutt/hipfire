@@ -469,6 +469,11 @@ pub const GEMV_HFQ4G256_WIDE_SRC: &str = include_str!("../../../kernels/src/gemv
 pub const GEMM_HFQ4G256_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256.hip");
 // CDNA3 wave64-native batched HFQ4-G256 GEMM (overwrite). 2 rows per block.
 pub const GEMM_HFQ4G256_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64.hip");
+// gfx906 dp4a-port — see kernels/src/gemm_hfq4g256_wave64_dp4a.hip for the
+// math + lane-mapping invariants. Targets the LM-head batched GEMM that
+// PMC at 2026-05-06 showed was 17.0 % of DFlash 27B steady-state decode
+// time on the FP wave64 path.
+pub const GEMM_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_wave64_dp4a.hip");
 
 /// One-shot dequantize HFQ4-G256 matrix → FP16 row-major. Used when the
 /// downstream prefill GEMM path uses rocBLAS MFMA kernels (CDNA3 only —
