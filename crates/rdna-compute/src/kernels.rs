@@ -47,6 +47,13 @@ pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/
 /// add_inplace_f32 launch on the residual path (~4.4% of decode time).
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.hip");
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.gfx1100.hip");
+/// MQ3G256Lloyd WMMA residual GEMM (Phase 5 / issue #116 — batched-prefill kernel).
+/// gfx1100+ wave32 WMMA. 16-row × 16-batch tile, per-row LDS-staged codebook.
+/// Phase A MVP: gfx1100 only; gfx12 sibling pending Phase B1.
+/// fp16-LDS variant (256 B/workgroup, no cvt at decode).
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma.hip");
+/// fp32-LDS sibling for Phase A bench comparison (512 B/workgroup, v_cvt_f16_f32 at decode).
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_LDS_F32_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma_lds_f32.hip");
 /// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
 /// per FFN). Mirrors fused_gate_up_hfq4g256.{,gfx1100.}hip.
 pub const FUSED_GATE_UP_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.hip");

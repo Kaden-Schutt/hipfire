@@ -2167,6 +2167,137 @@ impl Gpu {
         self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
     }
 
+    /// MQ3-Lloyd WMMA residual GEMM (Phase 5 / issue #116, Phase A MVP).
+    /// Mirrors `gemm_hfq3g256_residual_wmma` shape + grid; group stride is 112 B
+    /// (16 B fp16 codebook + 96 B 3-bit indices) instead of HFQ3's 104. K must
+    /// be a multiple of 256. gfx1100+ only (RDNA3 wave32 WMMA); other archs are
+    /// not yet supported (Phase A scope — gfx12 sibling deferred to Phase B1).
+    /// Caller is responsible for pre-rotating X (FWHT) for the MQ3-Lloyd dtype;
+    /// this dispatch mirrors `gemm_hfq3g256_residual_wmma` and does not rotate.
+    /// fp16-LDS variant; sister `gemm_mq3g256_lloyd_residual_wmma_lds_f32`
+    /// stages codebook as fp32 — used for Phase A LDS-storage A/B.
+    pub fn gemm_mq3g256_lloyd_residual_wmma(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq3g256_lloyd_residual_wmma",
+            kernels::GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC,
+            "gemm_mq3g256_lloyd_residual_wmma",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        // 112 B/group (Lloyd) vs HFQ3's 104. LLOYD_MQ3_GROUP_BYTES would
+        // become a named const in Phase B2; for Phase A keep the magic
+        // number scoped to this single arm.
+        let weight_bytes = m * (k / 256) * 112;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_mq3g256_lloyd_residual_wmma", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_mq3g256_lloyd_residual_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// fp32-LDS sibling of `gemm_mq3g256_lloyd_residual_wmma`. Phase A
+    /// bench-only — picks fp16 vs fp32 LDS storage by measurement.
+    /// Functionally identical; only the codebook staging type differs.
+    pub fn gemm_mq3g256_lloyd_residual_wmma_lds_f32(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
+            kernels::GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_LDS_F32_SRC,
+            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let weight_bytes = m * (k / 256) * 112;
+        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_mq3g256_lloyd_residual_wmma_lds_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Fused Gate+Up MQ3-Lloyd: two GEMVs in one launch. Mirrors
     /// `fused_gate_up_hfq4g256` for the Lloyd-MQ3 dtype. Caller is
     /// responsible for pre-rotating x (FWHT) before invoking; the kernel
