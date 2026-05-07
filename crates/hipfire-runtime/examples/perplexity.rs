@@ -46,7 +46,7 @@ fn main() {
     let corpus = String::from_utf8_lossy(&raw[..take]).to_string();
     eprintln!("Corpus: {} bytes (of {}) from {corpus_path}", corpus.len(), raw.len());
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
@@ -69,7 +69,7 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
     eprintln!("Loading weights from {model_path}...");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
 
     let kv_max = window.len() + 16;
     let mut kv_cache = KvCache::new_gpu_q8(
@@ -119,7 +119,7 @@ fn main() {
     println!("Corpus:   {corpus_path}");
     println!("Tokens:   offset={offset} ctx={} warmup={warmup}", window.len());
     println!("Scored:   {scored}");
-    println!("NLL/tok:  {:.6}", avg_nll);
+    println!("NLL/tok:  {:.10}", avg_nll);
     println!("PPL:      {:.4}", ppl);
     println!("Elapsed:  {:.1}s ({:.1} tok/s)", elapsed,
              scored as f64 / elapsed.max(1e-9));

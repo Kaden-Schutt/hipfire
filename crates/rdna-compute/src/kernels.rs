@@ -77,7 +77,15 @@ pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
         return (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd");
     }
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
+        // gfx1151 (Strix Halo APU, RDNA3.5) added 2026-05-07 after empirical
+        // validation: K4 + LDS-codebook GEMV produces byte-equal PPL on
+        // Qwen3.5-9B vs the slow generic kernel (NLL/tok 3.2110607378
+        // byte-match at 10 decimal precision). Residual + fused (gate+up,
+        // QKV, QKVZA) variants are NOT enabled on gfx1151 — extending the
+        // matcher to all 5 produces ~0.9% PPL drift (multi-acc fp32-reorder
+        // noise compounding under full coverage). gfx1100 remains the
+        // calibrated perf target.
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (GEMV_MQ3G256_LLOYD_GFX1100_SRC, "gemv_mq3g256_lloyd_rdna3")
         }
         _ => (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd"),
@@ -92,7 +100,7 @@ pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
         return (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual");
     }
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq3g256_lloyd_residual_rdna3")
         }
         _ => (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual"),
@@ -107,7 +115,7 @@ pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
         return (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd");
     }
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq3g256_lloyd_rdna3")
         }
         _ => (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd"),
@@ -122,7 +130,7 @@ pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
         return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
     }
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq3g256_lloyd_rdna3")
         }
         _ => (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd"),
@@ -136,7 +144,7 @@ pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static s
         return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
     }
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkv_mq3g256_lloyd_rdna3")
         }
         _ => (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd"),
