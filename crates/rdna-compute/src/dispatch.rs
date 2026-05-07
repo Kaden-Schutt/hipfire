@@ -2167,15 +2167,16 @@ impl Gpu {
         self.gemv_mq3g256_lloyd_residual(a_raw, x_rot, y, m, k)
     }
 
-    /// MQ3-Lloyd WMMA residual GEMM (Phase 5 / issue #116, Phase A MVP).
+    /// MQ3-Lloyd WMMA residual GEMM (Phase 5 / issue #116, Phase B1).
     /// Mirrors `gemm_hfq3g256_residual_wmma` shape + grid; group stride is 112 B
     /// (16 B fp16 codebook + 96 B 3-bit indices) instead of HFQ3's 104. K must
-    /// be a multiple of 256. gfx1100+ only (RDNA3 wave32 WMMA); other archs are
-    /// not yet supported (Phase A scope — gfx12 sibling deferred to Phase B1).
+    /// be a multiple of 256. gfx11/gfx12 wave32 WMMA; other archs fall through
+    /// to the baseline kernel (which itself currently requires WMMA — caller
+    /// must check arch before dispatching).
     /// Caller is responsible for pre-rotating X (FWHT) for the MQ3-Lloyd dtype;
     /// this dispatch mirrors `gemm_hfq3g256_residual_wmma` and does not rotate.
-    /// fp16-LDS variant; sister `gemm_mq3g256_lloyd_residual_wmma_lds_f32`
-    /// stages codebook as fp32 — used for Phase A LDS-storage A/B.
+    /// fp16-LDS staging — fp16 won the Phase A bench by 7.15% (devlog
+    /// 2026-05-07).
     pub fn gemm_mq3g256_lloyd_residual_wmma(
         &mut self,
         a_raw: &GpuTensor,
@@ -2186,11 +2187,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_mq3g256_lloyd_residual_wmma",
-            kernels::GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC,
-            "gemm_mq3g256_lloyd_residual_wmma",
-        )?;
+        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -2237,60 +2235,211 @@ impl Gpu {
         result
     }
 
-    /// fp32-LDS sibling of `gemm_mq3g256_lloyd_residual_wmma`. Phase A
-    /// bench-only — picks fp16 vs fp32 LDS storage by measurement.
-    /// Functionally identical; only the codebook staging type differs.
-    pub fn gemm_mq3g256_lloyd_residual_wmma_lds_f32(
+    /// MQ3-Lloyd WMMA fused QKVZA GEMM (LA preamble: qkv + z + beta + alpha).
+    /// 4-way fused — one launch covers all four projections of the LA layer.
+    /// Caller pre-rotates X (FWHT) for MQ3-Lloyd dtype.
+    pub fn gemm_qkvza_mq3g256_lloyd_wmma(
         &mut self,
-        a_raw: &GpuTensor,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
         x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        batch_size: usize,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
-            kernels::GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_LDS_F32_SRC,
-            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
-        )?;
-        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x_f16_ptr;
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut bs_val = batch_size as i32;
+        let mut a_qkv_p = a_qkv.buf.as_ptr();
+        let mut a_z_p = a_z.buf.as_ptr();
+        let mut a_beta_p = a_beta.buf.as_ptr();
+        let mut a_alpha_p = a_alpha.buf.as_ptr();
+        let mut x_p = x_f16_ptr;
+        let mut y_qkv_p = y_qkv.buf.as_ptr();
+        let mut y_z_p = y_z.buf.as_ptr();
+        let mut y_beta_p = y_beta.buf.as_ptr();
+        let mut y_alpha_p = y_alpha.buf.as_ptr();
+        let mut qkv_m_v = qkv_m as i32;
+        let mut z_m_v = z_m as i32;
+        let mut beta_m_v = beta_m as i32;
+        let mut alpha_m_v = alpha_m as i32;
+        let mut k_v = k as i32;
+        let mut n_v = n as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
-            &mut bs_val as *mut _ as *mut c_void,
+            &mut a_qkv_p as *mut _ as *mut c_void,
+            &mut a_z_p as *mut _ as *mut c_void,
+            &mut a_beta_p as *mut _ as *mut c_void,
+            &mut a_alpha_p as *mut _ as *mut c_void,
+            &mut x_p as *mut _ as *mut c_void,
+            &mut y_qkv_p as *mut _ as *mut c_void,
+            &mut y_z_p as *mut _ as *mut c_void,
+            &mut y_beta_p as *mut _ as *mut c_void,
+            &mut y_alpha_p as *mut _ as *mut c_void,
+            &mut qkv_m_v as *mut _ as *mut c_void,
+            &mut z_m_v as *mut _ as *mut c_void,
+            &mut beta_m_v as *mut _ as *mut c_void,
+            &mut alpha_m_v as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut n_v as *mut _ as *mut c_void,
         ];
 
-        let row_tiles = (m + 15) / 16;
-        let batch_tiles = (batch_size + 15) / 16;
-
-        let weight_bytes = m * (k / 256) * 112;
-        let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (n + 15) / 16;
+        let weight_bytes = total_m * (k / 256) * 112;
+        let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
         let timer = crate::profile::begin_timer(
-            &self.hip, "gemm", "gemm_mq3g256_lloyd_residual_wmma_lds_f32", bytes,
+            &self.hip, "gemm", "gemm_qkvza_mq3g256_lloyd_wmma", bytes,
         );
         let result = self.launch_maybe_blob(
-            "gemm_mq3g256_lloyd_residual_wmma_lds_f32",
+            "gemm_qkvza_mq3g256_lloyd_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b.push_ptr(a_qkv_p); b.push_ptr(a_z_p); b.push_ptr(a_beta_p); b.push_ptr(a_alpha_p);
+                b.push_ptr(x_p);
+                b.push_ptr(y_qkv_p); b.push_ptr(y_z_p); b.push_ptr(y_beta_p); b.push_ptr(y_alpha_p);
+                b.push_i32(qkv_m_v); b.push_i32(z_m_v); b.push_i32(beta_m_v); b.push_i32(alpha_m_v);
+                b.push_i32(k_v); b.push_i32(n_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3-Lloyd WMMA fused QKV GEMM (FA preamble: q + k + v).
+    pub fn gemm_qkv_mq3g256_lloyd_wmma(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
+
+        let mut a_q_p = a_q.buf.as_ptr();
+        let mut a_k_p = a_k.buf.as_ptr();
+        let mut a_v_p = a_v.buf.as_ptr();
+        let mut x_p = x_f16_ptr;
+        let mut y_q_p = y_q.buf.as_ptr();
+        let mut y_k_p = y_k.buf.as_ptr();
+        let mut y_v_p = y_v.buf.as_ptr();
+        let mut q_m_v = q_m as i32;
+        let mut k_m_v = k_m as i32;
+        let mut v_m_v = v_m as i32;
+        let mut k_v = k as i32;
+        let mut n_v = n as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_q_p as *mut _ as *mut c_void,
+            &mut a_k_p as *mut _ as *mut c_void,
+            &mut a_v_p as *mut _ as *mut c_void,
+            &mut x_p as *mut _ as *mut c_void,
+            &mut y_q_p as *mut _ as *mut c_void,
+            &mut y_k_p as *mut _ as *mut c_void,
+            &mut y_v_p as *mut _ as *mut c_void,
+            &mut q_m_v as *mut _ as *mut c_void,
+            &mut k_m_v as *mut _ as *mut c_void,
+            &mut v_m_v as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut n_v as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (n + 15) / 16;
+        let weight_bytes = total_m * (k / 256) * 112;
+        let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_qkv_mq3g256_lloyd_wmma", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_mq3g256_lloyd_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_q_p); b.push_ptr(a_k_p); b.push_ptr(a_v_p);
+                b.push_ptr(x_p);
+                b.push_ptr(y_q_p); b.push_ptr(y_k_p); b.push_ptr(y_v_p);
+                b.push_i32(q_m_v); b.push_i32(k_m_v); b.push_i32(v_m_v);
+                b.push_i32(k_v); b.push_i32(n_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// MQ3-Lloyd WMMA fused gate+up GEMM (FFN preamble).
+    pub fn gemm_gate_up_mq3g256_lloyd_wmma(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize, n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
+        let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
+
+        let mut a_gate_p = a_gate.buf.as_ptr();
+        let mut a_up_p = a_up.buf.as_ptr();
+        let mut x_p = x_f16_ptr;
+        let mut y_gate_p = y_gate.buf.as_ptr();
+        let mut y_up_p = y_up.buf.as_ptr();
+        let mut gate_m_v = gate_m as i32;
+        let mut up_m_v = up_m as i32;
+        let mut k_v = k as i32;
+        let mut n_v = n as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_gate_p as *mut _ as *mut c_void,
+            &mut a_up_p as *mut _ as *mut c_void,
+            &mut x_p as *mut _ as *mut c_void,
+            &mut y_gate_p as *mut _ as *mut c_void,
+            &mut y_up_p as *mut _ as *mut c_void,
+            &mut gate_m_v as *mut _ as *mut c_void,
+            &mut up_m_v as *mut _ as *mut c_void,
+            &mut k_v as *mut _ as *mut c_void,
+            &mut n_v as *mut _ as *mut c_void,
+        ];
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (n + 15) / 16;
+        let weight_bytes = total_m * (k / 256) * 112;
+        let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_gate_up_mq3g256_lloyd_wmma", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_gate_up_mq3g256_lloyd_wmma",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_gate_p); b.push_ptr(a_up_p);
+                b.push_ptr(x_p);
+                b.push_ptr(y_gate_p); b.push_ptr(y_up_p);
+                b.push_i32(gate_m_v); b.push_i32(up_m_v);
+                b.push_i32(k_v); b.push_i32(n_v);
                 b
             },
         );

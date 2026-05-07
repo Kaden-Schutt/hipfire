@@ -144,14 +144,7 @@ fn cpu_reference_gemm(
     y
 }
 
-#[derive(Copy, Clone)]
-enum Variant { Fp16Lds, Fp32Lds }
-
-impl Variant {
-    fn name(self) -> &'static str { match self { Variant::Fp16Lds => "fp16-LDS", Variant::Fp32Lds => "fp32-LDS" } }
-}
-
-fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize, variant: Variant) -> (f32, f32, f32, f64) {
+fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (f32, f32, f32) {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
     let groups_per_row = k / 256;
 
@@ -199,38 +192,8 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize, variant: Variant) -> (f3
     let d_x = gpu.upload_f32(&x, &[n, k]).unwrap();
     let d_y = gpu.upload_f32(&y_init, &[n, m]).unwrap();
 
-    // 1. Parity check on d_y (initialized with y_init).
-    match variant {
-        Variant::Fp16Lds => gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y, m, k, n).unwrap(),
-        Variant::Fp32Lds => gpu.gemm_mq3g256_lloyd_residual_wmma_lds_f32(&d_a, &d_x, &d_y, m, k, n).unwrap(),
-    };
-    let y_gpu = gpu.download_f32(&d_y).unwrap();  // forces device sync
-
-    // 2. Bench on a separate scratch Y (don't care about value, just wall time).
-    //    n_warmup priming calls + n_iter timed calls. download forces device-side sync.
-    let n_warmup = 3usize;
-    let n_iter = 20usize;
-    let d_y_bench = gpu.zeros(&[n, m], DType::F32).unwrap();
-    for _ in 0..n_warmup {
-        match variant {
-            Variant::Fp16Lds => gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y_bench, m, k, n).unwrap(),
-            Variant::Fp32Lds => gpu.gemm_mq3g256_lloyd_residual_wmma_lds_f32(&d_a, &d_x, &d_y_bench, m, k, n).unwrap(),
-        };
-    }
-    // Force completion of warmup before timing starts.
-    let _ = gpu.download_f32(&d_y_bench).unwrap();
-
-    let t0 = std::time::Instant::now();
-    for _ in 0..n_iter {
-        match variant {
-            Variant::Fp16Lds => gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y_bench, m, k, n).unwrap(),
-            Variant::Fp32Lds => gpu.gemm_mq3g256_lloyd_residual_wmma_lds_f32(&d_a, &d_x, &d_y_bench, m, k, n).unwrap(),
-        };
-    }
-    // Force completion before stopping the timer.
-    let _ = gpu.download_f32(&d_y_bench).unwrap();
-    let elapsed_us_per_call = t0.elapsed().as_secs_f64() * 1e6 / n_iter as f64;
-    gpu.free_tensor(d_y_bench).unwrap();
+    gpu.gemm_mq3g256_lloyd_residual_wmma(&d_a, &d_x, &d_y, m, k, n).unwrap();
+    let y_gpu = gpu.download_f32(&d_y).unwrap();
 
     let y_ref = cpu_reference_gemm(m, k, n, &codebooks_per_row, &indices_per_row, &x, &y_init);
 
@@ -250,7 +213,7 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize, variant: Variant) -> (f3
     gpu.free_tensor(d_a).unwrap();
     gpu.free_tensor(d_x).unwrap();
     gpu.free_tensor(d_y).unwrap();
-    (max_abs, max_rel, rms_err, elapsed_us_per_call)
+    (max_abs, max_rel, rms_err)
 }
 
 fn main() {
@@ -279,39 +242,23 @@ fn main() {
 
     let mut all_pass = true;
     let mut global_max_abs = 0f32;
-    println!("{:>5} {:>6} {:>4}  {:>10}  {:>11}  {:>11}  {:>11}  {:>10}  {}",
-             "M", "K", "N", "variant", "max_abs", "max_rel", "rms", "us/call", "verdict");
-
-    let variants = [Variant::Fp16Lds, Variant::Fp32Lds];
-
-    // Aggregate timing per variant (sum of us/call across all shapes).
-    let mut variant_total_us: [f64; 2] = [0.0, 0.0];
+    println!("{:>5} {:>6} {:>4}  {:>11}  {:>11}  {:>11}  {}",
+             "M", "K", "N", "max_abs", "max_rel", "rms", "verdict");
 
     for &(m, k, n) in cases {
-        for (i, &variant) in variants.iter().enumerate() {
-            let (max_abs, max_rel, rms, us_per_call) = run_one(&mut gpu, m, k, n, variant);
-            let pass = max_abs < phase_a_tolerance;
-            let tag = if pass { "PASS" } else { "FAIL" };
-            println!(
-                "{:>5} {:>6} {:>4}  {:>10}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {:>10.1}  {tag}",
-                m, k, n, variant.name(), max_abs, max_rel, rms, us_per_call
-            );
-            if !pass { all_pass = false; }
-            if max_abs > global_max_abs { global_max_abs = max_abs; }
-            variant_total_us[i] += us_per_call;
-        }
+        let (max_abs, max_rel, rms) = run_one(&mut gpu, m, k, n);
+        let pass = max_abs < phase_a_tolerance;
+        let tag = if pass { "PASS" } else { "FAIL" };
+        println!(
+            "{:>5} {:>6} {:>4}  {:>11.3e}  {:>11.3e}  {:>11.3e}  {tag}",
+            m, k, n, max_abs, max_rel, rms
+        );
+        if !pass { all_pass = false; }
+        if max_abs > global_max_abs { global_max_abs = max_abs; }
     }
     println!();
     println!("Max-abs across all shapes  : {:.3e}", global_max_abs);
     println!("Phase A tolerance (initial): {:.3e}", phase_a_tolerance);
-    println!("Suggested B1 tolerance (~3× observed): {:.3e}", global_max_abs * 3.0);
-    println!();
-    println!("Aggregate wall time per variant (sum across all shapes):");
-    println!("  fp16-LDS: {:>9.1} us", variant_total_us[0]);
-    println!("  fp32-LDS: {:>9.1} us", variant_total_us[1]);
-    let pct = (variant_total_us[1] - variant_total_us[0]) / variant_total_us[0] * 100.0;
-    let winner = if variant_total_us[0] <= variant_total_us[1] { "fp16-LDS" } else { "fp32-LDS" };
-    println!("  Winner   : {} (Δ {:+.2}%, fp32 vs fp16 baseline)", winner, pct);
 
     if !all_pass {
         eprintln!("\nFAIL: one or more shapes exceeded {} absolute", phase_a_tolerance);
