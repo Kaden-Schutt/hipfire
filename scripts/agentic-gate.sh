@@ -191,14 +191,15 @@ if [ "$rebuild" -eq 1 ]; then
     fi
 fi
 
-# Isolate the daemon's pid file under a gate-private dir so we never
-# interfere with a parallel user-spawned daemon. The daemon hardcodes its
-# lock to $HOME/.hipfire/daemon.pid (daemon.rs:142-153) and there is no env
-# var to disable it on master. We override $HOME for the daemon child only
-# (see env line further down) so its lock writes to GATE_HIPFIRE_DIR/.hipfire/
-# daemon.pid, leaving the user's $HOME/.hipfire/daemon.pid untouched. $HOME
-# is the only place daemon.rs reads it, verified via grep.
-GATE_HIPFIRE_DIR="$(mktemp -d /tmp/agentic-gate-hipfire-XXXXXX)"
+# Concurrency policy: the gate uses the daemon's existing singleton flock
+# at $HOME/.hipfire/daemon.pid (daemon.rs:171). If a user daemon is already
+# running, the gate's daemon will exit with FATAL; we detect that in the
+# per-cell parser and surface it as a hard fail. We do NOT override $HOME
+# or rm the pid file — both would either bypass the singleton (allowing two
+# 35B daemons on one GPU) or break a parallel user daemon's lock. When the
+# gate's daemon dies via SIGKILL (cleanup path), the kernel auto-releases
+# the flock; the stale pid-file content is harmless (next daemon truncates
+# and overwrites at startup).
 DAEMON_PID=""
 
 cleanup() {
@@ -210,7 +211,6 @@ cleanup() {
         kill -9 "$DAEMON_PID" 2>/dev/null
     fi
     DAEMON_PID=""
-    rm -rf "$GATE_HIPFIRE_DIR" 2>/dev/null
     gpu_release 2>/dev/null || true
 }
 
@@ -406,14 +406,12 @@ PY
     mkfifo "$STDIN_FIFO"
 
     # Spawn daemon in background, redirected stdin from FIFO, stdout to file.
-    # The daemon hardcodes its pid lock to $HOME/.hipfire/daemon.pid (see
-    # daemon.rs:142-153). To isolate the gate's daemon from any parallel
-    # user-spawned daemon we override $HOME for this child only — the daemon
-    # then writes its lock under our gate-private temp dir. $HOME is the
-    # ONLY place daemon.rs reads it (verified via grep), so model paths and
-    # other state are unaffected.
-    env HOME="$GATE_HIPFIRE_DIR" \
-        HIPFIRE_KV_MODE=asym3 \
+    # The daemon's flock at $HOME/.hipfire/daemon.pid (daemon.rs:171) acts
+    # as the singleton: if another daemon is already running, this child
+    # will exit with "FATAL: hipfire daemon already running" and the
+    # detector picks it up. No HOME override here — that bypasses the
+    # singleton and risks two 35B daemons on one GPU.
+    env HIPFIRE_KV_MODE=asym3 \
         HIPFIRE_GRAPH=1 \
         "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
     DAEMON_PID=$!
@@ -455,8 +453,9 @@ out_path = sys.argv[1]
 report_path = sys.argv[2]
 cells = sys.argv[3:]
 
+raw_text = pathlib.Path(out_path).read_text()
 events = []
-for line in pathlib.Path(out_path).read_text().splitlines():
+for line in raw_text.splitlines():
     line = line.strip()
     if not line.startswith("{"): continue
     try:
@@ -470,9 +469,15 @@ for ev in events:
     if ev.get("type") == "token":
         by_id.setdefault(ev["id"], []).append(ev["text"])
 
-# Detect daemon panic / error
+# Detect daemon panic / error (JSON error events).
 panic = any(ev.get("type") == "error" for ev in events)
 panic_msg = next((ev["message"] for ev in events if ev.get("type") == "error"), "")
+
+# Detect singleton-collision FATAL. The Rust daemon emits this as plain
+# text on stderr (now merged into stdout) when another daemon already
+# holds $HOME/.hipfire/daemon.pid (daemon.rs:178-182). It is NOT a JSON
+# event, so it slips past the panic check above.
+fatal_singleton = "FATAL: hipfire daemon already running" in raw_text
 
 def extract_tool_call_body(text):
     # Use minimal regex; the body extraction is the same as coherence-gate.
@@ -517,6 +522,11 @@ with open(report_path, "a") as report:
         verdict = "PASS"
         notes = []
 
+        # Hard-fail: singleton collision (a user daemon was already running)
+        if fatal_singleton:
+            verdict = "HARD_FAIL"
+            notes.append("daemon singleton: another hipfire daemon was already running on this host - release it before running the gate")
+            hard_fail = True
         # Hard-fail: zero tokens
         if not toks_t1:
             verdict = "HARD_FAIL"
