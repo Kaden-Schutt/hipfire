@@ -9,6 +9,18 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// Per-group byte size of the MQ3-Lloyd quantization layout.
+///
+/// 16 B fp16 codebook (8 entries) + 96 B 3-bit packed indices = 112 B.
+/// Compare to HFQ3 / uniform MQ3's 104 B/group (8 B affine header).
+///
+/// Every Lloyd-MQ3 dispatch arm references this constant; **never use a
+/// literal 112 in dispatch.rs** — keeping the named constant lets a
+/// future review grep `\* 1(04|12)` and find any Lloyd-related hits as
+/// stride-mismatch bugs (followup discipline from
+/// docs/plans/mq-lloyd-batched-prefill-followup.md).
+pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
+
 thread_local! {
     /// Per-thread cache for `Gpu::bind_thread`. Sentinel `-1` forces the
     /// first call to issue `hipSetDevice` even when the target id is 0.
@@ -2210,10 +2222,7 @@ impl Gpu {
         let row_tiles = (m + 15) / 16;
         let batch_tiles = (batch_size + 15) / 16;
 
-        // 112 B/group (Lloyd) vs HFQ3's 104. LLOYD_MQ3_GROUP_BYTES would
-        // become a named const in Phase B2; for Phase A keep the magic
-        // number scoped to this single arm.
-        let weight_bytes = m * (k / 256) * 112;
+        let weight_bytes = m * (k / 256) * LLOYD_MQ3_GROUP_BYTES;
         let bytes = weight_bytes + batch_size * k * 2 + batch_size * m * 4 * 2;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_mq3g256_lloyd_residual_wmma", bytes,
@@ -2288,7 +2297,7 @@ impl Gpu {
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (n + 15) / 16;
-        let weight_bytes = total_m * (k / 256) * 112;
+        let weight_bytes = total_m * (k / 256) * LLOYD_MQ3_GROUP_BYTES;
         let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_qkvza_mq3g256_lloyd_wmma", bytes,
@@ -2358,7 +2367,7 @@ impl Gpu {
         let total_m = q_m + k_m + v_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (n + 15) / 16;
-        let weight_bytes = total_m * (k / 256) * 112;
+        let weight_bytes = total_m * (k / 256) * LLOYD_MQ3_GROUP_BYTES;
         let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_qkv_mq3g256_lloyd_wmma", bytes,
@@ -2422,7 +2431,7 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let row_tiles = (total_m + 15) / 16;
         let batch_tiles = (n + 15) / 16;
-        let weight_bytes = total_m * (k / 256) * 112;
+        let weight_bytes = total_m * (k / 256) * LLOYD_MQ3_GROUP_BYTES;
         let bytes = weight_bytes + n * k * 2 + n * total_m * 4;
         let timer = crate::profile::begin_timer(
             &self.hip, "gemm", "gemm_gate_up_mq3g256_lloyd_wmma", bytes,
