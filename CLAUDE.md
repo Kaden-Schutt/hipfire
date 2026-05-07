@@ -203,6 +203,25 @@ verify the caller actually sets a stream (fix pattern: create
 `gpu.active_stream` at the top of the caller — see da2753e for
 `spec_step_dflash`).
 
+## Skills (`docs/skills/`)
+
+Reusable how-tos kept out of CLAUDE.md to avoid bloat. Each skill is a
+self-contained reference; reach for it by name when the situation
+matches. Index of currently-available skills:
+
+- **`gfx-kernel-metadata`** — extract VGPR/SGPR/LDS/spill counts from
+  a compiled `.hsaco` and compute theoretical occupancy. Covers all
+  CDNA (gfx906/908/90a/942 wave64) and RDNA (gfx10xx through gfx1200+
+  wave32) archs. **Reach for this when:** verifying zero spills after
+  a kernel change, computing occupancy headroom, comparing register /
+  LDS budgets across kernel variants, or interpreting
+  `__launch_bounds__` tradeoffs. Manual disassembly via
+  `clang-offload-bundler` + `llvm-readelf` is fiddly enough that the
+  skill doc is faster to follow than to rederive.
+
+When adding a new skill, give it a one-line index entry here so future
+sessions find it without grepping.
+
 ## Coherence Gate (mandatory)
 
 Any change to kernels, quant formats, dispatch, fusion, rotation, rmsnorm,
