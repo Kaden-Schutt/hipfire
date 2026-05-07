@@ -14,6 +14,17 @@
 #     1. Prompt-length-sensitive MMQ regression cover (the #87 class)
 #     2. Tool-call structural validation (JSON.parse + schema match)
 #
+# What this gate does NOT cover (by design, today):
+#   - Jinja chat-template rendering. Master hardcodes AssistantPrefix::Plain
+#     at 4 daemon sites; there is no HIPFIRE_JINJA_CHAT toggle on master.
+#     PR #175 ships that toggle (gated 1=on, default off + Plain). When #175
+#     lands, this gate should grow a `jinja=1` axis so we exercise both
+#     framing paths. Until then, every cell uses the Plain scaffold.
+#   - OpenAI HTTP path. Cells drive the daemon over stdin JSONL; the
+#     `serve` HTTP path runs additional Node-side Jinja rendering that
+#     this harness skips. OpenAI-shaped tool-call regressions need a
+#     daemon-up + curl harness; defer.
+#
 # Modes:
 #   ./scripts/agentic-gate.sh                # full: 2 models * 4 cells = 8 cells, ~5 min
 #   ./scripts/agentic-gate.sh --fast         # 1 cell, ~2 min - used by pre-commit
@@ -180,12 +191,35 @@ if [ "$rebuild" -eq 1 ]; then
     fi
 fi
 
+# Isolate the daemon's pid file under a gate-private dir so we never
+# interfere with a parallel user-spawned daemon. The daemon hardcodes its
+# lock to $HOME/.hipfire/daemon.pid (daemon.rs:142-153) and there is no env
+# var to disable it on master. We override $HOME for the daemon child only
+# (see env line further down) so its lock writes to GATE_HIPFIRE_DIR/.hipfire/
+# daemon.pid, leaving the user's $HOME/.hipfire/daemon.pid untouched. $HOME
+# is the only place daemon.rs reads it, verified via grep.
+GATE_HIPFIRE_DIR="$(mktemp -d /tmp/agentic-gate-hipfire-XXXXXX)"
+DAEMON_PID=""
+
+cleanup() {
+    # Kill ONLY the daemon we spawned, by tracked PID. Never pkill -f.
+    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null
+        # Give it a beat, then SIGKILL if still alive.
+        sleep 1
+        kill -9 "$DAEMON_PID" 2>/dev/null
+    fi
+    DAEMON_PID=""
+    rm -rf "$GATE_HIPFIRE_DIR" 2>/dev/null
+    gpu_release 2>/dev/null || true
+}
+
 # GPU lock
 if [ -r "$LOCK_SCRIPT" ]; then
     # shellcheck disable=SC1090
     . "$LOCK_SCRIPT"
     gpu_acquire "agentic-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
-    trap 'pkill -f "examples/daemon" 2>/dev/null; rm -f "$HOME/.hipfire/daemon.pid" 2>/dev/null; gpu_release 2>/dev/null || true' EXIT
+    trap cleanup EXIT
 fi
 
 # ---- Build cell list -------------------------------------------------------
@@ -193,11 +227,9 @@ fi
 build_cells() {
     local model="$1"
     local prefix="$2"
-    if [ "$MODE" = "fast" ]; then
-        # Fast mode: single cell on 3.6 if present, else 3.5
-        if [ "$prefix" = "3.6" ]; then
-            echo "$model|$HERMES_SYS|0|0|${prefix}_hermes_unclamped"
-        fi
+    local fast_only="$3"  # 1 = emit only the fast cell for this model
+    if [ "$fast_only" = "1" ]; then
+        echo "$model|$HERMES_SYS|0|0|${prefix}_hermes_unclamped"
         return
     fi
     # Full mode: 4 cells per model
@@ -208,20 +240,41 @@ build_cells() {
 }
 
 CELLS=()
-if [ -f "$A3B_35" ]; then
-    while IFS= read -r line; do
-        [ -n "$line" ] && CELLS+=("$line")
-    done < <(build_cells "$A3B_35" "3.5")
-fi
-if [ -f "$A3B_36" ]; then
-    while IFS= read -r line; do
-        [ -n "$line" ] && CELLS+=("$line")
-    done < <(build_cells "$A3B_36" "3.6")
+if [ "$MODE" = "fast" ]; then
+    # Fast mode: prefer 3.6 (newer) if present; fall back to 3.5 if only it
+    # is installed. Never silently skip if at least one A3B is available.
+    if [ -f "$A3B_36" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && CELLS+=("$line")
+        done < <(build_cells "$A3B_36" "3.6" 1)
+    elif [ -f "$A3B_35" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && CELLS+=("$line")
+        done < <(build_cells "$A3B_35" "3.5" 1)
+    fi
+else
+    # Full mode: every available A3B contributes its 4 cells.
+    if [ -f "$A3B_35" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && CELLS+=("$line")
+        done < <(build_cells "$A3B_35" "3.5" 0)
+    fi
+    if [ -f "$A3B_36" ]; then
+        while IFS= read -r line; do
+            [ -n "$line" ] && CELLS+=("$line")
+        done < <(build_cells "$A3B_36" "3.6" 0)
+    fi
 fi
 
 if [ "${#CELLS[@]}" -eq 0 ]; then
-    echo "agentic-gate: no cells to run (fast mode requires 3.6-A3B; both models absent or fast on 3.5-only)"
-    exit 0
+    # Belt-and-suspenders: should never reach here, since the early skip-on-
+    # absence at the top exited 0 when both models are missing. If we DO get
+    # here, something is wrong with the cell builder; fail loud rather than
+    # silently passing.
+    echo "agentic-gate: no cells built despite at least one A3B model present" >&2
+    echo "  A3B_35=$A3B_35  exists=$([ -f "$A3B_35" ] && echo yes || echo no)" >&2
+    echo "  A3B_36=$A3B_36  exists=$([ -f "$A3B_36" ] && echo yes || echo no)" >&2
+    exit 2
 fi
 
 # ---- Report header ---------------------------------------------------------
@@ -268,8 +321,12 @@ for model in "${!MODEL_CELLS[@]}"; do
 
     # Build JSONL: load + (per cell: generate, optional second-turn generate) + unload
     # Each cell gets a unique id ${prefix}_${cellnum}_t1 (and _t2 for multi-turn).
+    # NOTE: never touch $HOME/.hipfire/daemon.pid here. The daemon's lock at
+    # daemon.rs:142 always opens that path under $HOME — we override $HOME
+    # for the daemon child below so its pid lives at $GATE_HIPFIRE_DIR/.hipfire/
+    # daemon.pid instead. Removing the user's pid file would unlink an active
+    # user daemon's flock target.
     JSONL_FILE="$(mktemp /tmp/agentic-gate-jsonl.XXXXXX)"
-    rm -f "$HOME/.hipfire/daemon.pid" 2>/dev/null
 
     python3 - "$model" "$JSONL_FILE" <<'PY' >/dev/null
 import sys, json, os
@@ -342,9 +399,28 @@ PY
 
     # Pace JSONL into the daemon. The daemon blocks on stdin readline, so we
     # need a slow producer to allow load + each generate to complete in order.
+    # We use named-pipe + background daemon so we can capture the daemon's
+    # exact PID and kill ONLY that PID at end-of-cell. Never pkill -f.
     OUTPUT_FILE="$(mktemp /tmp/agentic-gate-out.XXXXXX)"
+    STDIN_FIFO="$(mktemp -u /tmp/agentic-gate-fifo.XXXXXX)"
+    mkfifo "$STDIN_FIFO"
+
+    # Spawn daemon in background, redirected stdin from FIFO, stdout to file.
+    # The daemon hardcodes its pid lock to $HOME/.hipfire/daemon.pid (see
+    # daemon.rs:142-153). To isolate the gate's daemon from any parallel
+    # user-spawned daemon we override $HOME for this child only — the daemon
+    # then writes its lock under our gate-private temp dir. $HOME is the
+    # ONLY place daemon.rs reads it (verified via grep), so model paths and
+    # other state are unaffected.
+    env HOME="$GATE_HIPFIRE_DIR" \
+        HIPFIRE_KV_MODE=asym3 \
+        HIPFIRE_GRAPH=1 \
+        "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
+    DAEMON_PID=$!
+
+    # Producer: pace each JSONL line. The daemon reads-and-blocks per
+    # newline, so we sleep after each send to let it complete.
     (
-        # First line is load; pace ~90s for A3B model load.
         while IFS= read -r line; do
             printf '%s\n' "$line"
             type="$(echo "$line" | python3 -c 'import sys,json;d=json.loads(sys.stdin.read());print(d["type"])' 2>/dev/null)"
@@ -354,12 +430,22 @@ PY
                 unload)   sleep 2  ;;
             esac
         done < "$JSONL_FILE"
-    ) | env HIPFIRE_NO_PID_FILE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
-        "$EXE" 2>&1 > "$OUTPUT_FILE" || true
-    pkill -f "examples/daemon" 2>/dev/null
-    sleep 2
+    ) > "$STDIN_FIFO"
 
-    rm -f "$JSONL_FILE"
+    # Producer is done; daemon will see EOF on stdin after unload. Wait
+    # briefly for graceful exit, then kill by tracked PID if still alive.
+    for _ in 1 2 3 4 5; do
+        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then break; fi
+        sleep 1
+    done
+    if kill -0 "$DAEMON_PID" 2>/dev/null; then
+        kill "$DAEMON_PID" 2>/dev/null
+        sleep 1
+        kill -9 "$DAEMON_PID" 2>/dev/null
+    fi
+    wait "$DAEMON_PID" 2>/dev/null || true
+    DAEMON_PID=""
+    rm -f "$STDIN_FIFO" "$JSONL_FILE"
 
     # Parse output, run detectors per cell, append to report.
     python3 - "$OUTPUT_FILE" "$OUT" "${cell_args[@]}" <<'PY'
@@ -527,6 +613,18 @@ total_cells=${#CELLS[@]}
     echo "- soft warns: $soft_count"
 } >> "$OUT"
 
+if [ "$HARD_FAIL" -eq 1 ]; then
+    {
+        echo
+        echo "## Detector failure"
+        echo
+        echo "One or more model passes had a detector script crash. Exit code 1"
+        echo "regardless of report-level cell counts."
+    } >> "$OUT"
+    echo "agentic-gate: HARD FAIL (detector crashed during a model pass)"
+    echo "report: $OUT"
+    exit 1
+fi
 if [ "$hard_count" -gt 0 ]; then
     echo "agentic-gate: HARD FAIL ($hard_count cells)"
     echo "report: $OUT"
