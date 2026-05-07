@@ -153,10 +153,22 @@ SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rop
 if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
    || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
    || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
-    echo "=== DFlash/DDTree Coherence Battery ==="
-    echo "Spec-decode path changed. Running dflash coherence battery (~3 min)..."
+    # --fast on every commit; --full only when explicitly forced. The fast
+    # battery (1 prose + 1 code, dflash only) catches the Path A single-token
+    # attractor regression class which is what this gate is here for. The
+    # ddtree variants in the short battery add ~2 min of redundant cover for
+    # the same failure mode.
+    if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ]; then
+        DFLASH_FLAG=""
+        DFLASH_NOTE="(forced full battery)"
+    else
+        DFLASH_FLAG="--fast"
+        DFLASH_NOTE="(fast: 2 cells, ~1 min — full battery via HIPFIRE_FORCE_SPEC_GATE=1)"
+    fi
+    echo "=== DFlash/DDTree Coherence Battery $DFLASH_NOTE ==="
+    echo "Spec-decode path changed. Running dflash coherence battery..."
     echo
-    if ! ./scripts/coherence-gate-dflash.sh; then
+    if ! ./scripts/coherence-gate-dflash.sh $DFLASH_FLAG; then
         echo
         echo "========================================================================"
         echo "COMMIT BLOCKED: dflash coherence battery hit a HARD error."
@@ -171,8 +183,8 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
         echo "+τ / +tok-s wins on stat gates and silently corrupt outputs."
         echo
         echo "Investigation:"
-        echo "  ./scripts/coherence-gate-dflash.sh    # re-run short"
-        echo "  ./scripts/coherence-gate-dflash.sh --full   # add b22-k4 + b8-k2"
+        echo "  ./scripts/coherence-gate-dflash.sh           # re-run short (4 cells)"
+        echo "  ./scripts/coherence-gate-dflash.sh --full    # add b22-k4 + b8-k2"
         echo
         exit 1
     fi
@@ -183,6 +195,53 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
 fi
 
 echo
+
+# ── Agentic gate (--fast) ────────────────────────────────────────────────
+# Tool-call shape regression battery for A3B variants under realistic-length
+# agent system prompts (Pi-style ~1300 tok, Hermes-style ~780 tok). Guards
+# against issue #87-class regressions: prompt-length-sensitive corruption of
+# tool_call JSON (special-token leak, malformed JSON, stacked openers) that
+# coherence-gate.sh's 50-token system prompt cannot reproduce.
+#
+# Fires on any HOTSPOT match (same surface as coherence-gate). Skips silently
+# if A3B models absent (CI-safe). Force full battery via
+# HIPFIRE_FORCE_AGENTIC_GATE=1; skip entirely via HIPFIRE_SKIP_AGENTIC_GATE=1.
+if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
+    if [ "${HIPFIRE_FORCE_AGENTIC_GATE:-0}" = "1" ]; then
+        AGENTIC_FLAG=""
+        AGENTIC_NOTE="(forced full: 8 cells, ~5 min)"
+    else
+        AGENTIC_FLAG="--fast"
+        AGENTIC_NOTE="(fast: 1 cell, ~2 min — full via HIPFIRE_FORCE_AGENTIC_GATE=1)"
+    fi
+    echo "=== Agentic Gate $AGENTIC_NOTE ==="
+    echo "Tool-call shape regression cover. Skips if A3B models absent."
+    echo
+    if ! ./scripts/agentic-gate.sh $AGENTIC_FLAG; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: agentic-gate.sh hit a HARD failure."
+        echo "========================================================================"
+        echo
+        echo "One or more A3B + agent-prompt cells produced corrupt tool_call output:"
+        echo "malformed JSON, missing required fields, special-token leak, stacked"
+        echo "openers, or > 1 soft-warn (collective threshold)."
+        echo
+        echo "DO NOT bypass with --no-verify. This regression class silently breaks"
+        echo "tool-call parsers downstream — see issue #87 (April 2026 auto-MMQ"
+        echo "regression that ChatML-leaked into <tool_call> JSON)."
+        echo
+        echo "Investigation:"
+        echo "  ./scripts/agentic-gate.sh --fast        # re-run single cell"
+        echo "  ./scripts/agentic-gate.sh               # full 8-cell battery"
+        echo "  ./scripts/agentic-gate.sh --self-check  # verify detectors not rotted"
+        echo
+        echo "Per-commit escape (use with care): HIPFIRE_SKIP_AGENTIC_GATE=1"
+        echo
+        exit 1
+    fi
+    echo
+fi
 
 # ── Multi-GPU PP gate ────────────────────────────────────────────────────
 # Skips silently when fewer than 2 GPU are visible — single-GPU CI and

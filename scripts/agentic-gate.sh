@@ -1,0 +1,543 @@
+#!/usr/bin/env bash
+# Agentic gate - tool-call shape regression battery for A3B variants.
+#
+# Why this gate exists:
+#   coherence-gate.sh runs a tool-call test row but only checks for `<tool_call>`
+#   tag presence and `<|im_start|>` leakage in visible text. It uses a 50-token
+#   system prompt. Issue #87's auto-MMQ regression produced clean output on
+#   short prompts but corrupt tool-call JSON on long agent-shape prompts.
+#   This gate guards that regression class with realistic 780-1300 token
+#   system contexts (Pi-style + Hermes-style) and machine-evaluated JSON
+#   structural validation.
+#
+#   Value-add over coherence-gate.sh --full (which already runs A3B sheep):
+#     1. Prompt-length-sensitive MMQ regression cover (the #87 class)
+#     2. Tool-call structural validation (JSON.parse + schema match)
+#
+# Modes:
+#   ./scripts/agentic-gate.sh                # full: 2 models * 4 cells = 8 cells, ~5 min
+#   ./scripts/agentic-gate.sh --fast         # 1 cell, ~2 min - used by pre-commit
+#   ./scripts/agentic-gate.sh --self-check   # detector rot guard, <1s
+#
+# Exit codes:
+#   0 - battery ran clean
+#   1 - hard error (panic, zero tokens, JSON parse fail, special-token leak,
+#       stacked openers, or > 1/N cells soft-warned)
+#   2 - build / env / detector-self-check failure
+#
+# Skip semantics (CI-safe):
+#   - Both A3B models absent      -> exit 0 with SKIPPED message
+#   - One model absent            -> run the present one's cells, log skip
+#   - HIPFIRE_SKIP_AGENTIC_GATE=1 -> exit 0 immediately
+#
+# Report destination: /tmp/agentic-gate-<timestamp>.md (or $HIPFIRE_AGENTIC_GATE_OUT)
+
+set -u
+cd "$(dirname "$0")/.."
+
+MODE="full"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --fast)        MODE="fast"; ;;
+        --self-check)  MODE="self-check"; ;;
+        -h|--help)
+            sed -n '3,32p' "$0"
+            exit 0
+            ;;
+        *) echo "unknown arg: $1" >&2; exit 2 ;;
+    esac
+    shift
+done
+
+if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" = "1" ]; then
+    echo "agentic-gate: HIPFIRE_SKIP_AGENTIC_GATE=1 - skipping"
+    exit 0
+fi
+
+# ---- Self-check mode (detector rot guard) ----------------------------------
+# Construct a payload that intentionally trips every detector, run them, and
+# assert each fires. Cheap (<1s); guards the gate against silent rot if the
+# detector regexes drift away from real failure shapes.
+if [ "$MODE" = "self-check" ]; then
+    python3 - <<'PY'
+import sys, json, re
+
+# Two synthetic payloads cover all 4 detectors. parse-fail and schema-violation
+# are mutually exclusive on a single payload (one requires successful parse, the
+# other forbids it), so we test them on separate inputs.
+
+# Trips: stacked_openers + special_token_leak + json_parse_fail
+PAYLOAD_CORRUPT = '''\
+Here is my response:
+
+<tool_call>
+<tool_call>
+{"arguments": {"path": "/tmp/x"<|im_start|>}}
+</tool_call><|im_end|>
+'''
+
+# Trips: schema_violation only (JSON parses, but missing required `name` field)
+PAYLOAD_SCHEMA_BAD = '''\
+<tool_call>
+{"arguments": {"path": "/tmp/x"}}
+</tool_call><|im_end|>
+'''
+
+def detect_stacked_openers(text):
+    return bool(re.search(r"<tool_call>\s*<tool_call>", text))
+
+def detect_special_token_leak(body):
+    return any(tok in body for tok in ("<|im_start|>", "<|endoftext|>"))
+
+def detect_json_parse_fail(body):
+    try:
+        json.loads(body)
+        return False
+    except json.JSONDecodeError:
+        return True
+
+def detect_schema_violation(body):
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        return False  # parse-fail is its own detector; don't double-count
+    return not (isinstance(obj, dict) and "name" in obj and "arguments" in obj)
+
+def body_of(payload):
+    m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", payload, re.S)
+    body = m.group(1) if m else ""
+    # Strip any nested opener before JSON tests so stacked_openers stays
+    # independent.
+    return re.sub(r"^<tool_call>\s*", "", body)
+
+corrupt_body = body_of(PAYLOAD_CORRUPT)
+schema_body = body_of(PAYLOAD_SCHEMA_BAD)
+
+results = {
+    "stacked_openers":     detect_stacked_openers(PAYLOAD_CORRUPT),
+    "special_token_leak":  detect_special_token_leak(corrupt_body),
+    "json_parse_fail":     detect_json_parse_fail(corrupt_body),
+    "schema_violation":    detect_schema_violation(schema_body),
+}
+
+failed = [k for k, v in results.items() if not v]
+print("self-check results:")
+for k, v in results.items():
+    print(f"  {k:20s} {'fired' if v else 'MISSED'}")
+if failed:
+    print(f"\nself-check FAILED: detectors did not fire on synthetic corrupt: {failed}", file=sys.stderr)
+    print("detector rot suspected - review the regexes and update before merging.", file=sys.stderr)
+    sys.exit(2)
+print("\nself-check passed: all 4 detectors fired against synthetic corrupt payloads")
+PY
+    exit $?
+fi
+
+# ---- Setup -----------------------------------------------------------------
+EXE="./target/release/examples/daemon"
+MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
+OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
+LOCK_SCRIPT="./scripts/gpu-lock.sh"
+
+A3B_35="$MODELS_DIR/qwen3.5-35b-a3b.mq4"
+A3B_36="$MODELS_DIR/qwen3.6-35b-a3b.mq4"
+PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
+HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
+USER_READ="benchmarks/prompts/agentic_user_read.txt"
+
+# Skip-on-absence: both models missing -> exit 0
+if [ ! -f "$A3B_35" ] && [ ! -f "$A3B_36" ]; then
+    echo "agentic-gate: A3B models absent ($A3B_35, $A3B_36) - SKIPPED"
+    exit 0
+fi
+
+# Required fixtures
+for f in "$PI_SYS" "$HERMES_SYS" "$USER_READ"; do
+    if [ ! -f "$f" ]; then
+        echo "agentic-gate: required fixture missing: $f" >&2
+        exit 2
+    fi
+done
+
+# Rebuild daemon if any tracked source is newer than the binary.
+rebuild=0
+if [ ! -x "$EXE" ]; then
+    rebuild=1
+else
+    for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
+               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
+               crates/rdna-compute/src/dispatch.rs; do
+        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
+            rebuild=1; break
+        fi
+    done
+fi
+if [ "$rebuild" -eq 1 ]; then
+    echo "agentic-gate: rebuilding daemon..."
+    if ! cargo build --release --example daemon --features deltanet >&2; then
+        echo "agentic-gate: build failed" >&2
+        exit 2
+    fi
+fi
+
+# GPU lock
+if [ -r "$LOCK_SCRIPT" ]; then
+    # shellcheck disable=SC1090
+    . "$LOCK_SCRIPT"
+    gpu_acquire "agentic-gate" || { echo "could not acquire GPU lock" >&2; exit 2; }
+    trap 'pkill -f "examples/daemon" 2>/dev/null; rm -f "$HOME/.hipfire/daemon.pid" 2>/dev/null; gpu_release 2>/dev/null || true' EXIT
+fi
+
+# ---- Build cell list -------------------------------------------------------
+# Each cell: model | system_fixture | thinking_clamp_bool | multi_turn_bool | label
+build_cells() {
+    local model="$1"
+    local prefix="$2"
+    if [ "$MODE" = "fast" ]; then
+        # Fast mode: single cell on 3.6 if present, else 3.5
+        if [ "$prefix" = "3.6" ]; then
+            echo "$model|$HERMES_SYS|0|0|${prefix}_hermes_unclamped"
+        fi
+        return
+    fi
+    # Full mode: 4 cells per model
+    echo "$model|$PI_SYS|0|0|${prefix}_pi_unclamped"
+    echo "$model|$PI_SYS|1|0|${prefix}_pi_clamped"
+    echo "$model|$HERMES_SYS|0|0|${prefix}_hermes_unclamped"
+    echo "$model|$HERMES_SYS|0|1|${prefix}_hermes_multiturn"
+}
+
+CELLS=()
+if [ -f "$A3B_35" ]; then
+    while IFS= read -r line; do
+        [ -n "$line" ] && CELLS+=("$line")
+    done < <(build_cells "$A3B_35" "3.5")
+fi
+if [ -f "$A3B_36" ]; then
+    while IFS= read -r line; do
+        [ -n "$line" ] && CELLS+=("$line")
+    done < <(build_cells "$A3B_36" "3.6")
+fi
+
+if [ "${#CELLS[@]}" -eq 0 ]; then
+    echo "agentic-gate: no cells to run (fast mode requires 3.6-A3B; both models absent or fast on 3.5-only)"
+    exit 0
+fi
+
+# ---- Report header ---------------------------------------------------------
+{
+    echo "# Agentic gate"
+    echo
+    echo "- commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+    echo "- date:   $(date -Iseconds)"
+    echo "- mode:   $MODE"
+    echo "- cells:  ${#CELLS[@]}"
+    echo
+    echo "Hard-fail predicates:"
+    echo "- daemon panic / zero tokens / timeout"
+    echo "- tool_call body fails JSON parse"
+    echo "- parsed JSON missing required field (name or arguments)"
+    echo "- special-token leak inside tool_call body (<|im_start|>, <|endoftext|>)"
+    echo "- stacked openers (two consecutive <tool_call>)"
+    echo "- soft-warn count > 1 across all cells"
+    echo
+    echo "Soft-warn signals (printed, included in collective threshold):"
+    echo "- <tool_call> not emitted (model answered inline)"
+    echo "- <tool_call> appearing inside <think>...</think>"
+    echo
+} > "$OUT"
+
+# ---- Run cells -------------------------------------------------------------
+HARD_FAIL=0
+SOFT_WARN_TOTAL=0
+
+# Group cells by model for single-load efficiency.
+declare -A MODEL_CELLS
+for cell in "${CELLS[@]}"; do
+    model="$(echo "$cell" | cut -d'|' -f1)"
+    MODEL_CELLS["$model"]+="${cell}"$'\n'
+done
+
+# Iterate models; per model, build a single JSONL session.
+for model in "${!MODEL_CELLS[@]}"; do
+    model_short="$(basename "$model" .mq4)"
+    echo "## $model_short" >> "$OUT"
+    echo >> "$OUT"
+    echo "agentic-gate: model $model_short ($(echo "${MODEL_CELLS[$model]}" | grep -c '|') cells)..."
+
+    # Build JSONL: load + (per cell: generate, optional second-turn generate) + unload
+    # Each cell gets a unique id ${prefix}_${cellnum}_t1 (and _t2 for multi-turn).
+    JSONL_FILE="$(mktemp /tmp/agentic-gate-jsonl.XXXXXX)"
+    rm -f "$HOME/.hipfire/daemon.pid" 2>/dev/null
+
+    python3 - "$model" "$JSONL_FILE" <<'PY' >/dev/null
+import sys, json, os
+
+model_path = sys.argv[1]
+jsonl_path = sys.argv[2]
+
+# 4-second pacing between sends; daemon will buffer.
+# load
+print_load = json.dumps({"type": "load", "model": model_path,
+                         "params": {"max_seq": 4096}})
+
+with open(jsonl_path, "w") as f:
+    f.write(print_load + "\n")
+PY
+
+    # Read cells back for this model and build the JSONL body in Python (cleanest
+    # JSON escaping). Pass cells as repeated args.
+    cell_args=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && cell_args+=("$line")
+    done <<< "${MODEL_CELLS[$model]}"
+
+    python3 - "$JSONL_FILE" "$USER_READ" "${cell_args[@]}" <<'PY' >/dev/null
+import sys, json
+
+jsonl = sys.argv[1]
+user_file = sys.argv[2]
+cells = sys.argv[3:]
+
+with open(user_file) as f:
+    user_prompt = f.read()
+
+with open(jsonl, "a") as out:
+    for idx, cell in enumerate(cells):
+        model, sys_path, clamp, multi, label = cell.split("|")
+        with open(sys_path) as f:
+            system = f.read()
+        max_think = 1 if clamp == "1" else 0
+        gen_msg = {
+            "type": "generate",
+            "id": f"c{idx}_t1",
+            "prompt": user_prompt,
+            "system": system,
+            "max_tokens": 256,
+            "temperature": 0.0,
+            "top_p": 1.0,
+            "repeat_penalty": 1.0,
+            "thinking": False if clamp == "1" else True,
+            "max_think_tokens": max_think,
+        }
+        out.write(json.dumps(gen_msg) + "\n")
+        if multi == "1":
+            # Synthesize a tool_response then ask the model to continue.
+            tool_resp_text = (
+                "<tool_response>\n"
+                "{\"contents\": \"int main() { return 0; }\"}\n"
+                "</tool_response>\n"
+                "Now describe what the file does in one sentence."
+            )
+            out.write(json.dumps({
+                "type": "generate", "id": f"c{idx}_t2",
+                "prompt": tool_resp_text, "system": "",
+                "max_tokens": 128, "temperature": 0.0, "top_p": 1.0,
+                "repeat_penalty": 1.0, "thinking": False, "max_think_tokens": 1,
+            }) + "\n")
+    # unload at end
+    out.write(json.dumps({"type": "unload"}) + "\n")
+PY
+
+    # Pace JSONL into the daemon. The daemon blocks on stdin readline, so we
+    # need a slow producer to allow load + each generate to complete in order.
+    OUTPUT_FILE="$(mktemp /tmp/agentic-gate-out.XXXXXX)"
+    (
+        # First line is load; pace ~90s for A3B model load.
+        while IFS= read -r line; do
+            printf '%s\n' "$line"
+            type="$(echo "$line" | python3 -c 'import sys,json;d=json.loads(sys.stdin.read());print(d["type"])' 2>/dev/null)"
+            case "$type" in
+                load)     sleep 90 ;;
+                generate) sleep 60 ;;
+                unload)   sleep 2  ;;
+            esac
+        done < "$JSONL_FILE"
+    ) | env HIPFIRE_NO_PID_FILE=1 HIPFIRE_KV_MODE=asym3 HIPFIRE_GRAPH=1 \
+        "$EXE" 2>&1 > "$OUTPUT_FILE" || true
+    pkill -f "examples/daemon" 2>/dev/null
+    sleep 2
+
+    rm -f "$JSONL_FILE"
+
+    # Parse output, run detectors per cell, append to report.
+    python3 - "$OUTPUT_FILE" "$OUT" "${cell_args[@]}" <<'PY'
+import sys, json, re, pathlib
+
+out_path = sys.argv[1]
+report_path = sys.argv[2]
+cells = sys.argv[3:]
+
+events = []
+for line in pathlib.Path(out_path).read_text().splitlines():
+    line = line.strip()
+    if not line.startswith("{"): continue
+    try:
+        events.append(json.loads(line))
+    except json.JSONDecodeError:
+        pass
+
+# Group token events by id.
+by_id = {}
+for ev in events:
+    if ev.get("type") == "token":
+        by_id.setdefault(ev["id"], []).append(ev["text"])
+
+# Detect daemon panic / error
+panic = any(ev.get("type") == "error" for ev in events)
+panic_msg = next((ev["message"] for ev in events if ev.get("type") == "error"), "")
+
+def extract_tool_call_body(text):
+    # Use minimal regex; the body extraction is the same as coherence-gate.
+    m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.S)
+    return m.group(1).strip() if m else None
+
+def detect_stacked_openers(text):
+    return bool(re.search(r"<tool_call>\s*<tool_call>", text))
+
+def detect_tool_in_think(text):
+    # Tool call appearing inside a <think>...</think> block.
+    for m in re.finditer(r"<think>(.*?)</think>", text, re.S):
+        if "<tool_call>" in m.group(1):
+            return True
+    return False
+
+def detect_special_token_leak(body):
+    return any(tok in body for tok in ("<|im_start|>", "<|endoftext|>"))
+
+def detect_json(body):
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError as e:
+        return ("parse_fail", str(e))
+    if not isinstance(obj, dict):
+        return ("schema_fail", "tool_call body is not a JSON object")
+    if "name" not in obj or "arguments" not in obj:
+        return ("schema_fail", "missing required field (name or arguments)")
+    return ("ok", obj)
+
+results = []
+soft_warn_count = 0
+hard_fail = False
+
+with open(report_path, "a") as report:
+    for idx, cell in enumerate(cells):
+        model, sys_path, clamp, multi, label = cell.split("|")
+        cid_t1 = f"c{idx}_t1"
+        cid_t2 = f"c{idx}_t2"
+        toks_t1 = by_id.get(cid_t1, [])
+        text_t1 = "".join(toks_t1)
+        verdict = "PASS"
+        notes = []
+
+        # Hard-fail: zero tokens
+        if not toks_t1:
+            verdict = "HARD_FAIL"
+            notes.append("zero tokens emitted")
+            hard_fail = True
+        else:
+            # Hard: stacked openers
+            if detect_stacked_openers(text_t1):
+                verdict = "HARD_FAIL"
+                notes.append("stacked <tool_call> openers")
+                hard_fail = True
+            body = extract_tool_call_body(text_t1)
+            if body is None:
+                # Soft: tool_call not emitted
+                soft_warn_count += 1
+                notes.append("soft: <tool_call> not emitted (inline answer)")
+                if verdict == "PASS": verdict = "SOFT_WARN"
+            else:
+                # Hard: special-token leak
+                if detect_special_token_leak(body):
+                    verdict = "HARD_FAIL"
+                    notes.append("special-token leak inside tool_call body")
+                    hard_fail = True
+                # Hard: JSON parse / schema
+                kind, info = detect_json(body)
+                if kind != "ok":
+                    verdict = "HARD_FAIL"
+                    notes.append(f"json {kind}: {info}")
+                    hard_fail = True
+                else:
+                    notes.append(f"json ok: name={info.get('name')!r}")
+            # Soft: tool inside think
+            if detect_tool_in_think(text_t1):
+                soft_warn_count += 1
+                notes.append("soft: <tool_call> inside <think>...</think>")
+                if verdict == "PASS": verdict = "SOFT_WARN"
+
+        # Multi-turn t2 evaluation if applicable
+        if multi == "1":
+            toks_t2 = by_id.get(cid_t2, [])
+            text_t2 = "".join(toks_t2)
+            if not toks_t2:
+                verdict = "HARD_FAIL"
+                notes.append("multi-turn t2: zero tokens")
+                hard_fail = True
+            else:
+                # Either coherent text or another tool_call - both ok.
+                # Just check for stacked openers and special-token leak in t2.
+                if detect_stacked_openers(text_t2):
+                    verdict = "HARD_FAIL"
+                    notes.append("multi-turn t2: stacked openers")
+                    hard_fail = True
+                body_t2 = extract_tool_call_body(text_t2)
+                if body_t2 is not None and detect_special_token_leak(body_t2):
+                    verdict = "HARD_FAIL"
+                    notes.append("multi-turn t2: special-token leak")
+                    hard_fail = True
+
+        report.write(f"### {label}    {verdict}\n\n")
+        report.write(f"- system: `{sys_path}` ({pathlib.Path(sys_path).stat().st_size} bytes)\n")
+        report.write(f"- thinking: {'clamped (max_think=1)' if clamp == '1' else 'unclamped'}\n")
+        report.write(f"- multi-turn: {'yes' if multi == '1' else 'no'}\n")
+        report.write(f"- notes: {'; '.join(notes) if notes else 'clean'}\n\n")
+        report.write("```\n" + (text_t1 if text_t1 else "(no tokens)") + "\n```\n\n")
+        if multi == "1":
+            text_t2 = "".join(by_id.get(f"c{idx}_t2", []))
+            report.write("**Turn 2 (after synthesized tool_response):**\n\n")
+            report.write("```\n" + (text_t2 if text_t2 else "(no tokens)") + "\n```\n\n")
+
+    # Append per-model summary line via stderr so caller can read it.
+    print(json.dumps({"hard_fail": hard_fail, "soft_warn_count": soft_warn_count}), file=sys.stderr)
+PY
+    res=$?
+    if [ "$res" -ne 0 ]; then
+        echo "agentic-gate: detector script failed for $model_short" >&2
+        HARD_FAIL=1
+    fi
+    # Read per-model summary written to stderr by the python detector.
+    # (We didn't capture stderr above; instead recompute by running a thin checker.)
+    # For simplicity, re-run a quick aggregator from the report file.
+    rm -f "$OUTPUT_FILE"
+done
+
+# ---- Aggregate verdict -----------------------------------------------------
+# Count HARD_FAIL and SOFT_WARN headers in the report.
+hard_count=$(grep -cE '^### .* HARD_FAIL$' "$OUT" || true)
+soft_count=$(grep -cE '^### .* SOFT_WARN$' "$OUT" || true)
+total_cells=${#CELLS[@]}
+{
+    echo "## Summary"
+    echo
+    echo "- total cells: $total_cells"
+    echo "- hard fails: $hard_count"
+    echo "- soft warns: $soft_count"
+} >> "$OUT"
+
+if [ "$hard_count" -gt 0 ]; then
+    echo "agentic-gate: HARD FAIL ($hard_count cells)"
+    echo "report: $OUT"
+    exit 1
+fi
+# Soft-warn collective threshold: > 1 of N cells = hard fail.
+if [ "$soft_count" -gt 1 ]; then
+    echo "agentic-gate: HARD FAIL via soft-warn threshold ($soft_count > 1)"
+    echo "report: $OUT"
+    exit 1
+fi
+echo "agentic-gate: PASS ($total_cells cells, $soft_count soft warns)"
+echo "report: $OUT"
+exit 0

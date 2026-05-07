@@ -30,20 +30,31 @@
 #
 # Modes:
 #   ./scripts/coherence-gate-dflash.sh          # short — 4 tests, ~2-3 min
+#   ./scripts/coherence-gate-dflash.sh --fast   # 2 tests (1 prose + 1 code, dflash only) — ~1 min
 #   ./scripts/coherence-gate-dflash.sh --full   # add ddtree b22-k4 + b8-k2 — ~6-8 min
+#
+# --fast is for pre-commit on $SPEC_HOTSPOT match (down from full short battery).
+# Force-full via HIPFIRE_FORCE_SPEC_GATE=1.
 
 set -u
 cd "$(dirname "$0")/.."
 
 FULL=0
+FAST=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --full) FULL=1 ;;
+        --fast) FAST=1 ;;
         -h|--help) sed -n '3,32p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
 done
+
+if [ "$FAST" -eq 1 ] && [ "$FULL" -eq 1 ]; then
+    echo "coherence-gate-dflash: --fast and --full are mutually exclusive" >&2
+    exit 2
+fi
 
 EXE="./target/release/examples/dflash_spec_demo"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-$HOME/.hipfire/models}"
@@ -113,12 +124,22 @@ SHORT_TESTS=(
     "27b-ddtree-b12-prose|ddtree-b12-k2|PROSE_PROMPT|192"
     "27b-ddtree-b12-code|ddtree-b12-k2|CODE_PROMPT|128"
 )
+# Fast mode drops the ddtree variants; dflash alone catches the Path A
+# single-token attractor regression class. ~1 min wall vs ~3 min for short.
+FAST_TESTS=(
+    "27b-dflash-prose|dflash|PROSE_PROMPT|192"
+    "27b-dflash-code|dflash|CODE_PROMPT|128"
+)
 FULL_EXTRA=(
     "27b-ddtree-b22-prose|ddtree-b22-k4|PROSE_PROMPT|192"
     "27b-ddtree-b8-prose|ddtree-b8-k2|PROSE_PROMPT|192"
 )
-tests=("${SHORT_TESTS[@]}")
-[ "$FULL" -eq 1 ] && tests+=("${FULL_EXTRA[@]}")
+if [ "$FAST" -eq 1 ]; then
+    tests=("${FAST_TESTS[@]}")
+else
+    tests=("${SHORT_TESTS[@]}")
+    [ "$FULL" -eq 1 ] && tests+=("${FULL_EXTRA[@]}")
+fi
 
 # ── Run ───────────────────────────────────────────────────────────────────
 hard_errors=0
@@ -129,7 +150,7 @@ hard_errors=0
     echo "- commit: $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
-    echo "- mode:   $( [ "$FULL" -eq 1 ] && echo full || echo short )"
+    echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
