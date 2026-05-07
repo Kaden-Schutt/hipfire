@@ -1453,7 +1453,34 @@ fn load_model_pp(
 
     let config = qwen35::config_from_hfq(&hfq).ok_or("failed to read Qwen3.5 config")?;
 
-    let mut gpus = Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?;
+    // HIPFIRE_PP_LAYERS="a,b,..." overrides uniform split. Length must equal
+    // pp; sum must equal n_layers; each entry >= 1. Used to shift layers off
+    // dev 0 when token_embd asymmetry caps max_seq under uniform split.
+    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS").ok().filter(|s| !s.is_empty()) {
+        Some(spec) => {
+            let counts: Result<Vec<usize>, _> = spec
+                .split(',')
+                .map(|s| s.trim().parse::<usize>())
+                .collect();
+            let counts = counts.map_err(|e| format!("HIPFIRE_PP_LAYERS parse: {e}"))?;
+            if counts.len() != pp {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS has {} entries, expected pp={}",
+                    counts.len(), pp
+                ));
+            }
+            let sum: usize = counts.iter().sum();
+            if sum != config.n_layers {
+                return Err(format!(
+                    "HIPFIRE_PP_LAYERS sum={} != n_layers={}",
+                    sum, config.n_layers
+                ));
+            }
+            eprintln!("  HIPFIRE_PP_LAYERS override: {:?}", counts);
+            Gpus::init_layers(&counts).map_err(|e| format!("{e}"))?
+        }
+        None => Gpus::init_uniform(pp, config.n_layers).map_err(|e| format!("{e}"))?,
+    };
 
     let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).map_err(|e| format!("{e}"))?;
 
