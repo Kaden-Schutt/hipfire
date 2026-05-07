@@ -600,8 +600,10 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    if pflash_drafter.is_some() || pflash_mode_str != "off" {
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1; see issue #58 v1.1 roadmap"}}"#);
+                    if (pflash_drafter.is_some() || pflash_mode_str != "off")
+                        && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
+                    {
+                        let _ = writeln!(stdout, r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#);
                         let _ = stdout.flush();
                         continue;
                     }
@@ -2296,6 +2298,9 @@ fn generate_dflash(
 #[allow(clippy::too_many_arguments)]
 fn generate_multi(
     m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
@@ -2341,7 +2346,70 @@ fn generate_multi(
 
     let im_end = tokenizer.encode("<|im_end|>");
     let nl = tokenizer.encode("\n");
-    let q_tokens = tokenizer.encode(prompt);
+    let raw_q_tokens = tokenizer.encode(prompt);
+
+    // PFlash compression on first turn (seq_pos == 0). Drafter runs on the
+    // daemon's single-GPU `gpu` handle, which binds to the same physical
+    // device as `pp_gpus.devices[0]` (HIP enumerates within ROCR_VISIBLE).
+    // VRAM is shared between the two Gpu handles via the HIP heap, so
+    // drafter weights coexist with the target's dev 0 portion. Output is
+    // a Vec<u32> of kept token IDs which feeds forward_prefill_batch_multi
+    // unchanged. Mode=Off / drafter unloaded falls through to raw tokens.
+    let request_kind = match tokenizer.special_token_id("<tool_call>") {
+        Some(tid) => {
+            let in_user = raw_q_tokens.iter().any(|&t| t == tid);
+            let in_system = system_prompt
+                .map(|s| tokenizer.encode(s).iter().any(|&t| t == tid))
+                .unwrap_or(false);
+            if in_user || in_system {
+                hipfire_arch_qwen35::pflash::RequestKind::ToolCall
+            } else {
+                hipfire_arch_qwen35::pflash::RequestKind::Text
+            }
+        }
+        None => hipfire_arch_qwen35::pflash::RequestKind::Text,
+    };
+    let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
+        if m.seq_pos == 0 {
+            match hipfire_arch_qwen35::pflash::maybe_compress_prompt(
+                gpu, state, cfg, &raw_q_tokens, request_kind, &[],
+            ) {
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"total_ms":{}}}"#,
+                        id, cp.source_tokens, cp.kept_tokens,
+                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32,
+                        cp.source_md5, cp.compressed_md5,
+                        cp.timings.score_ms, cp.timings.total_ms,
+                    );
+                    let _ = stdout.flush();
+                    cp.token_ids
+                }
+                Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+                    if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
+                        let _ = writeln!(stdout,
+                            r#"{{"type":"pflash_bypass","id":"{}","reason":"{}"}}"#,
+                            id, reason.as_str().replace('"', "'"),
+                        );
+                        let _ = stdout.flush();
+                    }
+                    raw_q_tokens
+                }
+                Err(e) => {
+                    let _ = writeln!(stdout,
+                        r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
+                        id, e.to_string().replace('"', "'"),
+                    );
+                    let _ = stdout.flush();
+                    raw_q_tokens
+                }
+            }
+        } else {
+            raw_q_tokens
+        }
+    } else {
+        raw_q_tokens
+    };
 
     // ChatML framing via the canonical hipfire_runtime::prompt_frame module.
     // Identical to the pp=1 path so multi-turn behavior matches byte-for-byte
@@ -2650,10 +2718,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
-        let _ = (gpu, pflash_state, pflash_cfg);
         generate_multi(
-            m, stdout, id, prompt, system_prompt, temp, top_p, max_tokens,
-            repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, max_think_tokens,
+            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, repeat_penalty, repeat_window,
+            budget_alert_at_tok, budget_alert_text, max_think_tokens,
         );
         return;
     }
