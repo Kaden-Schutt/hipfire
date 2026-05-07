@@ -423,19 +423,47 @@ fn arch_host() -> (String, String) {
 
 fn run_self_check() -> Result<(), Vec<String>> {
     let mut errors: Vec<String> = Vec::new();
-    let r = self_check::run_phase_a();
-    let mut shown_pass = 0;
+    let r = self_check::run_full();
+
+    // Phase A — synthetic payloads.
+    let mut a_pass = 0;
     for (name, ok, detail) in &r.phase_a {
         if *ok {
-            shown_pass += 1;
+            a_pass += 1;
         } else {
             errors.push(format!("Phase A miss: {} ({})", name, detail));
         }
     }
-    eprintln!("self-check Phase A: {} / {} detectors fired correctly",
-              shown_pass, r.phase_a.len());
+    eprintln!(
+        "self-check Phase A: {} / {} detectors fired correctly",
+        a_pass,
+        r.phase_a.len()
+    );
+
+    // Phase B — captured-JSONL replay against shipped fixtures.
+    let mut b_pass = 0;
+    for (label, ok, detail) in &r.phase_b {
+        if *ok {
+            b_pass += 1;
+            eprintln!("self-check Phase B: {} {}", label, detail);
+        } else {
+            errors.push(format!("Phase B miss: {} ({})", label, detail));
+        }
+    }
+    eprintln!(
+        "self-check Phase B: {} / {} fixtures replayed correctly",
+        b_pass,
+        r.phase_b.len()
+    );
+
     if errors.is_empty() {
-        eprintln!("self-check passed: all detectors fired against synthetic payloads");
+        eprintln!(
+            "self-check passed: Phase A {} / {} synthetic + Phase B {} / {} replay",
+            a_pass,
+            r.phase_a.len(),
+            b_pass,
+            r.phase_b.len()
+        );
         Ok(())
     } else {
         Err(errors)

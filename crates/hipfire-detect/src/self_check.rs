@@ -291,6 +291,148 @@ pub fn run_phase_a() -> SelfCheckReport {
     out
 }
 
+// ─── Phase B: captured-JSONL replay ──────────────────────────────────────
+//
+// Fixtures are embedded at compile time so the probe binary doesn't need
+// to know where the source tree lives at runtime. Each fixture is paired
+// with a list of `(detector_name, expected_outcome)` assertions — the
+// same assertions the integration test in `tests/replay.rs` makes.
+
+const CLEAN_JSONL: &str = include_str!("../tests/fixtures/clean.jsonl");
+const PATH_A_JSONL: &str = include_str!("../tests/fixtures/path_a_attractor.jsonl");
+const AGENTIC_CORRUPT_JSONL: &str = include_str!("../tests/fixtures/agentic_corrupt.jsonl");
+
+/// Expected outcome for one detector on one fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expect {
+    Quiet, // Verdict::Ok or Verdict::Skip
+    Warn,
+    Fail,
+}
+
+struct FixtureCheck {
+    label: &'static str,
+    jsonl: &'static str,
+    expectations: &'static [(&'static str, Expect)],
+}
+
+const FIXTURES: &[FixtureCheck] = &[
+    FixtureCheck {
+        label: "clean.jsonl",
+        jsonl: CLEAN_JSONL,
+        expectations: &[
+            ("attractor_first_128", Expect::Quiet),
+            ("attractor_last_128", Expect::Quiet),
+            ("ngram_density", Expect::Quiet),
+            ("loop_guard_mirror", Expect::Quiet),
+            ("think_empty", Expect::Quiet),
+            ("special_leak", Expect::Quiet),
+            ("toolcall_shape", Expect::Quiet),
+            ("eos_immediate", Expect::Quiet),
+            ("whitespace_only", Expect::Quiet),
+        ],
+    },
+    FixtureCheck {
+        label: "path_a_attractor.jsonl",
+        jsonl: PATH_A_JSONL,
+        expectations: &[
+            ("attractor_first_128", Expect::Fail),
+            ("ngram_density", Expect::Warn),
+            ("loop_guard_mirror", Expect::Warn),
+            ("special_leak", Expect::Quiet),
+            ("toolcall_shape", Expect::Quiet),
+            ("think_empty", Expect::Quiet),
+        ],
+    },
+    FixtureCheck {
+        label: "agentic_corrupt.jsonl",
+        jsonl: AGENTIC_CORRUPT_JSONL,
+        expectations: &[
+            ("toolcall_shape", Expect::Fail),
+            ("special_leak", Expect::Fail),
+            ("attractor_first_128", Expect::Quiet),
+        ],
+    },
+];
+
+fn build_full_replay_bank() -> DetectorBank {
+    use crate::{
+        attractor::{AttractorFirst128, AttractorLast128},
+        eos_immediate::EosImmediate,
+        ngram::{LoopGuardMirror, NgramDensity},
+        special_leak::SpecialLeak,
+        think::ThinkEmpty,
+        toolcall::ToolcallShape,
+        whitespace_only::WhitespaceOnly,
+    };
+    let mut bank = DetectorBank::new();
+    bank.add(Box::new(AttractorFirst128::new()));
+    bank.add(Box::new(AttractorLast128::new()));
+    bank.add(Box::new(NgramDensity::new()));
+    bank.add(Box::new(LoopGuardMirror::new()));
+    bank.add(Box::new(ThinkEmpty::new()));
+    bank.add(Box::new(SpecialLeak::new()));
+    bank.add(Box::new(ToolcallShape::new()));
+    bank.add(Box::new(EosImmediate::new()));
+    bank.add(Box::new(WhitespaceOnly::new()));
+    bank
+}
+
+fn evaluate_expectation(verdict: &Verdict, want: Expect) -> bool {
+    match want {
+        Expect::Quiet => !verdict.is_fail() && !verdict.is_warn(),
+        Expect::Warn => verdict.is_warn(),
+        Expect::Fail => verdict.is_fail(),
+    }
+}
+
+/// Run Phase B — replay each shipped JSONL fixture through a fresh
+/// `DetectorBank` and assert that every detector produces the expected
+/// outcome (Quiet / Warn / Fail).
+pub fn run_phase_b() -> Vec<(String, bool, String)> {
+    let mut out: Vec<(String, bool, String)> = Vec::new();
+    for fx in FIXTURES {
+        let events = parse_jsonl_events(fx.jsonl);
+        let mut bank = build_full_replay_bank();
+        let finals = replay(&mut bank, &events);
+        let mut misses: Vec<String> = Vec::new();
+        for (det_name, want) in fx.expectations {
+            let verdict = finals
+                .iter()
+                .find(|(n, _)| *n == *det_name)
+                .map(|(_, v)| v);
+            match verdict {
+                None => misses.push(format!("{} not in bank", det_name)),
+                Some(v) => {
+                    if !evaluate_expectation(v, *want) {
+                        misses.push(format!(
+                            "{}: want {:?}, got {}",
+                            det_name,
+                            want,
+                            v.label()
+                        ));
+                    }
+                }
+            }
+        }
+        let ok = misses.is_empty();
+        let detail = if ok {
+            format!("{} expectations met", fx.expectations.len())
+        } else {
+            misses.join("; ")
+        };
+        out.push((fx.label.to_string(), ok, detail));
+    }
+    out
+}
+
+/// Run both Phase A and Phase B. Used by `coherence_probe --self-check`.
+pub fn run_full() -> SelfCheckReport {
+    let mut report = run_phase_a();
+    report.phase_b = run_phase_b();
+    report
+}
+
 /// Parse a JSONL stream of daemon-style events. Each line is either
 /// `{"type":"committed",...}`, `{"type":"token",...}`, or
 /// `{"type":"done",...}`.
@@ -426,5 +568,22 @@ mod tests {
 {"type":"done","id":"r1","tokens":1,"wall_ms":20,"ttft_ms":10}"#;
         let evs = parse_jsonl_events(jsonl);
         assert_eq!(evs.len(), 3);
+    }
+
+    #[test]
+    fn phase_b_all_fixtures_pass() {
+        let r = run_phase_b();
+        for (label, ok, detail) in &r {
+            assert!(*ok, "Phase B miss for {}: {}", label, detail);
+        }
+        assert_eq!(r.len(), 3, "expected three shipped fixtures");
+    }
+
+    #[test]
+    fn run_full_runs_both_phases() {
+        let r = run_full();
+        assert!(!r.phase_a.is_empty(), "phase A should run");
+        assert!(!r.phase_b.is_empty(), "phase B should run");
+        assert!(r.ok());
     }
 }
