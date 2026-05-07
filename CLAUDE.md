@@ -246,6 +246,35 @@ This replaces the prior byte-exact `quality-gate.sh` barrier (removed),
 which blocked legitimate forward-pass fixes by treating any token diff as
 a regression.
 
+## Coherence Probe (user-facing behavior debugger)
+
+`coherence_probe` (in `crates/hipfire-runtime/examples/`) is the
+user-facing version of the gate scripts: spawns the daemon, runs a
+prompt, surfaces token attractors / special-token leaks / empty-think
+halts / n-gram density spikes / tool-call malformations. Detector code
+lives in `crates/hipfire-detect/`, a GPU-independent library crate that
+the bash gates can also pipe into via a future thin CLI binary
+(eliminates the inline-Python wart in
+`coherence-gate-dflash.sh:191-243` and `agentic-gate.sh:72-144`).
+
+Quick run:
+```
+cargo build --release --example coherence_probe
+./target/release/examples/coherence_probe --self-check     # no GPU needed
+./target/release/examples/coherence_probe \
+    --model ~/.hipfire/models/qwen3.5-9b.mq4 \
+    --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
+    --max-tokens 200 --temperature 0.0
+```
+
+The probe sets `HIPFIRE_EMIT_TOKEN_IDS=1` on the daemon child it spawns;
+the daemon then emits a parallel `{"type":"committed",...}` event
+stream alongside the existing text events so the probe can run token-id
+detectors (attractor windows, n-gram density, loop_guard mirror)
+without re-tokenizing. The flag is off by default — existing JSONL
+clients see no change. The 3-gram density detector promised below is
+now implemented in `hipfire-detect::ngram` as a soft warn.
+
 ## DFlash Coherence Gate (spec-decode token-attractor guard)
 
 Any DDTree / spec-decode / slow-path-kill change that claims a τ or tok/s

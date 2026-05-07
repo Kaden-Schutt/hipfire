@@ -121,6 +121,49 @@ struct CaskConfig {
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
 /// reference for a future per-token attractor block.
+//
+// ─── Probe-mode `committed` event emitter ────────────────────────────────
+//
+// When `HIPFIRE_EMIT_TOKEN_IDS=1` is set, the daemon emits a
+// `{"type":"committed",...}` event for every token it commits (i.e. every
+// time a sampled token is appended to `streamed_tokens` /
+// `conversation_tokens`). This is a parallel stream alongside the
+// existing `{"type":"token","text":"..."}` events; it carries the raw
+// token ID, the per-request position, and ms-since-request-start.
+//
+// Why a parallel stream and not a `tok_id` field on the existing token
+// event: `EosFilter` can hold/merge/strip/stop bytes across multiple
+// committed tokens (many-to-one and zero-to-one relationships); a
+// `tok_id` field on a text event would lie about which token produced
+// the visible chunk. The runtime-protective synthetic emit at the
+// `</think>` force-close site is intentionally NOT paired with a
+// `committed` event, because no token was actually committed there.
+//
+// Off by default — env var read once on first call. The probe binary
+// (`examples/coherence_probe.rs`) sets the env on the daemon child it
+// spawns. Existing JSONL clients see no change.
+fn emit_committed_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    tok_id: u32,
+    pos: usize,
+    t_ms: u64,
+) {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let on = *ENABLED.get_or_init(|| {
+        std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1")
+    });
+    if !on {
+        return;
+    }
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
+        id, tok_id, pos, t_ms
+    );
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -2072,6 +2115,7 @@ fn generate_dflash(
 
     // Emit the first token immediately so TTFT is the prefill time.
     streamed_tokens.push(first_token);
+    emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
     let new_bytes = &all_bytes[bytes_fed_to_filter..];
     bytes_fed_to_filter = all_bytes.len();
@@ -2190,6 +2234,7 @@ fn generate_dflash(
             if generated >= max_tokens { break; }
             emitted.push(tok);
             streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -2529,6 +2574,7 @@ fn generate_multi(
         generated += 1;
         m.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[bytes_fed_to_filter..];
         bytes_fed_to_filter = all_bytes.len();
@@ -2579,6 +2625,7 @@ fn generate_multi(
                     m.seq_pos += 1;
                     m.conversation_tokens.push(t);
                     streamed_tokens.push(t);
+                    emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes = &all_bytes[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes.len();
@@ -2645,6 +2692,7 @@ fn generate_multi(
                 for &tok in &nudge_tokens[..nudge_len] {
                     m.conversation_tokens.push(tok);
                     streamed_tokens.push(tok);
+                    emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                     let all_bytes2 = tokenizer.decode_bytes(&streamed_tokens);
                     let new_bytes2 = &all_bytes2[bytes_fed_to_filter..];
                     bytes_fed_to_filter = all_bytes2.len();
@@ -3164,6 +3212,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             // Incremental UTF-8 + filter routing: feed only the new
             // bytes since last call, let the filter buffer any partial
             // codepoint or marker prefix until disambiguated.
@@ -3243,6 +3292,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         }
                         m.conversation_tokens.push(t);
                         streamed_tokens.push(t);
+                        emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[bytes_fed_to_filter..];
                         bytes_fed_to_filter = all_bytes.len();
@@ -3347,6 +3397,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                     for &tok in &nudge_tokens[..nudge_len] {
                         m.conversation_tokens.push(tok);
                         streamed_tokens.push(tok);
+                        emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         // Emit the injected token's text to stdout so the client
                         // sees it as part of the stream (will be inside <think>
                         // if that's the current state, and get stripped client-
@@ -3490,6 +3541,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
+            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
@@ -3709,6 +3761,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     for _ in 0..max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
+        emit_committed_event(stdout, id, next_token, generated - 1, t0.elapsed().as_millis() as u64);
         let text = tokenizer.decode(&[next_token]);
         let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
         let _ = stdout.flush();

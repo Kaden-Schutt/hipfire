@@ -68,6 +68,7 @@ rayon = "1"
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-detect = { path = "../hipfire-detect" }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -81,6 +82,10 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 [[example]]
 name = "daemon"
 required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama"]
+
+[[example]]
+name = "coherence_probe"
+required-features = []
 
 [[example]]
 name = "gpus_smoke"

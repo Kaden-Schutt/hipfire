@@ -1,0 +1,14 @@
+{"type":"committed","id":"r1","tok_id":83,"pos":0,"t_ms":50}
+{"type":"token","id":"r1","text":"The"}
+{"type":"committed","id":"r1","tok_id":1142,"pos":1,"t_ms":60}
+{"type":"token","id":"r1","text":" answer"}
+{"type":"committed","id":"r1","tok_id":374,"pos":2,"t_ms":70}
+{"type":"token","id":"r1","text":" is"}
+{"type":"committed","id":"r1","tok_id":220,"pos":3,"t_ms":80}
+{"type":"token","id":"r1","text":" "}
+{"type":"committed","id":"r1","tok_id":19,"pos":4,"t_ms":90}
+{"type":"token","id":"r1","text":"4"}
+{"type":"committed","id":"r1","tok_id":13,"pos":5,"t_ms":100}
+{"type":"token","id":"r1","text":"."}
+{"type":"committed","id":"r1","tok_id":248046,"pos":6,"t_ms":110}
+{"type":"done","id":"r1","tokens":7,"tok_s":63.6,"wall_ms":110,"ttft_ms":50}
