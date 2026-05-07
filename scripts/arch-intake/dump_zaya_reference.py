@@ -166,14 +166,27 @@ def main():
     input_ids = enc["input_ids"].to("cuda:0")
     print(f"[zaya-ref] input_ids shape: {tuple(input_ids.shape)}, tokens: {input_ids[0].tolist()[:20]}{'...' if input_ids.shape[1] > 20 else ''}")
 
-    captures = {}  # (layer_idx, side) -> tensor (cpu, fp32)
+    captures = {}  # (layer_idx, side, "in"|"out") -> tensor (cpu, fp32)
+
+    def to_cpu_fp32(x):
+        return x.detach().to("cpu", dtype=torch.float32).contiguous()
 
     def make_hook(layer_idx, side):
-        def hook(_module, _inputs, output):
-            t = output[0] if isinstance(output, tuple) else output
-            if not hasattr(t, "detach"):
-                return  # non-tensor output (e.g. cache obj) - skip
-            captures[(layer_idx, side)] = t.detach().to("cpu", dtype=torch.float32).contiguous()
+        def hook(_module, inputs, output):
+            # Capture every positional INPUT that is a tensor.
+            # E.g. ResidualScaling.forward(residual, hidden_states) gives
+            # us both via "in0" and "in1".
+            for j, x in enumerate(inputs or []):
+                if hasattr(x, "detach"):
+                    key = "in" if (j == 0 and len(inputs) == 1) else f"in{j}"
+                    captures[(layer_idx, side, key)] = to_cpu_fp32(x)
+            # Capture OUTPUT (multi-tensor tuple → out0, out1, ...; single → out)
+            if isinstance(output, tuple):
+                for j, t in enumerate(output):
+                    if hasattr(t, "detach"):
+                        captures[(layer_idx, side, f"out{j}")] = to_cpu_fp32(t)
+            elif hasattr(output, "detach"):
+                captures[(layer_idx, side, "out")] = to_cpu_fp32(output)
         return hook
 
     handles = []
@@ -183,7 +196,7 @@ def main():
             skipped.append((layer_idx, side))
             continue
         handles.append(mod.register_forward_hook(make_hook(layer_idx, side)))
-    print(f"[zaya-ref] registered {len(handles)} hooks ({len(skipped)} skipped: {skipped[:5]}{'...' if len(skipped) > 5 else ''})")
+    print(f"[zaya-ref] registered {len(handles)} hooks ({len(skipped)} skipped)")
 
     print("[zaya-ref] running prefill forward ...")
     with torch.no_grad():
@@ -194,15 +207,16 @@ def main():
 
     print(f"[zaya-ref] captured {len(captures)} tensors; writing safetensors ...")
     manifest_entries = []
-    for (layer_idx, side), tensor in sorted(captures.items()):
+    for (layer_idx, side, io), tensor in sorted(captures.items()):
         layer_name = "final" if layer_idx < 0 else f"layer_{layer_idx:02d}"
         sub = out / layer_name
         sub.mkdir(parents=True, exist_ok=True)
-        path = sub / f"prefill.{side}.safetensors"
+        path = sub / f"prefill.{side}.{io}.safetensors"
         save_file({"x": tensor}, str(path))
         manifest_entries.append({
             "layer": layer_idx,
             "side": side,
+            "io": io,
             "shape": list(tensor.shape),
             "dtype": "float32",
             "path": str(path.relative_to(out)),
