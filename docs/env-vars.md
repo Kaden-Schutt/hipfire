@@ -8,7 +8,7 @@ This document is the single canonical reference for every environment variable h
 
 | Layer | Count | Notes |
 |---|---|---|
-| `HIPFIRE_*` env vars | 114 | 14 plumbed through TUI, 44 mentioned in some doc, 56 silent |
+| `HIPFIRE_*` env vars | 115 | 14 plumbed through TUI, 44 mentioned in some doc, 57 silent |
 | Non-`HIPFIRE_*` project env vars | 21 | Test/example/diag scaffolding. Should be renamed `HIPFIRE_*` for consistency. |
 | `config.json` schema (`HipfireConfig`) | ~40 keys | Validated by `validateConfigValue()` in `cli/index.ts`. Some keys map 1:1 to env vars set at daemon spawn. |
 | `per_model_config.json` overrides | same surface | Sparse overrides on top of the base config, applied per model tag. |
@@ -103,6 +103,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_HAVE_2_GPU` | MULTI-GPU | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:159` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | MISC-USER | — | `crates/rdna-compute/src/compiler.rs:298` |
 | `HIPFIRE_HOST_TIMING` | PERF-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:934` |
+| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative) | `crates/rdna-compute/src/compiler.rs:89` |
 | `HIPFIRE_KV_MODE` | KV-CACHE | — | `cli/index.ts:400` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | KV-CACHE | — | `crates/hipfire-runtime/examples/daemon.rs:1211` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/kernels.rs:76` |
@@ -328,6 +329,7 @@ Miscellaneous user-facing flags.
 - `HIPFIRE_DETERMINISTIC=1` — byte-exact output mode. Disables non-deterministic optimizations.
 - `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT=1` — gate the `budget_alert_at_tok` / `budget_alert_text` daemon params. Maps to `cfg.experimental_budget_alert`.
 - `HIPFIRE_HIPCC_EXTRA_FLAGS` — extra flags appended to all hipcc invocations during JIT.
+- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache directory. Default `.hipfire_kernels` (cwd-relative). Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
 - `HIPFIRE_ALLOW_MQ2=1`, `HIPFIRE_ALLOW_MQ2_LLOYD=1`, `HIPFIRE_ALLOW_MQ3_LLOYD=1` — opt-in research-grade quant formats during quantizer run.
 
 ### `DIAG-DUMP` (8)
@@ -527,13 +529,15 @@ A pre-commit hook to enforce this is on the roadmap (issue forthcoming).
 To regenerate the quick-reference table:
 
 ```bash
-# Auto-extract from source
-grep -r 'env::var("HIPFIRE_\|process.env.HIPFIRE_' \
+# Auto-extract from source. Covers env::var(), env::var_os(), process.env.X
+grep -rE 'env::var(_os)?\("HIPFIRE_|process\.env\.HIPFIRE_' \
     $(git ls-files | grep -E '\.(rs|ts)$') \
-    | grep -oE '(env::var\("[A-Z_0-9]+"\)|process\.env\.[A-Z_0-9]+)' \
-    | sed 's/env::var("//; s/")//; s/process\.env\.//' \
+    | grep -oE '(env::var(_os)?\("[A-Z_0-9]+"\)|process\.env\.[A-Z_0-9]+)' \
+    | sed -E 's/env::var(_os)?\("//; s/"\)//; s/process\.env\.//' \
     | sort -u
 ```
+
+Note the `(_os)?` group — `compiler.rs:89` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
 
 A future pass should ship `scripts/regen-env-vars-doc.sh` that mechanically rebuilds the quick-reference table while preserving the prose category guide.
 
