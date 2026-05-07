@@ -9,6 +9,7 @@ members = [
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-toy",
+    "crates/hipfire-arch-zaya",
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
     "crates/redline",

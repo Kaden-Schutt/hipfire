@@ -1,0 +1,28 @@
+[package]
+name = "hipfire-arch-zaya"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zyphra ZAYA1 architecture (CCA + MoE + MoD) for hipfire (Phase 1 scaffold)"
+
+# Status: Phase 1 intake scaffold (2026-05-07).
+# - config / state / weights are typed but load_weights and new_state
+#   return Err until the recurrent-state plumbing lands (see
+#   docs/investigations/2026-05-07-zaya1-port-intake/00-cca-disambiguation.md
+#   for the verdict and Phase 6 design-doc plan).
+# - No CCA kernel yet (Phase 3 is gated behind Phase 6 runtime decision).
+# - No feature flag today; CCA recurrence is structurally pervasive,
+#   there is no "zaya without CCA" mode worth gating. If/when the
+#   recurrent-state primitives move into hipfire-runtime they may grow
+#   a `cca` feature there, mirroring qwen35's `deltanet` gate.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[example]]
+name = "verify_against_torch"
+path = "examples/verify_against_torch.rs"
