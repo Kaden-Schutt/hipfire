@@ -17,17 +17,22 @@ use rdna_compute::Gpu;
 
 /// Per-decode GPU scratch for a single ZAYA1 sequence.
 ///
-/// Field shapes (for ZAYA1-8B, num_layers=80, hidden_size=2048):
-///   - `kv_cache_bytes`: standard KV cache, sized by max context. Owned
-///     by the runtime's existing KV pager (placeholder field today).
-///   - `cca_conv_states`: `[num_layers, B, in_out_ch=1280, conv_kernel_size=2]`
-///     fp16. Per-step roll-and-write update from
-///     `ZayaDynamicCache.update_conv_state`. ~205 KB per sequence.
-///   - `cca_prev_hs`: `[num_layers, B, hidden_size=2048]` fp16. Per-step
-///     overwrite from `prev_hs[layer].copy_(hs[-1, :, :])`. ~328 KB per
-///     sequence.
+/// ZAYA1's `num_hidden_layers=80` is the alternating ATT+MLP sub-layer
+/// count (40 ATT + 40 MLP, even/odd interleave). Only the 40 ATT
+/// sub-layers carry CCA state.
 ///
-/// Total CCA recurrent state per sequence: ~533 KB at fp16. Trivial vs
+/// Field shapes (for ZAYA1-8B, num_attn_layers=40, hidden_size=2048):
+///   - `kv_cache_bytes`: standard KV cache, sized by max context, lives
+///     on the 40 ATT layers. Owned by the runtime's existing KV pager
+///     (placeholder field today).
+///   - `cca_conv_states`: `[num_attn_layers, B, in_out_ch=1280, conv_kernel_size=2]`
+///     fp16. Per-step roll-and-write update from
+///     `ZayaDynamicCache.update_conv_state`. ~200 KB per sequence.
+///   - `cca_prev_hs`: `[num_attn_layers, B, hidden_size=2048]` fp16.
+///     Per-step overwrite from `prev_hs[layer].copy_(hs[-1, :, :])`.
+///     ~164 KB per sequence.
+///
+/// Total CCA recurrent state per sequence: ~370 KB at fp16. Trivial vs
 /// KV cache; large vs nothing. Fits comfortably in a single HBM block.
 ///
 /// RDNA ISA notes (gfx1201 R9700 target):
@@ -75,13 +80,17 @@ impl ZayaState {
     /// Compute the per-sequence CCA recurrent state size in bytes.
     /// Used by the Phase 6 design doc to size the runtime allocator
     /// budget regardless of which option lands.
+    ///
+    /// ZAYA1 alternates ATT and MLP sub-layers; only ATT layers carry
+    /// CCA state. Strict alternation is assumed: count = num_hidden_layers / 2.
     pub fn cca_state_bytes_per_seq(cfg: &ZayaConfig) -> usize {
         let dtype_bytes = 2; // fp16, per ZayaDynamicCache default
+        let num_attn_layers = cfg.num_hidden_layers / 2;
         let in_out_ch = cfg.cca_num_q_heads * cfg.head_dim
             + cfg.num_query_groups * cfg.head_dim;
         let conv_kernel_size = cfg.cca_time0.max(cfg.cca_time1); // both =2 in 8B
-        let conv = cfg.num_hidden_layers * in_out_ch * conv_kernel_size * dtype_bytes;
-        let prev_hs = cfg.num_hidden_layers * cfg.hidden_size * dtype_bytes;
+        let conv = num_attn_layers * in_out_ch * conv_kernel_size * dtype_bytes;
+        let prev_hs = num_attn_layers * cfg.hidden_size * dtype_bytes;
         conv + prev_hs
     }
 
@@ -99,13 +108,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cca_state_bytes_8b_under_1mb() {
+    fn cca_state_bytes_8b_under_500kb() {
         let cfg = ZayaConfig::default();
         let bytes = ZayaState::cca_state_bytes_per_seq(&cfg);
-        // Expected for 8B (80 layers, in_out_ch=1280, kernel=2, hidden=2048):
-        //   conv:    80 * 1280 * 2 * 2 = 409_600
-        //   prev_hs: 80 * 2048 * 2     = 327_680
-        //   total = 737_280 = ~720 KB
-        assert!(bytes > 700_000 && bytes < 800_000, "got {bytes} bytes");
+        // Expected for 8B (40 ATT layers, in_out_ch=1280, kernel=2, hidden=2048):
+        //   conv:    40 * 1280 * 2 * 2 = 204_800
+        //   prev_hs: 40 * 2048 * 2     = 163_840
+        //   total = 368_640 = ~360 KB
+        assert!(bytes > 350_000 && bytes < 400_000, "got {bytes} bytes");
     }
 }

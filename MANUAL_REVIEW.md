@@ -7,11 +7,12 @@ downstream work.
 
 - **What's escalated:** First per-layer recurrent state in hipfire that
   lives across decode steps. CCA (Compressed Convolutional Attention)
-  carries two per-layer per-sequence state buffers across decode steps
-  (~720 KB total per sequence at fp16 for ZAYA1-8B):
-   - `conv_states[80, B, 1280, 2]` fp16 - causal Conv1d-along-time
-     circular buffer.
-   - `prev_hs[80, B, 2048]` fp16 - 1-step lag of input hidden state.
+  carries two per-ATT-layer per-sequence state buffers across decode
+  steps (~370 KB total per sequence at fp16 for ZAYA1-8B):
+   - `conv_states[40, B, 1280, 2]` fp16 - causal Conv1d-along-time
+     circular buffer (40 = ATT-layer count, not 80; ZAYA1 alternates
+     ATT and MLP sub-layers).
+   - `prev_hs[40, B, 2048]` fp16 - 1-step lag of input hidden state.
 - **Why escalated:** the contract for the overnight ZAYA1 port intake
   forbids autonomous structural runtime changes. Three coupled
   decisions need your call before the implementing PR can land.
@@ -28,8 +29,8 @@ downstream work.
       structural simplicity. Recurrent spec-decode added in a later
       PR with proper state fork/commit primitives.
    3. **Paging policy.** HBM-pinned recurrent state vs paged.
-      Recommendation: HBM-pinned. ~720 KB per sequence at fp16; even
-      256 sequences only consumes 184 MB pinned per device.
+      Recommendation: HBM-pinned. ~370 KB per sequence at fp16; even
+      256 sequences only consumes 95 MB pinned per device.
 - **Predicates already landed on this branch:**
    - `00-cca-disambiguation.md` (verdict: RECURRENT, with verbatim code
      evidence).

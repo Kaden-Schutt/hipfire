@@ -18,8 +18,11 @@ The state being placed:
 | `conv_states` | `[in_out_ch=1280, conv_kernel_size=2]` | fp16 | roll(-1) + write at [-1] |
 | `prev_hs` | `[hidden_size=2048]` | fp16 | overwrite (1-step lag of input hs) |
 
-For ZAYA1-8B (80 layers): ~720 KB per sequence at fp16. No KV-pager-scale
-allocation; comfortably HBM-resident.
+For ZAYA1-8B: ~370 KB per sequence at fp16. (40 ATT layers carry CCA;
+the other 40 are MLP layers and have no CCA state. ZAYA1's
+`num_hidden_layers=80` is total sub-layer count, alternating ATT/MLP;
+per Phase 1 layer-structure probe.) No KV-pager-scale allocation;
+comfortably HBM-resident.
 
 This is the **first per-layer recurrent state in hipfire** that lives
 across decode steps (qwen35's DeltaNet recurrence is folded into the LA

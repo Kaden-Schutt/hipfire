@@ -144,7 +144,7 @@ grep -nE "Conv1d|conv_states|prev_hs|has_previous_state|update_conv_state"
 ### What's structurally new
 
 1. **First per-layer recurrent state in hipfire.** Existing infra (Qwen 3.5 DeltaNet linear-attention path is the closest analogue, but DeltaNet's recurrence is folded into the LA forward signature, not externalized as a stateful cache the way CCA does).
-2. **State allocation:** 80 layers × (1280 × 2 + 2048) = 80 × 4608 = ~370k elems per sequence at fp16 = ~740 KB per sequence. Trivial vs KV cache. But it needs a home.
+2. **State allocation:** ZAYA1 alternates ATT layers and MLP layers; only the 40 ATT layers carry CCA. So total: 40 layers × (1280 × 2 + 2048) = 40 × 4608 = ~184k elems per sequence at fp16 = ~370 KB per sequence. (Earlier draft of this doc claimed 80 layers × ... = ~740 KB; corrected after Phase 1 empirical layer-structure probe on hiptrx confirmed `model.layers[i]` alternates `ZayaDecoderATTLayer` (even idx) with `ZayaDecoderMLPLayer` (odd idx), so `num_hidden_layers=80` really means 40 ATT + 40 MLP, not 80 attention blocks.) Still trivial vs KV cache. But it needs a home.
 3. **State carry:** every decode step reads `conv_states[layer]` and `prev_hs[layer]`, computes new outputs, writes both back. The `roll(-1) + write [-1]` semantic for `conv_states` is a circular buffer; on RDNA we'd implement as a small persistent HBM tensor or a single-line LDS-resident buffer per layer.
 4. **State reset** on session end / context reset (`reset()` zeroes both buffers).
 

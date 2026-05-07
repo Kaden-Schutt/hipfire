@@ -87,25 +87,37 @@ def hook_target_modules(model, max_layers=None):
     if max_layers is not None:
         layers = layers[:max_layers]
 
+    # ZAYA1 alternates ZayaDecoderATTLayer (even idx) with
+    # ZayaDecoderMLPLayer (odd idx). Each carries its own input_norm
+    # + res_scale; ATT layers carry self_attn (which contains CCA),
+    # MLP layers carry zaya_block (which contains router + experts).
     for i, layer in enumerate(layers):
-        # Names below follow modeling_zaya.py:1197 (ZayaBlock). Each
-        # getattr is wrapped so a missing attr emits a None which we
-        # filter at registration time.
+        kind = type(layer).__name__
         candidates = [
-            ("pre_norm", getattr(layer, "input_layernorm", None) or getattr(layer, "pre_attn_norm", None)),
-            ("cca", getattr(getattr(layer, "self_attn", layer), "cca", None)),
-            ("self_attn", getattr(layer, "self_attn", None)),
-            ("post_attn_norm", getattr(layer, "post_attention_layernorm", None) or getattr(layer, "pre_mlp_norm", None)),
-            ("mlp_router", getattr(getattr(layer, "mlp", layer), "router", None)),
-            ("mlp", getattr(layer, "mlp", None)),
-            ("block_out", layer),  # Hooks the ZayaBlock's own forward output
+            ("kind", None),  # placeholder; emitted only as a marker line, not a hook
+            ("input_norm", getattr(layer, "input_norm", None)),
+            ("res_scale", getattr(layer, "res_scale", None)),
+            ("layer_out", layer),  # the ATTLayer / MLPLayer's own forward output
         ]
+        if "ATT" in kind:
+            self_attn = getattr(layer, "self_attn", None)
+            candidates.extend([
+                ("self_attn", self_attn),
+                ("cca", getattr(self_attn, "cca", None)),
+            ])
+        else:
+            zaya_block = getattr(layer, "zaya_block", None)
+            candidates.extend([
+                ("zaya_block", zaya_block),
+                ("router", getattr(zaya_block, "router", None)),
+                ("experts", getattr(zaya_block, "experts", None)),
+            ])
         for side, mod in candidates:
             if mod is not None:
                 yield (i, side, mod)
 
-    # Final norm + lm_head
-    yield (-1, "final_norm", getattr(model.model, "norm", None) or getattr(model.model, "final_layernorm", None))
+    # Final norm + lm_head (ZayaModel uses .final_norm, NOT .norm)
+    yield (-1, "final_norm", getattr(model.model, "final_norm", None) or getattr(model.model, "norm", None))
     yield (-1, "lm_head", model.lm_head)
 
 
@@ -165,9 +177,13 @@ def main():
         return hook
 
     handles = []
+    skipped = []
     for layer_idx, side, mod in hook_target_modules(model, max_layers=args.max_layers):
+        if mod is None:
+            skipped.append((layer_idx, side))
+            continue
         handles.append(mod.register_forward_hook(make_hook(layer_idx, side)))
-    print(f"[zaya-ref] registered {len(handles)} hooks")
+    print(f"[zaya-ref] registered {len(handles)} hooks ({len(skipped)} skipped: {skipped[:5]}{'...' if len(skipped) > 5 else ''})")
 
     print("[zaya-ref] running prefill forward ...")
     with torch.no_grad():
