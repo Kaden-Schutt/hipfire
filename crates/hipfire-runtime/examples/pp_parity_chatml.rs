@@ -64,10 +64,10 @@ fn build_prompt_tokens(tok: &Tokenizer) -> Vec<u32> {
 }
 
 fn run_single_gpu(path: &str, prompt_tokens: &[u32]) -> (Vec<u32>, Vec<Vec<f32>>) {
-    let hfq = HfqFile::open(Path::new(path)).expect("open hfq");
+    let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
     let mut kv = KvCache::new_gpu_asym3_capped(
         &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 4096, 4096,
     )
