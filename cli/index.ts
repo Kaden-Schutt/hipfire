@@ -641,6 +641,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
+function hfHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": "hipfire",
+  };
+  const token = process.env.HF_TOKEN;
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -1108,7 +1117,7 @@ async function pull(tag: string): Promise<string> {
   console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
   console.error(`  ${url}`);
 
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hfHeaders() });
   if (!res.ok) {
     console.error(`Download failed: ${res.status} ${res.statusText}`);
     console.error(`URL: ${url}`);
@@ -1156,7 +1165,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-        const sres = await fetch(sidecarUrl);
+            const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
