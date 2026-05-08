@@ -8,7 +8,7 @@ This document is the single canonical reference for every environment variable h
 
 | Layer | Count | Notes |
 |---|---|---|
-| `HIPFIRE_*` env vars | 115 | 14 plumbed through TUI, 44 mentioned in some doc, 57 silent |
+| `HIPFIRE_*` env vars | 117 | 14 plumbed through TUI, 44 mentioned in some doc, 59 silent |
 | Non-`HIPFIRE_*` project env vars | 21 | Test/example/diag scaffolding. Should be renamed `HIPFIRE_*` for consistency. |
 | `config.json` schema (`HipfireConfig`) | ~40 keys | Validated by `validateConfigValue()` in `cli/index.ts`. Some keys map 1:1 to env vars set at daemon spawn. |
 | `per_model_config.json` overrides | same surface | Sparse overrides on top of the base config, applied per model tag. |
@@ -107,6 +107,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_KV_MODE` | KV-CACHE | — | `cli/index.ts:400` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | KV-CACHE | — | `crates/hipfire-runtime/examples/daemon.rs:1211` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/kernels.rs:76` |
+| `HIPFIRE_LLOYD_GFX12` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:3779` |
 | `HIPFIRE_LM_HEAD_WMMA` | KERNEL-SELECTOR | — | `crates/rdna-compute/src/dispatch.rs:7954` |
 | `HIPFIRE_LOCAL` | DAEMON-RUNTIME | — | `cli/index.ts:1205` |
 | `HIPFIRE_MEMSET_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hip-bridge/src/ffi.rs:669` |
@@ -209,6 +210,7 @@ Hot-path kernel choice levers. **All silent today.** Power users who tune for sp
 - `HIPFIRE_GCN5_WAVE64_HYBRID` — gfx906 (MI50) prefill: hybrid Wave64 FP16. Production-path on gfx906.
 - `HIPFIRE_GPU_TOPK` — opt-in GPU-resident topk folding (Gemma4 perf lever). Set `1` to enable.
 - `HIPFIRE_LLOYD_FORCE_BASELINE` — disable Lloyd-MQ3 K4+LDS fast variants on gfx11. Used to bisect drift.
+- `HIPFIRE_LLOYD_GFX12=1` — opt-in dispatch of Lloyd-MQ3 WMMA kernels on gfx12 (RDNA4) inside `is_batchable_la`. Default off because the gfx12 sibling kernels ship code-complete but runtime-unvalidated locally; gfx12 reviewers set this to exercise parity / coherence-gate on RDNA4. Once external CI confirms gfx12 parity, the gate can be dropped or default-flipped. Ships with PR #195 (MQ3-Lloyd WMMA prefill).
 - `HIPFIRE_LM_HEAD_WMMA` — lm_head dispatch lever.
 - `HIPFIRE_RDNA2_VARIANT` — RDNA2 (gfx10x0) variant override. Plumbed via TUI + `cfg.rdna2_variant`.
 - `HIPFIRE_ROCBLAS_ALL_ARCHS`, `HIPFIRE_ROCBLAS_MIN_BATCH`, `HIPFIRE_ROCBLAS_OFF` — rocBLAS dispatch gates.
