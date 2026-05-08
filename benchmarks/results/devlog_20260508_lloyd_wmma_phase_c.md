@@ -150,6 +150,42 @@ Absolute throughput is ~3.2× lower than gfx1100 on prefill and
 ~2.3× lower on decode — consistent with the LPDDR5x-vs-GDDR6
 bandwidth ratio (~250 / 960 = 0.26).
 
+## gfx1151 coherence (post-review, 2026-05-08)
+
+`./scripts/coherence-gate.sh` run on gfx1151 against the 4 Lloyd rows
+(cap-4b, reason-9b, long-prefill-4b, long-prefill-9b). All produce
+fluent output and terminate cleanly with `<|im_end|>`. Raw rows from
+`/tmp/coherence-gfx1151-pr195.md`:
+
+```
+qwen3.5-4b.mq3-lloyd / cap-mq3-lloyd-4b
+  prefill 21 tok @ 457.4 tok/s  decode 72.2 tok/s  → "Paris is the capital of France."
+
+qwen3.5-9b.mq3-lloyd / reason-mq3-lloyd-9b
+  prefill 36 tok @ 363.3 tok/s  decode 50.6 tok/s  → "Final Number: 8"
+  (sheep-riddle answer is wrong on this model class — the same prompt
+   on gfx1100 produces the same off-by-one; not a kernel issue.)
+
+qwen3.5-4b.mq3-lloyd / long-prefill-mq3-lloyd-4b
+  prefill 190 tok @ 964.3 tok/s  decode 70.4 tok/s  → 220-token LRU cache
+  walkthrough, fluent, on-topic, no attractor loops.
+
+qwen3.5-9b.mq3-lloyd / long-prefill-mq3-lloyd-9b
+  prefill 190 tok @ 496.2 tok/s  decode 49.0 tok/s  → 126-token LRU cache
+  explanation, fluent, terminates cleanly.
+```
+
+The `HARD_ERROR exit=139` entries in the gate report are the
+pre-existing daemon-shutdown segfault (affects every model row, MQ4
+through MQ6 — not a Lloyd or kernel issue). Generation completes
+successfully and emits the `done` event before the segfault on
+cleanup; the `tokens=N` field in the gate report confirms full
+output for each row.
+
+The 964.3 / 496.2 tok/s long-prefill numbers confirm the new batched
+WMMA path is engaged on gfx1151 (pre-B2 per-token `forward_scratch`
+fallback would show ~30-50 tok/s at this prompt length).
+
 ## What this validates
 
 - The Phase B1 fused kernel family (qkv, qkvza, gate_up, residual,
@@ -183,6 +219,25 @@ bandwidth ratio (~250 / 960 = 0.26).
   prefill only. The DDTree / PFlash paths route through different
   matchers and were not exercised here. This is the obvious next
   area to bench once #116 lands.
+
+- **Decode-path numerical drift.** This PR's 4 WMMA prefill kernels
+  (`gemm_*_mq3g256_lloyd_wmma.hip` × gfx11/gfx12) are single-acc by
+  design — verified at `gemm_mq3g256_lloyd_residual_wmma.hip:72`,
+  `gemm_qkvza_…:97`, `gemm_qkv_…:71`, `gemm_gate_up_…:65` (each uses
+  one `float8_t acc` per lane). So **prefill** is drift-free.
+  However, the **decode** path GEMV kernels (`gemv_mq3g256_lloyd*.hip`
+  + the fused gemv siblings) are unchanged on this branch and still
+  carry the universal multi-accumulator drift documented at
+  `benchmarks/results/devlog_20260507_mq3_lloyd_gfx1151.md`: a 0.9 %
+  PPL drift on Qwen3.5-9B caused by the K4
+  `(acc0+acc1)+(acc2+acc3)` reduction order, reproducible on
+  gfx1100/1101/1102/1151. The Phase C decode ratios reported here
+  (94 % at gfx1100, 91 % at gfx1151) are throughput-only; they do
+  not measure PPL drift, and the master decode path carries the
+  same drift envelope independent of this PR. Closing it requires a
+  single-accumulator port of the GEMV family (mirroring this PR's
+  WMMA kernels and the production MQ4-Lloyd kernels) — separate
+  follow-up, tracked outside this PR's scope.
 
 ## Watch-items carried forward
 

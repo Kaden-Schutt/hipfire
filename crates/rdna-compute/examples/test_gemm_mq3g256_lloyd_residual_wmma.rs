@@ -234,11 +234,14 @@ fn main() {
         (1024, 12288, 64),  // qwen3.5-9b mlp.down_proj K dim
     ];
 
-    // Tolerance is empirical-set. Initial rough budget 5e-3 absolute (fp32-acc-
-    // from-fp16 with K up to 12288). The Phase A acceptance criterion
-    // requires logging max-abs across all cases and setting tolerance to ~3×
-    // observed for regression detection in B1 onward.
-    let phase_a_tolerance = 5e-3f32;
+    // Tightened post-Phase-A from the initial 5e-3 budget. Worst observed
+    // max-abs across all shapes is 5.83e-5 at K=12288 (Phase A devlog
+    // 2026-05-07). 2e-4 = ~3× observed, matching the fused-test tolerance
+    // discipline (test_gemm_fused_mq3g256_lloyd_wmma.rs:162 = 1.75e-4).
+    // The original 5e-3 was 86× looser than observed and would silently
+    // pass 1e-4-class regressions — flagged in the multi-reviewer code
+    // review at docs/plans/mq3-lloyd-wmma-code-rev-claude.md (S3).
+    let phase_a_tolerance = 2e-4f32;
 
     let mut all_pass = true;
     let mut global_max_abs = 0f32;
