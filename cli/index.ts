@@ -1167,7 +1167,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-            const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
