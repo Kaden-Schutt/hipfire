@@ -15220,6 +15220,21 @@ impl Gpu {
         self.ensure_kernel("attention_dflash_f32", kernels::ATTENTION_DFLASH_SRC, "attention_dflash_f32")?;
         let func = &self.functions["attention_dflash_f32"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Tiled online-softmax (FlashAttention-style). LDS layout:
+        //   tile_scores[tile_size] + ws[block_size] + out_run[head_dim]
+        //
+        // tile_size is chosen to keep LDS ≤ 56 KB (8 KB margin under gfx1100's
+        // 64 KB hard limit for kernel launch overhead). Single-tile case
+        // (l ≤ tile_size) is mathematically equivalent to the prior
+        // single-pass softmax up to FP order; multi-tile carries (max, sum,
+        // out) running state across tiles. Replaces the prior `scores[L]`
+        // allocation that overflowed LDS at l > ~16128.
+        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
+        let block_size = block_size.next_power_of_two();
+        const LDS_BUDGET_F32: usize = 14_336; // 56 KB / 4 bytes
+        let fixed = block_size as usize + head_dim;
+        let max_tile_room = LDS_BUDGET_F32.saturating_sub(fixed);
+        let tile_size = std::cmp::min(l.max(1), max_tile_room.max(1));
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
         let mut vp = v.buf.as_ptr();
@@ -15230,6 +15245,7 @@ impl Gpu {
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let mut ts = tile_size as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut kp as *mut _ as *mut c_void,
@@ -15241,11 +15257,9 @@ impl Gpu {
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut ts as *mut _ as *mut c_void,
         ];
-        let block_size = std::cmp::min(256, std::cmp::max(l, head_dim)) as u32;
-        let block_size = block_size.next_power_of_two();
-        // Shared: scores[L] + workspace[block_size]
-        let shared_mem = ((l + block_size as usize) * 4) as u32;
+        let shared_mem = ((tile_size + block_size as usize + head_dim) * 4) as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
