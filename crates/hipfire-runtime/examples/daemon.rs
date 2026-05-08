@@ -1466,19 +1466,65 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             if let Some(d) = dflash_drafter_gpu.as_mut() {
                 let target_dev = gpu.device_id;
                 let drafter_dev = d.device_id;
-                // Bidirectional peer-access enable. Target context already
-                // current (we are inside load_model's body). Drafter side
-                // requires bind_thread before enabling peer access from there.
+                // Bidirectional peer-access enable.
+                //
+                // PR3 step 2 fix: `Gpu::init_with_device(drafter_dev)` left the
+                // calling thread bound to the DRAFTER device (it issued
+                // hipSetDevice + LAST_BOUND_DEVICE=drafter as part of init).
+                // The pre-step-2 PR2 code then called
+                // `gpu.hip.enable_peer_access(drafter_dev)` on the (silently
+                // mis-bound) thread, which enabled drafter→drafter peer access
+                // — a no-op or error swallowed by `let _ =`. Result: target →
+                // drafter peer writes (e.g. target's verify forward writing
+                // hidden_rb under hetero) faulted asynchronously and the GPU
+                // aborted at the next sync.
+                //
+                // Fix: explicitly `gpu.bind_thread()` before each direction to
+                // guarantee the calling-thread device matches the source side
+                // of `enable_peer_access`. Surface errors via `eprintln!`
+                // instead of swallowing — silent failure here corrupts step 2's
+                // entire correctness story.
                 if target_dev != drafter_dev {
-                    if let Ok(true) = gpu.hip.can_access_peer(target_dev, drafter_dev) {
-                        let _ = gpu.hip.enable_peer_access(drafter_dev);
+                    // Direction 1: target → drafter (kernels on target context
+                    // can read/write drafter VRAM by direct address).
+                    if let Err(e) = gpu.bind_thread() {
+                        eprintln!("  hetero peer-access: bind target failed: {e}");
                     }
-                    let _ = d.bind_thread();
-                    if let Ok(true) = d.hip.can_access_peer(drafter_dev, target_dev) {
-                        let _ = d.hip.enable_peer_access(target_dev);
+                    match gpu.hip.can_access_peer(target_dev, drafter_dev) {
+                        Ok(true) => {
+                            if let Err(e) = gpu.hip.enable_peer_access(drafter_dev) {
+                                eprintln!("  hetero peer-access target→drafter: {e}");
+                            } else {
+                                eprintln!("  hetero peer-access target({target_dev})→drafter({drafter_dev}): enabled");
+                            }
+                        }
+                        Ok(false) => eprintln!(
+                            "  hetero peer-access target({target_dev})→drafter({drafter_dev}): NOT supported by HIP runtime"
+                        ),
+                        Err(e) => eprintln!("  hetero peer-access can_access_peer t→d: {e}"),
+                    }
+                    // Direction 2: drafter → target (kernels on drafter context
+                    // can read/write target VRAM by direct address).
+                    if let Err(e) = d.bind_thread() {
+                        eprintln!("  hetero peer-access: bind drafter failed: {e}");
+                    }
+                    match d.hip.can_access_peer(drafter_dev, target_dev) {
+                        Ok(true) => {
+                            if let Err(e) = d.hip.enable_peer_access(target_dev) {
+                                eprintln!("  hetero peer-access drafter→target: {e}");
+                            } else {
+                                eprintln!("  hetero peer-access drafter({drafter_dev})→target({target_dev}): enabled");
+                            }
+                        }
+                        Ok(false) => eprintln!(
+                            "  hetero peer-access drafter({drafter_dev})→target({target_dev}): NOT supported by HIP runtime"
+                        ),
+                        Err(e) => eprintln!("  hetero peer-access can_access_peer d→t: {e}"),
                     }
                     // Restore target context for the rest of load_model.
-                    let _ = gpu.bind_thread();
+                    if let Err(e) = gpu.bind_thread() {
+                        eprintln!("  hetero peer-access: restore target failed: {e}");
+                    }
                 }
             }
             match load_dflash_state(dp, physical_cap, &config, &dn, gpu, dflash_drafter_gpu.as_mut()) {
@@ -1744,24 +1790,43 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
         let _ = gpu;
         return;
     }
-    // DFlash state: draft weights have free_gpu; ring / snapshot / tape /
-    // verify_scratch don't expose one — their GpuTensors / DeviceBuffers will
-    // leak until daemon exit if the caller cycles load/unload mid-session.
-    // Acceptable for the daemon since unload is rare and the weights are the
-    // bulk of the VRAM anyway.
+    // DFlash state. Under PR3 step 1 + 2 the split is:
+    //   - draft_weights, draft_scratch, hidden_rb live on the dedicated
+    //     drafter Gpu when `dflash_drafter_gpu` is `Some`. Free them via
+    //     that Gpu so its allocation pool actually shrinks.
+    //   - target_snap, gdn_tape, verify_scratch were allocated on `gpu`
+    //     (target). They still don't expose free_gpu — they leak until
+    //     daemon exit if the caller cycles load/unload mid-session, same
+    //     as before this PR.
+    //
+    // Single-card mode (drafter_gpu = None) preserves the prior behavior:
+    // weights + scratch + ring all freed on the target gpu.
     if let Some(df) = m.dflash {
-        df.draft_weights.free_gpu(gpu);
-        df.draft_scratch.free_gpu(gpu);
-    }
-    // PR2: drop the dedicated drafter Gpu instance if one was opened by
-    // HIPFIRE_DFLASH_DRAFTER_DEVICE. Drop releases the HIP device handle
-    // and any tensors still owned by the Gpu's pool. PR2 has no tensors
-    // on the drafter Gpu yet (drafter weights/scratch still on `gpu`
-    // until PR3), so this is essentially a handle close.
-    if let Some(_drafter_gpu) = m.dflash_drafter_gpu {
-        // Drop runs Gpu's destructor which frees pool + closes the
-        // device. No explicit free needed beyond letting it fall out of
-        // scope, but binding to a local makes the intent explicit.
+        if let Some(mut drafter_gpu) = m.dflash_drafter_gpu {
+            // Bind drafter for the per-tensor frees so the underlying
+            // hipFree calls reach the right device's allocator.
+            let _ = drafter_gpu.bind_thread();
+            df.draft_weights.free_gpu(&mut drafter_gpu);
+            df.draft_scratch.free_gpu(&mut drafter_gpu);
+            df.hidden_rb.free_gpu(&mut drafter_gpu);
+            drafter_gpu.invalidate_weight_caches();
+            drafter_gpu.invalidate_graph_state();
+            drafter_gpu.drain_pool();
+            // Restore the calling thread to target before subsequent target-
+            // side frees below run on the wrong device.
+            let _ = gpu.bind_thread();
+            // drafter_gpu falls out of scope here — Gpu::Drop closes the
+            // device handle and releases any remaining pooled allocations.
+        } else {
+            df.draft_weights.free_gpu(gpu);
+            df.draft_scratch.free_gpu(gpu);
+            df.hidden_rb.free_gpu(gpu);
+        }
+    } else if let Some(_drafter_gpu) = m.dflash_drafter_gpu {
+        // No dflash state but a drafter Gpu was opened — reachable only via
+        // load_dflash_state's early ddtree+hetero refusal, which fires BEFORE
+        // any drafter VRAM is allocated. Dropping the Gpu closes the device
+        // handle; nothing else needs to be freed.
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
@@ -1799,6 +1864,34 @@ fn load_dflash_state(
     gpu: &mut rdna_compute::Gpu,
     drafter_gpu: Option<&mut rdna_compute::Gpu>,
 ) -> Result<DflashState, String> {
+    // Capture before we move `drafter_gpu` into the alloc_gpu match below.
+    // Used by the ddtree+hetero refusal check further down — we still need
+    // to know whether a dedicated drafter device was opened by load_model.
+    let drafter_pinned = drafter_gpu.is_some();
+
+    // PR3 step 2 refusal: ddtree + cross-card spec-decode is not yet wired
+    // up. spec_step_ddtree_batched / spec_step_ddtree_path_c still take a
+    // single `gpu: &mut Gpu` and run their drafter forwards through that
+    // context, which crashes when drafter weights/scratch live on a
+    // different device. Refuse cleanly at load — and BEFORE allocating any
+    // drafter VRAM — rather than letting it blow up at the first decode
+    // cycle. Plain chain-mode (`spec_step_dflash`) is the supported hetero
+    // path in step 2; ddtree hetero is a follow-on.
+    let ddtree_budget_raw = std::env::var("HIPFIRE_DDTREE_BUDGET")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    if ddtree_budget_raw > 0 && drafter_pinned {
+        return Err(
+            "ddtree + cross-card spec-decode not yet supported \
+             (HIPFIRE_DDTREE_BUDGET set together with HIPFIRE_DFLASH_DRAFTER_DEVICE). \
+             Unset one of them. Chain-mode DFlash with HIPFIRE_DFLASH_DRAFTER_DEVICE \
+             is the supported hetero path in PR3 step 2."
+                .to_string(),
+        );
+    }
+
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
 
@@ -1819,6 +1912,14 @@ fn load_dflash_state(
         Some(d) => d,
         None => gpu,
     };
+    // PR3 step 2: hipMalloc in `alloc_gpu.alloc_tensor` and the upload helpers
+    // honor the CURRENTLY BOUND device, not `alloc_gpu.device_id`. With the
+    // step-1 peer-access setup ending bound to target, the draft allocations
+    // would land on target memory while DflashWeights / DflashScratch tracked
+    // them as drafter — silent device mismatch that survives only because
+    // peer access masks the cross-device pointers. Make the binding explicit
+    // here so the malloc target matches `alloc_gpu`.
+    alloc_gpu.bind_thread().map_err(|e| format!("bind alloc_gpu: {e}"))?;
     let draft_weights = DflashWeights::load(alloc_gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
     let draft_scratch = DflashScratch::new_with_mq(
         alloc_gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
@@ -1836,6 +1937,13 @@ fn load_dflash_state(
         ctx_capacity + draft_config.block_size,
         hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
     ).map_err(|e| format!("hidden_rb: {e}"))?;
+
+    // Switch back to target before allocating target-side state (target_snap,
+    // gdn_tape, verify_scratch). Same reason as the bind above: hipMalloc on
+    // the wrong device would land these on drafter memory.
+    if drafter_pinned {
+        gpu.bind_thread().map_err(|e| format!("bind target post draft alloc: {e}"))?;
+    }
 
     let target_snap = DeltaNetSnapshot::new_for(gpu, target_dn).map_err(|e| format!("target_snap: {e}"))?;
 
@@ -1878,6 +1986,8 @@ fn load_dflash_state(
             }
         },
     };
+    // (ddtree+hetero refusal already fired at the top of load_dflash_state,
+    // before any drafter VRAM was allocated.)
     let scratch_max_n = if ddtree_budget_env > 0 {
         std::cmp::max(draft_config.block_size, 1 + ddtree_budget_env)
     } else {
@@ -2060,6 +2170,13 @@ fn generate_dflash(
         for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
         for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
     }
+    // PR3 step 2: take the drafter Gpu out of LoadedModel for the
+    // duration of the decode loop. spec_step_dflash needs `Option<&mut Gpu>`
+    // for the drafter; taking ownership here avoids split-borrow conflicts
+    // with `m.dflash` and lets us re-borrow on every cycle via `.as_mut()`.
+    // We restore it back into `m.dflash_drafter_gpu` on every exit path
+    // below so subsequent requests see the same pinned device.
+    let mut drafter_gpu_owned: Option<rdna_compute::Gpu> = m.dflash_drafter_gpu.take();
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
     df.draft_scratch.reset_upload_tracking();
@@ -2082,6 +2199,7 @@ fn generate_dflash(
             let _ = stdout.flush();
             m.q35_weights = Some(weights); m.kv_cache = Some(kv_cache);
             m.dn_state = Some(dn_state); m.q35_scratch = Some(scratch);
+            m.dflash_drafter_gpu = drafter_gpu_owned;
             return;
         }
     };
@@ -2118,6 +2236,7 @@ fn generate_dflash(
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        m.dflash_drafter_gpu = drafter_gpu_owned;
         return;
     }
     if m.eviction.is_none() && prompt_tokens.len() + max_tokens + df.block_size > ctx_capacity {
@@ -2131,6 +2250,7 @@ fn generate_dflash(
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        m.dflash_drafter_gpu = drafter_gpu_owned;
         return;
     }
 
@@ -2147,6 +2267,7 @@ fn generate_dflash(
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        m.dflash_drafter_gpu = drafter_gpu_owned;
         return;
     }
     // Prime the draft's GPU target_hidden buffer from the prompt rows so the
@@ -2173,6 +2294,7 @@ fn generate_dflash(
             m.kv_cache = Some(target.kv_cache);
             m.dn_state = Some(target.dn_state);
             m.q35_scratch = Some(target.scratch);
+            m.dflash_drafter_gpu = drafter_gpu_owned;
             return;
         }
     };
@@ -2310,7 +2432,9 @@ fn generate_dflash(
             }
         } else {
             spec_step_dflash(
-                gpu, &mut target, &df.draft_weights, &df.draft_config,
+                gpu,
+                drafter_gpu_owned.as_mut(),
+                &mut target, &df.draft_weights, &df.draft_config,
                 &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
                 &mut df.target_snap, &df.verify_scratch,
                 position, seed_token,
@@ -2404,6 +2528,14 @@ fn generate_dflash(
         if hit_eos || think_cap_hit { break; }
     }
 
+    // PR3 step 2: defensively re-bind target before handing control back
+    // to the daemon's outer loop. spec_step_dflash flips the thread to
+    // drafter for §2-§4 and back; on a successful cycle it ends bound to
+    // target, but if an inner kernel errored via `?` the bind could be
+    // left on drafter. The daemon's next request expects target bound, so
+    // force the cache back to target here. No-op in single-card mode.
+    let _ = gpu.bind_thread();
+
     // Put target state back on LoadedModel so the next request sees fresh
     // (reset) state. We zero DN/kv on entry anyway, but we still need the
     // ownership back.
@@ -2411,6 +2543,9 @@ fn generate_dflash(
     m.kv_cache = Some(target.kv_cache);
     m.dn_state = Some(target.dn_state);
     m.q35_scratch = Some(target.scratch);
+    // Restore the dedicated drafter Gpu (was taken at the top of generate_dflash
+    // for borrow-disjoint access during the decode loop).
+    m.dflash_drafter_gpu = drafter_gpu_owned;
     m.seq_pos = position;
     m.conversation_tokens = emitted.clone();
 

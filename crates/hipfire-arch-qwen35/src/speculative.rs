@@ -1343,6 +1343,20 @@ impl HiddenStateRingBuffer {
         self.head = 0;
         self.written = 0;
     }
+
+    /// Free all GPU tensors owned by this ring. Caller MUST pass the same
+    /// `Gpu` instance the ring was allocated from — under hetero PFlash+DFlash
+    /// (PR3 step 2) the ring lives on the drafter Gpu, so unload_model must
+    /// route the free through `dflash_drafter_gpu` rather than the target.
+    /// Freeing on the wrong device leaks the allocations.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in self.layer_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.staging_bufs {
+            let _ = gpu.free_tensor(t);
+        }
+    }
 }
 
 /// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
@@ -2272,6 +2286,21 @@ pub fn scatter_hidden_block_to_interleaved(
     let row_bytes = hidden * 4;
     let start_slot = (head + max_pos - block_size) % max_pos;
 
+    // PR3 step 2 hetero hardening: at long prompts (≥ ~10K BPE tokens with
+    // num_extract=5 → 50K+ memcpys), the AMD HIP runtime accumulates an
+    // internal `Command` object chain proportional to memcpy count. The
+    // chain releases linked-list-style via `Command::terminate() →
+    // ReferenceCountedObject::release() → Command::releaseResources()
+    // → terminate()` recursion. At ~10K rows × 5 extracts = 50K commands,
+    // the recursive release blows the main thread's 8 MB stack on the
+    // FIRST subsequent kernel launch (in our case spec_step_dflash's
+    // first cycle). Verified via core-dump backtrace: 50K identical
+    // frames in libamdhip64.so.
+    //
+    // Workaround: periodically `device_synchronize()` to drain the
+    // command chain. Fence at every CHAIN_DRAIN_INTERVAL rows × num_extract
+    // memcpys so the chain stays bounded.
+    const CHAIN_DRAIN_INTERVAL: usize = 1024;
     for r in 0..n_rows {
         let slot = (start_slot + r) % max_pos;
         let dst_row = dst_row_offset + r;
@@ -2287,6 +2316,17 @@ pub fn scatter_hidden_block_to_interleaved(
                 row_bytes,
             )?;
         }
+        // Drain the HIP command chain periodically (see comment above the loop).
+        if (r + 1) % CHAIN_DRAIN_INTERVAL == 0 {
+            gpu.hip.device_synchronize()?;
+        }
+    }
+    // Final drain only if any pending memcpys haven't been drained by the
+    // periodic fence above. Skip the unconditional sync on short prompts
+    // (n_rows < CHAIN_DRAIN_INTERVAL) so single-card / short-context cycles
+    // don't pay an extra device_synchronize that adds nothing.
+    if n_rows > 0 && n_rows % CHAIN_DRAIN_INTERVAL != 0 {
+        gpu.hip.device_synchronize()?;
     }
     Ok(())
 }
@@ -2401,7 +2441,8 @@ pub fn download_hidden_block(
 /// full cumulative context (the default, distribution-preserving path).
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
-    gpu: &mut Gpu,
+    target_gpu: &mut Gpu,
+    mut drafter_gpu: Option<&mut Gpu>,
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -2424,6 +2465,27 @@ pub fn spec_step_dflash(
     repeat_penalty: f32,
     repeat_window: usize,
 ) -> HipResult<SpecStepResult> {
+    // Hetero PFlash+DFlash (PR3 step 2): when `drafter_gpu` is `Some`, drafter
+    // weights / scratch / hidden_rb live on a separate HIP device. Drafter
+    // kernels must launch on the drafter Gpu's HIP context (its module cache
+    // is the only one that has the kernels' GPU-side modules loaded — calling
+    // them through target_gpu's context crashes with hipErrorInvalidImage).
+    //
+    // Convention used below:
+    //   - target-side blocks (target weights / KV / dn_state / verify_scratch)
+    //     run with `target_gpu.bind_thread()` current.
+    //   - drafter-side blocks (draft_weights / draft_scratch / hidden_rb-local
+    //     scatter) run with `drafter_gpu.bind_thread()` current — or the same
+    //     gpu in single-card mode where `drafter_gpu` is None.
+    //   - peer access between target and drafter is enabled bidirectionally
+    //     at load time (daemon.rs::load_model), so cross-device memcpys and
+    //     incidental cross-device pointer reads inside kernels work without
+    //     any per-call setup.
+    //
+    // Single-card mode (drafter_gpu = None) is byte-identical to the pre-PR3
+    // path: every "drafter" block reuses target_gpu, bind_thread is a no-op
+    // via the thread-local cache, and we skip the cross-device synchronizes.
+    let split_mode = drafter_gpu.is_some();
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
     // doing adaptive-B based on rolling τ can shrink to save per-iter cost.
@@ -2445,8 +2507,20 @@ pub fn spec_step_dflash(
     // and stream-ordered launches have a non-null stream to ride on. Without
     // this, the lm_head pre-zero memsets in dispatch.rs:4475/4545 fall through
     // to the sync hipMemset path (~46 hot calls/cycle on 27B).
-    if gpu.active_stream.is_none() {
-        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    //
+    // In hetero (split_mode) we initialize streams on BOTH gpus — drafter
+    // kernels need a non-null stream on drafter_gpu's context for the same
+    // memset_async fast path; otherwise the stream-gated async fallthrough in
+    // commit_staging_to_ring / write_rows_to_staging breaks.
+    if target_gpu.active_stream.is_none() {
+        target_gpu.active_stream = Some(target_gpu.hip.stream_create()?);
+    }
+    if let Some(d) = drafter_gpu.as_deref_mut() {
+        if d.active_stream.is_none() {
+            d.bind_thread()?;
+            d.active_stream = Some(d.hip.stream_create()?);
+            target_gpu.bind_thread()?;
+        }
     }
 
     assert!(b >= 2, "dflash block size must be ≥ 2");
@@ -2470,7 +2544,7 @@ pub fn spec_step_dflash(
     // of Instant::now() calls.
     let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_spec_start = std::time::Instant::now();
     let mut t_phase = t_spec_start;
@@ -2521,28 +2595,40 @@ pub fn spec_step_dflash(
             }
         }
     } else {
-    // ── 2. noise_embedding = target.embed_tokens(block) written directly
-    // into draft_scratch.x on GPU (no host round-trip). Target and draft
-    // share the same Gpu, so the embedding lookup can target the draft's
-    // scratch buffer. Avoids 16 × D2H + one H2D per iter (~1 ms saved).
-    for (i, &tok) in block.iter().enumerate() {
-        let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            _ => panic!("dflash: unsupported target embedding format for noise lookup"),
+    // ── Drafter-bound section (§2 embedding, §3 positions, §4 draft_forward) ──
+    //
+    // In hetero (split_mode), drafter weights / scratch live on a different
+    // HIP device than the target. The embedding lookup writes into
+    // `draft_scratch.x` (drafter memory) and reads `target.weights.token_embd`
+    // via peer access; the draft forward runs entirely against drafter
+    // weights/scratch. Both must launch on drafter_gpu's HIP context.
+    {
+        let drafter: &mut Gpu = match drafter_gpu.as_mut() {
+            Some(d) => &mut **d,
+            None => &mut *target_gpu,
+        };
+        if split_mode {
+            drafter.bind_thread()?;
         }
-    }
+        // ── 2. embedding lookup on drafter context ──
+        for (i, &tok) in block.iter().enumerate() {
+            let dst = draft_scratch.x.sub_offset(i * h, h);
+            match target.weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                    drafter.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                    drafter.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                    drafter.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    drafter.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                }
+                _ => panic!("dflash: unsupported target embedding format for noise lookup"),
+            }
+        }
 
     // ── 3. Position arrays + optional context slice ─────────────────────
     // Q positions: the absolute positions of the block slots,
@@ -2609,7 +2695,7 @@ pub fn spec_step_dflash(
     // noise_embedding = None: we wrote embeddings directly into
     // draft_scratch.x above via D2D (no host round-trip).
     dflash::draft_forward(
-        gpu,
+        drafter,
         draft_weights,
         draft_cfg,
         None,
@@ -2620,6 +2706,24 @@ pub fn spec_step_dflash(
         effective_ctx_len,
         draft_scratch,
     )?;
+
+    // Drain drafter's stream so the next (target-bound) lm_head GEMM sees
+    // a coherent draft_scratch.x via peer read. Skipped in single-card mode
+    // — kernels submitted on the same device order naturally on the same
+    // null-stream / active_stream.
+    if split_mode {
+        drafter.hip.device_synchronize()?;
+    }
+    } // drafter borrow ends — target_gpu reusable below
+
+    // ── Target-bound section (§5 lm_head + §6 verify) ───────────────────
+    // Switch the calling thread to target's HIP context for the rest of
+    // the cycle. The lm_head GEMM reads target.weights.output (target
+    // memory) and writes verify_scratch.logits (target memory); reads
+    // draft_scratch.x cross-device via peer access.
+    if split_mode {
+        target_gpu.bind_thread()?;
+    }
 
     // ── 5. Apply target.lm_head to draft hidden positions 1..B ──────────
     // Fast path: a single batched GEMM against target.weights.output over
@@ -2658,10 +2762,10 @@ pub fn spec_step_dflash(
 
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
+                target_gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             rdna_compute::DType::HFQ4G256 => {
-                gpu.gemm_hfq4g256_batched_lmhead(
+                target_gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -2669,8 +2773,8 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq4g256_batched_lmhead(
+                target_gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                target_gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -2678,13 +2782,13 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for MQ3 draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq3g256_batched_lmhead(
+                target_gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                target_gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             rdna_compute::DType::HFQ6G256 => {
-                gpu.gemm_hfq6g256_batched_lmhead(
+                target_gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -2692,8 +2796,8 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for MQ6 draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
-                gpu.gemm_hfq6g256_batched_lmhead(
+                target_gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                target_gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
@@ -2702,7 +2806,7 @@ pub fn spec_step_dflash(
 
         if use_temp_sampling {
             // Full D2H of (B-1)×vocab logits, CPU softmax+sample.
-            let host_logits = gpu.download_f32(&logits_batch)?;
+            let host_logits = target_gpu.download_f32(&logits_batch)?;
             debug_assert_eq!(host_logits.len(), batch * vocab);
             draft_softmaxes.reserve(batch);
             for i in 0..batch {
@@ -2720,7 +2824,7 @@ pub fn spec_step_dflash(
             // so draft and target pick from the same reshaped distribution.
             // Keeps spec-decode aligned (τ doesn't collapse from mismatched
             // argmaxes — both sides see identical -inf logits on banned toks).
-            let host_logits = gpu.download_f32(&logits_batch)?;
+            let host_logits = target_gpu.download_f32(&logits_batch)?;
             debug_assert_eq!(host_logits.len(), batch * vocab);
             let mut row = vec![0f32; vocab];
             for i in 0..batch {
@@ -2736,13 +2840,13 @@ pub fn spec_step_dflash(
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
             let argmax_buf = verify_scratch.argmax.sub_offset(0, batch);
-            gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch)?;
+            target_gpu.argmax_f32_batched(&logits_batch, &argmax_buf, vocab, batch)?;
             let mut host_idx = vec![0i32; batch];
             {
                 let bytes: &mut [u8] = unsafe {
                     std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
                 };
-                gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
+                target_gpu.hip.memcpy_dtoh(bytes, &argmax_buf.buf)?;
             }
             for &idx in &host_idx {
                 drafted.push(idx as u32);
@@ -2752,8 +2856,8 @@ pub fn spec_step_dflash(
         // Fallback: per-row weight_gemv loop.
         for i in 1..b {
             let hidden_row = draft_scratch.x.sub_offset(i * h, h);
-            llama::weight_gemv(gpu, w_out, &hidden_row, &target.scratch.logits)?;
-            let logits = gpu.download_f32(&target.scratch.logits)?;
+            llama::weight_gemv(target_gpu, w_out, &hidden_row, &target.scratch.logits)?;
+            let logits = target_gpu.download_f32(&target.scratch.logits)?;
             debug_assert_eq!(logits.len(), vocab);
             if use_temp_sampling {
                 let mut probs = Vec::with_capacity(vocab);
@@ -2784,7 +2888,7 @@ pub fn spec_step_dflash(
     }
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_draft_end = std::time::Instant::now();
 
@@ -2834,7 +2938,7 @@ pub fn spec_step_dflash(
     // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
     // replay just the GDN recurrence for `accept+1` steps without
     // re-running the target.
-    target_snap.save_from(&target.dn_state, gpu)?;
+    target_snap.save_from(&target.dn_state, target_gpu)?;
     // Mutable variable to allow both verify capture + rollback replay usage.
     let mut gdn_tape_opt = gdn_tape;
     // MoE targets can't populate the tape: forward_prefill_batch_with_pbs's
@@ -2854,18 +2958,18 @@ pub fn spec_step_dflash(
     }
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
     let verify_out = verify_dflash_block(
-        gpu, target, &block, position, hidden_rb,
+        target_gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
         use_temp_sampling || host_path_active,  // full target logits needed for rejection sampling, RP, or n-gram block
         verify_scratch,
     )?;
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_verify_end = std::time::Instant::now();
 
@@ -3041,7 +3145,7 @@ pub fn spec_step_dflash(
     debug_assert_eq!(committed_count, accept_len + 2);
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_accept_end = std::time::Instant::now();
 
@@ -3084,7 +3188,12 @@ pub fn spec_step_dflash(
     let rows_to_keep = accept_len + 1;
     if ctx_slice.is_some() {
         // ctx_slice path: CPU shadow still required for the window slice.
-        let hidden_block = download_hidden_block(gpu, hidden_rb, b)?;
+        // hidden_rb lives on drafter memory in hetero mode; the d2h read
+        // works either way thanks to peer access (hipMemcpy across peer-
+        // enabled devices), so we leave the read on target_gpu's context
+        // here. ctx_slice is a diagnostic-only path — not in the production
+        // hot loop.
+        let hidden_block = download_hidden_block(target_gpu, hidden_rb, b)?;
         target_hidden_host.extend_from_slice(&hidden_block[..rows_to_keep * ne * h]);
     } else {
         // Fast path: scatter straight from hidden_rb into draft scratch on GPU.
@@ -3094,14 +3203,41 @@ pub fn spec_step_dflash(
         // `rows_to_keep` (= accept+1) of those. Pass block_size=b so the
         // scatter function aligns to the verify-block origin, not the
         // ring tail.
-        scatter_hidden_block_to_interleaved(
-            gpu,
-            hidden_rb,
-            &draft_scratch.target_hidden,
-            position,
-            b,
-            rows_to_keep,
-        )?;
+        //
+        // Both `hidden_rb` and `draft_scratch.target_hidden` live on the
+        // drafter Gpu in hetero mode. The scatter is a chain of D2D
+        // memcpys; in single-card mode it stays on target_gpu, in hetero
+        // we bind drafter so the memcpys execute on the drafter device's
+        // context (their src AND dst are drafter-local — no peer hop). We
+        // also need to drain target_gpu's stream first so verify's writes
+        // into hidden_rb (peer writes from target context) are visible
+        // before drafter starts reading them.
+        if split_mode {
+            target_gpu.hip.device_synchronize()?;
+        }
+        {
+            let drafter: &mut Gpu = match drafter_gpu.as_mut() {
+                Some(d) => &mut **d,
+                None => &mut *target_gpu,
+            };
+            if split_mode {
+                drafter.bind_thread()?;
+            }
+            scatter_hidden_block_to_interleaved(
+                drafter,
+                hidden_rb,
+                &draft_scratch.target_hidden,
+                position,
+                b,
+                rows_to_keep,
+            )?;
+            if split_mode {
+                drafter.hip.device_synchronize()?;
+            }
+        }
+        if split_mode {
+            target_gpu.bind_thread()?;
+        }
         // Keep draft_forward's incremental-upload tracker in sync so any future
         // ctx_slice=Some call in the same session doesn't try to re-upload what
         // GPU already has; and so the assertion-in-draft path stays coherent.
@@ -3119,7 +3255,7 @@ pub fn spec_step_dflash(
     }
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_scatter_end = std::time::Instant::now();
 
@@ -3129,10 +3265,10 @@ pub fn spec_step_dflash(
     // draft tokens). The bonus token is NOT replayed — it will be
     // block[0] of the next iter. This keeps the invariant that before each
     // verify, target state is at position `start` (= pre-verify position).
-    target_snap.restore_to(&mut target.dn_state, gpu)?;
+    target_snap.restore_to(&mut target.dn_state, target_gpu)?;
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
     }
     let t_restore_end = std::time::Instant::now();
     // Tape-replay path (0.1.7 perf): if a GdnTape was captured during verify,
@@ -3148,12 +3284,12 @@ pub fn spec_step_dflash(
     // batched call instead of (accept+1) sequential decodes.
     if let Some(tape) = gdn_tape_opt.as_deref() {
         tape.replay_gdn(
-            gpu, &target.weights, &target.config, &mut target.dn_state, accept_len + 1,
+            target_gpu, &target.weights, &target.config, &mut target.dn_state, accept_len + 1,
         )?;
     } else {
         let replay_tokens = &committed[..accept_len + 1];
         qwen35::forward_prefill_batch(
-            gpu,
+            target_gpu,
             &target.weights,
             &target.config,
             replay_tokens,
@@ -3170,7 +3306,7 @@ pub fn spec_step_dflash(
     // `position + accept_len + 1`) as part of that iter's block[0] forward.
 
     if phase_on {
-        gpu.hip.device_synchronize()?;
+        target_gpu.hip.device_synchronize()?;
         let t_end = std::time::Instant::now();
         let us_draft   = t_draft_end.duration_since(t_spec_start).as_micros();
         let us_ngram   = t_verify_start.duration_since(t_draft_end).as_micros();

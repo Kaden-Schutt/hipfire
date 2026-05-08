@@ -651,11 +651,21 @@ fn upload_slice_i32(gpu: &Gpu, dst: &GpuTensor, data: &[i32]) -> HipResult<()> {
 /// Run one draft forward over `block_size` positions with `ctx_len` cached
 /// context rows.
 ///
+/// `gpu` is the **drafter** device — the Gpu instance that owns
+/// `weights` and `scratch`. The caller MUST have already bound this device
+/// on the calling thread (`gpu.bind_thread()`); every kernel launched here
+/// goes through this Gpu's HIP context and module cache. Under hetero
+/// PFlash+DFlash (PR3 step 2) this is the dedicated drafter device when
+/// `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` is set, else it's the target's Gpu
+/// (single-card mode is byte-identical to the pre-PR3 behavior).
+///
 /// `noise_embedding`: if `Some`, uploaded into `scratch.x` before the forward.
 ///     If `None`, the caller must have already filled `scratch.x` with B × hidden
 ///     F32 embeddings — this avoids the target→host→draft round-trip in the
-///     spec-decode hot loop (both target and draft share the same GPU, so
-///     D2D copies into `scratch.x` suffice).
+///     spec-decode hot loop. In single-card mode the embedding lookup writes
+///     directly via D2D from target weights into drafter scratch; in hetero
+///     mode it crosses the peer-access boundary (memory still ends up in
+///     `scratch.x` on the drafter Gpu).
 /// `target_hidden`: if `Some`, uploaded into `scratch.target_hidden`.
 ///     If `None`, the caller must have already filled `scratch.target_hidden`
 ///     with `ctx_len × num_extract × hidden` F32 rows.

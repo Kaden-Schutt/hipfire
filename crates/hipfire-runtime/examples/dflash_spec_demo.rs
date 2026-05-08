@@ -1209,6 +1209,7 @@ fn main() {
         } else {
             speculative::spec_step_dflash(
                 &mut gpu,
+                None,                  // drafter_gpu — demo is single-card only
                 &mut target,
                 &draft_weights,
                 &draft_cfg,
