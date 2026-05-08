@@ -124,15 +124,52 @@ extern "C" __global__ void attention_dflash_f32(
         // Update running denominator.
         l_run = alpha * l_run + tile_sum;
 
-        // Update running output: each thread updates the head_dim slots it owns.
-        for (int d = tid; d < head_dim; d += nthreads) {
-            float scaled_old = alpha * out_run[d];
-            float contrib = 0.0f;
-            for (int j = 0; j < tile_len; ++j) {
+        // Phase C: V accumulation. Earlier revision used `for d = tid;
+        // d < head_dim; d += nthreads`, which left half the workgroup idle
+        // when nthreads > head_dim (the typical case: nthreads=256,
+        // head_dim=128). Now split the j-range across `nthreads /
+        // head_dim` partitions so all 256 threads do useful work.
+        //
+        // Thread `tid` owns:
+        //   d_local = tid % head_dim
+        //   j_part  = tid / head_dim          (0 .. j_parts-1)
+        // and accumulates the slice [j_part * span, (j_part+1) * span) of
+        // the j-loop. We reduce per-d partials through ws[] and then a
+        // single thread per d updates out_run[d].
+        //
+        // When nthreads ≤ head_dim the original 1-partition path is exactly
+        // recovered (j_parts=1, span=tile_len, every active thread does
+        // the full loop). The reduction step also degrades cleanly: with
+        // j_parts=1 there is no inter-partition combine, just a single
+        // scaled_old + ws[tid] write.
+        int j_parts = nthreads / head_dim;
+        if (j_parts < 1) j_parts = 1;
+        int d_local = tid % head_dim;
+        int j_part  = tid / head_dim;
+        int span    = (tile_len + j_parts - 1) / j_parts;
+        int j_start = j_part * span;
+        int j_end   = j_start + span;
+        if (j_end > tile_len) j_end = tile_len;
+        // Idle lanes: tid where j_part * head_dim ≥ nthreads (impossible
+        // here) or where j_start ≥ tile_len (small tile_len). Their partial
+        // is 0 and contributes nothing to the reduction.
+        float partial = 0.0f;
+        if (j_part < j_parts && j_start < tile_len) {
+            for (int j = j_start; j < j_end; ++j) {
                 int abs_j = tile_start + j;
-                contrib += tile_scores[j] * v[abs_j * kv_stride + kv_head * head_dim + d];
+                partial += tile_scores[j] * v[abs_j * kv_stride + kv_head * head_dim + d_local];
             }
-            out_run[d] = scaled_old + contrib;
+        }
+        ws[tid] = partial;
+        __syncthreads();
+        // One thread per d_local sums across j_parts and writes out_run.
+        if (tid < head_dim) {
+            float scaled_old = alpha * out_run[tid];
+            float sum_partials = 0.0f;
+            for (int p = 0; p < j_parts; ++p) {
+                sum_partials += ws[tid + p * head_dim];
+            }
+            out_run[tid] = scaled_old + sum_partials;
         }
         __syncthreads();
 
