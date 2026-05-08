@@ -101,9 +101,13 @@ def hook_target_modules(model, max_layers=None):
         ]
         if "ATT" in kind:
             self_attn = getattr(layer, "self_attn", None)
+            # CCA in the model is at `self_attn.qkv` (the attribute name
+            # is `qkv` even though the class is CCA). Output tuple is
+            # (q, k, v) -> captured as out0 / out1 / out2.
             candidates.extend([
                 ("self_attn", self_attn),
-                ("cca", getattr(self_attn, "cca", None)),
+                ("cca", getattr(self_attn, "qkv", None)),
+                ("o_proj", getattr(self_attn, "o_proj", None)),
             ])
         else:
             zaya_block = getattr(layer, "zaya_block", None)

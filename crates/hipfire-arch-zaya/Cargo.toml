@@ -24,12 +24,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-# Phase 2.B/2.C CPU validator only. Not needed for the library build,
-# only for the cpu_validate_phase2 example which compares hipfire's
-# CPU implementations of free components against a PyTorch reference
-# dump. Skips HFQ entirely; reads the model's bf16 safetensors directly.
+# Phase 2.B/2.C/2.D CPU validator only. Not needed for the library
+# build; only for the cpu_validate_phase2 example which compares
+# hipfire's CPU implementations of free components against a PyTorch
+# reference dump. Skips HFQ entirely; reads the model's bf16
+# safetensors directly.
 safetensors = "0.4"
 half = "2"
+libm = "0.2"  # erff for the exact GELU in the MLP-based MoE router.
 
 [[example]]
 name = "verify_against_torch"
