@@ -1415,7 +1415,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // Preflight: device id must be in `[0, hip.device_count())`. The
         // HIP runtime returns a clear error if it's out of range, so we
         // surface that as a load failure rather than silently downgrading.
-        let dflash_drafter_gpu: Option<rdna_compute::Gpu> = match (
+        let mut dflash_drafter_gpu: Option<rdna_compute::Gpu> = match (
             draft_path,
             std::env::var("HIPFIRE_DFLASH_DRAFTER_DEVICE")
                 .ok()
@@ -1458,7 +1458,30 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             // `max_seq` so eviction's smaller buffer caps VRAM: a 128K-advertised
             // model with physical_cap=896 allocates an 896-slot ring, not 128K.
             // Without eviction, physical_cap == max_seq so the behavior matches.
-            match load_dflash_state(dp, physical_cap, &config, &dn, gpu) {
+            //
+            // PR3: when `dflash_drafter_gpu` is `Some`, drafter weights/scratch/
+            // hidden_rb allocate on that device instead of the target Gpu. Peer
+            // access between target and drafter must be enabled (we do that
+            // bidirectionally below if drafter device is set).
+            if let Some(d) = dflash_drafter_gpu.as_mut() {
+                let target_dev = gpu.device_id;
+                let drafter_dev = d.device_id;
+                // Bidirectional peer-access enable. Target context already
+                // current (we are inside load_model's body). Drafter side
+                // requires bind_thread before enabling peer access from there.
+                if target_dev != drafter_dev {
+                    if let Ok(true) = gpu.hip.can_access_peer(target_dev, drafter_dev) {
+                        let _ = gpu.hip.enable_peer_access(drafter_dev);
+                    }
+                    let _ = d.bind_thread();
+                    if let Ok(true) = d.hip.can_access_peer(drafter_dev, target_dev) {
+                        let _ = d.hip.enable_peer_access(target_dev);
+                    }
+                    // Restore target context for the rest of load_model.
+                    let _ = gpu.bind_thread();
+                }
+            }
+            match load_dflash_state(dp, physical_cap, &config, &dn, gpu, dflash_drafter_gpu.as_mut()) {
                 Ok(state) => {
                     eprintln!(
                         "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
@@ -1774,12 +1797,31 @@ fn load_dflash_state(
     target_config: &qwen35::Qwen35Config,
     target_dn: &DeltaNetState,
     gpu: &mut rdna_compute::Gpu,
+    drafter_gpu: Option<&mut rdna_compute::Gpu>,
 ) -> Result<DflashState, String> {
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
-    let draft_weights = DflashWeights::load(gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
+
+    // PR3: when `drafter_gpu` is `Some`, drafter weights + scratch + hidden_rb
+    // live on the dedicated drafter device. The big buffers — `target_hidden`
+    // (l × ne × h × 4) and `mq_x_rot` (same size) — together comprise the
+    // bulk of DFlash scratch (~5 GB on 16K, ~10 GB on 32K). Routing them off
+    // the target Gpu is what makes 27B + DFlash fit on a single 24 GB card
+    // again — modulo peer-access overhead between cards on the verify path.
+    //
+    // `target_snap`, `gdn_tape`, and `verify_scratch` stay on the target Gpu:
+    // they are populated during the target's prefill forward (which runs on
+    // the target Gpu) and read during verify (also target Gpu). Drafter
+    // forward reads them via peer access when needed. This split mirrors the
+    // PRD's component map: drafter-private state on drafter Gpu, target-
+    // adjacent state on target Gpu, peer-access glue at the boundary.
+    let alloc_gpu: &mut rdna_compute::Gpu = match drafter_gpu {
+        Some(d) => d,
+        None => gpu,
+    };
+    let draft_weights = DflashWeights::load(alloc_gpu, &hfq, &draft_config).map_err(|e| format!("load weights: {e}"))?;
     let draft_scratch = DflashScratch::new_with_mq(
-        gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
+        alloc_gpu, &draft_config, draft_config.block_size, ctx_capacity, draft_weights.has_mq,
     ).map_err(|e| format!("draft scratch: {e}"))?;
 
     // Hidden ring: one row per target-layer selected by the draft config,
@@ -1787,7 +1829,7 @@ fn load_dflash_state(
     // one block fits without aliasing. Cheap (< 100 MB) next to the draft
     // weights themselves.
     let hidden_rb = HiddenStateRingBuffer::new(
-        gpu,
+        alloc_gpu,
         target_config.n_layers,
         draft_config.num_extract(),
         draft_config.hidden,
