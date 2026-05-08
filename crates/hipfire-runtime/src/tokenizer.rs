@@ -484,9 +484,16 @@ impl Tokenizer {
     ///    splice out the right neighbor; push the two newly-formed pairs
     ///    `(prev[l], l)` and `(l, next[l])`.
     ///
-    /// Result is byte-identical to the naive implementation (BPE merge
-    /// order is deterministic when ranks are unique, and GPT-2 BPE
-    /// merges are unique by construction).
+    /// Byte-identicality with the naive scan — load-bearing invariant:
+    /// the heap key is `(rank, l, gen_at_push)`, ordered lexicographically.
+    /// On equal `rank`, the smaller `l` (leftmost surviving symbol) wins
+    /// the pop. This matches the naive scan's `if rank < best_rank`
+    /// strict-`<` tiebreak (first-occurrence-wins from the left), which
+    /// is the BPE encoding contract HuggingFace `tokenizers` and OpenAI
+    /// `tiktoken` follow. Future refactors that change the heap key
+    /// ordering MUST preserve this leftmost-on-tie property or the
+    /// encoded token IDs will silently diverge from every reference
+    /// implementation.
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
         // 1. Convert text to GPT-2 byte-encoded symbols.
         let mut syms: Vec<String> = text
@@ -543,11 +550,7 @@ impl Tokenizer {
         // splice is O(1); two pushes are O(log N). Total O(N log N).
         while let Some(Reverse((rank, l, gen_at_push))) = heap.pop() {
             // Validate: slot still alive, generation matches, right neighbor
-            // exists, and current pair still has the popped rank (the rank
-            // we expected). The rank-recheck guards against the case where
-            // `l` was the *right* side of a merge that absorbed it via a
-            // different code path — should not happen with this state
-            // machine, but cheap to verify.
+            // exists. Stale heap entries are dropped here cheaply.
             if dead[l] || gen[l] != gen_at_push {
                 continue;
             }
@@ -556,16 +559,18 @@ impl Tokenizer {
                 continue;
             }
             let r = r as usize;
-            // Optional: re-verify rank for paranoia; skip if it diverges.
-            // In the strict pq model with generation tagging this should
-            // never trigger, but cost is one HashMap lookup vs silent
-            // corruption risk.
-            let cur_rank = merge_rank
-                .get(&(syms[l].clone(), syms[r].clone()))
-                .copied();
-            if cur_rank != Some(rank) {
-                continue;
-            }
+
+            // The gen-tag invariant guarantees the popped rank still describes
+            // the live `(syms[l], syms[r])` pair: any merge that could change
+            // either side bumps `gen[l]` (or kills `r`) and would have failed
+            // the check above. Verified in debug builds; release trusts it.
+            debug_assert_eq!(
+                merge_rank
+                    .get(&(syms[l].clone(), syms[r].clone()))
+                    .copied(),
+                Some(rank),
+                "BPE pq invariant: popped rank must match live pair rank",
+            );
 
             // Apply the merge: l absorbs r.
             let merged = {
@@ -576,7 +581,11 @@ impl Tokenizer {
             };
             syms[l] = merged;
             dead[r] = true;
-            gen[l] = gen[l].wrapping_add(1);
+            // Plain `+= 1`: bumps are bounded by N − 1 per slot, N < 2³², so
+            // overflow is unreachable. `wrapping_add` would silently un-stale
+            // heap entries on overflow — wrong semantics. Debug panics, release
+            // aborts: both communicate that wraparound is a bug, not a feature.
+            gen[l] += 1;
 
             // Splice r out of the linked list.
             let nr = next[r];
@@ -590,9 +599,9 @@ impl Tokenizer {
             if pl >= 0 {
                 // `l`'s left neighbor's right pair is now (pl, l) with new
                 // syms[l]; bump pl's gen so its old heap entries die. (Not
-                // strictly required since we recheck rank on pop, but tightens
+                // strictly required since we revalidate on pop, but tightens
                 // the invariant.)
-                gen[pl as usize] = gen[pl as usize].wrapping_add(1);
+                gen[pl as usize] += 1;
                 push_pair(&mut heap, &syms, &gen, pl as usize, l);
             }
             if next[l] >= 0 {
@@ -601,12 +610,14 @@ impl Tokenizer {
         }
 
         // 7. Walk the linked list collecting live symbols → token ids.
-        // Find head: the slot with prev == -1 that's still alive. Slot 0
-        // is the head unless it was absorbed (which can't happen since
-        // BPE only merges right-into-left).
-        debug_assert!(!dead[0], "BPE merged into slot 0 — algorithm invariant violated");
-        let mut result = Vec::with_capacity(syms.len());
-        let mut p: i32 = 0;
+        // Slot 0 is always the head under our merge-left-into-right invariant,
+        // but we scan explicitly for `prev == -1 && !dead`. The scan is O(N)
+        // once and is robust against any future invariant breakage (a
+        // `debug_assert!` here would be a release-mode no-op and walk
+        // tombstoned data silently; the explicit scan can't).
+        let mut result = Vec::with_capacity(n);
+        let head = (0..n).find(|&i| prev[i] == -1 && !dead[i]);
+        let mut p: i32 = head.map(|i| i as i32).unwrap_or(-1);
         while p >= 0 {
             let pi = p as usize;
             result.push(self.token_to_id.get(&syms[pi]).copied().unwrap_or(0));
@@ -1129,6 +1140,120 @@ fn needs_trailing_ws_strip(s: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod bpe_tests {
+    use super::*;
+
+    /// Build a synthetic GPT-2 BPE Tokenizer from a vocab list and an ordered
+    /// merge list. Used to assert exact `Vec<u32>` output of the priority-queue
+    /// encoder against hand-computed expected token sequences. Locks the
+    /// byte-identicality contract in CI.
+    fn synth(vocab: &[&str], merges: &[(&str, &str)]) -> Tokenizer {
+        let vocab: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
+        let token_to_id: HashMap<String, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        let merges: Vec<(String, String)> = merges
+            .iter()
+            .map(|(l, r)| (l.to_string(), r.to_string()))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            eot_id: None,
+            is_gpt2_bpe: true,
+        }
+    }
+
+    #[test]
+    fn encode_full_cascade() {
+        // "hello" with merges chained from highest priority to lowest:
+        //   ("h","e") rank 0 → "he"
+        //   ("l","l") rank 1 → "ll"
+        //   ("he","ll") rank 2 → "hell"
+        //   ("hell","o") rank 3 → "hello"
+        // Final symbol list: ["hello"] → [id 7]
+        let tok = synth(
+            &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
+        );
+        assert_eq!(tok.encode_gpt2_bpe("hello"), vec![7]);
+    }
+
+    #[test]
+    fn encode_partial_merge() {
+        // "lol" — only ("l","o") is reachable; "ol" is not in merges.
+        // Init ["l","o","l"] → after merge ["lo","l"] → [id 8, id 2].
+        let tok = synth(
+            &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
+        );
+        assert_eq!(tok.encode_gpt2_bpe("lol"), vec![8, 2]);
+    }
+
+    #[test]
+    fn encode_no_merges() {
+        // "ho" — no ("h","o") merge in the table; output is the two byte tokens.
+        let tok = synth(
+            &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
+        );
+        assert_eq!(tok.encode_gpt2_bpe("ho"), vec![0, 3]);
+    }
+
+    #[test]
+    fn encode_leftmost_on_tie_priority() {
+        // Equal-rank tiebreak invariant: when the same merge could fire at
+        // multiple positions, the leftmost wins (matches naive `<` scan and
+        // every reference BPE implementation). Heap key `(rank, l, gen)`
+        // encodes this — equal rank → smaller `l` pops first.
+        //
+        // Setup: merges ("a","b") rank 0, ("ab","a") rank 1.
+        // Input "ababa" → init ["a","b","a","b","a"].
+        // Both (0,1) and (2,3) are ("a","b") at rank 0. Leftmost (0,1) merges
+        // first → ["ab","a","b","a"] → ("a","b") at (1,2) → ["ab","ab","a"] →
+        // now ("ab","a") at (1,2) rank 1 → ["ab","aba"]. No more merges.
+        // Expected: [id of "ab", id of "aba"].
+        let tok = synth(
+            &["a", "b", "ab", "aba"],
+            &[("a", "b"), ("ab", "a")],
+        );
+        assert_eq!(tok.encode_gpt2_bpe("ababa"), vec![2, 3]);
+    }
+
+    #[test]
+    fn encode_empty_and_single() {
+        let tok = synth(&["a", "b"], &[]);
+        assert_eq!(tok.encode_gpt2_bpe(""), Vec::<u32>::new());
+        assert_eq!(tok.encode_gpt2_bpe("a"), vec![0]);
+    }
+
+    #[test]
+    fn encode_long_input_pq_stress() {
+        // 1024-byte input exercises the priority-queue path with many merges
+        // and many stale heap entries (each merge invalidates ≤ 2 prior
+        // entries via the gen tag). Verifies we don't panic, deadlock, or
+        // produce a non-decreasing-length output for a known shape.
+        let tok = synth(
+            &["a", "aa", "aaaa"],
+            &[("a", "a"), ("aa", "aa")],
+        );
+        let input = "a".repeat(1024);
+        let out = tok.encode_gpt2_bpe(&input);
+        // 1024 bytes → 512 "aa" pairs (rank 0) → 256 "aaaa" (rank 1). No
+        // further merges, so the linked list collapses to 256 tokens, all
+        // pointing at vocab id 2 ("aaaa").
+        assert_eq!(out.len(), 256);
+        assert!(out.iter().all(|&id| id == 2));
+    }
 }
 
 #[cfg(test)]
