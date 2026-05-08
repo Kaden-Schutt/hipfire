@@ -355,6 +355,13 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    /// PR2 (hetero PFlash+DFlash PRD step 2): when env var
+    /// `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` is set at load time, this holds a
+    /// dedicated `Gpu` instance bound to HIP device N. PR2 only opens the
+    /// instance and stores it; PR3 (cross-card spec-decode coordination)
+    /// will route drafter ops here. None when env unset — drafter shares
+    /// the target's Gpu (current single-card behavior preserved).
+    dflash_drafter_gpu: Option<rdna_compute::Gpu>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1392,6 +1399,54 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 }
             }
         } else { None };
+
+        // ── PR2 (hetero PFlash+DFlash PRD): drafter device pinning ──────
+        //
+        // `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` opens a separate `Gpu` instance
+        // bound to HIP device N for the DFlash drafter. Empty / unset / no
+        // draft → preserve current behavior (drafter shares the target's
+        // Gpu). PR2 only opens the instance and stores it in
+        // `LoadedModel.dflash_drafter_gpu`; PR3 routes drafter ops onto
+        // that instance. Until PR3 lands, setting this env opens a Gpu
+        // that is allocated but unused — that's intentional: it lets PR2
+        // be reviewed in isolation without breaking the existing single-
+        // Gpu DFlash path.
+        //
+        // Preflight: device id must be in `[0, hip.device_count())`. The
+        // HIP runtime returns a clear error if it's out of range, so we
+        // surface that as a load failure rather than silently downgrading.
+        let dflash_drafter_gpu: Option<rdna_compute::Gpu> = match (
+            draft_path,
+            std::env::var("HIPFIRE_DFLASH_DRAFTER_DEVICE")
+                .ok()
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(_), Some(dev_str)) => match dev_str.parse::<i32>() {
+                Ok(dev) => match rdna_compute::Gpu::init_with_device(dev) {
+                    Ok(g) => {
+                        eprintln!(
+                            "  DFlash drafter pinned to HIP device {} ({}, {} MiB VRAM)",
+                            dev,
+                            g.arch,
+                            g.hip.get_vram_info().map(|(_, t)| t / (1024 * 1024)).unwrap_or(0),
+                        );
+                        Some(g)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "HIPFIRE_DFLASH_DRAFTER_DEVICE={dev}: failed to open Gpu: {e}",
+                        ));
+                    }
+                },
+                Err(e) => {
+                    return Err(format!(
+                        "HIPFIRE_DFLASH_DRAFTER_DEVICE={dev_str}: not a valid device id (parse error: {e})",
+                    ));
+                }
+            },
+            _ => None,
+        };
+
         // Optional DFlash draft: load the draft model's weights + a fresh set
         // of per-cycle scratch buffers (hidden ring, verify scratch, GdnTape,
         // DeltaNetSnapshot) sized for the target's max_seq. If the draft file
@@ -1431,6 +1486,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            dflash_drafter_gpu,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1458,6 +1514,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            dflash_drafter_gpu: None,
         })
     }
 }
@@ -1586,6 +1643,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        dflash_drafter_gpu: None,
     })
 }
 
@@ -1671,6 +1729,16 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+    }
+    // PR2: drop the dedicated drafter Gpu instance if one was opened by
+    // HIPFIRE_DFLASH_DRAFTER_DEVICE. Drop releases the HIP device handle
+    // and any tensors still owned by the Gpu's pool. PR2 has no tensors
+    // on the drafter Gpu yet (drafter weights/scratch still on `gpu`
+    // until PR3), so this is essentially a handle close.
+    if let Some(_drafter_gpu) = m.dflash_drafter_gpu {
+        // Drop runs Gpu's destructor which frees pool + closes the
+        // device. No explicit free needed beyond letting it fall out of
+        // scope, but binding to a local makes the intent explicit.
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
