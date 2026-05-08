@@ -12,8 +12,9 @@
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
+// C symbol kept unsuffixed (see residual gfx12 sibling for rationale).
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_qkvza_mq3g256_lloyd_wmma_gfx12(
+extern "C" __global__ void gemm_qkvza_mq3g256_lloyd_wmma(
     const char*    __restrict__ A_qkv,
     const char*    __restrict__ A_z,
     const char*    __restrict__ A_beta,

@@ -3309,13 +3309,21 @@ pub fn forward_prefill_batch_single_chunk_captured(
     let arch = gpu.arch.as_str();
     let mut mq3_in_dense = false;
     let mut mq3_in_moe = false;
+    let mut lloyd_in_dense = false;
     // The Lloyd dtype is treated identically to plain MQ3 in this guard:
     // both use 112-vs-104-byte stride that the MoE batched branches'
     // HFQ4-layout dispatch would corrupt, and both depend on the gfx11/12
     // WMMA family that other archs lack. Add Lloyd alongside MQ3 so the
     // refusal fires symmetrically and a future MQ3-Lloyd MoE model can't
     // silently land here without explicit MoE-Lloyd kernels.
+    //
+    // We also track `lloyd_in_dense` separately because Lloyd-MQ3 on
+    // gfx12 ships behind an opt-in env gate (see is_batchable_la above) —
+    // the gfx12 sibling kernels are runtime-unvalidated locally, so by
+    // default a captured-path call with Lloyd-MQ3 weights on gfx1200/1201
+    // must refuse rather than dispatch to an untested kernel.
     let is_mq3_any = |dt: DType| matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd);
+    let is_lloyd = |dt: DType| matches!(dt, DType::MQ3G256Lloyd);
     for lw in &weights.layers {
         match lw {
             LayerWeights::DeltaNet(l) => {
@@ -3328,6 +3336,15 @@ pub fn forward_prefill_batch_single_chunk_captured(
                     || is_mq3_any(l.w_up.gpu_dtype)
                     || is_mq3_any(l.w_down.gpu_dtype)
                 { mq3_in_dense = true; }
+                if is_lloyd(l.wqkv.gpu_dtype)
+                    || is_lloyd(l.wz.gpu_dtype)
+                    || is_lloyd(l.w_beta.gpu_dtype)
+                    || is_lloyd(l.w_alpha.gpu_dtype)
+                    || is_lloyd(l.wo.gpu_dtype)
+                    || is_lloyd(l.w_gate.gpu_dtype)
+                    || is_lloyd(l.w_up.gpu_dtype)
+                    || is_lloyd(l.w_down.gpu_dtype)
+                { lloyd_in_dense = true; }
             }
             LayerWeights::FullAttn(l) => {
                 if is_mq3_any(l.wq.gpu_dtype)
@@ -3338,6 +3355,14 @@ pub fn forward_prefill_batch_single_chunk_captured(
                     || is_mq3_any(l.w_up.gpu_dtype)
                     || is_mq3_any(l.w_down.gpu_dtype)
                 { mq3_in_dense = true; }
+                if is_lloyd(l.wq.gpu_dtype)
+                    || is_lloyd(l.wk.gpu_dtype)
+                    || is_lloyd(l.wv.gpu_dtype)
+                    || is_lloyd(l.wo.gpu_dtype)
+                    || is_lloyd(l.w_gate.gpu_dtype)
+                    || is_lloyd(l.w_up.gpu_dtype)
+                    || is_lloyd(l.w_down.gpu_dtype)
+                { lloyd_in_dense = true; }
             }
             LayerWeights::DeltaNetMoe(l) => {
                 if is_mq3_any(l.wqkv.gpu_dtype)
@@ -3381,6 +3406,25 @@ pub fn forward_prefill_batch_single_chunk_captured(
              forward_prefill_batch path (which falls back to per-token \
              forward_scratch on this arch). gfx12 K4 variant for MQ3 is \
              a planned follow-up."
+        )));
+    }
+    // Lloyd-MQ3 on gfx12 is opt-in (see is_batchable_la's gate). The
+    // captured entry point bypasses is_batchable_la, so we replicate the
+    // gate here: refuse Lloyd-on-gfx12 unless HIPFIRE_LLOYD_GFX12=1 is set.
+    // Without this guard, a captured call would reach the dispatch arms
+    // and try to load gfx12 kernels that are still community-CI-pending.
+    let arch_is_gfx12 = matches!(arch, "gfx1200" | "gfx1201");
+    let lloyd_gfx12_optin = std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+    if lloyd_in_dense && arch_is_gfx12 && !lloyd_gfx12_optin {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "forward_prefill_batch_single_chunk_captured: model contains \
+             MQ3G256Lloyd weights on arch {arch}, but the gfx12 (RDNA4) \
+             sibling kernels (gemm_*_mq3g256_lloyd_wmma.gfx12.hip) are \
+             runtime-unvalidated locally and ship behind an opt-in gate. \
+             Set HIPFIRE_LLOYD_GFX12=1 to enable the gfx12 path for parity \
+             testing, or use the non-captured forward_prefill_batch path \
+             (which falls back to per-token forward_scratch on this arch \
+             when the env var is unset)."
         )));
     }
 
@@ -3677,9 +3721,12 @@ pub fn forward_prefill_batch_with_pbs(
 // produces dead code (safe but useless) or silent prefill corruption
 // (HFQ4-stride GEMM reading a different-stride weight block). See
 // docs/plans/mq-lloyd-batched-prefill-followup.md for the full
-// checklist + rationale. MQ3G256Lloyd / MQ2G256Lloyd intentionally
-// excluded today: no batched Lloyd-prefill kernel exists; per-token
-// fallback is correct.
+// checklist + rationale.
+//
+// As of this PR (issue #116 Phase 5): MQ3G256Lloyd is wired through
+// the gemm_*_mq3g256_lloyd_wmma family on gfx11 (always-on) and on
+// gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd / MQ4G256Lloyd
+// remain unwired here — MQ4-Lloyd lands separately in issue #182.
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
@@ -3688,27 +3735,48 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     if always_ok {
         return true;
     }
-    // MQ3 / MQ3-Lloyd are batchable on archs with a WMMA family ported.
-    // As of this commit:
+    // MQ3 (uniform / HFQ3 family) is batchable on archs with a WMMA
+    // family ported. As of this commit:
     //   - gfx11 (gfx1100/1101/1102/1150/1151): wave32 WMMA via the
     //     `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` builtin.
     //   - gfx12 (gfx1200/1201): wave32 WMMA via the `_w32_gfx12` builtin
-    //     with K4 unroll + half8_t lane-split.
+    //     with K4 unroll + half8_t lane-split, runtime-validated through
+    //     the existing HFQ3 dispatch fork (gemm_*_hfq3g256_wmma_gfx12).
     // gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA
     // kernel; they stay on the per-token forward_scratch fallback
     // (correct, just slower).
-    //
-    // Lloyd-MQ3 (MQ3G256Lloyd) inherits the same arch matrix — Phase 5 of
-    // issue #116 ships the gemm_*_mq3g256_lloyd_wmma family alongside the
-    // existing HFQ3 WMMA path; group stride differs (112 B Lloyd vs 104 B
-    // HFQ3) so dispatch must route to the Lloyd-specific arms (handled by
-    // the LA/FA matchers downstream — see followup-checklist condition 3).
-    let mq3_with_wmma = matches!(dt, DType::MQ3G256 | DType::MQ3G256Lloyd)
+    let mq3_uniform_with_wmma = matches!(dt, DType::MQ3G256)
         && matches!(arch,
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
             | "gfx1200" | "gfx1201"
         );
-    mq3_with_wmma
+
+    // Lloyd-MQ3 (MQ3G256Lloyd) on gfx11: Phase 5 of issue #116 ships the
+    // gemm_*_mq3g256_lloyd_wmma family alongside the existing HFQ3 WMMA
+    // path; group stride differs (112 B Lloyd vs 104 B HFQ3) so dispatch
+    // must route to the Lloyd-specific arms (handled by the LA/FA
+    // matchers downstream — see followup-checklist condition 3).
+    let lloyd_mq3_with_gfx11_wmma = matches!(dt, DType::MQ3G256Lloyd)
+        && matches!(arch,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        );
+
+    // Lloyd-MQ3 on gfx12 (RDNA4): the gemm_*_mq3g256_lloyd_wmma.gfx12.hip
+    // kernels are code-complete but runtime-unvalidated locally — bench
+    // host is gfx1100/1151 — so they ship behind an opt-in env gate.
+    // With HIPFIRE_LLOYD_GFX12 unset (default), Lloyd-MQ3 on gfx1200/1201
+    // falls through to per-token forward_scratch (correct, ~14× slower;
+    // matches pre-Phase-B2 behaviour for that arch class). With
+    // HIPFIRE_LLOYD_GFX12=1, the WMMA path is exercised — this is the
+    // path RDNA4 reviewers should set when running the parity tests /
+    // coherence-gate to validate the gfx12 sibling kernels. Once external
+    // CI confirms gfx12 parity, the gate can be dropped (or default
+    // flipped) in a follow-up commit.
+    let lloyd_mq3_with_gfx12_wmma = matches!(dt, DType::MQ3G256Lloyd)
+        && matches!(arch, "gfx1200" | "gfx1201")
+        && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+
+    mq3_uniform_with_wmma || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -4090,13 +4158,13 @@ fn forward_prefill_chunk(
                 // are dtype-agnostic — they just consume whatever [N × K]
                 // activation buffer we point them at.
                 // GAP NOTE: this matcher (and the 7 sibling dense LA/FA
-                // matchers in this file) is missing DType::MQ3G256Lloyd /
-                // MQ2G256Lloyd. Currently dead code for those dtypes —
-                // is_batchable_la (line 3660) keeps Lloyd weights on the
-                // per-token forward_scratch fallback. To enable batched
-                // Lloyd prefill: update is_batchable_la, ALL is_mq* matchers,
-                // AND add a Lloyd-specific GEMM dispatch arm together. See
-                // docs/plans/mq-lloyd-batched-prefill-followup.md.
+                // matchers in this file) wires MQ3G256Lloyd through the
+                // gemm_*_mq3g256_lloyd_wmma family. MQ2G256Lloyd remains
+                // unwired — to add it, update is_batchable_la, ALL 8 is_mq*
+                // matchers, AND add a Lloyd-MQ2-specific GEMM dispatch arm
+                // together (the all-together corruption-prevention rule from
+                // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
+                // is wired in a separate PR (issue #182).
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ3G256Lloyd);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);

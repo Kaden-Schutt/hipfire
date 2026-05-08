@@ -170,8 +170,15 @@ bandwidth ratio (~250 / 960 = 0.26).
 - **gfx12 (RDNA4) sibling kernels.** No RDNA4 hardware on the bench
   host. The gfx12 selector arms in `crates/rdna-compute/src/kernels.rs`
   and the kernel sources `*.gfx12.hip` are code-complete-but-runtime-
-  unvalidated as flagged in B1. Community CI on RDNA4 hardware needed
-  before we can claim coverage.
+  unvalidated as flagged in B1. **As of the post-review hardening
+  commit, Lloyd-MQ3 on gfx12 ships behind an opt-in env gate
+  (`HIPFIRE_LLOYD_GFX12=1`)**: with the gate unset, gfx1200/1201
+  fall through to the per-token `forward_scratch` fallback (correct,
+  ~14× slower) instead of dispatching the unvalidated WMMA kernels.
+  RDNA4 reviewers should set `HIPFIRE_LLOYD_GFX12=1` when running the
+  parity tests / coherence-gate to exercise the gfx12 path. Once
+  external CI confirms gfx12 parity, the gate can be dropped or
+  default-flipped in a follow-up commit.
 - **PFlash / spec-decode interaction.** Phase C measured non-spec
   prefill only. The DDTree / PFlash paths route through different
   matchers and were not exercised here. This is the obvious next

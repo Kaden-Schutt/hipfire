@@ -14,8 +14,11 @@
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
 
+// C symbol kept unsuffixed so the dispatch arm's unsuffixed
+// ensure_kernel lookup resolves on both archs. Per-arch .hsaco cache
+// keys are still distinct via the *_for_arch _rdna4 module suffix.
 __launch_bounds__(32, 2)
-extern "C" __global__ void gemm_mq3g256_lloyd_residual_wmma_gfx12(
+extern "C" __global__ void gemm_mq3g256_lloyd_residual_wmma(
     const char* __restrict__ A,
     const _Float16* __restrict__ X,
     float* __restrict__ Y,

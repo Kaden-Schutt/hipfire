@@ -375,6 +375,19 @@ CI work.
   for now, (b) ship as code-complete-but-runtime-unvalidated with an
   explicit note in the kernel header, or (c) request community CI on
   RDNA4 hardware before merge. Decide at Phase B1 start.
+
+  **Resolved (2026-05-08, post-review):** option (a)-flavoured runtime
+  env gate. `is_batchable_la` only returns true for `MQ3G256Lloyd` on
+  gfx1200/1201 when `HIPFIRE_LLOYD_GFX12=1`; default behaviour falls
+  through to per-token `forward_scratch` (correct, ~14× slower; matches
+  pre-Phase-B2 baseline). RDNA4 reviewers set the env var to exercise
+  the gfx12 WMMA path. The captured-prefill entry point has a parallel
+  refusal so the gate can't be bypassed.
+
+  Two follow-ups gated behind external RDNA4 CI:
+  - confirm gfx12 parity tests at max_abs ≤ Phase A envelope;
+  - confirm gfx12 coherence-gate row produces fluent output;
+  …then drop the env gate (or default-flip it) in a follow-up commit.
 - **Codebook header alignment.** 8 fp16 entries × 2 B = 16 B header at
   offset 0 of each group. Verify that `quantize_mq3g256_lloyd` writes
   group bases at ≥ 16-B alignment. If yes, vectorized loads are
