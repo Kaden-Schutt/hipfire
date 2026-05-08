@@ -331,6 +331,18 @@ Watch-item from Gemini's review: gfx12's lane-group K-split
 pattern than gfx11's full-tile-per-lane mapping. If gfx11 underperforms
 relative to gfx12 in Phase C, this is a candidate root cause.
 
+**Phase C results (recorded 2026-05-08):**
+
+- gfx1100 (7900 XTX, GDDR6): Lloyd / uniform = 88.2 % → ship.
+- gfx1151 (Strix Halo APU, LPDDR5x): Lloyd / uniform = 96.7 % → ship.
+
+Both gfx11-class hosts clear the gate comfortably. gfx1151's higher
+ratio reflects a memory-bound regime narrowing the per-tile-overhead
+gap — useful precedent for future per-row-codebook formats. See
+`benchmarks/results/devlog_20260508_lloyd_wmma_phase_c.md` for the
+full numbers + ratio tables. gfx12 (RDNA4) parity remains community-
+CI work.
+
 ## Out of scope (deferred)
 
 - **MQ2-Lloyd WMMA prefill** — research-only format; PR #115 keeps

@@ -1,8 +1,10 @@
 # Dev log 2026-05-08 — MQ3-Lloyd WMMA prefill, Phase C
 
-**Branch:** `feat/mq3-lloyd-wmma-prefill` (HEAD `053f78d`)
+**Branch:** `feat/mq3-lloyd-wmma-prefill` (HEAD `053f78d` for the
+gfx1100 round; gfx1151 follow-up round added 2026-05-08).
 **Plan:** `docs/plans/mq3-lloyd-wmma-prefill.md` (rev 2, commit a654099)
-**Hardware:** gfx1100 (7900 XTX), ROCm 7.2.
+**Hardware:** gfx1100 (7900 XTX, GDDR6), ROCm 7.2 — primary round.
+gfx1151 (Strix Halo APU, LPDDR5x), ROCm 7.12 — follow-up round below.
 
 ## Summary
 
@@ -88,6 +90,66 @@ deterministic than uniform-MQ3's K-tile schedule (where the K-stride
 through 3-bit indices interacts with DPM steps differently across
 runs). Worth noting but not actionable.
 
+## gfx1151 round (Strix Halo APU, RDNA3.5, ROCm 7.12, 2026-05-08)
+
+Same bench config as the gfx1100 round above (`--prefill 256 --warmup 5
+--prefill-runs 3 --gen 30`, asym3 KV, GRAPH=1, 3 fresh process
+invocations × 2 models). The gfx1151 selector arm dispatches to the
+same `_rdna3` kernel as gfx1100, so this round confirms behaviour
+matches across the gfx11 family.
+
+```
+=== qwen3.5-9b.mq3 (uniform) ===
+  inv 1: prefill_median=514.8 tok/s, gen=53.8 tok/s
+  inv 2: prefill_median=520.2 tok/s, gen=53.8 tok/s
+  inv 3: prefill_median=520.6 tok/s, gen=53.9 tok/s
+  → prefill mean = 518.5 tok/s   gen mean = 53.8 tok/s
+
+=== qwen3.5-9b.mq3-lloyd ===
+  inv 1: prefill_median=495.3 tok/s, gen=49.1 tok/s
+  inv 2: prefill_median=503.3 tok/s, gen=48.9 tok/s
+  inv 3: prefill_median=505.5 tok/s, gen=49.1 tok/s
+  → prefill mean = 501.4 tok/s   gen mean = 49.0 tok/s
+```
+
+Decode-regression check at the canonical probe-commits shape
+(`--prefill 16 --warmup 3 --gen 30`, 3 fresh invocations × 2 models):
+
+```
+qwen3.5-9b.mq3      : gen 55.7 / 56.0 / 55.7 → mean 55.8 tok/s
+qwen3.5-9b.mq3-lloyd: gen 50.5 / 50.6 / 50.7 → mean 50.6 tok/s
+```
+
+| Comparison | Numerator | Denominator | Ratio | Verdict |
+|---|---|---|---|---|
+| Lloyd prefill / uniform-MQ3 prefill | 501.4 | 518.5 | **96.7 %** | ≥ 60 % ship gate **PASS** |
+| Lloyd decode / uniform-MQ3 decode (prefill-256 shape) | 49.0 | 53.8 | 91.1 % | constant Lloyd codebook-indexing overhead, not regression |
+| Lloyd decode / uniform-MQ3 decode (probe-commits shape) | 50.6 | 55.8 | 90.7 % | same constant overhead — gfx1151 doesn't show the gfx1100 shape-dependent behaviour |
+
+**Per the Phase C decision tree: gfx1151 ships too.**
+
+Two notable deltas from the gfx1100 round:
+
+1. **Prefill ratio is *higher* on gfx1151 (96.7 %) than gfx1100 (88.2 %).**
+   Strix Halo's shared LPDDR5x (~250 GB/s peak, shared with CPU) makes
+   the workload more memory-bound; the per-tile cooperative codebook
+   load that costs Lloyd ~12 % vs uniform on gfx1100's GDDR6 narrows
+   to ~3 % when the bottleneck shifts toward off-chip bandwidth.
+   Useful precedent for future per-row-codebook formats: arch-class
+   matters less when the host is bandwidth-bound.
+
+2. **Decode ratio is *flat* across prefill shapes on gfx1151
+   (91.1 % at prefill-256, 90.7 % at prefill-16).** gfx1100 saw the
+   ratio collapse to 100.1 % at the small-prefill shape (122.3 vs
+   122.2). gfx1151's shared-memory regime apparently makes Lloyd
+   codebook indexing a constant-cost overhead, not one that's
+   absorbed into KV-cache traffic at long contexts. Documented for
+   future Lloyd-decode-perf work but not actionable in this PR.
+
+Absolute throughput is ~3.2× lower than gfx1100 on prefill and
+~2.3× lower on decode — consistent with the LPDDR5x-vs-GDDR6
+bandwidth ratio (~250 / 960 = 0.26).
+
 ## What this validates
 
 - The Phase B1 fused kernel family (qkv, qkvza, gate_up, residual,
@@ -110,10 +172,6 @@ runs). Worth noting but not actionable.
   and the kernel sources `*.gfx12.hip` are code-complete-but-runtime-
   unvalidated as flagged in B1. Community CI on RDNA4 hardware needed
   before we can claim coverage.
-- **gfx1151.** Smoke-tested at the Phase B2 stage but not in this Phase
-  C bench round. The kernel arch matrix dispatches gfx1151 onto the
-  RDNA3 (`_rdna3` suffix) kernels, same as gfx1100, so behaviour
-  should match within hardware-config noise.
 - **PFlash / spec-decode interaction.** Phase C measured non-spec
   prefill only. The DDTree / PFlash paths route through different
   matchers and were not exercised here. This is the obvious next
