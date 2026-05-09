@@ -49,6 +49,19 @@ pub enum AssistantPrefix {
     /// silently inserting raw text bytes that would tokenize
     /// differently from the special-token path.
     OpenThink,
+    /// Assistant turn with an immediately closed empty think block
+    /// for non-thinking mode:
+    /// `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+    ///
+    /// This mirrors the merged Qwen 3.6 community template behavior
+    /// when `enable_thinking=false`. The model starts generation in
+    /// visible-answer mode because the think block is already closed.
+    /// Useful for routing/agentic contexts where we need visible
+    /// output without disabling DFlash (still valid at temp=0).
+    ///
+    /// Requires both `<think>` and `</think>` as single special
+    /// tokens. Falls back to `Plain` if either is absent.
+    ClosedThink,
 }
 
 /// Role of a multi-turn history entry. `User` / `Assistant` are
@@ -188,6 +201,10 @@ struct ChatScaffold<'a> {
     /// special token). When `None`, `OpenThink` falls back to `Plain`
     /// — see `append_assistant_prefix`.
     think_open: Option<u32>,
+    /// `</think>` closer (if the tokenizer recognizes it as a single
+    /// special token). When `None`, `ClosedThink` falls back to `Plain`
+    /// — see `append_assistant_prefix`.
+    think_close: Option<u32>,
 }
 
 impl<'a> ChatScaffold<'a> {
@@ -201,6 +218,7 @@ impl<'a> ChatScaffold<'a> {
             user_role: t.encode("user"),
             assistant_role: t.encode("assistant"),
             think_open: t.special_token_id("<think>"),
+            think_close: t.special_token_id("</think>"),
         }
     }
 
@@ -243,17 +261,36 @@ impl<'a> ChatScaffold<'a> {
         out.extend_from_slice(&self.im_start);
         out.extend_from_slice(&self.assistant_role);
         out.extend_from_slice(&self.nl);
-        if matches!(prefix, AssistantPrefix::OpenThink) {
-            // Only emit `<think>\n` when the tokenizer registers
-            // `<think>` as a single special token. Otherwise the
-            // string would tokenize as ordinary BPE pieces and behave
-            // differently from the special-token path the model was
-            // trained on. Falling back to `Plain` in that case is
-            // safer than silently emitting wrong-shaped tokens.
-            if let Some(think_id) = self.think_open {
-                out.push(think_id);
-                out.extend_from_slice(&self.nl);
+        match prefix {
+            AssistantPrefix::OpenThink => {
+                // Only emit `<think>\n` when the tokenizer registers
+                // `<think>` as a single special token. Otherwise the
+                // string would tokenize as ordinary BPE pieces and behave
+                // differently from the special-token path the model was
+                // trained on. Falling back to `Plain` in that case is
+                // safer than silently emitting wrong-shaped tokens.
+                if let Some(think_id) = self.think_open {
+                    out.push(think_id);
+                    out.extend_from_slice(&self.nl);
+                }
             }
+            AssistantPrefix::ClosedThink => {
+                // Emit an immediately-closed empty think block:
+                // `<think>\n\n</think>\n\n`.
+                // Mirrors the merged Qwen 3.6 community template's
+                // `enable_thinking=false` behavior. Falls back to
+                // `Plain` if either `<think>` or `</think>` is not
+                // a single special token.
+                if let (Some(open_id), Some(close_id)) = (self.think_open, self.think_close) {
+                    out.push(open_id);
+                    out.extend_from_slice(&self.nl);
+                    out.extend_from_slice(&self.nl);
+                    out.push(close_id);
+                    out.extend_from_slice(&self.nl);
+                    out.extend_from_slice(&self.nl);
+                }
+            }
+            AssistantPrefix::Plain => {}
         }
     }
 }
@@ -535,6 +572,36 @@ mod tests {
         Tokenizer::from_hf_json(&json).expect("test tokenizer")
     }
 
+    /// Like `make_tokenizer` but WITHOUT `<think>` / `</think>`
+    /// as special added tokens — used to verify ClosedThink fallback.
+    fn test_tokenizer_no_think() -> Tokenizer {
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""<|im_start|>": 0"#.to_string());
+        entries.push(r#""<|im_end|>": 1"#.to_string());
+        entries.push(r#""system": 4"#.to_string());
+        entries.push(r#""user": 5"#.to_string());
+        entries.push(r#""assistant": 6"#.to_string());
+        entries.push(r#""\n": 7"#.to_string());
+        entries.push(r#""Ġ": 8"#.to_string());
+        for b in 0u32..=255u32 {
+            let ch = byte_to_gpt2_char_test(b as u8);
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
+        }
+        let vocab_block = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}}
+                ]
+            }}"#,
+            vocab = vocab_block,
+        );
+        Tokenizer::from_hf_json(&json).expect("test tokenizer without think tokens")
+    }
+
     /// Mirror of `byte_to_gpt2_char` from tokenizer.rs (private). The
     /// GPT-2 byte-to-char mapping leaves printable ASCII (33..127, 161..173,
     /// 174..256) untouched and renumbers the rest above 256.
@@ -633,6 +700,65 @@ mod tests {
         expected.extend_from_slice(&t.encode("\n"));
         assert_eq!(opened, expected, "OpenThink should append <think>\\n after the assistant prefix");
         assert!(opened.len() > plain.len(), "OpenThink output must be strictly longer than Plain");
+    }
+
+    #[test]
+    fn closed_think_appends_empty_closed_block_when_tokens_present() {
+        let t = make_tokenizer();
+        let plain = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let closed = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        }
+        .build();
+        let think_id = t.special_token_id("<think>")
+            .expect("test tokenizer registers <think> as special");
+        let close_id = t.special_token_id("</think>")
+            .expect("test tokenizer registers </think> as special");
+        let nl = t.encode("\n");
+        let mut expected = plain.clone();
+        // <think>\n\n</think>\n\n
+        expected.push(think_id);
+        expected.extend_from_slice(&nl);
+        expected.extend_from_slice(&nl);
+        expected.push(close_id);
+        expected.extend_from_slice(&nl);
+        expected.extend_from_slice(&nl);
+        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
+        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+    }
+
+    #[test]
+    fn closed_think_falls_back_to_plain_when_tokens_missing() {
+        // tokenize from scratch with no think/close special tokens
+        let t = test_tokenizer_no_think();
+        let plain = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let closed = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        }
+        .build();
+        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
     }
 
     #[test]

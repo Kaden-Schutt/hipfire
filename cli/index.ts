@@ -1665,16 +1665,20 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
-        // thinking=off is currently a no-op at the CLI layer. Earlier
-        // versions injected a prose system directive ("Respond directly
-        // without using <think>...</think> reasoning blocks") here, but
-        // the literal special tokens in that string caused Qwen3.5 to
-        // halt at 3-4 tokens — coherence-gate (which hits the daemon
-        // direct, no system injection) consistently passes on the same
-        // models, while CLI-routed requests with this directive break.
-        // Pass through whatever system prompt the client sent, no
-        // augmentation. The downstream <think>...</think> filter still
-        // strips visible reasoning so users get clean answers.
+        // Wire thinking control for both legacy assistant_prefix
+        // (ChatFrame::ClosedThink) and the new Jinja template path.
+        // The Jinja path uses max_think_tokens==1 as the signal for
+        // enable_thinking=false (daemon.rs line 3099). For the legacy
+        // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        if (effective.thinking === "off") {
+          genParams.assistant_prefix = "closed_think";
+        } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1; // Jinja path signal
+        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1;
+        }
         if (systemPrompt) genParams.system = systemPrompt;
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
@@ -2011,12 +2015,20 @@ async function serve(port: number) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
+        const strippedContent = content;
         if (preserveThinking) {
           content = content.replace(/<\|im_end\|>/g, "").trim();
         } else {
           content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
             .replace(/<think>[\s\S]*$/, "") // unclosed think block
             .replace(/<\|im_end\|>/g, "").trim();
+        }
+
+        // Diagnostic: detect empty-after-unclosed-think-strip.
+        let thinkWarning: string | null = null;
+        if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
+          thinkWarning = "empty after unclosed think strip";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
         // Check for tool calls in response
@@ -2029,11 +2041,15 @@ async function serve(port: number) {
         }
 
         safeRelease();
-        return Response.json({
+        const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
-        });
+        };
+        if (thinkWarning) {
+          responseBody.x_hipfire_warning = thinkWarning;
+        }
+        return Response.json(responseBody);
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
