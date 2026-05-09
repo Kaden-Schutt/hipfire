@@ -3513,9 +3513,15 @@ fn run_dflash_draft_for_logits(
 ///
 /// Returns `(top_tokens, top_log_probs)` each of size `(b-1) * k` in
 /// row-major order (same convention as `ddtree::topk_from_logits`).
+///
+/// Hetero (split_mode = drafter_gpu.is_some()): embedding lookup + DFlash
+/// draft forward run on drafter; lm_head GEMM + GPU top-K + D2H run on
+/// target_gpu (target.weights.output is local there). Mirrors the drafter/
+/// target split in `spec_step_dflash` step 2.
 #[allow(clippy::too_many_arguments)]
 fn run_dflash_draft_for_topk_gpu(
-    gpu: &mut Gpu,
+    target_gpu: &mut Gpu,
+    mut drafter_gpu: Option<&mut Gpu>,
     target: &ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -3531,33 +3537,12 @@ fn run_dflash_draft_for_topk_gpu(
     let ne = draft_cfg.num_extract();
     let vocab = target.config.vocab_size;
     let mask_token = draft_cfg.mask_token_id;
+    let split_mode = drafter_gpu.is_some();
     assert!(b >= 2, "dflash draft: b must be ≥ 2");
     assert!(k >= 1 && k <= 8, "topk k={} must be in [1, 8]", k);
 
-    // Step 1-3: identical to run_dflash_draft_for_logits — embed, positions,
-    // draft forward. Duplicating the small glue to avoid a refactor risk;
-    // this path is shipped after. (Could factor out, but the savings is <50
-    // lines and the call site is stable.)
     let mut block: Vec<u32> = vec![mask_token; b];
     block[0] = seed_token;
-    for (i, &tok) in block.iter().enumerate() {
-        let dst = draft_scratch.x.sub_offset(i * h, h);
-        match target.weights.embd_format {
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
-                gpu.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
-                gpu.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
-                gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
-            }
-            hipfire_runtime::llama::EmbeddingFormat::F32 => {
-                gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
-            }
-            _ => panic!("ddtree draft: unsupported target embedding format"),
-        }
-    }
     let effective_ctx_len = match ctx_slice {
         Some(n) => n.min(position),
         None => position,
@@ -3568,22 +3553,65 @@ fn run_dflash_draft_for_topk_gpu(
     let th_offset = ctx_start * ne * h;
     let th_slice: &[f32] = &target_hidden_host[th_offset..];
 
-    dflash::draft_forward(
-        gpu,
-        draft_weights,
-        draft_cfg,
-        None,
-        Some(th_slice),
-        &positions_q,
-        &positions_k,
-        b,
-        effective_ctx_len,
-        draft_scratch,
-    )?;
+    // ── Drafter-bound section (embedding + DFlash draft forward) ──
+    {
+        let drafter: &mut Gpu = match drafter_gpu.as_mut() {
+            Some(d) => &mut **d,
+            None => &mut *target_gpu,
+        };
+        if split_mode {
+            drafter.bind_thread()?;
+        }
+        for (i, &tok) in block.iter().enumerate() {
+            let dst = draft_scratch.x.sub_offset(i * h, h);
+            match target.weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                    drafter.embedding_lookup_hfq4g256(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                    drafter.embedding_lookup_hfq4g128(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                    drafter.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    drafter.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
+                }
+                _ => panic!("ddtree draft: unsupported target embedding format"),
+            }
+        }
+        dflash::draft_forward(
+            drafter,
+            draft_weights,
+            draft_cfg,
+            None,
+            Some(th_slice),
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+        )?;
+        // Drain drafter so the next (target-bound) lm_head GEMM sees a
+        // coherent draft_scratch.x via peer read. Skipped in single-card
+        // mode — kernels submitted on the same device order naturally.
+        if split_mode {
+            drafter.hip.device_synchronize()?;
+        }
+    } // drafter borrow ends — target_gpu reusable below
+
+    // ── Target-bound section (lm_head + GPU top-K + D2H) ──
+    // The lm_head reads target.weights.output (target memory) and writes
+    // logits_batch (target memory); reads draft_scratch.x cross-device via
+    // peer access in hetero mode.
+    if split_mode {
+        target_gpu.bind_thread()?;
+    }
 
     // Step 4: lm_head → [batch × vocab] logits (GPU-resident).
     let batch = b - 1;
     let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+    let gpu = target_gpu;
     let logits_batch = gpu.alloc_tensor(&[batch * vocab], rdna_compute::DType::F32)?;
     let w_out = &target.weights.output;
     let gemm_result = match w_out.gpu_dtype {
@@ -4040,7 +4068,8 @@ pub fn spec_step_ddtree(
 /// τ wins (+40–46% on creative/essay) into wall-clock wins.
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_ddtree_batched(
-    gpu: &mut Gpu,
+    target_gpu: &mut Gpu,
+    drafter_gpu: Option<&mut Gpu>,
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -4088,9 +4117,14 @@ pub fn spec_step_ddtree_batched(
     // ── 1+2. GPU-resident draft + per-row top-K + log-sum-exp ────────────
     // Keeps logits on device; returns only (b-1) × k indices + log-probs
     // to the host. Replaces the prior 15 MB D2H + CPU sort pair (~34 ms)
-    // with an on-device top-K (~µs) plus a ~480 byte D2H.
+    // with an on-device top-K (~µs) plus a ~480 byte D2H. In hetero mode
+    // the drafter half (embedding + DFlash forward) launches on
+    // drafter_gpu's HIP context; the target half (lm_head + top-K + D2H)
+    // launches on target_gpu — and the thread is left bound to target on
+    // return so the rest of the function uses target_gpu via `gpu`.
     let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
-        gpu,
+        target_gpu,
+        drafter_gpu,
         target,
         draft_weights,
         draft_cfg,
@@ -4102,6 +4136,7 @@ pub fn spec_step_ddtree_batched(
         b,
         tree_topk,
     )?;
+    let gpu = target_gpu;
 
     let t_draft = t_all.elapsed();
     let t_topk = t_draft; // fused with draft now
@@ -4617,7 +4652,8 @@ pub struct Phase2Snapshots<'a> {
 /// (this function uses `target_snap` + `path_c_phase2` snapshots instead).
 #[cfg(feature = "deltanet")]
 pub fn spec_step_ddtree_path_c(
-    gpu: &mut Gpu,
+    target_gpu: &mut Gpu,
+    drafter_gpu: Option<&mut Gpu>,
     target: &mut ModelSlot,
     draft_weights: &DflashWeights,
     draft_cfg: &DflashConfig,
@@ -4650,8 +4686,11 @@ pub fn spec_step_ddtree_path_c(
     );
 
     // ── 1+2. GPU-resident draft + per-row top-K (identical to batched path) ──
+    // Hetero: drafter half on drafter_gpu, lm_head/top-K on target. Returns
+    // with thread bound to target.
     let (top_tokens, top_log_probs) = run_dflash_draft_for_topk_gpu(
-        gpu,
+        target_gpu,
+        drafter_gpu,
         target,
         draft_weights,
         draft_cfg,
@@ -4663,6 +4702,7 @@ pub fn spec_step_ddtree_path_c(
         b,
         tree_topk,
     )?;
+    let gpu = target_gpu;
 
     // ── 3. Build the DDTree ───────────────────────────────────────────────
     let tree = hipfire_runtime::ddtree::build_ddtree_tree_with_cutoff(

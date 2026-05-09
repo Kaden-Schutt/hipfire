@@ -1869,28 +1869,10 @@ fn load_dflash_state(
     // to know whether a dedicated drafter device was opened by load_model.
     let drafter_pinned = drafter_gpu.is_some();
 
-    // PR3 step 2 refusal: ddtree + cross-card spec-decode is not yet wired
-    // up. spec_step_ddtree_batched / spec_step_ddtree_path_c still take a
-    // single `gpu: &mut Gpu` and run their drafter forwards through that
-    // context, which crashes when drafter weights/scratch live on a
-    // different device. Refuse cleanly at load — and BEFORE allocating any
-    // drafter VRAM — rather than letting it blow up at the first decode
-    // cycle. Plain chain-mode (`spec_step_dflash`) is the supported hetero
-    // path in step 2; ddtree hetero is a follow-on.
-    let ddtree_budget_raw = std::env::var("HIPFIRE_DDTREE_BUDGET")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0);
-    if ddtree_budget_raw > 0 && drafter_pinned {
-        return Err(
-            "ddtree + cross-card spec-decode not yet supported \
-             (HIPFIRE_DDTREE_BUDGET set together with HIPFIRE_DFLASH_DRAFTER_DEVICE). \
-             Unset one of them. Chain-mode DFlash with HIPFIRE_DFLASH_DRAFTER_DEVICE \
-             is the supported hetero path in PR3 step 2."
-                .to_string(),
-        );
-    }
+    // PR3 step 4: ddtree + cross-card spec-decode is now wired through
+    // spec_step_ddtree_batched / spec_step_ddtree_path_c (drafter half
+    // routes via `drafter_gpu: Option<&mut Gpu>` mirroring
+    // spec_step_dflash). drafter_pinned no longer blocks DDTree.
 
     let hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("open draft: {e}"))?;
     let draft_config = DflashConfig::from_hfq(&hfq).ok_or("parse DflashConfig")?;
@@ -2409,7 +2391,9 @@ fn generate_dflash(
                     None
                 };
                 spec_step_ddtree_path_c(
-                    gpu, &mut target, &df.draft_weights, &df.draft_config,
+                    gpu,
+                    drafter_gpu_owned.as_mut(),
+                    &mut target, &df.draft_weights, &df.draft_config,
                     &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
                     &mut df.target_snap, &mut df.gdn_tape, &df.verify_scratch,
                     position, seed_token,
@@ -2420,7 +2404,9 @@ fn generate_dflash(
                 )
             } else {
                 spec_step_ddtree_batched(
-                    gpu, &mut target, &df.draft_weights, &df.draft_config,
+                    gpu,
+                    drafter_gpu_owned.as_mut(),
+                    &mut target, &df.draft_weights, &df.draft_config,
                     &mut df.draft_scratch, &mut df.hidden_rb, &mut df.target_hidden_host,
                     &mut df.target_snap, &mut dd.post_seed_snap, &mut df.gdn_tape,
                     &dd.scratch, &df.verify_scratch,

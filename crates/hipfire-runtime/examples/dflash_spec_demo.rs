@@ -1147,6 +1147,7 @@ fn main() {
                 };
                 speculative::spec_step_ddtree_path_c(
                     &mut gpu,
+                    None,                       // single-card example: no drafter_gpu
                     &mut target,
                     &draft_weights,
                     &draft_cfg,
@@ -1167,6 +1168,7 @@ fn main() {
             } else if ddtree_batched {
                 speculative::spec_step_ddtree_batched(
                     &mut gpu,
+                    None,                       // single-card example: no drafter_gpu
                     &mut target,
                     &draft_weights,
                     &draft_cfg,
