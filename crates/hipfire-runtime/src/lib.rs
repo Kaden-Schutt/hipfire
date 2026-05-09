@@ -31,3 +31,4 @@ pub mod weight_pager;
 pub mod tokenizer;
 pub mod eos_filter;
 pub mod prompt_frame;
+pub mod tool_call;
