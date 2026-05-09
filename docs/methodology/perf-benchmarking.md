@@ -65,6 +65,78 @@ Or via the harness directly:
 + a multi-run median. A delta that survives this protocol is real;
 one that doesn't probably isn't.
 
+## Daemon-driven perf measurement
+
+The in-process `bench_qwen35_mq4` and `dflash_spec_demo` examples are
+the canonical perf tools — they run a 10s `dpm_warmup` (memset loop
+that pins the GPU at high sclk/mclk) before the timed gen window, so
+their `gen_tok_s` numbers reflect steady-state silicon throughput.
+
+Anything that talks to the daemon (`coherence_probe`, agent CLIs, eval
+scripts) used to run *without* DPM warmup, leaving the GPU at a low
+power state when the first request arrived. That produced ~5–10%
+lower decode-rate measurements than the in-process bench tools. The
+gap was especially confusing because `coherence_probe` reported
+`tok_s = total_tokens / wall_ms`, which folds TTFT (and any new warmup
+time) into the headline number — so short generations can look
+catastrophically slow even when steady-state decode is fine.
+
+Two fixes ship together:
+
+- **`HIPFIRE_DPM_WARMUP_SECS=N` is honored by the daemon.** When set
+  and positive, the daemon runs `gpu.dpm_warmup(N)` after weight
+  upload but **before emitting the `loaded` ack**. The contract
+  becomes: `loaded` means daemon is fully ready, including DPM-pinned.
+  This ordering is load-bearing: if warmup ran *after* the ack, the
+  probe would receive `loaded`, immediately send `generate`, and the
+  daemon (still inside the load handler doing warmup) wouldn't
+  process the `generate` until warmup finished. From the probe's POV
+  that warmup time would fold into the measured TTFT, breaking
+  `tok_s = total_tokens / wall_ms`. With warmup-before-ack, the probe
+  sees `loaded` only when the daemon really is ready, and TTFT
+  measures real prefill alone.
+  Default OFF (production load latency unchanged). Recommended `10`
+  for perf-bench runs, matching the bench tools.
+
+- **`coherence_probe` reports both probe-derived and daemon-authoritative
+  numbers.** Read the daemon ones for perf comparisons.
+  - **Daemon-authoritative** (right number for perf): `daemon perf:
+    prefill X tok/s (Yms / real ttft) | decode Z tok/s | overall W tok/s`.
+    These come from the `done` event the daemon emits — `prefill_ms`
+    is the real `forward_prefill_batch` timer, `decode_tok_s` is
+    steady-state post-prefill, `ttft_ms` is real first-prefill-token
+    latency. Apples-to-apples with `bench_qwen35_mq4 prefill_tok_s` /
+    `gen_tok_s`.
+  - **Probe-derived** (UX framing only, NOT perf-comparable): `tokens:
+    N (probe wall A tok/s, probe gen B tok/s, probe ttft Cms)`. The
+    probe sets `ttft` on the first non-synthetic `token` event it
+    receives — but the daemon strips `<think>...</think>` content
+    by default, so on thinking models (Qwen3.5, Qwen3.6) the first
+    visible token only arrives *after* think closes. Probe `ttft`
+    therefore folds prefill + entire think phase + `</think>` into
+    one number, and `wall tok/s` / `gen tok/s` derived from it look
+    catastrophically slow vs in-process bench. They aren't —
+    they're just measuring something different (user-perceived
+    time-to-visible-content).
+
+  When in doubt: read the `daemon perf:` line, ignore `probe wall/gen`.
+  The JSON report carries `daemon_prefill_tok_s`, `daemon_decode_tok_s`,
+  `daemon_ttft_ms`, `daemon_tok_s` for downstream tooling.
+
+Use:
+
+```bash
+HIPFIRE_DPM_WARMUP_SECS=10 \
+  ./target/release/examples/coherence_probe \
+    --model some.hfq --prompt-file p.txt --max-tokens 400
+```
+
+The expected residual gap between probe `gen tok/s` and bench
+`gen_tok_s` after this is ~10% — that's daemon per-token overhead
+(JSONL streaming, detokenize, stop-condition checks). Closing it
+further is a separate workstream; it is uniform across quant formats
+so does not interfere with format ranking.
+
 ## Speed-gate baselines
 
 `tests/speed-baselines/<arch>.txt` records the "ground floor" decode

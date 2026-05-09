@@ -667,6 +667,39 @@ fn main() {
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else { (0, 0, 0) };
+                        // ── Optional DPM stabilization (perf instrumentation) ──
+                        //
+                        // Pins the GPU at high sclk/mclk so the first `generate`
+                        // request doesn't pay the 1-10s DPM ramp from idle. Same
+                        // `HIPFIRE_DPM_WARMUP_SECS` env the in-process bench tools
+                        // honor (`bench_qwen35_mq4`, `dflash_spec_demo`,
+                        // `bench_stream_overlap`); see
+                        // `crates/rdna-compute/src/dispatch.rs::dpm_warmup` and
+                        // `docs/methodology/perf-benchmarking.md`.
+                        //
+                        // Runs AFTER weight upload but BEFORE the `loaded` ack so
+                        // the contract becomes "loaded means daemon is fully ready
+                        // including DPM-pinned." Critical for probe-side timing:
+                        // if warmup ran AFTER the ack, the probe would receive
+                        // `loaded`, immediately send `generate`, and the daemon
+                        // (still warming up in this handler) wouldn't process the
+                        // generate until warmup finished — folding the warmup
+                        // into the probe-measured TTFT and breaking
+                        // `tok_s = total_tokens / wall_ms`. With warmup before the
+                        // ack, the probe sees `loaded` only when the daemon is
+                        // truly ready, and TTFT measures real prefill alone.
+                        //
+                        // Default OFF (production daemon load latency unchanged).
+                        if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
+                            if let Ok(secs) = secs_str.parse::<f32>() {
+                                if secs > 0.0 {
+                                    if let Err(e) = gpu.dpm_warmup(secs) {
+                                        eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
+                                    }
+                                }
+                            }
+                        }
+
                         let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────

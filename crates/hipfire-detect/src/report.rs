@@ -24,8 +24,29 @@ pub struct ReportHeader {
     pub arch: String,
     pub host: String,
     pub total_tokens: usize,
+    /// Wall-clock tok/s as the *probe* measured it (`total_tokens / wall_ms`).
+    /// Confused on thinking models because the probe sees a "first visible
+    /// token" only after `</think>` closes, so its wall_ms folds prefill +
+    /// think into TTFT. Kept for back-compat / UX framing; perf consumers
+    /// should read `daemon_*` fields instead.
     pub tok_s: f64,
+    /// Probe-derived gen rate: `total_tokens / (wall_ms - ttft_ms)`.
+    /// Same caveat as `tok_s` — strips think-as-prefill but doesn't
+    /// distinguish real prefill from think.
+    pub gen_tok_s: f64,
     pub ttft_ms: u64,
+    /// Authoritative timings emitted by the daemon's `done` event:
+    /// `prefill_ms` and `prefill_tok_s` are real-prefill-only (forward_prefill
+    /// timer, post-DPM-warmup), `decode_tok_s` is the steady-state decode
+    /// rate (post-prefill), `ttft_ms` is real prefill time, `tok_s` is the
+    /// daemon's own `total_tokens / total_wall_seconds`. These are the
+    /// numbers to compare against `bench_qwen35_mq4 prefill_tok_s` and
+    /// `gen_tok_s`. Zero for non-Qwen35 paths or older daemons.
+    pub daemon_prefill_ms: f64,
+    pub daemon_prefill_tok_s: f64,
+    pub daemon_decode_tok_s: f64,
+    pub daemon_ttft_ms: f64,
+    pub daemon_tok_s: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -93,10 +114,21 @@ impl Report {
         .unwrap();
         writeln!(
             out,
-            "tokens:      {} ({:.1} tok/s, ttft {}ms)",
-            self.header.total_tokens, self.header.tok_s, self.header.ttft_ms
+            "tokens:      {} (probe wall {:.1} tok/s, probe gen {:.1} tok/s, probe ttft {}ms)",
+            self.header.total_tokens, self.header.tok_s, self.header.gen_tok_s, self.header.ttft_ms
         )
         .unwrap();
+        if self.header.daemon_tok_s > 0.0 {
+            writeln!(
+                out,
+                "daemon perf: prefill {:.1} tok/s ({:.1}ms / real ttft) | decode {:.1} tok/s | overall {:.1} tok/s",
+                self.header.daemon_prefill_tok_s,
+                self.header.daemon_prefill_ms,
+                self.header.daemon_decode_tok_s,
+                self.header.daemon_tok_s,
+            )
+            .unwrap();
+        }
         writeln!(
             out,
             "verdict:     {} ({} hard, {} soft)",
@@ -152,7 +184,13 @@ mod tests {
             host: "k9lin".to_string(),
             total_tokens: 100,
             tok_s: 100.0,
+            gen_tok_s: 200.0,
             ttft_ms: 50,
+            daemon_prefill_ms: 0.0,
+            daemon_prefill_tok_s: 0.0,
+            daemon_decode_tok_s: 0.0,
+            daemon_ttft_ms: 0.0,
+            daemon_tok_s: 0.0,
         }
     }
 

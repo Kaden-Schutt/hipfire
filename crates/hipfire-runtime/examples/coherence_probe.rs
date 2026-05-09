@@ -281,6 +281,17 @@ struct DoneStats {
     total_visible_bytes: usize,
     wall_ms: u64,
     ttft_ms: u64,
+    /// Daemon-reported authoritative timings from its `done` event. The
+    /// probe's own `wall_ms` / `ttft_ms` are wall-clock and confused by
+    /// stripped think tokens (TTFT becomes "first visible character",
+    /// which on a thinking model is prefill + think_phase + </think>).
+    /// The daemon timestamps real prefill end and real decode separately,
+    /// so trust those for perf reporting.
+    daemon_prefill_ms: f64,
+    daemon_prefill_tok_s: f64,
+    daemon_decode_tok_s: f64,
+    daemon_ttft_ms: f64,
+    daemon_tok_s: f64,
 }
 
 fn drive_generate(
@@ -378,11 +389,23 @@ fn drive_generate(
                 for (n, vd) in trans {
                     print_live(n, &vd, wall_ms, last_pos);
                 }
+                // Daemon-authoritative perf metrics from the done event.
+                // Default to 0 if absent (older daemons / non-Qwen35 paths).
+                let daemon_prefill_ms = v.get("prefill_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_prefill_tok_s = v.get("prefill_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_decode_tok_s = v.get("decode_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_ttft_ms = v.get("ttft_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_tok_s = v.get("tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 done_stats = DoneStats {
                     total_tokens,
                     total_visible_bytes: visible_bytes,
                     wall_ms,
                     ttft_ms: ttft,
+                    daemon_prefill_ms,
+                    daemon_prefill_tok_s,
+                    daemon_decode_tok_s,
+                    daemon_ttft_ms,
+                    daemon_tok_s,
                 };
                 break;
             }
@@ -573,6 +596,17 @@ fn run() -> Result<i32, String> {
     } else {
         0.0
     };
+    // Generation-only rate: subtract TTFT (which includes any optional
+    // HIPFIRE_DPM_WARMUP_SECS pin the daemon performs after load) from wall
+    // time. This is the apples-to-apples number against in-process bench tools
+    // like bench_qwen35_mq4's `gen_tok_s`. Falls back to wall-clock tok_s if
+    // we somehow saw a zero gen window (single-token request, error path).
+    let gen_tok_s = if stats.wall_ms > stats.ttft_ms && stats.total_tokens > 0 {
+        let gen_ms = stats.wall_ms - stats.ttft_ms;
+        stats.total_tokens as f64 * 1000.0 / gen_ms as f64
+    } else {
+        tok_s
+    };
     let header = ReportHeader {
         prompt_md5: md5,
         prompt_label,
@@ -581,7 +615,13 @@ fn run() -> Result<i32, String> {
         host,
         total_tokens: stats.total_tokens,
         tok_s,
+        gen_tok_s,
         ttft_ms: stats.ttft_ms,
+        daemon_prefill_ms: stats.daemon_prefill_ms,
+        daemon_prefill_tok_s: stats.daemon_prefill_tok_s,
+        daemon_decode_tok_s: stats.daemon_decode_tok_s,
+        daemon_ttft_ms: stats.daemon_ttft_ms,
+        daemon_tok_s: stats.daemon_tok_s,
     };
     let report = Report::new(header, finals);
 
