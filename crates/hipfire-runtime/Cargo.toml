@@ -59,7 +59,11 @@ rayon = "1"
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`
 # scaffolding when the template is absent or fails to render.
-minijinja = { version = "2", features = ["loop_controls"] }
+# `json` enables the `tojson` filter — Qwen3.5/3.6 + Gemma 4 tool-rendering
+# branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
+# inside the system block; without it, tool-using turns die at render time
+# (caught by jinja_smoke scenario C, 2026-05-09).
+minijinja = { version = "2", features = ["loop_controls", "json"] }
 # `pycompat` ships an unknown-method callback that makes Python
 # str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
 # work on plain Jinja values — required by the Qwen3 family

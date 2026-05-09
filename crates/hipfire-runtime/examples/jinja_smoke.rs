@@ -289,10 +289,25 @@ fn main() {
 
     let t_decode = Instant::now();
     let mut generated: Vec<u32> = Vec::new();
-    let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+    let mut token_history: Vec<u32> = prompt_tokens.clone();
+
+    // Apply CPU-side repeat-penalty pre-pass (matches the daemon's
+    // sampler::sample path). Without this, top-p sampling at temp 0.3
+    // collapses to a greedy attractor on hard prompts and produces
+    // visible loops in the last 256 tokens. text_thinking() defaults
+    // to penalty=1.15, window=128.
+    let sample_one = |logits: &mut [f32], history: &[u32]| -> u32 {
+        if sc.repeat_penalty != 1.0 && sc.repeat_window > 0 {
+            llama::apply_repeat_penalty(logits, history, sc.repeat_window, sc.repeat_penalty);
+        }
+        llama::sample_top_p(logits, temp, sc.top_p)
+    };
+
+    let mut next_token = sample_one(&mut logits, &token_history);
 
     for _ in 0..max_gen {
         generated.push(next_token);
+        token_history.push(next_token);
         if Some(next_token) == im_end_token { break; }
         if Some(next_token) == endoftext_token { break; }
         if next_token == config.eos_token { break; }
@@ -301,7 +316,7 @@ fn main() {
         qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch)
             .expect("decode forward");
         logits = gpu.download_f32(&scratch.logits).expect("download logits");
-        next_token = llama::sample_top_p(&logits, temp, sc.top_p);
+        next_token = sample_one(&mut logits, &token_history);
     }
     let decode_ms = t_decode.elapsed().as_millis();
     let decode_tok_s = (generated.len() as f64) * 1000.0 / (decode_ms as f64).max(1.0);
