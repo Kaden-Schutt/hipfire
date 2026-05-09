@@ -355,6 +355,15 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    // Upstream HF Jinja chat_template, extracted from the HFQ
+    // `tokenizer_config.chat_template` at load time. `None` when the source
+    // model didn't ship one (rare for instruct models). Only consumed when
+    // `HIPFIRE_JINJA_CHAT=1` is set; otherwise the daemon's hand-rolled
+    // `prompt_frame::ChatFrame::Plain` scaffolding is used as today.
+    //
+    // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
+    // VL paths still hit the Plain scaffold.
+    chat_template: Option<String>,
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1452,6 +1461,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             }
         } else { None };
 
+        let chat_template = hfq.chat_template();
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1464,6 +1474,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            chat_template,
         })
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
@@ -1479,6 +1490,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
+        let chat_template = hfq.chat_template();
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1491,6 +1503,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            chat_template,
         })
     }
 }
@@ -1619,6 +1632,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        chat_template: hfq.chat_template(),
     })
 }
 
@@ -3012,19 +3026,66 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         raw_q_tokens
     };
 
-    // ChatML framing via the canonical hipfire_runtime::prompt_frame module.
-    // System prompt is prepended only on the first turn (seq_pos == 0)
-    // — subsequent turns continue the conversation in-place. The user
-    // body comes in pre-tokenized as `q_tokens` because PFlash may
-    // have compressed it upstream.
-    let new_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
-        user: "", // unused: we pass tokens directly via build_with_user_tokens
-        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
-        raw: false,
-    }
-    .build_with_user_tokens(&q_tokens);
+    // ChatML framing — two paths:
+    //
+    //   1) `HIPFIRE_JINJA_CHAT=1` AND model carries an embedded chat_template
+    //      AND first turn (seq_pos == 0): render through `JinjaChatFrame`
+    //      against the upstream HF Jinja template, producing the byte
+    //      sequence the model was actually trained on (fixes the "hand-roll
+    //      drifted from upstream template" class — XML tool calls on
+    //      Qwen3.5/3.6 instead of JSON, `<|im_start|>user` for tool
+    //      responses instead of `<|im_start|>tool`, etc.). PFlash
+    //      compression is bypassed under Jinja for now (q_tokens not
+    //      reusable when the template renders to a String).
+    //
+    //   2) Default: hand-rolled `prompt_frame::ChatFrame::Plain`
+    //      scaffold, byte-identical to today's behavior.
+    //
+    // Multi-turn (seq_pos > 0) currently always uses path 2 — Jinja
+    // single-turn parity is Stage 2; multi-turn message-history state on
+    // the daemon side is Stage 2 follow-up.
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let new_tokens = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            // max_think_tokens == 1 is the daemon's current "no-think"
+            // sentinel (CLI sets it that way for `thinking=off` and
+            // `enable_thinking=false`). All other values keep thinking
+            // on, matching the Plain path which always emits the
+            // `<think>\n` opener via AssistantPrefix::Plain trailing
+            // tokens.
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        match frame.render() {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                    raw: false,
+                }
+                .build_with_user_tokens(&q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "", // unused: we pass tokens directly via build_with_user_tokens
+            assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build_with_user_tokens(&q_tokens)
+    };
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
