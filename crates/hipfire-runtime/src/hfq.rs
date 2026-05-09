@@ -200,6 +200,20 @@ impl HfqFile {
         &self.path
     }
 
+    /// The upstream HuggingFace Jinja `chat_template` baked into this
+    /// .hfq's `tokenizer_config` metadata. `None` when the source model
+    /// did not ship a chat_template (rare for instruct models, common
+    /// for base models). The runtime renders this when present so prompt
+    /// framing matches the model's training-time expectation; absent or
+    /// failing renders fall back to the hand-rolled `prompt_frame` path.
+    pub fn chat_template(&self) -> Option<String> {
+        let meta: serde_json::Value = serde_json::from_str(&self.metadata_json).ok()?;
+        meta.get("tokenizer_config")?
+            .get("chat_template")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
     /// Look up a tensor's metadata (name, quant_type, shape, byte offset/size)
     /// without copying its data. The weight pager calls this at load time to
     /// register byte ranges without forcing eager VRAM allocation.

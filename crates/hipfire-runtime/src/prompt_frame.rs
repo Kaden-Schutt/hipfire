@@ -243,6 +243,156 @@ impl<'a> ChatScaffold<'a> {
     }
 }
 
+// ─── Jinja path — render upstream HF chat_template ──────────────────────────
+//
+// `ChatFrame` above is a hand-rolled approximation of ChatML scaffolding.
+// `JinjaChatFrame` renders the actual `chat_template` shipped with the
+// model (via the .hfq metadata blob). When the template is present this
+// is strictly more correct: the model sees the exact prefix shape it
+// was trained on, including default system prompts, `<think>\n` openers
+// gated by `enable_thinking`, tool-call scaffolding, and any other
+// per-arch quirks the upstream tokenizer_config encodes.
+//
+// Failure modes (template parse error, missing context var, explicit
+// `raise_exception`) bubble up as `Err(String)` so the caller can fall
+// back to `ChatFrame::Plain` rather than panicking.
+//
+// The render output is a plain UTF-8 string. Tokenization goes through
+// `Tokenizer::encode` which recognizes registered special tokens
+// (`<|im_start|>`, `<|im_end|>`, `<think>`, etc.) and emits their
+// single-token IDs — so the rendered string round-trips to the same
+// token sequence the model would see under transformers' apply_chat_template.
+
+/// Renders the upstream HF Jinja `chat_template` to produce a prompt
+/// token sequence. Use when the .hfq carries a chat_template; fall back
+/// to `ChatFrame::Plain` when it doesn't or when render fails.
+pub struct JinjaChatFrame<'a> {
+    pub tokenizer: &'a Tokenizer,
+    /// The Jinja template source string from the model's
+    /// `tokenizer_config.json:chat_template` field.
+    pub template: &'a str,
+    /// Optional system message for this turn. `None` = no system block.
+    pub system: Option<&'a str>,
+    /// User content for the new turn.
+    pub user: &'a str,
+    /// Maps to the upstream `enable_thinking` template kwarg. For
+    /// Qwen3.5/3.6 thinking-mode models, `true` (the upstream default)
+    /// emits `<|im_start|>assistant\n<think>\n` at the end; `false`
+    /// emits the empty-think pattern `<think>\n\n</think>\n\n` which
+    /// is known to cause loop pathologies (see
+    /// `feedback_no_think_directive_loops.prd`). Default callers
+    /// should pass `true`.
+    pub enable_thinking: bool,
+    /// Optional explicit bos_token string for the template's
+    /// `{{ bos_token }}` expression. Required when the tokenizer's
+    /// `decode_bytes(bos_id)` does NOT match the canonical BOS string
+    /// the template expects. Example: Gemma 4's tokenizer reports
+    /// bos_id=203 (and id=2 decodes to LLaMA-cosmetic `<s>`), but the
+    /// Gemma 4 template needs the literal `<bos>` which re-tokenizes to
+    /// single special token id=2 (the actual BOS the model trained on).
+    /// When None, falls back to decoding bos_id (works for Qwen3.5/3.6).
+    pub bos_token: Option<&'a str>,
+}
+
+impl<'a> JinjaChatFrame<'a> {
+    /// Render the template and tokenize the result. Returns `Err` on
+    /// any template-side failure so the caller can fall back to
+    /// `ChatFrame::Plain` framing.
+    pub fn render_and_encode(&self) -> Result<Vec<u32>, String> {
+        let rendered = self.render()?;
+        Ok(self.tokenizer.encode(&rendered))
+    }
+
+    /// Render the template to a string without tokenizing. Exposed
+    /// separately so a diagnostic example can dump the rendered prompt
+    /// for byte-level comparison against transformers' output.
+    pub fn render(&self) -> Result<String, String> {
+        use minijinja::{Environment, Error, ErrorKind, Value};
+        use minijinja_contrib::pycompat::unknown_method_callback;
+
+        let mut env = Environment::new();
+        // Strict-undefined: a missing context variable raises Err instead of
+        // silently rendering empty/partial output. Without this, malformed
+        // prompts could propagate to the model unnoticed (Codex review on
+        // PR #175 flagged this; we apply it here in the same port).
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Make Python-style str/list/dict methods (`.startswith`,
+        // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
+        // ordinary Jinja values. Required by the Qwen3 family
+        // template — it calls these throughout the assistant-turn
+        // and tool branches.
+        env.set_unknown_method_callback(unknown_method_callback);
+        // The Qwen3 template uses `raise_exception('...')` to fail
+        // fast on malformed inputs (e.g. system message in the
+        // middle of the conversation). minijinja has no builtin
+        // for this, so we register it as a global function that
+        // surfaces the message as a render error.
+        env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
+            Err(Error::new(ErrorKind::InvalidOperation, msg))
+        });
+
+        env.add_template("chat", self.template)
+            .map_err(|e| format!("template parse: {e}"))?;
+        let tmpl = env.get_template("chat")
+            .map_err(|e| format!("template lookup: {e}"))?;
+
+        // Build the messages list the way transformers does: optional
+        // system first, then a single user turn. Multi-turn history is
+        // not yet plumbed through — the daemon's request shape is
+        // single-turn, and the template's `<think>` stripping for
+        // prior assistant turns only matters once that lands.
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        // Each message gets `tool_calls: []` so chat templates can use
+        // bracket-access (`message['tool_calls']`) without tripping
+        // strict-undefined. Gemma 4's template hits this on every loop
+        // iteration; without the empty default the render fails and we
+        // silently fall back to a raw bos+token shape that breaks the
+        // model's instruct framing.
+        if let Some(sys) = self.system {
+            messages.push(serde_json::json!({
+                "role": "system",
+                "content": sys,
+                "tool_calls": [],
+            }));
+        }
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": self.user,
+            "tool_calls": [],
+        }));
+
+        // Pass bos_token to the template context. Caller may override via
+        // `self.bos_token` (Gemma 4 needs explicit `<bos>` because its
+        // tokenizer returns LLaMA-cosmetic `<s>` for decode_bytes(bos_id)
+        // and that re-tokenizes to a 3-token BPE fragment instead of
+        // single id=2 the template expects). Default: decode bos_id back
+        // to text (works for Qwen / LLaMA).
+        let bos_token: String = match self.bos_token {
+            Some(s) => s.to_string(),
+            None => {
+                let bytes = self.tokenizer.decode_bytes(&[self.tokenizer.bos_id]);
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
+        // Strict-undefined needs every var the template might reference to be
+        // defined (else the render Errs and we fall back to Plain). Common
+        // chat templates probe `tools`, `documents`, and `tool_call_kwargs`
+        // even on plain user-only turns; pass empty defaults so the
+        // template predicates evaluate to false rather than raise.
+        let empty_list: Vec<serde_json::Value> = Vec::new();
+        let ctx = minijinja::context! {
+            messages => Value::from_serialize(&messages),
+            add_generation_prompt => true,
+            enable_thinking => self.enable_thinking,
+            bos_token => bos_token,
+            tools => Value::from_serialize(&empty_list),
+            documents => Value::from_serialize(&empty_list),
+            tool_call_kwargs => Value::from_serialize(&serde_json::json!({})),
+        };
+        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
