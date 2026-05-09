@@ -1161,6 +1161,76 @@ fn main() {
     }
 }
 
+/// Resolve the chat_template to use for a loaded model, walking the
+/// override-precedence chain:
+///
+///   1. `HIPFIRE_CHAT_TEMPLATE_FILE` env var → if set and file readable,
+///      that template wins. Operator escape hatch / debugging knob.
+///   2. Per-model file at `~/.hipfire/templates/<sanitized-tag>.j2`
+///      where the tag is derived from the model file basename
+///      (`qwen3.5-9b.mq4` → `qwen3.5-9b.mq4.j2`). User-controllable
+///      override for a specific model without env-var globalness.
+///   3. HFQ-embedded `tokenizer_config.chat_template`. Default — what
+///      the model was trained with.
+///   4. None of the above → `None`. The render path falls back to the
+///      hand-rolled `ChatFrame::Plain` scaffold (current default
+///      behavior under Stage 2's `HIPFIRE_JINJA_CHAT=1` gate). Stage 5+
+///      will tighten this to a hard error once Plain is removed.
+///
+/// Per-request inline override (`chat_template_kwargs.chat_template`,
+/// vLLM-style) is the responsibility of the per-request render call,
+/// not load-time resolution. It belongs in Stage 5 alongside the CLI
+/// passthrough refactor; this resolver only handles the load-time
+/// sources.
+fn resolve_chat_template(
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    model_path: &str,
+) -> Option<String> {
+    // 1. Env-var override.
+    if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
+        if !env_path.is_empty() {
+            match std::fs::read_to_string(&env_path) {
+                Ok(s) => {
+                    eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
+                    return Some(s);
+                }
+                Err(e) => eprintln!(
+                    "[chat_template] HIPFIRE_CHAT_TEMPLATE_FILE={env_path} failed to read ({e}); falling through"
+                ),
+            }
+        }
+    }
+
+    // 2. Per-model file at ~/.hipfire/templates/<basename>.j2.
+    if let Some(home) = std::env::var_os("HOME") {
+        let basename = std::path::Path::new(model_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        if !basename.is_empty() {
+            let per_model = std::path::Path::new(&home)
+                .join(".hipfire")
+                .join("templates")
+                .join(format!("{basename}.j2"));
+            if per_model.is_file() {
+                match std::fs::read_to_string(&per_model) {
+                    Ok(s) => {
+                        eprintln!("[chat_template] using per-model override {}", per_model.display());
+                        return Some(s);
+                    }
+                    Err(e) => eprintln!(
+                        "[chat_template] per-model file {} failed to read ({e}); falling through",
+                        per_model.display()
+                    ),
+                }
+            }
+        }
+    }
+
+    // 3. HFQ-embedded.
+    hfq.chat_template()
+}
+
 fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
@@ -1461,7 +1531,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             }
         } else { None };
 
-        let chat_template = hfq.chat_template();
+        let chat_template = resolve_chat_template(&hfq, path);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1490,7 +1560,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         eprintln!("  KV cache: Q8");
         let kv = llama::KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?;
         let scratch = <Llama as Architecture>::new_state(gpu, &config)?;
-        let chat_template = hfq.chat_template();
+        let chat_template = resolve_chat_template(&hfq, path);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
@@ -1632,7 +1702,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
-        chat_template: hfq.chat_template(),
+        chat_template: resolve_chat_template(&hfq, path),
     })
 }
 
