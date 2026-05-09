@@ -563,6 +563,15 @@ pub fn weight_gemv(
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
         DType::HFP4G32 => gpu.gemv_hfp4g32(&w.buf, x, y, w.m, w.k),
+        DType::MFP4G32 => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            gpu.gemv_mfp4g32_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+        }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -659,7 +668,7 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
             gpu.fused_rmsnorm_rotate_mq(x, norm_weight, x_rot_scratch, sample_weight.k, eps)?;
             Ok(Some(x_rot_scratch))
         }
@@ -694,7 +703,7 @@ pub fn rotate_x_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd => {
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
             gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
             Ok(Some(x_rot_scratch))
         }
@@ -726,6 +735,13 @@ pub fn weight_gemv_prerotated(
         DType::MQ4G256 => {
             if let Some(xr) = x_rot {
                 gpu.gemv_mq4g256_prerotated(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
+        DType::MFP4G32 => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mfp4g32_prerotated(&w.buf, xr, y, w.m, w.k)
             } else {
                 weight_gemv(gpu, w, x, y)
             }

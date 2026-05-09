@@ -747,6 +747,11 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0 })
         }
+        24 => { // MFP4G32 — HFP4G32 + offline FWHT. Drop-in MQ4 replacement; same byte
+                // layout as qtype 21 with format_flags=0x05 stamped in the per-row hdr.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0 })
+        }
         3 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })

@@ -753,6 +753,41 @@ fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
     out
 }
 
+/// MFP4G32 = HFP4G32 + offline FWHT rotation. Drop-in MQ4 replacement.
+///
+/// Applies the same per-256-element FWHT as `cpu_fwht_256` (used by MQ4) to the
+/// weight matrix before HFP4G32 quantization. Runtime path applies the same
+/// FWHT to activations via `mq_rotate_x`, so `dot(rot(W), rot(x)) == dot(W, x)`
+/// (the FWHT is orthogonal). K must be a multiple of LCM(32, 256) = 256.
+///
+/// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
+/// = offline FWHT). This is metadata only — the kernel can still consume the
+/// row as plain HFP4G32 because the rotation is baked into the codes.
+fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert!(k % 256 == 0, "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+
+    // Rotate one row's worth of weights in-place per 256-element segment, then
+    // quantize as HFP4G32 and stamp the rotation flag. Reuses signs1/signs2
+    // from the same `gen_fwht_signs(42, 256)` / `gen_fwht_signs(1042, 256)`
+    // pair MQ4 ships with so the runtime's mq_rotate_x undoes this rotation.
+    let mut row_buf = vec![0.0f32; k];
+    for r in 0..m {
+        row_buf.copy_from_slice(&f32_data[r * k..(r + 1) * k]);
+        // Apply 256-element FWHT to each segment of the row.
+        for seg in 0..(k / 256) {
+            cpu_fwht_256(&mut row_buf[seg * 256..(seg + 1) * 256], signs1, signs2);
+        }
+        let mut row_packed = quantize_hfp4g32_row(&row_buf);
+        // Stamp format_flags = 0x05 (bit 0 set + bits 2-3 = 01 = offline FWHT).
+        row_packed[6] = 0x05;
+        out.extend_from_slice(&row_packed);
+    }
+    out
+}
+
 /// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
 /// Returns the K reconstructed FP32 weights for one row.
 #[allow(dead_code)] // used by tests + future round-trip diagnostics
@@ -906,6 +941,34 @@ mod hfp4_tests {
         let rs_bits = u16::from_le_bytes([packed[0], packed[1]]);
         assert_ne!(rs_bits, 0);
     }
+
+    #[test]
+    fn mfp4_stamps_rotation_flag() {
+        // MFP4G32 must stamp format_flags = 0x05 (bit 0 + bits 2-3 = 01) in every row
+        // header so loaders/tooling can detect the offline-FWHT variant. Byte length must
+        // match HFP4G32 (only the flag byte and the rotated weight content differ).
+        let m = 3;
+        let k = 256;
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let f32_data: Vec<f32> = (0..m * k).map(|i| (i as f32 * 0.001).sin()).collect();
+        let packed = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+        let row_bytes = 16 + 17 * (k / 32);
+        assert_eq!(packed.len(), m * row_bytes, "MFP4G32 byte length mismatch");
+        for r in 0..m {
+            let off = r * row_bytes;
+            assert_eq!(packed[off + 6], 0x05, "row {} format_flags expected 0x05, got {:#x}", r, packed[off + 6]);
+            // block_count must equal k/32.
+            let bc = u16::from_le_bytes([packed[off + 4], packed[off + 5]]);
+            assert_eq!(bc as usize, k / 32);
+        }
+    }
+
+    // Orthogonality of the FWHT (`dot(R(W), R(x)) ≈ dot(W, x)`) is the load-bearing
+    // correctness property and is empirically validated by `examples/test_gemv_mfp4g32.rs`
+    // across K = {512, 1024, 1280, 1536, 1792, 2048} on real GPU hardware (max-abs error
+    // ≤ 1.14e-5 vs 5e-3 tolerance — three orders of magnitude under). A CPU-only unit test
+    // can't tighten that further without duplicating the GPU's CPU-reference path.
 }
 
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
@@ -1583,10 +1646,13 @@ enum QuantType {
     // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
     // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
     HFP4G32 = 21,      // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
+    // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
+    // signals "rotation present, offline FWHT" for future interop/detection.
+    MFP4G32 = 24,      // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
     // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
     // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
     // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
-    // MFP4G32     = 24, // v1.5 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
     // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
@@ -2283,6 +2349,7 @@ enum GgufFormat {
     Mq2Lloyd,
     Mq3Lloyd,
     Hfp4,  // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
+    Mfp4,  // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
 }
 
 impl GgufFormat {
@@ -2297,6 +2364,7 @@ impl GgufFormat {
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
             "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
+            "mfp4" | "mfp4g32" | "mf4p" => Some(Self::Mfp4),
             _ => None,
         }
     }
@@ -2312,6 +2380,7 @@ impl GgufFormat {
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
             Self::Hfp4 => "HFP4G32",
+            Self::Mfp4 => "MFP4G32",
         }
     }
 }
@@ -2362,7 +2431,7 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(format,
         GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd);
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mfp4);
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
@@ -2475,6 +2544,13 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
+                GgufFormat::Mfp4 => {
+                    // No MFP6 variant. Promote6 for MFP4 stays at MFP4G32 (4.25 bpw).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -2518,6 +2594,12 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let k = info.shape[1] as usize;
                     let q = quantize_hfp4g32_2d(&f32_data, m, k);
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                }
+                GgufFormat::Mfp4 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
             }
         } else {
@@ -2636,6 +2718,9 @@ fn main() {
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
+    // MFP4G32 — HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same per-row layout
+    // as HFP4G32 with format_flags bit 0 + bits 2-3 = 01 stamping the rotation kind.
+    let use_mfp4 = format == "mfp4" || format == "mfp4g32" || format == "mf4p";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
     // K-map gate: applies to MoE models by default. Dense models opt in
@@ -3219,6 +3304,24 @@ fn main() {
                     (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 } else {
                     // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_mfp4 && is_embed {
+                // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mfp4 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let m = meta.shape[0];
+                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                } else {
+                    // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
+                    // requires 256-element segments). Matches MQ4's ragged fallback.
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }

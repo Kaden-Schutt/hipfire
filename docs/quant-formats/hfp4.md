@@ -1,6 +1,6 @@
 # HFP4 — Hipfire FP4 Quantization (RDNA-optimal E2M1 family)
 
-**Status:** v1 draft. First-kernel scope: HFP4G32 GEMV correctness anchor on gfx1100. WMMA-FP8 hero kernel and rotation variants are v2/v3 (deferred — see `docs/QUANTIZATION.md` for the production format index).
+**Status:** v1 (HFP4G32) and v1.5 MFP4G32 (HFP4G32 + offline FWHT, drop-in MQ4 replacement) shipped. WMMA-FP8 hero kernel, HFP4G16/G64 ablations, and online rotation variants are v2/v3 (deferred — see `docs/QUANTIZATION.md` for the production format index).
 
 **Related**: [`docs/QUANTIZATION.md`](../QUANTIZATION.md) (production format index) · [`docs/QUANTIZE.md`](../QUANTIZE.md) (CLI usage) · `crates/hipfire-quantize/src/main.rs` (quantizer) · `kernels/src/gemv_hfp4g32*.hip` (kernels).
 
@@ -149,10 +149,10 @@ Online modes (`10`, `11`) block fused QKV/QKVZA/gate_up kernels until their fuse
 
 | ID | Variant | Status |
 |:--:|---------|--------|
-| 21 | `HFP4G32` | v1 — first kernel target |
+| 21 | `HFP4G32` | v1 — first kernel target (shipped) |
 | 22 | `HFP4G16` | v1.5 ablation |
 | 23 | `HFP4G64` | v1.5 ablation |
-| 24 | `MFP4G32` | v1.5 (HFP4G32 + offline FWHT) |
+| 24 | `MFP4G32` | v1.5 — HFP4G32 + offline FWHT (shipped, drop-in MQ4 replacement) |
 | 25 | `HFP4G32MX` | v2 (strict OCP MXFP4 interop alias) |
 | 26 | `HFP4G16NV` | v2 (strict NVFP4 interop alias) |
 | 27 | `HFP8E4M3G32` | v2 HFP8 family |
@@ -188,7 +188,7 @@ IDs 21–29 are reserved at v1 ship time. Future PRs MUST NOT squat these IDs ev
 | `--format hfp4` (or `hfp4g32`, `hf4p`, `fp4`) | HFP4G32 quant — v1 default |
 | `--format hfp4g16` | HFP4G16 ablation (v1.5) |
 | `--format hfp4g64` | HFP4G64 ablation (v1.5) |
-| `--format mfp4` (or `mfp4g32`) | HFP4G32 + offline FWHT rotation (v1.5) |
+| `--format mfp4` (or `mfp4g32`, `mf4p`) | HFP4G32 + offline FWHT rotation (shipped v1.5) |
 | `--block-size {16,32,64}` | override block size for HFP4 family |
 | `--rotation {off,offline-fwht}` | override rotation mode |
 

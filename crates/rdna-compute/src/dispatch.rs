@@ -321,6 +321,10 @@ pub enum DType {
     HFP4G32,   // HFP4: E2M1 element + UE8M0 g32 block scale + FP16 row scale.
                // Per-row header 16 B; per-block payload 17 B (UE8M0 + 16 packed nibbles).
                // See docs/quant-formats/hfp4.md.
+    MFP4G32,   // MFP4: HFP4G32 + offline FWHT (drop-in MQ4 replacement). Same byte layout
+               // as HFP4G32; format_flags bit 0 + bits 2-3 = 01 stamps the rotation kind.
+               // Runtime applies the matching FWHT to x via mq_rotate_x; the kernel itself
+               // is shared with HFP4G32.
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
@@ -332,7 +336,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::Raw => 1, // byte-level
         }
     }
 }
@@ -3075,6 +3079,28 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MFP4G32: rotate x once via FWHT, then HFP4G32 GEMV against rotated x.
+    /// MFP4 weights are stored in HFP4G32 format (E2M1 + UE8M0 g32 + FP16 row scale)
+    /// with the same 256-element FWHT pre-applied, so the GEMV inner loop is
+    /// identical to standard HFP4 — we reuse `gemv_hfp4g32`.
+    pub fn gemv_mfp4g32_with_rotate(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        x_rot: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.rotate_x_mq(x, x_rot, k)?;
+        self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
+    }
+
+    /// MFP4G32 with pre-rotated x. Skips the rotation step entirely — caller must
+    /// have called `rotate_x_mq` into `x_rot` first.
+    pub fn gemv_mfp4g32_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_hfp4g32(a_raw, x_rot, y, m, k)
     }
 
     /// MagnumQuant MQ3: rotate x once, then HFQ3-G256 GEMV against rotated x.
