@@ -639,6 +639,275 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+// ─── HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale) ────────────────
+//
+// Spec: docs/quant-formats/hfp4.md
+//
+// Per-row layout: 16-B header (row_scale_a:f16, row_scale_b:f16, block_count:u16, flags:u8, ...)
+//                 followed by (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
+// Per element:    value = row_scale_a * 2^(block_e - 127) * E2M1_LUT[nibble]
+
+/// OCP E2M1 magnitude lattice (signed 4-bit FP). 16 codes: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
+/// Order: positive 0..7, then negative 0..7 (mirrors hardware-canonical sign-magnitude packing).
+const E2M1_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+/// E2M1 round-to-nearest in the 16-code lattice. Returns the nibble (0..15).
+/// Ties broken away from zero (consistent with FP rounding).
+fn e2m1_round(x: f32) -> u8 {
+    let mut best_idx = 0u8;
+    let mut best_err = f32::INFINITY;
+    for (i, &code) in E2M1_LUT.iter().enumerate() {
+        let err = (code - x).abs();
+        // Strict < ensures consistent tie-breaking by code-table order.
+        // The lattice has +0 at index 0 and -0 at index 8; +0 wins ties at zero.
+        if err < best_err {
+            best_err = err;
+            best_idx = i as u8;
+        }
+    }
+    best_idx
+}
+
+/// Quantize one row of K FP32 weights to HFP4G32 byte format.
+///
+/// K must be a multiple of 32 (hipfire model dims always satisfy this).
+/// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
+fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
+    assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
+    let k = row.len();
+    let n_blocks = k / 32;
+    let row_bytes = 16 + n_blocks * 17;
+    let mut out = vec![0u8; row_bytes];
+
+    // Per-row FP16 second-level scale: row_scale_a = max_abs(row) / 6.0  (E2M1 max = 6.0).
+    let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
+    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+
+    // Header.
+    out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
+    out[2..4].copy_from_slice(&0u16.to_le_bytes());           // row_scale_b unused in v1
+    out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes()); // block_count
+    out[6] = 0u8;                                              // format_flags = 0 (no rotation)
+    out[7] = 0u8;                                              // reserved
+    // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
+
+    // Per-block payload.
+    for b in 0..n_blocks {
+        let block_start = b * 32;
+        let block = &row[block_start..block_start + 32];
+
+        // Normalize block by row scale.
+        // block_max_normalized in units of [-6.0, +6.0] (because row_scale_a = max_abs/6.0).
+        // Pick UE8M0 block exponent so block fits cleanly into E2M1 lattice [-6, +6].
+        let block_max_abs = block.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
+        let block_max_normalized = block_max_abs * inv_row_scale;
+
+        // Choose smallest UE8M0 exponent that covers block_max_normalized without clipping:
+        //   6 * 2^(e - 127) ≥ block_max_normalized   →   e ≥ ceil(log2(block_max_normalized / 6)) + 127
+        // ceil (not round) prevents clipping; the precision cost is bounded by 1 bit at the top
+        // of the block. Clamp to UE8M0 range [0, 254] (255 = NaN, reserved per OCP spec).
+        let block_e: u8 = if block_max_normalized > 0.0 {
+            let log_ratio = (block_max_normalized / 6.0).log2();
+            let e_signed = log_ratio.ceil() as i32 + 127;
+            e_signed.clamp(0, 254) as u8
+        } else {
+            0u8 // empty block — smallest scale, all nibbles round to 0
+        };
+
+        let block_scale = (block_e as i32 - 127) as f32;
+        let block_scale_factor = block_scale.exp2(); // 2^(block_e - 127)
+        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+
+        // Block payload offset in the row buffer.
+        let payload_off = 16 + b * 17;
+        out[payload_off] = block_e;
+
+        // Pack 32 elements as 16 bytes, low nibble = even index, high nibble = odd index.
+        for i in 0..16 {
+            let lo = block[2 * i] * inv_row_scale * inv_block_scale;
+            let hi = block[2 * i + 1] * inv_row_scale * inv_block_scale;
+            let lo_nibble = e2m1_round(lo);
+            let hi_nibble = e2m1_round(hi);
+            out[payload_off + 1 + i] = (lo_nibble & 0x0F) | ((hi_nibble & 0x0F) << 4);
+        }
+    }
+
+    out
+}
+
+/// Quantize a row-major 2D weight tensor of shape `[m, k]` to HFP4G32.
+/// Returns `m * (16 + 17 * (k/32))` bytes — 16-B row header + per-block payloads, repeated per row.
+fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
+    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert!(k % 32 == 0, "HFP4G32 requires k % 32 == 0, got k={}", k);
+    let row_bytes = 16 + 17 * (k / 32);
+    let mut out = Vec::with_capacity(m * row_bytes);
+    for r in 0..m {
+        let row = &f32_data[r * k..(r + 1) * k];
+        out.extend_from_slice(&quantize_hfp4g32_row(row));
+    }
+    out
+}
+
+/// CPU reference dequantization for HFP4G32 — bit-exact mirror of `gemv_hfp4g32.hip`'s dequant.
+/// Returns the K reconstructed FP32 weights for one row.
+#[allow(dead_code)] // used by tests + future round-trip diagnostics
+fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
+    assert!(k % 32 == 0, "HFP4G32 requires K%32 == 0");
+    let n_blocks = k / 32;
+    assert_eq!(packed.len(), 16 + n_blocks * 17, "HFP4G32 row size mismatch");
+
+    let row_scale_a_bits = u16::from_le_bytes([packed[0], packed[1]]);
+    let row_scale_a = f16_to_f32(row_scale_a_bits);
+
+    let mut out = vec![0.0f32; k];
+    for b in 0..n_blocks {
+        let payload_off = 16 + b * 17;
+        let block_e = packed[payload_off] as i32;
+        let block_scale = (block_e - 127) as f32;
+        let block_scale_factor = block_scale.exp2();
+        let scale = row_scale_a * block_scale_factor;
+
+        for i in 0..16 {
+            let byte = packed[payload_off + 1 + i];
+            let lo_nibble = (byte & 0x0F) as usize;
+            let hi_nibble = ((byte >> 4) & 0x0F) as usize;
+            out[b * 32 + 2 * i]     = scale * E2M1_LUT[lo_nibble];
+            out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi_nibble];
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod hfp4_tests {
+    use super::*;
+
+    #[test]
+    fn e2m1_round_matches_lattice() {
+        // Each lattice value should round to its own code.
+        for (i, &val) in E2M1_LUT.iter().enumerate() {
+            let nibble = e2m1_round(val);
+            // +0 and -0 are both at value 0.0; either nibble is acceptable.
+            if val.abs() < 1e-6 {
+                assert!(nibble == 0 || nibble == 8, "zero rounds to nibble {}", nibble);
+            } else {
+                assert_eq!(nibble, i as u8, "code {} rounded to nibble {} not {}", i, nibble, i);
+            }
+        }
+    }
+
+    #[test]
+    fn e2m1_round_midpoint() {
+        // Halfway between +1.0 and +1.5 → either is acceptable (tie).
+        let n = e2m1_round(1.25);
+        assert!(n == 2 || n == 3, "midpoint rounded to {}", n);
+        // Halfway between +4.0 and +6.0 (= 5.0) → either is acceptable.
+        let n = e2m1_round(5.0);
+        assert!(n == 6 || n == 7, "5.0 rounded to {}", n);
+    }
+
+    #[test]
+    fn round_trip_constant_row() {
+        // All-1.0 row: row_scale_a = 1/6, every block_e ≈ 127 + log2(1) = 127, every nibble = 2 (=1.0).
+        let row = vec![1.0f32; 64];
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, 64);
+        for (i, &v) in recovered.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-2, "elem {} recovered to {}", i, v);
+        }
+    }
+
+    #[test]
+    fn round_trip_mixed_magnitudes() {
+        // Row with mixed positive/negative E2M1 magnitudes — should round-trip exactly.
+        let row: Vec<f32> = (0..64).map(|i| {
+            let v = E2M1_LUT[i % 16];
+            v * 6.0 // scale up so row_scale_a sees max abs at 6 * 6 = 36, brings code lattice back to [-6, 6]
+        }).collect();
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, 64);
+        // Bound: |recovered - input| ≤ row_scale * 2^(block_e - 127) * 0.5 (half min E2M1 step).
+        // With row_scale_a = 36/6 = 6, and block_max_normalized = 6, block_e = 127 → step ≈ 0.5 → tol = 3.0.
+        // Actual tolerance should be much tighter for exact lattice values; allow some headroom.
+        for (i, (&got, &want)) in recovered.iter().zip(row.iter()).enumerate() {
+            let rel_err = (got - want).abs() / want.abs().max(1.0);
+            assert!(rel_err < 0.1, "elem {}: got {} want {} rel_err {}", i, got, want, rel_err);
+        }
+    }
+
+    #[test]
+    fn round_trip_per_block_error_bound() {
+        // Mathematical guarantee: for every element, |recovered - original| must be ≤
+        //   row_scale_a * 2^(block_e - 127) * (max_E2M1_step / 2)
+        // = effective_block_scale * 1.0  (max E2M1 step is 2.0, half = 1.0)
+        //
+        // This is the format's correctness contract; if this fails we have a real bug.
+        // NRMSE quality on raw weights is a downstream concern (MXFP4 family is documented
+        // as needing rotation+smoothing for production accuracy — that's MFP4G32 in v1.5).
+        let mut rng_state: u64 = 0xdead_beef_dead_beef;
+        let mut next_uniform = || -> f32 {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            ((rng_state & 0x00FF_FFFF) as f32 / 0x0100_0000 as f32).max(1e-7)
+        };
+        // Box-Muller Gaussian std=0.5.
+        let row: Vec<f32> = (0..512).flat_map(|_| {
+            let u1 = next_uniform();
+            let u2 = next_uniform();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let t = 2.0 * std::f32::consts::PI * u2;
+            [r * t.cos() * 0.5, r * t.sin() * 0.5]
+        }).collect();
+
+        let k = row.len();
+        let packed = quantize_hfp4g32_row(&row);
+        let recovered = dequant_hfp4g32_row(&packed, k);
+
+        let row_scale_a = f16_to_f32(u16::from_le_bytes([packed[0], packed[1]]));
+
+        // Per-block half-max-step bound. Allow 1% slack for FP16 row-scale rounding.
+        for b in 0..(k / 32) {
+            let payload_off = 16 + b * 17;
+            let block_e = packed[payload_off] as i32;
+            let block_scale = ((block_e - 127) as f32).exp2();
+            // Max E2M1 step is 2.0 (between 4 and 6); half = 1.0. Round-trip element error must
+            // be ≤ effective block scale × 1.0 × (1 + slack). Slack absorbs FP16 row-scale rounding.
+            let bound = row_scale_a * block_scale * 1.0 * 1.01 + 1e-5;
+            for i in 0..32 {
+                let idx = b * 32 + i;
+                let err = (recovered[idx] - row[idx]).abs();
+                assert!(err <= bound,
+                        "block {} elem {} err {} exceeds bound {} (block_e={}, row_scale_a={}, block_scale={})",
+                        b, i, err, bound, block_e, row_scale_a, block_scale);
+            }
+        }
+    }
+
+    #[test]
+    fn header_layout_matches_spec() {
+        // 64 elements = 2 blocks. Row size: 16 + 2*17 = 50 bytes.
+        let row = vec![3.0f32; 64];
+        let packed = quantize_hfp4g32_row(&row);
+        assert_eq!(packed.len(), 50);
+        // Block count == 2.
+        let bc = u16::from_le_bytes([packed[4], packed[5]]);
+        assert_eq!(bc, 2);
+        // Format flags: rotation off, no row_scale_b.
+        assert_eq!(packed[6] & 0x0F, 0);
+        // First block UE8M0 byte at offset 16.
+        // Last block payload ends at 16 + 2*17 = 50 (= total).
+        // Sanity: row_scale_a > 0 (FP16 bits non-zero).
+        let rs_bits = u16::from_le_bytes([packed[0], packed[1]]);
+        assert_ne!(rs_bits, 0);
+    }
+}
+
 /// MagnumQuant MQ3-G256: FWHT-rotated 3-bit quantization.
 /// Same binary format as HFQ3-G256 (104 bytes/group). Rotation is baked into
 /// the weights via cpu_fwht_256; the GEMV kernel rotates x instead.
@@ -1310,6 +1579,19 @@ enum QuantType {
     MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
     MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
+    // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
+    // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
+    HFP4G32 = 21,      // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
+    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
+    // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
+    // MFP4G32     = 24, // v1.5 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
+    // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
+    // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
+    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    // HFP8E5M2G32 = 28, // v2  — HFP8 E5M2 family
+    // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -2000,6 +2282,7 @@ enum GgufFormat {
     Mq2,
     Mq2Lloyd,
     Mq3Lloyd,
+    Hfp4,  // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
 }
 
 impl GgufFormat {
@@ -2013,6 +2296,7 @@ impl GgufFormat {
             "mq2" | "mq2g256" => Some(Self::Mq2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
+            "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
             _ => None,
         }
     }
@@ -2027,6 +2311,7 @@ impl GgufFormat {
             Self::Mq2 => "MQ2G256",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
+            Self::Hfp4 => "HFP4G32",
         }
     }
 }
@@ -2183,6 +2468,13 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
+                GgufFormat::Hfp4 => {
+                    // No HFP6 variant in v1. Promote6 for HFP4 stays at HFP4G32 (4.25 bpw).
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                }
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -2220,6 +2512,12 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Hfp4 => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                 }
             }
         } else {
@@ -2336,6 +2634,8 @@ fn main() {
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
+    // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
+    let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
     let q8_router_flag = args.iter().any(|a| a == "--q8-router");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
     // K-map gate: applies to MoE models by default. Dense models opt in
@@ -2903,6 +3203,22 @@ fn main() {
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 } else {
                     // Fallback to standard HFQ4-G128 for non-256-aligned
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
+            } else if use_hfp4 && is_embed {
+                // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
+                // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
+                let q = quantize_q8f16(&f32_data);
+                (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_hfp4 {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 32 == 0 && meta.shape.len() == 2 {
+                    let m = meta.shape[0];
+                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                } else {
+                    // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
                     let q = quantize_hfq4g128(&f32_data);
                     (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                 }

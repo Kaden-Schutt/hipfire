@@ -269,6 +269,13 @@ pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g2
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 
+/// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
+/// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
+/// Block: per-row 16 B header (row_scale_a:f16, row_scale_b:f16, block_count, flags),
+/// then (K/32) blocks × 17 B (UE8M0:u8 + 16 B nibbles).
+pub const GEMV_HFP4G32_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.hip");
+pub const GEMV_HFP4G32_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfp4g32.gfx1100.hip");
+
 
 
 
@@ -629,6 +636,22 @@ pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
         // RDNA4 variants (existing)
         // "gfx1200" | "gfx1201" => ...,
         _ => (GEMV_HFQ4G256_SRC, "gemv_hfq4g256"), // gfx1010 baseline
+    }
+}
+
+/// HFP4-G32 GEMV arch dispatch.
+///
+/// v1: gfx1100 variant is the byte-exact baseline (currently bit-identical to the
+/// default source; v2 adds VOPD + V_PERMLANE16 + SGPR-LUT here). All other archs
+/// route to the default source — same FP add ordering and accumulator structure
+/// guarantees byte-exact output across gfx1010, gfx1030, gfx1151, gfx1201, gfx906.
+/// gfx1201 WMMA-FP8 hero kernel ships in v2. See `docs/quant-formats/hfp4.md`.
+pub fn gemv_hfp4g32_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => {
+            (GEMV_HFP4G32_GFX1100_SRC, "gemv_hfp4g32_rdna3")
+        }
+        _ => (GEMV_HFP4G32_SRC, "gemv_hfp4g32"),
     }
 }
 
