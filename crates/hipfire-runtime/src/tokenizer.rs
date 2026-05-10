@@ -12,6 +12,13 @@ pub struct Tokenizer {
     token_to_id: HashMap<String, u32>,
     /// BPE merge rules: (left, right) → merged token
     merges: Vec<(String, String)>,
+    /// Pre-built BPE merge-rank lookup: (left, right) → rank index. Built
+    /// ONCE per tokenizer construction so `encode_gpt2_bpe` doesn't pay the
+    /// O(M) String-clone-into-HashMap cost on every encode call (M is the
+    /// merges count, ~150K for Qwen3+ — without this, ~50ms per encode call,
+    /// which compounds across the 9+ encodes-per-request the daemon does for
+    /// chat-template scaffolding and adds ~450ms to TTFT for short prompts).
+    merge_rank: HashMap<(String, String), usize>,
     /// Special tokens: strings like "<|im_start|>" → their token ID
     /// Sorted longest-first for greedy matching
     special_tokens: Vec<(String, u32)>,
@@ -25,6 +32,17 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA)
     is_gpt2_bpe: bool,
+}
+
+/// Pre-build the BPE merge-rank lookup. Called once at tokenizer construction
+/// time to amortize the O(M) String-clone-into-HashMap across the lifetime of
+/// the tokenizer rather than paying it per encode call.
+fn build_merge_rank(merges: &[(String, String)]) -> HashMap<(String, String), usize> {
+    merges
+        .iter()
+        .enumerate()
+        .map(|(i, (l, r))| ((l.clone(), r.clone()), i))
+        .collect()
 }
 
 impl Tokenizer {
@@ -94,10 +112,13 @@ impl Tokenizer {
         // Sort longest-first for greedy matching
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+        let merge_rank = build_merge_rank(&merges);
+
         Some(Tokenizer {
             vocab,
             token_to_id,
             merges,
+            merge_rank,
             special_tokens,
             bos_id,
             eos_id,
@@ -187,10 +208,13 @@ impl Tokenizer {
 
         let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
 
+        let merge_rank = build_merge_rank(&merges);
+
         Some(Tokenizer {
             vocab,
             token_to_id,
             merges,
+            merge_rank,
             special_tokens,
             bos_id,
             eos_id,
@@ -286,10 +310,13 @@ impl Tokenizer {
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
+        let merge_rank = build_merge_rank(&merges);
+
         Some(Tokenizer {
             vocab,
             token_to_id,
             merges,
+            merge_rank,
             special_tokens,
             bos_id,
             eos_id,
@@ -508,15 +535,12 @@ impl Tokenizer {
             return vec![self.token_to_id.get(&syms[0]).copied().unwrap_or(0)];
         }
 
-        // 2. Build merge rank map (built once per encode — moving to a
-        // pre-built field on Tokenizer would save this, but it's O(M)
-        // not O(N) and runs once not per-step).
-        let merge_rank: HashMap<(String, String), usize> = self
-            .merges
-            .iter()
-            .enumerate()
-            .map(|(i, (l, r))| ((l.clone(), r.clone()), i))
-            .collect();
+        // 2. Use the pre-built merge rank map cached on the Tokenizer.
+        // Earlier this was rebuilt every call (~50ms per encode for Qwen3+
+        // with ~150K merges); the daemon makes 9+ encode calls per request
+        // for chat-template scaffolding, so the per-call rebuild added
+        // ~450ms to TTFT for short prompts. Now O(1) per encode.
+        let merge_rank = &self.merge_rank;
 
         // 3. Doubly-linked-list state. `prev/next` are i32 with -1 sentinel.
         let mut prev: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
@@ -1161,10 +1185,12 @@ mod bpe_tests {
             .iter()
             .map(|(l, r)| (l.to_string(), r.to_string()))
             .collect();
+        let merge_rank = build_merge_rank(&merges);
         Tokenizer {
             vocab,
             token_to_id,
             merges,
+            merge_rank,
             special_tokens: Vec::new(),
             bos_id: 0,
             eos_id: 0,
