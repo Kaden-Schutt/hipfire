@@ -422,10 +422,9 @@ in
           DevicePolicy = "closed";
           DeviceAllow = [
             "/dev/kfd rw"
-            "/dev/dri rw"
-            "/dev/dri/* rw"
-            "/dev/accel rw"    # kernel 6.2+ DRM_ACCEL nodes
-            "/dev/accel/* rw"
+            "char-drm rw"      # /dev/dri/* — glob is silently ineffective
+                               # under DevicePolicy=closed on systemd 258.5+
+            "/dev/accel/accel0 rw"  # kernel 6.2+ DRM_ACCEL node
           ];
         };
       };
