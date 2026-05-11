@@ -2344,6 +2344,7 @@ fn generate_dflash(
                 None,                      // pld_spine
                 1.0_f32,                   // repeat_penalty (off)
                 0,                         // repeat_window
+                None,                      // ban_token_id
             )
         };
         let step = match step_result {
@@ -2638,7 +2639,7 @@ fn generate_multi(
     let gpus = m.pp_gpus.as_mut().unwrap();
 
     let dev_last = gpus.output_device;
-    let vocab_size = config.vocab_size;
+    let vocab_size = config.vocab_size.max(151659);
     let repeat_buf_cap = scratch_set.per_device[dev_last].repeat_buf.buf.size() / 4;
 
     if let Err(e) = qwen35::forward_prefill_batch_multi(
@@ -3146,7 +3147,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // picks up the signal it needs.
     let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
     let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
-    let new_tokens = if try_jinja {
+    let mut new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -3179,6 +3180,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             raw: false,
         }
         .build_with_user_tokens(&q_tokens)
+    };
+
+    // Inject `<think>` prefix when thinking is enabled. Must be done
+    // BEFORE prefill so the model sees it as part of the prompt.
+    // Look up think token IDs from the tokenizer at runtime (not hardcoded).
+    // Models that lack think tokens (MQ4 vocab-gap, non-Qwen families) return
+    // None → thinking_allowed stays false; ThinkState path no-ops.
+    let (think_start_id, think_end_id, thinking_allowed) = match (
+        tokenizer.special_token_id("<think>"),
+        tokenizer.special_token_id("</think>"),
+    ) {
+        (Some(a), Some(b)) => (a, b, true),
+        _ => (0, 0, false), // Model lacks think tokens — see docs/mq4-think-token-report.md
     };
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
@@ -3306,9 +3320,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // need to clear the buffer between calls. The upload is on the same
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
-        let vocab_size = config.vocab_size;
+        let vocab_size = config.vocab_size.max(151659);
         let mut rng_state: u32 = 0x13579BDFu32;
         let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
+
+        // Think-block policy state machine (AR path).
+        // The `<think>` token was injected into new_tokens before prefill,
+        // so it is already in conversation_tokens. Scan to detect it.
+        let mut think_state = sampler::ThinkState::default();
+        {
+            let mut depth: i32 = 0;
+            for &t in m.conversation_tokens.iter() {
+                if t == think_start_id { depth += 1; }
+                else if t == think_end_id && depth > 0 { depth -= 1; }
+            }
+            if depth > 0 {
+                think_state.in_think = true;
+                think_state.think_blocks_seen = 1;
+            }
+        }
 
         // Build the list of paired (open, close) attractor pairs once;
         // sampler::collect_unclosed_attractor_blocks decides per-call
@@ -3333,16 +3363,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             2,
             &mut blocked0,
         );
+        // Merge think-policy bans.
+        sampler::merge_think_bans(&mut blocked0, &think_state, thinking_allowed, think_start_id, think_end_id, think_state.tokens_inside_think);
         let cfg0 = SamplerConfig {
             temperature: temp,
             top_p,
             repeat_penalty,
-            // Window is bounded by the GPU repeat_buf capacity (sized
-            // at 64 in ForwardScratch::new). Pre-PR3 code did this
-            // bound by setting `scope_start = len - repeat_buf_cap`
-            // and passing `scope.len()` to the kernel; we let
-            // sampler::sample do the same `min(window, buf_cap)`
-            // internally.
             repeat_window: repeat_buf_cap,
             blocked_tokens: blocked0,
         };
@@ -3361,6 +3387,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // decode loop below.
         let t_prefill = Instant::now();
         let mut next_token = tok0;
+
+        // Update think state after first token.
+        sampler::update_think_state(&mut think_state, tok0, think_start_id, think_end_id);
 
         let mut generated = 0;
         let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -3552,6 +3581,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         2,
                         &mut blocked,
                     );
+                    sampler::merge_think_bans(&mut blocked, &think_state, thinking_allowed, think_start_id, think_end_id, think_state.tokens_inside_think);
                     let cfg = SamplerConfig {
                         temperature: temp,
                         top_p,
@@ -3569,6 +3599,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                         &cfg,
                         &mut rng_state,
                     );
+                    sampler::update_think_state(&mut think_state, next_token, think_start_id, think_end_id);
                     continue;
                 }
                 let nudge_tokens = tokenizer.encode(budget_alert_text);
@@ -3633,6 +3664,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 2,
                 &mut blocked,
             );
+            sampler::merge_think_bans(&mut blocked, &think_state, thinking_allowed, think_start_id, think_end_id, think_state.tokens_inside_think);
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,
@@ -3653,6 +3685,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
                 &cfg,
                 &mut rng_state,
             );
+            // Update think state after every token.
+            sampler::update_think_state(&mut think_state, next_token, think_start_id, think_end_id);
         }
         // m.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to

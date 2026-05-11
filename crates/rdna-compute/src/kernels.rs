@@ -1272,6 +1272,13 @@ pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
 
+/// Batched repeat-penalty + argmax: same as ARGMAX_BATCHED_SRC but applies
+/// frequency-weighted + recency-decayed repeat penalty per row before argmax,
+/// plus optional n-gram continuation blocking. One block per row.
+/// Used by DFlash greedy verify when repeat_penalty > 1.0 — avoids the CPU
+/// host_path D2H of full B×vocab logits.
+pub const REPEAT_PENALTY_ARGMAS_BATCHED_SRC: &str = include_str!("../../../kernels/src/repeat_penalty_argmax_batched.hip");
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)

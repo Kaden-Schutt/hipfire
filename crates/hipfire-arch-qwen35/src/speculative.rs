@@ -2423,6 +2423,7 @@ pub fn spec_step_dflash(
     pld_spine: Option<&[u32]>,
     repeat_penalty: f32,
     repeat_window: usize,
+    ban_token_id: Option<u32>,
 ) -> HipResult<SpecStepResult> {
     // Effective block size for THIS step. Usually `draft_cfg.block_size`
     // (what the draft was trained at, 16 for Qwen3.5-*-DFlash) but a caller
@@ -2715,23 +2716,45 @@ pub fn spec_step_dflash(
                 drafted.push(t);
                 draft_softmaxes.push(probs);
             }
-        } else if host_path_active {
-            // RP / n-gram-block path: apply per-row penalties before argmax
-            // so draft and target pick from the same reshaped distribution.
-            // Keeps spec-decode aligned (τ doesn't collapse from mismatched
-            // argmaxes — both sides see identical -inf logits on banned toks).
-            let host_logits = gpu.download_f32(&logits_batch)?;
-            debug_assert_eq!(host_logits.len(), batch * vocab);
-            let mut row = vec![0f32; vocab];
-            for i in 0..batch {
-                row.copy_from_slice(&host_logits[i * vocab..(i + 1) * vocab]);
-                if rp_active {
-                    llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
-                }
-                if ngram_block_active {
-                    llama::apply_ngram_block(&mut row, prev_committed);
-                }
-                drafted.push(argmax_u32(&row));
+        } else if rp_active || ngram_block_active {
+            // RP / n-gram-block path: apply per-row penalties via GPU compound
+            // kernel (repeat_penalty_argmax_batched) — avoids CPU D2H of
+            // B×vocab logits. Same logic as the target verify path.
+            let upload_len = prev_committed.len().min(repeat_window.max(1));
+            let upload_start = prev_committed.len().saturating_sub(upload_len);
+            let upload_slice = &prev_committed[upload_start..];
+            let upload_bytes: Vec<u8> = upload_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+            let prev_gpu = &verify_scratch.rot;
+            let prev_cap = prev_gpu.buf.size() / 4;
+            let eff_window = upload_len.min(prev_cap);
+            if eff_window > 0 {
+                let _ = gpu.hip.memcpy_htod(&prev_gpu.buf, &upload_bytes[..eff_window * 4]);
+            }
+            // Upload block tokens (seed + draft so far) to argmax buffer
+            let block_gpu = &verify_scratch.argmax;
+            let block_eff = (batch + 1).min(block_gpu.buf.size() / 4);
+            if block_eff > 0 {
+                let block_bytes: Vec<u8> = block[..block_eff].iter().flat_map(|t| t.to_ne_bytes()).collect();
+                let _ = gpu.hip.memcpy_htod(&block_gpu.buf, &block_bytes);
+            }
+            gpu.repeat_penalty_argmax_batched(
+                &logits_batch,          // (batch)×vocab logits on GPU
+                &verify_scratch.argmax, // batch×4 result
+                prev_gpu, block_gpu,
+                vocab, batch,
+                eff_window, repeat_window, repeat_penalty,
+                ngram_block_active,
+                ban_token_id,
+            )?;
+            let mut host_idx = vec![0i32; batch];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, batch * 4)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &verify_scratch.argmax.buf)?;
+            }
+            for &idx in &host_idx {
+                drafted.push(idx as u32);
             }
         } else {
             // GPU argmax over (B-1) rows — one kernel, small D2H.
@@ -2860,7 +2883,7 @@ pub fn spec_step_dflash(
     let verify_out = verify_dflash_block(
         gpu, target, &block, position, hidden_rb,
         gdn_tape_opt.as_deref_mut(),
-        use_temp_sampling || host_path_active,  // full target logits needed for rejection sampling, RP, or n-gram block
+        use_temp_sampling,  // full logits only needed for temp>0 rejection sampling
         verify_scratch,
     )?;
 
@@ -2949,25 +2972,53 @@ pub fn spec_step_dflash(
             sample_categorical(&target_probs, u)
         };
     } else {
-        // Greedy path. If RP or n-gram-block is active, re-derive argmax per
-        // row after applying penalties to the full target logits (requires
-        // want_full_logits). `prev_committed` carries the emitted history
-        // used as the penalty / block window.
-        let argmax_per_pos: std::borrow::Cow<'_, [u32]> = if host_path_active {
-            let tgt_logits = &verify_out.logits_per_pos;
-            debug_assert_eq!(tgt_logits.len(), b * vocab);
-            let mut out: Vec<u32> = Vec::with_capacity(b);
-            let mut row = vec![0f32; vocab];
-            for i in 0..b {
-                row.copy_from_slice(&tgt_logits[i * vocab..(i + 1) * vocab]);
-                if rp_active {
-                    llama::apply_repeat_penalty(&mut row, prev_committed, repeat_window, repeat_penalty);
-                }
-                if ngram_block_active {
-                    llama::apply_ngram_block(&mut row, prev_committed);
-                }
-                out.push(argmax_u32(&row));
+        // Greedy path. If RP or n-gram-block is active, apply penalties via GPU
+        // compound kernel (repeat_penalty_argmax_batched) instead of the CPU
+        // host_path — avoids downloading B×vocab logits for per-row CPU processing.
+        let argmax_per_pos: std::borrow::Cow<'_, [u32]> = if rp_active || ngram_block_active {
+            // Upload committed history to GPU (last `repeat_window` tokens)
+            let upload_len = prev_committed.len().min(repeat_window.max(1));
+            let upload_start = prev_committed.len().saturating_sub(upload_len);
+            let upload_slice = &prev_committed[upload_start..];
+            let upload_bytes: Vec<u8> = upload_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
+            // Reuse verify_scratch.rot as the prev_committed GPU buffer (same size class,
+            // lives across cycles). Zero-fill if larger than needed.
+            let prev_gpu = &verify_scratch.rot;
+            let prev_cap = prev_gpu.buf.size() / 4;
+            let eff_window = upload_len.min(prev_cap);
+            if eff_window > 0 {
+                let _ = gpu.hip.memcpy_htod(&prev_gpu.buf, &upload_bytes[..eff_window * 4]);
             }
+            // Upload block tokens to a temp area in verify_scratch.argmax (we'll overwrite
+            // it with the result anyway). block has `b` tokens.
+            let block_gpu = &verify_scratch.argmax;
+            let block_cap = block_gpu.buf.size() / 4;
+            let block_eff = b.min(block_cap);
+            if block_eff > 0 {
+                let block_bytes: Vec<u8> = block[..block_eff].iter().flat_map(|t| t.to_ne_bytes()).collect();
+                let _ = gpu.hip.memcpy_htod(&block_gpu.buf, &block_bytes);
+            }
+            // Launch GPU compound kernel: repeat_penalty + ngram_block + argmax per row
+            gpu.repeat_penalty_argmax_batched(
+                &verify_scratch.logits,  // B×vocab logits (still on GPU from verify)
+                &verify_scratch.argmax,  // B×4 result buffer (will overwrite)
+                prev_gpu,                // upload_len × u32
+                block_gpu,               // b × u32
+                vocab, b,
+                eff_window, // prev_committed_len = uploaded count (kernel uses window internally)
+                repeat_window, repeat_penalty,
+                ngram_block_active,
+                ban_token_id,
+            )?;
+            // Download B×4 bytes of argmax indices
+            let mut host_idx = vec![0i32; b];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(host_idx.as_mut_ptr() as *mut u8, b * 4)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &verify_scratch.argmax.buf)?;
+            }
+            let out: Vec<u32> = host_idx.iter().map(|&i| i as u32).collect();
             std::borrow::Cow::Owned(out)
         } else {
             std::borrow::Cow::Borrowed(verify_out.argmax_per_pos.as_slice())

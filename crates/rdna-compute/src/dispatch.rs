@@ -10658,6 +10658,79 @@ impl Gpu {
         )
     }
 
+    /// Batched repeat-penalty + argmax for DFlash greedy verify.
+    ///
+    /// One block per batch row. Applies repeat_penalty to each row (same Phase 0
+    /// logic as sample_top_p kernel) and optional n-gram blocking, then takes
+    /// argmax. Keeps everything on GPU — no D2H except B×4 bytes of indices.
+    ///
+    /// When repeat_penalty <= 1.0 and ngram_block is false, falls through to
+    /// plain argmax (fast path, no penalty computation).
+    pub fn repeat_penalty_argmax_batched(
+        &mut self,
+        logits: &GpuTensor,
+        result: &GpuTensor,
+        prev_committed: &GpuTensor,
+        block_tokens: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+        prev_committed_len: usize,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        ngram_block: bool,
+        ban_token_id: Option<u32>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "repeat_penalty_argmax_batched",
+            kernels::REPEAT_PENALTY_ARGMAS_BATCHED_SRC,
+            "repeat_penalty_argmax_batched",
+        )?;
+
+        let mut dp = logits.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut pp = prev_committed.buf.as_ptr();
+        let mut bp = block_tokens.buf.as_ptr();
+        let mut nn = n as i32;
+        let mut bs = batch_size as i32;
+        let mut pl = prev_committed_len as i32;
+        let mut rw = repeat_window as i32;
+        let mut rv = repeat_penalty;
+        let mut nb = if ngram_block { 1i32 } else { 0i32 };
+        let mut ban = ban_token_id.map(|id| id as i32).unwrap_or(-1);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut pl as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void,
+            &mut rv as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut ban as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8 + 256 * 4; // reduction pairs (f32+i32) + max 256 local_hist
+        self.launch_maybe_blob(
+            "repeat_penalty_argmax_batched",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp); b.push_ptr(rp); b.push_ptr(pp); b.push_ptr(bp);
+                b.push_i32(nn); b.push_i32(bs); b.push_i32(pl); b.push_i32(rw);
+                b.push_f32(rv); b.push_i32(nb); b.push_i32(ban);
+                b
+            },
+        )
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;

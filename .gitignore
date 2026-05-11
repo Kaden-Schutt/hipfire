@@ -25,6 +25,7 @@
 # JIT-compiled kernel cache
 kernels/compiled/
 .hipfire_kernels/
+.hipfire_kernels
 
 # Agent / tool state
 .serena/
@@ -90,3 +91,5 @@ research/
 .codeinsight+research/
 
 bench/coherence-results/
+
+PR_DESCRIPTION.md

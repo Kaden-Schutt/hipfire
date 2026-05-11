@@ -1930,7 +1930,7 @@ impl ForwardScratch {
             up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
             ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
-            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
+            logits: gpu.alloc_tensor(&[config.vocab_size.max(151659)], DType::F32)?,
             sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
             repeat_buf: gpu.alloc_tensor(&[64], DType::F32)?,
             attn_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,

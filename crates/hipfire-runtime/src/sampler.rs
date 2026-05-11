@@ -225,6 +225,132 @@ pub fn sample_cpu(logits: &mut [f32], history: &[u32], cfg: &SamplerConfig) -> u
 /// `threshold = 2`, a second consecutive opener without an intervening
 /// closer is the last one the decoder is allowed to emit.
 ///
+/// Think-block policy state machine for the AR path.
+/// Mirrors the DFlash think-policy bans in generate_dflash().
+#[derive(Default)]
+pub struct ThinkState {
+    pub in_think: bool,
+    pub think_blocks_seen: usize,
+    pub visible_answer_started: bool,
+    pub tokens_inside_think: usize,
+}
+
+/// Merge structural think-block bans into an existing ban list.
+/// One entry point for every AR sample site — call before building SamplerConfig.
+pub fn merge_think_bans(
+    ban_tokens: &mut Vec<u32>,
+    state: &ThinkState,
+    thinking_allowed: bool,
+    think_start_id: u32,
+    think_end_id: u32,
+    tokens_inside_think: usize,
+) {
+    // Always ban <think> when thinking is disabled.
+    if !thinking_allowed {
+        ban_tokens.push(think_start_id);
+        ban_tokens.push(think_end_id);
+        ban_tokens.sort_unstable();
+        ban_tokens.dedup();
+        return;
+    }
+
+    let allow_think_open =
+        !state.in_think
+        && state.think_blocks_seen == 0
+        && !state.visible_answer_started;
+
+    if !allow_think_open {
+        ban_tokens.push(think_start_id);
+    }
+
+    // `</think>` outside a think block is structural junk.
+    if !state.in_think {
+        ban_tokens.push(think_end_id);
+    }
+
+    // Force the model to stay inside <think> for at least 64 tokens
+    // so it has room to reason before closing. Without this, greedy
+    // decode immediately emits </think> and skips reasoning entirely.
+    if state.in_think && tokens_inside_think < 64 {
+        ban_tokens.push(think_end_id);
+        eprintln!("[sampler] forcing think open: banning </think> (tokens_inside={tokens_inside_think})");
+    }
+
+    ban_tokens.sort_unstable();
+    ban_tokens.dedup();
+}
+
+/// Update think state after a token is sampled. Must use raw sampled token,
+/// before any visible filtering or stripping.
+pub fn update_think_state(
+    state: &mut ThinkState,
+    tok: u32,
+    think_start_id: u32,
+    think_end_id: u32,
+) {
+    if tok == think_start_id {
+        if !state.in_think {
+            state.in_think = true;
+            state.think_blocks_seen += 1;
+            state.tokens_inside_think = 0;
+        }
+        return;
+    }
+
+    if tok == think_end_id {
+        state.in_think = false;
+        state.tokens_inside_think = 0;
+        return;
+    }
+
+    if state.in_think {
+        state.tokens_inside_think += 1;
+    }
+
+    // Any non-think token outside think → visible answer has started.
+    if !state.in_think {
+        state.visible_answer_started = true;
+    }
+}
+
+/// Compute think-block policy bans for the AR path (legacy wrapper, kept
+/// for callers that don't use ThinkState).
+///
+/// Returns a list of token IDs that should be unconditionally banned.
+pub fn collect_think_policy_bans(
+    think_open_id: u32,
+    think_close_id: u32,
+    thinking_allowed: bool,
+    in_think: bool,
+    think_blocks_seen: usize,
+    visible_answer_started: bool,
+) -> Vec<u32> {
+    let mut bans = Vec::new();
+
+    // Always ban <think> when thinking is disabled
+    if !thinking_allowed {
+        bans.push(think_open_id);
+        return bans;
+    }
+
+    // Ban <think> reopen: already saw one block AND answer started
+    if think_blocks_seen > 0 && visible_answer_started {
+        bans.push(think_open_id);
+    }
+
+    // Ban nested <think> inside the first think block
+    if in_think && think_blocks_seen > 0 {
+        bans.push(think_open_id);
+    }
+
+    // Ban </think> when not inside think (malformed close)
+    if !in_think {
+        bans.push(think_close_id);
+    }
+
+    bans
+}
+
 /// Pure, no GPU work; the caller passes the result into
 /// [`SamplerConfig::blocked_tokens`].
 pub fn collect_unclosed_attractor_blocks(

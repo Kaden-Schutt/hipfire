@@ -1261,6 +1261,11 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.assistant_prefix = "closed_think";
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
+    // When thinking budget is hit, daemon injects </think> so generation
+    // can continue into visible answer instead of stopping inside an
+    // unclosed <think> block (which leaves empty visible output after strip).
+    genMsg.budget_alert_at_tok = modelCfg.max_think_tokens;
+    genMsg.budget_alert_text = "</think>\n\n";
   }
   if (image) {
     genMsg.image = resolve(image);
@@ -1676,6 +1681,33 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
+        // Budget-aware think cap.
+        //
+        // The daemon can only force-close <think> if max_think_tokens fires
+        // before request max_tokens is exhausted. Without this clamp:
+        //   max_tokens=200, max_think_tokens=256
+        // means the model can spend the whole request budget inside <think>,
+        // after which the OpenAI wrapper strips the unclosed block and
+        // returns content:"".
+        const minVisibleAfterThink = Math.max(
+          1,
+          Number(process.env.HIPFIRE_MIN_VISIBLE_AFTER_THINK ?? 32) || 32,
+        );
+        const closeThinkOverheadGuess = 8;
+        const thinkBudgetCap = Math.max(
+          1,
+          requestMaxTokens - minVisibleAfterThink - closeThinkOverheadGuess,
+        );
+        if (enableThinking !== false && effective.thinking !== "off" && !preserveThinking) {
+          if (genParams.max_think_tokens == null) {
+            genParams.max_think_tokens = thinkBudgetCap;
+          } else if (genParams.max_think_tokens > 1) {
+            genParams.max_think_tokens = Math.min(
+              genParams.max_think_tokens,
+              thinkBudgetCap,
+            );
+          }
+        }
         // Wire thinking control for both legacy assistant_prefix
         // (ChatFrame::ClosedThink) and the new Jinja template path.
         // The Jinja path uses max_think_tokens==1 as the signal for
@@ -2044,7 +2076,21 @@ async function serve(port: number) {
 
         // Check for tool calls in response
         const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
+
+        // Detect max_tokens exhaustion inside unclosed think block
+        const openThink = strippedContent.lastIndexOf("<think>");
+        const closeThink = strippedContent.lastIndexOf("</think>");
+        const endedInsideThink = openThink >= 0 && openThink > closeThink;
+        const exhaustedBudget = completionTokens >= requestMaxTokens;
+
+        const choice: any = {
+          index: 0,
+          finish_reason: parsed.tool_calls
+            ? "tool_calls"
+            : exhaustedBudget && endedInsideThink
+              ? "length"
+              : "stop",
+        };
         if (parsed.tool_calls) {
           choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
         } else {
