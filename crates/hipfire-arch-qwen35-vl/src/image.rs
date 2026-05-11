@@ -3,6 +3,12 @@
 
 use std::path::Path;
 
+/// Maximum total pixel count, checked from format-header dimensions BEFORE
+/// the pixel buffer is allocated (decompression bomb guard). 4M pixels is
+/// well above `smart_resize`'s `max_pixels` target of ~1M but caps the
+/// pre-decode memory request from a malicious 50000×50000 PNG.
+const MAX_DIMENSION_PIXELS: usize = 4_000_000;
+
 /// Smart resize matching HuggingFace Qwen2_5_VLImageProcessor.
 ///
 /// `factor` MUST equal `patch_size * spatial_merge_size`. With that constraint
@@ -31,28 +37,19 @@ pub fn smart_resize(height: usize, width: usize, factor: usize, min_pixels: usiz
     }
 }
 
-/// Load an image, smart-resize to match HuggingFace, normalize.
+/// Shared preprocessing logic that takes an already-loaded `DynamicImage`.
 /// Returns (CHW data, height, width) where height and width are multiples of
-/// `patch_size * spatial_merge_size`, so (h/patch_size) and (w/patch_size)
-/// are both multiples of `spatial_merge_size` — required by the merger
-/// downstream.
-pub fn load_and_preprocess(
-    path: &Path,
+/// `patch_size * spatial_merge_size`.
+fn preprocess_dynamic_image(
+    img: image::DynamicImage,
     patch_size: usize,
     spatial_merge_size: usize,
 ) -> (Vec<f32>, usize, usize) {
-    let img = image::open(path)
-        .unwrap_or_else(|e| panic!("Failed to open image {}: {e}", path.display()));
-
     let (orig_w, orig_h) = (img.width() as usize, img.height() as usize);
 
-    // factor = patch_size * spatial_merge_size matches HuggingFace
-    // Qwen2_5_VLImageProcessor and guarantees the patch grid is sms-divisible.
-    // Qwen3.5-VL: patch_size=16, sms=2 → factor=32. (Qwen2-VL was
-    // patch_size=14, sms=2 → factor=28; the literal 28 was wrong here.)
     let factor = patch_size * spatial_merge_size;
-    let min_pixels = 56 * 56;         // 3136
-    let max_pixels = 14 * 14 * 4 * 1280; // 1003520
+    let min_pixels = 56 * 56;
+    let max_pixels = 14 * 14 * 4 * 1280;
     let (final_h, final_w) = smart_resize(orig_h, orig_w, factor, min_pixels, max_pixels);
 
     let img = img.resize_exact(
@@ -93,6 +90,59 @@ pub fn load_and_preprocess(
         }
     }
     (out, h, w)
+}
+
+/// Load an image from a filesystem path, smart-resize, normalize.
+/// Panics on failure (CLI path).
+pub fn load_and_preprocess(
+    path: &Path,
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> (Vec<f32>, usize, usize) {
+    let img = image::open(path)
+        .unwrap_or_else(|e| panic!("Failed to open image {}: {e}", path.display()));
+    preprocess_dynamic_image(img, patch_size, spatial_merge_size)
+}
+
+/// Load an image from raw bytes (PNG or JPEG), smart-resize, normalize.
+/// Returns `Result` so callers can surface decode errors.
+///
+/// Reads dimensions from the format header BEFORE decoding pixels so a
+/// decompression-bomb image (e.g. 50000×50000 PNG that compresses to ~50 KB
+/// but expands to multi-GB raw) is rejected before allocation. Format
+/// rejection (non-PNG/JPEG) is via `ImageError::Unsupported` rather than
+/// substring matching so the error surface is stable across `image` crate
+/// versions.
+pub fn load_and_preprocess_from_bytes(
+    data: &[u8],
+    patch_size: usize,
+    spatial_merge_size: usize,
+) -> Result<(Vec<f32>, usize, usize), String> {
+    let reader = image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("failed to read image: {e}"))?;
+
+    let (orig_w, orig_h) = reader
+        .into_dimensions()
+        .map_err(map_image_err)?;
+    let (orig_w, orig_h) = (orig_w as usize, orig_h as usize);
+    if orig_w * orig_h > MAX_DIMENSION_PIXELS {
+        return Err(format!(
+            "image dimensions ({orig_w}x{orig_h}) exceed maximum ({MAX_DIMENSION_PIXELS} pixels)"
+        ));
+    }
+
+    let img = image::load_from_memory(data).map_err(map_image_err)?;
+    Ok(preprocess_dynamic_image(img, patch_size, spatial_merge_size))
+}
+
+fn map_image_err(e: image::ImageError) -> String {
+    match e {
+        image::ImageError::Unsupported(_) => {
+            "unsupported image format — supported: png, jpeg".to_string()
+        }
+        other => format!("failed to decode image: {other}"),
+    }
 }
 
 /// Extract non-overlapping patches from a CHW image.

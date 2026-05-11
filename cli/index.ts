@@ -874,9 +874,9 @@ async function runViaHttp(
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
 ): Promise<boolean> {
-  // VL flows go through the image-base64 path on the daemon which the HTTP
-  // wrapper doesn't expose — fall back to local spawn.
-  if (image) return false;
+  // VL requests proxy through the daemon's `image_base64` IPC field —
+  // `hipfire run --image` can hit a running serve instead of cold-spawning
+  // a fresh daemon per call.
 
   const messages: any[] = [];
   if (system) messages.push({ role: "system", content: system });
@@ -887,6 +887,23 @@ async function runViaHttp(
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
+
+  if (image) {
+    const imgBuf = Bun.file(resolve(image));
+    if (!(await imgBuf.exists())) { console.error(`Image not found: ${image}`); return false; }
+    const imgBytes = await imgBuf.arrayBuffer();
+    const imgBase64 = Buffer.from(imgBytes).toString("base64");
+    const ext = image.toLowerCase().split(".").pop();
+    const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : null;
+    if (!mime) { console.error(`Unsupported image format: ${ext} — supported: png, jpeg`); return false; }
+    body.messages = [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${mime};base64,${imgBase64}` } },
+      ],
+    }];
+  }
 
   let resp: Response;
   try {
@@ -1217,7 +1234,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // If a serve daemon is already running on this port, proxy through its HTTP
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
-  const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
+  const useLocal = process.env.HIPFIRE_LOCAL === "1";
   if (!useLocal && await isServeUp(cfg.port)) {
     const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
@@ -1328,6 +1345,7 @@ async function serve(port: number) {
   // or a client-sent body.max_tokens) needs more headroom than the KV cache
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
+  let modelHasVL = false;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1359,10 +1377,16 @@ async function serve(port: number) {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
-      current = null;
-      currentMaxSeq = null;
     } catch (err: any) {
       console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+    } finally {
+      // Reset capability state regardless of whether send/recv threw.
+      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
+      // eviction) makes the next request forward image_base64 to a
+      // daemon that has nothing loaded.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1387,6 +1411,7 @@ async function serve(port: number) {
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
+        modelHasVL = loadResult.vl === true;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1468,16 +1493,43 @@ async function serve(port: number) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractText = (content: any): string => {
-          if (typeof content === "string") return content;
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
-            return content
-              .filter((p: any) => p && p.type === "text")
-              .map((p: any) => p.text ?? "")
-              .join("");
+            const textParts: string[] = [];
+            const images: string[] = [];
+            let unsupportedImage = false;
+            let malformedImage = false;
+            for (const p of content) {
+              if (p?.type === "text") textParts.push(p.text ?? "");
+              else if (p?.type === "image_url") {
+                if (p.image_url?.url) {
+                  const url: string = p.image_url.url;
+                  if (url.startsWith("data:")) {
+                    const mimeMatch = url.match(/^data:(image\/(png|jpeg));base64,/);
+                    if (mimeMatch) {
+                      const raw = url.slice(url.indexOf(",") + 1);
+                      images.push(raw);
+                    } else {
+                      // Anything else under `data:` is unsupported. Flag
+                      // both data:image/<other> (webp, gif, ...) AND
+                      // non-image data: URIs (data:application/pdf, ...)
+                      // so the request fails loudly instead of silently
+                      // dropping the part and proceeding as text-only.
+                      unsupportedImage = true;
+                    }
+                  }
+                } else {
+                  malformedImage = true;
+                }
+              }
+            }
+            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
           }
-          return "";
+          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
         };
+
+        const extractText = (content: any): string => extractContent(content).text;
 
         // Extract system message. OpenAI's o1/o3-style reasoning surface
         // (and pi-coding-agent) sends `role:"developer"` instead of
@@ -1515,7 +1567,19 @@ async function serve(port: number) {
            .replace(/<think>[\s\S]*$/, "");
 
         const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
+        let requestImages: string[] = [];
         const convParts: string[] = [];
+        // Image-validation errors fire inline (per-message) so the
+        // returned 400 reflects the actual offending turn rather than
+        // an aggregate across the conversation. Helper unifies the
+        // safeRelease + Response.json shape.
+        const rejectImage = (message: string) => {
+          safeRelease();
+          return Response.json(
+            { error: { message, type: "invalid_request_error" } },
+            { status: 400 },
+          );
+        };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
           const role = m.role;
@@ -1528,9 +1592,38 @@ async function serve(port: number) {
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
-                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+                let args = {};
+                try {
+                  args = JSON.parse(fn.arguments || "{}");
+                } catch (err: any) {
+                  // Surface the parse failure so a malformed-args call
+                  // doesn't silently turn into a "tool was called with {}"
+                  // entry in the conversation. Keep the call in-stream
+                  // (using {}) so the model isn't left with a torn turn,
+                  // but make the divergence visible in serve logs.
+                  console.error(`[hipfire] tool_call: failed to parse arguments JSON for "${fn.name}" (${err?.message ?? err}) — substituting {}`);
+                }
+                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: args })}\n</tool_call>`;
               }
             }
+          } else if (role === "user") {
+            const content = extractContent(m.content);
+            if (content.malformedImage) {
+              return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.unsupportedImage) {
+              return rejectImage("unsupported image format — supported: png, jpeg");
+            }
+            if (content.images.length > 0) {
+              if (i < nonSystem.length - 1) {
+                return rejectImage("images in earlier user turns are not supported — image must be in the last user message");
+              }
+              if (content.images.length + requestImages.length > 1) {
+                return rejectImage("multiple images not supported — only one image per request");
+              }
+              requestImages.push(...content.images);
+            }
+            text = content.text;
           } else {
             text = extractText(m.content);
           }
@@ -1562,7 +1655,8 @@ async function serve(port: number) {
         // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
         const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
-        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024);
+        const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
+        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -1579,11 +1673,13 @@ async function serve(port: number) {
           if (loadResult.type === "error") {
             current = null;
             currentMaxSeq = null;
+            modelHasVL = false;
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
+          modelHasVL = loadResult.vl === true;
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
@@ -1691,6 +1787,17 @@ async function serve(port: number) {
           genParams.max_think_tokens = 1;
         }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        if (requestImages.length === 1) {
+          if (!modelHasVL) {
+            safeRelease();
+            return Response.json(
+              { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
+              { status: 400 },
+            );
+          }
+          genParams.image_base64 = requestImages[0];
+        }
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         //
@@ -1941,10 +2048,10 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       } else {
-                        // No tool calls — flush accumulated content
                         if (accumulated) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -1953,7 +2060,8 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       }
                     } else {
@@ -1961,7 +2069,7 @@ async function serve(port: number) {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: msg.prefill_tokens + completionTokens } },
+                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
@@ -2013,9 +2121,16 @@ async function serve(port: number) {
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
           safeRelease();
+          let status = 500;
+          const err = daemonError.toLowerCase();
+          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
+          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
+            || err.includes("image dimensions") || err.includes("failed to decode base64")
+            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
+            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
-            { status: 400 }
+            { status }
           );
         }
 
