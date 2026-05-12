@@ -1591,6 +1591,132 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     })
 }
 
+// ─── ParoQuant safetensors loading ──────────────────────────────────────────
+
+fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: usize, gs: u32, kr: u8) -> HipResult<WeightTensor> {
+    let fp = format!("model.language_model.{prefix}");
+    if source.tensor_info(&format!("{fp}.qweight")).is_some() {
+        load_paroquant_weight(source, gpu, &fp, m, k, gs, kr)
+    } else {
+        load_fp16_weight_from_source(source, gpu, &format!("{fp}.weight"), m, k)
+    }
+}
+
+fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let full = format!("model.language_model.{name}");
+    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
+    let mut v: Vec<f32> = if info.dtype == "F16" {
+        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
+    } else {
+        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    };
+    for x in &mut v { *x += 1.0; }
+    gpu.upload_f32(&v, shape)
+}
+
+fn paro_load_norm_raw(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let full = format!("model.language_model.{name}");
+    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
+    let v: Vec<f32> = if info.dtype == "F16" {
+        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
+    } else {
+        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    };
+    gpu.upload_f32(&v, shape)
+}
+
+fn paro_load_f32(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+    let full = format!("model.language_model.{name}");
+    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
+    let v: Vec<f32> = if info.dtype == "F16" {
+        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
+    } else {
+        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    };
+    gpu.upload_f32(&v, &[n])
+}
+
+pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+    let qc = source.quant_config().expect("ParoQuant model must have quantization_config");
+    let gs = qc.group_size;
+    let kr = qc.krot;
+
+    eprintln!("  loading token_embd (ParoQuant)...");
+    let embd_name = "model.language_model.embed_tokens.weight";
+    let (_, embd_data) = source.tensor_data(embd_name).expect("embed_tokens not found");
+    let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+    let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
+    let embd_fmt = EmbeddingFormat::F32;
+
+    eprintln!("  loading output_norm...");
+    let output_norm = if config.num_experts > 0 {
+        paro_load_norm_raw(source, gpu, "norm.weight", &[config.dim])?
+    } else {
+        paro_load_norm(source, gpu, "norm.weight", &[config.dim])?
+    };
+
+    eprintln!("  loading output (tied embeddings)...");
+    let output = {
+        let (_, td) = source.tensor_data(embd_name).expect("embed_tokens for lm_head");
+        let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
+        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None }
+    };
+
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for i in 0..config.n_layers {
+        eprintln!("  loading layer {i}/{} ({:?}, ParoQuant)...", config.n_layers, config.layer_types[i]);
+        let p = format!("layers.{i}");
+        let is_moe = config.num_experts > 0;
+
+        match (config.layer_types[i], is_moe) {
+            (LayerType::LinearAttention, false) => {
+                let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                            + config.linear_num_value_heads * config.linear_value_head_dim;
+                let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wqkv: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_qkv"), qkv_dim, config.dim, gs, kr)?,
+                    wz: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_z"), d_inner, config.dim, gs, kr)?,
+                    w_alpha: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_a"), config.linear_num_value_heads, config.dim, gs, kr)?,
+                    w_beta: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_b"), config.linear_num_value_heads, config.dim, gs, kr)?,
+                    a_log: paro_load_f32(source, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
+                    dt_bias: paro_load_f32(source, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
+                    conv_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.conv1d.weight"), qkv_dim * config.conv_kernel_dim)?,
+                    norm_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
+                    wo: paro_load_wt(source, gpu, &format!("{p}.linear_attn.out_proj"), config.dim, d_inner, gs, kr)?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    w_gate: paro_load_wt(source, gpu, &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
+                    w_up: paro_load_wt(source, gpu, &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
+                    w_down: paro_load_wt(source, gpu, &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
+                }));
+            }
+            (LayerType::FullAttention, false) => {
+                let q_out_dim = config.n_heads * config.head_dim * 2;
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wq: paro_load_wt(source, gpu, &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
+                    wk: paro_load_wt(source, gpu, &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
+                    wv: paro_load_wt(source, gpu, &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
+                    wo: paro_load_wt(source, gpu, &format!("{p}.self_attn.o_proj"), config.dim, config.n_heads * config.head_dim, gs, kr)?,
+                    q_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                    k_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    w_gate: paro_load_wt(source, gpu, &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
+                    w_up: paro_load_wt(source, gpu, &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
+                    w_down: paro_load_wt(source, gpu, &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
+                }));
+            }
+            _ => panic!("ParoQuant MoE loading not yet implemented (layer {i})"),
+        }
+    }
+
+    Ok(Qwen35Weights { token_embd, embd_format: embd_fmt, output_norm, output, layers, pager: None })
+}
+
 /// Multi-GPU weight loader. Variant 2 placement: `token_embd` on `gpus.devices[0]`,
 /// `output_norm + output` on `gpus.devices[gpus.output_device]`, each layer on
 /// `gpus.devices[gpus.device_for_layer(i)]`. The single-GPU `load_weights` path is
