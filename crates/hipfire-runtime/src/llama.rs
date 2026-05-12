@@ -679,6 +679,7 @@ pub fn weight_gemv(
             };
             // Copy x → scratch, rotate scratch, GEMV from scratch
             gpu.copy_d2d(x, &scratch_alias)?;
+            gpu.copy_d2d(x, &scratch_alias)?;
             gpu.givens_rotate(
                 &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
                 1, w.k, paro.krot as usize,
