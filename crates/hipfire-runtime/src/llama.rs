@@ -483,12 +483,36 @@ fn load_tensor_f32(gguf: &GgufFile, info: &TensorInfo) -> Vec<f32> {
 }
 
 /// A weight matrix on GPU — may be quantized or F32.
+/// ParoQuant Givens rotation metadata for a single linear layer.
+/// Stored alongside the weight buffer; applied to activations before GEMV.
+pub struct ParoRotation {
+    pub pairs: GpuTensor,           // I16 [krot, in_dim] — pair indices per rotation layer
+    pub theta: GpuTensor,           // F16 [krot, in_dim/2] — learned angles
+    pub channel_scales: GpuTensor,  // F16 [in_dim] — per-channel scaling factor alpha
+    pub krot: u32,                  // number of rotation layers (typically 8)
+    pub group_size: u32,            // quantization group size (typically 128)
+}
+
 pub struct WeightTensor {
     pub buf: GpuTensor,
     pub gpu_dtype: DType, // dispatch type for kernel selection
     pub m: usize,         // output dim (rows)
     pub k: usize,         // input dim (cols)
     pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
+    pub paro: Option<ParoRotation>,
+}
+
+impl WeightTensor {
+    /// Free the weight buffer and any associated metadata (ParoQuant rotation) from GPU.
+    pub fn free_all(self, gpu: &mut Gpu) {
+        if let Some(paro) = self.paro {
+            let _ = gpu.free_tensor(paro.pairs);
+            let _ = gpu.free_tensor(paro.theta);
+            let _ = gpu.free_tensor(paro.channel_scales);
+        }
+        let _ = gpu.free_tensor(self.buf);
+    }
 }
 
 /// How the embedding table is stored on GPU.
@@ -1820,19 +1844,19 @@ pub fn load_weights(
         match info.dtype {
             GgmlType::Q4K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0, paro: None })
             }
             GgmlType::Q6K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0, paro: None })
             }
             GgmlType::Q8_0 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None })
             }
             GgmlType::F32 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
             }
             _ => {
                 // Unsupported: dequant to F32 on CPU, upload as raw bytes
@@ -1841,7 +1865,7 @@ pub fn load_weights(
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
             }
         }
     }
@@ -1868,7 +1892,7 @@ pub fn load_weights(
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0 }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
