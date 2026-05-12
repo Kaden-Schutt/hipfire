@@ -1259,6 +1259,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // ─── ParoQuant / safetensors directory path ────────────────────────────
+    // If the path is a directory with config.json, try loading as a
+    // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
+    if Path::new(path).is_dir() {
+        return load_model_safetensors(path, max_seq, &kv_mode, gpu);
+    }
+
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .ok_or("tokenizer not found")?;
@@ -1587,6 +1594,85 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             chat_template,
         })
     }
+}
+
+/// Load a model from a HuggingFace safetensors directory (ParoQuant, AWQ, etc.).
+fn load_model_safetensors(
+    path: &str, max_seq: usize, kv_mode: &str, gpu: &mut rdna_compute::Gpu,
+) -> Result<LoadedModel, String> {
+    use hipfire_runtime::safetensors_source::SafetensorsSource;
+    use hipfire_runtime::model_source::ModelSource;
+
+    eprintln!("  opening safetensors directory: {path}");
+    let source = SafetensorsSource::open(Path::new(path))
+        .map_err(|e| format!("safetensors open: {e}"))?;
+
+    let arch_id = source.arch_id();
+    let qm = source.quant_config().map(|q| q.method.as_str()).unwrap_or("none");
+    eprintln!("  arch_id={arch_id}, quant_method={qm}");
+
+    // Tokenizer from tokenizer.json
+    let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
+        hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+            .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
+    } else {
+        return Err("no tokenizer.json found in model directory".into());
+    };
+
+    if arch_id != 5 && arch_id != 6 {
+        return Err(format!("safetensors loading only supports Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
+    }
+
+    // Parse config (reuse Qwen35's config parser via metadata_json)
+    let config = qwen35::config_from_safetensors(&source)
+        .ok_or("failed to parse Qwen3.5 config from config.json")?;
+
+    eprintln!("  Qwen3.5/3.6: dim={}, layers={}, heads={}", config.dim, config.n_layers, config.n_heads);
+
+    // Load weights via ParoQuant path
+    let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
+        .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
+
+    // KV cache: default to asym3 (matches the main Qwen35 path)
+    let effective_max_seq = max_seq;
+    let kv_cache = match kv_mode {
+        "q8" => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        _ => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+    }.map_err(|e| format!("KvCache: {e}"))?;
+    let dn_state = DeltaNetState::new(gpu, &config)
+        .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
+    let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
+        .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
+    let chat_template = source.chat_template();
+
+    Ok(LoadedModel {
+        arch_id,
+        pp: 1,
+        pp_gpus: None,
+        pp_scratch_set: None,
+        pp_dn_la_to_device: None,
+        q35_config: Some(config),
+        q35_weights: Some(weights),
+        q35_scratch: Some(scratch),
+        kv_cache: Some(kv_cache),
+        dn_state: Some(dn_state),
+        llama_config: None,
+        llama_weights: None,
+        llama_scratch: None,
+        llama_kv: None,
+        vision_config: None,
+        vision_weights: None,
+        tokenizer: Some(tokenizer),
+        seq_pos: 0,
+        max_seq: effective_max_seq,
+        physical_cap: effective_max_seq,
+        eviction: None,
+        conversation_tokens: Vec::new(),
+        model_path: path.to_string(),
+        dflash: None,
+        chat_template,
+    })
 }
 
 /// Multi-GPU pipeline-parallel load path (Stage 7 of #58). Refuses VL,

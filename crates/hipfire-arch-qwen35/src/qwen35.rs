@@ -196,6 +196,56 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     })
 }
 
+/// Parse Qwen35Config from a SafetensorsSource (or any ModelSource).
+/// Delegates to the same JSON parser as config_from_hfq — the SafetensorsSource
+/// builds compatible metadata JSON from config.json.
+pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
+    let config = meta.get("config")?;
+    let tc = config.get("text_config").unwrap_or(config);
+
+    let dim = tc.get("hidden_size")?.as_u64()? as usize;
+    let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
+    let n_heads = tc.get("num_attention_heads")?.as_u64()? as usize;
+    let n_kv_heads = tc.get("num_key_value_heads").and_then(|v| v.as_u64()).unwrap_or(n_heads as u64) as usize;
+    let head_dim = tc.get("head_dim").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(dim / n_heads);
+    let vocab_size = tc.get("vocab_size")?.as_u64()? as usize;
+    let hidden_dim = tc.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let norm_eps = tc.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
+    let rope_params = tc.get("rope_parameters");
+    let rope_theta = rope_params.and_then(|r| r.get("rope_theta")).and_then(|v| v.as_f64()).unwrap_or(10_000_000.0) as f32;
+    let partial_rotary_factor = tc.get("partial_rotary_factor")
+        .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
+        .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+    let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
+    let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+    let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+    let linear_key_head_dim = tc.get("linear_key_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+    let linear_value_head_dim = tc.get("linear_value_head_dim").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+    let conv_kernel_dim = tc.get("linear_conv_kernel_dim").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+    let layer_types: Vec<LayerType> = tc.get("layer_types")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().map(|v| match v.as_str().unwrap_or("full_attention") {
+            "linear_attention" => LayerType::LinearAttention, _ => LayerType::FullAttention,
+        }).collect())
+        .unwrap_or_else(|| vec![LayerType::FullAttention; n_layers]);
+    let num_experts = tc.get("num_experts").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let num_experts_per_tok = tc.get("num_experts_per_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let moe_intermediate_size = tc.get("moe_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let shared_expert_intermediate_size = tc.get("shared_expert_intermediate_size").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let has_shared_expert = shared_expert_intermediate_size > 0;
+    let norm_topk_prob = tc.get("norm_topk_prob").and_then(|v| v.as_bool()).unwrap_or(true);
+    Some(Qwen35Config {
+        dim, n_layers, vocab_size, norm_eps, eos_token,
+        n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
+        linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
+        hidden_dim, layer_types,
+        num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
+        norm_topk_prob,
+        paged_experts: false, vram_budget_bytes: u64::MAX,
+    })
+}
+
 // ─── Weight structs ─────────────────────────────────────────────────────
 
 /// Weights for a DeltaNet (linear attention) layer.

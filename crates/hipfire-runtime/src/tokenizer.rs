@@ -238,6 +238,12 @@ impl Tokenizer {
     ///      tokenizer verbatim, no HF-format translation).
     ///
     /// Returns None if neither is present.
+    /// Load tokenizer from a tokenizer.json file on disk.
+    pub fn from_tokenizer_json(path: &std::path::Path) -> Option<Self> {
+        let json_str = std::fs::read_to_string(path).ok()?;
+        Self::from_hf_json(&json_str)
+    }
+
     pub fn from_hfq_metadata(metadata_json: &str) -> Option<Self> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
