@@ -2,9 +2,10 @@
 //! Feature-gated behind `deltanet`.
 
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
-                              weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
+use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, WeightTensor,
+                              weight_gemv, weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               weight_gemv_residual, weight_gemv_swiglu_residual};
+use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
@@ -827,6 +828,171 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         load_weight_tensor_raw(gpu, info.quant_type, data, m, k)
     }
 }
+
+// ─── ParoQuant AWQ → HFQ4G128 repack ────────────────────────────────────────
+
+/// Repack AWQ-format INT4 weights into HFQ4G128 inline layout.
+///
+/// AWQ layout (3 separate tensors):
+///   qweight: I32 [in_dim, out_dim/8] — 8 nibbles per I32
+///   qzeros:  I32 [in_dim/group_size, out_dim/8] — 8 zero-point nibbles per I32
+///   scales:  F16 [in_dim/group_size, out_dim] — per-group scales
+///
+/// HFQ4G128 layout (per output row, one contiguous buffer):
+///   For each group of 128 input elements:
+///     [f32 scale (4B)][f32 zero (4B)][64B packed nibbles] = 72 bytes
+///
+/// Returns: Vec<u8> in HFQ4G128 format, ready for gpu.upload_raw.
+fn repack_awq_to_hfq4g128(
+    qweight: &[u8],  // I32 raw bytes
+    qzeros: &[u8],   // I32 raw bytes
+    scales: &[u8],   // F16 raw bytes
+    out_dim: usize,  // M (output features)
+    in_dim: usize,   // K (input features)
+    group_size: usize, // 128
+) -> Vec<u8> {
+    let groups_per_row = in_dim / group_size;
+    let bytes_per_row = groups_per_row * 72;
+    let mut out = vec![0u8; out_dim * bytes_per_row];
+
+    // Parse qweight as &[u32] (LE)
+    let qw: &[u32] = unsafe {
+        std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4)
+    };
+    // qweight shape: [in_dim, out_dim/8] → row-major
+    let qw_cols = out_dim / 8;
+
+    // Parse qzeros as &[u32]
+    let qz: &[u32] = unsafe {
+        std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4)
+    };
+    // qzeros shape: [in_dim/group_size, out_dim/8]
+    let qz_cols = out_dim / 8;
+
+    // Parse scales as &[u16] (F16)
+    let sc: &[u16] = unsafe {
+        std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2)
+    };
+    // scales shape: [in_dim/group_size, out_dim]
+
+    for m in 0..out_dim {
+        for g in 0..groups_per_row {
+            let row_off = m * bytes_per_row + g * 72;
+
+            // Scale: scales[g, m] — F16 → F32
+            let scale_f16 = sc[g * out_dim + m];
+            let scale_f32 = f16_to_f32(scale_f16);
+
+            // Zero: qzeros[g, m/8] — extract nibble (m%8)
+            let zero_i32 = qz[g * qz_cols + m / 8];
+            let zero_nibble = ((zero_i32 >> ((m % 8) * 4)) & 0xF) as f32;
+            // AWQ dequant: w = scale * (q - zero). HFQ4G128: w = scale * q + zero_offset.
+            // So zero_offset = -scale * zero_nibble
+            let zero_f32 = -scale_f32 * zero_nibble;
+
+            // Write scale + zero (F32 LE)
+            out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
+            out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
+
+            // Pack 128 nibbles into 64 bytes
+            // Source: qweight[in_idx, m/8] where in_idx = g*group_size..
+            // Each qweight I32 at [in_idx, m/8] has nibble at bit position (m%8)*4
+            let nibble_shift = (m % 8) * 4;
+            let qw_col = m / 8;
+            for i in 0..64 {
+                let in_idx0 = g * group_size + i * 2;
+                let in_idx1 = in_idx0 + 1;
+
+                let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
+                let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
+
+                // HFQ4G128: lo nibble = even element, hi nibble = odd element
+                out[row_off + 8 + i] = nib0 | (nib1 << 4);
+            }
+        }
+    }
+
+    out
+}
+
+/// Load a ParoQuant-quantized weight from a SafetensorsSource.
+/// Repacks AWQ INT4 → HFQ4G128 and uploads rotation metadata.
+fn load_paroquant_weight(
+    source: &dyn ModelSource,
+    gpu: &Gpu,
+    tensor_prefix: &str, // e.g. "model.language_model.layers.0.mlp.gate_proj"
+    out_dim: usize,      // M
+    in_dim: usize,       // K
+    group_size: u32,
+    krot: u8,
+) -> HipResult<WeightTensor> {
+    let qw_name = format!("{tensor_prefix}.qweight");
+    let qz_name = format!("{tensor_prefix}.qzeros");
+    let sc_name = format!("{tensor_prefix}.scales");
+    let pairs_name = format!("{tensor_prefix}.pairs");
+    let theta_name = format!("{tensor_prefix}.theta");
+    let cs_name = format!("{tensor_prefix}.channel_scales");
+
+    let (_, qw_data) = source.tensor_data(&qw_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qw_name}"));
+    let (_, qz_data) = source.tensor_data(&qz_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qz_name}"));
+    let (_, sc_data) = source.tensor_data(&sc_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {sc_name}"));
+
+    // Repack AWQ → HFQ4G128
+    let hfq_data = repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size as usize);
+    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
+
+    // Load rotation metadata
+    let (_, pairs_data) = source.tensor_data(&pairs_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {pairs_name}"));
+    let (_, theta_data) = source.tensor_data(&theta_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {theta_name}"));
+    let (_, cs_data) = source.tensor_data(&cs_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {cs_name}"));
+
+    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
+    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
+    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
+
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::ParoQ4G128,
+        m: out_dim,
+        k: in_dim,
+        row_stride: 0,
+        paro: Some(ParoRotation {
+            pairs,
+            theta,
+            channel_scales,
+            krot: krot as u32,
+            group_size,
+        }),
+    })
+}
+
+/// Load an FP16 weight tensor from safetensors (for excluded/unquantized layers).
+fn load_fp16_weight_from_source(
+    source: &dyn ModelSource,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let (_, data) = source.tensor_data(name)
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let f32_data: Vec<f32> = data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+    };
+    let buf = gpu.upload_raw(bytes, &[m, k])?;
+    Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
+}
+
+// ─── Standard HFQ loading ───────────────────────────────────────────────────
 
 /// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
 fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
