@@ -663,8 +663,9 @@ pub fn weight_gemv(
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         DType::ParoQ4G128 => {
             // ParoQuant: Givens-rotate activations in-place, then dequant GEMV.
-            // Rotation metadata must be present (populated at load time).
             let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| eprintln!("  [ParoQ4G128] Givens rotation + HFQ4G128 GEMV path active"));
             // Rotate x in-place (F32). Seq_len=1 for decode, >1 for prefill.
             gpu.givens_rotate(
                 x,
