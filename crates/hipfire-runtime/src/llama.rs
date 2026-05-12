@@ -661,6 +661,24 @@ pub fn weight_gemv(
         DType::HFQ6G256 => gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
+        DType::ParoQ4G128 => {
+            // ParoQuant: Givens-rotate activations in-place, then dequant GEMV.
+            // Rotation metadata must be present (populated at load time).
+            let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
+            // Rotate x in-place (F32). Seq_len=1 for decode, >1 for prefill.
+            gpu.givens_rotate(
+                x,
+                &paro.pairs,
+                &paro.theta,
+                &paro.channel_scales,
+                1,  // decode: single token
+                w.k,
+                paro.krot as usize,
+            )?;
+            // GEMV on the rotated activation. Weights are repacked to HFQ4G128
+            // layout at load time, so we reuse the existing kernel.
+            gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k)
+        }
         other => {
             eprintln!("WARNING: no GPU kernel for {:?}", other);
             Err(hip_bridge::HipError::new(0, &format!("unsupported dtype {:?}", other)))

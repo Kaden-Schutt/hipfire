@@ -2144,6 +2144,65 @@ impl Gpu {
         }
     }
 
+    /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
+    /// scaling to activation vector x in-place. Called before GEMV on
+    /// ParoQ4G128 weights.
+    ///
+    /// x: [seq_len, hidden_dim] F16 (modified in place)
+    /// pairs: [krot, hidden_dim] I16
+    /// theta: [krot, hidden_dim/2] F16
+    /// channel_scales: [hidden_dim] F16
+    pub fn givens_rotate(
+        &mut self,
+        x: &GpuTensor,
+        pairs: &GpuTensor,
+        theta: &GpuTensor,
+        channel_scales: &GpuTensor,
+        seq_len: usize,
+        hidden_dim: usize,
+        krot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("givens_rotate_f32", kernels::GIVENS_ROTATE_SRC, "givens_rotate_f32")?;
+        let func = &self.functions["givens_rotate_f32"];
+
+        let cta_m: u32 = 4;
+        let group_size: u32 = 128;
+        let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
+        let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut pairs_ptr = pairs.buf.as_ptr();
+        let mut theta_ptr = theta.buf.as_ptr();
+        let mut cs_ptr = channel_scales.buf.as_ptr();
+        let mut seq_val = seq_len as i32;
+        let mut dim_val = hidden_dim as i32;
+        let mut krot_val = krot as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut pairs_ptr as *mut _ as *mut c_void,
+            &mut theta_ptr as *mut _ as *mut c_void,
+            &mut cs_ptr as *mut _ as *mut c_void,
+            &mut seq_val as *mut _ as *mut c_void,
+            &mut dim_val as *mut _ as *mut c_void,
+            &mut krot_val as *mut _ as *mut c_void,
+        ];
+
+        let smem = (cta_m * group_size * 4) as u32; // CTA_M * GROUP_SIZE * sizeof(float)
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, groups_per_row, 1],
+                [group_size / 2, 1, 1],  // 64 threads
+                smem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
     pub fn gemm_hfq4g128(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
