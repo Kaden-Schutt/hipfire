@@ -677,19 +677,12 @@ pub fn weight_gemv(
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
-            // Copy x → scratch
+            // Copy x → scratch, rotate scratch, GEMV from scratch
             gpu.copy_d2d(x, &scratch_alias)?;
-            // Rotate scratch in-place
             gpu.givens_rotate(
-                &scratch_alias,
-                &paro.pairs,
-                &paro.theta,
-                &paro.channel_scales,
-                1,  // decode: single token
-                w.k,
-                paro.krot as usize,
+                &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
+                1, w.k, paro.krot as usize,
             )?;
-            // GEMV on the rotated scratch
             gpu.gemv_hfq4g128(&w.buf, &scratch_alias, y, w.m, w.k)
         }
         other => {

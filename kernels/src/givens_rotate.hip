@@ -63,11 +63,10 @@ extern "C" __global__ void givens_rotate_f32(
     // Apply krot sequential Givens rotation rounds
     for (int rot = 0; rot < krot; rot++) {
         // Each thread handles one pair per rotation round.
-        // pairs layout: [krot, hidden_dim] where each I16 encodes (i, j)
-        //   i = lo byte, j = hi byte (within-group indices 0..127)
-        const short pair_val = pairs[rot * hidden_dim + ch_base + tid];
-        const int i = pair_val & 0xFF;
-        const int j = (pair_val >> 8) & 0xFF;
+        // pairs layout: [krot, hidden_dim] — pairs[rot, ch] = partner index
+        // Thread tid is the primary channel; pairs[rot, ch_base+tid] is the partner.
+        const int i = tid;  // primary channel within group (0..63)
+        const int j = (int)pairs[rot * hidden_dim + ch_base + tid];  // partner (0..127)
 
         // theta layout: [krot, hidden_dim/2]
         const float angle = __half2float(theta[rot * (hidden_dim / 2) + group_idx * HALF_GROUP + tid]);
