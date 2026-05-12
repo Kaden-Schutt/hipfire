@@ -662,13 +662,26 @@ pub fn weight_gemv(
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
         DType::ParoQ4G128 => {
-            // ParoQuant: Givens-rotate activations in-place, then dequant GEMV.
+            // ParoQuant: copy x → scratch, Givens-rotate scratch, GEMV from scratch.
+            // Must NOT rotate x in-place: the same x_norm is shared across multiple
+            // weight_gemv calls in a layer (wqkv, wz, w_alpha, w_beta, etc.),
+            // each with different rotation metadata.
             let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| eprintln!("  [ParoQ4G128] Givens rotation + HFQ4G128 GEMV path active"));
-            // Rotate x in-place (F32). Seq_len=1 for decode, >1 for prefill.
+            // Lazily allocate the scratch buffer on first use
+            gpu.ensure_paro_scratch(w.k)?;
+            // Alias the scratch buffer to avoid borrow conflicts with gpu methods
+            let scratch_alias = GpuTensor {
+                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k],
+                dtype: DType::F32,
+            };
+            // Copy x → scratch
+            gpu.copy_d2d(x, &scratch_alias)?;
+            // Rotate scratch in-place
             gpu.givens_rotate(
-                x,
+                &scratch_alias,
                 &paro.pairs,
                 &paro.theta,
                 &paro.channel_scales,
@@ -676,9 +689,8 @@ pub fn weight_gemv(
                 w.k,
                 paro.krot as usize,
             )?;
-            // GEMV on the rotated activation. Weights are repacked to HFQ4G128
-            // layout at load time, so we reuse the existing kernel.
-            gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k)
+            // GEMV on the rotated scratch
+            gpu.gemv_hfq4g128(&w.buf, &scratch_alias, y, w.m, w.k)
         }
         other => {
             eprintln!("WARNING: no GPU kernel for {:?}", other);

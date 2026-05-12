@@ -423,6 +423,7 @@ pub struct Gpu {
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
+    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
     /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
@@ -713,6 +714,7 @@ impl Gpu {
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,
+            paro_x_scratch: None,
             mq_x_q8: None,
             mq_x_scales: None,
             fp16_x_scratch: None,
@@ -2201,6 +2203,22 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
+    pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
+        if let Some(ref s) = self.paro_x_scratch {
+            if s.buf.size() >= dim * 4 { return Ok(()); }
+        }
+        let buf = self.hip.malloc(dim * 4)?; // F32
+        self.paro_x_scratch = Some(GpuTensor { buf, shape: vec![dim], dtype: DType::F32 });
+        Ok(())
+    }
+
+    /// Device-to-device copy (same-size tensors).
+    pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
+        let size = src.buf.size().min(dst.buf.size());
+        self.hip.memcpy_dtod(&dst.buf, &src.buf, size)
     }
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
