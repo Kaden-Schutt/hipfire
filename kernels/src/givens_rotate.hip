@@ -82,8 +82,7 @@ extern "C" __global__ void givens_rotate_f32(
             const float xi = row_smem[i];
             const float xj = row_smem[j];
 
-            //  x[i] =  xi * cos(theta) + xj * sin(theta)
-            //  x[j] = -xi * sin(theta) + xj * cos(theta)
+            //  Forward Givens: x[i] = xi*c + xj*s, x[j] = xj*c - xi*s
             row_smem[i] = xi * c + xj * s;
             row_smem[j] = xj * c - xi * s;
         }
