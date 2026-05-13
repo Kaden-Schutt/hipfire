@@ -762,13 +762,14 @@ fn repack_awq_to_hfq4g128(
             let scale_f32 = f16_to_f32(scale_f16);
 
             let zero_i32 = qz[g * qz_cols + m / 8];
-            let zero_nibble = ((zero_i32 >> ((m % 8) * 4)) & 0xF) as f32;
+            let zero_nibble = ((zero_i32 >> (AWQ_DEQUANT[m % 8] * 4)) & 0xF) as f32;
             let zero_f32 = -scale_f32 * zero_nibble;
 
             out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
             out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
 
-            let nibble_shift = (m % 8) * 4;
+            const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+            let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
             let qw_col = m / 8;
             for i in 0..64 {
                 let in_idx0 = g * group_size + i * 2;

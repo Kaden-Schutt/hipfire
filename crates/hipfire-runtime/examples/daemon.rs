@@ -1620,8 +1620,7 @@ fn load_model_safetensors(
     };
 
     // HF safetensors use half-split RoPE convention (rotate_half)
-    gpu.rope_halfsplit = true;
-    eprintln!("  RoPE convention: half-split (HF rotate_half)");
+    // — upstream now defaults to halfsplit, no flag needed
     let chat_template = source.chat_template();
 
     if arch_id == 0 || arch_id == 1 {

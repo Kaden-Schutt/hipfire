@@ -925,29 +925,25 @@ fn repack_awq_to_hfq4g128(
     };
     // scales shape: [in_dim/group_size, out_dim]
 
+    // AWQ nibble reorder: ParoQuant packs with _AWQ_REORDER=(0,2,4,6,1,3,5,7).
+    // To extract element m, use the inverse permutation:
+    const AWQ_DEQUANT: [usize; 8] = [0, 4, 1, 5, 2, 6, 3, 7];
+
     for m in 0..out_dim {
         for g in 0..groups_per_row {
             let row_off = m * bytes_per_row + g * 72;
 
-            // Scale: scales[g, m] — F16 → F32
             let scale_f16 = sc[g * out_dim + m];
             let scale_f32 = f16_to_f32(scale_f16);
 
-            // Zero: qzeros[g, m/8] — extract nibble (m%8)
             let zero_i32 = qz[g * qz_cols + m / 8];
-            let zero_nibble = ((zero_i32 >> ((m % 8) * 4)) & 0xF) as f32;
-            // AWQ dequant: w = scale * (q - zero). HFQ4G128: w = scale * q + zero_offset.
-            // So zero_offset = -scale * zero_nibble
+            let zero_nibble = ((zero_i32 >> (AWQ_DEQUANT[m % 8] * 4)) & 0xF) as f32;
             let zero_f32 = -scale_f32 * zero_nibble;
 
-            // Write scale + zero (F32 LE)
             out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
             out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
 
-            // Pack 128 nibbles into 64 bytes
-            // Source: qweight[in_idx, m/8] where in_idx = g*group_size..
-            // Each qweight I32 at [in_idx, m/8] has nibble at bit position (m%8)*4
-            let nibble_shift = (m % 8) * 4;
+            let nibble_shift = AWQ_DEQUANT[m % 8] * 4;
             let qw_col = m / 8;
             for i in 0..64 {
                 let in_idx0 = g * group_size + i * 2;
