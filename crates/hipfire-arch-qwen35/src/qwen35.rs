@@ -793,14 +793,15 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
         }
         1 => {
-            let f32_data: Vec<f32> = data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect();
-            let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
-            };
-            let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            // qt=1 is F16. Keep raw F16 on GPU (previously decompressed host-
+            // side to F32). Native F16 storage halves the lm_head bandwidth
+            // and lets the dispatch path hit the WMMA-backed
+            // `gemm_f16_batched_lmhead` kernel on gfx11. Required to make
+            // F16 lm_head usable at scale — the F32-fallback path runs the
+            // 1023-position prefill lm_head fan-out at ~280 s/chunk vs
+            // ~0.79 s/chunk via WMMA.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
         }
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }

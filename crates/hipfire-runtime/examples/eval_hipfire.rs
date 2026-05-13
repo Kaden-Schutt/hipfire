@@ -408,18 +408,48 @@ fn main() {
                 None, Some(h_buf), None, None,
             ).expect("forward_prefill_batch scored");
 
-            // 3. lm_head fan-out + KLD per scored position. weight_gemv
-            //    writes into scratch.logits each iteration; score_position
-            //    then reads + computes KLD. Same per-position math as the
-            //    per-token branch.
+            // 3. lm_head fan-out + KLD per scored position.
+            //
+            // F16 fast path: when the lm_head weight is stored as F16 on
+            // GPU (e.g. q8f16 models with a separate F16 lm_head), one
+            // batched `gemm_f16_batched_lmhead` reads the lm_head matrix
+            // ONCE for all `scored_per_chunk` positions instead of
+            // `scored_per_chunk` independent GEMV calls. On gfx11 this
+            // routes through the WMMA `gemm_mw16_residual_wmma` kernel;
+            // on non-gfx11 it falls back to a scalar F32 GEMM. Drops eval
+            // wall-clock for F16 lm_head from ~280 s/chunk to 0.8 s/chunk
+            // measured on gfx1151 (Qwen3.5-0.8B per-token kv-q8).
+            //
+            // Other lm_head dtypes (Q8, MQ4, etc.) keep the per-position
+            // weight_gemv path until a batched variant is wired for each.
+            let f16_lmhead = weights.output.gpu_dtype == DType::F16;
+            let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
+                let alloc = gpu.alloc_tensor(
+                    &[scored_per_chunk, config.vocab_size],
+                    DType::F32,
+                ).expect("alloc batched lm_head logits");
+                gpu.gemm_f16_batched_lmhead(
+                    &weights.output.buf, h_buf, &alloc,
+                    config.vocab_size, config.dim, scored_per_chunk,
+                ).expect("gemm_f16_batched_lmhead");
+                Some(alloc)
+            } else {
+                None
+            };
+
             for j in 0..scored_per_chunk {
-                let row_view = h_buf.sub_offset(j * config.dim, config.dim);
-                weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
-                    .expect("weight_gemv lm_head");
+                let logits_view = if let Some(ref all_logits) = batched_logits {
+                    all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
+                } else {
+                    let row_view = h_buf.sub_offset(j * config.dim, config.dim);
+                    weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
+                        .expect("weight_gemv lm_head");
+                    scratch.logits.sub_offset(0, config.vocab_size)
+                };
                 let pos = scoring_start + j;
                 let actual_next = chunk_tokens[pos + 1] as usize;
                 let (kld, nll) = score_position(
-                    &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
+                    &mut gpu, &logits_view, &mut ref_in, &mut block_buf, actual_next,
                 );
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
@@ -436,6 +466,10 @@ fn main() {
                         c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
                     );
                 }
+            }
+
+            if let Some(alloc) = batched_logits {
+                let _ = gpu.free_tensor(alloc);
             }
         }
 
