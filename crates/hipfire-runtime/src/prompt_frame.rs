@@ -73,7 +73,7 @@ pub enum AssistantPrefix {
 ///
 /// Lowercase serialization matches what the Qwen3.5/3.6 + Gemma 4
 /// templates compare against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     System,
@@ -357,9 +357,10 @@ pub struct JinjaChatFrame<'a> {
 /// `message['tool_call_id']` under strict-undefined mode; all four fields
 /// are always present (defaults: empty content, empty tool_calls vec, no
 /// tool_call_id) so probes never raise.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Message {
     pub role: Role,
+    #[serde(default)]
     pub content: String,
     #[serde(default)]
     pub tool_calls: Vec<ToolCall>,
@@ -368,7 +369,7 @@ pub struct Message {
     /// this field; OpenAI-spec clients and some other templates require
     /// it. Skipped from the serialized JSON when None so templates that
     /// `is defined` against it don't see a misleading null.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
 }
 
@@ -376,9 +377,10 @@ pub struct Message {
 /// `arguments` is a free-form JSON value (typically an object). Templates
 /// that render in XML format (Qwen3.5/3.6's `<function=NAME><parameter=ARG>`
 /// shape) walk this with `arguments | items` under pycompat.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
+    #[serde(default)]
     pub arguments: serde_json::Value,
 }
 
@@ -838,6 +840,173 @@ mod tests {
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
         assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+    }
+
+    #[test]
+    fn message_deserializes_minimal_shape() {
+        // The daemon's stdin schema must accept the smallest valid
+        // message: role + content, no tool_calls, no tool_call_id.
+        let json = r#"{"role":"user","content":"hi"}"#;
+        let m: Message = serde_json::from_str(json).expect("minimal message parses");
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.content, "hi");
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_deserializes_assistant_tool_call() {
+        // OpenAI-style assistant turn that emitted a tool call. The
+        // template path consumes `tool_calls[]` to render the model's
+        // own prior call (XML on Qwen3.5/3.6, JSON on others).
+        let json = r#"{
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"name":"get_weather","arguments":{"city":"SF","unit":"f"}}]
+        }"#;
+        let m: Message = serde_json::from_str(json).expect("assistant w/ tool_call parses");
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            m.tool_calls[0].arguments,
+            serde_json::json!({"city":"SF","unit":"f"}),
+        );
+    }
+
+    #[test]
+    fn message_deserializes_tool_response() {
+        // Tool-role response carries a `tool_call_id` referencing the
+        // assistant call it answers. Field must round-trip through
+        // serde so templates that read it (OpenAI-spec ones) see it.
+        let json = r#"{"role":"tool","content":"72F","tool_call_id":"call_42"}"#;
+        let m: Message = serde_json::from_str(json).expect("tool response parses");
+        assert_eq!(m.role, Role::Tool);
+        assert_eq!(m.content, "72F");
+        assert_eq!(m.tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn render_messages_with_tools_fires_tools_block() {
+        // Smoke test: a minimal template gated on `{% if tools %}`
+        // must render the tools branch when the caller supplies a
+        // non-empty tools array — and skip it when tools is None.
+        // This is the architectural invariant Phase 1 unblocks:
+        // structured tools from daemon stdin reach the Jinja template's
+        // `{% if tools %}` predicate.
+        let t = make_tokenizer();
+        let template = "{% if tools %}TOOLS:{% for f in tools %}{{ f.function.name }};{% endfor %}{% endif %}MSGS:{% for m in messages %}{{ m.role }}={{ m.content }};{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        })];
+
+        let with_tools = frame
+            .render_messages(&messages, Some(&tools), None)
+            .expect("render_messages w/ tools succeeds");
+        assert!(
+            with_tools.contains("TOOLS:get_weather;"),
+            "tools-block must fire when tools is Some: got {with_tools:?}",
+        );
+        assert!(
+            with_tools.contains("MSGS:user=hi;"),
+            "messages must still render: got {with_tools:?}",
+        );
+
+        // None branch: empty tools array means `{% if tools %}` evaluates false.
+        let without_tools = frame
+            .render_messages(&messages, None, None)
+            .expect("render_messages w/o tools succeeds");
+        assert!(
+            !without_tools.contains("TOOLS:"),
+            "tools-block must NOT fire when tools is None: got {without_tools:?}",
+        );
+        assert!(
+            without_tools.contains("MSGS:user=hi;"),
+            "messages must still render w/o tools: got {without_tools:?}",
+        );
+    }
+
+    #[test]
+    fn render_messages_with_history_and_tools_includes_assistant_call() {
+        // Full agentic round-trip shape: system + user + assistant w/
+        // tool_calls + tool response. The template walks tool_calls and
+        // tool_call_id so the trip-record must reach it.
+        let t = make_tokenizer();
+        // `tool_call_id` is serialize-skipped when None, so under
+        // strict-undefined the template MUST guard with `is defined`
+        // (matching how the upstream Qwen3.5/3.6 + Hermes templates
+        // probe the field). The Message doc comment on this struct
+        // describes the same convention.
+        let template = "{% for m in messages %}{{ m.role }}:{% if m.tool_calls %}call={% for tc in m.tool_calls %}{{ tc.name }}({{ tc.arguments.city }});{% endfor %}{% else %}{{ m.content }}{% endif %}{% if m.tool_call_id is defined %}[id={{ m.tool_call_id }}]{% endif %};{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "be brief".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "weather?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city":"SF"}),
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("multi-turn render succeeds");
+        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
+        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("assistant:call=get_weather(SF);"),
+            "assistant tool_call rendered: {out:?}",
+        );
+        assert!(
+            out.contains("tool:72F[id=call_1];"),
+            "tool response w/ tool_call_id rendered: {out:?}",
+        );
     }
 
     #[test]

@@ -808,6 +808,51 @@ fn main() {
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
+
+                // Structured-tools + structured-messages support (Phase 1 of
+                // Jinja-everywhere migration). When present, both fields are
+                // routed through `JinjaChatFrame::render_messages` so the
+                // model sees the upstream template's `{% if tools %}` and
+                // multi-turn branches (XML/JSON tool-call format per arch,
+                // tool-response role mapping, etc.).
+                //
+                // Backward compat: when neither is present, legacy
+                // `prompt`+`system` continues to drive a synthesized
+                // [system?, user] slice — byte-identical to today's
+                // `JinjaChatFrame::render()` single-turn path.
+                //
+                // Parse errors emit a structured error event and skip the
+                // request (rather than silently dropping the fields).
+                let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
+                    Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
+                                id, e.to_string().replace('"', "'"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> = match msg.get("messages") {
+                    Some(v) => match serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone()) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
+                                id, e.to_string().replace('"', "'"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
@@ -928,6 +973,8 @@ fn main() {
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
+                        tools_json.as_deref(),
+                        messages_history.as_deref(),
                     );
                 }
             }
@@ -2047,23 +2094,89 @@ fn generate_dflash(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
 
-    // Tokenize with ChatML wrapping (identical to the AR path). System prompt
-    // is always prepended because this fast path is single-turn.
+    // Prompt build: same two-path branch as the AR-path generate() — when
+    // `HIPFIRE_JINJA_CHAT=1` AND the model carries a chat_template, render
+    // via `JinjaChatFrame` so structured `tools` / `messages` can reach
+    // the upstream template's `{% if tools %}` / multi-turn branches.
+    // Otherwise fall back to the hand-rolled `ChatFrame::Plain` scaffold
+    // (byte-identical to the prior DFlash-path build).
+    //
+    // DFlash is single-turn by construction — `seq_pos` is reset to 0
+    // below before seed_target_hidden_from_prompt runs — so we never
+    // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: system_prompt,
-        user: prompt,
-        assistant_prefix,
-        raw: false,
-    }
-    .build();
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let prompt_tokens: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in dflash path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build()
+    };
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -2893,11 +3006,16 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
+        // tools / messages_history are silently dropped on the multi-GPU
+        // PP path for Phase 1; Jinja-everywhere is wired through the
+        // single-GPU AR generate path first. PP-with-tools follows once
+        // the AR path is stable.
+        let _ = (tools, messages_history);
         generate_multi(
             m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
@@ -2942,8 +3060,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha);
-        // Silence unused-variable warnings for the params we didn't need.
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha, tools, messages_history);
+        // Silence unused-variable warnings for the params DFlash doesn't
+        // consume (top_p / repeat penalties are AR-only sampling knobs;
+        // pflash_state is bypassed on the DFlash decode path).
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
@@ -3156,7 +3276,45 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
-        match frame.render() {
+        // Phase 1 of Jinja-everywhere migration: when the caller supplies
+        // either a `tools` array or a `messages` history (or both), route
+        // through `render_messages` so the upstream template's
+        // `{% if tools %}` / multi-turn branches fire. With neither
+        // supplied, fall through to the single-turn `render()` convenience,
+        // which is byte-identical to the synthesized [system?, user]
+        // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            // Synthesize [system?, user] when no explicit history was
+            // provided. Tools-with-legacy-prompt is the natural OpenAI
+            // function-calling shape (one turn + tool definitions).
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
