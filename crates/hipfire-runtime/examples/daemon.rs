@@ -1619,8 +1619,63 @@ fn load_model_safetensors(
         return Err("no tokenizer.json found in model directory".into());
     };
 
+    // HF safetensors use half-split RoPE convention (rotate_half)
+    gpu.rope_halfsplit = true;
+    eprintln!("  RoPE convention: half-split (HF rotate_half)");
+    let chat_template = source.chat_template();
+
+    if arch_id == 0 || arch_id == 1 {
+        // LLaMA / Qwen3 — standard attention, no DeltaNet
+        let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
+            .ok_or("failed to parse LLaMA/Qwen3 config from config.json")?;
+
+        eprintln!("  LLaMA/Qwen3: dim={}, layers={}, heads={}, kv_heads={}, head_dim={}, qk_norm={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.head_dim, config.has_qk_norm);
+
+        let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, gpu)
+            .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
+
+        let kv = match kv_mode {
+            "q8" => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+            "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+            "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+            _ => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        }.map_err(|e| format!("KvCache: {e}"))?;
+
+        let scratch = llama::ForwardScratch::new(gpu, &config)
+            .map_err(|e| format!("ForwardScratch::new: {e:?}"))?;
+
+        return Ok(LoadedModel {
+            arch_id,
+            pp: 1,
+            pp_gpus: None,
+            pp_scratch_set: None,
+            pp_dn_la_to_device: None,
+            q35_config: None,
+            q35_weights: None,
+            q35_scratch: None,
+            kv_cache: None,
+            dn_state: None,
+            llama_config: Some(config),
+            llama_weights: Some(weights),
+            llama_scratch: Some(scratch),
+            llama_kv: Some(kv),
+            vision_config: None,
+            vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0,
+            max_seq,
+            physical_cap: max_seq,
+            eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
     if arch_id != 5 && arch_id != 6 {
-        return Err(format!("safetensors loading only supports Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
+        return Err(format!("safetensors loading only supports LLaMA/Qwen3 (arch_id 0/1) and Qwen3.5/3.6 (arch_id 5/6), got {arch_id}"));
     }
 
     // Parse config (reuse Qwen35's config parser via metadata_json)
@@ -1644,7 +1699,6 @@ fn load_model_safetensors(
         .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
     let scratch = qwen35::Qwen35Scratch::new(gpu, &config, 256)
         .map_err(|e| format!("Qwen35Scratch::new: {e:?}"))?;
-    let chat_template = source.chat_template();
 
     Ok(LoadedModel {
         arch_id,

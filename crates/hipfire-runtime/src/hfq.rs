@@ -669,3 +669,327 @@ pub fn load_weights_hfq(
 
     Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
 }
+
+// ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
+
+/// Parse a LlamaConfig from a SafetensorsSource's metadata JSON.
+/// The metadata JSON has structure: `{ "config": { ...config.json... } }`.
+pub fn config_from_safetensors_llama(source: &dyn crate::model_source::ModelSource) -> Option<LlamaConfig> {
+    let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
+    let config = meta.get("config")?;
+
+    let arch_str = config.get("model_type")?.as_str()?;
+    let arch = match arch_str {
+        "llama" | "mistral" => ModelArch::Llama,
+        "qwen3" | "qwen2" => ModelArch::Qwen3,
+        _ => ModelArch::Llama,
+    };
+
+    let dim = config.get("hidden_size")?.as_u64()? as usize;
+    let n_layers = config.get("num_hidden_layers")?.as_u64()? as usize;
+    let n_heads = config.get("num_attention_heads")?.as_u64()? as usize;
+    let n_kv_heads = config.get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(n_heads as u64) as usize;
+    let hidden_dim = config.get("intermediate_size")?.as_u64()? as usize;
+    let vocab_size = config.get("vocab_size")?.as_u64()? as usize;
+    let norm_eps = config.get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-5) as f32;
+    let max_seq_len = config.get("max_position_embeddings")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2048) as usize;
+    let rope_freq_base = config.get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(10000.0) as f32;
+
+    let head_dim = config.get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(dim / n_heads);
+
+    let bos_token = config.get("bos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as u32;
+    let eos_token = config.get("eos_token_id")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(2) as u32;
+
+    // Detect QK norm from tensor names
+    let has_qk_norm = source.tensor_info("model.layers.0.self_attn.q_norm.weight").is_some();
+
+    Some(LlamaConfig {
+        arch, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size,
+        head_dim, norm_eps, max_seq_len, rope_freq_base,
+        bos_token, eos_token,
+        has_qk_norm,
+    })
+}
+
+/// Repack AWQ-format INT4 weights into HFQ4G128 layout (ParoQuant uses AWQ packing).
+/// Duplicated from hipfire-arch-qwen35 to avoid cross-crate dependency cycle.
+fn repack_awq_to_hfq4g128(
+    qweight: &[u8],    // I32 raw bytes
+    qzeros: &[u8],     // I32 raw bytes
+    scales: &[u8],     // F16 raw bytes
+    out_dim: usize,    // M (output features)
+    in_dim: usize,     // K (input features)
+    group_size: usize, // 128
+) -> Vec<u8> {
+    let groups_per_row = in_dim / group_size;
+    let bytes_per_row = groups_per_row * 72;
+    let mut out = vec![0u8; out_dim * bytes_per_row];
+
+    let qw: &[u32] = unsafe {
+        std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4)
+    };
+    let qw_cols = out_dim / 8;
+
+    let qz: &[u32] = unsafe {
+        std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4)
+    };
+    let qz_cols = out_dim / 8;
+
+    let sc: &[u16] = unsafe {
+        std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2)
+    };
+
+    for m in 0..out_dim {
+        for g in 0..groups_per_row {
+            let row_off = m * bytes_per_row + g * 72;
+
+            let scale_f16 = sc[g * out_dim + m];
+            let scale_f32 = f16_to_f32(scale_f16);
+
+            let zero_i32 = qz[g * qz_cols + m / 8];
+            let zero_nibble = ((zero_i32 >> ((m % 8) * 4)) & 0xF) as f32;
+            let zero_f32 = -scale_f32 * zero_nibble;
+
+            out[row_off..row_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
+            out[row_off + 4..row_off + 8].copy_from_slice(&zero_f32.to_le_bytes());
+
+            let nibble_shift = (m % 8) * 4;
+            let qw_col = m / 8;
+            for i in 0..64 {
+                let in_idx0 = g * group_size + i * 2;
+                let in_idx1 = in_idx0 + 1;
+
+                let nib0 = ((qw[in_idx0 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
+                let nib1 = ((qw[in_idx1 * qw_cols + qw_col] >> nibble_shift) & 0xF) as u8;
+
+                out[row_off + 8 + i] = nib0 | (nib1 << 4);
+            }
+        }
+    }
+
+    out
+}
+
+/// Load a ParoQuant-quantized weight tensor from a safetensors source.
+/// Repacks AWQ INT4 data to HFQ4G128 and uploads ParoQuant rotation metadata.
+fn load_paroquant_weight_from_source(
+    source: &dyn crate::model_source::ModelSource,
+    gpu: &Gpu,
+    tensor_prefix: &str, // e.g. "model.layers.0.mlp.gate_proj"
+    out_dim: usize,      // M
+    in_dim: usize,       // K
+    group_size: u32,
+    krot: u8,
+) -> HipResult<WeightTensor> {
+    use crate::llama::ParoRotation;
+
+    let qw_name = format!("{tensor_prefix}.qweight");
+    let qz_name = format!("{tensor_prefix}.qzeros");
+    let sc_name = format!("{tensor_prefix}.scales");
+    let pairs_name = format!("{tensor_prefix}.pairs");
+    let theta_name = format!("{tensor_prefix}.theta");
+    let cs_name = format!("{tensor_prefix}.channel_scales");
+
+    let (_, qw_data) = source.tensor_data(&qw_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qw_name}"));
+    let (_, qz_data) = source.tensor_data(&qz_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qz_name}"));
+    let (_, sc_data) = source.tensor_data(&sc_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {sc_name}"));
+
+    let hfq_data = repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size as usize);
+    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
+
+    let (_, pairs_data) = source.tensor_data(&pairs_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {pairs_name}"));
+    let (_, theta_data) = source.tensor_data(&theta_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {theta_name}"));
+    let (_, cs_data) = source.tensor_data(&cs_name)
+        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {cs_name}"));
+
+    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
+    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
+    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
+
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: DType::ParoQ4G128,
+        m: out_dim,
+        k: in_dim,
+        row_stride: 0,
+        paro: Some(ParoRotation {
+            pairs,
+            theta,
+            channel_scales,
+            krot: krot as u32,
+            group_size,
+        }),
+    })
+}
+
+/// Load an FP16 weight tensor from safetensors as F32 on GPU.
+fn load_fp16_weight_tensor_from_source(
+    source: &dyn crate::model_source::ModelSource,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let (_, data) = source.tensor_data(name)
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let f32_data: Vec<f32> = data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+    };
+    let buf = gpu.upload_raw(bytes, &[m, k])?;
+    Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
+}
+
+/// Load a ParoQuant weight (quantized or FP16 fallback) using `model.` tensor prefix.
+fn paro_load_llama_wt(
+    source: &dyn crate::model_source::ModelSource,
+    gpu: &Gpu,
+    prefix: &str, // e.g. "layers.0.self_attn.q_proj"
+    m: usize,
+    k: usize,
+    gs: u32,
+    kr: u8,
+) -> HipResult<WeightTensor> {
+    let fp = format!("model.{prefix}");
+    if source.tensor_info(&format!("{fp}.qweight")).is_some() {
+        load_paroquant_weight_from_source(source, gpu, &fp, m, k, gs, kr)
+    } else {
+        load_fp16_weight_tensor_from_source(source, gpu, &format!("{fp}.weight"), m, k)
+    }
+}
+
+/// Load an F16 norm weight as F32 on GPU (raw, no +1.0 bias — HF convention).
+fn paro_load_llama_norm_raw(
+    source: &dyn crate::model_source::ModelSource,
+    gpu: &mut Gpu,
+    name: &str,   // e.g. "layers.0.input_layernorm.weight"
+    shape: &[usize],
+) -> HipResult<GpuTensor> {
+    let full = format!("model.{name}");
+    let (info, data) = source.tensor_data(&full)
+        .unwrap_or_else(|| panic!("not found: {full}"));
+    let v: Vec<f32> = if info.dtype == "F16" {
+        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
+    } else {
+        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    };
+    gpu.upload_f32(&v, shape)
+}
+
+/// Load LLaMA/Qwen3 weights from a ParoQuant safetensors model.
+///
+/// Tensor naming convention: `model.layers.{i}.self_attn.q_proj.{qweight,...}`
+/// (no `model.language_model.` prefix — that's Qwen3.5-specific).
+pub fn load_weights_paroquant_llama(
+    source: &dyn crate::model_source::ModelSource,
+    config: &LlamaConfig,
+    gpu: &mut Gpu,
+) -> HipResult<LlamaWeights> {
+    let qc = source.quant_config().expect("ParoQuant model must have quantization_config");
+    let gs = qc.group_size;
+    let kr = qc.krot;
+
+    // Embedding
+    eprintln!("  loading token_embd (ParoQuant LLaMA/Qwen3)...");
+    let embd_name = "model.embed_tokens.weight";
+    let (_, embd_data) = source.tensor_data(embd_name).expect("embed_tokens not found");
+    let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+    let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
+    let embd_fmt = EmbeddingFormat::F32;
+
+    // Output norm
+    eprintln!("  loading output_norm...");
+    let output_norm = paro_load_llama_norm_raw(source, gpu, "norm.weight", &[config.dim])?;
+
+    // Output / lm_head (tied or separate)
+    let output = if source.tensor_info("lm_head.weight").is_some() {
+        eprintln!("  loading output (separate lm_head)...");
+        let lm_prefix = "lm_head";
+        if source.tensor_info(&format!("{lm_prefix}.qweight")).is_some() {
+            load_paroquant_weight_from_source(source, gpu, lm_prefix, config.vocab_size, config.dim, gs, kr)?
+        } else {
+            load_fp16_weight_tensor_from_source(source, gpu, &format!("{lm_prefix}.weight"), config.vocab_size, config.dim)?
+        }
+    } else {
+        eprintln!("  loading output (tied embeddings)...");
+        let (_, td) = source.tensor_data(embd_name).expect("embed_tokens for lm_head");
+        let f: Vec<f32> = td.chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4)
+        };
+        let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None }
+    };
+
+    // Layers
+    let mut layers = Vec::with_capacity(config.n_layers);
+    for i in 0..config.n_layers {
+        eprintln!("  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...", config.n_layers);
+        let p = format!("layers.{i}");
+        let q_out_dim = config.n_heads * config.head_dim;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+
+        let q_norm = if config.has_qk_norm {
+            Some(paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?)
+        } else {
+            None
+        };
+        let k_norm = if config.has_qk_norm {
+            Some(paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?)
+        } else {
+            None
+        };
+
+        let layer = LayerWeights {
+            attn_norm: paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+            wq: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
+            wk: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
+            wv: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
+            wo: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.o_proj"), config.dim, q_out_dim, gs, kr)?,
+            q_norm,
+            k_norm,
+            ffn_norm: paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+            w_gate: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
+            w_up: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
+            w_down: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
+        };
+        layers.push(layer);
+    }
+
+    Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
+}
