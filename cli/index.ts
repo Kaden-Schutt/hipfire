@@ -1479,6 +1479,67 @@ async function serve(port: number) {
           return "";
         };
 
+        // Strip <think>...</think> blocks from historical assistant text. Same
+        // rationale as the inline-ChatML builder below (line 1513): the Qwen3.5
+        // chat template doesn't carry thinking forward, and including it in
+        // history-shaped structured messages pollutes the KV cache.
+        const stripThinkingInline = (s: string): string =>
+          s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+           .replace(/<think>[\s\S]*$/, "");
+
+        // Map OpenAI chat-completion messages to the daemon's structured
+        // `messages` JSONL field (Phase 2 of Jinja-everywhere). Roles:
+        //   developer → system (OpenAI o1/o3 alias — chat templates
+        //                       only know system/user/assistant/tool).
+        //   tool_calls.function.arguments is JSON-string in OpenAI;
+        //   the daemon expects a raw JSON value, so we parse here and
+        //   pass through any non-string `arguments` unchanged.
+        //
+        // The daemon arbitrates whether to consume `messages` or fall
+        // back to the legacy inline-ChatML `prompt` based on
+        // HIPFIRE_JINJA_CHAT — clients don't need to know which path
+        // fires. We always send both shapes so backward-compat with
+        // Jinja-off daemons holds.
+        const mapMessagesToStructured = (msgs: any[]): any[] => {
+          const out: any[] = [];
+          for (const m of msgs) {
+            if (!m || typeof m !== "object") continue;
+            let role: string = m.role;
+            if (role === "developer") role = "system";
+            if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
+              continue;
+            }
+            const entry: any = { role, content: "" };
+            if (role === "assistant") {
+              entry.content = stripThinkingInline(extractText(m.content));
+              if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                const tcs: any[] = [];
+                for (const tc of m.tool_calls) {
+                  const fn = tc?.function ?? tc ?? {};
+                  let args: any = {};
+                  if (typeof fn.arguments === "string") {
+                    try { args = JSON.parse(fn.arguments); }
+                    catch { args = { _raw: fn.arguments }; }
+                  } else if (fn.arguments !== undefined) {
+                    args = fn.arguments;
+                  }
+                  tcs.push({ name: fn.name ?? "unknown", arguments: args });
+                }
+                if (tcs.length > 0) entry.tool_calls = tcs;
+              }
+            } else if (role === "tool") {
+              entry.content = extractText(m.content);
+              if (typeof m.tool_call_id === "string" && m.tool_call_id.length > 0) {
+                entry.tool_call_id = m.tool_call_id;
+              }
+            } else {
+              entry.content = extractText(m.content);
+            }
+            out.push(entry);
+          }
+          return out;
+        };
+
         // Extract system message. OpenAI's o1/o3-style reasoning surface
         // (and pi-coding-agent) sends `role:"developer"` instead of
         // `role:"system"` for the same purpose — strict instructions that
@@ -1692,6 +1753,24 @@ async function serve(port: number) {
         }
         if (systemPrompt) genParams.system = systemPrompt;
 
+        // Phase 2: structured tools + messages passed alongside the
+        // legacy prompt/system text. Under HIPFIRE_JINJA_CHAT=1 the
+        // daemon's Jinja path renders `messages` + `tools` through the
+        // model's upstream chat_template (XML tool-call format on
+        // Qwen3.5/3.6 etc.) and ignores `prompt`/`system`. Under
+        // HIPFIRE_JINJA_CHAT=0 (default) the daemon ignores the
+        // structured fields and falls back to the inline-ChatML prompt
+        // + text-rendered tools-block already built above. We send both
+        // shapes so the same OpenAI request works against either
+        // daemon mode without per-client awareness.
+        if (Array.isArray(body.tools) && body.tools.length > 0) {
+          genParams.tools = body.tools;
+        }
+        const structuredMessages = mapMessagesToStructured(messages);
+        if (structuredMessages.length > 0) {
+          genParams.messages = structuredMessages;
+        }
+
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         //
         // Defensive against MQ4 quantization drift on structured-token positions
@@ -1784,28 +1863,87 @@ async function serve(port: number) {
             }
           } catch {}
 
-          // Form 3: XML-tag corruption. Look for a function name in
-          //   <plain>NAME</param>  or  <function=NAME>  or  <NAME>
-          // patterns at the head of the block, followed by a JSON object.
+          // Form 3: XML-tag forms.
+          //
+          // Originally introduced as a defensive repair for MQ4
+          // quantization drift (`<plain>NAME</param> {ARGS}`), this branch
+          // now also serves as the primary path for Qwen3.5/3.6's
+          // upstream chat_template, which emits a fully-structured
+          //   <function=NAME>
+          //     <parameter=KEY>VALUE</parameter>
+          //     <parameter=KEY>VALUE</parameter>
+          //   </function>
+          // shape under the Jinja-everywhere path (Phase 2).
+          //
+          // Order of probes:
+          //   1) `<function=NAME>` followed by `<parameter=K>V</parameter>`
+          //       siblings — Qwen3.5/3.6 native (Jinja path).
+          //   2) Any of the 3 legacy XML name patterns + a JSON-object
+          //       args tail — MQ4-corruption repair shape.
+          //   3) Any of the 3 name patterns w/ empty args — last-resort
+          //       so we never silently drop a call we can identify by name.
           const xmlPatterns = [
             /^<\s*plain\s*>\s*([A-Za-z_][\w.]*)\s*<\s*\/\s*param\s*>/,
             /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
             /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
           ];
+          // Probe (1): Qwen3.5/3.6 `<function=NAME>...<parameter=K>V</parameter>...</function>`.
+          const fnMatch = raw.match(/^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)(?:<\s*\/\s*function\s*>|$)/);
+          if (fnMatch) {
+            const fname = fnMatch[1];
+            const body = fnMatch[2];
+            const params: Record<string, any> = {};
+            const paramRe = /<\s*parameter\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/g;
+            let anyParam = false;
+            for (const pm of body.matchAll(paramRe)) {
+              const key = pm[1];
+              // VALUE often arrives with one leading + one trailing newline
+              // (the template emits `<parameter=K>\nVALUE\n</parameter>`).
+              // Trim whitespace; coerce strings that look like JSON values
+              // (numbers, booleans, null, objects, arrays) so downstream
+              // tool runners see typed args instead of stringy "42".
+              const valueRaw = pm[2].trim();
+              params[key] = coerceParamValue(valueRaw);
+              anyParam = true;
+            }
+            if (anyParam) {
+              return { name: fname, arguments: params, repaired: true };
+            }
+            // No parameter siblings: fall through to JSON-object probe
+            // below (the JSON-corruption repair case may still apply).
+          }
+          // Probe (2): name pattern + JSON-object args tail (legacy
+          // MQ4-corruption repair).
           for (const pat of xmlPatterns) {
             const nm = raw.match(pat);
             if (!nm) continue;
             const after = raw.slice(nm[0].length).trim();
-            // Find the first balanced JSON object in the remainder.
             const args = extractFirstJsonObject(after);
             if (args !== null) {
               return { name: nm[1], arguments: args, repaired: true };
             }
-            // Even if we cannot parse args, the function name is usable;
-            // emit empty args rather than dropping the call entirely.
+            // Probe (3): emit empty args so the call isn't silently
+            // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
           return null;
+        }
+
+        // Coerce a `<parameter=K>VALUE</parameter>` body. Strings that
+        // parse as JSON (numbers, booleans, null, objects, arrays)
+        // become typed values; everything else stays as a string.
+        function coerceParamValue(s: string): any {
+          if (s === "") return "";
+          if (s === "true" || s === "false" || s === "null") return JSON.parse(s);
+          if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(s)) {
+            const n = Number(s);
+            if (Number.isFinite(n)) return n;
+          }
+          // Object/array literal — try a strict parse; on fail keep raw.
+          if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            try { return JSON.parse(s); } catch {}
+          }
+          return s;
         }
 
         // Best-effort balanced-brace JSON extraction. Returns the parsed
