@@ -78,7 +78,46 @@ if [ -z "$MODEL" ]; then
     echo "  (set HIPFIRE_JINJA_TOOLS_MODEL=<path> to point at a non-default model)"
     exit 0
 fi
+
+# DFlash drafter: when a per-family drafter is present alongside the
+# chosen base, attach it via params.draft so the daemon's DFlash fast
+# path fires at temp=0. Without a drafter the daemon routes through
+# AR — both paths now carry the structured-tools Jinja wiring, but
+# exercising DFlash specifically is the more production-relevant
+# signal (agentic workloads on Qwen3.5/3.6 default to temp=0 →
+# DFlash).
+#
+# Mapping is base-specific. 3.5 and 3.6 ship distinct drafters — the
+# legacy `qwen35-27b-dflash.mq4` is 3.5-only despite being the original
+# DFlash drafter that shipped before 3.6 trained its own.
+#
+# Override with HIPFIRE_JINJA_TOOLS_DRAFTER=<path|"none"> when the
+# auto-pairing is wrong on your host or you want to force the AR branch.
+DRAFTER=""
+if [ -n "${HIPFIRE_JINJA_TOOLS_DRAFTER:-}" ]; then
+    if [ "$HIPFIRE_JINJA_TOOLS_DRAFTER" != "none" ] && [ -f "$HIPFIRE_JINJA_TOOLS_DRAFTER" ]; then
+        DRAFTER="$HIPFIRE_JINJA_TOOLS_DRAFTER"
+    fi
+else
+    case "$(basename "$MODEL")" in
+        qwen3.6-27b.mq4)         DRAFTER_CAND="$MODELS_DIR/qwen36-27b-dflash-mq4.hf4" ;;
+        qwen3.5-27b.mq4)         DRAFTER_CAND="$MODELS_DIR/qwen35-27b-dflash-mq4.hf4" ;;
+        qwen3.5-9b.mq4)          DRAFTER_CAND="$MODELS_DIR/qwen35-9b-dflash-mq4.hf4" ;;
+        qwen3.6-35b-a3b.mq4)     DRAFTER_CAND="$MODELS_DIR/qwen36-35b-a3b-dflash-mq4.hf4" ;;
+        qwen3.5-35b-a3b.mq4)     DRAFTER_CAND="$MODELS_DIR/qwen35-35b-a3b-dflash-mq4.hf4" ;;
+        *)                       DRAFTER_CAND="" ;;
+    esac
+    if [ -n "$DRAFTER_CAND" ] && [ -f "$DRAFTER_CAND" ]; then
+        DRAFTER="$DRAFTER_CAND"
+    fi
+fi
+
 echo "agentic-gate-jinja-tools: using $LABEL ($(du -h "$MODEL" | cut -f1))"
+if [ -n "$DRAFTER" ]; then
+    echo "agentic-gate-jinja-tools: DFlash drafter: $(basename "$DRAFTER") ($(du -h "$DRAFTER" | cut -f1))"
+else
+    echo "agentic-gate-jinja-tools: no DFlash drafter — AR-path only"
+fi
 
 # Rebuild daemon if any tracked source is newer than the binary. Mirrors
 # the rebuild gate in agentic-gate.sh.
@@ -130,19 +169,27 @@ fi
 JSONL_FILE="$(mktemp /tmp/agentic-gate-jinja-tools.XXXXXX.jsonl)"
 OUTPUT_FILE="$(mktemp /tmp/agentic-gate-jinja-tools.XXXXXX.out)"
 
-python3 - "$MODEL" "$JSONL_FILE" <<'PY' >/dev/null
+python3 - "$MODEL" "$JSONL_FILE" "$DRAFTER" <<'PY' >/dev/null
 import sys, json
 
-model_path, jsonl_path = sys.argv[1], sys.argv[2]
+model_path, jsonl_path, drafter_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+# Single-turn smoke; 1024 ctx is plenty for sys+user+tools-block+
+# response and keeps KV cache headroom usable on hosts where the
+# weight blob already takes most of the VRAM (e.g., 22 GB A3B-36
+# on a 24 GB card OOMs at max_seq=4096).
+params = {"max_seq": 1024}
+if drafter_path:
+    # `params.draft` triggers the daemon's DFlash drafter load (see
+    # daemon.rs:520). With a drafter attached and temperature=0 the
+    # generate dispatch lands on the DFlash fast path, exercising the
+    # `generate_dflash()` Jinja branch added in Phase 1.
+    params["draft"] = drafter_path
 
 load_msg = {
     "type": "load",
     "model": model_path,
-    # Single-turn smoke; 1024 ctx is plenty for sys+user+tools-block+
-    # response and keeps KV cache headroom usable on hosts where the
-    # weight blob already takes most of the VRAM (e.g., 22 GB A3B-36
-    # on a 24 GB card OOMs at max_seq=4096).
-    "params": {"max_seq": 1024},
+    "params": params,
 }
 
 # Structured tools: one function with description + a typed parameters
@@ -226,10 +273,11 @@ DAEMON_PID=""
 rm -f "$STDIN_FIFO" "$JSONL_FILE"
 
 # ---- Verdict ---------------------------------------------------------------
-python3 - "$OUTPUT_FILE" "$LABEL" <<'PY'
+python3 - "$OUTPUT_FILE" "$LABEL" "$DRAFTER" <<'PY'
 import sys, json, pathlib
 
-out_path, label = sys.argv[1], sys.argv[2]
+out_path, label, drafter_path = sys.argv[1], sys.argv[2], sys.argv[3]
+expect_dflash = bool(drafter_path)
 raw = pathlib.Path(out_path).read_text()
 
 events = []
@@ -247,12 +295,24 @@ fatal_singleton = "FATAL: hipfire daemon already running" in raw
 toks = [ev["text"] for ev in events if ev.get("type") == "token" and ev.get("id") == "jinja_tools_t1"]
 text = "".join(toks)
 
+# DFlash signature on the `done` event. When the DFlash branch fired,
+# the daemon's done payload includes `"dflash":true,"tau":<f>,"cycles":<i>`
+# (see daemon.rs:2570). Plain AR done lacks all three. Reading the
+# signature tells us which path the request actually took — independent
+# of whether a drafter was offered at load time.
+done_ev = next((ev for ev in events if ev.get("type") == "done"
+                and ev.get("id") == "jinja_tools_t1"), None)
+took_dflash = bool(done_ev and done_ev.get("dflash") is True)
+
 print(f"# Agentic gate (Jinja + structured tools): {label}")
 print()
 print(f"- model        : {label}")
+print(f"- drafter      : {pathlib.Path(drafter_path).name if drafter_path else '(none — AR path)'}")
 print(f"- jinja env    : HIPFIRE_JINJA_CHAT=1")
 print(f"- tools field  : structured (1 function: get_weather)")
 print(f"- tokens emit  : {len(toks)}")
+print(f"- path taken   : {'DFlash' if took_dflash else 'AR'}"
+      + (f" (τ={done_ev.get('tau')}, cycles={done_ev.get('cycles')})" if took_dflash else ""))
 print(f"- daemon panic : {panic['message'] if panic else 'none'}")
 print()
 
@@ -266,8 +326,15 @@ elif panic is not None:
 elif len(toks) == 0:
     print("HARD_FAIL: zero tokens emitted — Jinja render failed silently, or tools schema rejected by template")
     verdict = "HARD_FAIL"
+elif expect_dflash and not took_dflash:
+    print("HARD_FAIL: drafter was supplied at load but the `done` event has no DFlash signature — "
+          "request fell through to AR instead of `generate_dflash()`. The DFlash Jinja branch did not actually run.")
+    verdict = "HARD_FAIL"
 else:
-    print("PASS: structured-tools JSONL accepted, Jinja path rendered, model emitted tokens")
+    msg = "PASS: structured-tools JSONL accepted, Jinja path rendered, model emitted tokens"
+    if took_dflash:
+        msg += " — DFlash branch confirmed via done.dflash signature"
+    print(msg)
 
 print()
 print("## Model output")
