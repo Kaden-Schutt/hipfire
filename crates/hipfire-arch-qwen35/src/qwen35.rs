@@ -6165,6 +6165,22 @@ pub fn forward_scratch_embed(
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
+/// Debug: dump first `n` F32 elements from a GPU tensor to stderr.
+/// Gated by HIPFIRE_PARO_DEBUG=1 env var.
+#[inline(always)]
+fn paro_debug_dump(gpu: &mut Gpu, label: &str, tensor: &GpuTensor, n: usize) {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let enabled = *ENABLED.get_or_init(|| std::env::var("HIPFIRE_PARO_DEBUG").map_or(false, |v| v == "1"));
+    if !enabled { return; }
+    let count = n.min(tensor.buf.size() / 4);
+    let mut buf = vec![0f32; count];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, count * 4) };
+    if gpu.hip.memcpy_dtoh(bytes, &tensor.buf).is_ok() {
+        let vals: Vec<String> = buf.iter().map(|v| format!("{v:.6}")).collect();
+        eprintln!("  [PARO_DEBUG] {label} = [{vals}]", vals = vals.join(", "));
+    }
+}
+
 /// Layer loop using scratch buffers. Zero alloc/free per token.
 ///
 /// `hidden_rb`: if Some, the layer loop extracts post-residual hidden states
@@ -6200,6 +6216,9 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    paro_debug_dump(gpu, "L0 x_normed[0:8]", &s.tmp, 8);
+                }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
                 // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
@@ -6263,12 +6282,22 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
+                if layer_idx == 0 {
+                    paro_debug_dump(gpu, "L0 qkv[0:8]", &s.dn_qkv, 8);
+                    paro_debug_dump(gpu, "L0 z[0:8]", &s.dn_z, 8);
+                    paro_debug_dump(gpu, "L0 beta_raw[0:8]", &s.dn_beta, 8);
+                    paro_debug_dump(gpu, "L0 alpha_raw[0:8]", &s.dn_alpha, 8);
+                }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
+                if layer_idx == 0 {
+                    paro_debug_dump(gpu, "L0 beta_gated[0:4]", &s.dn_beta, 4);
+                    paro_debug_dump(gpu, "L0 alpha_gated[0:4]", &s.dn_alpha, 4);
+                }
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
@@ -6279,6 +6308,11 @@ fn forward_scratch_layers(
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
+                if layer_idx == 0 {
+                    paro_debug_dump(gpu, "L0 q_raw[0:8]", &s.dn_q_raw, 8);
+                    paro_debug_dump(gpu, "L0 k_raw[0:8]", &s.dn_k_raw, 8);
+                    paro_debug_dump(gpu, "L0 v[0:8]", &s.dn_v, 8);
+                }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
