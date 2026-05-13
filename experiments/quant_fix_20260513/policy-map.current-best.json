@@ -1,0 +1,287 @@
+{
+  "schema": "hipfire.quant_fix.policy_map.v0",
+  "current_best": "cand148-c146-l5-conv1d-mq6",
+  "artifact": "/home/kaden/.hipfire/models/qwen3.5-9b.mq4.cand148-c146-l5-conv1d-mq6",
+  "base": "/home/kaden/.hipfire/models/qwen3.5-9b.mq4",
+  "metrics": {
+    "kld": 0.206809,
+    "mean_nll": 2.228706,
+    "ppl": 9.2878,
+    "throughput_tok_s": 328,
+    "chunks": 20,
+    "oracle_status": "pending for cand148; cand143 oracle remains last full hidden/logits validation",
+    "logits_rel_rmse": 0.12362032430905785,
+    "final_norm_rel_rmse": 0.1940879074848564,
+    "worst_hidden_rel_rmse": 0.23303936724333693,
+    "worst_hidden_layer": 17,
+    "ar_decode_tok_s": 92.04,
+    "dflash_prefill_tok_s": 1460.97,
+    "dflash_decode_tok_s": 228.41,
+    "dflash_tau": 9.9167,
+    "dflash_accept_rate": 0.6611,
+    "artifact_md5": "3f82428f18f621c740a679c405d14f80",
+    "artifact_size_bytes": 5559695706,
+    "eval_env": "HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=asym3; decode smoke used HIPFIRE_VERIFY_GRAPH=0",
+    "calibration": "rotwls activation energy from BF16 PyTorch hooks, ref chunks 0-7, seq_len 512, layers 9/10/29"
+  },
+  "policies": [
+    {
+      "tensor": "*.mlp.{gate_proj,up_proj,down_proj}.weight",
+      "method": "AWQ/imatrix clip to MQ4",
+      "source_candidate": "cand05-all-mlp-awq"
+    },
+    {
+      "tensor": "*.self_attn.{q_proj,k_proj,v_proj}.weight",
+      "method": "MQ6G256 promotion from BF16 source",
+      "source_candidate": "cand49-c46-fa-qkv-mq6"
+    },
+    {
+      "tensor": "*.linear_attn.out_proj.weight",
+      "method": "MQ6G256 promotion from BF16 source",
+      "source_candidate": "cand51-c49-la-out-mq6"
+    },
+    {
+      "tensor": "*.linear_attn.conv1d.weight",
+      "method": "MQ4 LS flat refit from BF16 source",
+      "source_candidate": "cand52-c51-conv1d-ls"
+    },
+    {
+      "tensor": "model.language_model.layers.{11,15,19}.self_attn.o_proj.weight",
+      "method": "MQ6G256 promotion from BF16 source",
+      "source_candidate": "cand57-c54-fa-o-l11-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.{14,16,17,18}.linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b}.weight",
+      "method": "MQ6G256 promotion from BF16 source",
+      "source_candidate": "cand70-c63-l14-la-inproj-mq6-pplrepair"
+    },
+    {
+      "tensor": "model.language_model.layers.22.linear_attn.in_proj_z.weight",
+      "method": "AWQ-style MQ4 recalibration from imatrix; split test showed qkv/a/b were unnecessary or harmful",
+      "source_candidate": "cand77-c70-l22-z-awq"
+    },
+    {
+      "tensor": "remaining *.self_attn.o_proj.weight",
+      "method": "imatrix-weighted MQ4 LS",
+      "source_candidate": "cand16-mlp-awq-out-wls"
+    },
+    {
+      "tensor": "lm_head.weight",
+      "method": "MQ4 LS clip_ratio=0.96",
+      "source_candidate": "cand46-c29-lmhead-lsclip96"
+    },
+    {
+      "tensor": "model.language_model.layers.6.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source selected by PyTorch projection-error attribution",
+      "source_candidate": "cand92-c77-l6-qkv-ls"
+    },
+    {
+      "tensor": "model.language_model.layers.1.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source selected by PyTorch projection-error attribution",
+      "source_candidate": "cand93-c92-l1-qkv-ls"
+    },
+    {
+      "tensor": "model.language_model.layers.13.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source selected by PyTorch projection-error attribution",
+      "source_candidate": "cand96-c93-l13-qkv-ls"
+    },
+    {
+      "tensor": "model.language_model.layers.2.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand104-c96-l2-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.20.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand105-c104-l20-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.16.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand108-c105-l16-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.17.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand109-c108-l17-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.18.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand111-c110-l18-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.21.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by PyTorch targeted full-layer attribution",
+      "source_candidate": "cand110-c109-l21-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.28.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand113-c111-l28-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.26.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand114-c113-l26-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.30.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand115-c114-l30-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.24.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand116-c115-l24-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.22.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand117-c116-l22-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.25.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by late-layer PyTorch attribution",
+      "source_candidate": "cand118-c117-l25-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.0.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by direct PyTorch attribution and accepted by KLD/PPL/speed gate",
+      "source_candidate": "cand120-c118-l0-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.14.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by direct PyTorch attribution and accepted by KLD/PPL/speed gate",
+      "source_candidate": "cand121-c120-l14-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.8.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion accepted only with L2 qkv MQ4-LS PPL repair",
+      "source_candidate": "cand127-c123-l2-qkv-mq4ls-pplrepair"
+    },
+    {
+      "tensor": "model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source used as PPL repair for L8 conv1d MQ6",
+      "source_candidate": "cand127-c123-l2-qkv-mq4ls-pplrepair"
+    },
+    {
+      "tensor": "model.language_model.layers.12.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion accepted only with L5 qkv MQ4-LS PPL repair",
+      "source_candidate": "cand129-c127-l12conv-l5qkvls"
+    },
+    {
+      "tensor": "model.language_model.layers.5.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source used as PPL repair for L12 conv1d MQ6",
+      "source_candidate": "cand129-c127-l12conv-l5qkvls"
+    },
+    {
+      "tensor": "model.language_model.layers.9.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion accepted only with L4 qkv MQ4-LS PPL repair",
+      "source_candidate": "cand132-c131-l4-qkv-mq4ls-pplrepair"
+    },
+    {
+      "tensor": "model.language_model.layers.4.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source used as PPL repair for L9 conv1d MQ6",
+      "source_candidate": "cand132-c131-l4-qkv-mq4ls-pplrepair"
+    },
+    {
+      "tensor": "model.language_model.layers.6.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by direct PyTorch attribution and accepted by KLD/PPL/speed gate",
+      "source_candidate": "cand133-c132-l6-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.29.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion selected by cand133 attribution and accepted by KLD/PPL/speed gate",
+      "source_candidate": "cand137-c133-l29-conv1d-mq6"
+    },
+    {
+      "tensor": "model.language_model.layers.29.linear_attn.in_proj_qkv.weight",
+      "method": "MQ4 LS refit from BF16 source paired with L29 conv1d MQ6; current best cand143",
+      "source_candidate": "cand143-c137-l29-qkv-mq4ls"
+    },
+    {
+      "tensor": "model.language_model.layers.10.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion; KLD-positive but PPL-toxic until paired with L10 rotated-weighted qkv and L5 conv PPL repair",
+      "source_candidate": "cand146-c133-l10conv-l10qkv-rotwls-c8s512"
+    },
+    {
+      "tensor": "model.language_model.layers.10.linear_attn.in_proj_qkv.weight",
+      "method": "activation-weighted rotated-domain MQ4 affine refit from BF16 source; calibration chunks 0-7 seq_len 512",
+      "source_candidate": "cand146-c133-l10conv-l10qkv-rotwls-c8s512"
+    },
+    {
+      "tensor": "model.language_model.layers.5.linear_attn.conv1d.weight",
+      "method": "MQ6G256 promotion used as PPL repair for cand146; current best cand148",
+      "source_candidate": "cand148-c146-l5-conv1d-mq6"
+    }
+  ],
+  "rejected_top3": [
+    {
+      "candidate": "cand146-c133-l10conv-l10qkv-rotwls-c8s512",
+      "reason": "Best KLD seen at 0.205683, but PPL failed at 9.4331 and speed was 326."
+    },
+    {
+      "candidate": "cand147-c146-l13-conv1d-mq6",
+      "reason": "KLD/PPL passed at 0.206135/9.2875, but speed missed by 1 tok/s at 327."
+    },
+    {
+      "candidate": "cand144-c137-l29-qkv-rotwls-c8s512",
+      "reason": "Rotated activation weighting failed to beat plain LS for L29 qkv: KLD 0.210347 and speed 327."
+    }
+  ],
+  "next_hypotheses": [
+    "KLD is not theoretically asymptotic at 0.20: full-MQ6/q8-KV control reached 0.067687, proving the eval can see Q4-class KLD.",
+    "Under the current cheap tensor-transplant/MQ4-refit loop, the curve is flattening around 0.205-0.21. cand148 is accepted at 0.206809; cand146 got 0.205683 but failed PPL/speed.",
+    "Next work should either harden the L10 branch with a stronger PPL/speed repair or move to a real GPTQ/full-Hessian block objective. Diagonal rotated activation weighting was not enough.",
+    "cand148 needs the full accepted-candidate validation suite before it can replace cand143 as a deliverable artifact: Astrea tests/build are already recently green, but hidden/logits oracle and decode smoke are still pending for cand148."
+  ],
+  "diagnostics": {
+    "cand96_q8_kv": {
+      "kld": 0.252473,
+      "mean_nll": 2.17432,
+      "ppl": 8.7962,
+      "throughput_tok_s": 313,
+      "interpretation": "KV precision helps only modestly and fails speed."
+    },
+    "cand96_asym4_kv": {
+      "kld": 0.248123,
+      "mean_nll": 2.198996,
+      "ppl": 9.016,
+      "throughput_tok_s": 321,
+      "interpretation": "Best KV diagnostic for cand96, still far above KLD target and below speed floor."
+    },
+    "cand133_pytorch_oracle": {
+      "logits_last_rel_rmse": 0.12308900596568602,
+      "final_norm_last_rel_rmse": 0.19177431581724141,
+      "worst_hidden_layer": 17,
+      "worst_hidden_rel_rmse": 0.23303936724333693,
+      "oracle_json": "experiments/quant_fix_20260513/oracle/cand133-c132-l6-conv1d-mq6-oracle-amd721.json"
+    },
+    "cand133_decode_smoke": {
+      "prompt": "benchmarks/prompts/lru_cache_pep8_strict.txt",
+      "env": "HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=asym3 HIPFIRE_VERIFY_GRAPH=0",
+      "ar_decode_tok_s": 92.93,
+      "dflash_prefill_tok_s": 1438.51,
+      "dflash_decode_tok_s": 231.2,
+      "dflash_tau": 9.8333,
+      "dflash_accept_rate": 0.6556
+    },
+    "cand143_pytorch_oracle": {
+      "logits_last_rel_rmse": 0.12362032430905785,
+      "final_norm_last_rel_rmse": 0.1940879074848564,
+      "worst_hidden_layer": 17,
+      "worst_hidden_rel_rmse": 0.23303936724333693,
+      "oracle_json": "experiments/quant_fix_20260513/oracle/cand143-c137-l29-qkv-mq4ls-oracle-amd721.json"
+    },
+    "cand143_decode_smoke": {
+      "prompt": "benchmarks/prompts/lru_cache_pep8_strict.txt",
+      "env": "HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_KV_MODE=asym3 HIPFIRE_VERIFY_GRAPH=0",
+      "ar_decode_tok_s": 92.04,
+      "dflash_prefill_tok_s": 1460.97,
+      "dflash_decode_tok_s": 228.41,
+      "dflash_tau": 9.9167,
+      "dflash_accept_rate": 0.6611
+    }
+  }
+}

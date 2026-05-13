@@ -1,0 +1,7 @@
+interface:
+  display_name: "Astrea"
+  short_description: "Model calibration, KV policy, and eval workflow"
+  default_prompt: "Use $astrea to plan and evaluate a hipfire model calibration or KV policy experiment."
+
+policy:
+  allow_implicit_invocation: true

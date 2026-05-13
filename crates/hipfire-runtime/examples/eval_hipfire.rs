@@ -291,15 +291,29 @@ fn main() {
             f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
 
         let cand_logits = gpu.download_f32(scratch_logits).expect("download logits");
+        if let Some((idx, value)) = cand_logits
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            panic!("candidate logits contain non-finite value at vocab index {idx}: {value}");
+        }
 
         // Candidate's log-Z = log Σ exp(logit_i) — fp64 throughout.
         let mut max_logit = f32::NEG_INFINITY;
         for &v in cand_logits.iter() { if v > max_logit { max_logit = v; } }
+        if !max_logit.is_finite() {
+            panic!("candidate logits have non-finite max logit: {max_logit}");
+        }
         let mut sum_exp = 0.0f64;
         for &v in cand_logits.iter() {
             sum_exp += ((v - max_logit) as f64).exp();
         }
         let log_z = (max_logit as f64) + sum_exp.ln();
+        if !log_z.is_finite() {
+            panic!("candidate logits produced non-finite log_z: {log_z}");
+        }
 
         // KLD = Σ_{i in top_K_P_ref} P_ref(i) * (log_p_ref(i) - log_p_cand(i))
         //     + residual cross-term  (sum_p_residual_ref * Δlog_residual)
