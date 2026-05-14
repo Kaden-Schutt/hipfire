@@ -4656,6 +4656,13 @@ fn forward_prefill_chunk(
                 let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+                // Fused QKV kernels require all three weights to share a
+                // dtype — they treat wq/wk/wv as same-stride byte arrays.
+                // When kmap mode 2 promotes only `v_proj` (issue #249), the
+                // fused HFQ4 path reads `wv` as MQ6 with HFQ4's 136-B stride
+                // and produces silent NaN. Gate the fused kernels here.
+                let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
+                                  && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
                 // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
                 if qkv_is_mq {
@@ -4670,7 +4677,7 @@ fn forward_prefill_chunk(
                 }
 
                 // 2. Batched 3-way QKV projection (wq+wk+wv).
-                if qkv_is_6bit {
+                if qkv_is_6bit && qkv_same_dtype {
                     gpu.gemm_qkv_hfq6g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -4678,7 +4685,7 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
-                } else if qkv_is_mq3_lloyd {
+                } else if qkv_is_mq3_lloyd && qkv_same_dtype {
                     gpu.gemm_qkv_mq3g256_lloyd_wmma(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -4686,7 +4693,7 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
-                } else if qkv_is_mq3 {
+                } else if qkv_is_mq3 && qkv_same_dtype {
                     // X is already FWHT-rotated by fused_rmsnorm_rotate_mq_batched
                     // above; call the bare HFQ3 WMMA (no second rotation).
                     gpu.gemm_qkv_hfq3g256_wmma(
@@ -4696,7 +4703,7 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
-                } else if qkv_is_fp4 {
+                } else if qkv_is_fp4 && qkv_same_dtype {
                     // HFP4G32 / MFP4G32 FP4 batched WMMA. X is already
                     // rotated above for MFP4 (is_mq path) — same kernel
                     // covers both unrotated HFP4 and rotated MFP4 inputs.
@@ -4707,7 +4714,7 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
-                } else {
+                } else if qkv_same_dtype {
                     gpu.gemm_qkv_hfq4g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -4715,6 +4722,14 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
+                } else {
+                    // Mixed-format fallback (issue #249): wq/wk/wv don't all
+                    // share a dtype. Dispatch each weight to its own
+                    // single-weight batched GEMM, dropping the fused-kernel
+                    // launch-overhead optimization for correctness.
+                    batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+                    batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+                    batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
                 }
 
                 // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
@@ -5295,6 +5310,10 @@ fn forward_prefill_chunk(
                 // wiring lives in a separate PR (see followup issue).
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                // Fused QKV requires uniform dtype — see issue #249 for
+                // the dense FA variant. Gate the same way here.
+                let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
+                                  && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 
                 if qkv_is_mq {
                     gpu.fused_rmsnorm_rotate_mq_batched(
@@ -5306,7 +5325,7 @@ fn forward_prefill_chunk(
                         n, dim, config.norm_eps,
                     )?;
                 }
-                if qkv_is_6bit {
+                if qkv_is_6bit && qkv_same_dtype {
                     gpu.gemm_qkv_hfq6g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -5314,7 +5333,7 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
-                } else {
+                } else if qkv_same_dtype {
                     gpu.gemm_qkv_hfq4g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -5322,6 +5341,11 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
+                } else {
+                    // Mixed-format fallback (issue #249).
+                    batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
+                    batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+                    batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
                 }
                 gpu.deinterleave_f32_batched(
                     &pbs.fa_q_full_batch, &pbs.fa_q_batch, &pbs.fa_gate_batch,
@@ -5821,6 +5845,44 @@ pub fn forward_scratch_embed(
     };
     gpu.hip.memcpy_htod(&scratch.x.buf, bytes)?;
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
+}
+
+/// Batched single-weight GEMM used by the mixed-format fallback in
+/// `forward_prefill_chunk`'s FA QKV path. The fused `gemm_qkv_hfq*` kernels
+/// require wq/wk/wv to share a bit-width — they index all three weight
+/// buffers with the same stride. When `--kmap-dense --kmap-mode 2` promotes
+/// only `v_proj` to MQ6 (issue #249), the fused HFQ4 kernel reads `wv`'s
+/// MQ6 buffer with HFQ4's 136-B stride (true stride: 200 B), producing
+/// silent NaN. Callers gate the fused path on a same-dtype check and route
+/// here per-weight when they disagree.
+///
+/// Covers the MQ4/HFQ4 ⇄ MQ6/HFQ6 mix produced by kmap mode 2; extend
+/// per-format arms as new mixes appear.
+fn batched_gemm_single_weight(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::MQ4G256 | DType::HFQ4G256 => {
+            gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, n)
+        }
+        DType::MQ6G256 | DType::HFQ6G256 => {
+            // No non-residual batched MQ6/HFQ6 GEMM exists. Zero Y then accumulate.
+            let bytes = w.m * n * 4;
+            gpu.hip.memset(&y.buf, 0, bytes)?;
+            gpu.gemm_hfq6g256_residual(&w.buf, x, y, w.m, w.k, n)
+        }
+        other => Err(hip_bridge::HipError::new(0, &format!(
+            "mixed-format batched prefill: weight dtype {other:?} has no \
+             single-weight batched dispatch yet. Currently only MQ4/HFQ4 and \
+             MQ6/HFQ6 mixes are wired (covers `hipfire-quantize --kmap-dense \
+             --kmap-mode 2`, issue #249). Re-quantize with uniform format or \
+             extend `batched_gemm_single_weight` to cover this format."
+        ))),
+    }
 }
 
 /// Layer loop using scratch buffers. Zero alloc/free per token.
