@@ -5870,9 +5870,19 @@ fn batched_gemm_single_weight(
             gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, n)
         }
         DType::MQ6G256 | DType::HFQ6G256 => {
-            // No non-residual batched MQ6/HFQ6 GEMM exists. Zero Y then accumulate.
+            // No non-residual batched MQ6/HFQ6 GEMM exists. Zero Y then
+            // accumulate. The zero MUST be ordered on the same stream as
+            // the GEMM that consumes it — using sync `hipMemset` on the
+            // null stream while subsequent kernels enqueue on a non-null
+            // active stream leaves a race that produces silent NaN in the
+            // residual stream (logits stay NaN on eval until a stray host
+            // sync masks the order bug).
             let bytes = w.m * n * 4;
-            gpu.hip.memset(&y.buf, 0, bytes)?;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
             gpu.gemm_hfq6g256_residual(&w.buf, x, y, w.m, w.k, n)
         }
         other => Err(hip_bridge::HipError::new(0, &format!(
