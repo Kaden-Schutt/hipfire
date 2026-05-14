@@ -5856,8 +5856,12 @@ pub fn forward_scratch_embed(
 /// silent NaN. Callers gate the fused path on a same-dtype check and route
 /// here per-weight when they disagree.
 ///
-/// Covers the MQ4/HFQ4 ⇄ MQ6/HFQ6 mix produced by kmap mode 2; extend
-/// per-format arms as new mixes appear.
+/// Covers same-rotation-family bit-width mixes: MQ4+MQ6 (both
+/// FWHT-baked, what kmap mode 2 produces) and HFQ4+HFQ6 (both
+/// unrotated). Cross-family mixes (e.g. HFQ4+MQ6) would corrupt the
+/// shared rmsnorm+rotate output; no quantizer config produces them
+/// today, but extend the dispatch caller's invariants here if that
+/// changes.
 fn batched_gemm_single_weight(
     gpu: &mut Gpu,
     w: &WeightTensor,
