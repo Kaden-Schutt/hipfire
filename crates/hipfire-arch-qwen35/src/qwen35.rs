@@ -72,6 +72,7 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 /// is `None`, LA layers fall back to the linear path (byte-exact with
 /// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
 /// callers that haven't been rewritten).
+
 /// Override the embedding for a single batch slot after the embedding-lookup
 /// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
 /// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
@@ -4800,7 +4801,7 @@ fn forward_prefill_chunk(
         if let Some(ovr) = mask_override {
             assert!(
                 ovr.slot < n,
-                "MaskEmbedOverride.slot ({}) must be < chunk_n ({})",
+                "MaskEmbedOverride.slot ({}) must be < n ({})",
                 ovr.slot, n,
             );
             assert_eq!(
