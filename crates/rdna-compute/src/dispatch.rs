@@ -297,6 +297,16 @@ fn is_fp8_wmma_enabled() -> bool {
 /// FP16 WMMA on the production prefill bench can lower it later.
 const FP8_WMMA_MIN_BATCH: usize = 1024;
 
+/// Number of AR forward calls that run direct (no hipGraph capture) before
+/// any capture is attempted. A single warmup is insufficient on ROCm 7.2.2:
+/// captured graphs intermittently snapshot stale kernarg state when JIT
+/// recompiles a kernel between capture and replay (manifests as token-0
+/// `<think>\n!!!!!` attractor on Qwen3.5-27B mq4 gfx1100). Three warmup
+/// calls give HIP's JIT enough runway to specialize all kernels the captured
+/// forward will reach. Increase if a future arch/format combination still
+/// trips the snapshot bug; do NOT decrease below 2 without arch-wide A/B.
+pub const AR_FORWARD_WARMUP_CALLS: u32 = 3;
+
 /// Minimum output dimension M at which the FP8-dot4 decode GEMV path
 /// is enabled. Below this, the fallback wins or ties on gfx1201
 /// (measured 0.92-1.03× on wo M=2048 K=2048 vs 1.17-1.21× on FFN
@@ -772,10 +782,15 @@ pub struct Gpu {
     /// First call with `HIPFIRE_GRAPH=1` runs direct so kernel JIT and lazy
     /// scratch allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel modules)
     /// happen outside any captured region. Capturing the first call hits
-    /// `hipMalloc not permitted under stream capture`. Set after the first
-    /// direct run; the next call captures the graph for replay. Mirrors
-    /// `verify_warmed_up` but uses a scalar flag (no per-B keying).
-    pub ar_forward_warmed_up: bool,
+    /// `hipMalloc not permitted under stream capture`. The first N
+    /// (AR_FORWARD_WARMUP_CALLS) AR forward calls run direct so HIP's JIT
+    /// fully specializes per kernel signature; subsequent calls capture once
+    /// then replay. A single warmup is insufficient on ROCm 7.2.2 — captured
+    /// graphs intermittently snapshot stale kernarg state when JIT recompiles
+    /// any kernel between capture and replay (manifests as token-0 attractor
+    /// `<think>\n!!!!!` on Qwen3.5-27B mq4 gfx1100). Mirrors `verify_warmed_up`
+    /// but uses a countdown (no per-B keying).
+    pub ar_forward_warmup_remaining: u32,
 
     /// Per-B cache of captured verify-forward graphs. Each entry owns its
     /// graph + exec + the kernarg blobs that graph captured pointers into.
@@ -1042,7 +1057,7 @@ impl Gpu {
             captured_graph: None,
             graph_verify_n: None,
             graph_verify_warmup: 0,
-            ar_forward_warmed_up: false,
+            ar_forward_warmup_remaining: AR_FORWARD_WARMUP_CALLS,
             verify_graph_cache: HashMap::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
@@ -1243,14 +1258,13 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
-        // Without this, model swap leaves the flag stuck on `true`. The
-        // forward path in qwen35::forward_scratch then jumps straight from
-        // graph_exec.is_none() into capture mode on the new model's first
-        // AR forward call, before kernel JIT / scratch allocations have
-        // happened against the new tensors. That trips
-        // "hipMalloc not permitted under stream capture" the same way
+        // Without this reset, model swap leaves the countdown at 0 (post-warmup),
+        // so qwen35::forward_scratch jumps straight from graph_exec.is_none()
+        // into capture mode on the new model's first AR forward call — before
+        // kernel JIT / scratch allocations have happened against the new tensors.
+        // That trips "hipMalloc not permitted under stream capture" the same way
         // verify_warmed_up does for the DFlash verify path.
-        self.ar_forward_warmed_up = false;
+        self.ar_forward_warmup_remaining = AR_FORWARD_WARMUP_CALLS;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────

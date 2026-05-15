@@ -3192,18 +3192,17 @@ pub fn forward_scratch(
     //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
     //     graph path numerically drifts after ~30-50 tokens on MoE
     //     (see surrounding comment block for repro).
-    // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
-    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
-        match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
-            Some("0") => Some(false),
-            Some("1") => Some(true),
-            _ => None,
-        }
-    });
-    let graph_arch_default =
-        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-    let graph_enabled = graph_override.unwrap_or(graph_arch_default);
-    let use_graph = graph_enabled && (config.num_experts == 0 || allow_moe);
+    // AR-forward hipGraph capture is DEFAULT-OFF (2026-05-15). Empirically on
+    // ROCm 7.2.2 + gfx11 + Qwen3.5-27B mq4, captured graph replay produces a
+    // token-0 `<think>\n!!!!!` attractor: the warmup + capture calls emit
+    // correct tokens, then every subsequent replay reads stale pos / state
+    // (kernarg-snapshot bug; not fixable by adding warmup runway). Until the
+    // replay-side bug is root-caused, AR forward goes direct. Opt back in
+    // with HIPFIRE_GRAPH=1 for experimental A/B work.
+    let graph_arch_default = false;
+    let graph_opt_in = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1");
+    let use_graph = (graph_arch_default || graph_opt_in)
+        && (config.num_experts == 0 || allow_moe);
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -3222,21 +3221,31 @@ pub fn forward_scratch(
 
     if use_graph && gpu.graph_exec.is_some() && no_compact {
         // ── Graph replay path ──
-        // Update pos_buf on the device via stream write (no host→device copy).
-        let stream = gpu.active_stream.as_ref().unwrap();
-        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+        // Update pos_buf via host blocking copy. The previous version used
+        // `stream_write_value32` to avoid the host roundtrip, but on
+        // ROCm 7.2.2 + gfx11 that produces a token-0 attractor on first
+        // replay (decode emits `<think>\n</think>\n` correctly during the
+        // direct warmup+capture calls, then 0 forever once replay starts).
+        // Suspected stream-vs-graph ordering bug: the stream write either
+        // races the captured kernel's pos read or writes to a snapshotted
+        // address rather than the live buffer. memcpy_htod fully synchronizes
+        // before the graph_launch and writes the live buffer; the small
+        // host-roundtrip cost is amortized over the full forward (947 blobs).
+        let pos_i32 = pos as i32;
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graph_launch()?;
     } else if use_graph && gpu.graph_exec.is_none() && no_compact {
         let pos_i32 = pos as i32;
-        if !gpu.ar_forward_warmed_up {
-            // ── Warmup: run direct so kernel JIT and lazy scratch
-            // allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel module
-            // load) happen outside any captured region. Capturing the first
-            // call hits "hipMalloc not permitted under stream capture" — the
-            // same trap `verify_warmed_up` solves for the verify path. The
-            // next call will capture. (See bench_qwen35_mq4 / forward_prefill_batch
-            // for the production warmup path.)
-            gpu.ar_forward_warmed_up = true;
+        if gpu.ar_forward_warmup_remaining > 0 {
+            // ── Warmup: run direct so kernel JIT and lazy scratch allocations
+            // (MQ signs/x_rot/x_q8, FP16 shadow, kernel module load) happen
+            // outside any captured region. A SINGLE warmup is insufficient on
+            // ROCm 7.2.2 — kernels can JIT-recompile across calls and the
+            // capture snapshots stale kernarg state (token-0 `<think>\n!!!!!`
+            // attractor on Qwen3.5-27B mq4 gfx1100). Run AR_FORWARD_WARMUP_CALLS
+            // direct dispatches first so JIT settles before any capture.
+            // Same trap `verify_warmed_up` solves for the verify path.
+            gpu.ar_forward_warmup_remaining -= 1;
             gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
             forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
         } else {
