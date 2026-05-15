@@ -80,6 +80,31 @@ pub struct MtpSpecState {
     /// MTP head KV cache (Task 9). Single-layer F32, rolling overwrite.
     pub mtp_kv: Qwen35MtpHeadKvCache,
 
+    /// Per-step `t_mtp_out` capture buffer for the K-step batched lm_head
+    /// chain (Task 10b). Shape `[max_n, n_embd]` row-major. After the
+    /// chain runs, the end-of-chain batched lm_head consumes this whole
+    /// buffer in one GEMM call. Step k writes its `t_mtp_out` into row k
+    /// (offset `k * n_embd * 4` bytes); step k+1 reads row k as its
+    /// "next-token embedding override" + `prev_hidden`.
+    pub mtp_t_outs: GpuTensor,
+
+    /// Per-step batched-rmsnorm output for the K-step batched lm_head.
+    /// Shape `[max_n, n_embd]`. Caller of `mtp_head_apply_lm_head_batched`
+    /// owns this scratch.
+    pub mtp_lm_tmp: GpuTensor,
+
+    /// Per-step FWHT-rotated x scratch for MagnumQuant lm_heads (MQ4/MQ3/MQ6).
+    /// Shape `[max_n, n_embd]`. Unused for non-MQ lm_head dtypes.
+    pub mtp_lm_rot: GpuTensor,
+
+    /// Per-step batched lm_head logits output. Shape `[max_n, vocab]`.
+    /// Caller `argmax_f32_batched` reads this for the K predicted tokens.
+    pub mtp_lm_logits: GpuTensor,
+
+    /// GPU-side argmax destination for the K-step batched argmax over
+    /// `mtp_lm_logits`. Shape `[max_n]` i32 stored as F32 slots.
+    pub mtp_lm_argmax: GpuTensor,
+
     /// Maximum number of MTP candidates per cycle (chain depth).
     pub max_n: usize,
 }
@@ -120,6 +145,13 @@ impl MtpSpecState {
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
         let mtp_kv = Qwen35MtpHeadKvCache::new(gpu, &head.config)?;
 
+        // Per-step batched-lm_head scratch (Task 10b).
+        let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_tmp = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_rot = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
+        let mtp_lm_logits = gpu.alloc_tensor(&[max_n * vocab], DType::F32)?;
+        let mtp_lm_argmax = gpu.alloc_tensor(&[max_n], DType::F32)?;
+
         Ok(Self {
             prev_hidden,
             verify_hidden,
@@ -130,6 +162,11 @@ impl MtpSpecState {
             trunk_pbs,
             mtp_scratch,
             mtp_kv,
+            mtp_t_outs,
+            mtp_lm_tmp,
+            mtp_lm_rot,
+            mtp_lm_logits,
+            mtp_lm_argmax,
             max_n,
         })
     }
@@ -174,6 +211,11 @@ impl MtpSpecState {
         let _ = gpu.free_tensor(self.verify_logits);
         let _ = gpu.free_tensor(self.verify_rot);
         let _ = gpu.free_tensor(self.verify_argmax);
+        let _ = gpu.free_tensor(self.mtp_t_outs);
+        let _ = gpu.free_tensor(self.mtp_lm_tmp);
+        let _ = gpu.free_tensor(self.mtp_lm_rot);
+        let _ = gpu.free_tensor(self.mtp_lm_logits);
+        let _ = gpu.free_tensor(self.mtp_lm_argmax);
         // DeltaNetSnapshot's DeviceBuffers free on drop.
         drop(self.trunk_snap);
         self.trunk_pbs.free_gpu(gpu);
@@ -272,43 +314,106 @@ pub fn spec_step_mtp(
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
 
-    // ── 1. MTP candidate chain ──────────────────────────────────────────
+    // ── 1. MTP candidate chain (Approach B: feature-only K-step) ────────
     //
-    // Step k (k = 0..max_n) feeds (next_token_k, prev_hidden_k) → predicts
-    // candidate_k via argmax. Step 0 takes (last_committed, state.prev_hidden);
-    // step k > 0 takes (candidates[k-1], mtp_scratch.t_mtp_out from step k-1).
+    // ARCHITECTURALLY LOSSY: each step k (k > 0) feeds the previous step's
+    // `t_mtp_out` directly as both the "embedding of the predicted token"
+    // (bypassing the embedding table — see `mtp_head_forward_block_only`'s
+    // `next_token_embed` doc comment) AND as `prev_hidden`. This lets us
+    // chain all K block forwards back-to-back WITHOUT running lm_head per
+    // step, then collapse the K argmaxes into a single batched lm_head GEMM.
     //
-    // MTP step k writes its own KV slot at position cur_pos + k (the position
-    // of the input token, identical to a transformer per-layer cache).
-    let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
+    // Trade-off (vs the earlier discrete-token-roundtrip path that called
+    // `mtp_head_forward` K times): saves K-1 separate GEMV launches into
+    // the trunk's vocab×n_embd lm_head matrix. Each saved launch is ~12 ms
+    // for the 27B-3.5 lm_head (vocab=152K). On gfx1100 K=3 the projected
+    // win is ~22 ms/cycle = ~37%-1.5× lift if τ holds.
+    //
+    // Lossless guarantee preserved at trunk-verify: any incorrect MTP
+    // candidate (from the lossy chain or otherwise) is rejected by trunk
+    // argmax check; the cycle just degenerates to AR + bonus token. τ may
+    // drop relative to the discrete-token-roundtrip path because the head
+    // was trained with `embed[token]`, not raw `t_mtp_out`, as its
+    // step-input distribution.
+    //
+    // MTP step k writes its own KV slot at position cur_pos + k (same as
+    // before — a per-step single-layer transformer cache).
+    let dim_bytes = dim * 4;
     for k in 0..max_n {
         // Step 0 reads from state.prev_hidden (trunk's last post-norm
-        // hidden, snapshot from the previous cycle / prefill). Step k > 0
-        // reads from t_mtp_out (the MTP head's own post-FFN, pre-LM-head-
-        // norm hidden) of the previous step in this cycle.
-        let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
-        let prev_view = if k == 0 {
-            &state.prev_hidden
+        // hidden, snapshot from the previous cycle / prefill) and embeds
+        // last_committed via the trunk's table. Step k > 0 reads from row
+        // (k-1) of mtp_t_outs and uses that same row as the embedding
+        // override (lossy substitute for embed[predicted_token_{k-1}]).
+        if k == 0 {
+            mtp_head::mtp_head_forward_block_only(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                last_committed,
+                &state.prev_hidden,
+                None,
+                cur_pos + k,
+                trunk_weights,
+            )?;
         } else {
-            &state.mtp_scratch.t_mtp_out
-        };
-
-        mtp_head::mtp_head_forward(
-            gpu,
-            head,
-            &state.mtp_scratch,
-            &mut state.mtp_kv,
-            next_tok,
-            prev_view,
-            cur_pos + k,
-            trunk_weights,
-            &trunk_weights.output,
+            let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+            mtp_head::mtp_head_forward_block_only(
+                gpu,
+                head,
+                &state.mtp_scratch,
+                &mut state.mtp_kv,
+                0,                  // sentinel: ignored when next_token_embed is Some(_)
+                &prev_row,          // prev_hidden = step k-1's t_mtp_out
+                Some(&prev_row),    // embed override = step k-1's t_mtp_out (lossy)
+                cur_pos + k,
+                trunk_weights,
+            )?;
+        }
+        // Capture this step's t_mtp_out into row k of mtp_t_outs so the
+        // next step can read it AND so the end-of-chain batched lm_head
+        // can ingest the whole stack.
+        gpu.hip.memcpy_dtod_at(
+            &state.mtp_t_outs.buf, k * dim_bytes,
+            &state.mtp_scratch.t_mtp_out.buf, 0,
+            dim_bytes,
         )?;
-
-        // Greedy argmax of the MTP logits.
-        let cand = gpu.argmax_f32(&state.mtp_scratch.logits, vocab)?;
-        candidates.push(cand);
     }
+
+    // ── 1b. Batched lm_head over all K t_mtp_outs ────────────────────────
+    //
+    // Single GEMM (N=max_n) replacing K separate GEMV calls. shared_head_norm
+    // is applied row-wise via rmsnorm_batched inside the helper. MQ4
+    // dispatch path includes the FWHT rotation pre-pass (rotate_x_mq_batched).
+    let t_outs_view = state.mtp_t_outs.sub_offset(0, max_n * dim);
+    let lm_tmp_view = state.mtp_lm_tmp.sub_offset(0, max_n * dim);
+    let lm_rot_view = state.mtp_lm_rot.sub_offset(0, max_n * dim);
+    let lm_logits_view = state.mtp_lm_logits.sub_offset(0, max_n * vocab);
+    mtp_head::mtp_head_apply_lm_head_batched(
+        gpu,
+        head,
+        &trunk_weights.output,
+        &t_outs_view,
+        &lm_tmp_view,
+        &lm_rot_view,
+        &lm_logits_view,
+        max_n,
+    )?;
+
+    // Batched argmax over (max_n) rows → single D2H of K i32 ids.
+    let lm_argmax_view = state.mtp_lm_argmax.sub_offset(0, max_n);
+    gpu.argmax_f32_batched(&lm_logits_view, &lm_argmax_view, vocab, max_n)?;
+    let mut argmax_host: Vec<i32> = vec![0; max_n];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                argmax_host.as_mut_ptr() as *mut u8, max_n * 4,
+            )
+        };
+        gpu.hip.memcpy_dtoh(bytes, &lm_argmax_view.buf)?;
+    }
+    let candidates: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
 
     // ── 2. Build trunk verify input: [last_committed, c1, ..., c_max_n] ──
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);

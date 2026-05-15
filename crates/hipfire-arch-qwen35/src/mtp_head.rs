@@ -555,20 +555,8 @@ pub fn mtp_head_forward(
     lm_head_weights: &WeightTensor,
 ) -> HipResult<()> {
     let cfg = &head.config;
-    let w = &head.weights;
     let n_embd = cfg.n_embd;
-    let kv_dim = cfg.head_dim * cfg.n_head_kv;
 
-    assert_eq!(
-        prev_hidden.numel(), n_embd,
-        "mtp_head_forward: prev_hidden has {} elems but expected n_embd={n_embd}",
-        prev_hidden.numel(),
-    );
-    assert!(
-        pos < kv.max_seq,
-        "mtp_head_forward: pos={pos} >= kv.max_seq={}",
-        kv.max_seq,
-    );
     assert_eq!(
         lm_head_weights.k, n_embd,
         "mtp_head_forward: lm_head_weights.k={} but n_embd={n_embd}; \
@@ -576,19 +564,104 @@ pub fn mtp_head_forward(
         lm_head_weights.k,
     );
 
+    // Run the block (NextN concat + eh_proj + attn + FFN). Writes
+    // `scratch.t_mtp_out` and leaves `scratch.ffn_out` holding the same
+    // hidden (alias for the LM-head path).
+    mtp_head_forward_block_only(
+        gpu, head, scratch, kv, next_token, prev_hidden, None, pos,
+        trunk_weights,
+    )?;
+
+    // Standard single-step lm_head: shared_head_norm + GEMV over t_mtp_out.
+    let w = &head.weights;
+    gpu.rmsnorm_f32(&scratch.t_mtp_out, &w.shared_head_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+    weight_gemv(gpu, lm_head_weights, &scratch.tmp, &scratch.logits)?;
+
+    Ok(())
+}
+
+/// Block-only variant of [`mtp_head_forward`]: runs the NextN concat +
+/// eh_proj + attention + FFN, but **stops before** `shared_head_norm` and
+/// `lm_head`. Writes the post-FFN, pre-shared-head-norm hidden into
+/// `scratch.t_mtp_out`. Caller is responsible for running
+/// [`mtp_head_apply_lm_head_batched`] on a stack of N `t_mtp_out`s to
+/// recover the predicted-token logits in one batched GEMM.
+///
+/// ## Optional embedding override (lossy K-step chaining)
+///
+/// In the standard path (`next_token_embed = None`), `next_token` is
+/// embedded via the trunk's `token_embd` table — same as
+/// `mtp_head_forward`. The K-step batched-lm_head optimization in
+/// `spec_step_mtp` chains forwards WITHOUT yet knowing each step's
+/// predicted token (we postpone all K argmaxes to a single end-of-chain
+/// batched lm_head). To allow step k+1 to proceed before step k's
+/// `lm_head` runs, the caller passes `next_token_embed = Some(prev_step_t_mtp_out)`,
+/// which BYPASSES the embedding lookup and feeds the previous step's
+/// `t_mtp_out` directly as the "embedding of the predicted token."
+///
+/// This is **architecturally lossy** — the MTP head was trained with
+/// discrete-token round-trips through `token_embd`, so feeding the
+/// continuous post-FFN hidden as a substitute for `embed[token]` is OOD
+/// for the head. Acceptance rate (τ) may degrade. Lossless guarantee is
+/// preserved at the trunk-verify level: any incorrect MTP candidate is
+/// rejected by the trunk's argmax check and the cycle just re-AR-decodes
+/// from the bonus token.
+///
+/// `next_token` is IGNORED when `next_token_embed` is `Some(_)`. The
+/// caller may pass any sentinel (e.g. 0).
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_only(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    next_token_embed: Option<&GpuTensor>,
+    pos: usize,
+    trunk_weights: &Qwen35Weights,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let n_embd = cfg.n_embd;
+    let kv_dim = cfg.head_dim * cfg.n_head_kv;
+
+    assert_eq!(
+        prev_hidden.numel(), n_embd,
+        "mtp_head_forward_block_only: prev_hidden has {} elems but expected n_embd={n_embd}",
+        prev_hidden.numel(),
+    );
+    assert!(
+        pos < kv.max_seq,
+        "mtp_head_forward_block_only: pos={pos} >= kv.max_seq={}",
+        kv.max_seq,
+    );
+
     // Upload position scalar for the RoPE / attention kernels.
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
 
-    // ── 1. Embed next_token via trunk's table ────────────────────────────
-    embed_lookup_into(gpu, trunk_weights, &scratch.tok_embd, next_token, n_embd)?;
+    // ── 1. Token embedding (table lookup OR caller-supplied override) ────
+    let dim_bytes = n_embd * 4;
+    if let Some(embed) = next_token_embed {
+        assert_eq!(
+            embed.numel(), n_embd,
+            "mtp_head_forward_block_only: next_token_embed has {} elems but expected n_embd={n_embd}",
+            embed.numel(),
+        );
+        // Lossy-recursion path: feed the caller's pre-computed activation
+        // directly into the e_norm input slot. Aliasing-safe (separate
+        // backing buffers — caller passes the previous step's t_mtp_out).
+        gpu.hip.memcpy_dtod_at(&scratch.tok_embd.buf, 0, &embed.buf, 0, dim_bytes)?;
+    } else {
+        embed_lookup_into(gpu, trunk_weights, &scratch.tok_embd, next_token, n_embd)?;
+    }
 
     // ── 2. RMSNorm both inputs to the NextN projection ───────────────────
     gpu.rmsnorm_f32(&scratch.tok_embd, &w.enorm, &scratch.e_norm, cfg.rms_norm_eps)?;
     gpu.rmsnorm_f32(prev_hidden, &w.hnorm, &scratch.h_norm, cfg.rms_norm_eps)?;
 
     // ── 3. concat = [e_norm | h_norm], then cur = eh_proj @ concat ───────
-    let dim_bytes = n_embd * 4;
     gpu.hip.memcpy_dtod_at(&scratch.concat.buf, 0, &scratch.e_norm.buf, 0, dim_bytes)?;
     gpu.hip.memcpy_dtod_at(&scratch.concat.buf, dim_bytes, &scratch.h_norm.buf, 0, dim_bytes)?;
     weight_gemv(gpu, &w.eh_proj, &scratch.concat, &scratch.cur)?;
@@ -662,13 +735,121 @@ pub fn mtp_head_forward(
     gpu.add_inplace_f32(&scratch.ffn_out, &scratch.o)?;
     // scratch.ffn_out now holds the post-FFN, pre-LM-head-norm hidden.
 
-    // Snapshot for callers that want to chain into n+2 prediction.
+    // Snapshot for callers that want to chain into n+2 prediction OR feed
+    // into the batched `mtp_head_apply_lm_head_batched` end-of-chain reduce.
     gpu.hip.memcpy_dtod_at(&scratch.t_mtp_out.buf, 0, &scratch.ffn_out.buf, 0, dim_bytes)?;
 
-    // ── 11. shared_head_norm + lm_head ──────────────────────────────────
-    gpu.rmsnorm_f32(&scratch.ffn_out, &w.shared_head_norm, &scratch.tmp, cfg.rms_norm_eps)?;
-    weight_gemv(gpu, lm_head_weights, &scratch.tmp, &scratch.logits)?;
+    Ok(())
+}
 
+/// Batched end-of-chain LM head: applies `shared_head_norm` to `n` stacked
+/// `t_mtp_out` rows and runs the trunk's lm_head as a single batched GEMM.
+///
+/// `t_mtp_outs_stacked` has shape `[n, n_embd]` (row-major, contiguous).
+/// `logits_batched` is the caller-allocated output of shape `[n, vocab]`.
+/// `tmp_batched` is `[n, n_embd]` scratch for the rmsnorm output (caller
+/// owns; reused across cycles).
+/// `rot_batched` is `[n, n_embd]` scratch used for FWHT-rotated x for
+/// MagnumQuant lm_heads (MQ4/MQ3/MQ6); ignored for non-MQ dtypes.
+///
+/// Mirrors the per-dtype dispatch in `mtp_probe::probe_one_step` and
+/// `speculative::verify_dflash_block_inner`.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_apply_lm_head_batched(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    lm_head_weights: &WeightTensor,
+    t_mtp_outs_stacked: &GpuTensor,
+    tmp_batched: &GpuTensor,
+    rot_batched: &GpuTensor,
+    logits_batched: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let n_embd = cfg.n_embd;
+    let vocab = cfg.vocab_size;
+    assert_eq!(
+        lm_head_weights.k, n_embd,
+        "mtp_head_apply_lm_head_batched: lm_head_weights.k={} but n_embd={n_embd}",
+        lm_head_weights.k,
+    );
+    assert!(
+        t_mtp_outs_stacked.numel() >= n * n_embd,
+        "t_mtp_outs_stacked too small: {} < n*n_embd ({})",
+        t_mtp_outs_stacked.numel(), n * n_embd,
+    );
+    assert!(
+        tmp_batched.numel() >= n * n_embd,
+        "tmp_batched too small: {} < n*n_embd ({})",
+        tmp_batched.numel(), n * n_embd,
+    );
+    assert!(
+        logits_batched.numel() >= n * vocab,
+        "logits_batched too small: {} < n*vocab ({})",
+        logits_batched.numel(), n * vocab,
+    );
+
+    // Per-row shared_head_norm.
+    gpu.rmsnorm_batched(t_mtp_outs_stacked, &w.shared_head_norm, tmp_batched,
+                        n, n_embd, cfg.rms_norm_eps)?;
+
+    // Per-dtype batched LM head dispatch (mirrors mtp_probe.rs:278+).
+    let logits_view = logits_batched.sub_offset(0, n * vocab);
+    match lm_head_weights.gpu_dtype {
+        DType::Q8_0 => {
+            gpu.gemm_q8_0_batched(
+                &lm_head_weights.buf, tmp_batched, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        DType::HFQ4G256 => {
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &lm_head_weights.buf, tmp_batched, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        DType::MQ4G256 => {
+            let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
+            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            gpu.gemm_hfq4g256_batched_lmhead(
+                &lm_head_weights.buf, &rot_view, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        DType::MQ3G256 => {
+            let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
+            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            gpu.gemm_hfq3g256_batched_lmhead(
+                &lm_head_weights.buf, &rot_view, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        DType::HFQ6G256 => {
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &lm_head_weights.buf, tmp_batched, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        DType::MQ6G256 => {
+            let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
+            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            gpu.gemm_hfq6g256_batched_lmhead(
+                &lm_head_weights.buf, &rot_view, &logits_view,
+                lm_head_weights.m, lm_head_weights.k, n,
+            )?;
+        }
+        _ => {
+            // Fallback: per-row weight_gemv. Same path mtp_probe uses for
+            // unrecognized dtypes. Defeats the K-amortization but keeps
+            // correctness for less-common lm_head formats.
+            for i in 0..n {
+                let row = tmp_batched.sub_offset(i * n_embd, n_embd);
+                let logits_row = logits_view.sub_offset(i * vocab, vocab);
+                weight_gemv(gpu, lm_head_weights, &row, &logits_row)?;
+            }
+        }
+    }
     Ok(())
 }
 
