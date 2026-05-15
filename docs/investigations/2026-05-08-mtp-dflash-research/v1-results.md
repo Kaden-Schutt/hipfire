@@ -234,3 +234,86 @@ confirmed recompiled, AR-baseline output is byte-identical. The `!!!!!` is not
 a JIT artifact. The hypothesis is partially supported for the probe path (run
 1 still collapses, runs 2/3 escape), but in a way that opens a new bug rather
 than closing one.
+
+---
+
+## 2026-05-15 second re-run after hipGraph default-OFF (commit 788c1090)
+
+The 2026-05-15 first re-run blamed the bug on a model-side AR attractor and
+linked it to `docs/investigations/2026-05-12-deltanet-mq4-bug/`. **That
+attribution was wrong.** Empirical disambiguation (this run):
+
+### Daemon-vs-example smoke (same model, same prompt, same kernels)
+
+| path | output first 4 tokens | output coherent? |
+|---|---|---|
+| daemon (`crates/hipfire-runtime/examples/daemon.rs`) | ` an LRU cache with O(1)...` | YES |
+| `infer_qwen35` (per-token `forward_scratch`) | `<think>!!!!!!!!` (2048 of `!`) | NO |
+| `dflash_spec_demo --ar-baseline` (batched `forward_prefill_batch_with_pbs`) | `<think>\n\n!!!!!!!!` | NO |
+
+Same `qwen3.5-27b.mq4`, same LRU prompt, fresh kernels, same hardware.
+Daemon works; example binaries break.
+
+### Root cause: hipGraph capture/replay kernarg-snapshot bug on ROCm 7.2.2
+
+`HIPFIRE_GRAPH=0 ./target/release/examples/dflash_spec_demo --ar-baseline ...` produces COHERENT
+Python output at 487 tok/s prefill. With graph default-on (gfx11/12 per
+prior `forward_scratch` policy), prefill drops to 13.5 tok/s AND output
+collapses to `<think>\n!!!!!`.
+
+Inspection of decode token sequence with 3-call warmup
+(`AR_FORWARD_WARMUP_CALLS = 3`) showed: tokens 1-4 correct (`<think>\n</think>\n`),
+tokens 5+ all 0. The first 4 are the warmup-direct + capture-direct calls
+(all dispatch directly); token 5 is the FIRST replay. The bug is in REPLAY,
+not capture: the captured graph snapshots stale pos / kernarg state and
+every replay reads it instead of the live buffer.
+
+`stream_write_value32(pos_buf)` on the replay path was suspect, but a
+deeper fix requires HIP-side investigation. Practical mitigation in commit
+`788c1090`: **AR-forward hipGraph capture defaults OFF**, opt back in via
+`HIPFIRE_GRAPH=1` for experimental A/B. The 3-call countdown warmup
+infrastructure stays for when the underlying bug is fixed.
+
+### Real MTP probe bench (3× on 27B-3.5 LRU PEP-8 prompt, max=120, temp=0)
+
+With the coherent forward path:
+
+| run | prefill tok/s | decode tok/s | τ | cycles | committed | output coherent |
+|---|---|---|---|---|---|---|
+| 1 | 46.53 | 32.30 | 1.6000 | 75 | 120 (75r + 45s) | NO (backtick attractor) |
+| 2 | 46.32 | 41.51 | 1.6000 | 75 | 120 (75r + 45s) | NO (backtick attractor) |
+| 3 | 46.44 | 41.41 | 1.6000 | 75 | 120 (75r + 45s) | NO (backtick attractor) |
+
+**Discriminating test**: ran `dflash_spec_demo --ar-baseline --max 120` on
+the same prompt with the same forward path. Output: COHERENT Python class
+definition for 120 tokens, 45.68 tok/s. So the forward path is fine —
+the probe is the thing pushing the model into the backtick attractor.
+
+### Decision
+
+**ABORT v1 — probe wiring has a defect, NOT a real τ measurement.** The
+τ=1.6 number is on probe-induced attractor output (mask top-1 keeps
+predicting the same backtick token, slot-0 keeps emitting it, bonus accepts ≈
+60% of the time → committed/cycles ≈ 1.6). On the same coherent prompt where
+AR baseline produces real Python at max=120, the probe collapses to a
+backtick loop after ~10-15 tokens.
+
+Suspected probe bug locations (for a v2 investigation):
+1. `MaskEmbedOverride` slot index off-by-one or wrong buffer offset
+2. Mask token's position id wrong (RoPE phase delta skew — recurring class per CLAUDE.md)
+3. Candidate-slot KV cache write corrupting subsequent reads
+4. Replicated lm_head dispatch in `mtp_probe.rs:272-325` divergent from `verify_dflash_block_inner`
+5. Prompt-mean mask embedding pushing residual stream off-distribution
+
+**Next step**: debug `mtp_probe.rs` against the now-known-good forward path.
+Don't proceed to v2 head training until the v1 wiring produces τ on coherent
+output (i.e. probe doesn't push the model into an attractor on prompts where
+plain AR is coherent).
+
+### Files modified in this re-run
+
+- `crates/rdna-compute/src/dispatch.rs` — `ar_forward_warmed_up: bool` →
+  `ar_forward_warmup_remaining: u32`, init to `AR_FORWARD_WARMUP_CALLS = 3`
+- `crates/hipfire-arch-qwen35/src/qwen35.rs` — gate inverted: graph
+  `default-OFF`, opt-in via `HIPFIRE_GRAPH=1`
+- Commit: `788c1090`
