@@ -44,3 +44,8 @@ pub mod arch;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
+
+#[cfg(feature = "deltanet")]
+pub use mtp_compose::{
+    spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState,
+};

@@ -869,3 +869,399 @@ fn embed_lookup_into(
         EmbeddingFormat::F32      => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
     }
 }
+
+// ─── Batched MTP head forward (Task 11b) ─────────────────────────────────
+
+/// Per-call GPU scratch for the batched MTP head forward — sized for up to
+/// `max_n` MTP forwards processed in a single per-layer GEMM batch. Mirrors
+/// [`Qwen35MtpHeadScratch`] but with each tensor sized `max_n × <dim>`.
+///
+/// All buffers are row-major contiguous: row `i` for slot i lives at byte
+/// offset `i * <dim> * 4`, exactly as the trunk's batched-prefill scratch
+/// expects (and matches the layout the existing batched GEMM /
+/// rmsnorm_batched / rope_batched / deinterleave_batched kernels read).
+pub struct Qwen35MtpHeadBatchedScratch {
+    pub max_n: usize,
+    pub n_embd: usize,
+    pub n_ff: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    // Activations
+    pub tok_embd: GpuTensor,    // [max_n × n_embd]
+    pub e_norm: GpuTensor,      // [max_n × n_embd]
+    pub h_norm: GpuTensor,      // [max_n × n_embd]
+    pub concat: GpuTensor,      // [max_n × 2 × n_embd]
+    pub cur: GpuTensor,         // [max_n × n_embd]
+    pub residual: GpuTensor,    // [max_n × n_embd]
+    pub tmp: GpuTensor,         // [max_n × n_embd]
+    // Attention sub-block
+    pub q_full: GpuTensor,      // [max_n × 2 × q_dim]
+    pub q: GpuTensor,           // [max_n × q_dim]
+    pub gate: GpuTensor,        // [max_n × q_dim]
+    pub k: GpuTensor,           // [max_n × kv_dim]
+    pub v: GpuTensor,           // [max_n × kv_dim]
+    pub attn_out: GpuTensor,    // [max_n × q_dim]
+    pub o: GpuTensor,           // [max_n × n_embd]
+    // FFN sub-block
+    pub gate_ffn: GpuTensor,    // [max_n × n_ff]
+    pub up: GpuTensor,          // [max_n × n_ff]
+    pub ffn_hidden: GpuTensor,  // [max_n × n_ff]
+    pub ffn_out: GpuTensor,     // [max_n × n_embd]
+    /// Stacked post-FFN, pre-LM-head-norm hidden — feeds
+    /// `mtp_head_apply_lm_head_batched` directly. [max_n × n_embd]
+    pub t_mtp_outs: GpuTensor,
+    /// Per-slot positions device buffer. [max_n] i32, uploaded fresh each call.
+    pub positions: GpuTensor,
+}
+
+impl Qwen35MtpHeadBatchedScratch {
+    pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig, max_n: usize) -> HipResult<Self> {
+        assert!(max_n >= 1, "Qwen35MtpHeadBatchedScratch: max_n must be >= 1");
+        let dim = config.n_embd;
+        let q_dim = config.head_dim * config.n_head;
+        let kv_dim = config.head_dim * config.n_head_kv;
+        Ok(Self {
+            max_n,
+            n_embd: dim,
+            n_ff: config.n_ff,
+            q_dim,
+            kv_dim,
+            tok_embd: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            e_norm: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            h_norm: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            concat: gpu.alloc_tensor(&[max_n * 2 * dim], DType::F32)?,
+            cur: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            residual: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            tmp: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            q_full: gpu.alloc_tensor(&[max_n * 2 * q_dim], DType::F32)?,
+            q: gpu.alloc_tensor(&[max_n * q_dim], DType::F32)?,
+            gate: gpu.alloc_tensor(&[max_n * q_dim], DType::F32)?,
+            k: gpu.alloc_tensor(&[max_n * kv_dim], DType::F32)?,
+            v: gpu.alloc_tensor(&[max_n * kv_dim], DType::F32)?,
+            attn_out: gpu.alloc_tensor(&[max_n * q_dim], DType::F32)?,
+            o: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            gate_ffn: gpu.alloc_tensor(&[max_n * config.n_ff], DType::F32)?,
+            up: gpu.alloc_tensor(&[max_n * config.n_ff], DType::F32)?,
+            ffn_hidden: gpu.alloc_tensor(&[max_n * config.n_ff], DType::F32)?,
+            ffn_out: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            t_mtp_outs: gpu.alloc_tensor(&[max_n * dim], DType::F32)?,
+            positions: gpu.alloc_tensor(&[max_n], DType::F32)?, // F32 alias for i32 storage
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.tok_embd);
+        let _ = gpu.free_tensor(self.e_norm);
+        let _ = gpu.free_tensor(self.h_norm);
+        let _ = gpu.free_tensor(self.concat);
+        let _ = gpu.free_tensor(self.cur);
+        let _ = gpu.free_tensor(self.residual);
+        let _ = gpu.free_tensor(self.tmp);
+        let _ = gpu.free_tensor(self.q_full);
+        let _ = gpu.free_tensor(self.q);
+        let _ = gpu.free_tensor(self.gate);
+        let _ = gpu.free_tensor(self.k);
+        let _ = gpu.free_tensor(self.v);
+        let _ = gpu.free_tensor(self.attn_out);
+        let _ = gpu.free_tensor(self.o);
+        let _ = gpu.free_tensor(self.gate_ffn);
+        let _ = gpu.free_tensor(self.up);
+        let _ = gpu.free_tensor(self.ffn_hidden);
+        let _ = gpu.free_tensor(self.ffn_out);
+        let _ = gpu.free_tensor(self.t_mtp_outs);
+        let _ = gpu.free_tensor(self.positions);
+    }
+}
+
+/// Per-format BATCHED weight GEMM dispatch for the MTP head's inner-layer
+/// projections. M is the OUTPUT row count, K is the input dim. Each batch
+/// row `i` reads `x[i * k..(i+1) * k]` and writes `y[i * m..(i+1) * m]`.
+///
+/// Reuses the same kernels the trunk's prefill batch + lm_head batched paths
+/// use (no new kernels).
+fn weight_gemm_batched(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_batched: &GpuTensor,
+    y_batched: &GpuTensor,
+    n: usize,
+    rotated_x_scratch: Option<&GpuTensor>,
+) -> HipResult<()> {
+    match w.gpu_dtype {
+        DType::Q8_0 => gpu.gemm_q8_0_batched(&w.buf, x_batched, y_batched, w.m, w.k, n),
+        DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x_batched, y_batched, w.m, w.k, n),
+        DType::MQ4G256 => {
+            // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
+            let rot = rotated_x_scratch
+                .expect("MQ4 batched gemm requires rotated_x_scratch");
+            gpu.rotate_x_mq_batched(x_batched, rot, w.k, n)?;
+            gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
+        }
+        DType::F32 => {
+            // Fallback: per-row gemv (slow but correct). MTP head loaded via
+            // load_weight_raw can ship F32 for rare formats — keep functional.
+            for i in 0..n {
+                let x_row = x_batched.sub_offset(i * w.k, w.k);
+                let y_row = y_batched.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)?;
+            }
+            Ok(())
+        }
+        other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
+    }
+}
+
+/// Batched MTP head block forward (Task 11b).
+///
+/// Runs the NextN concat + eh_proj + gated-Q attention + SwiGLU FFN over
+/// `n` parallel slots in a single per-layer GEMM batch. Each slot has its
+/// OWN `prev_hidden` and `next_token`; the K/V for slot `i` are written to
+/// the MTP head's KV cache at `positions[i]`.
+///
+/// ## v1 simplification: per-slot independent attention
+///
+/// Each slot's attention reads ONLY its own freshly-written K/V at the
+/// caller-supplied position. There's no cross-slot attention, no historical
+/// reads from previous cycles' MTP slots. This is the v1 simplification —
+/// the MTP head was trained with full historical attention, so τ_mtp may
+/// drop, but the trunk verify is the correctness gate: bad MTP candidates
+/// just get rejected.
+///
+/// Concretely, attention reduces to: `out[h, d] = V[h, d]` (single-key
+/// attention with self-only key collapses softmax to 1). The gate
+/// (sigmoid_mul) then modulates V before `wo`. We still WRITE K/V to the
+/// per-slot KV slot so future cycles' historical reads (when wired) would
+/// see the correct cache state — slot writes are cheap and keep the cache
+/// snapshot invariant simple.
+///
+/// ## Inputs
+///
+/// - `prev_hiddens_stacked`: `[n × n_embd]` row-major. Slot i's drafter /
+///   trunk hidden that gets fed into `hnorm`.
+/// - `next_tokens`: length-`n` slice of u32 token ids — embedded via the
+///   trunk's `token_embd` table, then RMSNorm'd via `enorm`.
+/// - `positions`: length-`n` slice of i32 absolute MTP-cache slots. Each
+///   `positions[i]` MUST be < `kv.max_seq` and unique (or the K/V writes
+///   collide). Caller is responsible for slot allocation.
+///
+/// ## Output
+///
+/// - `scratch.t_mtp_outs[i]` holds the post-FFN hidden for slot i. Pass the
+///   full `t_mtp_outs` view to [`mtp_head_apply_lm_head_batched`] for the
+///   batched lm_head step.
+///
+/// ## Side effects
+///
+/// - K/V for slot i written into `kv` at slot `positions[i]`. Caller may
+///   call `kv.reset(gpu)` after the cycle if the writes shouldn't persist.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_head_forward_block_batched(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &mut Qwen35MtpHeadBatchedScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_tokens: &[u32],
+    prev_hiddens_stacked: &GpuTensor,
+    positions: &[i32],
+    n: usize,
+    trunk_weights: &Qwen35Weights,
+    rotated_x_scratch: Option<&GpuTensor>,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let dim = cfg.n_embd;
+    let q_dim = cfg.head_dim * cfg.n_head;
+    let kv_dim = cfg.head_dim * cfg.n_head_kv;
+    let dim_bytes = dim * 4;
+
+    assert_eq!(next_tokens.len(), n, "next_tokens.len() != n");
+    assert_eq!(positions.len(), n, "positions.len() != n");
+    assert!(n <= scratch.max_n, "n={n} > scratch.max_n={}", scratch.max_n);
+    assert!(prev_hiddens_stacked.numel() >= n * dim,
+        "prev_hiddens_stacked too small: {} < n*dim ({})",
+        prev_hiddens_stacked.numel(), n * dim);
+    for &p in positions {
+        assert!(
+            (p as usize) < kv.max_seq,
+            "position {p} >= kv.max_seq {}", kv.max_seq,
+        );
+    }
+
+    // Upload positions (i32 stored in F32-typed buffer; aliasing is fine since
+    // the kernels read raw bytes via memcpy_htod into the F32 buffer).
+    {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4)
+        };
+        gpu.hip.memcpy_htod(&scratch.positions.buf, bytes)?;
+    }
+
+    // ── 1. Per-slot token embeddings into stacked tok_embd ───────────────
+    // No batched embedding-lookup kernel; per-slot dispatch is cheap (n×fast lookups).
+    for (i, &tok) in next_tokens.iter().enumerate() {
+        let dst = scratch.tok_embd.sub_offset(i * dim, dim);
+        embed_lookup_into(gpu, trunk_weights, &dst, tok, dim)?;
+    }
+
+    // ── 2. Batched RMSNorm both inputs to NextN projection ───────────────
+    let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
+    let e_norm_view = scratch.e_norm.sub_offset(0, n * dim);
+    let prev_view = prev_hiddens_stacked.sub_offset(0, n * dim);
+    let h_norm_view = scratch.h_norm.sub_offset(0, n * dim);
+    gpu.rmsnorm_batched(&tok_embd_view, &w.enorm, &e_norm_view, n, dim, cfg.rms_norm_eps)?;
+    gpu.rmsnorm_batched(&prev_view, &w.hnorm, &h_norm_view, n, dim, cfg.rms_norm_eps)?;
+
+    // ── 3. Build concat = [e_norm | h_norm] per slot ─────────────────────
+    // Layout: concat[i] = [e_norm[i, 0..dim], h_norm[i, 0..dim]] (length 2*dim).
+    for i in 0..n {
+        gpu.hip.memcpy_dtod_at(
+            &scratch.concat.buf, i * 2 * dim_bytes,
+            &scratch.e_norm.buf, i * dim_bytes,
+            dim_bytes,
+        )?;
+        gpu.hip.memcpy_dtod_at(
+            &scratch.concat.buf, i * 2 * dim_bytes + dim_bytes,
+            &scratch.h_norm.buf, i * dim_bytes,
+            dim_bytes,
+        )?;
+    }
+
+    // cur = eh_proj @ concat (per-slot). w.eh_proj has m=n_embd, k=2*n_embd.
+    let concat_view = scratch.concat.sub_offset(0, n * 2 * dim);
+    let cur_view = scratch.cur.sub_offset(0, n * dim);
+    weight_gemm_batched(gpu, &w.eh_proj, &concat_view, &cur_view, n, rotated_x_scratch)?;
+
+    // Save residual (inpSA) for the post-attn add.
+    gpu.hip.memcpy_dtod_at(
+        &scratch.residual.buf, 0,
+        &scratch.cur.buf, 0,
+        n * dim_bytes,
+    )?;
+
+    // ── 4. Pre-attn norm + Q/K/V projections ─────────────────────────────
+    let tmp_view = scratch.tmp.sub_offset(0, n * dim);
+    gpu.rmsnorm_batched(&cur_view, &w.attn_norm, &tmp_view, n, dim, cfg.rms_norm_eps)?;
+
+    // wq emits 2 * q_dim per slot.
+    let q_full_view = scratch.q_full.sub_offset(0, n * 2 * q_dim);
+    weight_gemm_batched(gpu, &w.wq, &tmp_view, &q_full_view, n, rotated_x_scratch)?;
+
+    // Deinterleave per-head into Q + Gate. Output: [n × n_head × head_dim] each.
+    let q_view = scratch.q.sub_offset(0, n * q_dim);
+    let gate_view = scratch.gate.sub_offset(0, n * q_dim);
+    gpu.deinterleave_f32_batched(&q_full_view, &q_view, &gate_view, cfg.n_head, cfg.head_dim, n)?;
+
+    // attn_q_norm: per-head normalization of Q.
+    // rmsnorm_batched treats `batch` as "rows of length n", and gates the
+    // single norm-weight broadcast across all rows. For per-head norm here,
+    // each Q row is `n_head` heads of length `head_dim`, so we want
+    // `batch = n * n_head`, `n = head_dim`. Same convention as the trunk's
+    // per-head q_norm at qwen35.rs.
+    gpu.rmsnorm_batched(
+        &q_view, &w.attn_q_norm, &q_view,
+        n * cfg.n_head, cfg.head_dim, cfg.rms_norm_eps,
+    )?;
+
+    // K, V projections.
+    let k_view = scratch.k.sub_offset(0, n * kv_dim);
+    let v_view = scratch.v.sub_offset(0, n * kv_dim);
+    weight_gemm_batched(gpu, &w.wk, &tmp_view, &k_view, n, rotated_x_scratch)?;
+    weight_gemm_batched(gpu, &w.wv, &tmp_view, &v_view, n, rotated_x_scratch)?;
+    gpu.rmsnorm_batched(
+        &k_view, &w.attn_k_norm, &k_view,
+        n * cfg.n_head_kv, cfg.head_dim, cfg.rms_norm_eps,
+    )?;
+
+    // ── 5. Batched RoPE on Q + K ─────────────────────────────────────────
+    gpu.rope_partial_interleaved_f32_batched(
+        &q_view, &k_view, &scratch.positions,
+        cfg.n_head, cfg.n_head_kv, cfg.head_dim, cfg.n_rot, cfg.rope_theta, n,
+    )?;
+
+    // ── 6. v1 simplification: per-slot K/V writes + attention = V
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Each slot's attention reads its own KV slot only, so attn_out = V
+    // (single-token softmax = 1). We still write K/V to make the KV cache
+    // available for future cycles that wire historical reads.
+    //
+    // Per-slot K/V writes use the F32 KV cache write helper. Each write is
+    // `kv_dim` floats; positions[i] is the slot. We construct a per-slot
+    // device pos_buf by sub-offsetting `scratch.positions`, but
+    // kv_cache_write expects a separate i32 device buffer per call. To avoid
+    // n separate allocs, we pass sub-offset views of `scratch.positions`
+    // (each one i32-sized), since the kernel reads `*pos` as the slot index.
+    for i in 0..n {
+        let k_row = scratch.k.sub_offset(i * kv_dim, kv_dim);
+        let v_row = scratch.v.sub_offset(i * kv_dim, kv_dim);
+        let pos_slot = scratch.positions.sub_offset(i, 1);
+        gpu.kv_cache_write(&kv.k_gpu, &k_row, &pos_slot.buf, kv_dim)?;
+        gpu.kv_cache_write(&kv.v_gpu, &v_row, &pos_slot.buf, kv_dim)?;
+    }
+
+    // attn_out = V (self-only attention with 1 key collapses softmax to 1).
+    // V layout = [n × n_head_kv × head_dim]; attn_out layout = [n × n_head × head_dim].
+    // For GQA (n_head > n_head_kv), repeat each KV head `n_head/n_head_kv` times.
+    let attn_out_view = scratch.attn_out.sub_offset(0, n * q_dim);
+    if cfg.n_head == cfg.n_head_kv {
+        // No GQA expansion: attn_out := V row-by-row.
+        gpu.hip.memcpy_dtod_at(
+            &scratch.attn_out.buf, 0,
+            &scratch.v.buf, 0,
+            n * kv_dim * 4,
+        )?;
+    } else {
+        let ratio = cfg.n_head / cfg.n_head_kv;
+        assert!(
+            cfg.n_head % cfg.n_head_kv == 0,
+            "n_head ({}) must be divisible by n_head_kv ({})",
+            cfg.n_head, cfg.n_head_kv,
+        );
+        // Per-slot per-head expand: attn_out[i, h, d] = V[i, h/ratio, d].
+        for i in 0..n {
+            for h in 0..cfg.n_head {
+                let kv_h = h / ratio;
+                let src_off = (i * kv_dim + kv_h * cfg.head_dim) * 4;
+                let dst_off = (i * q_dim + h * cfg.head_dim) * 4;
+                gpu.hip.memcpy_dtod_at(
+                    &scratch.attn_out.buf, dst_off,
+                    &scratch.v.buf, src_off,
+                    cfg.head_dim * 4,
+                )?;
+            }
+        }
+    }
+
+    // ── 7. Apply gate (sigmoid * attn_out, in-place) ─────────────────────
+    // sigmoid_mul_f32 is shape-agnostic (operates on flat buffer); pass the
+    // full `n * q_dim` views.
+    gpu.sigmoid_mul_f32(&attn_out_view, &gate_view)?;
+
+    // ── 8. Output projection + residual ──────────────────────────────────
+    let o_view = scratch.o.sub_offset(0, n * dim);
+    weight_gemm_batched(gpu, &w.wo, &attn_out_view, &o_view, n, rotated_x_scratch)?;
+    let res_view = scratch.residual.sub_offset(0, n * dim);
+    gpu.add_inplace_f32(&o_view, &res_view)?;
+
+    // ── 9. POST-attn norm + SwiGLU FFN + residual ────────────────────────
+    gpu.rmsnorm_batched(&o_view, &w.attn_post_norm, &tmp_view, n, dim, cfg.rms_norm_eps)?;
+
+    let gate_ffn_view = scratch.gate_ffn.sub_offset(0, n * cfg.n_ff);
+    let up_view = scratch.up.sub_offset(0, n * cfg.n_ff);
+    let ffn_hidden_view = scratch.ffn_hidden.sub_offset(0, n * cfg.n_ff);
+    let ffn_out_view = scratch.ffn_out.sub_offset(0, n * dim);
+    weight_gemm_batched(gpu, &w.ffn_gate, &tmp_view, &gate_ffn_view, n, rotated_x_scratch)?;
+    weight_gemm_batched(gpu, &w.ffn_up,   &tmp_view, &up_view,       n, rotated_x_scratch)?;
+    gpu.silu_mul_f32(&gate_ffn_view, &up_view, &ffn_hidden_view)?;
+    weight_gemm_batched(gpu, &w.ffn_down, &ffn_hidden_view, &ffn_out_view, n, rotated_x_scratch)?;
+    gpu.add_inplace_f32(&ffn_out_view, &o_view)?;
+
+    // ── 10. Snapshot post-FFN hidden into t_mtp_outs ─────────────────────
+    gpu.hip.memcpy_dtod_at(
+        &scratch.t_mtp_outs.buf, 0,
+        &scratch.ffn_out.buf, 0,
+        n * dim_bytes,
+    )?;
+
+    Ok(())
+}
