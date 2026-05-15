@@ -214,16 +214,58 @@ impl HfqFile {
             .map(|s| s.to_string())
     }
 
+    /// Resolve a tensor name, trying common prefix variants.
+    ///
+    /// Qwen3.5 safetensors-converted files store tensors under
+    /// `model.language_model.layers.N.` while the canonical GGUF-derived
+    /// hipfire-quantize path produces `model.layers.N.`. Callers consistently
+    /// pass one prefix style; this helper tries the exact name first, then
+    /// strips or adds the `model.language_model.` prefix so a model file
+    /// from either pipeline loads cleanly. Returns `None` only when no
+    /// variant matches — the per-callsite `?` early-return is preserved.
+    fn resolve_idx(&self, name: &str) -> Option<usize> {
+        if let Some(&idx) = self.tensor_map.get(name) {
+            return Some(idx);
+        }
+        // Strip "model.language_model." → "model."
+        if let Some(rest) = name.strip_prefix("model.language_model.") {
+            let short = format!("model.{rest}");
+            if let Some(&idx) = self.tensor_map.get(&short) {
+                return Some(idx);
+            }
+        }
+        // Add "model.language_model." prefix: "model.X" → "model.language_model.X"
+        if let Some(rest) = name.strip_prefix("model.") {
+            let long = format!("model.language_model.{rest}");
+            if let Some(&idx) = self.tensor_map.get(&long) {
+                return Some(idx);
+            }
+        }
+        // Try with `model.` / `model.language_model.` added when name has no
+        // `model.` prefix at all (e.g. `lm_head.weight`).
+        if !name.starts_with("model.") {
+            let with_model = format!("model.{name}");
+            if let Some(&idx) = self.tensor_map.get(&with_model) {
+                return Some(idx);
+            }
+            let with_lm = format!("model.language_model.{name}");
+            if let Some(&idx) = self.tensor_map.get(&with_lm) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
     /// Look up a tensor's metadata (name, quant_type, shape, byte offset/size)
     /// without copying its data. The weight pager calls this at load time to
     /// register byte ranges without forcing eager VRAM allocation.
     pub fn find_tensor_info(&self, name: &str) -> Option<&HfqTensorInfo> {
-        let idx = *self.tensor_map.get(name)?;
+        let idx = self.resolve_idx(name)?;
         Some(&self.tensors[idx])
     }
 
     pub fn tensor_data(&self, name: &str) -> Option<(&HfqTensorInfo, &[u8])> {
-        let idx = *self.tensor_map.get(name)?;
+        let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
         debug_assert!(
             self.mmap.is_some(),
@@ -243,7 +285,7 @@ impl HfqFile {
     #[cfg(unix)]
     pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
         use std::os::unix::io::AsRawFd;
-        let idx = *self.tensor_map.get(name)?;
+        let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
         let fd = self._file.as_raw_fd();
         {
@@ -280,7 +322,7 @@ impl HfqFile {
     ///
     /// Returns owned Vec<u8> to avoid lifetime issues with the pread RefCell.
     pub fn tensor_data_vec(&self, name: &str) -> Option<(&HfqTensorInfo, Vec<u8>)> {
-        let idx = *self.tensor_map.get(name)?;
+        let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
 
         #[cfg(unix)]
@@ -341,7 +383,7 @@ impl HfqFile {
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
-        self.tensor_map.get(name).map(|&i| &self.tensors[i])
+        self.resolve_idx(name).map(|i| &self.tensors[i])
     }
 
     /// Returns the name of the first tensor whose `quant_type` matches `qt`,
