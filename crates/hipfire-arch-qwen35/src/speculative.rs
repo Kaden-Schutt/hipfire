@@ -205,40 +205,50 @@ impl ModelSlot {
         })?;
         let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
 
-        let n_kv_layers = config
+        // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
+        // FullAttention out of 64 total), only the FullAttention layers need
+        // a KV cache slot. The LinearAttention layers carry their own state
+        // via DeltaNetState (`new_with_quant` below) and never write to
+        // kv_cache.k_gpu / .v_gpu. Pre-2026-05-15 the KV constructor
+        // allocated full K/V slots for ALL layers regardless of type — at
+        // ctx=64K that's ~5 GB of dead allocation on 27B. The `_filtered`
+        // constructors take a `is_kv_layer` slice and substitute a
+        // 1-element placeholder for non-KV layers. Indexing by absolute
+        // layer_idx is preserved.
+        let is_kv_layer: Vec<bool> = config
             .layer_types
             .iter()
-            .filter(|t| **t == qwen35::LayerType::FullAttention)
-            .count();
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
 
         // Honor the caller's requested KV cache mode. Default is Q8 for
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
         // longer contexts — asym3/asym4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
-            KvMode::Q8 => KvCache::new_gpu_q8(
+            KvMode::Q8 => KvCache::new_gpu_q8_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym4 => KvCache::new_gpu_asym4(
+            KvMode::Asym4 => KvCache::new_gpu_asym4_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym3 => KvCache::new_gpu_asym3(
+            KvMode::Asym3 => KvCache::new_gpu_asym3_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym2 => KvCache::new_gpu_asym2(
+            KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
