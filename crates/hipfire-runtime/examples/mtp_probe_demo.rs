@@ -78,6 +78,9 @@ fn main() {
         std::process::exit(2);
     }
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_raw).into_owned();
+    // md5 of the normalized bare prompt string (pre-ChatML wrap), consistent
+    // with the dflash_spec_demo convention. Used for cross-session bench
+    // reproducibility per CLAUDE.md prompt-structure τ rule.
     let prompt_hash = prompt_md5(prompt.as_bytes());
 
     eprintln!("=== mtp_probe_demo ===");
@@ -90,9 +93,10 @@ fn main() {
     eprintln!("gpu: {}", gpu.arch);
 
     let mut slot_cfg = ModelSlotConfig::default();
-    // Probe forward batches at most 3 positions per cycle. Reserve headroom
-    // for prefill + max generation + a small margin.
-    slot_cfg.max_seq = ctx_capacity + 16;
+    // Worst-case KV consumption: prompt_len + max_tokens * MTP_PROBE_MAX_BATCH (3)
+    // per cycle (probe advances by 2 or 3 KV slots regardless of how many tokens
+    // commit; the candidate slot writes to KV even on rejection). +8 padding.
+    slot_cfg.max_seq = ctx_capacity + max_tokens * 3 + 8;
     let t_load = Instant::now();
     let mut target = ModelSlot::load(
         &mut gpu, Path::new(&target_path), "target", slot_cfg,
@@ -127,8 +131,8 @@ fn main() {
     }
     assert!(!prompt_tokens.is_empty(), "empty prompt after tokenization");
     assert!(
-        prompt_tokens.len() + max_tokens + 8 <= ctx_capacity,
-        "prompt ({}) + max ({}) tokens won't fit in --ctx {}; raise --ctx",
+        prompt_tokens.len() + max_tokens * 3 + 8 <= ctx_capacity,
+        "prompt ({}) + max ({}) * 3 KV slots/cycle won't fit in --ctx {}; raise --ctx",
         prompt_tokens.len(), max_tokens, ctx_capacity,
     );
 
