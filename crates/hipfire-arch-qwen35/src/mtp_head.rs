@@ -368,6 +368,10 @@ pub fn load_mtp_head(
     let n_embd = config.n_embd;
     let head_dim = config.head_dim;
 
+    // shared_head_norm gets +1.0 like the per-layer norms — empirically
+    // verified 2026-05-15 A/B: removing +1.0 regressed K=3 from τ=3.08 to
+    // τ=2.00 on 27B-3.5 LRU bench. The MTP head trains its `mtp.norm` with
+    // the trunk per-layer convention, NOT the trunk final-norm convention.
     let shared_head_norm = load_norm_raw(&hfq, gpu, "shared_head_norm", n_embd)?;
     let enorm           = load_norm_raw(&hfq, gpu, "enorm",            n_embd)?;
     let hnorm           = load_norm_raw(&hfq, gpu, "hnorm",            n_embd)?;
@@ -406,6 +410,17 @@ pub fn load_mtp_head(
 fn load_norm_raw(
     hfq: &HfqFile, gpu: &mut Gpu, name: &str, expected_n: usize,
 ) -> HipResult<GpuTensor> {
+    load_norm_raw_with_offset(hfq, gpu, name, expected_n, true)
+}
+
+/// Like load_norm_raw but allows callers to control whether the +1.0 trunk
+/// offset is applied. Trunk's per-layer norms get +1; trunk's FINAL norm
+/// (`model.norm.weight` → `output_norm`) is RAW. The MTP head's
+/// `mtp.norm.weight` (shared_head_norm) is the equivalent of the trunk's
+/// final norm — should also be RAW. Pass apply_plus_one=false for that one.
+fn load_norm_raw_with_offset(
+    hfq: &HfqFile, gpu: &mut Gpu, name: &str, expected_n: usize, apply_plus_one: bool,
+) -> HipResult<GpuTensor> {
     let (info, data) = hfq
         .tensor_data_vec(name)
         .unwrap_or_else(|| panic!(".mtp tensor '{name}' missing"));
@@ -433,7 +448,9 @@ fn load_norm_raw(
     // shipped values for `mtp.norm.weight` ≈ 0 (consistent with offset
     // representation). Off-by-one risk is small: the trunk does the same
     // +1 for `shared_expert_intermediate.norm` etc.
-    for v in &mut f32_data { *v += 1.0; }
+    if apply_plus_one {
+        for v in &mut f32_data { *v += 1.0; }
+    }
     gpu.upload_f32(&f32_data, &[expected_n])
 }
 
