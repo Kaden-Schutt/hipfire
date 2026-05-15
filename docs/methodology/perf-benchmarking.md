@@ -4,34 +4,51 @@ The protocol for measuring kernel-level tok/s honestly. Read this
 before claiming any win in a commit message; the gates assume you've
 followed it.
 
+## Warm the cache and DPM state first
+
+The single biggest cause of "noisy" benches is **measuring a cold
+process before the kernel JIT cache and DPM state have warmed up**.
+A first run after `cargo build` is 3-7× slower than steady state
+because hipcc compiles kernels on first dispatch and the GPU
+clocks haven't ramped. **That's not "DPM noise" — that's measurement
+error.** Warm first, then measure.
+
+Warmup options (any of these is sufficient):
+- `HIPFIRE_DPM_WARMUP_SECS=10` env var on the bench binary
+  (built into `bench_qwen35_mq4`, `dflash_spec_demo`, daemon)
+- A throwaway warmup run with the same prompt before the timed run
+- Use `scripts/probe_commits.sh` (handles warmup automatically)
+
 ## The within-session noise band
 
-On gfx1100 (7900 XTX) the within-session A/B noise band on a fresh
-process is **±10–15%** depending on DPM state, thermal headroom, and
-firmware version. This is BIG. A "+8%" win measured by changing some
-code in one shell session and re-running is **inside the noise**.
+Once warm, the within-session A/B noise band on gfx1100 (7900 XTX)
+is **±1–3%** on a fresh process. **A 3%+ delta is real signal worth
+investigating, not noise to wave off.** Earlier versions of this doc
+quoted ±10-15% — that figure conflated cold-start overhead with
+true noise and let real regressions slip through. Don't repeat the
+mistake: if you see a 3% delta, it's a real change. Bisect it.
 
-Sources of within-session drift, ranked by impact:
+Sources of REAL drift, ranked by impact (all distinct from the
+cold-start overhead above):
 
 1. **Stale build cache**. The speed-gate's `ensure_build()` is a
    no-op when the bench binary already exists. A "stash and re-bench"
    flow leaves the post-change binary in place, so both runs measure
    the same code. Always `rm target/release/examples/<bench>` before
    re-running.
-2. **DPM state**. The GPU clocks ramp up over the first ~5 seconds of
-   sustained load; benchmarks that include warmup catch this, ones
-   that don't measure cold clocks for the first run and hot clocks
-   for subsequent runs. Use `cat /sys/class/drm/card*/device/pp_dpm_sclk`
-   to inspect.
-3. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
+2. **Firmware shadowing**. `/lib/firmware/updates/amdgpu` overrides
    the kernel's bundled firmware; if the dkms-installed firmware
    doesn't match the kernel-installed firmware, you get a SMU IF
    mismatch and ~50% prefill cratering. Fix:
    `sudo mv /lib/firmware/updates/amdgpu /lib/firmware/updates/amdgpu.bak
    && sudo reboot`. Symptoms in `dmesg | tail -40`.
-4. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
+3. **Thermal throttle**. After 10+ minutes of sustained DFlash runs
    with the case closed, the 7900 XTX throttles. Check
    `cat /sys/class/drm/card*/device/hwmon/hwmon*/temp*_input`.
+4. **DPM state ON COLD START** (mitigated by warmup). The GPU clocks
+   ramp up over the first ~5 seconds of sustained load. This is the
+   confound the old "±10-15%" claim was actually measuring. Solved by
+   warmup; not a steady-state noise source.
 
 ## Cross-process verification
 
