@@ -346,3 +346,44 @@ is deferred. To recover hipGraph: do not aggressively purge the kernel
 cache mid-session, OR debug the JIT-order-vs-capture-snapshot interaction
 in `crates/rdna-compute/src/dispatch.rs`'s `begin_graph_capture` /
 `capture_blobs` machinery.
+
+---
+
+## 2026-05-15 — Native MTP head integration (Tasks 8-11) DEFERRED
+
+After the Qualcomm probe v1 was abandoned (probe wiring defect), pivoted to native Qwen MTP head extraction per `[option (a)]`. Built and benched the full stack:
+
+### What shipped (research-artifact infrastructure)
+
+- **Task 8** (`78e28a75`): `mtp_extract` binary — extracts 15 MTP tensors from Qwen3.5/3.6 dense safetensors → MQ4/Q8 .mtp file (arch_id=21). Validated on Qwen3.5-0.8B (10.38 MiB MQ4) and 27B (~215 MiB MQ4).
+- **Task 9** (`703c7023`): `Qwen35MtpHead` Rust struct + forward pass. Smoke on 0.8B PASS — coherent logits, KV cumulative, sensitive to inputs.
+- **Task 10** (`2ad85e57`): `spec_step_mtp` standalone MTP-only spec decode + bench harness. 27B canonical bench: **39.68 tok/s τ=3.08 at K=3** — BELOW AR baseline 45.
+- **Task 10b** (`96e51ed9`): lm_head batching attempt via feature-only K-step recursion. **REGRESSED to 26.00 tok/s τ=1.98** — feature-only chain breaks acceptance; lossless held but speed lost.
+- **Task 11** (`ed1162de`): `spec_step_dflash_mtp` linear-chain composition (DFlash B=16 + MTP K=1/2/3 appended at end). **108.9 tok/s** at K=1 — **−32.7% vs DFlash baseline** (which measured 161.7 on this branch, vs 199 in CLAUDE.md canonical).
+
+### Why MTP-on-hipfire doesn't win on this codebase + ROCm 7.2 + gfx1100
+
+The dominant per-MTP-step cost is **lm_head GEMV** (5120 × 248320 MQ4 = 127M elements per dispatch, ~12 ms each). The MTP head shares the trunk's vocab + hidden dim, so its lm_head is structurally identical-cost to the trunk's. DFlash works because its drafter is a SEPARATE smaller model (0.8B/9B) with smaller hidden dim → cheaper drafter lm_head per draft token. MTP doesn't have that escape hatch.
+
+Three optimization paths attempted:
+1. **lm_head batching with serial argmax**: impossible (step k+1's input depends on step k's argmax)
+2. **Feature-only K-step chain (Task 10b)**: empirically falsified (-34% perf)
+3. **Linear-chain composition (Task 11)**: empirically falsified (-32.7%)
+
+Same MEMORY.md pattern documented in `[[project_gfx11_dot2_trickle_down_falsified_2026_05_11]]` and adjacent: only launch-reduction levers (β / hipGraph / fusion) cross zero in production on this codebase + ROCm 7.2 + RDNA3. Adding work — even lossless work — consistently loses.
+
+### Deferred follow-ups (NOT recommended without architectural change)
+
+1. **Per-slot tree composition** with MTP block forwards batched as a single per-layer N=16 GEMM. Requires MTP forward to drop historical-KV (treat each candidate as independent), which breaks training-distribution alignment. Projected upside: ~210 tok/s (+30% over baseline). Risk: τ collapse from off-distribution input.
+2. **EAGLE-style smaller draft head**: requires training a custom head specifically for hipfire's drafter slot. ~1-2 weeks training + integration.
+3. **Wait for MTP architecture without lm_head sharing**: not on any published roadmap.
+
+### Disposition
+
+- **Code ships as research-artifact infrastructure** — `mtp_extract`, `mtp_head`, `mtp_spec`, `mtp_compose` all build clean and run when invoked manually
+- **NOT enabled in production** — daemon path unchanged
+- **No PR merge to master** — the work lives on `worktree-mtp-qualcomm-probe` for archival
+
+### Tangential finding worth investigation
+
+DFlash canonical bench measured **161.7 tok/s on this branch** vs CLAUDE.md's **199 tok/s τ=10.36** (-19%). Same config (asym3 KV, --no-chatml, max=120, PEP-8 prompt). Could be (a) the hipGraph hard-disable in `e218dd03` indirectly affected DFlash's verify path, (b) some other regression on this branch, (c) the 199 figure was measured under different conditions. Worth bisecting against master before merging anything off this branch.
