@@ -2,7 +2,7 @@
 
 Date: 2026-05-14
 Branch: `worktree-mtp-qualcomm-probe`
-Hardware: gfx1100 (k9lin's Sapphire Nitro+ 7900 XTX), ROCm runtime 1.18 (HIP 7.2)
+Hardware: gfx1100 (k9lin's Sapphire Nitro+ 7900 XTX), ROCm 7.2.2
 
 ## Algorithm
 
@@ -103,6 +103,10 @@ inherit the same 0-token attractor through the verify channel.
    one-token-ahead match rate. If τ then lands in the 1.4-2.0 range on
    coherent output, decision shifts to "proceed to head-training v2".
    If it lands ≤1.05, abort MTP-on-dflash entirely.
+5. The bare-AR `!!!!!` attractor on 27B-3.5 mq4 is likely the same root-cause
+   class tracked separately in `docs/investigations/2026-05-12-deltanet-mq4-bug/`
+   (placeholder dir from 2026-05-12). When that investigation produces a fix,
+   this v1 bench should be re-run before any v2 head-training decision.
 
 ## Cross-references
 
