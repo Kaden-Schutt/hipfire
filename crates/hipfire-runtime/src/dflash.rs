@@ -27,6 +27,20 @@ use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)
+/// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
+/// sized to this many rows × `max(inter, q_dim, num_extract * hidden)`,
+/// regardless of context length. Calls with `batch > MQ_X_ROT_CHUNK_ROWS`
+/// are chunked transparently inside `gemm_dispatch`.
+///
+/// Sizing rationale: at chunk=1024 and 27B (ne*h = 25600 floats per row),
+/// the scratch is `1024 × 25600 × 4 ≈ 100 MB`. The pre-2026-05-15
+/// allocator sized this buffer to `max_seq × ne × h`, which at ctx=17K
+/// reached 1.74 GB on 27B — a multi-GB waste that scaled with `max_seq`.
+/// Chunking adds `ceil(batch / 1024)` extra kernel launches on the
+/// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
+const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
+
 // ─── Config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -422,11 +436,26 @@ impl DflashScratch {
         let kvd = cfg.kv_dim();
 
         let mq_x_rot = if with_mq {
-            // The widest single rotation: max(max_ctx × ne*h, max_block × max(intermediate, q_dim)).
-            // ne*h on ctx is the `fc` rotation (target_hidden). intermediate is the `w_down`
-            // rotation. q_dim is the `wo` rotation. Take the max so a single
-            // buffer covers them all.
-            let widest = std::cmp::max(l * ne * h, b * std::cmp::max(inter, qd));
+            // Sized for a CHUNK of the worst-case MQ rotation, not the whole
+            // first-call prefix. The rotations called through `gemm_dispatch`
+            // are:
+            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = ne*h
+            //   - per-cycle wq/wk/wv/gate/up:       batch = b,         w.k = h
+            //   - per-cycle wo:                     batch = b,         w.k = q_dim
+            //   - per-cycle w_down:                 batch = b,         w.k = intermediate
+            //   - first-call wk/wv on prefix:       batch up to `l`,   w.k = h
+            //
+            // Steady-state cycles only need `b × max(inter, qd, ne*h)`. The
+            // first-call rotations against the full prefix used to pin the
+            // buffer to `l × ne × h` (1.7 GB at ctx=17K on 27B). That sizing
+            // forced VRAM bloat that scales with max_seq.
+            //
+            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, ne*h)`
+            // floats and chunk any call where `batch × w.k > scratch.size()`
+            // inside `gemm_dispatch`. The first-call rotations are split into
+            // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
+            // 1K prefix tokens (negligible vs seconds-scale prefill).
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
             Some(gpu.alloc_tensor(&[widest], DType::F32)?)
         } else {
             None
@@ -577,23 +606,58 @@ fn gemm_dispatch(
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
+            // Chunk on `batch` when the request exceeds the scratch capacity
+            // for this w.k. `mq_x_rot` is sized to MQ_X_ROT_CHUNK_ROWS × max(...)
+            // — first-call rotations against the full prefix split into
+            // `ceil(batch / max_chunk)` GEMMs.
             let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
-            // Use the prefix [0, batch * k) of the rotation scratch.
-            let rot_view = scratch.sub_offset(0, batch * w.k);
-            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
-            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                if let Err(e) = gpu.rotate_x_mq_batched(&x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                if let Err(e) = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
         }
         DType::MQ3G256 => {
             // Mirrors the MQ4 path: pre-rotate x via FWHT (same shared signs
             // as MQ4 — rotate_x_mq_batched is dtype-agnostic for the activation
             // side), invalidate the FP16 x cache because the rotated bytes
             // share the same source pointer, then dispatch the HFQ3 batched
-            // lm_head WMMA kernel.
+            // lm_head WMMA kernel. Chunked symmetrically with MQ4.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
-            let rot_view = scratch.sub_offset(0, batch * w.k);
-            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
-            gpu.fp16_x_source_ptr = std::ptr::null_mut();
-            gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                if let Err(e) = gpu.rotate_x_mq_batched(&x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                gpu.fp16_x_source_ptr = std::ptr::null_mut();
+                if let Err(e) = gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
