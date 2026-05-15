@@ -2100,6 +2100,7 @@ fn verify_dflash_block_inner(
             gdn_tape,
             tree_verify,
             verify_scratch.prefill_batch.as_ref(),
+            None, // mask_override: speculative verify path doesn't use the MTP probe hook
         )
     };
 

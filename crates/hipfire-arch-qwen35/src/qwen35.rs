@@ -72,6 +72,30 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 /// is `None`, LA layers fall back to the linear path (byte-exact with
 /// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
 /// callers that haven't been rewritten).
+/// Override the embedding for a single batch slot after the embedding-lookup
+/// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
+/// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
+/// from prompt-mean rather than the embedding table.
+///
+/// Default callers pass `None`; passing `Some(_)` triggers a single
+/// host-to-device memcpy into `pbs.x_batch.buf` at byte offset
+/// `slot * config.dim * 4` AFTER the embedding-lookup kernel populates
+/// the batched-x scratch and BEFORE the first layer reads it.
+///
+/// Constraints:
+///   - `slot < tokens.len()` of the call (asserted)
+///   - `embed.len() == config.dim` (asserted)
+///   - The override is applied unconditionally to whichever chunk's range
+///     contains `slot`. Multi-chunk callers MUST size the prefill batch
+///     scratch to keep their target slot in chunk 0, or pass the override
+///     only on the chunk where `slot < chunk_n`. (For the MTP probe the
+///     entire mask block fits in one chunk by construction.)
+#[derive(Clone, Copy)]
+pub struct MaskEmbedOverride<'a> {
+    pub slot: usize,
+    pub embed: &'a [f32],
+}
+
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],
@@ -3776,6 +3800,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         gdn_tape, 0, tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
+        None, // mask_override: captured-prefill caller does not use the MTP probe hook
     )
 }
 
@@ -3796,6 +3821,7 @@ pub fn forward_prefill_batch(
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
+        None, // mask_override: MTP probe is the only consumer; default callers don't override
     )
 }
 
@@ -3822,6 +3848,7 @@ pub fn forward_prefill_batch_with_pbs(
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -3977,6 +4004,18 @@ pub fn forward_prefill_batch_with_pbs(
             "tree-verify mode requires the batched-FA-eligible prefill path; \
              kv quant + FA weight dtypes do not match on this model",
         );
+        // mask_override has nowhere to land on the per-token forward_scratch
+        // fallback (it operates on `scratch.x`, not the batched `pbs.x_batch`,
+        // and there's no shared "post-embed, pre-layer" hook). The MTP probe
+        // is the only consumer today and runs on MQ4-quantized models that
+        // always satisfy `eligible`, so hard-error rather than silently
+        // ignoring the override.
+        assert!(
+            mask_override.is_none(),
+            "MaskEmbedOverride requires the batched prefill path, but this \
+             model fell through to the per-token fallback (likely non-MQ4 \
+             weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
+        );
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
         // buffer still gets populated correctly (each call advances head by 1).
@@ -4051,12 +4090,36 @@ pub fn forward_prefill_batch_with_pbs(
             // Tree-verify was asserted to fit in one chunk above, so passing
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
+            // Apply mask_override only to the chunk that actually contains
+            // its target slot, and rebase the slot index to chunk-local
+            // coordinates. Out-of-range slots panic (caller error).
+            let mo_for_chunk = mask_override.and_then(|ovr| {
+                if ovr.slot >= chunk_start && ovr.slot < chunk_end {
+                    Some(MaskEmbedOverride {
+                        slot: ovr.slot - chunk_start,
+                        embed: ovr.embed,
+                    })
+                } else {
+                    None
+                }
+            });
+            // Sanity: if caller provided an override, it MUST land in some
+            // chunk. Detect "fell off the end" at the last chunk boundary.
+            if mask_override.is_some() && chunk_end == n {
+                let landed_anywhere = mask_override.unwrap().slot < n;
+                assert!(
+                    landed_anywhere,
+                    "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
+                    mask_override.unwrap().slot, n,
+                );
+            }
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
+                mo_for_chunk,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -4643,6 +4706,7 @@ fn forward_prefill_chunk(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -4716,6 +4780,39 @@ fn forward_prefill_chunk(
                 _ => panic!("unsupported embedding format"),
             }
             gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        }
+    }
+
+    // ── 1a. Apply MaskEmbedOverride (MTP probe hook) ─────────────────────
+    //
+    // Overwrite a single batch slot's embedding row in `pbs.x_batch` after
+    // the embedding-lookup kernel populated it but BEFORE the layer loop
+    // (or any subsequent kernel) reads it. The Qualcomm MTP probe uses this
+    // to replace the embedding-table value at a "mask token" position with
+    // a prompt-mean vector. Default callers pass `None` → zero overhead.
+    //
+    // Multi-GPU band-mode: skip on non-first bands; pbs.x_batch already
+    // holds the peer-copied activation from the previous band, so an
+    // override applied at band 0 has already propagated through the layer
+    // stack on that device — re-applying here would clobber the partial
+    // forward state.
+    if do_embed {
+        if let Some(ovr) = mask_override {
+            assert!(
+                ovr.slot < n,
+                "MaskEmbedOverride.slot ({}) must be < chunk_n ({})",
+                ovr.slot, n,
+            );
+            assert_eq!(
+                ovr.embed.len(), dim,
+                "MaskEmbedOverride.embed.len() ({}) must equal config.dim ({})",
+                ovr.embed.len(), dim,
+            );
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4)
+            };
+            let offset = ovr.slot * dim_row_bytes;
+            gpu.hip.memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
         }
     }
 
@@ -8666,6 +8763,7 @@ pub fn forward_prefill_batch_multi(
                         None, // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
+                        None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                     )?;
                 }
 
