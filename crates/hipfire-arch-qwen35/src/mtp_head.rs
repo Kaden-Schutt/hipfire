@@ -238,6 +238,13 @@ pub struct Qwen35MtpHeadScratch {
     // Populated by `mtp_head_forward_compressed` instead of `logits`.
     pub logits_compressed: Option<GpuTensor>,
 
+    // FlashAttention partials buffer for the asym3 attention kernel.
+    // Sized [n_heads * max_tiles * (2 + head_dim)] F32 where max_tiles =
+    // ceil(max_seq / 128). Required by `attention_flash_asym3`. Trunk
+    // sizes this with batch_mult=16 for batched prefill; MTP single-step
+    // forward uses batch_mult=1.
+    pub flash_partials: GpuTensor,
+
     // Position scalar — uploaded each forward into a 4-byte device buffer.
     pub pos_buf: DeviceBuffer,
 }
@@ -269,6 +276,18 @@ impl Qwen35MtpHeadScratch {
             t_mtp_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
             logits_compressed: None,
+            flash_partials: {
+                // Same sizing as trunk's prefill_partials at qwen35.rs:2822
+                // (TILE_SIZE=128) but with batch_mult=1 since MTP forward
+                // is single-token. Allocated per scratch instance, lives
+                // for the lifetime of the slot.
+                let tile_size = 128usize;
+                let max_tiles = (config.max_seq + tile_size - 1) / tile_size;
+                gpu.alloc_tensor(
+                    &[config.n_head * max_tiles * (2 + config.head_dim)],
+                    DType::F32,
+                )?
+            },
             pos_buf: gpu.hip.malloc(4)?,
         })
     }
@@ -320,6 +339,7 @@ impl Qwen35MtpHeadScratch {
         if let Some(lc) = self.logits_compressed {
             let _ = gpu.free_tensor(lc);
         }
+        let _ = gpu.free_tensor(self.flash_partials);
         let _ = gpu.hip.free(self.pos_buf);
     }
 }
@@ -327,13 +347,24 @@ impl Qwen35MtpHeadScratch {
 // ─── KV cache (single-layer, MTP-private) ────────────────────────────────
 
 /// The MTP head has a single attention block, so its KV cache is one
-/// per-layer F32 K + V buffer. Separate from the trunk's `KvCache` since
-/// the MTP head writes the SAME absolute position the trunk just emitted —
+/// per-layer K + V buffer. Separate from the trunk's `KvCache` since the
+/// MTP head writes the SAME absolute position the trunk just emitted —
 /// reusing the trunk's cache would mean either double-write or
 /// snapshot/restore on every cycle.
+///
+/// **Format:** asym3 (3-bit Givens-rotated K + Q8 V) — matches the trunk's
+/// default `--kv-mode asym3`. The previous F32 implementation used naive
+/// `attention_f32` which becomes the long-context bottleneck at seq_len ≥
+/// ~4K. Switching to asym3 + `attention_flash_asym3` (a) brings MTP attention
+/// in line with the trunk's storage size (~24× smaller per slot vs F32),
+/// (b) unlocks the same flash-attn tile kernel the trunk runs.
+///
+/// Internally wraps a single-layer [`llama::KvCache`] so we get the
+/// asym3-packed buffer sizing + Givens cos/sin tables (deterministic from
+/// seed=42, shared with the trunk) for free. Single-layer-ness means
+/// `inner.k_gpu[0]` / `inner.v_gpu[0]` are the only slots used.
 pub struct Qwen35MtpHeadKvCache {
-    pub k_gpu: GpuTensor,    // [max_seq * n_head_kv * head_dim] F32
-    pub v_gpu: GpuTensor,    // [max_seq * n_head_kv * head_dim] F32
+    pub inner: hipfire_runtime::llama::KvCache,
     pub max_seq: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
@@ -341,33 +372,58 @@ pub struct Qwen35MtpHeadKvCache {
 
 impl Qwen35MtpHeadKvCache {
     pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig) -> HipResult<Self> {
-        let kv_dim = config.n_head_kv * config.head_dim;
-        let total = config.max_seq * kv_dim;
+        // asym3 requires head_dim=256 (kernel limit, see llama.rs:3060).
+        // Qwen3.5/3.6 dense ALL ship head_dim=256 so this should hold for
+        // every supported model. Asserting here gives a clear error early
+        // rather than deep inside KvCache::new_gpu_asym3.
+        assert!(
+            config.head_dim == 256,
+            "MTP head asym3 KV requires head_dim=256, got {} (Qwen3.5/3.6 \
+             dense models all use 256; check loader/config)",
+            config.head_dim,
+        );
+        let inner = hipfire_runtime::llama::KvCache::new_gpu_asym3(
+            gpu,
+            /* n_layers */ 1,
+            config.n_head_kv,
+            config.head_dim,
+            config.max_seq,
+        )?;
         Ok(Self {
-            k_gpu: gpu.zeros(&[total], DType::F32)?,
-            v_gpu: gpu.zeros(&[total], DType::F32)?,
+            inner,
             max_seq: config.max_seq,
             n_head_kv: config.n_head_kv,
             head_dim: config.head_dim,
         })
     }
 
-    /// Reset positions 0..=highest_written. Cheap since we re-zero the
-    /// whole buffer; MTP cache is tiny (single layer × max_seq positions).
+    /// Reset positions to all-zeros. Asym3 K/V slots are stored as packed
+    /// bytes inside an F32-typed buffer; zeroing the underlying buffer is
+    /// equivalent to "no positions written" at the kernel level (the asym3
+    /// scoring kernel reads slot `i` as null when its bytes are all zero,
+    /// matching pre-write state).
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        let kv_dim = self.n_head_kv * self.head_dim;
-        let zeros = vec![0.0f32; self.max_seq * kv_dim];
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(zeros.as_ptr() as *const u8, zeros.len() * 4)
-        };
-        gpu.hip.memcpy_htod(&self.k_gpu.buf, bytes)?;
-        gpu.hip.memcpy_htod(&self.v_gpu.buf, bytes)?;
+        for layer in 0..self.inner.k_gpu.len() {
+            let k_n = self.inner.k_gpu[layer].numel();
+            let v_n = self.inner.v_gpu[layer].numel();
+            let zeros_k = vec![0.0f32; k_n];
+            let zeros_v = vec![0.0f32; v_n];
+            let kb: &[u8] = unsafe {
+                std::slice::from_raw_parts(zeros_k.as_ptr() as *const u8, k_n * 4)
+            };
+            let vb: &[u8] = unsafe {
+                std::slice::from_raw_parts(zeros_v.as_ptr() as *const u8, v_n * 4)
+            };
+            gpu.hip.memcpy_htod(&self.inner.k_gpu[layer].buf, kb)?;
+            gpu.hip.memcpy_htod(&self.inner.v_gpu[layer].buf, vb)?;
+        }
         Ok(())
     }
 
-    pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.k_gpu);
-        let _ = gpu.free_tensor(self.v_gpu);
+    pub fn free_gpu(self, _gpu: &mut Gpu) {
+        // llama::KvCache owns its GpuTensors; they free on Drop.
+        // Explicit method kept for API parity with old callers.
+        drop(self.inner);
     }
 }
 
@@ -859,18 +915,28 @@ pub fn mtp_head_forward_block_only(
 
     // ── 6. KV cache write at slot `pos` ──────────────────────────────────
     //
-    // F32 cache: kv_cache_write copies kv_dim floats into slot pos.
-    gpu.kv_cache_write(&kv.k_gpu, &scratch.k, &scratch.pos_buf, kv_dim)?;
-    gpu.kv_cache_write(&kv.v_gpu, &scratch.v, &scratch.pos_buf, kv_dim)?;
+    // asym3: K stored as 3-bit Givens-rotated + V as Q8_0. `_fused` writes
+    // both K and V in one kernel launch and consumes the same Givens cos/sin
+    // tables the attention kernel below will read.
+    let ct = kv.inner.givens_cos.as_ref().expect("asym3 KV missing givens_cos");
+    let st = kv.inner.givens_sin.as_ref().expect("asym3 KV missing givens_sin");
+    gpu.kv_cache_write_asym3_fused(
+        &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+        &scratch.k, &scratch.v, &scratch.pos_buf, ct, st,
+        cfg.n_head_kv, cfg.head_dim,
+    )?;
 
     // ── 7. Attention ────────────────────────────────────────────────────
     //
-    // attention_f32 computes attn_out = softmax(Q · Kᵀ / sqrt(hd)) · V over
-    // positions [0, seq_len_hint). seq_len_hint = pos + 1 — every position
-    // up to and including the slot we just wrote.
-    gpu.attention_f32(
-        &scratch.q, &kv.k_gpu, &kv.v_gpu, &scratch.attn_out, &scratch.pos_buf,
-        pos + 1, cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.max_seq,
+    // attention_flash_asym3: tiled FlashAttention against the asym3-packed
+    // K/V cache. Internally de-rotates K via the same Givens tables before
+    // the Q·K dot; V is dequantized per-tile from Q8_0. Output layout
+    // matches attention_f32 (n_head × head_dim into attn_out).
+    gpu.attention_flash_asym3(
+        &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+        &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+        cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
+        &scratch.flash_partials,
     )?;
 
     // ── 8. Apply gate (sigmoid(gate) * attn_out, in-place on attn_out) ───
@@ -1356,12 +1422,17 @@ pub fn mtp_head_forward_block_batched(
     // kv_cache_write expects a separate i32 device buffer per call. To avoid
     // n separate allocs, we pass sub-offset views of `scratch.positions`
     // (each one i32-sized), since the kernel reads `*pos` as the slot index.
+    let ct = kv.inner.givens_cos.as_ref().expect("asym3 KV missing givens_cos");
+    let st = kv.inner.givens_sin.as_ref().expect("asym3 KV missing givens_sin");
     for i in 0..n {
         let k_row = scratch.k.sub_offset(i * kv_dim, kv_dim);
         let v_row = scratch.v.sub_offset(i * kv_dim, kv_dim);
         let pos_slot = scratch.positions.sub_offset(i, 1);
-        gpu.kv_cache_write(&kv.k_gpu, &k_row, &pos_slot.buf, kv_dim)?;
-        gpu.kv_cache_write(&kv.v_gpu, &v_row, &pos_slot.buf, kv_dim)?;
+        gpu.kv_cache_write_asym3_fused(
+            &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+            &k_row, &v_row, &pos_slot.buf, ct, st,
+            cfg.n_head_kv, cfg.head_dim,
+        )?;
     }
 
     // attn_out = V (self-only attention with 1 key collapses softmax to 1).
