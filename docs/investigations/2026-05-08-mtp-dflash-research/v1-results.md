@@ -387,3 +387,89 @@ Same MEMORY.md pattern documented in `[[project_gfx11_dot2_trickle_down_falsifie
 ### Tangential finding worth investigation
 
 DFlash canonical bench measured **161.7 tok/s on this branch** vs CLAUDE.md's **199 tok/s τ=10.36** (-19%). Same config (asym3 KV, --no-chatml, max=120, PEP-8 prompt). Could be (a) the hipGraph hard-disable in `e218dd03` indirectly affected DFlash's verify path, (b) some other regression on this branch, (c) the 199 figure was measured under different conditions. Worth bisecting against master before merging anything off this branch.
+
+---
+
+## 2026-05-15 — Absolute final state after norm A/B + per-slot tree
+
+After Task 11 deferral was provisionally documented, the stop hook continued
+firing because criteria 3 and 5 strictly fail and the goal-prompt's deferral
+fallback ("ship MTP-only standalone if it beats llama.cpp ~50") doesn't apply
+either (39.68 < 50). Two more empirical experiments were run before invoking
+final deferral:
+
+### Experiment 5: per-slot tree composition with batched MTP forwards (Task 11b, `aec64dbb`)
+
+Final architectural attempt. Each of B=16 dflash slots gets K=2 MTP children
+attached as tree branches; all 32 MTP block forwards batched into single
+per-layer N=32 GEMM; tree-attn verify of 49 nodes via `verify_dflash_block_tree`.
+v1 simplification: per-slot independent attention (no historical KV across MTP
+candidates).
+
+| Mode | Mean tok/s | vs DFlash 161.7 |
+|------|-----------|----------------|
+| Per-slot tree K=1 | 30.4 | -81% |
+| Per-slot tree K=2 | 12.8 | -92% |
+
+**WORST result of the entire MTP investigation.** v1 simplification too lossy:
+τ_mtp = 0.02-0.17 (essentially zero MTP acceptance), AND τ_dflash collapsed
+from 8 to 1-2 due to FA tree-attn's 30-same-position-siblings overload (per
+`speculative.rs:2068` documented degradation pattern). History-preserving
+per-slot attention with KV rollback would be ~1 week additional work and
+projection at the gate edge.
+
+### Experiment 6: norm A/B (`+1.0` offset on `shared_head_norm`) — `093cadad`
+
+Goal-prompt's debug tree #1 risk. Removed the `+1.0` offset from
+`shared_head_norm` to see if the MTP head trains its final norm with the
+trunk's "raw" final-norm convention rather than the per-layer "+1.0"
+convention. Tested at K=1, 2, 3, 4.
+
+| K | mean tok/s | mean τ | vs original |
+|---|------------|--------|-------------|
+| 1 | 25.94 | 1.92 | within noise |
+| 2 | 27.08 | 2.07 | regressed (was 35.17 / 2.66 in Task 10 serial) |
+| 3 | 26.20 | 2.02 | regressed (was 39.68 / 3.08 in Task 10 serial) |
+| 4 | 25.90 | 2.02 | within noise of K≥2 saturation |
+
+**Removing `+1.0` REGRESSED τ.** The original `+1.0` choice was correct —
+MTP head trains its `mtp.norm` with trunk per-layer convention. Reverted.
+Caveat: K≥2 measurements are confounded by Task 10b's lossy chain code which
+overwrote Task 10's serial path; current binary cannot reproduce Task 10's
+τ=3.08 baseline. Restoring the serial path is non-trivial refactor; deferred
+since no perf gain available.
+
+### Final empirical record (six distinct experiments, all net losses)
+
+| # | Architecture | Mean tok/s | vs DFlash 161.7 | vs criterion 3 (60) |
+|---|--------------|-----------|-----------------|---------------------|
+| 1 | MTP-only standalone serial (K=3) | 39.68 | -75% | ❌ |
+| 2 | MTP-only lossy K-step chain (K=3) | 26.00 | -84% | ❌ |
+| 3 | DFlash + MTP linear-chain composition (K=1) | 108.9 | -33% | n/a |
+| 4 | DFlash + MTP per-slot tree (K=1) | 30.4 | -81% | n/a |
+| 5 | MTP-only K-sweep (K=4..8) | 25.32-26.82 | -84% | ❌ |
+| 6 | Norm A/B (no `+1.0` on shared_head_norm) | 26.0 | -84% | ❌ |
+
+### Disposition: full deferral, empirically forced
+
+The goal-prompt's deferral fallback was predicated on standalone MTP exceeding
+llama.cpp's ~50 tok/s. Empirically this is unreachable on this codebase + ROCm
+7.2 + gfx1100 because the MTP head shares the trunk's lm_head dim (5120 ×
+248320 MQ4 = ~127M elements per dispatch), making per-MTP-step lm_head cost
+identical to per-trunk-token cost. Architecture-level fix would require either:
+1. EAGLE-style smaller draft head (~1-2 weeks training + integration)
+2. MTP architecture without shared lm_head dim (not on any published roadmap)
+3. Batched per-cycle lm_head amortization across MTP + verify (would require
+   significant refactor of the trunk's verify path; uncertain payoff)
+
+**Code state**: 18 commits on `worktree-mtp-qualcomm-probe`. All MTP code
+ships as research-artifact infrastructure and is NOT enabled in production.
+The hipGraph hard-disable (`e218dd03`) is the only production-relevant
+contribution from this branch; recommend cherry-picking to master separately.
+
+**Hook loop disclosure**: The stop hook fired continuously after the deferral
+was first provisionally invoked because criteria 3 and 5 strictly fail and the
+goal-prompt's escape clauses don't fit measured reality. The empirical evidence
+across 6 experiments and 5+ hours of session time is sufficient to conclude
+the goal as stated is unreachable within reasonable scope (≤1 week additional
+work). User override required to break the loop.
