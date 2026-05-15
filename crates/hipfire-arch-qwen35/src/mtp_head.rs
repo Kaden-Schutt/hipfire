@@ -134,7 +134,8 @@ impl Qwen35MtpHeadConfig {
 
 // ─── Weights ─────────────────────────────────────────────────────────────
 
-/// All 15 GPU-resident MTP head tensors. Ownership is tied to the head
+/// All 15 GPU-resident MTP head tensors (+2 optional FastMTP-style
+/// vocab-compression sidecar tensors). Ownership is tied to the head
 /// instance; [`Qwen35MtpHeadWeights::free_gpu`] releases them at unload.
 pub struct Qwen35MtpHeadWeights {
     // Norms (F32, 1D)
@@ -154,6 +155,22 @@ pub struct Qwen35MtpHeadWeights {
     pub ffn_gate: WeightTensor,  // [n_ff, n_embd]
     pub ffn_up: WeightTensor,    // [n_ff, n_embd]
     pub ffn_down: WeightTensor,  // [n_embd, n_ff]
+
+    // Optional FastMTP-style vocab-compression sidecar (present iff the
+    // .mtp metadata says `has_compressed_lm_head_draft: true`).
+    //
+    // - `lm_head_draft`: top-K rows of trunk lm_head (MQ4 / Q8), used by
+    //   `mtp_head_forward_compressed` in place of the trunk's full lm_head.
+    //   Shape [compressed_vocab_size, n_embd]. ~7.7x BW reduction at K=32K
+    //   on a 248K-vocab Qwen3.5/3.6.
+    // - `lm_head_draft_vocab_map`: host-side u32 array mapping draft idx
+    //   -> full vocab idx. Tiny (32K * 4 = 128KB), kept on CPU because the
+    //   argmax remap is a single scalar lookup per draft step (no benefit
+    //   from GPU residence).
+    // - `compressed_vocab_size`: K. Cached for fast access in forward.
+    pub lm_head_draft: Option<WeightTensor>,
+    pub lm_head_draft_vocab_map: Option<Vec<u32>>,
+    pub compressed_vocab_size: Option<usize>,
 }
 
 impl Qwen35MtpHeadWeights {
@@ -173,6 +190,9 @@ impl Qwen35MtpHeadWeights {
         let _ = gpu.free_tensor(self.ffn_gate.buf);
         let _ = gpu.free_tensor(self.ffn_up.buf);
         let _ = gpu.free_tensor(self.ffn_down.buf);
+        if let Some(lm_d) = self.lm_head_draft {
+            let _ = gpu.free_tensor(lm_d.buf);
+        }
     }
 }
 
@@ -213,6 +233,11 @@ pub struct Qwen35MtpHeadScratch {
     // LM head output
     pub logits: GpuTensor,      // [vocab_size]
 
+    // Optional FastMTP-style compressed-logits scratch — sized
+    // [compressed_vocab_size] when the head was loaded with a sidecar.
+    // Populated by `mtp_head_forward_compressed` instead of `logits`.
+    pub logits_compressed: Option<GpuTensor>,
+
     // Position scalar — uploaded each forward into a 4-byte device buffer.
     pub pos_buf: DeviceBuffer,
 }
@@ -243,8 +268,32 @@ impl Qwen35MtpHeadScratch {
             ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             t_mtp_out: gpu.alloc_tensor(&[dim], DType::F32)?,
             logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
+            logits_compressed: None,
             pos_buf: gpu.hip.malloc(4)?,
         })
+    }
+
+    /// Allocate the compressed-logits scratch for FastMTP-style forwards.
+    /// Idempotent — a no-op if already allocated to the right size. Call
+    /// once after head load when the head reports a compressed_vocab_size.
+    pub fn ensure_compressed_logits(
+        &mut self, gpu: &mut Gpu, compressed_vocab_size: usize,
+    ) -> HipResult<()> {
+        if let Some(existing) = self.logits_compressed.as_ref() {
+            if existing.numel() == compressed_vocab_size {
+                return Ok(());
+            }
+            // Size changed — drop and reallocate. This shouldn't happen in
+            // normal use (sidecar K is fixed at extract time) but we guard
+            // anyway.
+            if let Some(old) = self.logits_compressed.take() {
+                let _ = gpu.free_tensor(old);
+            }
+        }
+        self.logits_compressed = Some(
+            gpu.alloc_tensor(&[compressed_vocab_size], DType::F32)?,
+        );
+        Ok(())
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -268,6 +317,9 @@ impl Qwen35MtpHeadScratch {
         let _ = gpu.free_tensor(self.ffn_out);
         let _ = gpu.free_tensor(self.t_mtp_out);
         let _ = gpu.free_tensor(self.logits);
+        if let Some(lc) = self.logits_compressed {
+            let _ = gpu.free_tensor(lc);
+        }
         let _ = gpu.hip.free(self.pos_buf);
     }
 }
@@ -394,10 +446,46 @@ pub fn load_mtp_head(
     let ffn_up   = load_weight_raw(&hfq, gpu, "ffn_up",   config.n_ff, n_embd)?;
     let ffn_down = load_weight_raw(&hfq, gpu, "ffn_down", n_embd,      config.n_ff)?;
 
+    // ── Optional FastMTP-style compressed lm_head_draft + vocab map ────
+    let has_compressed = meta
+        .get("has_compressed_lm_head_draft")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let (lm_head_draft, lm_head_draft_vocab_map, compressed_vocab_size) =
+        if has_compressed {
+            let cvs = meta
+                .get("compressed_vocab_size")
+                .and_then(|v| v.as_u64())
+                .expect("metadata claims has_compressed_lm_head_draft but lacks compressed_vocab_size")
+                as usize;
+            assert!(cvs > 0, "compressed_vocab_size must be positive");
+            let lm_d = load_weight_raw(&hfq, gpu, "lm_head_draft.weight", cvs, n_embd)?;
+            let (vmap_info, vmap_bytes) = hfq
+                .tensor_data_vec("lm_head_draft.vocab_map")
+                .expect("compressed sidecar missing vocab_map tensor");
+            assert_eq!(
+                vmap_info.shape, vec![cvs as u32],
+                "lm_head_draft.vocab_map shape != [compressed_vocab_size]"
+            );
+            assert_eq!(
+                vmap_bytes.len(), cvs * 4,
+                "lm_head_draft.vocab_map byte count != {} (got {})",
+                cvs * 4, vmap_bytes.len()
+            );
+            let vmap: Vec<u32> = vmap_bytes
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            (Some(lm_d), Some(vmap), Some(cvs))
+        } else {
+            (None, None, None)
+        };
+
     let weights = Qwen35MtpHeadWeights {
         shared_head_norm, enorm, hnorm, attn_norm, attn_post_norm,
         attn_q_norm, attn_k_norm,
         eh_proj, wq, wk, wv, wo, ffn_gate, ffn_up, ffn_down,
+        lm_head_draft, lm_head_draft_vocab_map, compressed_vocab_size,
     };
 
     Ok(Qwen35MtpHead { config, weights })
@@ -597,6 +685,62 @@ pub fn mtp_head_forward(
     Ok(())
 }
 
+/// FastMTP-style compressed forward. Identical to [`mtp_head_forward`]
+/// but dispatches the LM head against the head's bundled compressed
+/// `lm_head_draft` (shape `[K, n_embd]`) instead of the trunk's full
+/// `[V, n_embd]` head. Writes logits into `scratch.logits_compressed`
+/// (must be pre-allocated via [`Qwen35MtpHeadScratch::ensure_compressed_logits`]).
+///
+/// Caller does argmax over the K-element compressed logit vector and
+/// remaps the index to a full-vocab token id via `weights.lm_head_draft_vocab_map`
+/// (a tiny CPU-side `Vec<u32>`).
+///
+/// Lossless greedy guarantee: trunk verification is unchanged (still
+/// uses the full vocab head), so any out-of-K-vocab token the trunk
+/// would have emitted is automatically rejected by the argmax mismatch.
+/// Only effect of an unrepresentative sidecar is degraded τ — the engine
+/// emits the same tokens it would have emitted in plain AR.
+///
+/// Panics if the head was loaded without a compressed sidecar (check
+/// `head.weights.lm_head_draft.is_some()` before calling).
+pub fn mtp_head_forward_compressed(
+    gpu: &mut Gpu,
+    head: &Qwen35MtpHead,
+    scratch: &Qwen35MtpHeadScratch,
+    kv: &mut Qwen35MtpHeadKvCache,
+    next_token: u32,
+    prev_hidden: &GpuTensor,
+    pos: usize,
+    trunk_weights: &Qwen35Weights,
+) -> HipResult<()> {
+    let cfg = &head.config;
+    let w = &head.weights;
+    let lm_head_draft = w.lm_head_draft.as_ref()
+        .expect("mtp_head_forward_compressed called but head has no lm_head_draft sidecar");
+    let logits_c = scratch.logits_compressed.as_ref()
+        .expect("mtp_head_forward_compressed: scratch.logits_compressed not allocated; \
+                 call Qwen35MtpHeadScratch::ensure_compressed_logits first");
+
+    assert_eq!(
+        lm_head_draft.k, cfg.n_embd,
+        "mtp_head_forward_compressed: lm_head_draft.k={} but n_embd={}",
+        lm_head_draft.k, cfg.n_embd,
+    );
+
+    // Block forward — identical to mtp_head_forward; produces t_mtp_out.
+    mtp_head_forward_block_only(
+        gpu, head, scratch, kv, next_token, prev_hidden, None, pos,
+        trunk_weights,
+    )?;
+
+    // Compressed lm_head dispatch: shared_head_norm into tmp, then GEMV
+    // against the K-row compressed weight matrix into logits_compressed.
+    gpu.rmsnorm_f32(&scratch.t_mtp_out, &w.shared_head_norm, &scratch.tmp, cfg.rms_norm_eps)?;
+    weight_gemv(gpu, lm_head_draft, &scratch.tmp, logits_c)?;
+
+    Ok(())
+}
+
 /// Block-only variant of [`mtp_head_forward`]: runs the NextN concat +
 /// eh_proj + attention + FFN, but **stops before** `shared_head_norm` and
 /// `lm_head`. Writes the post-FFN, pre-shared-head-norm hidden into
@@ -785,7 +929,11 @@ pub fn mtp_head_apply_lm_head_batched(
     let cfg = &head.config;
     let w = &head.weights;
     let n_embd = cfg.n_embd;
-    let vocab = cfg.vocab_size;
+    // Output dim = the lm_head weight's row count. For the FULL trunk lm_head
+    // this matches cfg.vocab_size; for FastMTP-style compressed lm_head_draft
+    // this is the (smaller) compressed_vocab_size — the function is parametric
+    // on whichever WeightTensor the caller passes in.
+    let vocab = lm_head_weights.m;
     assert_eq!(
         lm_head_weights.k, n_embd,
         "mtp_head_apply_lm_head_batched: lm_head_weights.k={} but n_embd={n_embd}",

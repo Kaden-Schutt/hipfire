@@ -413,6 +413,11 @@ struct Args {
     output: PathBuf,
     quant: QuantChoice,
     verbose: bool,
+    /// Optional FastMTP-style vocab-compression sidecar JSON. When set, we
+    /// also pack a compressed `lm_head_draft.weight` (top-K rows of trunk
+    /// lm_head, MQ4G256) and a `lm_head_draft.vocab_map` (u32 IDs packed
+    /// as f32 bit-cast). Tensor count goes 15 -> 17 when present.
+    vocab_sidecar: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -421,6 +426,7 @@ fn parse_args() -> Args {
     let mut output: Option<String> = None;
     let mut quant = QuantChoice::Mq4;
     let mut verbose = false;
+    let mut vocab_sidecar: Option<String> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -440,6 +446,10 @@ fn parse_args() -> Args {
                 });
                 i += 2;
             }
+            "--vocab-sidecar" => {
+                vocab_sidecar = Some(argv[i + 1].clone());
+                i += 2;
+            }
             "--verbose" | "-v" => {
                 verbose = true;
                 i += 1;
@@ -447,7 +457,7 @@ fn parse_args() -> Args {
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_extract --hf-dir <safetensors_dir> --output <out.mtp> \
-                     [--quant mq4|q8] [--verbose]"
+                     [--quant mq4|q8] [--vocab-sidecar <sidecar.json>] [--verbose]"
                 );
                 std::process::exit(0);
             }
@@ -462,6 +472,7 @@ fn parse_args() -> Args {
         output: PathBuf::from(output.expect("--output required")),
         quant,
         verbose,
+        vocab_sidecar: vocab_sidecar.map(PathBuf::from),
     }
 }
 
@@ -782,7 +793,176 @@ fn main() {
     assert_eq!(
         hfq_tensors.len(),
         15,
-        "expected to pack exactly 15 MTP tensors, got {}",
+        "expected to pack exactly 15 MTP tensors before optional sidecar, got {}",
+        hfq_tensors.len()
+    );
+
+    // ─── Optional FastMTP-style vocab-compression sidecar ─────────────────
+    //
+    // When `--vocab-sidecar <path>` is set, append two extra tensors:
+    //   * lm_head_draft.weight   shape [K, n_embd] MQ4G256 — top-K rows of
+    //                             trunk lm_head, used by MTP forward as a
+    //                             compressed draft head (~7.7x BW reduction
+    //                             at K=32K vs K=248K).
+    //   * lm_head_draft.vocab_map  shape [K] F32 (u32 bit-cast) — maps
+    //                             draft idx -> full vocab idx for argmax
+    //                             remap on the engine side.
+    //
+    // Verifier path is unchanged: trunk uses its full lm_head, so any
+    // out-of-K-vocab draft proposal automatically rejects via argmax
+    // mismatch — lossless greedy preserved. Coverage gaps just reduce τ.
+    let mut compressed_vocab_size: Option<usize> = None;
+    if let Some(sidecar_path) = &args.vocab_sidecar {
+        eprintln!("  sidecar: {}", sidecar_path.display());
+        let sidecar_str = std::fs::read_to_string(sidecar_path)
+            .unwrap_or_else(|e| panic!("cannot read sidecar {}: {e}", sidecar_path.display()));
+        let sidecar: serde_json::Value = serde_json::from_str(&sidecar_str)
+            .expect("sidecar JSON parse failed");
+        let draft_to_full: Vec<u32> = sidecar
+            .get("draft_to_full")
+            .and_then(|v| v.as_array())
+            .expect("sidecar missing draft_to_full array")
+            .iter()
+            .map(|x| x.as_u64().expect("draft_to_full element not u64") as u32)
+            .collect();
+        let k_dim = draft_to_full.len();
+        let cvs_meta = sidecar
+            .get("compressed_vocab_size")
+            .and_then(|v| v.as_u64())
+            .expect("sidecar missing compressed_vocab_size") as usize;
+        assert_eq!(
+            k_dim, cvs_meta,
+            "sidecar inconsistent: draft_to_full.len()={k_dim} vs compressed_vocab_size={cvs_meta}"
+        );
+        assert!(
+            k_dim > 0 && k_dim <= vocab_size,
+            "sidecar K={k_dim} outside (0, vocab_size={vocab_size}]"
+        );
+        // Find lm_head in safetensors. Qwen3.5/3.6 are VLMs with a
+        // `model.language_model.*` namespace; the dedicated lm_head (when
+        // present) is at top-level `lm_head.weight`. When
+        // tie_word_embeddings is true (e.g., 0.8B), lm_head IS embed_tokens
+        // and only the embed_tokens key exists. Prefer the dedicated head
+        // when available.
+        let lm_head_candidates = [
+            "lm_head.weight",
+            "model.lm_head.weight",
+            "model.language_model.lm_head.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+            "embed_tokens.weight",
+        ];
+        let mut lm_head_found: Option<(&TensorMeta, &[u8], &str)> = None;
+        for cand in &lm_head_candidates {
+            for st in &st_files {
+                if let Some((meta, data)) = st.tensor_data(cand) {
+                    lm_head_found = Some((meta, data, cand));
+                    break;
+                }
+            }
+            if lm_head_found.is_some() {
+                break;
+            }
+        }
+        let (lm_meta, lm_raw, lm_name) = lm_head_found.unwrap_or_else(|| {
+            panic!(
+                "sidecar mode: cannot find trunk lm_head in safetensors (tried {:?})",
+                lm_head_candidates
+            )
+        });
+        eprintln!("  lm_head src: {lm_name} dtype={} shape={:?}", lm_meta.dtype, lm_meta.shape);
+        assert_eq!(
+            lm_meta.shape.len(),
+            2,
+            "lm_head must be 2D, got shape {:?}",
+            lm_meta.shape
+        );
+        // Safetensors layout: row-major [V, H] where row v is the projection
+        // vector for token id v. Slice rows for the top-K token IDs.
+        let v_dim = lm_meta.shape[0];
+        let h_dim = lm_meta.shape[1];
+        assert_eq!(
+            h_dim, n_embd,
+            "lm_head hidden dim {h_dim} != model n_embd {n_embd}"
+        );
+        let lm_full_f32 = to_f32(lm_raw, &lm_meta.dtype);
+        assert_eq!(lm_full_f32.len(), v_dim * h_dim);
+
+        let mut lm_compressed_f32: Vec<f32> = Vec::with_capacity(k_dim * h_dim);
+        let mut out_of_range = 0usize;
+        for &tok_id in &draft_to_full {
+            let row_start = (tok_id as usize) * h_dim;
+            if (tok_id as usize) >= v_dim {
+                // Sidecar requested an ID beyond actual lm_head rows; fill
+                // with zeros (will produce -Inf-like logits, harmless: the
+                // compressed argmax will never select it).
+                out_of_range += 1;
+                lm_compressed_f32.extend(std::iter::repeat(0.0f32).take(h_dim));
+            } else {
+                lm_compressed_f32.extend_from_slice(&lm_full_f32[row_start..row_start + h_dim]);
+            }
+        }
+        if out_of_range > 0 {
+            eprintln!(
+                "  sidecar: {out_of_range}/{k_dim} requested IDs beyond lm_head rows ({v_dim}); \
+                 filled with zeros"
+            );
+        }
+
+        // Quantize compressed lm_head as MQ4G256 (h_dim=5120 is 256-aligned
+        // for all Qwen3.5/3.6 dense models). If --quant q8, fall back.
+        let (lm_quant_type, lm_group_size, lm_bytes, lm_label) = match args.quant {
+            QuantChoice::Mq4 if h_dim % 256 == 0 => {
+                let q = quantize_mq4g256(&lm_compressed_f32, &signs1, &signs2);
+                (QuantType::MQ4G256, 256u32, q, "MQ4G256")
+            }
+            _ => {
+                let q = quantize_q8f16(&lm_compressed_f32);
+                (QuantType::Q8F16, 32u32, q, "Q8_F16")
+            }
+        };
+        let lm_in_bytes = lm_full_f32.len() * 4; // ref baseline
+        total_in_bytes += lm_compressed_f32.len() * 4;
+        total_out_bytes += lm_bytes.len();
+        eprintln!(
+            "  [{lm_label:>7}] {:>18}  shape=[{k_dim}, {h_dim}]  full_f32={:>10}B  out={:>10}B",
+            "lm_head_draft", lm_in_bytes, lm_bytes.len()
+        );
+        hfq_tensors.push(HfqTensor {
+            name: "lm_head_draft.weight".to_string(),
+            quant_type: lm_quant_type,
+            shape: vec![k_dim as u32, h_dim as u32],
+            group_size: lm_group_size,
+            data: lm_bytes,
+        });
+
+        // Pack vocab map as raw u32 LE bytes. Marked as QuantType::F32 in
+        // the index so the file format accounts for 4 bytes/element; the
+        // reader (in mtp_head.rs) reads each 4-byte slot as u32 directly
+        // (no float arithmetic) to recover the token ID. Avoids extending
+        // the QuantType enum and keeps the existing 4 GB/page-aligned
+        // file layout intact.
+        let vocab_map_bytes: Vec<u8> = draft_to_full
+            .iter()
+            .flat_map(|&id| id.to_le_bytes())
+            .collect();
+        assert_eq!(vocab_map_bytes.len(), k_dim * 4);
+        hfq_tensors.push(HfqTensor {
+            name: "lm_head_draft.vocab_map".to_string(),
+            quant_type: QuantType::F32,
+            shape: vec![k_dim as u32],
+            group_size: 0,
+            data: vocab_map_bytes,
+        });
+
+        compressed_vocab_size = Some(k_dim);
+    }
+
+    let expected_tensor_count = if compressed_vocab_size.is_some() { 17 } else { 15 };
+    assert_eq!(
+        hfq_tensors.len(),
+        expected_tensor_count,
+        "tensor count mismatch: got {} expected {expected_tensor_count}",
         hfq_tensors.len()
     );
 
@@ -817,6 +997,8 @@ fn main() {
         "shared_output_norm_with_trunk": false,
         "tie_word_embeddings": tie_word_embeddings,
         "weight_quant": args.quant.label(),
+        "has_compressed_lm_head_draft": compressed_vocab_size.is_some(),
+        "compressed_vocab_size": compressed_vocab_size.unwrap_or(0),
         "config_text_config": tc,
     });
     let metadata_json = serde_json::to_string(&metadata).expect("metadata JSON serialize");
@@ -838,12 +1020,16 @@ fn main() {
         .expect("stat output")
         .len();
     eprintln!(
-        "wrote {}: {:.2} MiB  (15 tensors, in={:.2} MiB, out={:.2} MiB)",
+        "wrote {}: {:.2} MiB  ({} tensors, in={:.2} MiB, out={:.2} MiB)",
         args.output.display(),
         file_size as f64 / (1024.0 * 1024.0),
+        hfq_tensors.len(),
         total_in_bytes as f64 / (1024.0 * 1024.0),
         total_out_bytes as f64 / (1024.0 * 1024.0),
     );
+    if let Some(k) = compressed_vocab_size {
+        eprintln!("  compressed_vocab_size = {k} (FastMTP-style draft head)");
+    }
 
     // Round-trip verify the HFQ container we just wrote. Reads back the
     // header + tensor index from disk and asserts every field matches the

@@ -37,6 +37,8 @@ fn main() {
     let mut temp: f32 = 0.0;
     let mut max_n: usize = 3;
     let mut chatml: bool = true;
+    let mut compressed: bool = false;
+    let mut compressed_serial: bool = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -51,11 +53,18 @@ fn main() {
             "--max-n" => { max_n = args[i + 1].parse().unwrap(); i += 2; }
             "--no-chatml" => { chatml = false; i += 1; }
             "--chatml" => { chatml = true; i += 1; }
+            "--compressed" => { compressed = true; i += 1; }
+            "--compressed-serial" => { compressed = true; compressed_serial = true; i += 1; }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \\\n\
                      \t(--prompt \"Hello\" | --prompt-file <path>) \\\n\
-                     \t[--max 64] [--ctx 4096] [--temp 0.0] [--max-n 3] [--no-chatml]"
+                     \t[--max 64] [--ctx 4096] [--temp 0.0] [--max-n 3] \\\n\
+                     \t[--no-chatml] [--compressed]\n\
+                     \n\
+                     --compressed: use FastMTP-style compressed lm_head_draft (K=1 path).\n\
+                                   Requires .mtp head built with --vocab-sidecar.\n\
+                                   Forces max_n=1 since the compressed spec is K=1 only."
                 );
                 std::process::exit(0);
             }
@@ -86,6 +95,11 @@ fn main() {
         std::process::exit(2);
     }
     assert!(max_n >= 1 && max_n <= 8, "--max-n must be in [1,8]");
+    if compressed && max_n > 1 {
+        eprintln!("compressed K={max_n}: chains K block forwards with lossy embedding \
+                   override (same OOD risk as plain K-step path). Batched compressed \
+                   lm_head over the K outputs amortizes the BW saving across the chain.");
+    }
 
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt_raw).into_owned();
     let prompt_hash = prompt_md5(prompt.as_bytes());
@@ -165,6 +179,27 @@ fn main() {
     let mut state = MtpSpecState::new_for_slot(&mut gpu, &target, &head, max_n)
         .expect("alloc MtpSpecState");
 
+    // Compressed mode: ensure scratch.logits_compressed is allocated and
+    // verify the head actually carries a sidecar.
+    if compressed {
+        let cvs = head.weights.compressed_vocab_size.unwrap_or_else(|| {
+            eprintln!(
+                "error: --compressed requires .mtp built with --vocab-sidecar \
+                 but loaded head reports has_compressed_lm_head_draft=false"
+            );
+            std::process::exit(2);
+        });
+        // Single-step compressed forward scratch (used by K=1 single-forward
+        // path that still exists; the batched K-step path doesn't need it).
+        state.mtp_scratch
+            .ensure_compressed_logits(&mut gpu, cvs)
+            .expect("alloc logits_compressed");
+        // Batched K-output compressed lm_head scratch (used by spec_step_mtp_compressed).
+        state.ensure_compressed_lm_logits(&mut gpu, cvs)
+            .expect("alloc mtp_lm_logits_compressed");
+        eprintln!("compressed: ON (cvs={cvs}, K={max_n})");
+    }
+
     let eos_token = target.config.eos_token;
 
     // ── Prefill prompt one token at a time ─────────────────────────────
@@ -230,10 +265,22 @@ fn main() {
             eprintln!("hit max_seq {}; stopping", max_seq_total);
             break;
         }
-        let result = mtp_spec::spec_step_mtp(
-            &mut gpu, &mut target, &head, &mut state,
-            cur_pos, last_committed, eos_token,
-        ).expect("spec_step_mtp");
+        let result = if compressed_serial {
+            mtp_spec::spec_step_mtp_compressed_serial(
+                &mut gpu, &mut target, &head, &mut state,
+                cur_pos, last_committed, eos_token,
+            ).expect("spec_step_mtp_compressed_serial")
+        } else if compressed {
+            mtp_spec::spec_step_mtp_compressed(
+                &mut gpu, &mut target, &head, &mut state,
+                cur_pos, last_committed, eos_token,
+            ).expect("spec_step_mtp_compressed")
+        } else {
+            mtp_spec::spec_step_mtp(
+                &mut gpu, &mut target, &head, &mut state,
+                cur_pos, last_committed, eos_token,
+            ).expect("spec_step_mtp")
+        };
 
         cycles += 1;
         accepted_total += result.accept_count;
