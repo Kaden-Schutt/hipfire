@@ -3192,17 +3192,20 @@ pub fn forward_scratch(
     //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
     //     graph path numerically drifts after ~30-50 tokens on MoE
     //     (see surrounding comment block for repro).
-    // AR-forward hipGraph capture is DEFAULT-OFF (2026-05-15). Empirically on
-    // ROCm 7.2.2 + gfx11 + Qwen3.5-27B mq4, captured graph replay produces a
-    // token-0 `<think>\n!!!!!` attractor: the warmup + capture calls emit
-    // correct tokens, then every subsequent replay reads stale pos / state
-    // (kernarg-snapshot bug; not fixable by adding warmup runway). Until the
-    // replay-side bug is root-caused, AR forward goes direct. Opt back in
-    // with HIPFIRE_GRAPH=1 for experimental A/B work.
-    let graph_arch_default = false;
-    let graph_opt_in = std::env::var("HIPFIRE_GRAPH").ok().as_deref() == Some("1");
-    let use_graph = (graph_arch_default || graph_opt_in)
-        && (config.num_experts == 0 || allow_moe);
+    // AR-forward hipGraph DISABLED (2026-05-15). Empirically on ROCm 7.2.2 +
+    // gfx11 + Qwen3.5-27B mq4, both replay AND capture+launch produce a
+    // token-0 attractor outside very narrow conditions:
+    //   - Capture+launch at position 2 (after 1 direct warmup) → `!!!!!`
+    //   - Capture+launch at position 4 (after 3 direct warmups) → correct
+    //   - Replay of a working capture (any position) → `!!!!!` from pos+1 on
+    // The kernarg-snapshot bug isn't fixable by warmup tuning OR caller-driven
+    // commit gating (`end_decode_turn()`); both fail empirically. Until ROCm
+    // 7.2.2's hipGraph capture/replay is debugged, AR forward is direct-only.
+    // Policy infrastructure (`ar_forward_kernel_dirty`, `ar_forward_replay_enabled`,
+    // `end_decode_turn()`, `drop_captured_graph()`) is preserved on Gpu so the
+    // path can be flipped on once the underlying bug is fixed.
+    let use_graph = false;
+    let _ = (allow_moe, gpu.ar_forward_replay_enabled);  // suppress unused-field warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -3213,64 +3216,37 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    // Compact offset (TriAttention eviction) breaks graph capture/replay:
-    // during replay, stream_write_value32 updates pos_buf but the captured
-    // H2D copy of (pos + compact_offset) inside FA layers overwrites it,
-    // causing RoPE to read stale positions. Fall back to direct execution.
-    let no_compact = kv_cache.compact_offset == 0;
-
-    if use_graph && gpu.graph_exec.is_some() && no_compact {
-        // ── Graph replay path ──
-        // Update pos_buf via host blocking copy. The previous version used
-        // `stream_write_value32` to avoid the host roundtrip, but on
-        // ROCm 7.2.2 + gfx11 that produces a token-0 attractor on first
-        // replay (decode emits `<think>\n</think>\n` correctly during the
-        // direct warmup+capture calls, then 0 forever once replay starts).
-        // Suspected stream-vs-graph ordering bug: the stream write either
-        // races the captured kernel's pos read or writes to a snapshotted
-        // address rather than the live buffer. memcpy_htod fully synchronizes
-        // before the graph_launch and writes the live buffer; the small
-        // host-roundtrip cost is amortized over the full forward (947 blobs).
-        let pos_i32 = pos as i32;
+    let pos_i32 = pos as i32;
+    if use_graph && gpu.ar_forward_replay_enabled && gpu.graph_exec.is_some() {
+        // ── Replay path: caller has signalled end_decode_turn() since the
+        // last capture AND kernels are not dirty. Cheapest path. ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() && no_compact {
-        let pos_i32 = pos as i32;
-        if gpu.ar_forward_warmup_remaining > 0 {
-            // ── Warmup: run direct so kernel JIT and lazy scratch allocations
-            // (MQ signs/x_rot/x_q8, FP16 shadow, kernel module load) happen
-            // outside any captured region. A SINGLE warmup is insufficient on
-            // ROCm 7.2.2 — kernels can JIT-recompile across calls and the
-            // capture snapshots stale kernarg state (token-0 `<think>\n!!!!!`
-            // attractor on Qwen3.5-27B mq4 gfx1100). Run AR_FORWARD_WARMUP_CALLS
-            // direct dispatches first so JIT settles before any capture.
-            // Same trap `verify_warmed_up` solves for the verify path.
-            gpu.ar_forward_warmup_remaining -= 1;
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        } else {
-            // ── First post-warmup call: capture the forward pass as a graph ──
-            // Ensure we have an explicit stream for capture.
-            if gpu.active_stream.is_none() {
-                gpu.active_stream = Some(gpu.hip.stream_create()?);
-            }
-            // Write pos_buf before capture (this write is NOT in the graph)
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.begin_graph_capture()?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-            gpu.end_graph_capture()?;
-            // hipStreamCaptureModeGlobal RECORDS kernels — they do not execute
-            // during capture. Launch the freshly-instantiated graph once so
-            // this pos's forward actually runs (KV write, state advance,
-            // logits update). Same pattern as the verify path's
-            // begin_verify_graph_capture / end_verify_graph_capture /
-            // verify_graph_launch sequence.
-            gpu.graph_launch()?;
-            eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+    } else if use_graph && gpu.ar_forward_kernel_dirty {
+        // ── Direct path (kernel-dirty): kernels are dirty (init or post-
+        // model-load). Capture would trip "hipMalloc not permitted under
+        // stream capture" on the first inline JIT. Mark clean after a
+        // successful direct dispatch so subsequent calls can capture. ──
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.ar_forward_kernel_dirty = false;
+    } else if use_graph {
+        // ── Capture + launch: kernels are clean but caller has not committed
+        // a replay yet (or graph_exec is None). Drop any prior captured graph,
+        // record a fresh one, and launch it for this forward's output. After
+        // the caller signals end_decode_turn(), the most recent capture is
+        // promoted to the replay graph for the next decode turn. ──
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.drop_captured_graph();
+        gpu.begin_graph_capture()?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.end_graph_capture()?;
+        gpu.graph_launch()?;
     } else {
-        // ── Direct path (no graph) ──
-        let pos_i32 = pos as i32;
+        // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
     }
