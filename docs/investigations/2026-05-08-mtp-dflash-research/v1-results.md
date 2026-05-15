@@ -317,3 +317,32 @@ plain AR is coherent).
 - `crates/hipfire-arch-qwen35/src/qwen35.rs` — gate inverted: graph
   `default-OFF`, opt-in via `HIPFIRE_GRAPH=1`
 - Commit: `788c1090`
+
+---
+
+## 2026-05-15 correction: hipGraph framing was wrong
+
+The "ROCm 7.2.2 hipGraph kernarg snapshot bug" framing in this doc and in
+the commit messages on commits `788c1090` and `e218dd03` is **wrong on two
+counts**:
+
+1. **ROCm version is 7.2.0**, not 7.2.2 (`rocm-core 7.2.0.70200-43~24.04`,
+   `rocminfo` runtime 1.18). The "7.2.2" string was repeated from existing
+   memory entries (`feedback_hipx_rocm722_jit_broken.md`,
+   `feedback_hipgraph_kernarg_snapshot_rocm72_2026_05_07.md`) without
+   verifying. Those memories are also wrong.
+2. **hipGraph capture was working on this codebase earlier today** (per
+   user). The capture defect manifesting in this session is a regression
+   from sometime today, NOT a longstanding ROCm-side bug. Most likely
+   cause: the kernel-cache purge run earlier in this session
+   (`rm -rf .hipfire_kernels ~/.hipfire/bin/kernels/compiled ~/.cache/comgr/*`)
+   forced fresh hipcc compilation on first run; the JIT compilation order
+   under that scenario may diverge from incremental warmup in a way that
+   corrupts subsequent graph-capture kernarg snapshots.
+
+The hard-disable in `e218dd03` ships as a safety measure. Investigation
+of what specifically broke between earlier-today-working and now-broken
+is deferred. To recover hipGraph: do not aggressively purge the kernel
+cache mid-session, OR debug the JIT-order-vs-capture-snapshot interaction
+in `crates/rdna-compute/src/dispatch.rs`'s `begin_graph_capture` /
+`capture_blobs` machinery.
