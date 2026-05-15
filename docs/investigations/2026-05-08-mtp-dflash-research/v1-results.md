@@ -6,14 +6,19 @@ Hardware: gfx1100 (k9lin's Sapphire Nitro+ 7900 XTX), ROCm 7.2.2
 
 ## Algorithm
 
-v1 is a Qualcomm-style training-free MTP probe: at each cycle, append a single
-`<|MASK|>` token after the last committed token, run one batched target forward
-over `[last_committed, MASK]`, take argmax of both logit positions to produce
-`(real_t, spec_t+1)`, then verify by running the next single-token forward on
-`real_t` and accepting `spec_t+1` iff `argmax(real_t.logits) == spec_t+1`. No
-tree, no draft model, no head training, lossless greedy. EMA τ-estimator with
-λ=0.1 controls a soft admit gate to avoid catastrophic mis-speculation when the
-mask channel collapses.
+v1 is a Qualcomm-style training-free MTP probe: each cycle issues a single
+batched target forward over either `[last_committed, MASK]` (cycle 0) or
+`[last_committed, pending_candidate, MASK]` (subsequent cycles). The candidate
+carried in from the previous cycle's mask top-1 is verified in the same forward
+by comparing `argmax(slot_0)` to that candidate; on match, the candidate plus
+the candidate-slot's argmax are both committed (greedy lossless bonus). KV
+advances by exactly the batch size (2 or 3) every cycle regardless of
+acceptance. No tree, no draft model, no head training, lossless greedy.
+
+Mask embedding is initialized as the mean of prompt token embeddings (Qualcomm
+§3.1 soft-init, the best variant per Table 5) and updated each commit via Eq 4
+EMA with λ=0.1. There is no admit gate — acceptance is strict exact-match per
+Qualcomm §3.3.
 
 Implementation: `crates/hipfire-arch-qwen35/src/mtp_probe.rs` (e0b45b9d), driven
 by `crates/hipfire-runtime/examples/mtp_probe_demo.rs` (e32b871d, slot+admit
