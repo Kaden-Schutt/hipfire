@@ -170,6 +170,10 @@ name = "dflash_spec_demo"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "mtp_probe_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
 name = "dump_logits_qwen35"
 required-features = ["arch-qwen35"]
 
