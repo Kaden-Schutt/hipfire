@@ -47,6 +47,10 @@ use hip_bridge::HipResult;
 use hipfire_runtime::llama::{self, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Maximum batch size per MTP probe cycle: 1 last_committed + 1
+/// pending_candidate + 1 mask. v1 never exceeds this.
+const MTP_PROBE_MAX_BATCH: usize = 3;
+
 /// Mask-token id placeholder. The `MaskEmbedOverride` overwrites this slot's
 /// embedding bytes between the embedding-lookup kernel and the first layer's
 /// read of `pbs.x_batch`, so the actual id is purely positional — it controls
@@ -98,11 +102,8 @@ pub struct MtpProbeState {
 impl MtpProbeState {
     /// Allocate state and compute the prompt-mean mask embedding.
     ///
-    /// Loops over the prompt tokens calling the per-format embedding-lookup
-    /// kernel into a dim-sized scratch, downloads each row, and accumulates
-    /// the mean on the host. This is O(prompt_len) `memcpy_dtoh`s but only
-    /// runs once per generation; for any non-trivial decode the cost is
-    /// negligible.
+    /// O(prompt_len) `memcpy_dtoh`s but only runs once per generation; for
+    /// any non-trivial decode the cost is negligible.
     pub fn new_for_prompt(
         gpu: &mut Gpu,
         weights: &Qwen35Weights,
@@ -111,7 +112,7 @@ impl MtpProbeState {
     ) -> HipResult<Self> {
         assert!(!prompt_tokens.is_empty(), "MTP probe requires non-empty prompt");
         let dim = config.dim;
-        let max_n = 3; // [last_committed, pending_candidate?, MASK_SENTINEL]
+        let max_n = MTP_PROBE_MAX_BATCH;
         let vocab = config.vocab_size;
 
         let embed_tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
@@ -197,12 +198,17 @@ impl MtpProbeStats {
 /// true if any committed token is `eos_token`; the caller should stop
 /// generation once this fires.
 ///
-/// `cur_pos` is the absolute KV position where slot 0 of this cycle's
-/// batch lands. Caller must NOT advance KV between calls — this function
-/// advances `target.kv_cache` and `target.dn_state` by exactly
-/// `committed_tokens.len() + 1` positions (the +1 is the mask slot, which
-/// participates in the forward but whose argmax is consumed as next
-/// cycle's `pending_candidate`, not committed).
+/// `cur_pos` is the absolute KV position where slot 0 of this cycle's batch
+/// lands. Caller MUST NOT advance KV between calls — this function advances
+/// `target.kv_cache` and `target.dn_state` by exactly `batch.len()` positions
+/// (2 when no pending candidate, 3 when one is present), regardless of
+/// whether the candidate was accepted. The caller MUST advance `cur_pos` by
+/// the same amount before the next call:
+/// `cur_pos += 2 + state.pending_candidate.is_some() as usize` BEFORE the
+/// call (so the next cycle's slot 0 lands at the correct position). Note
+/// that `committed_tokens.len()` (1 or 2) is NOT the KV advance — using it
+/// to step `cur_pos` will silently corrupt subsequent positions on every
+/// rejected candidate.
 ///
 /// State updates:
 /// - `state.last_committed` is set to the LAST committed token of this cycle.
@@ -271,7 +277,12 @@ pub fn mtp_probe_step(
 
     match w_out.gpu_dtype {
         DType::Q8_0 => {
-            // gemm_q8_0_batched has hard MAX_BATCH=64; we never exceed 3.
+            // gemm_q8_0_batched has a hard MAX_BATCH=64 (speculative.rs
+            // Q8_LM_MAX); probe's n <= MTP_PROBE_MAX_BATCH = 3 always
+            // satisfies this. If MTP_PROBE_MAX_BATCH grows past 64, copy the
+            // chunking loop from verify_dflash_block_inner. Do NOT route
+            // through gemm_qkv_q8_0_wmma — would break greedy-parity with
+            // GEMV.
             gpu.gemm_q8_0_batched(
                 &w_out.buf, &final_hidden_view, &logits_batch,
                 w_out.m, w_out.k, n,
