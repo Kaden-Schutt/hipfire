@@ -184,3 +184,81 @@ papers:
 - SpecKV: https://arxiv.org/abs/2605.02888
 - DeltaNet: https://arxiv.org/abs/2406.06484
 - Component-Aware Self-Speculative (Qwen3.5 hybrid): https://arxiv.org/abs/2605.01106
+
+## Empirical validation on 7900 XTX (2026-05-15, late afternoon)
+
+Bench run on k9lin (Sapphire Nitro+ 7900 XTX, gfx1100) directly testing
+the hypothesis above. Same `qwen3.5-27b.mq4` target +
+`qwen35-27b-dflash.mq4` drafter, max=120, kv-mode=asym3.
+
+### Code prompt (`benchmarks/prompts/lru_cache_pep8_strict.txt`, md5 df5dedc)
+
+| Config | tok/s | τ |
+|---|---|---|
+| DFlash `--no-chatml` (bench peak) | 155-166 | 7.79-8.46 |
+| DFlash `--chatml` (production) | 50-99 (median ~75) | 2.6-3.7 |
+| DFlash `--chatml --ddtree-batched` | 42-48 | 4.0-4.6 |
+| AR baseline `--chatml` | 44.83 | — |
+
+### Prose prompt (200-word essay request, md5 6fa90245a4d9b03f)
+
+| Config | tok/s | τ |
+|---|---|---|
+| DFlash `--no-chatml` | 41.74 | **1.07** |
+| DFlash `--chatml` (production) | 41.99 | **1.09** |
+| DFlash `--chatml --ddtree-batched` | 25.10 | 1.86 |
+| **AR baseline `--chatml`** | **45.37** | — |
+
+### What the data says vs the hypothesis
+
+1. **Hypothesis confirmed.** On code prompts the drafter operates near
+   its training distribution (τ ≈ 8). On prose the drafter is at floor
+   (τ ≈ 1.07) — accepts barely one token per cycle, basically AR with
+   drafter-overhead tax.
+
+2. **Stronger than expected.** I'd predicted "drafter performs poorly
+   on prose"; the bench shows DFlash is actually **slightly slower than
+   AR on prose** (42 vs 45 tok/s, -7%). This is not "marginal win
+   reduced"; it's a net regression.
+
+3. **ChatML wrapping is a code-prompt-specific failure mode.** On
+   code, ChatML drops τ from 8 → 3 (-63%). On prose, ChatML changes
+   τ from 1.07 → 1.09 (zero difference). The drafter on prose was
+   already producing near-random argmax matches; ChatML noise on top
+   doesn't matter.
+
+4. **DDTree-batched recovers τ but kernel cost dominates on
+   gfx1100.** Tree expansion lifts prose τ from 1.07 → 1.86 (+74%
+   relative) but kernel slowdown drops tok/s to 25 (-40% vs default).
+   Net: still worse than AR. (May behave differently on gfx1201 /
+   gfx1151 — not tested today.)
+
+### Implications for the retrain plan
+
+- **Drafter retrain is no longer a "potentially worth it" optimization
+  — it is required for DFlash to be net-positive on chat use.**
+  Without retrain, the daemon is paying drafter overhead for a slight
+  regression on any prose request.
+
+- **The Direct Alignment 2403.00858 recipe's 2.3× block-efficiency
+  improvement, applied to a baseline of τ=1.07, would target τ ≈ 2.5
+  on prose.** That converts a -7% regression vs AR to roughly a +30%
+  speedup — still well below the code-prompt regime, but at least
+  net-positive.
+
+- **The drafter we ship today is well-tuned for code prompts.** Don't
+  throw out the existing drafter weights — distill from them as the
+  initialization for the retrain, not from base text.
+
+### Open questions raised by the bench
+
+- **Does the prose τ collapse hold on gfx1201 / gfx1151?** Different
+  arches may have different kernel cost/benefit ratios for DDTree.
+- **Where's the cutover from "code regime" to "prose regime"?** Tool
+  calls, structured JSON output, multi-turn chat history — these sit
+  between pure code and pure prose. A workload-cutover bench across
+  these shapes would tell us where the retrain effort earns out most.
+- **Online τ rolling-avg as cheap mitigation?** Skip DFlash dispatch
+  when last-N-cycle τ falls below ~2.5. PEARL-style adaptive but
+  applied at the dispatch level, not within DFlash. Runtime-only
+  fix, no retrain required.
