@@ -2488,7 +2488,10 @@ pub fn spec_step_dflash(
     // ACTUAL GPU completion (not CPU enqueue of async work). Perf-heavy —
     // use only for diagnostics. When disabled, zero cost beyond a handful
     // of Instant::now() calls.
-    let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
+    static PHASE_ON_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let phase_on = *PHASE_ON_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1")
+    });
     if phase_on {
         gpu.hip.device_synchronize()?;
     }
@@ -2516,8 +2519,11 @@ pub fn spec_step_dflash(
     // production-path defense in daemon/run/infer for the AR sampler.
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
-    let ngram_block_active = !use_temp_sampling
-        && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
+    static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ngram_block_env = *NGRAM_BLOCK_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1")
+    });
+    let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
 
     if let Some(pld) = pld_spine {

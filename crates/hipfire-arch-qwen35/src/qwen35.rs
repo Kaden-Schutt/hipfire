@@ -2980,7 +2980,15 @@ pub fn forward_scratch(
     //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
     //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
     //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
-    let allow_moe = std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1");
+    // Per-forward env var lookups cached via OnceLock — these used to fire
+    // ~16-46 std::env::var() syscalls per cycle on 27B decode, allocating a
+    // String and walking the env table each time. Process env can't legitimately
+    // change between forward calls; cache once and read atomically.
+    static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let allow_moe = *ALLOW_MOE_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1")
+    });
     // hipGraph per-forward-pass capture/replay default policy:
     //   - gfx12 (RDNA4): default-ON. +2.4-2.7% decode on 9B Qwen 3.5
     //     MFP4G32 (5-run mean, all positive, tight variance, 2026-05-11).
@@ -2995,14 +3003,16 @@ pub fn forward_scratch(
     //     graph path numerically drifts after ~30-50 tokens on MoE
     //     (see surrounding comment block for repro).
     // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
-    let graph_env = std::env::var("HIPFIRE_GRAPH").ok();
+    let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
+        match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
+            Some("0") => Some(false),
+            Some("1") => Some(true),
+            _ => None,
+        }
+    });
     let graph_arch_default =
         gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-    let graph_enabled = match graph_env.as_deref() {
-        Some("0") => false,
-        Some("1") => true,
-        _ => graph_arch_default,
-    };
+    let graph_enabled = graph_override.unwrap_or(graph_arch_default);
     let use_graph = graph_enabled && (config.num_experts == 0 || allow_moe);
 
     // Embedding lookup into scratch.x (always direct, changes per token)

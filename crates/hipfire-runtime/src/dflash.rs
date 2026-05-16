@@ -637,8 +637,17 @@ fn gemm_dispatch(
             // side), invalidate the FP16 x cache because the rotated bytes
             // share the same source pointer, then dispatch the HFQ3 batched
             // lm_head WMMA kernel. Chunked symmetrically with MQ4.
+            //
+            // `fp16_x_source_ptr` is invalidated ONCE before the chunk loop —
+            // not per-iteration. The MQ3 dispatch always overwrites the
+            // shared rotation scratch from scratch each call (no chunk can
+            // re-read FP16 from the previous chunk's output), so the
+            // invalidation only needs to fire once per gemm_dispatch entry.
+            // Previously the assignment was inside the loop, firing
+            // `ceil(batch / max_chunk)` times for no extra correctness.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
             let max_chunk = (scratch.shape[0] / w.k).max(1);
+            gpu.fp16_x_source_ptr = std::ptr::null_mut();
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {
@@ -650,7 +659,6 @@ fn gemm_dispatch(
                     chunked = Err(e);
                     break;
                 }
-                gpu.fp16_x_source_ptr = std::ptr::null_mut();
                 if let Err(e) = gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
                     chunked = Err(e);
                     break;
