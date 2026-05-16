@@ -10122,10 +10122,10 @@ impl Gpu {
     /// elements per WMMA iteration). All 27B/9B draft shapes satisfy this
     /// (hidden=5120, intermediate=17408, q_dim=4096, kv_dim=1024, fc-K=25600).
     ///
-    /// Non-gfx11 falls through to `gemm_f32_batched` — same semantics but
-    /// weight is read as F16 bytes, so the caller must have uploaded it that
-    /// way. (Currently only gfx11 is expected to hit this path; other archs
-    /// should use MQ4/HFQ4 drafts.)
+    /// Non-gfx11 falls through to row-by-row F16 GEMM so lm_head output keeps
+    /// the `[batch, vocab]` layout expected by callers. Set
+    /// `HIPFIRE_LM_HEAD_F16=f32` at load time to use the legacy F32-expanded
+    /// storage and bypass this path entirely.
     pub fn gemm_f16_batched_lmhead(
         &mut self,
         w_f16: &GpuTensor,

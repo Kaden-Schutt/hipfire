@@ -18,6 +18,24 @@ pub enum LayerType {
     FullAttention,    // Standard MHA with gated output
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum F16LmHeadMode {
+    Native,
+    F32,
+}
+
+fn parse_f16_lm_head_mode(value: Option<&str>) -> F16LmHeadMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if matches!(v.as_str(), "0" | "f32" | "fp32" | "legacy") => F16LmHeadMode::F32,
+        _ => F16LmHeadMode::Native,
+    }
+}
+
+fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
+    let value = std::env::var("HIPFIRE_LM_HEAD_F16").ok();
+    parse_f16_lm_head_mode(value.as_deref())
+}
+
 /// Optional tree-attention context for `forward_prefill_batch` — activates
 /// DDTree batched verify when `Some`.
 ///
@@ -792,17 +810,27 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
         }
-        1 => {
-            // qt=1 is F16. Keep raw F16 on GPU (previously decompressed host-
-            // side to F32). Native F16 storage halves the lm_head bandwidth
-            // and lets the dispatch path hit the WMMA-backed
-            // `gemm_f16_batched_lmhead` kernel on gfx11. Required to make
-            // F16 lm_head usable at scale — the F32-fallback path runs the
-            // 1023-position prefill lm_head fan-out at ~280 s/chunk vs
-            // ~0.79 s/chunk via WMMA.
-            let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
-        }
+        1 => match f16_lm_head_mode_from_env() {
+            F16LmHeadMode::Native => {
+                // qt=1 is F16. Keep raw F16 on GPU (previously decompressed
+                // host-side to F32). Native F16 storage halves the lm_head
+                // bandwidth and lets the dispatch path hit the WMMA-backed
+                // `gemm_f16_batched_lmhead` kernel on gfx11. Set
+                // HIPFIRE_LM_HEAD_F16=f32 to force the legacy F32 expansion.
+                let buf = gpu.upload_raw(data, &[data.len()])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0 })
+            }
+            F16LmHeadMode::F32 => {
+                let f32_data: Vec<f32> = data.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+                };
+                let buf = gpu.upload_raw(bytes, &[m, k])?;
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            }
+        },
         _ => panic!("unsupported quant_type {} for lm_head", quant_type),
     }
 }
@@ -7719,4 +7747,31 @@ pub fn forward_with_embedding(
 ) -> HipResult<Vec<f32>> {
     let x = gpu.upload_f32(embedding_data, &[config.dim])?;
     forward_from_x(gpu, weights, config, x, pos, kv_cache, dn_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f16_lm_head_mode_defaults_to_native() {
+        assert_eq!(parse_f16_lm_head_mode(None), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("auto")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("1")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("native")), F16LmHeadMode::Native);
+        assert_eq!(parse_f16_lm_head_mode(Some("f16")), F16LmHeadMode::Native);
+    }
+
+    #[test]
+    fn f16_lm_head_mode_allows_legacy_f32() {
+        assert_eq!(parse_f16_lm_head_mode(Some("0")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("f32")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("fp32")), F16LmHeadMode::F32);
+        assert_eq!(parse_f16_lm_head_mode(Some("legacy")), F16LmHeadMode::F32);
+    }
+
+    #[test]
+    fn f16_lm_head_mode_unknown_falls_back_to_native() {
+        assert_eq!(parse_f16_lm_head_mode(Some("surprise")), F16LmHeadMode::Native);
+    }
 }
