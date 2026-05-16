@@ -10137,9 +10137,15 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if !self.arch.starts_with("gfx11") {
-            // No mw16 WMMA on non-RDNA3 — fall back to the scalar F32 GEMM.
-            // This is slow but correct; non-gfx11 isn't the intended target.
-            return self.gemm_f32_batched(x, w_f16, y, batch_size, k, m);
+            // No mw16 WMMA on non-RDNA3. The generic F16 GEMM writes [M,N],
+            // while lm_head consumers expect [N,M], so preserve layout by
+            // launching one row at a time.
+            for b in 0..batch_size {
+                let x_row = x.sub_offset(b * k, k);
+                let y_row = y.sub_offset(b * m, m);
+                self.gemm_f16_tiled(w_f16, &x_row, &y_row, m, k, 1)?;
+            }
+            return Ok(());
         }
         self.ensure_kernel(
             "gemm_mw16_residual_wmma",
