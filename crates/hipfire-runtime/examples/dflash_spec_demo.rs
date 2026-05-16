@@ -62,6 +62,12 @@ fn main() {
     let mut target_path: Option<String> = None;
     let mut draft_path: Option<String> = None;
     let mut prompt: Option<String> = None;
+    let mut prompt_file: Option<String> = None;
+    let mut pflash_path: Option<String> = None;
+    let mut pflash_keep_ratio: f32 = 0.30;
+    let mut pflash_block_size: usize = 64;
+    let mut pflash_sink_tokens: usize = 16;
+    let mut pflash_recent_tokens: usize = 32;
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 512;
     let mut ctx_slice: Option<usize> = None;
@@ -180,6 +186,30 @@ fn main() {
             }
             "--prompt" => {
                 prompt = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt-file" => {
+                prompt_file = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--pflash" => {
+                pflash_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--keep-ratio" => {
+                pflash_keep_ratio = args[i + 1].parse().expect("--keep-ratio f32");
+                i += 2;
+            }
+            "--pflash-block-size" => {
+                pflash_block_size = args[i + 1].parse().expect("--pflash-block-size usize");
+                i += 2;
+            }
+            "--sink-tokens" => {
+                pflash_sink_tokens = args[i + 1].parse().expect("--sink-tokens usize");
+                i += 2;
+            }
+            "--recent-tokens" => {
+                pflash_recent_tokens = args[i + 1].parse().expect("--recent-tokens usize");
                 i += 2;
             }
             "--max" => {
@@ -360,7 +390,13 @@ fn main() {
     }
     let target_path = target_path.expect("--target required");
     let draft_path = draft_path.expect("--draft required");
-    let prompt = prompt.expect("--prompt required");
+    let prompt = match (prompt, prompt_file) {
+        (Some(p), None) => p,
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read --prompt-file {path}: {e}")),
+        (Some(_), Some(_)) => panic!("--prompt and --prompt-file are mutually exclusive"),
+        (None, None) => panic!("--prompt or --prompt-file required"),
+    };
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
     eprintln!("=== dflash_spec_demo ===");
@@ -507,8 +543,90 @@ fn main() {
         prompt_tokens = chat;
         eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
     }
-    eprintln!("prompt: {:?}", prompt);
-    eprintln!("prompt tokens ({}): {:?}", prompt_tokens.len(), prompt_tokens);
+    if prompt.len() < 2000 {
+        eprintln!("prompt: {:?}", prompt);
+    } else {
+        eprintln!("prompt: <{} chars elided>", prompt.len());
+    }
+    eprintln!("prompt tokens ({}): {}", prompt_tokens.len(),
+        if prompt_tokens.len() < 64 { format!("{:?}", prompt_tokens) } else { format!("[{} tokens]", prompt_tokens.len()) });
+
+    // ── Optional PFlash compression ───────────────────────────────────
+    // When --pflash <small-drafter> is set, run PFlash compression on the
+    // prompt before the DFlash spec-decode loop begins. PFlash uses a small
+    // sibling of the target (e.g. 0.8B vs 27B) to score per-block importance
+    // and keep ~keep_ratio of the source tokens (plus sink+recent windows).
+    // After compression we unload the PFlash drafter to free VRAM, then the
+    // existing DFlash spec-decode path runs on the compressed prompt.
+    let mut pflash_compress_ms: u128 = 0;
+    let mut pflash_kept_tokens: usize = prompt_tokens.len();
+    let pflash_source_tokens = prompt_tokens.len();
+    if let Some(pflash_drafter_path) = pflash_path.as_ref() {
+        use hipfire_arch_qwen35::pflash::{
+            self, BypassReason, PflashConfig, PflashDecision, PflashMode, PflashState, RequestKind,
+        };
+        let cfg = PflashConfig {
+            mode: PflashMode::Always,
+            keep_ratio: pflash_keep_ratio,
+            block_size: pflash_block_size,
+            sink_tokens: pflash_sink_tokens,
+            recent_tokens: pflash_recent_tokens,
+            min_keep_tokens: 0,
+            drafter_path: Some(pflash_drafter_path.clone()),
+            ..Default::default()
+        };
+        let mut state = PflashState::new(&cfg);
+        let drafter_max_kv = prompt_tokens.len() + 64;
+        let t_load = Instant::now();
+        pflash::load_drafter(
+            &mut state, &mut gpu, Path::new(pflash_drafter_path), &tokenizer, drafter_max_kv,
+        ).expect("pflash: load drafter");
+        eprintln!(
+            "pflash drafter loaded: {:.2}s | tokenizer_compat={}",
+            t_load.elapsed().as_secs_f64(), state.tokenizer_compat
+        );
+        if !state.tokenizer_compat {
+            eprintln!("FAIL: pflash drafter tokenizer incompatible with target");
+            state.unload_drafter(&mut gpu);
+            std::process::exit(2);
+        }
+
+        let t_compress = Instant::now();
+        let decision = pflash::maybe_compress_prompt(
+            &mut gpu, &mut state, &cfg, &prompt_tokens, RequestKind::Text, &[],
+        ).expect("pflash: maybe_compress_prompt");
+        pflash_compress_ms = t_compress.elapsed().as_millis();
+
+        prompt_tokens = match decision {
+            PflashDecision::Compressed(cp) => {
+                eprintln!(
+                    "pflash compress: {} ms (score={}ms select={}ms gather={}ms)",
+                    pflash_compress_ms, cp.timings.score_ms, cp.timings.select_ms, cp.timings.gather_ms
+                );
+                eprintln!(
+                    "pflash kept:    {} -> {} tokens (ratio {:.3})",
+                    cp.source_tokens, cp.kept_tokens,
+                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32
+                );
+                eprintln!("pflash spans:   {} ranges", cp.kept_spans.len());
+                pflash_kept_tokens = cp.kept_tokens;
+                cp.token_ids
+            }
+            PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens: st, threshold } } => {
+                eprintln!("pflash bypass (BelowThreshold {st} < {threshold}); running full prefill");
+                prompt_tokens
+            }
+            PflashDecision::Bypass { reason } => {
+                eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
+                state.unload_drafter(&mut gpu);
+                std::process::exit(2);
+            }
+        };
+        // Free PFlash drafter VRAM before DFlash machinery starts touching the
+        // target / DFlash-head scratches. The DFlash drafter remains loaded.
+        state.unload_drafter(&mut gpu);
+        vram_report(&gpu.hip, "after pflash unload");
+    }
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
     // Size for the max block we may use this session so adaptive-B-up
@@ -1518,6 +1636,15 @@ fn main() {
     let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
     eprintln!("=== BENCH METRICS ===");
     eprintln!("prompt_tokens: {}", prompt_tokens.len());
+    if pflash_path.is_some() {
+        eprintln!("pflash_source_tokens: {pflash_source_tokens}");
+        eprintln!("pflash_kept_tokens: {pflash_kept_tokens}");
+        eprintln!("pflash_compress_ms: {pflash_compress_ms}");
+        if pflash_source_tokens > 0 {
+            eprintln!("pflash_ratio: {:.3}",
+                pflash_kept_tokens as f32 / pflash_source_tokens as f32);
+        }
+    }
     eprintln!("prefill_secs: {:.4}", prefill_secs);
     eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
     eprintln!("ttft_ms: {:.2}", ttft_ms.unwrap_or(0.0));
