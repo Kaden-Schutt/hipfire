@@ -5162,6 +5162,7 @@ Flags:
   --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
   --cpu-calib            Force CPU calibration path
   -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
+  --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
 
 Examples:
   hipfire sidecar-gen qwen3.5:9b
@@ -5174,6 +5175,7 @@ Examples:
     let chunkLen = 256;
     let gpuCalib = true; // GPU calibration is default (Phase 2, 2026-04-28)
     let output: string | undefined;
+    let skipValidation = false; // sidecar generation doesn't need Phase 2 validation
     for (let i = 1; i < rest.length; i++) {
       const a = rest[i];
       if (a === "--corpus") {
@@ -5192,6 +5194,8 @@ Examples:
       } else if (a === "-o" || a === "--output") {
         output = rest[++i];
         if (!output) { console.error("--output requires a value"); process.exit(1); }
+      } else if (a === "--skip-validation") {
+        skipValidation = true;
       } else {
         console.error(`Unknown argument: ${a}\nRun 'hipfire sidecar-gen --help' for usage.`);
         process.exit(1);
@@ -5224,6 +5228,7 @@ Examples:
       const args = [resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
       if (corpusPath) args.push("--corpus", corpusPath);
       if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
       const proc = Bun.spawnSync([bin, ...args], { stdio: ["inherit", "inherit", "inherit"] });
       if ((proc.exitCode ?? 1) !== 0) {
         console.error(`triattn_validate failed (exit ${proc.exitCode})`);
@@ -5295,6 +5300,7 @@ Examples:
       const args = [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
       if (corpusPath) args.push("--corpus", corpusPath);
       if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
       const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
       );
       if ((proc.exitCode ?? 1) !== 0) {
