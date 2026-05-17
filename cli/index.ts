@@ -5297,7 +5297,6 @@ Examples:
       if (!gpuCalib) args.push("--cpu-calib");
       if (skipValidation) args.push("--val-prompt", "");
       const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
-      );
       if ((proc.exitCode ?? 1) !== 0) {
         console.error(`triattn_validate failed (exit ${proc.exitCode})`);
         process.exit(1);
