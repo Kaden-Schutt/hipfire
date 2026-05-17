@@ -39,6 +39,170 @@ use hip_bridge::HipResult;
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+// ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
+
+/// Sampling configuration matching the Unsloth-recommended MTP defaults
+/// (temp=1.0, top_p=0.95, top_k=20, min_p=0.0 for Qwen3.5/3.6 thinking
+/// mode). `temp == 0.0` disables sampling and the spec-step falls back
+/// to greedy argmax-match.
+#[derive(Copy, Clone, Debug)]
+pub struct MtpSamplingConfig {
+    pub temp: f32,
+    pub top_k: usize,     // 0 = disabled (no top-K cutoff)
+    pub top_p: f32,       // 1.0 = disabled (no nucleus cutoff)
+    pub min_p: f32,       // 0.0 = disabled (no min-prob cutoff)
+}
+
+impl Default for MtpSamplingConfig {
+    fn default() -> Self {
+        Self { temp: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0 }
+    }
+}
+
+impl MtpSamplingConfig {
+    pub fn is_greedy(&self) -> bool { self.temp <= 0.0 }
+}
+
+/// Reproducible xorshift64* RNG. Cheap, fast, no `rand` dep.
+#[derive(Copy, Clone, Debug)]
+pub struct MtpRng(u64);
+
+impl MtpRng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(0x9E3779B97F4A7C15).max(1))
+    }
+    pub fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545F4914F6CDD1D)
+    }
+    pub fn next_uniform_f32(&mut self) -> f32 {
+        // 24-bit mantissa: [0.0, 1.0).
+        (self.next_u64() >> 40) as f32 / (1u32 << 24) as f32
+    }
+}
+
+/// Sample one token from a row of logits with temp/top_k/top_p/min_p.
+/// Returns `(token_id, p_sampled)` where `p_sampled` is the normalized
+/// probability of the chosen token under the truncated distribution.
+///
+/// All arithmetic is host-side f64 for the softmax stability + cumulative
+/// sums, then cast back to f32 for the returned probability. The vocab is
+/// typically 32K (compressed) or 248K (full); a few μs per call.
+pub fn sample_from_logits(
+    logits: &[f32],
+    cfg: &MtpSamplingConfig,
+    rng: &mut MtpRng,
+) -> (u32, f32) {
+    assert!(!logits.is_empty(), "sample_from_logits: empty logits row");
+    assert!(cfg.temp > 0.0, "sample_from_logits: temp must be > 0; caller must branch on greedy");
+
+    // 1. Build (id, scaled_logit) pairs.
+    let inv_temp = 1.0 / cfg.temp as f64;
+    let mut pairs: Vec<(u32, f64)> = logits
+        .iter()
+        .enumerate()
+        .map(|(i, &l)| (i as u32, l as f64 * inv_temp))
+        .collect();
+
+    // 2. Optional top_k: partial-sort to keep top_k by logit (descending).
+    if cfg.top_k > 0 && cfg.top_k < pairs.len() {
+        pairs.select_nth_unstable_by(cfg.top_k - 1, |a, b| b.1.partial_cmp(&a.1).unwrap());
+        pairs.truncate(cfg.top_k);
+    }
+
+    // 3. Sort by logit descending for top_p and min_p filtering + sampling.
+    pairs.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    // 4. Softmax with max-subtraction stability.
+    let max_logit = pairs[0].1;
+    let mut sum_exp = 0.0_f64;
+    let mut probs: Vec<f64> = pairs
+        .iter()
+        .map(|(_, l)| {
+            let e = (l - max_logit).exp();
+            sum_exp += e;
+            e
+        })
+        .collect();
+    for p in probs.iter_mut() { *p /= sum_exp; }
+
+    // 5. min_p: drop tokens with normalized prob < min_p * top_prob.
+    if cfg.min_p > 0.0 {
+        let top_p_val = probs[0];
+        let thresh = (cfg.min_p as f64) * top_p_val;
+        let cutoff = probs.iter().position(|&p| p < thresh).unwrap_or(probs.len());
+        pairs.truncate(cutoff.max(1));
+        probs.truncate(cutoff.max(1));
+        // Renormalize after min_p.
+        let s: f64 = probs.iter().sum();
+        for p in probs.iter_mut() { *p /= s; }
+    }
+
+    // 6. top_p (nucleus): cumulative-prob cutoff.
+    if cfg.top_p < 1.0 {
+        let mut cum = 0.0_f64;
+        let mut cutoff = probs.len();
+        for (i, &p) in probs.iter().enumerate() {
+            cum += p;
+            if cum >= cfg.top_p as f64 {
+                cutoff = i + 1;
+                break;
+            }
+        }
+        pairs.truncate(cutoff);
+        probs.truncate(cutoff);
+        // Renormalize after top_p.
+        let s: f64 = probs.iter().sum();
+        for p in probs.iter_mut() { *p /= s; }
+    }
+
+    // 7. Multinomial sample.
+    let r = rng.next_uniform_f32() as f64;
+    let mut acc = 0.0_f64;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += p;
+        if r < acc {
+            return (pairs[i].0, probs[i] as f32);
+        }
+    }
+    // Numerical edge case: fall through to last.
+    let last = probs.len() - 1;
+    (pairs[last].0, probs[last] as f32)
+}
+
+/// Compute the temperature-scaled softmax probability of a single token at
+/// index `idx` in a logits row. Used by the residual-acceptance rule to
+/// gather `p_target(c_k)` and `p_draft(c_k)` under the same temperature
+/// scaling that draft sampling uses. Numerically stable via
+/// max-subtraction (single pass over logits).
+///
+/// Note: this is the **un-truncated** softmax prob (no top_k/top_p filter).
+/// For the residual ratio `p_target(c_k) / p_draft(c_k)` we want both probs
+/// from the same distribution shape; using raw temp-scaled softmax keeps
+/// the math clean even if draft sampling itself was truncated.
+pub fn softmax_prob_at_temp(logits: &[f32], idx: usize, temp: f32) -> f32 {
+    assert!(temp > 0.0, "softmax_prob_at_temp: temp must be > 0");
+    let inv_t = (1.0 / temp) as f64;
+    // First pass: find max (for stability) of temp-scaled logits.
+    let mut max_scaled = f64::NEG_INFINITY;
+    for &l in logits.iter() {
+        let s = l as f64 * inv_t;
+        if s > max_scaled { max_scaled = s; }
+    }
+    let mut sum_exp = 0.0_f64;
+    let mut target_e = 0.0_f64;
+    for (i, &l) in logits.iter().enumerate() {
+        let e = ((l as f64) * inv_t - max_scaled).exp();
+        sum_exp += e;
+        if i == idx { target_e = e; }
+    }
+    (target_e / sum_exp) as f32
+}
+
 // ─── Public state ────────────────────────────────────────────────────────
 
 /// All persistent buffers needed by [`spec_step_mtp`]. Allocate once per
@@ -131,6 +295,17 @@ pub struct MtpSpecState {
     /// [`Self::set_p_min`]. The current step's candidate IS kept (we already
     /// computed it); only steps k+1..max_n are skipped.
     pub p_min: f32,
+
+    /// Sampling config (temp/top_k/top_p/min_p). When `temp == 0.0` (default)
+    /// the spec-step uses the legacy greedy/argmax-match accept rule. When
+    /// `temp > 0`, the K-chain samples per step + the trunk applies
+    /// residual-style acceptance (matches Unsloth/llama.cpp #22673 canonical
+    /// MTP path). Set via [`Self::set_sampling`].
+    pub sampling: MtpSamplingConfig,
+
+    /// RNG state for sampling. Seeded via [`Self::set_sampling`].
+    /// Single global stream across all spec-decode positions in a generation.
+    pub rng: MtpRng,
 }
 
 impl MtpSpecState {
@@ -217,7 +392,20 @@ impl MtpSpecState {
             mtp_topk_logp,
             max_n,
             p_min: 0.0,
+            sampling: MtpSamplingConfig::default(),
+            rng: MtpRng::new(42),
         })
+    }
+
+    /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
+    /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
+    /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
+    pub fn set_sampling(&mut self, cfg: MtpSamplingConfig, seed: u64) {
+        assert!(cfg.temp >= 0.0, "set_sampling: temp must be >= 0.0, got {}", cfg.temp);
+        assert!(cfg.top_p > 0.0 && cfg.top_p <= 1.0, "set_sampling: top_p must be in (0,1], got {}", cfg.top_p);
+        assert!(cfg.min_p >= 0.0 && cfg.min_p <= 1.0, "set_sampling: min_p must be in [0,1], got {}", cfg.min_p);
+        self.sampling = cfg;
+        self.rng = MtpRng::new(seed);
     }
 
     /// Set the draft-confidence threshold for compressed-serial K-chain
@@ -1128,6 +1316,34 @@ pub fn spec_step_mtp_compressed_serial(
     let log_p_min = if use_p_min { p_min.ln() } else { f32::NEG_INFINITY };
     let mut chain_truncated = false;
 
+    // Sampling vs greedy: when sampling.temp > 0, K-chain SAMPLES from each
+    // draft distribution (instead of argmax) and trunk verify applies a
+    // residual acceptance rule (instead of strict argmax-match). Matches
+    // Unsloth/llama.cpp #22673 canonical MTP recipe (temp=1.0, top_p=0.95,
+    // top_k=20). Greedy path (temp=0) unchanged.
+    let sampling = state.sampling;
+    let use_sampling = !sampling.is_greedy();
+    if use_sampling && use_p_min {
+        // p_min logic uses the topk_logsumexp_batched output, which doesn't
+        // straightforwardly compose with arbitrary top_k/top_p sampling.
+        // Disallow the combination for now — caller picks one or the other.
+        panic!("spec_step_mtp_compressed_serial: --mtp-p-min and --temp > 0 are mutually exclusive (got p_min={p_min}, temp={})", sampling.temp);
+    }
+    let mut draft_probs: Vec<f32> = if use_sampling {
+        Vec::with_capacity(max_n)
+    } else {
+        Vec::new()
+    };
+    // Cached host buffer for per-step draft logits readback (sampling only).
+    // Sized to whichever vocab the dispatch path uses (compressed cvs or
+    // full 248K vocab). Allocated once outside the loop.
+    let mut draft_logits_host: Vec<f32> = if use_sampling {
+        let n = if use_full_vocab { vocab } else { cvs };
+        vec![0.0; n]
+    } else {
+        Vec::new()
+    };
+
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
     for k in 0..max_n {
         let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
@@ -1189,7 +1405,40 @@ pub fn spec_step_mtp_compressed_serial(
         let argmax_vocab = cvs;  // = full vocab in full-vocab mode, = compressed vocab in compressed mode
 
         let draft_idx: usize;
-        if use_p_min {
+        if use_sampling {
+            // D2H full draft logits row (32K for compressed, 248K for full-vocab).
+            // 128 KB or 1 MB per step; ~30-200 μs at PCIe 4 x16.
+            let logits_bytes = argmax_vocab * 4;
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    draft_logits_host.as_mut_ptr() as *mut u8, logits_bytes,
+                )
+            };
+            gpu.hip.memcpy_dtoh(bytes, &logits_for_argmax.buf)?;
+            // Sample with temp/top_k/top_p/min_p on host.
+            let (sampled_idx, _p_truncated) = sample_from_logits(
+                &draft_logits_host[..argmax_vocab],
+                &sampling,
+                &mut state.rng,
+            );
+            draft_idx = sampled_idx as usize;
+            assert!(draft_idx < argmax_vocab,
+                "draft sample {draft_idx} out of argmax_vocab {argmax_vocab}");
+            // For residual acceptance we use the UN-truncated temp-scaled
+            // softmax prob of the sampled token (matches p_target's
+            // un-truncated computation — keeps the ratio math clean).
+            let p_d_untruncated = softmax_prob_at_temp(
+                &draft_logits_host[..argmax_vocab],
+                draft_idx,
+                sampling.temp,
+            );
+            draft_probs.push(p_d_untruncated);
+            let token_id = match vocab_map_opt {
+                Some(vm) => vm[draft_idx],
+                None => draft_idx as u32,
+            };
+            candidates.push(token_id);
+        } else if use_p_min {
             // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
             gpu.topk_logsumexp_batched_f32(
                 logits_for_argmax, &state.mtp_topk_idx, &state.mtp_topk_logp,
@@ -1336,25 +1585,97 @@ pub fn spec_step_mtp_compressed_serial(
     let mut accept_count = 0usize;
     let mut hit_eos = false;
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
-    for k in 0..drafts_generated {
-        if argmax_per_pos[k] == candidates[k] {
-            committed.push(candidates[k]);
-            accept_count += 1;
-            if candidates[k] == eos_token_id {
-                hit_eos = true;
+
+    if use_sampling {
+        // ── Residual-acceptance sampling path ────────────────────────────
+        //
+        // For each draft candidate c_k, accept with probability
+        // min(1, p_target(c_k) / p_draft(c_k)). Both probs are computed
+        // as un-truncated temp-scaled softmax over the respective model's
+        // logits row, keeping the residual ratio math clean. On rejection
+        // or full accept, the bonus token is SAMPLED (with the same
+        // temp/top_k/top_p/min_p truncation as draft) from the trunk's
+        // distribution at the corresponding verify position.
+        //
+        // Approximations vs. the strict speculative-sampling formulation
+        // (Chen et al. / Leviathan et al.):
+        //   - Uses un-truncated p_target/p_draft in the accept ratio even
+        //     though draft was actually sampled from a truncated nucleus.
+        //     Practical impact: small bias on acceptance probabilities
+        //     when top_k/top_p truncation is aggressive; the resulting
+        //     token distribution is close to but not exactly trunk's.
+        //   - Bonus on rejection is `sample_from_logits(trunk_row)` not
+        //     `sample_from_residual((p_target - p_draft)+)`. Same caveat —
+        //     close to trunk's but not exact.
+        // These approximations match the practical posture of llama.cpp /
+        // vLLM speculative-decoding implementations and are appropriate
+        // for benchmark / quality-tolerant generation use cases.
+        let total_verify_floats = n_verify * vocab;
+        let mut verify_logits_host: Vec<f32> = vec![0.0; total_verify_floats];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    verify_logits_host.as_mut_ptr() as *mut u8,
+                    total_verify_floats * 4,
+                )
+            };
+            gpu.hip.memcpy_dtoh(bytes, &logits_view.buf)?;
+        }
+
+        for k in 0..drafts_generated {
+            let row = &verify_logits_host[k * vocab..(k + 1) * vocab];
+            let p_t = softmax_prob_at_temp(row, candidates[k] as usize, sampling.temp);
+            let p_d = draft_probs[k].max(1e-30);
+            let accept_ratio = (p_t / p_d).min(1.0);
+            let r = state.rng.next_uniform_f32();
+            if r < accept_ratio {
+                committed.push(candidates[k]);
+                accept_count += 1;
+                if candidates[k] == eos_token_id {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
                 break;
             }
-        } else {
-            break;
+        }
+        if !hit_eos {
+            // Sample bonus from trunk's distribution at position accept_count.
+            // accept_count is in [0, drafts_generated]; the bonus position is
+            // accept_count (= the first rejected slot, or drafts_generated on
+            // full accept).
+            let bonus_row_start = accept_count * vocab;
+            let bonus_row = &verify_logits_host[bonus_row_start..bonus_row_start + vocab];
+            let (bonus_idx, _) = sample_from_logits(bonus_row, &sampling, &mut state.rng);
+            let bonus = bonus_idx;
+            committed.push(bonus);
+            if bonus == eos_token_id {
+                hit_eos = true;
+            }
+        }
+    } else {
+        // ── Legacy greedy / argmax-match accept rule ─────────────────────
+        for k in 0..drafts_generated {
+            if argmax_per_pos[k] == candidates[k] {
+                committed.push(candidates[k]);
+                accept_count += 1;
+                if candidates[k] == eos_token_id {
+                    hit_eos = true;
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if !hit_eos {
+            let bonus = argmax_per_pos[accept_count];
+            committed.push(bonus);
+            if bonus == eos_token_id {
+                hit_eos = true;
+            }
         }
     }
-    if !hit_eos {
-        let bonus = argmax_per_pos[accept_count];
-        committed.push(bonus);
-        if bonus == eos_token_id {
-            hit_eos = true;
-        }
-    }
+
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 

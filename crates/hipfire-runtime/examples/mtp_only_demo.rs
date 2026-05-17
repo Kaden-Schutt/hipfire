@@ -41,6 +41,14 @@ fn main() {
     let mut compressed_serial: bool = false;
     let mut kv_mode_str: String = String::from("q8");
     let mut p_min: f32 = 0.0;
+    // Sampling parameters (Unsloth-recommended for Qwen3.5/3.6 MTP):
+    //   thinking-mode default: temp=1.0, top_p=0.95, top_k=20, min_p=0.0
+    //   coding-mode:          temp=0.6, top_p=0.95, top_k=20, min_p=0.0
+    // temp=0.0 keeps the legacy greedy / argmax-match accept path.
+    let mut top_p: f32 = 1.0;
+    let mut top_k: usize = 0;
+    let mut min_p: f32 = 0.0;
+    let mut seed: u64 = 42;
 
     let mut i = 1;
     while i < args.len() {
@@ -59,6 +67,10 @@ fn main() {
             "--compressed-serial" => { compressed = true; compressed_serial = true; i += 1; }
             "--kv-mode" => { kv_mode_str = args[i + 1].clone(); i += 2; }
             "--mtp-p-min" => { p_min = args[i + 1].parse().unwrap(); i += 2; }
+            "--top-p" => { top_p = args[i + 1].parse().unwrap(); i += 2; }
+            "--top-k" => { top_k = args[i + 1].parse().unwrap(); i += 2; }
+            "--min-p" => { min_p = args[i + 1].parse().unwrap(); i += 2; }
+            "--seed" => { seed = args[i + 1].parse().unwrap(); i += 2; }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \\\n\
@@ -105,8 +117,16 @@ fn main() {
             std::process::exit(2);
         })
     };
-    if temp != 0.0 {
-        eprintln!("error: mtp_only_demo v1 is greedy-only (--temp must be 0.0); got {temp}");
+    // temp > 0 enables residual-sampling spec decode (Unsloth/llama.cpp
+    // canonical MTP config). temp == 0 keeps the legacy greedy /
+    // argmax-match accept rule.
+    if temp < 0.0 {
+        eprintln!("error: --temp must be >= 0.0, got {temp}");
+        std::process::exit(2);
+    }
+    if temp > 0.0 && !compressed_serial {
+        eprintln!("error: --temp > 0 is only supported on --compressed-serial path \
+                   (other paths are greedy-only); got temp={temp}");
         std::process::exit(2);
     }
     assert!(max_n >= 1 && max_n <= 8, "--max-n must be in [1,8]");
@@ -213,6 +233,16 @@ fn main() {
         }
         state.set_p_min(p_min);
         eprintln!("mtp-p-min: {p_min} (early-exit chain at log P(argmax) < {:.4})", p_min.ln());
+    }
+    if temp > 0.0 {
+        let cfg = hipfire_arch_qwen35::mtp_spec::MtpSamplingConfig {
+            temp,
+            top_k,
+            top_p,
+            min_p,
+        };
+        state.set_sampling(cfg, seed);
+        eprintln!("sampling: temp={temp} top_k={top_k} top_p={top_p} min_p={min_p} seed={seed}");
     }
 
     // Compressed mode: two sub-cases now:
