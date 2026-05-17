@@ -37,6 +37,7 @@ kernels/compiled/
 .serena/
 .remember/
 .codex
+.sisyphus/
 
 # Local secrets (lmx api key, etc.) — never commit
 .env
