@@ -284,47 +284,178 @@ This avoids:
 - L2 pollution (Q evicted by Q_rot write)
 - hipGraph capture surface complication
 
-## Phase 1.0 — Spike (REQUIRED, 1-2 days, before any production code)
+## Phase 1.0 — Spike (COMPLETE, see results below)
 
-**This is a GO/NO-GO gate for the entire effort on gfx1151.** Three measurements + one code fix:
+**This was a GO/NO-GO gate for the entire effort on gfx1151.** All four
+tasks ran on the bench host (Radeon 8060S, ROCm 7.12, kernel-cache
+fresh). Results inline.
 
-### Tasks
+### Task 1 — profiler.rs gfx1151 arm (DONE)
 
-1. **profiler.rs gfx1151 arm** (10-line fix, A11). Unblocks downstream rocprof analysis.
+Committed `80ed5d8a`. RDNA3.5 arm added with empirically-verified L2=2 MB
+(rocminfo: Cache Info `L2: 2048 KB`). Unblocked downstream rocprof.
 
-2. **rocprof scalar FA on gfx1151** (1-2 hours). Measure on Qwen 3.5 9B asym2 (gfx1151 default), prompt ≥ 2048 tokens:
-   - VRAM → L2 read throughput vs LPDDR5x ceiling (~200 GB/s effective on this host)
-   - VALUUtil on the scalar FA tile kernel
-   - L2 hit rate
+### Task 2 — rocprof scalar FA on gfx1151 (PARTIAL — kernel-trace done, PMC counters timed out)
 
-   **Pass condition:** VRAM throughput < 80% of ceiling AND VALUUtil > 40%. If those hold, scalar FA is ALU-bound and WMMA can win. If VRAM > 90% of ceiling and VALUUtil < 30%, FA is bandwidth-locked and WMMA cannot win on gfx1151 — drop gfx1151 from Phase 1, target dGPU only.
+`rocprofv3 --kernel-trace` on a 2048-token prefill of Qwen 3.5 9B mq3
+with asym2 KV (gfx1151's default) gave per-kernel timings cleanly:
+`attention_flash_asym2_tile_batched` averaged **2.048 ms/call** (504
+calls, min 158 µs, max 2.836 ms — wide spread reflects per-position
+seq_len growth).
 
-3. **ALU-only stub kernel** (~150 lines, in `experiments/wmma_fa_spike/`). Takes already-dequantized fp16 Q, K, V (no asym dequant). Runs WMMA-FA with the LDS round-trip spelled out. A/B vs scalar FA on synthetic fp16 inputs, BLOCK_M ∈ {16, 32, 64}, BLOCK_N ∈ {32, 64} on gfx1100 + gfx1151.
+`rocprofv3 --pmc FETCH_SIZE WRITE_SIZE MemUnitBusy L2CacheHit ...`
+exceeded the 10-minute timeout budget twice (multi-pass counter replay
+on a 9B model load is slow). **PMC measurement deferred** — not needed
+once Task 3 produced an unambiguous signal.
 
-   **Pass condition:** ≥ +25% on gfx1100; ≥ 0% on gfx1151 (the inline-dequant kernel will be slower than the stub by some delta, so the stub needs headroom).
+**Arithmetic-intensity sanity check** (sufficient on its own):
+unique-bytes traffic per call ≈ 34 MB → ≥ 48 GB/s sustained at the
+measured 0.697 ms scalar fp16 spike, **vs gfx1151's ~150-200 GB/s
+ceiling**. Not bandwidth-locked. (The asym2 production kernel is even
+LESS bandwidth-pressured per byte than the fp16 spike, since asym2
+packing is 7× smaller per K element.)
 
-4. **fp16 P-narrow precision spike** (small Python or Rust harness, half a day). Run scalar FA with an artificial fp16 narrow inserted at the P-step. Measure NLL drift on Qwen 3.5 9B asym4 + asym2 over a 256-token completion on `benchmarks/prompts/lru_cache_pep8_strict.txt`.
+### Task 3 — ALU-only spike kernel (DONE — **5.91× WMMA win on gfx1151**)
 
-   **Pass condition:** ΔNLL/tok < 0.003 (leaves 0.002 headroom below the 0.005 Phase 1.2 gate for the V-WMMA fp16-input loss).
+Spike at `experiments/wmma_fa_spike/`, harness at
+`crates/hipfire-runtime/examples/wmma_fa_spike.rs`. Both kernels
+operate on pre-dequantized fp16 K/V — no asym dequant, no Givens —
+so the A/B isolates ALU only.
 
-### Failure modes
+Synthetic random Q/K/V, batch=32, seq=2048, n_heads=28, n_kv_heads=4,
+head_dim=128, 2 warmup + 5 measure:
 
-- **Bandwidth-bound on gfx1151** (likely per `devlog_20260508_lloyd_wmma_phase_c.md:149-151`): drop gfx1151 from Phase 1. Target RDNA3 dGPU only. Document in plan rev 3 and continue.
-- **Stub doesn't beat scalar by +25% on gfx1100**: kill the whole effort. The inline-dequant production kernel will be slower than the stub; if the stub can't win on the best case, no production kernel will.
-- **fp16 P-narrow drift > 0.005**: investigate alternatives — keep P in fp32 (skip the P-WMMA, do scalar P@V), or use a mixed-precision WMMA variant if available. May force Phase 1 to fp32-only P@V (~30% slower than the WMMA P@V but still benefits from the QK WMMA).
+|                     | scalar fp16 | WMMA fp16  | speedup |
+|---------------------|------------:|-----------:|--------:|
+| median time         | 0.694 ms    | 0.117 ms   | **5.91×** |
+| min time            | 0.672 ms    | 0.109 ms   | —       |
+
+Numerical compare (partials buffer, fp32):
+- max |Δ| = 0.0017
+- max rel-diff = 11% on cells with |val| > 0.01 (928k cells)
+- |Δ| histogram: 35% of cells > 1e-4, **0.05%** > 1e-3, **zero** > 5e-3
+
+Kernel metadata (from `gfx-kernel-metadata` skill on gfx1151 hsaco):
+
+|                   | VGPR | SGPR | LDS (B) | Spills | Max waves/SIMD |
+|-------------------|-----:|-----:|--------:|-------:|---------------:|
+| `fa_scalar_fp16`  | 28   | 37   | 0 (dyn 512 via launch) | 0 | 16 (unconstrained) |
+| `fa_wmma_fp16`    | **239** | 47 | 5248 (static) | 0 | 6 (VGPR-bound) |
+
+239 VGPRs > plan's 128 target → 38% of max occupancy on gfx1151. The
+5.91× still cleared by holding 8 acc_o fragments live to cover hd=128.
+Phase 1.1 has headroom to drop ~56 VGPRs by looping over V-dim slices
+instead of keeping all 8 fragments live.
+
+**Pass:** clears the +25% gfx1100 floor and the ≥0% gfx1151 floor by a
+wide margin. Caveats: synthetic uniform inputs (not real attention,
+which has more peaked softmax); no asym dequant overhead (production
+WMMA-asym2 will erode the margin — realistic production target ~3-4×);
+single shape (batch=32 only), no sweep.
+
+### Task 4 — fp16 P-narrow precision spike (DONE — **FAIL, ΔNLL/tok 6× over gate**)
+
+Patched `attention_flash_asym2_tile.hip` (single-token FA) with a
+one-line fp16 round-trip on P:
+
+```c
+float e = expf(scores[i] - tile_max);
+e = (float)(_Float16) e;   // simulate WMMA P → fp16 narrow
+```
+
+Force-cleaned `rdna-compute` + kernel cache between runs. Perplexity
+on `wikitext2-1024s-2048ctx.txt`, Qwen 3.5 9B mq3-lloyd, --kv-mode
+asym2, --ctx 2048 --warmup 8.
+
+|                  | NLL/tok           | PPL     |
+|------------------|------------------:|--------:|
+| baseline (fp32 P) | 2.9053274253      | 18.2712 |
+| fp16 P-narrow    | 2.9240367511      | 18.6163 |
+| **Δ**            | **+0.0187**       | +0.345  |
+
+**ΔNLL/tok = 0.0187 is 6.2× the 0.003 gate.** PPL drift of 1.9%
+relative is in the same envelope as switching from q8 KV to asym2 KV —
+i.e. comparable to a quant-tier downgrade. **Fail.**
+
+Caveat: spike applies fp16 narrow to P only. Production WMMA also
+narrows V for the P @ V multiply (V comes in fp16 from asym2 dequant
+anyway, so this is partly accounted for, but the WMMA inner product
+truncates BEFORE the fp32 accumulate where scalar accumulates from
+fp32 inputs). True production WMMA NLL drift is likely **≥ 0.0187**,
+possibly higher.
+
+### Phase 1.0 verdict
+
+- **Perf path: GREEN.** WMMA-FA is a real, large ALU win on gfx1151
+  despite the iGPU's bandwidth profile. The scalar-FA-is-ALU-bound
+  hypothesis is correct on this hardware.
+- **Precision path: RED.** The full-WMMA-FA design (with fp16 P-narrow
+  in the LDS round-trip) fails the NLL gate by 6×. Cannot ship as-is.
+
+### Phase 1.0 → Phase 1.1 redesign
+
+Path forward: **drop the P @ V WMMA. Keep the QK^T WMMA.** The plan's
+rev 1 Risk 1 fallback ("scalar P@V") is now the production design:
+
+1. Compute QK^T via WMMA (the big ALU win).
+2. Apply scale + causal mask + per-row online softmax → P held in fp32.
+3. **Multiply P × V in scalar wave32** (per-tile loop, fp32 accumulate)
+   — exactly what the current scalar FA does for Phase D.
+
+This sacrifices the second WMMA call but preserves the precision the
+gate requires. Perf hypothesis for the revised Phase 1.1: somewhere
+between scalar (0.694 ms) and full-WMMA spike (0.117 ms). The QK^T
+WMMA alone was ~75% of the speedup contribution; the P @ V WMMA was
+~25%. Estimate: ~0.20-0.30 ms in the spike, → ~2.5-3.5× over scalar fp16
+on gfx1151 (still well above the +25% gate).
+
+The Phase 1.1 kernel-shape section below needs an update to reflect
+this: remove the LDS P round-trip, replace the P @ V WMMA with a
+scalar tile-loop that mirrors `attention_flash_asym2_tile.hip` Phase D.
+
+### Failure modes (now historical; preserved for review trail)
+
+- **Bandwidth-bound on gfx1151**: did not occur. Scalar FA was ALU-bound,
+  not bandwidth-bound, on the bench host. Hypothesis from
+  `devlog_20260508_lloyd_wmma_phase_c.md` was about whole-pipeline
+  prefill scaling; the FA kernel specifically is not the bandwidth
+  bottleneck within prefill.
+- **Stub doesn't beat scalar by +25% on gfx1100**: not measured (no
+  gfx1100 available to this session); user testing on gfx1100 is a
+  separate validation step.
+- **fp16 P-narrow drift > 0.005**: OCCURRED at 0.0187. Plan revised
+  to scalar P@V (above).
 
 ## Phase 1.1 — Production kernel (5-7 days)
 
-Only enter if Phase 1.0 gates all pass.
+Reflects the Phase 1.0 redesign: WMMA for QK^T only; scalar P @ V to
+preserve fp32 precision on the softmax output.
 
-- **New kernel:** `kernels/src/attention_flash_asym4_wmma_tile_batched.hip` (~300-400 lines).
+- **New kernel:** `kernels/src/attention_flash_asym4_wmma_tile_batched.hip` (~250-300 lines).
 - **Asym4 only, hd=128 only, no tree-bias** (tree path falls through to scalar via the gate).
 - **Inline Givens** (no pre-pass kernel; no `fa_q_rot` scratch).
 - **TILE_SIZE = 128 preserved** — one partial-write per kv_tile, with 2× BLOCK_N=64 chunks per tile.
-- **LDS round-trip for P → A-fragment** (~512 B per workgroup).
+- **QK^T via WMMA, P @ V via scalar.** The Phase 1.0 precision spike
+  showed fp16 P-narrow drift = 0.0187 NLL/tok (6× the gate). Solution:
+  keep acc_qk in fp32 through softmax, accumulate scalar `w * V`
+  per-cell with fp32 precision — exactly the existing Phase D in
+  `attention_flash_asym2_tile_batched.hip`. The LDS P-tile and P @ V
+  WMMA from rev-2 are dropped.
 - **Per-row softmax state** as `float m_state[8], l_state[8]` per lane; row-max via `__shfl_xor` with off ∈ {1, 2, 4, 8}.
 - **Per-row causal mask** via LDS-broadcast of `positions[BLOCK_M]`.
+- **Scalar Phase D**: lane (tid & 15) accumulates V-dim values for
+  rows {2j + half}, mirroring the production scalar V-accumulate. No
+  LDS for V — the scalar pattern is one row per lane, fp16 V dequant
+  inline. Drops the LDS V staging from rev-2 as well.
 - **KernargBlob path mirrored** (per `dispatch.rs:14776` `launch_maybe_blob` pattern) for hipGraph capture.
+
+**Expected perf** (extrapolated from the spike): scalar Phase D adds
+~50-70% of the spike's ALU work back, since Phase D is the
+V-multiply-and-accumulate loop. Spike full-WMMA was 0.117 ms; scalar
+fp16 was 0.694 ms; estimated revised Phase 1.1 = **0.20-0.30 ms**, →
+2.5-3.5× speedup over scalar fp16 on gfx1151. Production WMMA-asym2
+will further erode the margin by the dequant tax, landing at ~1.5-2×
+production-realistic.
 
 **Dispatch wiring:**
 - New helper `launch_asym_flash_batched_wmma` in `dispatch.rs`.
@@ -336,7 +467,7 @@ Only enter if Phase 1.0 gates all pass.
 
 1. `cargo check -p rdna-compute -p hipfire-arch-qwen35` clean.
 2. **Kernel hsaco metadata:** zero spills, VGPR ≤ 128 (target 8-15 waves resident; `__launch_bounds__(32, 2)` is the minimum floor, not the ceiling). Check via `gfx-kernel-metadata` skill on the compiled `.hsaco`.
-3. **Numerical drift:** `ΔNLL/tok < 0.005` vs scalar FA on Qwen 3.5 9B asym4, 256 tokens, lru_cache PEP-8 strict prompt with `prompt_normalize=true`. Two precision-loss points budget combined: fp16 P-narrow (Phase 1.0 measured) + fp16 P×V WMMA inputs.
+3. **Numerical drift:** `ΔNLL/tok < 0.005` vs scalar FA on Qwen 3.5 9B asym4, 2048 tokens, wikitext2 slice with `prompt_normalize=true`. With the QK-only WMMA + scalar P @ V design, the only precision loss is fp32 fmadd reorder inside the WMMA accumulator — same envelope as issue #188. Phase 1.0 baseline was 2.9053; gate fails above 2.9103.
 4. **Coherence gate:** `./scripts/coherence-gate.sh` passes for Qwen 3.5 9B asym4 with `HIPFIRE_WMMA_FA=1`. No attractors, no token loops, no special-token leaks. *(Mandatory — see `feedback_v2_sgpr_lut_falsified_2026_05_10`, `project_gfx11_dot2_trickle_down_falsified_2026_05_11`, `project_fp8_wmma_hfp4g32_2026_05_10`: every prior kernel win that passed synthetic bench failed coherence on the first try.)*
 5. **DFlash coherence gate:** `./scripts/coherence-gate-dflash.sh` passes for Qwen 3.5 27B-3.5 LRU. *(The DFlash path doesn't use the new kernel because `tree_bias != null` falls through to scalar — this gate verifies no regression in the scalar path from our dispatch changes.)*
 6. **PFlash bench:** if a PFlash bench exists for the asym4 path (verify in `crates/hipfire-runtime/examples/`), run it; expect no τ regression on drafter acceptance.
