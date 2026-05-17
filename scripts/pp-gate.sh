@@ -147,29 +147,31 @@ arch_family() {
 # Stepping is hex for gfx90a (10) and gfx90c (12). Hand-coded for known archs.
 gfx_int_to_str() {
     case "$1" in
+        90002)  echo "gfx902" ;;
         90006)  echo "gfx906" ;;
         90008)  echo "gfx908" ;;
+        90009)  echo "gfx909" ;;
         90010)  echo "gfx90a" ;;
         90012)  echo "gfx90c" ;;
         90402)  echo "gfx942" ;;
         100100) echo "gfx1010" ;;
         100101) echo "gfx1011" ;;
         100102) echo "gfx1012" ;;
+        100103) echo "gfx1013" ;;
         100300) echo "gfx1030" ;;
         100301) echo "gfx1031" ;;
         100302) echo "gfx1032" ;;
-        101300) echo "gfx1013" ;;
-        103300) echo "gfx1033" ;;
-        103400) echo "gfx1034" ;;
-        103500) echo "gfx1035" ;;
-        103600) echo "gfx1036" ;;
+        100303) echo "gfx1033" ;;
+        100304) echo "gfx1034" ;;
+        100305) echo "gfx1035" ;;
+        100306) echo "gfx1036" ;;
         110000) echo "gfx1100" ;;
         110001) echo "gfx1101" ;;
         110002) echo "gfx1102" ;;
-        110300) echo "gfx1103" ;;
-        115000) echo "gfx1150" ;;
-        115100) echo "gfx1151" ;;
-        115200) echo "gfx1152" ;;
+        110003) echo "gfx1103" ;;
+        110500) echo "gfx1150" ;;
+        110501) echo "gfx1151" ;;
+        110502) echo "gfx1152" ;;
         120000) echo "gfx1200" ;;
         120001) echo "gfx1201" ;;
         0)      echo "" ;;   # CPU host node

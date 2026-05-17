@@ -72,7 +72,7 @@ Goes immediately after `set -u`, before `rocm-env.sh` sourcing.
 Read `/sys/class/kfd/kfd/topology/nodes/*/properties`. Each node has
 both `simd_count` (0 = CPU host node) and `gfx_target_version`
 (integer encoding: `90006` = gfx906, `90012` = gfx90c, `100100` =
-gfx1010, `110000` = gfx1100, `115100` = gfx1151, etc.).
+gfx1010, `110000` = gfx1100, `110501` = gfx1151, etc.).
 
 Verified on the repro box (this dev box):
 ```
@@ -112,8 +112,13 @@ parse_sysfs_devices() {
 The integer encoding is `major * 10000 + minor * 100 + stepping`:
 - `90006` → `gfx906` (9.0.6)
 - `90012` → `gfx90c` (9.0.12 → hex stepping `c` for gfx90c)
+- `100103` → `gfx1013` (10.1.3)
 - `110000` → `gfx1100` (11.0.0)
-- `115100` → `gfx1151` (11.5.1)
+- `110003` → `gfx1103` (11.0.3)
+- `110501` → `gfx1151` (11.5.1)
+
+This integer is not the decimal concatenation of the gfx suffix:
+`gfx1151` is encoded as 11.5.1 → `110501`, not `115100`.
 
 The stepping-as-hex case (gfx90c, gfx90a) requires a small lookup;
 hand-code the handful of known cases plus a fallback that prints the
