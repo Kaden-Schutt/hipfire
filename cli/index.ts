@@ -857,11 +857,17 @@ function readServePid(): number | null {
   } catch { return null; }
 }
 
+function serveProbeHost(host: string): string {
+  if (host === "0.0.0.0" || host === "::" || host === "") return "127.0.0.1";
+  if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
+  return host;
+}
+
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
-export async function isServeUp(port: number): Promise<boolean> {
+export async function isServeUp(port: number, host = "127.0.0.1"): Promise<boolean> {
   try {
     const ctl = AbortSignal.timeout(500);
-    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctl });
+    const r = await fetch(`http://${serveProbeHost(host)}:${port}/health`, { signal: ctl });
     return r.ok;
   } catch { return false; }
 }
@@ -1299,7 +1305,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
-async function serve(port: number) {
+async function serve(port: number, host?: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
@@ -1411,9 +1417,10 @@ async function serve(port: number) {
     else busy = false;
   }
 
-  console.error(`[hipfire] http://localhost:${port}/v1/chat/completions`);
+  console.error(`[hipfire] http://${host ?? "localhost"}:${port}/v1/chat/completions`);
 
   Bun.serve({
+    ...(host ? { hostname: host } : {}),
     port,
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
@@ -4046,23 +4053,61 @@ function listConfig(cfg: HipfireConfig): void {
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "serve": {
-    // Parse flags: `hipfire serve [port] [-d|--detach]`. Port can be anywhere.
+    // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
+    // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
     let port: number | null = null;
+    let host: string | null = null;
     let detach = false;
+    const setPort = (raw: string) => {
+      const n = parseInt(raw, 10);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        console.error(`Invalid serve port: ${raw}`);
+        process.exit(1);
+      }
+      if (port !== null && port !== n) {
+        console.error(`Serve port specified more than once: ${port} and ${n}`);
+        process.exit(1);
+      }
+      port = n;
+    };
+    const setHost = (raw: string) => {
+      if (!raw) {
+        console.error("Serve host cannot be empty");
+        process.exit(1);
+      }
+      if (host !== null && host !== raw) {
+        console.error(`Serve host specified more than once: ${host} and ${raw}`);
+        process.exit(1);
+      }
+      host = raw;
+    };
     for (const a of rest) {
       if (a === "-d" || a === "--detach" || a === "--background") detach = true;
-      else if (/^\d+$/.test(a)) port = parseInt(a, 10);
+      else if (/^\d+$/.test(a)) setPort(a);
+      else if (/^\[[^\]]+\]:\d+$/.test(a)) {
+        const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
+        setHost(m[1]);
+        setPort(m[2]);
+      }
+      else if (/^[^:]+:\d+$/.test(a)) {
+        const idx = a.lastIndexOf(":");
+        setHost(a.slice(0, idx));
+        setPort(a.slice(idx + 1));
+      }
       else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [port] [-d|--detach]\n\n`
+        console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
+          + `  [host]     Bind address (examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
+          + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
           + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
           + `Background daemon:\n`
           + `  hipfire serve -d           # start in background\n`
+          + `  hipfire serve 0.0.0.0:11435 -d\n`
           + `  hipfire stop               # kill it\n`
           + `  hipfire ps                 # check if running\n`
           + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
         process.exit(0);
-      } else { console.error(`Unknown serve arg: ${a}`); process.exit(1); }
+      } else setHost(a);
     }
     port = port ?? cfg.port;
 
@@ -4070,7 +4115,7 @@ switch (cmd) {
       // Refuse to start a second one.
       const existing = readServePid();
       if (existing) {
-        console.error(`hipfire serve already running (PID ${existing}) on port ${cfg.port}.`);
+        console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
         console.error(`  Stop it: hipfire stop`);
         process.exit(1);
       }
@@ -4081,7 +4126,8 @@ switch (cmd) {
       const self = process.argv[0];
       const script = process.argv[1];
       const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const child = Bun.spawn([...runBg, self, script, "serve", String(port)], {
+      const childArgs = host ? ["serve", host, String(port)] : ["serve", String(port)];
+      const child = Bun.spawn([...runBg, self, script, ...childArgs], {
         stdin: "ignore",
         stdout: logFd,
         stderr: logFd,
@@ -4097,15 +4143,16 @@ switch (cmd) {
       console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 500));
-        if (await isServeUp(port)) break;
+        if (await isServeUp(port, host ?? "127.0.0.1")) break;
         // Show progress every 30s
         const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
         if (elapsed > 0 && elapsed % 30 === 0) {
           process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
         }
       }
-      if (await isServeUp(port)) {
-        console.log(`hipfire serve started in background (PID ${child.pid}, port ${port})`);
+      if (await isServeUp(port, host ?? "127.0.0.1")) {
+        const bind = host ? `${host}:${port}` : String(port);
+        console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
         console.log(`  log:  ${SERVE_LOG_FILE}`);
         console.log(`  stop: hipfire stop`);
       } else {
@@ -4114,7 +4161,7 @@ switch (cmd) {
       }
       break;
     }
-    await serve(port);
+    await serve(port, host ?? undefined);
     break;
   }
   case "stop": {
@@ -5213,7 +5260,8 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
-  serve [port] [-d]     Start OpenAI-compatible server (-d = background daemon)
+  serve [host] [port] [-d]
+                        Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
