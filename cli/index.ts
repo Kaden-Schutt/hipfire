@@ -5244,7 +5244,8 @@ Examples:
       }
 
       // Determine if we should use dev source or installed source.
-      const srcPath = existsSync(devSrc) ? dirname(devSrc) : dirname(hipfireSrc);
+      const srcDir = existsSync(devSrc) ? dirname(dirname(devSrc)) : dirname(dirname(hipfireSrc));
+      const workspaceRoot = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
       console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
 
       // Parse deps for PATH augmentation (same as update command does).
@@ -5279,16 +5280,16 @@ Examples:
       console.error("Building triattn_validate...");
       const build = Bun.spawnSync(
         ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triattn_validate"],
-        { cwd: srcPath, stdio: ["inherit", "inherit", "inherit"] },
+        { cwd: workspaceRoot, stdio: ["inherit", "inherit", "inherit"] },
       );
       if (build.exitCode !== 0) {
         console.error("Failed to build triattn_validate. Check for ROCm/compilation errors above.");
         process.exit(1);
       }
 
-      // Run the built example.
+      // Run the built example — bin is at workspace_root/target/release/examples/triattn_validate
       const exe = process.platform === "win32" ? ".exe" : "";
-      const binPath = join(srcPath, `../../target/release/examples/triattn_validate${exe}`); // relative to src root
+      const binPath = join(workspaceRoot, `target/release/examples/triattn_validate${exe}`);
       console.error("  Running triattn_validate...");
       const proc = Bun.spawnSync(
         [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)],
