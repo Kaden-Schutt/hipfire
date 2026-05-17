@@ -35,17 +35,26 @@
 #define QI8_1 8
 
 // X_STRIDE chosen per-mmq_x to balance two LDS effects:
-//   - mmq_x >= 64: stride 40 (32 data ints + 8 pad). 40 × 4 = 160 B
+//   - mmq_x >= 32: stride 40 (32 data ints + 8 pad). 40 × 4 = 160 B
 //     is 16-B aligned every row → 100% ds_read_b128. 40 % 32 = 8 →
 //     4-way bank conflict, but the b128 issue rate dominates.
-//   - mmq_x < 64: stride 33 (32 data ints + 1 pad). 33 × 4 = 132 B
+//   - mmq_x < 32: stride 33 (32 data ints + 1 pad). 33 × 4 = 132 B
 //     is 16-B aligned every 4th row only. 33 % 32 = 1 → 0-way bank
 //     conflict. Smaller-mmq_x kernels (used at small batch sizes,
 //     e.g. _full_add_x16 in attn-out residual) regressed under
 //     stride-40 due to the bank conflict cost outweighing the b128
 //     win when j0 has few iterations. PMC-validated.
+//
+// Cliff moved from mmq_x>=64 to mmq_x>=32 mirroring the HFQ6 audit
+// fix in 3ac7a3d8: PMC on the HFQ6 sibling at mmq_x=32 showed
+// MemUnitBusy collapsing to 13.8% (vs 28.8% at mmq_x=16 and 16.0% at
+// mmq_x=40) — kernel idle, not stalled. The b32 path's 8 ds_read_b32
+// per inner ALU iter was choking the LDS pipeline. Activating b128
+// from mmq_x=32 upward (2 ds_read_b128 per iter) recovers 16-20%
+// per-call at mmq_x ∈ {32, 40, 48, 56}. The HFQ4 sibling has the
+// structurally identical inner loop so the same physics applies.
 template <int mmq_x>
-constexpr int x_stride_for() { return mmq_x >= 64 ? 40 : 33; }
+constexpr int x_stride_for() { return mmq_x >= 32 ? 40 : 33; }
 
 #define Y_STRIDE 36
 
@@ -54,6 +63,8 @@ constexpr int x_stride_for() { return mmq_x >= 64 ? 40 : 33; }
 //   [x_dm:   float2 × MMQ_Y                  ]  = 128 * 8     =  1,024 B
 //   [tile_y: i32    × mmq_x * Y_STRIDE       ]  = mmq_x * 144 B
 // At mmq_x=64 (stride 40):  20,480 + 1,024 + 9,216 = 30,720 B per WG.
+// At mmq_x=32 (stride 40):  20,480 + 1,024 + 4,608 = 26,112 B per WG.
+// At mmq_x=24 (stride 33):  16,896 + 1,024 + 3,456 = 21,376 B per WG.
 // At mmq_x=8  (stride 33):  16,896 + 1,024 + 1,152 = 19,072 B per WG.
 // Budget: ≤ 32 KiB/WG so 2 WGs/CU fit in 64 KiB cap. Verified ✅.
 
@@ -183,13 +194,18 @@ static __device__ __forceinline__ void vec_dot_dp4a_streaming(
             const int i = i0 + threadIdx.x;
 
             int sumi = 0;
-            if constexpr (mmq_x >= 64) {
+            if constexpr (mmq_x >= 32) {
                 // b128 path: issue 8 ints per operand as 2× int4 (b128)
                 // reads. With X_STRIDE=40 (160 B/row, 16-B aligned every
                 // row) the compiler emits 100% ds_read_b128 — no b32-quad
-                // fallback. Threshold mmq_x≥64 empirically determined
-                // (see plan v2.16): at smaller mmq_x the int4-unpack
-                // overhead exceeds the issue-rate win.
+                // fallback. Threshold mmq_x≥32 per HFQ6 audit (3ac7a3d8):
+                // the prior `mmq_x≥64` cliff left mmq_x ∈ {32,40,48,56}
+                // on the b32 path with MemUnitBusy collapsing to 13.8%
+                // (LDS pipeline starvation under 8 ds_read_b32 per
+                // inner-ALU iter). Moving the cliff to mmq_x≥32 activates
+                // 2 ds_read_b128 per iter and recovers 16-20% per-call.
+                // MUST stay in lockstep with `x_stride_for<>()` above —
+                // b128 reads need stride=40 for 16-B alignment.
                 const int4 x_v0 = *(const int4*)&x_qs[i * x_stride + kx_start + 0];
                 const int4 x_v1 = *(const int4*)&x_qs[i * x_stride + kx_start + 4];
                 const int4 y_v0 = *(const int4*)&tile_y[j * Y_STRIDE + ky_start + 0];

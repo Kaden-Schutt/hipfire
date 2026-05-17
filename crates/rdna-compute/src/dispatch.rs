@@ -9390,11 +9390,11 @@ impl Gpu {
         ];
 
         // Option C streaming topology — KEEP IN SYNC WITH body.cuh:
-        //   x_qs   : MMQ_Y * x_stride ints  (per-mmq_x: 40 if mmq_x≥64 else 33)
+        //   x_qs   : MMQ_Y * x_stride ints  (per-mmq_x: 40 if mmq_x≥32 else 33)
         //   x_dm   : MMQ_Y float2
         //   tile_y : mmq_x * Y_STRIDE ints
         const MMQ_Y: usize = 128;
-        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
@@ -9497,7 +9497,7 @@ impl Gpu {
         // Option C streaming topology — KEEP IN SYNC WITH body.cuh
         // (same layout invariant as residual variant above).
         const MMQ_Y: usize = 128;
-        let x_stride: usize = if mmq_x >= 64 { 40 } else { 33 };
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         const X_DM_HALF2: usize = 128;
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
