@@ -90,6 +90,38 @@ const FP8_GEMV_MIN_M: usize = 4096;
 
 
 
+/// Opt-in gate for the WMMA flash-attention prefill path (Phase 1.1 of
+/// issue #237 item 2). When enabled and the run-time conditions match
+/// (arch has wave32 WMMA, head_dim=128, asym4 KV, no tree-bias, chunk
+/// size multiple of BLOCK_M=16), `launch_asym_flash_batched` substitutes
+/// `attention_flash_asym4_wmma_tile_batched` for the scalar tile kernel.
+///
+/// Default-off in Phase 1.1; flip to default-on in a separate PR after
+/// Phase 1.2 acceptance gates pass (mirrors the prompt_normalize pattern,
+/// commit 9a2c667). Cached in OnceLock to avoid syscall overhead per
+/// dispatch (see HIPFIRE_FP8_WMMA precedent at line 180).
+fn is_wmma_fa_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1")
+    })
+}
+
+/// Minimum chunk size to engage the WMMA-FA route. Below this the per-launch
+/// overhead dominates the WMMA win. Default 16 = one BLOCK_M tile worth of
+/// query rows; tune via `HIPFIRE_WMMA_FA_MIN_BATCH`.
+fn wmma_fa_min_batch() -> usize {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<usize> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_WMMA_FA_MIN_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+    })
+}
+
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
     pub buf: DeviceBuffer,
@@ -24235,6 +24267,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         block_cols: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
+        const WMMA_BLOCK_M: usize = 16;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
@@ -24245,7 +24278,30 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             batch_size
         };
 
-        self.ensure_givens4_kernel(tile_key, tile_src, tile_func_name)?;
+        // ── Phase 1.1 WMMA-FA route gate ────────────────────────────────
+        // The WMMA kernel currently covers only the asym4 + hd=128 + non-tree
+        // path. Phase 1.2 adds asym2 and Phase 3 adds tree-bias. Chunk
+        // alignment to BLOCK_M=16 is required (the kernel doesn't carry a
+        // chunk_size arg; trailing OOB rows would read garbage positions).
+        let wmma_ok = is_wmma_fa_enabled()
+            && self.arch_caps.has_wmma_w32()
+            && (head_dim == 128 || head_dim == 256)
+            && tree_bias.is_none()
+            && tile_func_name == "attention_flash_asym4_tile_batched"
+            && batch_size >= wmma_fa_min_batch()
+            && batch_size % WMMA_BLOCK_M == 0
+            && sub_batch % WMMA_BLOCK_M == 0;
+        let (eff_tile_key, eff_tile_src, eff_tile_func): (&'static str, &'static str, &'static str) = if wmma_ok {
+            (
+                "attention_flash_asym4_wmma_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
+                "attention_flash_asym4_wmma_tile_batched",
+            )
+        } else {
+            (tile_key, tile_src, tile_func_name)
+        };
+
+        self.ensure_givens4_kernel(eff_tile_key, eff_tile_src, eff_tile_func)?;
         self.ensure_kernel(
             "attention_flash_asym_reduce_batched",
             kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
@@ -24296,11 +24352,21 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                 ];
+                // Grid swap for WMMA: m_tile dim replaces per-batch z-dim.
+                // BLOCK_M=16 rows per workgroup; chunk is guaranteed divisible
+                // by 16 by the wmma_ok gate above.
+                let (grid, lds_bytes): ([u32; 3], u32) = if wmma_ok {
+                    let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
+                    ([n_heads as u32, m_tiles as u32, max_tiles as u32], 0)
+                } else {
+                    ([n_heads as u32, max_tiles as u32, chunk as u32],
+                     (TILE_SIZE * 4) as u32)
+                };
                 self.launch_maybe_blob(
-                    tile_func_name,
-                    [n_heads as u32, max_tiles as u32, chunk as u32],
+                    eff_tile_func,
+                    grid,
                     [32, 1, 1],
-                    (TILE_SIZE * 4) as u32,
+                    lds_bytes,
                     &mut params,
                     || {
                         let mut b = hip_bridge::KernargBlob::new();
