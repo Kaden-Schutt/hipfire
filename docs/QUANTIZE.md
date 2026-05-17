@@ -42,6 +42,7 @@ Useful flags:
 | Flag | Purpose |
 |---|---|
 | `--format <fmt>` | Repeatable. Defaults: `mq4` (safetensors), `hf4` (GGUF). |
+| `--chat-template-file <path>` | Override the embedded `tokenizer_config.chat_template` for safetensors input. The file is read as UTF-8 and the quantizer fails before writing if it cannot be read. |
 | `--both` | Shorthand for `--format mq4 --format mq6`. |
 | `-o, --output <path>` | Single-format output path. |
 | `--output-dir <dir>` | Multi-format output directory. |
@@ -62,6 +63,12 @@ files. Architectures the engine actually loads at inference: `llama`,
 `qwen3`, `qwen3_5`, `qwen3_5_moe`. The quantizer accepts any
 architecture — the file just won't run if the engine has no matching
 loader.
+
+If a finetune ships a stale or missing chat template, pass
+`--chat-template-file ./template.jinja`. The template replaces
+`tokenizer_config.chat_template` in the emitted HFQ metadata; if
+`tokenizer_config.json` is absent, the quantizer writes a minimal
+`tokenizer_config` object containing only `chat_template`.
 
 ## From GGUF
 
