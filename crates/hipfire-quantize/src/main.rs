@@ -5,7 +5,7 @@
 
 //! hipfire-quantize: Quantize raw FP16/BF16/FP32 model weights to Q4_F16 format.
 //!
-//! Usage: hipfire-quantize --input <model_dir-or-gguf> --output <output.hfq> [--format mq4]
+//! Usage: hipfire-quantize --input <model_dir-or-gguf> --output <output.hfq> [--format mq4] [--chat-template-file template.jinja]
 //!
 //! Reads safetensors files from a HuggingFace model directory OR a single
 //! `.gguf` file and produces a `.hfq` (HipFire Quantized) file with
@@ -3215,6 +3215,36 @@ fn resolve_model_path(input: &str) -> String {
     input.to_string()
 }
 
+fn arg_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(|s| s.as_str())
+}
+
+fn read_chat_template_file(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("error: failed to read --chat-template-file {} as UTF-8: {e}", path.display());
+        std::process::exit(1);
+    })
+}
+
+fn tokenizer_config_with_chat_template(
+    tokenizer_config: Option<serde_json::Value>,
+    chat_template: String,
+) -> serde_json::Value {
+    match tokenizer_config {
+        Some(serde_json::Value::Object(mut map)) => {
+            map.insert(
+                "chat_template".to_string(),
+                serde_json::Value::String(chat_template),
+            );
+            serde_json::Value::Object(map)
+        }
+        _ => serde_json::json!({ "chat_template": chat_template }),
+    }
+}
+
 // ─── GGUF input pipeline ────────────────────────────────────────────────────
 
 /// True if the path points to a `.gguf` file on disk.
@@ -4196,16 +4226,16 @@ fn main() {
     eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
 
 
-    let input_dir = args.iter().position(|a| a == "--input")
-        .map(|i| &args[i + 1])
+    let input_dir = arg_value(&args, "--input")
         .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq>"); std::process::exit(1); });
 
-    let output_path = args.iter().position(|a| a == "--output")
-        .map(|i| &args[i + 1])
+    let output_path = arg_value(&args, "--output")
         .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format q8f16|q4f16]"); std::process::exit(1); });
 
-    let format = args.iter().position(|a| a == "--format")
-        .map(|i| args[i + 1].as_str())
+    let chat_template_override = arg_value(&args, "--chat-template-file")
+        .map(|p| read_chat_template_file(Path::new(p)));
+
+    let format = arg_value(&args, "--format")
         .unwrap_or("q8f16");
 
     // Optional imatrix (llama.cpp GGUF format with .in_sum2 / .counts per-tensor).
@@ -4684,7 +4714,7 @@ fn main() {
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
     {
-        let raw_input = Path::new(input_dir.as_str());
+        let raw_input = Path::new(input_dir);
         if is_gguf_input(raw_input) {
             let gguf_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
@@ -4794,6 +4824,10 @@ fn main() {
             .and_then(|s| serde_json::from_str(&s).ok())
     } else {
         None
+    };
+    let tokenizer_config = match chat_template_override {
+        Some(template) => Some(tokenizer_config_with_chat_template(tokenizer_config, template)),
+        None => tokenizer_config,
     };
 
     // Read generation_config.json. HF stores some sampler-side defaults
@@ -7686,6 +7720,36 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn chat_template_override_replaces_existing_template() {
+        let original = Some(json!({
+            "chat_template": "old",
+            "eos_token": "<|im_end|>"
+        }));
+        let updated = tokenizer_config_with_chat_template(original, "new-template".to_string());
+        assert_eq!(updated["chat_template"], "new-template");
+        assert_eq!(updated["eos_token"], "<|im_end|>");
+    }
+
+    #[test]
+    fn chat_template_override_creates_minimal_config_when_missing() {
+        let updated = tokenizer_config_with_chat_template(None, "{{ messages }}".to_string());
+        assert_eq!(updated, json!({ "chat_template": "{{ messages }}" }));
+    }
+
+    #[test]
+    fn chat_template_override_replaces_non_object_config_with_minimal_object() {
+        let updated = tokenizer_config_with_chat_template(
+            Some(json!("unexpected")),
+            "{% for message in messages %}{{ message.content }}{% endfor %}".to_string(),
+        );
+        assert_eq!(
+            updated,
+            json!({ "chat_template": "{% for message in messages %}{{ message.content }}{% endfor %}" })
+        );
+    }
 
     #[test]
     fn e2m1_lookup_matches_ocp_spec() {
