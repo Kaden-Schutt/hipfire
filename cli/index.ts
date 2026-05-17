@@ -4192,6 +4192,22 @@ function listConfig(cfg: HipfireConfig): void {
   console.log(`Reset:       hipfire config reset [key]`);
 }
 
+// ─── Shared helpers ─────────────────────────────────────
+
+/** Find a binary in PATH or known extra directories. Returns absolute path or null.**/
+function findDep(binary: string, extraDirs: string[]): string | null {
+  // 1. Already in PATH (use `which` to avoid shell interpolation)
+  const inPath = Bun.spawnSync(["which", binary], { stdout: "pipe", stderr: "pipe" });
+  const found = (inPath.stdout?.toString() ?? "").trim();
+  if (inPath.exitCode === 0 && found) return found;
+  // 2. Distro-specific known locations
+  for (const dir of extraDirs) {
+    const path = join(dir, binary);
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -4514,18 +4530,6 @@ switch (cmd) {
     // interactive shell loads those bindirs via profile snippets. We probe
     // well-known locations, augment process.env.PATH with any found dirs,
     // and error fast with an install hint if a required dep is missing.
-    const findDep = (binary: string, extraDirs: string[]): string | null => {
-      // 1. Already in PATH
-      const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
-      const found = (inPath.stdout?.toString() ?? "").trim();
-      if (inPath.exitCode === 0 && found) return found;
-      // 2. Distro-specific known locations
-      for (const dir of extraDirs) {
-        const path = join(dir, binary);
-        if (existsSync(path)) return path;
-      }
-      return null;
-    };
     const depsNeeded = [
       { name: "git",   dirs: ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"],
         hint: "Install git via your distro's package manager." },
@@ -5255,16 +5259,7 @@ Examples:
       console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
 
       // Parse deps for PATH augmentation (same as update command does).
-      const findDep = (binary: string, extraDirs: string[]): string | null => {
-        const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
-        const found = (inPath.stdout?.toString() ?? "").trim();
-        if (inPath.exitCode === 0 && found) return found;
-        for (const dir of extraDirs) {
-          const path = join(dir, binary);
-          if (existsSync(path)) return path;
-        }
-        return null;
-      };
+      // findDep is defined at module level above.
       const depsNeeded = ["cargo", "hipcc"];
       const augmentDirs = new Set<string>();
       for (const dep of depsNeeded) {
