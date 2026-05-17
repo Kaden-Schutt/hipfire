@@ -5291,9 +5291,10 @@ Examples:
       const exe = process.platform === "win32" ? ".exe" : "";
       const binPath = join(workspaceRoot, `target/release/examples/triattn_validate${exe}`);
       console.error("  Running triattn_validate...");
-      const proc = Bun.spawnSync(
-        [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)],
-        { stdio: ["inherit", "inherit", "inherit"] },
+      const args = [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
       );
       if ((proc.exitCode ?? 1) !== 0) {
         console.error(`triattn_validate failed (exit ${proc.exitCode})`);
