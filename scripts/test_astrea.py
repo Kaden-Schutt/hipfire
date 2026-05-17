@@ -43,8 +43,11 @@ class AstreaTests(unittest.TestCase):
         buf += struct.pack("<I", 8)  # string
         buf += gguf_string("synthetic-imatrix")
         for i, name in enumerate(tensor_names):
-            shape = [4] if name.endswith(".in_sum2") else [1]
-            offset = i * 16
+            shape = [256] if name.endswith(".in_sum2") else [1]
+            offset = 0 if i == 0 else sum(
+                (256 if prior.endswith(".in_sum2") else 1) * 4
+                for prior in tensor_names[:i]
+            )
             buf += gguf_string(name)
             buf += struct.pack("<I", len(shape))
             for dim in shape:
@@ -53,7 +56,8 @@ class AstreaTests(unittest.TestCase):
             buf += struct.pack("<Q", offset)
         pad = (-len(buf)) % 32
         buf += b"\0" * pad
-        buf += b"\0" * (16 * len(tensor_names))
+        payload_bytes = sum((256 if name.endswith(".in_sum2") else 1) * 4 for name in tensor_names)
+        buf += b"\0" * payload_bytes
         path.write_bytes(buf)
 
     def write_minimal_hfq(self, path, tensors=None):
@@ -168,6 +172,44 @@ class AstreaTests(unittest.TestCase):
             buf += payload
         path.write_bytes(buf)
 
+    def write_expert_imatrix_gguf(self, path, logical_name, k, n_experts):
+        def gguf_string(text):
+            raw = text.encode("utf-8")
+            return struct.pack("<Q", len(raw)) + raw
+
+        names = [f"{logical_name}.in_sum2", f"{logical_name}.counts"]
+        payloads = [
+            b"".join(struct.pack("<f", 1.0 + i / max(k, 1)) for i in range(k * n_experts)),
+            b"".join(struct.pack("<f", 8.0) for _ in range(n_experts)),
+        ]
+        shapes = [[k, n_experts], [1, n_experts]]
+        offsets = []
+        cursor = 0
+        for payload in payloads:
+            offsets.append(cursor)
+            cursor += len(payload)
+
+        buf = bytearray()
+        buf += b"GGUF"
+        buf += struct.pack("<I", 3)
+        buf += struct.pack("<Q", len(names))
+        buf += struct.pack("<Q", 1)
+        buf += gguf_string("general.alignment")
+        buf += struct.pack("<I", 4)
+        buf += struct.pack("<I", 32)
+        for name, shape, offset in zip(names, shapes, offsets):
+            buf += gguf_string(name)
+            buf += struct.pack("<I", len(shape))
+            for dim in shape:
+                buf += struct.pack("<Q", dim)
+            buf += struct.pack("<I", 0)
+            buf += struct.pack("<Q", offset)
+        pad = (-len(buf)) % 32
+        buf += b"\0" * pad
+        for payload in payloads:
+            buf += payload
+        path.write_bytes(buf)
+
     def test_inspect_records_model_and_imatrix_fingerprints(self):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
@@ -264,6 +306,38 @@ class AstreaTests(unittest.TestCase):
             matched["blk.0.attn_gate.weight"],
             "model.language_model.layers.0.linear_attn.in_proj_z.weight",
         )
+        self.assertEqual(result["k_dim_mismatch_count"], 0)
+
+    def test_match_imatrix_expert_matrix_expands_per_expert(self):
+        astrea = load_astrea()
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            model = root / "synthetic.mq4"
+            imatrix = root / "imatrix.gguf"
+            self.write_minimal_hfq(
+                model,
+                tensors=[
+                    ("model.language_model.layers.0.mlp.experts.0.gate_up_proj.weight", 13, [512, 256], 256, 272),
+                    ("model.language_model.layers.0.mlp.experts.1.gate_up_proj.weight", 13, [512, 256], 256, 272),
+                ],
+            )
+            self.write_expert_imatrix_gguf(
+                imatrix,
+                "blk.0.ffn_gate_exps.weight",
+                k=256,
+                n_experts=2,
+            )
+
+            result = astrea.match_imatrix_to_hfq(str(model), str(imatrix))
+
+        self.assertEqual(result["matched_count"], 2)
+        self.assertEqual(result["unmatched_count"], 0)
+        self.assertEqual(result["k_dim_mismatch_count"], 0)
+        self.assertEqual(result["awq_eligible_count"], 2)
+        self.assertEqual(result["matched_by_slot"], {"ffn_gate_exps": 2})
+        self.assertEqual(result["expert_coverage"][0]["matched_expert_count"], 2)
+        self.assertFalse(result["matches"][0]["calibration_supported"])
+        self.assertEqual(result["matches"][0]["imatrix_columns"], 2)
 
     def test_calibrate_dry_run_reports_matching_readiness(self):
         astrea = load_astrea()

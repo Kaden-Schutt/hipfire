@@ -384,6 +384,7 @@ def summarize_gguf(path, *, max_tensors=32):
     all_names = []
     imatrix_suffix_counts = {}
     imatrix_logical_names = set()
+    imatrix_logical_tensors = {}
     for i in range(tensor_count):
         name = reader.string()
         n_dims = reader.u32()
@@ -394,14 +395,34 @@ def summarize_gguf(path, *, max_tensors=32):
         all_names.append(name)
         dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
         if name.endswith(".in_sum2"):
+            logical_name = name[: -len(".in_sum2")]
             imatrix_suffix_counts["in_sum2"] = imatrix_suffix_counts.get("in_sum2", 0) + 1
-            imatrix_logical_names.add(name[: -len(".in_sum2")])
+            imatrix_logical_names.add(logical_name)
+            imatrix_logical_tensors.setdefault(logical_name, {})["in_sum2"] = {
+                "name": name,
+                "shape": shape,
+                "dtype": dtype,
+                "offset": offset,
+            }
         elif name.endswith(".counts"):
+            logical_name = name[: -len(".counts")]
             imatrix_suffix_counts["counts"] = imatrix_suffix_counts.get("counts", 0) + 1
-            imatrix_logical_names.add(name[: -len(".counts")])
+            imatrix_logical_names.add(logical_name)
+            imatrix_logical_tensors.setdefault(logical_name, {})["counts"] = {
+                "name": name,
+                "shape": shape,
+                "dtype": dtype,
+                "offset": offset,
+            }
         else:
             imatrix_suffix_counts["other"] = imatrix_suffix_counts.get("other", 0) + 1
             imatrix_logical_names.add(name)
+            imatrix_logical_tensors.setdefault(name, {})["other"] = {
+                "name": name,
+                "shape": shape,
+                "dtype": dtype,
+                "offset": offset,
+            }
         if i < max_tensors:
             tensors.append(
                 {
@@ -426,6 +447,10 @@ def summarize_gguf(path, *, max_tensors=32):
         "tensor_names_md5": names_md5,
         "imatrix_logical_tensor_count": len(imatrix_logical_names),
         "imatrix_logical_names": sorted(imatrix_logical_names),
+        "imatrix_logical_tensors": {
+            name: imatrix_logical_tensors[name]
+            for name in sorted(imatrix_logical_tensors)
+        },
         "imatrix_suffix_counts": dict(sorted(imatrix_suffix_counts.items())),
         "tensors": tensors,
         "tensors_truncated": tensor_count > len(tensors),
@@ -606,15 +631,171 @@ def gguf_to_hfq_candidates(gguf_name):
     return candidates
 
 
+def gguf_expert_to_hfq_candidates(gguf_name, expert_index):
+    if not gguf_name.startswith("blk."):
+        return []
+    rest = gguf_name[len("blk.") :]
+    dot = rest.find(".")
+    if dot < 0:
+        return []
+    layer_idx = rest[:dot]
+    slot_full = rest[dot + 1 :]
+    slot = slot_full[: -len(".weight")] if slot_full.endswith(".weight") else slot_full
+    slot_map = {
+        "ffn_gate_exps": ["gate_up_proj"],
+        "ffn_up_exps": ["gate_up_proj"],
+        "ffn_down_exps": ["down_proj"],
+    }
+    translated = slot_map.get(slot)
+    if not translated:
+        return []
+    candidates = []
+    for prefix in ("model.language_model.layers", "model.layers"):
+        for item in translated:
+            candidates.append(f"{prefix}.{layer_idx}.mlp.experts.{expert_index}.{item}.weight")
+    return candidates
+
+
+def hfq_k_dim(tensor):
+    shape = tensor.get("shape") or []
+    if len(shape) >= 2:
+        return int(shape[-1])
+    if shape:
+        return int(shape[0])
+    return None
+
+
+def awq_runtime_eligible(name):
+    return (
+        name.endswith("q_proj.weight")
+        or name.endswith("k_proj.weight")
+        or name.endswith("v_proj.weight")
+        or name.endswith("qkv_proj.weight")
+        or name.endswith("wqkv.weight")
+        or name.endswith("gate_proj.weight")
+        or name.endswith("up_proj.weight")
+        or name.endswith("w_gate.weight")
+        or name.endswith("w_up.weight")
+        or name.endswith("gate_up_proj.weight")
+        or ".in_proj_" in name
+        or name.endswith("mlp.gate.weight")
+        or name.endswith("router.weight")
+    )
+
+
+def imatrix_slot(logical_name):
+    parts = logical_name.split(".")
+    if logical_name.startswith("blk.") and len(parts) > 2:
+        return parts[2]
+    return "top_level"
+
+
+def imatrix_dims(logical_info):
+    in_sum2 = logical_info.get("in_sum2") or {}
+    shape = in_sum2.get("shape") or []
+    k = int(shape[0]) if shape else None
+    columns = int(shape[1]) if len(shape) >= 2 else 1
+    return k, columns
+
+
 def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
     hfq_summary, hfq_tensors = read_hfq_index(model, max_tensors=max_tensors)
     imatrix_summary = summarize_gguf(imatrix, max_tensors=max_tensors)
 
     matches = []
     unmatched = []
+    skipped = []
+    k_dim_mismatches = []
+    expert_coverage = []
     matched_quant_type_counts = {}
     matched_by_slot = {}
     for logical_name in imatrix_summary["imatrix_logical_names"]:
+        logical_info = imatrix_summary.get("imatrix_logical_tensors", {}).get(logical_name, {})
+        in_sum2 = logical_info.get("in_sum2")
+        if not in_sum2:
+            skipped.append({"imatrix_name": logical_name, "reason": "missing_in_sum2"})
+            continue
+        if in_sum2.get("dtype") != "F32":
+            skipped.append({
+                "imatrix_name": logical_name,
+                "reason": "non_f32_in_sum2",
+                "dtype": in_sum2.get("dtype"),
+            })
+            continue
+
+        imatrix_k, imatrix_columns = imatrix_dims(logical_info)
+        slot = imatrix_slot(logical_name)
+        is_expert_matrix = imatrix_columns > 1 or slot.endswith("_exps")
+        if is_expert_matrix:
+            matched_experts = []
+            missing_experts = []
+            for expert_index in range(imatrix_columns):
+                candidates = gguf_expert_to_hfq_candidates(logical_name, expert_index)
+                if not candidates:
+                    skipped.append({
+                        "imatrix_name": logical_name,
+                        "reason": "unsupported_multi_matrix_name",
+                        "shape": in_sum2.get("shape"),
+                    })
+                    break
+                hfq_name = next((name for name in candidates if name in hfq_tensors), None)
+                if hfq_name is None:
+                    missing_experts.append(expert_index)
+                    unmatched.append({
+                        "imatrix_name": logical_name,
+                        "expert_index": expert_index,
+                        "candidates": candidates,
+                    })
+                    continue
+                tensor = hfq_tensors[hfq_name]
+                quant_type_name = tensor["quant_type_name"]
+                matched_quant_type_counts[quant_type_name] = matched_quant_type_counts.get(quant_type_name, 0) + 1
+                matched_by_slot[slot] = matched_by_slot.get(slot, 0) + 1
+                tensor_k = hfq_k_dim(tensor)
+                k_dim_match = imatrix_k is None or tensor_k == imatrix_k
+                if not k_dim_match:
+                    k_dim_mismatches.append({
+                        "imatrix_name": logical_name,
+                        "expert_index": expert_index,
+                        "hfq_name": hfq_name,
+                        "imatrix_k": imatrix_k,
+                        "hfq_k": tensor_k,
+                    })
+                matched_experts.append(expert_index)
+                matches.append(
+                    {
+                        "imatrix_name": logical_name,
+                        "hfq_name": hfq_name,
+                        "expert_index": expert_index,
+                        "quant_type": tensor["quant_type"],
+                        "quant_type_name": quant_type_name,
+                        "shape": tensor["shape"],
+                        "group_size": tensor["group_size"],
+                        "data_offset": tensor["data_offset"],
+                        "data_size": tensor["data_size"],
+                        "imatrix_shape": in_sum2.get("shape"),
+                        "counts_shape": (logical_info.get("counts") or {}).get("shape"),
+                        "imatrix_k": imatrix_k,
+                        "imatrix_columns": imatrix_columns,
+                        "hfq_k": tensor_k,
+                        "k_dim_match": k_dim_match,
+                        "awq_eligible": awq_runtime_eligible(hfq_name),
+                        "calibration_supported": False,
+                    }
+                )
+            if imatrix_columns > 1:
+                expert_coverage.append({
+                    "imatrix_name": logical_name,
+                    "slot": slot,
+                    "expert_count": imatrix_columns,
+                    "matched_expert_count": len(matched_experts),
+                    "missing_expert_count": len(missing_experts),
+                    "matched_experts": matched_experts[:32],
+                    "missing_experts": missing_experts[:32],
+                    "truncated": len(matched_experts) > 32 or len(missing_experts) > 32,
+                })
+            continue
+
         candidates = gguf_to_hfq_candidates(logical_name)
         hfq_name = next((name for name in candidates if name in hfq_tensors), None)
         if hfq_name is None:
@@ -623,8 +804,16 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
         tensor = hfq_tensors[hfq_name]
         quant_type_name = tensor["quant_type_name"]
         matched_quant_type_counts[quant_type_name] = matched_quant_type_counts.get(quant_type_name, 0) + 1
-        slot = logical_name.split(".")[2] if logical_name.startswith("blk.") and len(logical_name.split(".")) > 2 else "top_level"
         matched_by_slot[slot] = matched_by_slot.get(slot, 0) + 1
+        tensor_k = hfq_k_dim(tensor)
+        k_dim_match = imatrix_k is None or tensor_k == imatrix_k
+        if not k_dim_match:
+            k_dim_mismatches.append({
+                "imatrix_name": logical_name,
+                "hfq_name": hfq_name,
+                "imatrix_k": imatrix_k,
+                "hfq_k": tensor_k,
+            })
         matches.append(
             {
                 "imatrix_name": logical_name,
@@ -635,6 +824,14 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
                 "group_size": tensor["group_size"],
                 "data_offset": tensor["data_offset"],
                 "data_size": tensor["data_size"],
+                "imatrix_shape": in_sum2.get("shape"),
+                "counts_shape": (logical_info.get("counts") or {}).get("shape"),
+                "imatrix_k": imatrix_k,
+                "imatrix_columns": imatrix_columns,
+                "hfq_k": tensor_k,
+                "k_dim_match": k_dim_match,
+                "awq_eligible": awq_runtime_eligible(hfq_name),
+                "calibration_supported": True,
             }
         )
 
@@ -654,11 +851,17 @@ def match_imatrix_to_hfq(model, imatrix, *, max_tensors=32):
         "imatrix_suffix_counts": imatrix_summary["imatrix_suffix_counts"],
         "matched_count": len(matches),
         "unmatched_count": len(unmatched),
+        "skipped_count": len(skipped),
+        "k_dim_mismatch_count": len(k_dim_mismatches),
+        "awq_eligible_count": sum(1 for item in matches if item.get("awq_eligible")),
         "matched_quant_type_counts": dict(sorted(matched_quant_type_counts.items())),
         "matched_by_slot": dict(sorted(matched_by_slot.items())),
+        "expert_coverage": expert_coverage,
+        "k_dim_mismatches": k_dim_mismatches,
         "matches": matches,
         "unmatched": unmatched,
-        "ready": len(matches) > 0 and len(unmatched) == 0,
+        "skipped": skipped,
+        "ready": len(matches) > 0 and len(unmatched) == 0 and len(skipped) == 0 and len(k_dim_mismatches) == 0,
     }
 
 
@@ -1717,6 +1920,8 @@ def select_imatrix_scale_matches(join, *, max_tensors=None, tensor_filter=None):
     filters = [item.strip() for item in (tensor_filter or "").split(",") if item.strip()]
     selected = []
     for item in join["matches"]:
+        if not item.get("calibration_supported", True):
+            continue
         if item["quant_type_name"] != "MFP4G32":
             continue
         if filters and not any(f in item["imatrix_name"] or f in item["hfq_name"] for f in filters):
@@ -1731,6 +1936,8 @@ def select_awq_mq4_matches(join, *, max_tensors=None, tensor_filter=None):
     filters = [item.strip() for item in (tensor_filter or "").split(",") if item.strip()]
     selected = []
     for item in join["matches"]:
+        if not item.get("calibration_supported", True):
+            continue
         if item["quant_type_name"] != "MQ4G256":
             continue
         if filters and not any(f in item["imatrix_name"] or f in item["hfq_name"] for f in filters):
@@ -1784,6 +1991,29 @@ def build_imatrix_scale_patch(task):
     }
 
 
+def run_patch_tasks(tasks, worker_fn, parallel_workers):
+    if parallel_workers == 1:
+        return [worker_fn(task) for task in tasks], "serial"
+
+    def run_with_executor(executor_cls):
+        by_index = {}
+        with executor_cls(max_workers=parallel_workers) as pool:
+            futures = {pool.submit(worker_fn, task): task["index"] for task in tasks}
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                by_index[result["index"]] = result
+        return [by_index[i] for i in range(len(tasks))]
+
+    try:
+        return run_with_executor(concurrent.futures.ProcessPoolExecutor), "process"
+    except PermissionError:
+        return run_with_executor(concurrent.futures.ThreadPoolExecutor), "thread"
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 1:
+            return run_with_executor(concurrent.futures.ThreadPoolExecutor), "thread"
+        raise
+
+
 def write_imatrix_scale_candidate(
     plan,
     join,
@@ -1826,17 +2056,9 @@ def write_imatrix_scale_candidate(
             }
         )
 
+    worker_mode = "serial"
     try:
-        if parallel_workers == 1:
-            results = [build_imatrix_scale_patch(task) for task in tasks]
-        else:
-            by_index = {}
-            with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as pool:
-                futures = {pool.submit(build_imatrix_scale_patch, task): task["index"] for task in tasks}
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    by_index[result["index"]] = result
-            results = [by_index[i] for i in range(len(tasks))]
+        results, worker_mode = run_patch_tasks(tasks, build_imatrix_scale_patch, parallel_workers)
 
         mutations = []
         for result in results:
@@ -1856,7 +2078,7 @@ def write_imatrix_scale_candidate(
         "candidate_bytes": Path(candidate).stat().st_size,
         "mutated_tensor_count": len(mutations),
         "parallel_workers": parallel_workers,
-        "worker_mode": "process" if parallel_workers > 1 else "serial",
+        "worker_mode": worker_mode,
         "mutations": mutations,
     }
 
@@ -2008,17 +2230,9 @@ def write_mq4_ls_candidate(
             }
         )
 
+    worker_mode = "serial"
     try:
-        if parallel_workers == 1:
-            results = [build_mq4_ls_patch(task) for task in tasks]
-        else:
-            by_index = {}
-            with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as pool:
-                futures = {pool.submit(build_mq4_ls_patch, task): task["index"] for task in tasks}
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    by_index[result["index"]] = result
-            results = [by_index[i] for i in range(len(tasks))]
+        results, worker_mode = run_patch_tasks(tasks, build_mq4_ls_patch, parallel_workers)
 
         mutations = []
         for result in results:
@@ -2039,7 +2253,7 @@ def write_mq4_ls_candidate(
         "candidate_bytes": Path(candidate).stat().st_size,
         "mutated_tensor_count": len(mutations),
         "parallel_workers": parallel_workers,
-        "worker_mode": "process" if parallel_workers > 1 else "serial",
+        "worker_mode": worker_mode,
         "mean_sample_mse_delta_pct": mean_delta,
         "clip_ratio": clip_ratio,
         "mutations": mutations,
@@ -2090,17 +2304,9 @@ def write_awq_mq4_candidate(
             }
         )
 
+    worker_mode = "serial"
     try:
-        if parallel_workers == 1:
-            results = [build_awq_mq4_patch(task) for task in tasks]
-        else:
-            by_index = {}
-            with concurrent.futures.ProcessPoolExecutor(max_workers=parallel_workers) as pool:
-                futures = {pool.submit(build_awq_mq4_patch, task): task["index"] for task in tasks}
-                for future in concurrent.futures.as_completed(futures):
-                    result = future.result()
-                    by_index[result["index"]] = result
-            results = [by_index[i] for i in range(len(tasks))]
+        results, worker_mode = run_patch_tasks(tasks, build_awq_mq4_patch, parallel_workers)
 
         mutations = []
         for result in results:
@@ -2120,7 +2326,7 @@ def write_awq_mq4_candidate(
         "candidate_bytes": Path(candidate).stat().st_size,
         "mutated_tensor_count": len(mutations),
         "parallel_workers": parallel_workers,
-        "worker_mode": "process" if parallel_workers > 1 else "serial",
+        "worker_mode": worker_mode,
         "awq_clip_ratio_grid": ratio_grid,
         "mutations": mutations,
     }
@@ -3284,6 +3490,13 @@ def build_parser():
     inspect.add_argument("--pretty", action="store_true")
     inspect.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
+    imatrix_join = sub.add_parser("imatrix-join", help="Report imatrix to HFQ tensor coverage.")
+    imatrix_join.add_argument("--model", required=True)
+    imatrix_join.add_argument("--imatrix", required=True)
+    imatrix_join.add_argument("--max-tensors", type=int, default=32)
+    imatrix_join.add_argument("--pretty", action="store_true")
+    imatrix_join.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
     fingerprint = sub.add_parser("fingerprint", help="Fingerprint the hipfire engine path.")
     fingerprint.add_argument("--engine-root")
     fingerprint.add_argument("--pretty", action="store_true")
@@ -3394,6 +3607,12 @@ def run(argv=None):
     if args.command == "inspect":
         write_json(
             inspect_model(args.model, imatrix=args.imatrix, quant_format=args.quant_format),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "imatrix-join":
+        write_json(
+            match_imatrix_to_hfq(args.model, args.imatrix, max_tensors=args.max_tensors),
             pretty=args.pretty,
             out=args.out,
         )
