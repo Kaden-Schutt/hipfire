@@ -46,6 +46,61 @@ Full key list and tradeoffs in [CONFIG.md](CONFIG.md).
 The full quantize how-to (formats, when to pick which, GGUF caveats) is
 in [QUANTIZE.md](QUANTIZE.md).
 
+## Calibration
+
+For models with custom or quantized weights that need CASK KV eviction,
+generate the calibration sidecar:
+
+| Command | Purpose |
+|---|---|
+| `hipfire sidecar-gen <model>` | Generate a `.triattn.bin` sidecar for the given model. The daemon auto-discovers it alongside the model file when CASK is enabled (`cask_sidecar on`). |
+
+Usage:
+
+```bash
+hipfire sidecar-gen qwen35-27b-dflash-mq4 --corpus my-corpus.txt --max-tokens 8192 --chunk-len 1024 -o /path/to/output.triattn.bin
+```
+
+Flags for `sidecar-gen`:
+
+| Flag | Purpose |
+|---|---|
+| `<model>` (positional) | Model tag or local file path. The sidecar is written next to the model file by default with the same base name: `my-finetune.mq4` → `my-finetune.triattn.bin`. See **Filename discovery** below for details. |
+| `--corpus PATH` | Text corpus for calibration. If omitted, uses an internal default. |
+| `--max-tokens N` | Maximum tokens of context to calibrate over (default: 8192). |
+| `--chunk-len N` | Chunk size for KV cache statistics collection (default: 1024). |
+| `--gpu-calib` | Run calibration on GPU instead of CPU. |
+| `--cpu-calib` | Override to run on CPU even if a compatible GPU is available. |
+| `-o PATH` | Output path for the `.triattn.bin` file (default: next to model). |
+| `--skip-validation` | Skip post-generation KV statistics validation check. |
+
+The generated sidecar contains per-position KV cache statistics that
+calculate which key-value positions are most important for retention.
+Without it, CASK eviction treats all positions equally and can discard
+critical early tokens on long context prompts, causing quality drop-off.
+
+**Quick setup after quantizing your own model:**
+
+```bash
+hipfire quantize ./my-model/ --format mq4 -o my-finetune.mq4
+hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+# The daemon will auto-attach the sidecar when you run with cask_sidecar on
+```
+
+See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
+
+> **Note:** `sidecar-gen` requires a model file to exist — it does not
+> pull models from HuggingFace. First pull your target: `hipfire pull <tag>`
+> or put your quantized weights alongside the expected filename pattern
+> (`qwen3{ver}-{size}-dflash-{quant}.hfq`). The daemon auto-discovers
+> `.triattn.bin` files next to their matching model.
+>
+> **Filename discovery:** When `cask_sidecar` is unset, the daemon looks for
+> a sidecar in the same directory as the model file using `<basename>.triattn*.bin`
+> (e.g., `my-finetune.mq4` → `my-finetune.triattn.bin`). If you specify a
+> path with directories (`foo/bar/model.mq4`), it scans `foo/bar/` for the
+> sidecar — not the current working directory.
+
 ## Diagnostics
 
 | Command | Purpose |

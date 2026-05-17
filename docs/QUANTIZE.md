@@ -139,3 +139,35 @@ wall times on a modern desktop CPU:
 `hipfire-quantize` defaults to 80% of available cores; cap with
 `--threads N` or `HIPFIRE_QUANT_THREADS=N`. Memory peak is roughly
 `max(weight tensor size) × 4` (a single tensor dequantized to f32).
+
+## After quantizing: generating a sidecar for CASK eviction
+
+After you've quantized your own model, generate the KV cache calibration
+sidecar so that CASK can perform intelligent key-value retention on long
+context prompts. Without it, all positions are treated equally and early
+tokens (which often carry critical instructions) may be evicted.
+
+```bash
+hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+```
+
+The sidecar is written as `my-finetune.triattn.bin` next to your model
+file by default. The daemon auto-discovers it when CASK eviction is
+enabled (`cask_sidecar on`). See [CLI.md](CLI.md) for full flag details.
+
+> **Tip:** If you're quantizing from a HuggingFace safetensors source,
+> use `--install` to copy your model into the models directory, then
+> generate the sidecar using either the file path or the registered tag:
+>
+> ```bash
+> hipfire quantize ./my-finetune/ --format mq4 -o my-finetune.mq4 \\
+>     --install --register finetune:1b
+> # Then generate the sidecar (either works):
+> hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
+> # or, if you prefer using the alias:
+> hipfire sidecar-gen finetune:1b --corpus /path/to/corpus.txt
+> ```
+>
+> The tag-based form works because `sidecar-gen` resolves local model
+> aliases (registered via `--register`). For HuggingFace models not yet
+> installed locally, use the file path instead.

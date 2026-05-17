@@ -97,6 +97,22 @@ buffer fills again. This pins physical VRAM regardless of advertised
 because only `cask_budget + cask_beta + 256` slots are physically
 allocated.
 
+### Generating the sidecar file
+
+For models from HuggingFace (e.g., `hipfire pull qwen3.6:27b`), a
+published `.triattn.bin` ships alongside the weights and is auto-attached.
+**For custom or quantized models**, you must generate one:
+
+```bash
+# After pushing your model to ~/.hipfire/models/:
+hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt -o my-finetune.triattn.bin
+```
+
+The generated file is placed next to the model by default.
+The daemon auto-discovers it using `<basename>.triattn*.bin` matching.
+See [CLI.md](CLI.md) for full `sidecar-gen` flag details and
+[QUANTIZE.md](QUANTIZE.md) for the post-quantization workflow.
+
 ### Profiles (recommended path)
 
 The five raw knobs interact non-obviously and have hard-rule failure
@@ -145,7 +161,7 @@ quality-sensitive single-turn workloads).
 
 | Key | Default | Range | Notes |
 |---|---|---|---|
-| `cask_sidecar` | "" | path | Path to TriAttention sidecar `.bin`. Empty = eviction disabled regardless of other knobs. |
+| `cask_sidecar` | "" | path | Path to TriAttention sidecar `.bin`. Empty = eviction disabled regardless of other knobs. For custom/quantized models, generate one with `hipfire sidecar-gen <model>` — see Generating the sidecar file above for details. |
 | `cask` | false | bool | true = CASK m-folding (Kim & Gwon 2026); false = plain TriAttention drop-eviction. |
 | `cask_budget` | 512 | 64–65536 | Active token count post-eviction. Smaller = tighter VRAM, more frequent eviction events. |
 | `cask_beta` | 128 | 0–65536 | Hysteresis. Buffer needs to fill `budget + beta` before re-triggering eviction. |

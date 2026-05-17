@@ -91,6 +91,33 @@ Common overrides: `temperature` (default 0.30), `kv_cache` (default
 `asym3`), `dflash_mode` (default `auto`). Full key list in
 [CONFIG.md](CONFIG.md).
 
+## Long context: KV cache eviction
+
+For long-context prompts (16K+ tokens), CASK-based eviction prevents OOM by
+capping physical VRAM regardless of the advertised `max_seq`. For HuggingFace
+models pulled via `hipfire pull`, a sidecar is auto-attached — just enable
+eviction with:
+
+```bash
+hipfire config set cask-profile balanced   # or conservative / aggressive-vram
+```
+
+The daemon automatically discovers the shipped `.triattn.bin` beside the
+weights and sets `cask_sidecar` for you. No manual path needed.
+
+**Note:** eviction is disabled by default even when a sidecar exists —
+you must set a CASK profile (`balanced`, `conservative`, or `aggressive-vram`) to activate it.
+
+For custom or quantized models, generate the sidecar first:
+
+```bash
+hipfire sidecar-gen my-finetune.mq4 --corpus corpus.txt -o my-finetune.triattn.bin
+hipfire config set cask_sidecar ~/models/my-finetune.triattn.bin
+hipfire config set cask-profile balanced
+```
+
+See [CONFIG.md](CONFIG.md) for profiles, knobs, and safety constraints.
+
 ## What to read next
 
 - [MODELS.md](MODELS.md) — supported model tags + how to bring your own
