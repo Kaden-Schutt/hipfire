@@ -663,7 +663,10 @@ fn main() {
                     }
                 }
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu) {
+                let state_quant_override = msg.get("params").and_then(|p| p.get("state_quant")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -1300,14 +1303,57 @@ fn resolve_chat_template(
     hfq.chat_template()
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn parse_state_quant(mode: Option<&str>) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
+        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "fp32" | "f32" => Ok(StateQuant::FP32),
+        "q4" | "int4" => Ok(StateQuant::Q4),
+        other => Err(format!("unsupported DeltaNet state_quant '{other}' (expected q8|fp32|q4)")),
+    }
+}
+
+fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static str {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    match q {
+        StateQuant::FP32 => "FP32",
+        StateQuant::Q8 => "Q8",
+        StateQuant::Q4 => "Q4",
+    }
+}
+
+fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
+    hfq.tensors()
+        .iter()
+        .map(|t| {
+            t.shape
+                .iter()
+                .fold(1u128, |acc, &dim| acc.saturating_mul(dim as u128))
+        })
+        .sum()
+}
+
+fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQuant) {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
+    let params = hfq_parameter_count(hfq);
+    if params < TINY_MODEL_PARAMS && q != StateQuant::FP32 {
+        eprintln!(
+            "  warning: model has ~{:.2}B params; FP32 DeltaNet state is recommended below 2B for long-generation coherence (current: {})",
+            params as f64 / 1.0e9,
+            state_quant_label(q)
+        );
+    }
+}
+
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
         let _ = (draft_path, cask);
-        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu);
+        return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -1522,16 +1568,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
-        // MoE models (num_experts > 0) have ~10x smaller hidden-state
-        // magnitudes than dense models, making Q8 DeltaNet state quantization
-        // error proportionally larger. Use FP32 state to avoid cumulative
-        // drift that degenerates output after ~200 tokens.
-        let dn_quant = if config.num_experts > 0 {
-            eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-            hipfire_arch_qwen35::qwen35::StateQuant::FP32
-        } else {
-            hipfire_arch_qwen35::qwen35::StateQuant::Q8
-        };
+        // Q8 DeltaNet state can accumulate quality drift on long generation.
+        // The load-time override exists for coherence A/B probes.
+        let dn_quant = parse_state_quant(state_quant_override)?;
+        eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+        warn_tiny_model_state(&hfq, dn_quant);
         let dn = DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
@@ -1658,6 +1699,7 @@ fn load_model_pp(
     path: &str,
     max_seq: usize,
     kv_mode_override: Option<&str>,
+    state_quant_override: Option<&str>,
     pp: usize,
     _gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
@@ -1732,15 +1774,11 @@ fn load_model_pp(
         }
     };
 
-    // MoE state-quant rule mirrors the pp=1 path (Q8 drift on small hidden
-    // states); apply at the multi entry point so bit-equivalence with pp=1
-    // forward output holds when both run on the same model.
-    let dn_quant = if config.num_experts > 0 {
-        eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-        qwen35::StateQuant::FP32
-    } else {
-        qwen35::StateQuant::Q8
-    };
+    // Mirror the pp=1 state-mode parser so pp parity probes can force the
+    // same DeltaNet state representation.
+    let dn_quant = parse_state_quant(state_quant_override)?;
+    eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+    warn_tiny_model_state(&hfq, dn_quant);
     let (dn, la_to_device) =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant).map_err(|e| format!("{e}"))?;
 
