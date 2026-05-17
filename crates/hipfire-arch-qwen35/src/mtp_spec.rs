@@ -111,18 +111,52 @@ pub struct MtpSpecState {
     /// Allocated lazily via [`MtpSpecState::ensure_compressed_lm_logits`].
     pub mtp_lm_logits_compressed: Option<GpuTensor>,
 
+    /// Per-step top-2 index scratch for [`spec_step_mtp_compressed_serial`]
+    /// with `p_min > 0`. Shape `[2]` i32 stored as F32 slots. Reused across
+    /// K-chain steps within a cycle.
+    pub mtp_topk_idx: GpuTensor,
+
+    /// Per-step top-2 log-softmax-prob scratch matching `mtp_topk_idx`.
+    /// Shape `[2]` F32. `top_logp[0]` is log P(argmax); compared against
+    /// `log(p_min)` for the chain-truncation early-exit.
+    pub mtp_topk_logp: GpuTensor,
+
     /// Maximum number of MTP candidates per cycle (chain depth).
     pub max_n: usize,
+
+    /// Optional draft-confidence cutoff for [`spec_step_mtp_compressed_serial`].
+    /// When `p_min > 0`, the K-chain truncates early at step k if the draft's
+    /// top-1 softmax prob falls below `p_min` — analog of llama.cpp's
+    /// `--spec-draft-p-min` (PR #22673). Default 0.0 = disabled. Set via
+    /// [`Self::set_p_min`]. The current step's candidate IS kept (we already
+    /// computed it); only steps k+1..max_n are skipped.
+    pub p_min: f32,
 }
 
 impl MtpSpecState {
     /// Allocate all per-generation buffers, sizing the trunk DN snapshot
-    /// against the live `target.dn_state`.
+    /// against the live `target.dn_state`. Defaults MTP head KV to Q8 — see
+    /// [`Self::new_for_slot_with_kv_mode`] for explicit selection.
     pub fn new_for_slot(
         gpu: &mut Gpu,
         target: &ModelSlot,
         head: &Qwen35MtpHead,
         max_n: usize,
+    ) -> HipResult<Self> {
+        Self::new_for_slot_with_kv_mode(
+            gpu, target, head, max_n, crate::mtp_head::MtpKvMode::Q8,
+        )
+    }
+
+    /// Like [`Self::new_for_slot`] but allocates the MTP head's KV cache in
+    /// the requested format. Used by `mtp_only_demo` to A/B kv-mode variants
+    /// (q8/asym3/fwht4) per the 2026-05-16 feat/fwht prose-τ findings.
+    pub fn new_for_slot_with_kv_mode(
+        gpu: &mut Gpu,
+        target: &ModelSlot,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
         assert!(
             max_n >= 1,
@@ -149,7 +183,7 @@ impl MtpSpecState {
         let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
         let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, max_n + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
-        let mtp_kv = Qwen35MtpHeadKvCache::new(gpu, &head.config)?;
+        let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
 
         // Per-step batched-lm_head scratch (Task 10b).
         let mtp_t_outs = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
@@ -157,6 +191,11 @@ impl MtpSpecState {
         let mtp_lm_rot = gpu.alloc_tensor(&[max_n * dim], DType::F32)?;
         let mtp_lm_logits = gpu.alloc_tensor(&[max_n * vocab], DType::F32)?;
         let mtp_lm_argmax = gpu.alloc_tensor(&[max_n], DType::F32)?;
+
+        // Per-step top-2 scratches for p_min early-exit (16 B total, always
+        // allocated — only used when state.p_min > 0).
+        let mtp_topk_idx = gpu.alloc_tensor(&[2], DType::F32)?;
+        let mtp_topk_logp = gpu.alloc_tensor(&[2], DType::F32)?;
 
         Ok(Self {
             prev_hidden,
@@ -174,8 +213,22 @@ impl MtpSpecState {
             mtp_lm_logits,
             mtp_lm_argmax,
             mtp_lm_logits_compressed: None,
+            mtp_topk_idx,
+            mtp_topk_logp,
             max_n,
+            p_min: 0.0,
         })
+    }
+
+    /// Set the draft-confidence threshold for compressed-serial K-chain
+    /// truncation. Pass `0.0` (default) to disable. Typical values: 0.5-0.8.
+    /// llama.cpp's PR #22673 ships `0.75` as the recommended starting point.
+    pub fn set_p_min(&mut self, p_min: f32) {
+        assert!(
+            (0.0..=1.0).contains(&p_min),
+            "MtpSpecState::set_p_min: p_min must be in [0.0, 1.0], got {p_min}"
+        );
+        self.p_min = p_min;
     }
 
     /// Allocate `mtp_lm_logits_compressed` shape `[max_n * cvs]` for the
@@ -272,6 +325,19 @@ pub struct MtpSpecResult {
     pub hit_eos: bool,
     /// Position advance (= committed.len()). Caller's `cur_pos += advance`.
     pub advance: usize,
+    /// Number of MTP draft candidates ACTUALLY generated this cycle (≤ max_n).
+    /// Equals max_n unless p_min early-exit truncated the chain. The trunk
+    /// verify batch is sized `drafts_generated + 1`.
+    pub drafts_generated: usize,
+    /// True iff `p_min` early-exit fired this cycle (caller can sum across
+    /// cycles to compute the "% cycles truncated" stat).
+    pub chain_truncated: bool,
+    /// True iff this cycle was a full-accept (advance == drafts_generated + 1
+    /// without EOS) so the post-verify replay was skipped — verify's KV +
+    /// DN state already match what replay would have produced. Currently
+    /// only set by [`spec_step_mtp_compressed_serial`]; other spec_step
+    /// variants always replay and report `false`.
+    pub replay_skipped: bool,
 }
 
 /// One MTP-only spec-decode cycle (greedy, temp=0).
@@ -670,6 +736,9 @@ pub fn spec_step_mtp(
         accept_count,
         hit_eos,
         advance,
+        drafts_generated: state.max_n,
+        chain_truncated: false,
+        replay_skipped: false,
     })
 }
 
@@ -954,6 +1023,9 @@ pub fn spec_step_mtp_compressed(
         accept_count,
         hit_eos,
         advance,
+        drafts_generated: state.max_n,
+        chain_truncated: false,
+        replay_skipped: false,
     })
 }
 
@@ -994,16 +1066,40 @@ pub fn spec_step_mtp_compressed_serial(
     let vocab = target.config.vocab_size;
     let trunk_weights: &Qwen35Weights = &target.weights;
 
-    // Sidecar must be loaded.
-    let _ = head.weights.lm_head_draft.as_ref()
-        .expect("spec_step_mtp_compressed_serial requires --vocab-sidecar");
-    let vocab_map = head.weights.lm_head_draft_vocab_map.as_ref()
-        .expect("compressed head missing vocab_map");
-    let cvs = head.weights.compressed_vocab_size
-        .expect("compressed head missing compressed_vocab_size");
-    let logits_c_single = state.mtp_scratch.logits_compressed.as_ref()
-        .expect("Qwen35MtpHeadScratch::logits_compressed not allocated; \
-                 call mtp_scratch.ensure_compressed_logits(gpu, cvs) after head load");
+    // Two modes for the K-step draft lm_head dispatch:
+    //
+    //   compressed (FastMTP-style): use head's own lm_head_draft (32K-row
+    //     top-K vocab slice) plus vocab_map for the draft→full id remap.
+    //     Small per-step GEMV (~0.09 ms BW on MQ4) but softmax is over the
+    //     32K compressed vocab, which dilutes top-1 prob signal (compresses
+    //     the distribution shape) and breaks --mtp-p-min.
+    //
+    //   full-vocab (bundled .mq4-mtp): use the trunk's own output (lm_head)
+    //     directly as the draft head. Per-step GEMV is larger (~0.69 ms BW)
+    //     but the softmax is over the real 248K vocab — top-1 prob is the
+    //     true confidence the trunk would see, and the argmax id IS the
+    //     committed token id (no vocab_map remap). Cost difference per cycle
+    //     is small (~3 ms more across K=5) since trunk verify dominates.
+    //     This is the architecture Unsloth/llama.cpp #22673 ship.
+    //
+    // Mode is selected by whether the loaded head carries a compressed sidecar.
+    // Bundled .mq4-mtp files drop the sidecar; load_mtp_head_bundled returns
+    // a head with lm_head_draft: None.
+    let use_full_vocab = head.weights.lm_head_draft.is_none();
+    let (vocab_map_opt, cvs): (Option<&Vec<u32>>, usize) = if use_full_vocab {
+        (None, vocab)
+    } else {
+        let _ = head.weights.lm_head_draft.as_ref()
+            .expect("compressed head missing lm_head_draft");
+        let vm = head.weights.lm_head_draft_vocab_map.as_ref()
+            .expect("compressed head missing vocab_map");
+        let c = head.weights.compressed_vocab_size
+            .expect("compressed head missing compressed_vocab_size");
+        let _ = state.mtp_scratch.logits_compressed.as_ref()
+            .expect("Qwen35MtpHeadScratch::logits_compressed not allocated; \
+                     call mtp_scratch.ensure_compressed_logits(gpu, cvs) after head load");
+        (Some(vm), c)
+    };
 
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
@@ -1012,36 +1108,141 @@ pub fn spec_step_mtp_compressed_serial(
     let dim_bytes = dim * 4;
     let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
     let argmax_view = state.mtp_lm_argmax.sub_offset(0, 1);
+    // Full-vocab per-step logits scratch: first row of mtp_lm_logits is
+    // shape [vocab] which is exactly what we need per step. Allocated as
+    // [max_n * vocab] elsewhere so the storage is already there.
+    let full_vocab_logits_view = state.mtp_lm_logits.sub_offset(0, vocab);
+
+    // p_min early-exit: when state.p_min > 0, each step uses
+    // topk_logsumexp_batched (K=2) instead of argmax. We then check
+    // top_logp[0] (log-softmax prob of argmax) against log(p_min) and
+    // truncate the chain when the draft's own confidence drops below
+    // threshold. Mirrors llama.cpp's --spec-draft-p-min (PR #22673).
+    //
+    // Semantics: the current step's candidate IS kept (we already computed
+    // it); only steps k+1..max_n are skipped. This matches the upstream
+    // implementation — a low-confidence draft still gets to face trunk
+    // verify, but we stop spending compute speculating further.
+    let p_min = state.p_min;
+    let use_p_min = p_min > 0.0;
+    let log_p_min = if use_p_min { p_min.ln() } else { f32::NEG_INFINITY };
+    let mut chain_truncated = false;
 
     // ── 1. K serial discrete-token roundtrips ─────────────────────────────
     for k in 0..max_n {
         let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
-        if k == 0 {
-            mtp_head::mtp_head_forward_compressed(
-                gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
-                next_tok, &state.prev_hidden, cur_pos + k, trunk_weights,
+
+        // Forward: in compressed mode, mtp_head_forward_compressed runs
+        // block_only + rmsnorm + small GEMV against lm_head_draft in one
+        // call. In full-vocab mode we run block_only here and do the
+        // rmsnorm + trunk-lm_head GEMV manually below.
+        if use_full_vocab {
+            if k == 0 {
+                mtp_head::mtp_head_forward_block_only(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    next_tok, &state.prev_hidden, None, cur_pos + k, trunk_weights,
+                )?;
+            } else {
+                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                mtp_head::mtp_head_forward_block_only(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    next_tok, &prev_row, None, cur_pos + k, trunk_weights,
+                )?;
+            }
+            // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
+            // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
+            // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
+            // trunk's output dtype.
+            gpu.rmsnorm_f32(
+                &state.mtp_scratch.t_mtp_out,
+                &head.weights.shared_head_norm,
+                &state.mtp_scratch.tmp,
+                head.config.rms_norm_eps,
+            )?;
+            llama::weight_gemv(
+                gpu,
+                &trunk_weights.output,
+                &state.mtp_scratch.tmp,
+                &full_vocab_logits_view,
             )?;
         } else {
-            let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-            mtp_head::mtp_head_forward_compressed(
-                gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
-                next_tok, &prev_row, cur_pos + k, trunk_weights,
-            )?;
+            if k == 0 {
+                mtp_head::mtp_head_forward_compressed(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    next_tok, &state.prev_hidden, cur_pos + k, trunk_weights,
+                )?;
+            } else {
+                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                mtp_head::mtp_head_forward_compressed(
+                    gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
+                    next_tok, &prev_row, cur_pos + k, trunk_weights,
+                )?;
+            }
         }
 
-        gpu.argmax_f32_batched(logits_c_single, &argmax_view, cvs, 1)?;
-        let mut argmax_host: [i32; 1] = [0];
-        {
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    argmax_host.as_mut_ptr() as *mut u8, 4,
-                )
+        // Pick the logits buffer to argmax over (mode-dependent).
+        let logits_for_argmax: &GpuTensor = if use_full_vocab {
+            &full_vocab_logits_view
+        } else {
+            state.mtp_scratch.logits_compressed.as_ref().unwrap()
+        };
+        let argmax_vocab = cvs;  // = full vocab in full-vocab mode, = compressed vocab in compressed mode
+
+        let draft_idx: usize;
+        if use_p_min {
+            // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
+            gpu.topk_logsumexp_batched_f32(
+                logits_for_argmax, &state.mtp_topk_idx, &state.mtp_topk_logp,
+                argmax_vocab, /* k */ 2, /* b */ 1,
+            )?;
+            let mut idx_host: [i32; 2] = [0, 0];
+            let mut logp_host: [f32; 2] = [0.0, 0.0];
+            {
+                let idx_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, 8)
+                };
+                gpu.hip.memcpy_dtoh(idx_bytes, &state.mtp_topk_idx.buf)?;
+                let logp_bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(logp_host.as_mut_ptr() as *mut u8, 8)
+                };
+                gpu.hip.memcpy_dtoh(logp_bytes, &state.mtp_topk_logp.buf)?;
+            }
+            draft_idx = idx_host[0] as usize;
+            assert!(draft_idx < argmax_vocab,
+                "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}");
+            // Compressed: remap via vocab_map. Full-vocab: idx IS the token id.
+            let token_id = match vocab_map_opt {
+                Some(vm) => vm[draft_idx],
+                None => draft_idx as u32,
             };
-            gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+            candidates.push(token_id);
+
+            // Check confidence AFTER pushing — keep this candidate, just
+            // skip future steps if confidence is below threshold.
+            if logp_host[0] < log_p_min {
+                chain_truncated = true;
+                break;
+            }
+        } else {
+            gpu.argmax_f32_batched(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
+            let mut argmax_host: [i32; 1] = [0];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        argmax_host.as_mut_ptr() as *mut u8, 4,
+                    )
+                };
+                gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+            }
+            draft_idx = argmax_host[0] as usize;
+            assert!(draft_idx < argmax_vocab,
+                "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}");
+            let token_id = match vocab_map_opt {
+                Some(vm) => vm[draft_idx],
+                None => draft_idx as u32,
+            };
+            candidates.push(token_id);
         }
-        let draft_idx = argmax_host[0] as usize;
-        assert!(draft_idx < cvs, "draft argmax {draft_idx} out of cvs {cvs}");
-        candidates.push(vocab_map[draft_idx]);
 
         if k + 1 < max_n {
             gpu.hip.memcpy_dtod_at(
@@ -1051,6 +1252,7 @@ pub fn spec_step_mtp_compressed_serial(
             )?;
         }
     }
+    let drafts_generated = candidates.len();
 
     // ── 2. Trunk verify ───────────────────────────────────────────────────
     let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
@@ -1133,8 +1335,8 @@ pub fn spec_step_mtp_compressed_serial(
 
     let mut accept_count = 0usize;
     let mut hit_eos = false;
-    let mut committed: Vec<u32> = Vec::with_capacity(max_n + 1);
-    for k in 0..max_n {
+    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
+    for k in 0..drafts_generated {
         if argmax_per_pos[k] == candidates[k] {
             committed.push(candidates[k]);
             accept_count += 1;
@@ -1154,24 +1356,51 @@ pub fn spec_step_mtp_compressed_serial(
         }
     }
     let advance = committed.len();
-    debug_assert!(advance >= 1 && advance <= max_n + 1);
+    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
 
-    state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-    if advance >= 2 {
-        let replay = &verify_tokens[..advance];
-        qwen35::forward_prefill_batch(
-            gpu, trunk_weights, &target.config, replay, cur_pos,
-            &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-            None, None, None, None,
-        )?;
-    } else {
-        qwen35::forward_scratch(
-            gpu, trunk_weights, &target.config, verify_tokens[0], cur_pos,
-            &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-        )?;
+    // ── 3. KV / DN rollback (or skip on full accept) ──────────────────────
+    //
+    // Replay is REDUNDANT when advance == drafts_generated + 1 (full
+    // accept, no EOS, no chain truncation matters): verify's forward
+    // already left DN state advanced by `drafts_generated + 1` steps from
+    // the snapshot, which is exactly where replay would land. KV cache
+    // slots `cur_pos..cur_pos + drafts_generated` are also already
+    // populated identically (replay would write the same tokens to the
+    // same slots).
+    //
+    // Skipping saves the per-cycle replay forward (~30-40 ms / 75 ms total
+    // cycle wall — replay is the second-biggest single cost per
+    // `mtp-cycle-anatomy.md`). At τ≈3.8 on K=5, ~20-30% of cycles full-
+    // accept, so net cycle-wall reduction is ~7-12% on the canonical bench.
+    //
+    // The trunk_snap.save_from() call earlier in the cycle is still made
+    // unconditionally (~1 ms, unavoidable since we don't know advance
+    // until verify completes); only the restore + replay are gated.
+    //
+    // On EOS we still take the replay branch: even though no further
+    // forwards happen, the caller's KV cache must reflect ONLY the
+    // committed prefix (some of which may have been rejected/truncated
+    // before the EOS-bearing token was committed).
+    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
+    let replay_skipped = full_accept_no_eos;
+    if !full_accept_no_eos {
+        state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
+        if advance >= 2 {
+            let replay = &verify_tokens[..advance];
+            qwen35::forward_prefill_batch(
+                gpu, trunk_weights, &target.config, replay, cur_pos,
+                &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+                None, None, None, None,
+            )?;
+        } else {
+            qwen35::forward_scratch(
+                gpu, trunk_weights, &target.config, verify_tokens[0], cur_pos,
+                &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+            )?;
+        }
     }
 
     Ok(MtpSpecResult {
@@ -1179,5 +1408,8 @@ pub fn spec_step_mtp_compressed_serial(
         accept_count,
         hit_eos,
         advance,
+        drafts_generated,
+        chain_truncated,
+        replay_skipped,
     })
 }

@@ -370,27 +370,76 @@ impl Qwen35MtpHeadScratch {
 /// - v2: tried asym3 — coherent but -9% perf at K=5 (44 tok/s) due to
 ///       3-bit K quant lowering attention quality → lower τ ceiling
 /// - v3 (current): Q8 — flash-attn enabled, attention quality preserved
+/// KV format for the MTP head's per-token decode path. Default is Q8.
+///
+/// - **Q8**: 8-bit per-block K and V, `attention_q8_0_kv` (non-flash).
+///   Reference: -3% perf vs F32 at K=5 per [[mtp-session-state-2026-05-15-compaction]],
+///   externally validated by Unsloth's 76.45% Q8 hit-rate claim.
+/// - **Asym3**: 3-bit Givens-rotated K + Q8 V, `attention_flash_asym3`.
+///   Prior session v2 attempt: -9% perf vs F32 (lower attention fidelity → lower τ).
+///   Reverted in favor of Q8. Re-running with the new ±1-3% methodology
+///   to confirm/refute that delta.
+/// - **Fwht4**: 4-bit signed-FWHT-rotated K + Q8 V, `attention_flash_fwht4`.
+///   Master's feat/fwht Phase 2 bench (3.5-27B prose, dflash): Fwht3 fixes
+///   asym3 collapse (τ 1.27→3.60) and Fwht2 EXCEEDS Q8 (τ 4.08 vs 3.91).
+///   Wired here as the MTP-head's matching test.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MtpKvMode {
+    Q8,
+    Asym3,
+    Fwht4,
+}
+
+impl MtpKvMode {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "q8" => Ok(Self::Q8),
+            "asym3" | "turbo3" => Ok(Self::Asym3),
+            "fwht4" => Ok(Self::Fwht4),
+            other => Err(format!(
+                "unknown MTP kv-mode '{other}' (expected: q8, asym3, fwht4)"
+            )),
+        }
+    }
+}
+
 pub struct Qwen35MtpHeadKvCache {
     pub inner: hipfire_runtime::llama::KvCache,
     pub max_seq: usize,
     pub n_head_kv: usize,
     pub head_dim: usize,
+    pub kv_mode: MtpKvMode,
 }
 
 impl Qwen35MtpHeadKvCache {
+    /// Default constructor: Q8 KV (current ship).
     pub fn new(gpu: &mut Gpu, config: &Qwen35MtpHeadConfig) -> HipResult<Self> {
-        let inner = hipfire_runtime::llama::KvCache::new_gpu_q8(
-            gpu,
-            /* n_layers */ 1,
-            config.n_head_kv,
-            config.head_dim,
-            config.max_seq,
-        )?;
+        Self::new_with_kv_mode(gpu, config, MtpKvMode::Q8)
+    }
+
+    /// Allocate the MTP head's single-layer KV cache in the requested format.
+    pub fn new_with_kv_mode(
+        gpu: &mut Gpu,
+        config: &Qwen35MtpHeadConfig,
+        kv_mode: MtpKvMode,
+    ) -> HipResult<Self> {
+        let inner = match kv_mode {
+            MtpKvMode::Q8 => hipfire_runtime::llama::KvCache::new_gpu_q8(
+                gpu, /* n_layers */ 1, config.n_head_kv, config.head_dim, config.max_seq,
+            )?,
+            MtpKvMode::Asym3 => hipfire_runtime::llama::KvCache::new_gpu_asym3(
+                gpu, /* n_layers */ 1, config.n_head_kv, config.head_dim, config.max_seq,
+            )?,
+            MtpKvMode::Fwht4 => hipfire_runtime::llama::KvCache::new_gpu_fwht4(
+                gpu, /* n_layers */ 1, config.n_head_kv, config.head_dim, config.max_seq,
+            )?,
+        };
         Ok(Self {
             inner,
             max_seq: config.max_seq,
             n_head_kv: config.n_head_kv,
             head_dim: config.head_dim,
+            kv_mode,
         })
     }
 
@@ -438,6 +487,63 @@ impl Qwen35MtpHead {
     }
 }
 
+// ─── Bundled .mq4-mtp loader (trunk + MTP head in one file) ───────────────
+
+/// Trailer magic written by `mq4_merge_mtp`. Indicates the file is a bundle
+/// of a trunk `.mq4` followed by an MTP `.mtp` section.
+pub const BUNDLE_TRAILER_MAGIC: &[u8; 8] = b"HFBNDMTP";
+/// Trailer is 8 bytes magic + 8 bytes u64 mtp-section offset = 16 bytes.
+pub const BUNDLE_TRAILER_LEN: u64 = 16;
+
+/// Inspect a file's trailing 16 bytes for the `mq4_merge_mtp` trailer. If
+/// present, returns the byte offset where the embedded MTP `.mtp` section
+/// starts. Returns `None` for plain `.mq4` trunk files (no MTP bundled).
+///
+/// Cheap operation — single 16-byte read from end of file. Safe to call
+/// on any path: returns `Ok(None)` rather than erroring when the file is
+/// too small or the magic doesn't match.
+pub fn detect_bundled_mtp_offset(path: &Path) -> std::io::Result<Option<u64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let file_size = f.metadata()?.len();
+    if file_size < BUNDLE_TRAILER_LEN {
+        return Ok(None);
+    }
+    f.seek(SeekFrom::End(-(BUNDLE_TRAILER_LEN as i64)))?;
+    let mut trailer = [0u8; BUNDLE_TRAILER_LEN as usize];
+    f.read_exact(&mut trailer)?;
+    if &trailer[..8] != BUNDLE_TRAILER_MAGIC {
+        return Ok(None);
+    }
+    let mtp_offset = u64::from_le_bytes(trailer[8..16].try_into().unwrap());
+    if mtp_offset >= file_size - BUNDLE_TRAILER_LEN {
+        // Corrupt trailer (offset past EOF). Treat as not-bundled rather
+        // than crashing — the trunk loader's HFQM parse will succeed
+        // independent of trailer state.
+        return Ok(None);
+    }
+    Ok(Some(mtp_offset))
+}
+
+/// Load the MTP head section embedded inside a bundled `.mq4-mtp` file.
+/// `path` is the bundle file path; the trailer is read to find the embedded
+/// MTP section offset, then [`load_mtp_head_at_offset`] parses it.
+///
+/// Returns `Ok(None)` if `path` is a plain trunk `.mq4` (no bundle trailer).
+pub fn load_mtp_head_bundled(
+    path: &Path,
+    gpu: &mut Gpu,
+    max_seq: usize,
+) -> HipResult<Option<Qwen35MtpHead>> {
+    let mtp_offset = match detect_bundled_mtp_offset(path) {
+        Ok(Some(off)) => off,
+        Ok(None) => return Ok(None),
+        Err(e) => panic!("read bundle trailer from {}: {e}", path.display()),
+    };
+    let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
+    Ok(Some(head))
+}
+
 // ─── Loader ──────────────────────────────────────────────────────────────
 
 /// Load a `.mtp` file (arch_id = 21) created by `mtp_extract` (Task 8).
@@ -450,8 +556,20 @@ pub fn load_mtp_head(
     gpu: &mut Gpu,
     max_seq: usize,
 ) -> HipResult<Qwen35MtpHead> {
-    let hfq = HfqFile::open(path)
-        .unwrap_or_else(|e| panic!("open .mtp file {}: {e}", path.display()));
+    load_mtp_head_at_offset(path, gpu, max_seq, 0)
+}
+
+/// Like [`load_mtp_head`] but opens the HFQM container at `base_offset`
+/// inside `path`. Pass `0` for a standalone `.mtp` file; for a bundled
+/// `.mq4-mtp` file pass the offset returned by [`detect_bundled_mtp_offset`].
+pub fn load_mtp_head_at_offset(
+    path: &Path,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    base_offset: u64,
+) -> HipResult<Qwen35MtpHead> {
+    let hfq = HfqFile::open_at_offset(path, base_offset)
+        .unwrap_or_else(|e| panic!("open .mtp file {} @ offset {base_offset}: {e}", path.display()));
     assert_eq!(
         hfq.arch_id, 21,
         ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
@@ -908,31 +1026,68 @@ pub fn mtp_head_forward_block_only(
         cfg.n_head, cfg.n_head_kv, cfg.head_dim, cfg.n_rot, cfg.rope_theta,
     )?;
 
-    // ── 6. KV cache write at slot `pos` ──────────────────────────────────
+    // ── 6+7. KV cache write + attention (dispatch on kv.kv_mode) ─────────
     //
-    // Q8_0: K and V each as 8-bit per-block (34 B / 32 elems) with one f32
-    // scale per block. Two separate write kernels (no _fused variant).
-    gpu.kv_cache_write_q8_0(
-        &kv.inner.k_gpu[0], &scratch.k, &scratch.pos_buf,
-        cfg.n_head_kv, cfg.head_dim,
-    )?;
-    gpu.kv_cache_write_q8_0(
-        &kv.inner.v_gpu[0], &scratch.v, &scratch.pos_buf,
-        cfg.n_head_kv, cfg.head_dim,
-    )?;
-
-    // ── 7. Attention ────────────────────────────────────────────────────
-    //
-    // attention_q8_0_kv: per-token decode path (non-flash). The trunk uses
-    // this same call for its per-token forward at qwen35.rs:2158. The flash
-    // variant attention_flash_q8_0 is reserved for batched prefill (used
-    // in trunk's batched prefill loop at qwen35.rs:1709) and gave τ collapse
-    // when called per-token from MTP — wrong API for single-token decode.
-    gpu.attention_q8_0_kv(
-        &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
-        &scratch.attn_out, &scratch.pos_buf, pos + 1,
-        cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
-    )?;
+    // Mirrors trunk's per-token decode dispatch at qwen35.rs:6062-6138.
+    // - Q8: 2-call kv_cache_write_q8_0 + attention_q8_0_kv (no flash partials)
+    // - Asym3: kv_cache_write_asym3_fused + attention_flash_asym3 (Givens cos/sin)
+    // - Fwht4: kv_cache_write_fwht4_fused + attention_flash_fwht4 (FWHT signs
+    //   stored in kv_cache.givens_cos/givens_sin slots — field-name reuse
+    //   per Phase 1 fwht4 commit `c64c0e3f`).
+    match kv.kv_mode {
+        MtpKvMode::Q8 => {
+            gpu.kv_cache_write_q8_0(
+                &kv.inner.k_gpu[0], &scratch.k, &scratch.pos_buf,
+                cfg.n_head_kv, cfg.head_dim,
+            )?;
+            gpu.kv_cache_write_q8_0(
+                &kv.inner.v_gpu[0], &scratch.v, &scratch.pos_buf,
+                cfg.n_head_kv, cfg.head_dim,
+            )?;
+            gpu.attention_q8_0_kv(
+                &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+                &scratch.attn_out, &scratch.pos_buf, pos + 1,
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
+            )?;
+        }
+        MtpKvMode::Asym3 => {
+            let ct = kv.inner.givens_cos.as_ref()
+                .expect("MtpKvMode::Asym3 requires kv.inner.givens_cos to be Some");
+            let st = kv.inner.givens_sin.as_ref()
+                .expect("MtpKvMode::Asym3 requires kv.inner.givens_sin to be Some");
+            gpu.kv_cache_write_asym3_fused(
+                &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+                &scratch.k, &scratch.v, &scratch.pos_buf,
+                ct, st, cfg.n_head_kv, cfg.head_dim,
+            )?;
+            gpu.attention_flash_asym3(
+                &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+                &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
+                &scratch.flash_partials,
+            )?;
+        }
+        MtpKvMode::Fwht4 => {
+            // Fwht uses the asym4-shaped k/v buffers + the cos/sin slots hold
+            // signs1/signs2 (128 elements each). FWHT operates on 128-element
+            // halves; head_dim=256 processes 2 halves reusing the same signs.
+            let ct = kv.inner.givens_cos.as_ref()
+                .expect("MtpKvMode::Fwht4 requires kv.inner.givens_cos (signs1) to be Some");
+            let st = kv.inner.givens_sin.as_ref()
+                .expect("MtpKvMode::Fwht4 requires kv.inner.givens_sin (signs2) to be Some");
+            gpu.kv_cache_write_fwht4_fused(
+                &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+                &scratch.k, &scratch.v, &scratch.pos_buf,
+                ct, st, cfg.n_head_kv, cfg.head_dim,
+            )?;
+            gpu.attention_flash_fwht4(
+                &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
+                &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
+                cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
+                &scratch.flash_partials,
+            )?;
+        }
+    }
 
     // ── 8. Apply gate (sigmoid(gate) * attn_out, in-place on attn_out) ───
     gpu.sigmoid_mul_f32(&scratch.attn_out, &scratch.gate)?;

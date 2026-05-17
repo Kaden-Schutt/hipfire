@@ -39,6 +39,8 @@ fn main() {
     let mut chatml: bool = true;
     let mut compressed: bool = false;
     let mut compressed_serial: bool = false;
+    let mut kv_mode_str: String = String::from("q8");
+    let mut p_min: f32 = 0.0;
 
     let mut i = 1;
     while i < args.len() {
@@ -55,6 +57,8 @@ fn main() {
             "--chatml" => { chatml = true; i += 1; }
             "--compressed" => { compressed = true; i += 1; }
             "--compressed-serial" => { compressed = true; compressed_serial = true; i += 1; }
+            "--kv-mode" => { kv_mode_str = args[i + 1].clone(); i += 2; }
+            "--mtp-p-min" => { p_min = args[i + 1].parse().unwrap(); i += 2; }
             "-h" | "--help" => {
                 eprintln!(
                     "Usage: mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \\\n\
@@ -76,7 +80,18 @@ fn main() {
     }
 
     let target_path = target_path.expect("--target required");
-    let mtp_path = mtp_path.expect("--mtp-head required");
+    // --mtp-head is optional when the target is a bundled .mq4-mtp file
+    // (the trailer points at the embedded MTP section). For plain .mq4
+    // targets it's required.
+    let target_is_bundle = target_path.ends_with(".mq4-mtp");
+    let mtp_path = match (mtp_path, target_is_bundle) {
+        (Some(p), _) => Some(p),
+        (None, true) => None,  // resolved from bundle below
+        (None, false) => {
+            eprintln!("--mtp-head required for non-bundle .mq4 target (got '{target_path}')");
+            std::process::exit(2);
+        }
+    };
     if prompt_str.is_some() == prompt_file.is_some() {
         eprintln!("exactly one of --prompt or --prompt-file is required");
         std::process::exit(2);
@@ -106,7 +121,8 @@ fn main() {
 
     eprintln!("=== mtp_only_demo ===");
     eprintln!("target:     {target_path}");
-    eprintln!("mtp-head:   {mtp_path}");
+    eprintln!("mtp-head:   {}",
+        mtp_path.as_deref().unwrap_or("<bundled in target .mq4-mtp>"));
     eprintln!("prompt md5: {prompt_hash}");
     eprintln!("max={max_tokens} ctx={ctx_capacity} max_n={max_n} chatml={chatml}");
 
@@ -130,13 +146,23 @@ fn main() {
     // MTP head's max_seq mirrors the trunk's. The head's KV cache is one
     // single layer, so even max_seq = 100K is only ~250 MB at dim=5120.
     let t_mtp = Instant::now();
-    let head = mtp_head::load_mtp_head(
-        Path::new(&mtp_path), &mut gpu, max_seq_total,
-    ).expect("load mtp head");
-    eprintln!("mtp head loaded in {:.2}s — n_embd={} vocab={} n_rot={} rope_theta={}",
+    let head = if let Some(ref mp) = mtp_path {
+        // Explicit --mtp-head: standalone .mtp file (legacy path).
+        mtp_head::load_mtp_head(Path::new(mp), &mut gpu, max_seq_total)
+            .expect("load mtp head")
+    } else {
+        // Bundled .mq4-mtp: load MTP section embedded in target file.
+        mtp_head::load_mtp_head_bundled(Path::new(&target_path), &mut gpu, max_seq_total)
+            .expect("load bundled mtp head")
+            .expect("target ends in .mq4-mtp but no MTP bundle trailer found; \
+                     was the file produced by mq4_merge_mtp?")
+    };
+    let head_source = if mtp_path.is_some() { "standalone .mtp" } else { "bundled .mq4-mtp" };
+    eprintln!("mtp head loaded in {:.2}s ({head_source}) — n_embd={} vocab={} n_rot={} rope_theta={} compressed_lm_head_draft={}",
               t_mtp.elapsed().as_secs_f64(),
               head.config.n_embd, head.config.vocab_size,
-              head.config.n_rot, head.config.rope_theta);
+              head.config.n_rot, head.config.rope_theta,
+              head.weights.lm_head_draft.is_some());
 
     // Sanity dims
     assert_eq!(head.config.n_embd, target.config.dim, "trunk/head dim mismatch");
@@ -176,28 +202,58 @@ fn main() {
     );
 
     // ── Allocate spec state ────────────────────────────────────────────
-    let mut state = MtpSpecState::new_for_slot(&mut gpu, &target, &head, max_n)
+    let kv_mode = hipfire_arch_qwen35::mtp_head::MtpKvMode::parse(&kv_mode_str)
+        .unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2); });
+    eprintln!("mtp-head kv-mode: {kv_mode:?}");
+    let mut state = MtpSpecState::new_for_slot_with_kv_mode(&mut gpu, &target, &head, max_n, kv_mode)
         .expect("alloc MtpSpecState");
+    if p_min > 0.0 {
+        if !compressed_serial {
+            eprintln!("warning: --mtp-p-min only affects --compressed-serial path; ignored for the other two");
+        }
+        state.set_p_min(p_min);
+        eprintln!("mtp-p-min: {p_min} (early-exit chain at log P(argmax) < {:.4})", p_min.ln());
+    }
 
-    // Compressed mode: ensure scratch.logits_compressed is allocated and
-    // verify the head actually carries a sidecar.
+    // Compressed mode: two sub-cases now:
+    //   (a) Head has a compressed lm_head_draft sidecar (`compressed_vocab_size:
+    //       Some`): allocate logits_compressed scratch + sub-batched scratch.
+    //   (b) Head has NO sidecar (e.g. bundled .mq4-mtp using full-vocab trunk
+    //       lm_head): nothing to allocate; spec_step_mtp_compressed_serial
+    //       branches internally on lm_head_draft.is_none() and uses the
+    //       trunk's lm_head for the K-step draft GEMV. compressed-serial path
+    //       is the only one that supports this; plain `--compressed` (batched
+    //       lossy K-step path) still requires a sidecar.
     if compressed {
-        let cvs = head.weights.compressed_vocab_size.unwrap_or_else(|| {
-            eprintln!(
-                "error: --compressed requires .mtp built with --vocab-sidecar \
-                 but loaded head reports has_compressed_lm_head_draft=false"
-            );
-            std::process::exit(2);
-        });
-        // Single-step compressed forward scratch (used by K=1 single-forward
-        // path that still exists; the batched K-step path doesn't need it).
-        state.mtp_scratch
-            .ensure_compressed_logits(&mut gpu, cvs)
-            .expect("alloc logits_compressed");
-        // Batched K-output compressed lm_head scratch (used by spec_step_mtp_compressed).
-        state.ensure_compressed_lm_logits(&mut gpu, cvs)
-            .expect("alloc mtp_lm_logits_compressed");
-        eprintln!("compressed: ON (cvs={cvs}, K={max_n})");
+        match head.weights.compressed_vocab_size {
+            Some(cvs) => {
+                state.mtp_scratch
+                    .ensure_compressed_logits(&mut gpu, cvs)
+                    .expect("alloc logits_compressed");
+                state.ensure_compressed_lm_logits(&mut gpu, cvs)
+                    .expect("alloc mtp_lm_logits_compressed");
+                eprintln!("compressed: ON (cvs={cvs}, K={max_n}, mode=sidecar)");
+            }
+            None if compressed_serial => {
+                // Full-vocab discrete-token chain via trunk's lm_head.
+                // spec_step_mtp_compressed_serial dispatches against
+                // trunk_weights.output and writes into state.mtp_lm_logits.
+                eprintln!(
+                    "compressed: ON (mode=full-vocab, K={max_n}, vocab={}) — \
+                     trunk lm_head used per-step",
+                    target.config.vocab_size
+                );
+            }
+            None => {
+                eprintln!(
+                    "error: --compressed (batched lossy path) requires a sidecar; \
+                     loaded head has no compressed_lm_head_draft. Use \
+                     --compressed-serial instead (supports full-vocab trunk \
+                     lm_head fallback) or pass a sidecar-extracted .mtp."
+                );
+                std::process::exit(2);
+            }
+        }
     }
 
     let eos_token = target.config.eos_token;
@@ -256,6 +312,9 @@ fn main() {
     let mut cycles = 0usize;
     let mut accepted_total = 0usize;  // sum of accept_count across cycles
     let mut bonus_total = 0usize;     // sum of "bonus committed" across cycles
+    let mut truncated_cycles = 0usize;  // cycles where p_min fired early-exit
+    let mut drafts_generated_total = 0usize;  // sum of drafts_generated across cycles
+    let mut replay_skipped_cycles = 0usize;  // full-accept cycles that skipped replay
 
     let t_decode = Instant::now();
     let mut hit_eos = tokenizer.is_terminator(seed_token);
@@ -284,6 +343,9 @@ fn main() {
 
         cycles += 1;
         accepted_total += result.accept_count;
+        drafts_generated_total += result.drafts_generated;
+        if result.chain_truncated { truncated_cycles += 1; }
+        if result.replay_skipped { replay_skipped_cycles += 1; }
         if !result.hit_eos || (result.committed.last().copied() != Some(eos_token)
                                && result.accept_count < max_n) {
             // bonus committed unless we EOS-broke inside the chain. Counts
@@ -333,6 +395,17 @@ fn main() {
     println!("prompt_tokens:        {}", prompt_tokens.len());
     println!("max_n:                {}", max_n);
     println!("cycles:               {}", cycles);
+    {
+        let skip_pct = 100.0 * replay_skipped_cycles as f64 / cycles.max(1) as f64;
+        println!("replay_skipped:       {replay_skipped_cycles} cycles ({skip_pct:.1}%)");
+    }
+    if p_min > 0.0 {
+        let truncated_pct = 100.0 * truncated_cycles as f64 / cycles.max(1) as f64;
+        let avg_drafts = drafts_generated_total as f64 / cycles.max(1) as f64;
+        println!("p_min:                {}", p_min);
+        println!("chain_truncated:      {} cycles ({:.1}%)", truncated_cycles, truncated_pct);
+        println!("avg_drafts_per_cycle: {:.3} (of max_n={})", avg_drafts, max_n);
+    }
     println!("committed_total:      {}", total_committed);
     println!("committed_seed:       1");
     println!("committed_per_cycle_avg: {:.4}", tau);

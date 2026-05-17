@@ -66,6 +66,20 @@ pub struct HfqFile {
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_at_offset(path, 0)
+    }
+
+    /// Open an HFQM container that lives inside a larger file, starting at
+    /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
+    /// MTP section embedded after the trunk's tensor data.
+    ///
+    /// The whole file is mmap'd, and the HFQM header is read starting at
+    /// `base_offset`. All stored offsets inside the HFQM container are
+    /// rebased to absolute file offsets (`base_offset + stored_offset`).
+    ///
+    /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
+    /// entry point.
+    pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Sequential access hint: helps the kernel readahead and drop pages sooner.
@@ -79,14 +93,23 @@ impl HfqFile {
             }
         }
 
-        // Parse header (32 bytes)
-        let magic = &mmap[0..4];
-        assert_eq!(magic, b"HFQM", "Not an HFQ file");
-        let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
-        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
-        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let base = base_offset as usize;
+        assert!(
+            base + 32 <= mmap.len(),
+            "HfqFile::open_at_offset: base ({base}) + 32 > file size ({}); not enough bytes for header",
+            mmap.len(),
+        );
+
+        // Parse header (32 bytes) at base offset.
+        let magic = &mmap[base..base + 4];
+        assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
+        let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
+        // Stored offsets are relative to the container start; rebase to absolute
+        // file offsets so all the existing mmap slicing below works unchanged.
+        let metadata_offset = u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
+        let data_offset = u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
 
         // Read metadata JSON
         // Metadata ends at the tensor index, which starts right after metadata
