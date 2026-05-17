@@ -288,14 +288,18 @@ fn has_mmq_dp4a_or_wmma(arch: &str) -> bool {
 ///   `0` / `off`            — force MMQ off (debug / regression bisect)
 ///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
 ///   `auto` / unset / other — auto-route by batch_size threshold (default)
+///
+/// Both env reads (`HIPFIRE_MMQ`, `HIPFIRE_MMQ_MIN_BATCH`) cache via
+/// `OnceLock` — no per-dispatch syscalls on the hot path (called from
+/// 9+ dispatch sites, ~288+ syscalls/chunk on 27B prefill otherwise).
 fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
     if !has_mmq_dp4a_or_wmma(arch) {
         return false;
     }
-    match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
-        Some("0") | Some("off") => false,
-        Some("1") | Some("on") => true,
-        _ => {
+    match mmq_env_override() {
+        Some(false) => false,
+        Some(true) => true,
+        None => {
             // Per-arch default min_batch:
             //   gfx906: 8 — empirically validated for both prefill (pp512
             //     within noise of min_batch=16) and DFlash 27B verify
@@ -313,13 +317,61 @@ fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
             //     than MMQ at small batches; flip only when MMQ amortization
             //     dominates.
             let arch_min_batch: usize = if arch == "gfx906" { 8 } else { 256 };
-            let min_batch = std::env::var("HIPFIRE_MMQ_MIN_BATCH")
-                .ok()
-                .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(arch_min_batch);
+            let min_batch = mmq_min_batch_override().unwrap_or(arch_min_batch);
             batch_size >= min_batch
         }
     }
+}
+
+/// Cached env-var read for `HIPFIRE_MMQ`. `Some(true)` = force on,
+/// `Some(false)` = force off, `None` = auto.
+fn mmq_env_override() -> Option<bool> {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
+            Some("0") | Some("off") => Some(false),
+            Some("1") | Some("on") => Some(true),
+            _ => None,
+        }
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_MMQ_MIN_BATCH` (per-arch min-batch override).
+fn mmq_min_batch_override() -> Option<usize> {
+    static CACHE: OnceLock<Option<usize>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_MMQ_MIN_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_FP16=0` (disable FP16 fast paths).
+/// Called from 12+ dispatch sites on the prefill hot path; uncached read
+/// is one syscall + String alloc per dispatch.
+fn fp16_disabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_WO_MMQ=1` (opt-in MMQ for the wo path
+/// on RDNA3+/RDNA3.5 while the tiled path is validated).
+fn wo_mmq_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
+    })
+}
+
+/// Cached env-var read for `HIPFIRE_LM_HEAD_WMMA=0` (disable the gfx11
+/// LM-head WMMA fast path).
+fn lm_head_wmma_disabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0")
+    })
 }
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -4901,7 +4953,7 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 // gfx906 dp4a MMQ split: qkv + z route through the new MMQ
@@ -5364,7 +5416,7 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 // gfx906 dp4a MMQ: route q+k+v through the new MMQ kernel.
@@ -5766,7 +5818,7 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             // gfx906 dp4a MMQ — default-on at batch_size ≥ 8 (per
             // should_use_mmq's gfx906 default). Quantize X once, screen
             // both weights, dispatch MMQ for each in set mode (add=0).
@@ -9071,7 +9123,7 @@ impl Gpu {
         }
 
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             // gfx906 dp4a MMQ residual path — default-on at batch ≥ 8 per
             // should_use_mmq's gfx906 default. Distinguishes two reasons
             // MMQ might NOT fire:
@@ -9122,8 +9174,7 @@ impl Gpu {
             }
 
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
-            if std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-                || should_use_mmq(&self.arch, batch_size)
+            if wo_mmq_enabled() || should_use_mmq(&self.arch, batch_size)
             {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
@@ -9530,6 +9581,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Caller (fused dispatcher) is expected to gate via `should_use_mmq`;
+        // the assert below enforces that contract so a future caller can't
+        // silently route a non-winning batch through MMQ. Mirrors the MQ6
+        // sibling's `hfq6_mmq_route` assert added in 5ea9050.
+        debug_assert!(
+            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            "_mmq_set_gfx906 called at non-winning B={} (capture={}) — \
+             caller must gate via should_use_mmq first",
+            batch_size, self.capture_mode,
+        );
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -9599,7 +9660,9 @@ impl Gpu {
         debug_assert!(shared_mem as usize <= 32 * 1024,
             "gfx906 MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
+        // bytes = weight read + X read (Q8_1, ~1 byte/element + scale) + Y write (set, no read).
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k
             + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_mmq_set_gfx906", bytes);
         let result = self.launch_maybe_blob(
@@ -10873,8 +10936,8 @@ impl Gpu {
         self.bind_thread()?;
         let wmma_eligible = batch_size > 1
             && self.arch.starts_with("gfx11")
-            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
-            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+            && !fp16_disabled()
+            && !lm_head_wmma_disabled();
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -10917,8 +10980,8 @@ impl Gpu {
         // gfx11+: WMMA residual + zero-init.
         let wmma_eligible = batch_size > 1
             && self.arch.starts_with("gfx11")
-            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
-            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+            && !fp16_disabled()
+            && !lm_head_wmma_disabled();
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -10962,8 +11025,8 @@ impl Gpu {
         // through to the per-row GEMV path.
         let wmma_eligible = batch_size > 1
             && (has_wmma_f16(&self.arch) || has_wmma_f16_gfx12(&self.arch))
-            && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
-            && !std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0");
+            && !fp16_disabled()
+            && !lm_head_wmma_disabled();
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -11061,7 +11124,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
@@ -11242,7 +11305,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkvza_hfq6g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
@@ -11727,7 +11790,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq6g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -12167,7 +12230,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0") {
+        if batch_size > 1 && !fp16_disabled() {
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_gate_up_hfq6g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }

@@ -26,6 +26,47 @@
 // the optimum stride differs at small vs large mmq_x. PMC validation
 // is in docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md
 // §5.
+//
+// ═══ KERNEL INVARIANTS — caller MUST satisfy ═══
+//
+//   1. K must be a multiple of 256 (= group_size). Body assumes
+//      `groups_per_row = K / 256`; not asserted at runtime (caller's job).
+//
+//   2. M alignment depends on the kernel variant:
+//        `_x{N}`            (need_check=true)  → ANY M ≥ 1 is safe.
+//                                                OOB rows clamp to M-1
+//                                                weights in shared memory
+//                                                and accumulate spurious
+//                                                sums, but write_back skips
+//                                                them so observable Y is
+//                                                correct.
+//        `_full_add_x{N}`   (need_check=false, add=1) → CALLER MUST GUARANTEE
+//                                                       `M % 128 == 0`.
+//        `_full_set_x{N}`   (need_check=false, add=0) → CALLER MUST GUARANTEE
+//                                                       `M % 128 == 0`.
+//      The `_full_*` variants drop the `(row >= M ? skip)` check from
+//      writeback for ~5 % perf — they will write GARBAGE to OOB rows
+//      otherwise. The dispatcher enforces `is_full = m % 128 == 0 &&
+//      batch_size % mmq_x == 0` before naming a `_full_*` kernel; do not
+//      bypass that gate.
+//
+//   3. N (batch_size) alignment depends on the kernel variant:
+//        `_x{N}`        → ANY N ≥ 1 is safe (need_check=true skips OOB cols).
+//        `_full_*_x{N}` → CALLER MUST GUARANTEE `batch_size % mmq_x == 0`.
+//
+//   4. Body's row-clamp at lines `(row0 + i < M) ? (row0 + i) : (M - 1)`
+//      means non-`_full_*` variants over-fetch row M-1 weights into the
+//      LDS slots that correspond to OOB rows. This costs ~0 % perf (cache-
+//      hot reads) but breaks if M==0 (would index row -1 underflowing
+//      to 2^64-1). Caller must also guarantee M ≥ 1.
+//
+//   5. HFQ4-specific (vs HFQ6 sibling):
+//        - 136 B/group (= 8 B scale/zero header + 128 B nibbles), not 200.
+//        - Nibbles are SIGNED 4-bit; the accumulation uses `zp_eff =
+//          zp + 8 * scale` to fold the unsigned-bias correction into a
+//          single per-block term (avoids a per-lane subtraction in the
+//          inner loop). The `_full_*` writeback formula assumes
+//          `acc + zp_eff * sum_x` with no additional shift.
 
 #define MMQ_Y 128
 #define MMQ_NWARPS 4
