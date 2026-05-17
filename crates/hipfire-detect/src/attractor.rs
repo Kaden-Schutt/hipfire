@@ -141,10 +141,101 @@ impl Detector for AttractorLast128 {
     }
 }
 
-/// Compute max_freq + unique_ratio over `window`. Apply tiered thresholds:
-///   hard: `max_freq > 0.50` OR `unique_ratio < hard_unique`
-///   soft: `max_freq > 0.40` OR `unique_ratio < soft_unique`
-fn verdict_for_window(window: &[u32], hard_unique: f64, soft_unique: f64) -> Verdict {
+/// Long-state collapse onset detector.
+///
+/// `attractor_last_128` answers whether the tail is collapsed. For recurrent
+/// state drift we also need to know when the collapse first became visible:
+/// a tiny model may eventually loop even with FP32 state, but Q8 state drift
+/// tends to move the first low-diversity window much earlier.
+pub struct LongStateCollapse {
+    pre_eot: Vec<u32>,
+    saw_eot: bool,
+}
+
+impl LongStateCollapse {
+    pub fn new() -> Self {
+        Self {
+            pre_eot: Vec::new(),
+            saw_eot: false,
+        }
+    }
+}
+
+impl Default for LongStateCollapse {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Detector for LongStateCollapse {
+    fn name(&self) -> &'static str {
+        "long_state_collapse"
+    }
+
+    fn observe(&mut self, ev: &Event<'_>) -> Option<Verdict> {
+        if let Event::Committed { tok_id, .. } = ev {
+            if !self.saw_eot {
+                if EOT_IDS.contains(tok_id) {
+                    self.saw_eot = true;
+                } else {
+                    self.pre_eot.push(*tok_id);
+                }
+            }
+        }
+        None
+    }
+
+    fn finalize(&mut self) -> Verdict {
+        const WINDOW: usize = 128;
+        if self.pre_eot.len() < WINDOW {
+            return Verdict::Ok;
+        }
+
+        let mut first_bad: Option<(usize, WindowStats)> = None;
+        let mut min_unique: Option<(usize, WindowStats)> = None;
+        for start in 0..=self.pre_eot.len() - WINDOW {
+            let stats = window_stats(&self.pre_eot[start..start + WINDOW]);
+            if min_unique
+                .as_ref()
+                .map(|(_, s)| stats.unique_ratio < s.unique_ratio)
+                .unwrap_or(true)
+            {
+                min_unique = Some((start, stats));
+            }
+            if first_bad.is_none() && (stats.max_freq > 0.50 || stats.unique_ratio < 0.30) {
+                first_bad = Some((start, stats));
+            }
+        }
+
+        let Some((start, stats)) = first_bad else {
+            return Verdict::Ok;
+        };
+        let (min_start, min_stats) = min_unique.expect("window exists");
+        let detail = format!(
+            "first low-diversity 128-token window starts at tok {} (unique_ratio {:.2}, max_freq {:.2} tok {}); min_unique starts at tok {} (unique_ratio {:.2})",
+            start,
+            stats.unique_ratio,
+            stats.max_freq,
+            stats.max_tok,
+            min_start,
+            min_stats.unique_ratio
+        );
+        if start < 64 {
+            Verdict::fail(detail)
+        } else {
+            Verdict::warn(detail)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WindowStats {
+    unique_ratio: f64,
+    max_freq: f64,
+    max_tok: u32,
+}
+
+fn window_stats(window: &[u32]) -> WindowStats {
     let mut counts: HashMap<u32, usize> = HashMap::with_capacity(window.len());
     for t in window {
         *counts.entry(*t).or_insert(0) += 1;
@@ -155,27 +246,30 @@ fn verdict_for_window(window: &[u32], hard_unique: f64, soft_unique: f64) -> Ver
         .iter()
         .max_by_key(|(_, c)| **c)
         .map(|(t, c)| (*t, *c))
-        .expect("window non-empty by MIN_WINDOW guard");
-    let max_freq = max_count as f64 / total;
+        .expect("window non-empty");
+    WindowStats {
+        unique_ratio,
+        max_freq: max_count as f64 / total,
+        max_tok,
+    }
+}
 
-    if max_freq > 0.50 || unique_ratio < hard_unique {
+/// Compute max_freq + unique_ratio over `window`. Apply tiered thresholds:
+///   hard: `max_freq > 0.50` OR `unique_ratio < hard_unique`
+///   soft: `max_freq > 0.40` OR `unique_ratio < soft_unique`
+fn verdict_for_window(window: &[u32], hard_unique: f64, soft_unique: f64) -> Verdict {
+    let stats = window_stats(window);
+
+    if stats.max_freq > 0.50 || stats.unique_ratio < hard_unique {
         return Verdict::fail(format!(
             "max_freq {:.2} (tok {}), unique_ratio {:.2} over {} tokens (hard: >0.50 OR <{:.2})",
-            max_freq,
-            max_tok,
-            unique_ratio,
-            window.len(),
-            hard_unique
+            stats.max_freq, stats.max_tok, stats.unique_ratio, window.len(), hard_unique
         ));
     }
-    if max_freq > 0.40 || unique_ratio < soft_unique {
+    if stats.max_freq > 0.40 || stats.unique_ratio < soft_unique {
         return Verdict::warn(format!(
             "max_freq {:.2} (tok {}), unique_ratio {:.2} over {} tokens (soft: >0.40 OR <{:.2})",
-            max_freq,
-            max_tok,
-            unique_ratio,
-            window.len(),
-            soft_unique
+            stats.max_freq, stats.max_tok, stats.unique_ratio, window.len(), soft_unique
         ));
     }
     Verdict::Ok
