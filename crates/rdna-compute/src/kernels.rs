@@ -293,6 +293,19 @@ pub const GEMM_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../ker
 pub const GEMM_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wave64_dp4a.hip");
 pub const GEMM_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wave64_dp4a.hip");
 
+/// HFQ4 siblings of the HFQ6 Phase A.3 fused dp4a kernels (issue #276
+/// Gap 2 part 2 of 4). Wave64+dp4a batched fused GEMMs at gfx906 for
+/// MQ4 prefill at B>1. Close the dispatch fallthroughs where MQ4 today
+/// drops to `gemm_*_hfq4g256_fp16_wave64` for the multi-output paths.
+/// Ship `BATCH_TILE=16` from the start per HFQ6 Phase B.1.1 (commits
+/// 2bee6e6b / ff9e2105). Math identity: signed 4-bit nibble unpack +
+/// `zp_eff = zp + 8*sc` matching the HFQ4 lm-head dp4a sibling
+/// `gemm_hfq4g256_wave64_dp4a.hip` and the HFQ4 residual dp4a
+/// `gemm_hfq4g256_residual_wave64_dp4a.hip`.
+pub const GEMM_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_QKV_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wave64_dp4a.hip");
+
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][96B data] = 104 bytes per 256 weights (0.41 B/w).
