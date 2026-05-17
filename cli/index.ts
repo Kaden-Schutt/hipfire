@@ -5187,10 +5187,10 @@ Examples:
         if (!corpusPath) { console.error("--corpus requires a value"); process.exit(1); }
       } else if (a === "--max-tokens") {
         maxTokens = parseInt(rest[++i]);
-        if (isNaN(maxTokens)) { console.error("--max-tokens requires a number"); process.exit(1); }
+        if (isNaN(maxTokens) || maxTokens < 1 || maxTokens > 1_000_000) { console.error("--max-tokens must be between 1 and 1,000,000"); process.exit(1); }
       } else if (a === "--chunk-len") {
         chunkLen = parseInt(rest[++i]);
-        if (isNaN(chunkLen)) { console.error("--chunk-len requires a number"); process.exit(1); }
+        if (isNaN(chunkLen) || chunkLen < 1 || chunkLen > 16384) { console.error("--chunk-len must be between 1 and 16,384"); process.exit(1); }
       } else if (a === "--gpu-calib") {
         gpuCalib = true;
       } else if (a === "--cpu-calib") {
