@@ -2363,11 +2363,11 @@ function findQuantizeBinary(): string | null {
 
 function findTriAttnValidateBinary(): string | null {
   const exe = process.platform === "win32" ? ".exe" : "";
-  const candidates = [
-    resolve(__dirname, `../target/release/examples/triattn_validate${exe}`),
-    join(HIPFIRE_DIR, "bin", "examples", `triattn_validate${exe}`),
-  ];
-  return candidates.find(p => existsSync(p)) || null;
+  // Dev: workspace root/target/release/examples/
+  const devCandidates = [resolve(__dirname, `../target/release/examples/triattn_validate${exe}`)];
+  // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
+  const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
+  return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
 }
 
 interface QuantizeOpts {
