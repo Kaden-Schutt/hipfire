@@ -1,0 +1,3 @@
+If a train leaves station A at 9am traveling 60 mph, and another leaves
+station B at 10am traveling 80 mph toward A, and the stations are 280
+miles apart, at what time do they meet? Show your work briefly.
