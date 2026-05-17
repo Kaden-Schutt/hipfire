@@ -5,6 +5,7 @@
 //   hipfire run qwen3.5:9b [prompt]  → generate (auto-pulls if needed)
 //   hipfire serve                     → start daemon + HTTP server
 //   hipfire list                      → show local + available models
+//   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
@@ -5592,6 +5593,7 @@ Examples:
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):
