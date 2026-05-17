@@ -2364,8 +2364,8 @@ function findQuantizeBinary(): string | null {
 function findTriAttnValidateBinary(): string | null {
   const exe = process.platform === "win32" ? ".exe" : "";
   const candidates = [
-    resolve(__dirname, `../target/release/examples/triatttn_validate${exe}`),
-    join(HIPFIRE_DIR, "bin", "examples", `triatttn_validate${exe}`),
+    resolve(__dirname, `../target/release/examples/triattn_validate${exe}`),
+    join(HIPFIRE_DIR, "bin", "examples", `triattn_validate${exe}`),
   ];
   return candidates.find(p => existsSync(p)) || null;
 }
@@ -4653,7 +4653,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triatttn_validate", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4676,7 +4676,7 @@ switch (cmd) {
     }
     // Recopy binaries
     // Example binaries live under target/release/examples/
-    for (const bin of ["daemon", "infer", "run", "triatttn_validate"]) {
+    for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -5225,7 +5225,7 @@ Examples:
       if (!gpuCalib) args.push("--cpu-calib");
       const proc = Bun.spawnSync([bin, ...args], { stdio: ["inherit", "inherit", "inherit"] });
       if ((proc.exitCode ?? 1) !== 0) {
-        console.error(`triatttn_validate failed (exit ${proc.exitCode})`);
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
         process.exit(1);
       }
     } else {
@@ -5237,8 +5237,8 @@ Examples:
       const srcExists = existsSync(devSrc) || existsSync(hipfireSrc);
 
       if (!srcExists) {
-        console.error("triatttn_validate binary not found and source not available.");
-        console.error("  Build: cargo build --release --features deltanet -p hipfire-runtime --example triatttn_validate");
+        console.error("triattn_validate binary not found and source not available.");
+        console.error("  Build: cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate");
         console.error("  Or update: hipfire update (which builds the example during rebuild)");
         process.exit(1);
       }
@@ -5276,26 +5276,26 @@ Examples:
       }
 
       // Build the example first.
-      console.error("Building triatttn_validate...");
+      console.error("Building triattn_validate...");
       const build = Bun.spawnSync(
-        ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triatttn_validate"],
+        ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triattn_validate"],
         { cwd: srcPath, stdio: ["inherit", "inherit", "inherit"] },
       );
       if (build.exitCode !== 0) {
-        console.error("Failed to build triatttn_validate. Check for ROCm/compilation errors above.");
+        console.error("Failed to build triattn_validate. Check for ROCm/compilation errors above.");
         process.exit(1);
       }
 
       // Run the built example.
       const exe = process.platform === "win32" ? ".exe" : "";
-      const binPath = join(srcPath, `../../target/release/examples/triatttn_validate${exe}`); // relative to src root
-      console.error("  Running triatttn_validate...");
+      const binPath = join(srcPath, `../../target/release/examples/triattn_validate${exe}`); // relative to src root
+      console.error("  Running triattn_validate...");
       const proc = Bun.spawnSync(
         [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)],
         { stdio: ["inherit", "inherit", "inherit"] },
       );
       if ((proc.exitCode ?? 1) !== 0) {
-        console.error(`triatttn_validate failed (exit ${proc.exitCode})`);
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
         process.exit(1);
       }
     }
