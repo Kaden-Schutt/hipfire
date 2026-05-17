@@ -285,6 +285,31 @@ pub struct MtpSpecState {
     /// `log(p_min)` for the chain-truncation early-exit.
     pub mtp_topk_logp: GpuTensor,
 
+    // ─── GPU sampling scratches (only used when sampling.temp > 0) ──────
+    /// Result buffer for `gpu.sample_top_p`: shape `[2]` u32-as-F32. Slot 0
+    /// = sampled token id, slot 1 = updated rng state.
+    pub mtp_sample_result: GpuTensor,
+    /// Dummy repeat-penalty buffer for `gpu.sample_top_p` (we pass
+    /// `repeat_window=0`, so the kernel skips this branch entirely;
+    /// only allocated so the dispatch wrapper has a valid pointer).
+    pub mtp_sample_repeat_buf: GpuTensor,
+    /// Single-element index buf for the per-step p_draft gather. Shape `[1]`
+    /// i32-as-F32. H2D'd with the sampled token id, fed to
+    /// `softmax_prob_gather_batched_f32` with n_rows=1.
+    pub mtp_gather_idx_draft: GpuTensor,
+    /// Output buf for the per-step p_draft gather. Shape `[1]` F32.
+    pub mtp_gather_prob_draft: GpuTensor,
+    /// Batched index buf for the K-candidate p_target gather. Shape `[max_n]`
+    /// i32-as-F32. H2D'd with `candidates[0..drafts_generated]`.
+    pub mtp_gather_idx_verify: GpuTensor,
+    /// Batched output buf for the K-candidate p_target gather. Shape `[max_n]`
+    /// F32. D2H'd after `softmax_prob_gather_batched_f32(n_rows=drafts_generated)`.
+    pub mtp_gather_prob_verify: GpuTensor,
+    /// On-device rng state for `gpu.sample_top_p`. Threaded through both
+    /// draft and bonus sampling calls within a cycle and across cycles.
+    /// Reseeded by [`Self::set_sampling`].
+    pub gpu_rng_state: u32,
+
     /// Maximum number of MTP candidates per cycle (chain depth).
     pub max_n: usize,
 
@@ -372,6 +397,15 @@ impl MtpSpecState {
         let mtp_topk_idx = gpu.alloc_tensor(&[2], DType::F32)?;
         let mtp_topk_logp = gpu.alloc_tensor(&[2], DType::F32)?;
 
+        // GPU sampling scratches (always allocated; only used when temp > 0).
+        // All are tiny so the unconditional alloc is fine.
+        let mtp_sample_result = gpu.alloc_tensor(&[2], DType::F32)?;
+        let mtp_sample_repeat_buf = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_idx_draft = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_prob_draft = gpu.alloc_tensor(&[1], DType::F32)?;
+        let mtp_gather_idx_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+        let mtp_gather_prob_verify = gpu.alloc_tensor(&[max_n], DType::F32)?;
+
         Ok(Self {
             prev_hidden,
             verify_hidden,
@@ -390,6 +424,13 @@ impl MtpSpecState {
             mtp_lm_logits_compressed: None,
             mtp_topk_idx,
             mtp_topk_logp,
+            mtp_sample_result,
+            mtp_sample_repeat_buf,
+            mtp_gather_idx_draft,
+            mtp_gather_prob_draft,
+            mtp_gather_idx_verify,
+            mtp_gather_prob_verify,
+            gpu_rng_state: 42,
             max_n,
             p_min: 0.0,
             sampling: MtpSamplingConfig::default(),
@@ -400,12 +441,17 @@ impl MtpSpecState {
     /// Configure sampling (temp/top_p/top_k/min_p) and reseed the per-state RNG.
     /// `cfg.temp == 0.0` keeps the legacy greedy path. `cfg.temp > 0` enables
     /// residual-acceptance sampling per the Unsloth/llama.cpp MTP recipe.
+    /// Reseeds BOTH the host RNG (used for the residual accept rule) and the
+    /// on-device RNG (used by `gpu.sample_top_p`).
     pub fn set_sampling(&mut self, cfg: MtpSamplingConfig, seed: u64) {
         assert!(cfg.temp >= 0.0, "set_sampling: temp must be >= 0.0, got {}", cfg.temp);
         assert!(cfg.top_p > 0.0 && cfg.top_p <= 1.0, "set_sampling: top_p must be in (0,1], got {}", cfg.top_p);
         assert!(cfg.min_p >= 0.0 && cfg.min_p <= 1.0, "set_sampling: min_p must be in [0,1], got {}", cfg.min_p);
         self.sampling = cfg;
         self.rng = MtpRng::new(seed);
+        // GPU rng uses u32; mix the lower + upper halves so different seeds
+        // produce different on-device streams.
+        self.gpu_rng_state = ((seed >> 32) as u32) ^ (seed as u32) | 1;
     }
 
     /// Set the draft-confidence threshold for compressed-serial K-chain
@@ -1406,38 +1452,64 @@ pub fn spec_step_mtp_compressed_serial(
 
         let draft_idx: usize;
         if use_sampling {
-            // D2H full draft logits row (32K for compressed, 248K for full-vocab).
-            // 128 KB or 1 MB per step; ~30-200 μs at PCIe 4 x16.
-            let logits_bytes = argmax_vocab * 4;
-            let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(
-                    draft_logits_host.as_mut_ptr() as *mut u8, logits_bytes,
-                )
-            };
-            gpu.hip.memcpy_dtoh(bytes, &logits_for_argmax.buf)?;
-            // Sample with temp/top_k/top_p/min_p on host.
-            let (sampled_idx, _p_truncated) = sample_from_logits(
-                &draft_logits_host[..argmax_vocab],
-                &sampling,
-                &mut state.rng,
-            );
-            draft_idx = sampled_idx as usize;
+            // GPU sample_top_p: kernel does the whole top_k(=20) + top_p +
+            // multinomial sample on-device. Returns 8 B (token id + new rng
+            // state). Eliminates the full 1 MB draft logits D2H + host
+            // softmax sample (~600 μs each step → ~3 ms/cycle saved).
+            //
+            // sample_top_p modifies logits in-place ONLY if repeat_penalty > 1
+            // and repeat_window > 0; we pass 1.0/0 so logits are untouched
+            // and the subsequent prob-gather sees the same values.
+            let (token_u32, new_rng) = gpu.sample_top_p(
+                logits_for_argmax,
+                &state.mtp_sample_result,
+                &state.mtp_sample_repeat_buf,
+                argmax_vocab,
+                sampling.temp,
+                sampling.top_p,
+                state.gpu_rng_state,
+                /* repeat_window */ 0,
+                /* repeat_penalty */ 1.0,
+            )?;
+            state.gpu_rng_state = new_rng;
+            draft_idx = token_u32 as usize;
             assert!(draft_idx < argmax_vocab,
                 "draft sample {draft_idx} out of argmax_vocab {argmax_vocab}");
-            // For residual acceptance we use the UN-truncated temp-scaled
-            // softmax prob of the sampled token (matches p_target's
-            // un-truncated computation — keeps the ratio math clean).
-            let p_d_untruncated = softmax_prob_at_temp(
-                &draft_logits_host[..argmax_vocab],
-                draft_idx,
+
+            // GPU p_draft gather: H2D the sampled token id, run the gather
+            // kernel with n_rows=1, D2H 4 B prob. Replaces the host
+            // softmax_prob_at_temp call (~600 μs).
+            let token_i32: i32 = token_u32 as i32;
+            let idx_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(&token_i32 as *const i32 as *const u8, 4)
+            };
+            gpu.hip.memcpy_htod(&state.mtp_gather_idx_draft.buf, idx_bytes)?;
+            gpu.softmax_prob_gather_batched_f32(
+                logits_for_argmax,
+                &state.mtp_gather_idx_draft,
+                &state.mtp_gather_prob_draft,
+                argmax_vocab,
                 sampling.temp,
-            );
-            draft_probs.push(p_d_untruncated);
+                /* n_rows */ 1,
+            )?;
+            let mut p_draft_host: [f32; 1] = [0.0];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(p_draft_host.as_mut_ptr() as *mut u8, 4)
+                };
+                gpu.hip.memcpy_dtoh(bytes, &state.mtp_gather_prob_draft.buf)?;
+            }
+            draft_probs.push(p_draft_host[0]);
+
             let token_id = match vocab_map_opt {
                 Some(vm) => vm[draft_idx],
                 None => draft_idx as u32,
             };
             candidates.push(token_id);
+            // draft_logits_host is unused on the GPU sampling path; left
+            // allocated for symmetry with the (now-removed) host-sample
+            // fallback. Compiler will elide.
+            let _ = &draft_logits_host;
         } else if use_p_min {
             // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
             gpu.topk_logsumexp_batched_f32(
@@ -1587,44 +1659,65 @@ pub fn spec_step_mtp_compressed_serial(
     let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
 
     if use_sampling {
-        // ── Residual-acceptance sampling path ────────────────────────────
+        // ── Residual-acceptance sampling path (GPU-side gather + sample) ──
         //
         // For each draft candidate c_k, accept with probability
-        // min(1, p_target(c_k) / p_draft(c_k)). Both probs are computed
-        // as un-truncated temp-scaled softmax over the respective model's
-        // logits row, keeping the residual ratio math clean. On rejection
-        // or full accept, the bonus token is SAMPLED (with the same
-        // temp/top_k/top_p/min_p truncation as draft) from the trunk's
-        // distribution at the corresponding verify position.
+        // min(1, p_target(c_k) / p_draft(c_k)). Both probs are un-truncated
+        // temp-scaled softmax probs — p_draft was gathered per-step in the
+        // K-chain above (state.mtp_gather_prob_draft); p_target is gathered
+        // here in one batched call (state.mtp_gather_prob_verify).
         //
-        // Approximations vs. the strict speculative-sampling formulation
-        // (Chen et al. / Leviathan et al.):
+        // On rejection (or full accept), the bonus token is SAMPLED via
+        // gpu.sample_top_p on the trunk's verify_logits row at slot
+        // accept_count, using the same temp/top_p (top_k=20 hardcoded in
+        // the kernel — matches Unsloth default).
+        //
+        // GPU-side path saves vs prior host-side draft:
+        //   - 6 MB D2H of full verify_logits → 4·K B D2H of probs (~24 B)
+        //   - 5 × ~600 μs host softmax_prob_at_temp → one batched kernel
+        //   - 1 host sample_from_logits for bonus → one sample_top_p kernel
+        // Net: ~4 ms saved per cycle.
+        //
+        // Approximations vs. strict speculative-sampling (Chen et al.):
         //   - Uses un-truncated p_target/p_draft in the accept ratio even
-        //     though draft was actually sampled from a truncated nucleus.
-        //     Practical impact: small bias on acceptance probabilities
-        //     when top_k/top_p truncation is aggressive; the resulting
-        //     token distribution is close to but not exactly trunk's.
-        //   - Bonus on rejection is `sample_from_logits(trunk_row)` not
-        //     `sample_from_residual((p_target - p_draft)+)`. Same caveat —
-        //     close to trunk's but not exact.
-        // These approximations match the practical posture of llama.cpp /
-        // vLLM speculative-decoding implementations and are appropriate
-        // for benchmark / quality-tolerant generation use cases.
-        let total_verify_floats = n_verify * vocab;
-        let mut verify_logits_host: Vec<f32> = vec![0.0; total_verify_floats];
+        //     though draft sample was from a truncated nucleus
+        //   - Bonus is sample_top_p(trunk) not sample-from-residual
+        // Same approximations as before — practical posture matching
+        // llama.cpp / vLLM spec-decode implementations.
+
+        // Batched p_target gather: H2D the K candidate token ids as i32,
+        // dispatch the gather kernel, D2H K probs. Replaces the 6 MB D2H
+        // of full verify_logits + K host softmax_prob_at_temp calls.
+        let cand_indices: Vec<i32> = candidates[..drafts_generated]
+            .iter().map(|&t| t as i32).collect();
+        let idx_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                cand_indices.as_ptr() as *const u8,
+                drafts_generated * 4,
+            )
+        };
+        gpu.hip.memcpy_htod(&state.mtp_gather_idx_verify.buf, idx_bytes)?;
+        gpu.softmax_prob_gather_batched_f32(
+            &logits_view,
+            &state.mtp_gather_idx_verify,
+            &state.mtp_gather_prob_verify,
+            vocab,
+            sampling.temp,
+            drafts_generated,
+        )?;
+        let mut p_targets: Vec<f32> = vec![0.0; drafts_generated];
         {
             let bytes: &mut [u8] = unsafe {
                 std::slice::from_raw_parts_mut(
-                    verify_logits_host.as_mut_ptr() as *mut u8,
-                    total_verify_floats * 4,
+                    p_targets.as_mut_ptr() as *mut u8,
+                    drafts_generated * 4,
                 )
             };
-            gpu.hip.memcpy_dtoh(bytes, &logits_view.buf)?;
+            gpu.hip.memcpy_dtoh(bytes, &state.mtp_gather_prob_verify.buf)?;
         }
 
         for k in 0..drafts_generated {
-            let row = &verify_logits_host[k * vocab..(k + 1) * vocab];
-            let p_t = softmax_prob_at_temp(row, candidates[k] as usize, sampling.temp);
+            let p_t = p_targets[k];
             let p_d = draft_probs[k].max(1e-30);
             let accept_ratio = (p_t / p_d).min(1.0);
             let r = state.rng.next_uniform_f32();
@@ -1640,14 +1733,23 @@ pub fn spec_step_mtp_compressed_serial(
             }
         }
         if !hit_eos {
-            // Sample bonus from trunk's distribution at position accept_count.
-            // accept_count is in [0, drafts_generated]; the bonus position is
-            // accept_count (= the first rejected slot, or drafts_generated on
-            // full accept).
-            let bonus_row_start = accept_count * vocab;
-            let bonus_row = &verify_logits_host[bonus_row_start..bonus_row_start + vocab];
-            let (bonus_idx, _) = sample_from_logits(bonus_row, &sampling, &mut state.rng);
-            let bonus = bonus_idx;
+            // Sample bonus on-device from trunk's verify_logits at slot
+            // accept_count. sub-offset gives a [vocab]-shape view that
+            // sample_top_p treats as a single row.
+            let bonus_row_view = logits_view.sub_offset(accept_count * vocab, vocab);
+            let (bonus_token, new_rng) = gpu.sample_top_p(
+                &bonus_row_view,
+                &state.mtp_sample_result,
+                &state.mtp_sample_repeat_buf,
+                vocab,
+                sampling.temp,
+                sampling.top_p,
+                state.gpu_rng_state,
+                /* repeat_window */ 0,
+                /* repeat_penalty */ 1.0,
+            )?;
+            state.gpu_rng_state = new_rng;
+            let bonus = bonus_token;
             committed.push(bonus);
             if bonus == eos_token_id {
                 hit_eos = true;

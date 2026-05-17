@@ -22190,6 +22190,64 @@ impl Gpu {
         result
     }
 
+    /// Per-row temperature-scaled softmax probability gather. For each row
+    /// `r` in `[0, n_rows)`, returns `probs_out[r] = softmax(logits[r] / temp)[indices[r]]`
+    /// — i.e., the softmax probability of the specified token id in that
+    /// row's temperature-scaled distribution.
+    ///
+    /// Used by MTP residual-acceptance sampling spec-decode:
+    ///   - n_rows = 1: gather `p_draft(c_k)` after each draft sample
+    ///   - n_rows = K: batched gather of `p_target(c_k)` over K verify
+    ///     positions, avoiding the 6 MB D2H of full verify logits
+    ///
+    /// Launch: `n_rows` blocks × 256 threads. Numerically stable via
+    /// max-subtraction inside the kernel. `temp` must be > 0.
+    ///
+    /// Output D2H: `n_rows × 4` bytes (typically ≤ 24 B for K ≤ 6).
+    pub fn softmax_prob_gather_batched_f32(
+        &mut self,
+        logits: &GpuTensor,   // [n_rows × vocab] f32
+        indices: &GpuTensor,  // [n_rows] i32 (we use F32 storage; caller reinterprets)
+        probs_out: &GpuTensor,// [n_rows] f32
+        vocab: usize,
+        temperature: f32,
+        n_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(temperature > 0.0, "softmax_prob_gather_batched: temperature must be > 0");
+        assert!(n_rows >= 1, "softmax_prob_gather_batched: n_rows must be >= 1");
+        self.ensure_kernel(
+            "softmax_prob_gather_batched",
+            kernels::SOFTMAX_PROB_GATHER_BATCHED_SRC,
+            "softmax_prob_gather_batched",
+        )?;
+        let func = &self.functions["softmax_prob_gather_batched"];
+        let mut lp = logits.buf.as_ptr();
+        let mut ip = indices.buf.as_ptr();
+        let mut pp = probs_out.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut tp = temperature;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+        ];
+        let nth: u32 = 256;
+        let lds: u32 = nth * 4 + 4;  // scratch[256] + s_target slot
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_rows as u32, 1, 1],
+                [nth, 1, 1],
+                lds,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are element-wise
     /// scalar transforms applied to independent buffers of size n_v_heads in the
     /// DeltaNet preamble. Saves one launch per linear-attention layer.

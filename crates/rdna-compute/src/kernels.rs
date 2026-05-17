@@ -1724,6 +1724,14 @@ pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
 
+/// Per-row temperature-scaled softmax probability gather. For each row r,
+/// returns the softmax prob of `indices[r]` under temp-scaled row logits.
+/// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and
+/// p_target(c_k) without D2H-ing the full vocab logit row. Saves ~6 MB
+/// D2H + ~4 ms host softmax per spec-decode cycle.
+pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/softmax_prob_gather_batched.hip");
+
 
 /// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
 /// Block layout: f16 scale (2B) + f16 min (2B) + uint8 quants[32] (32B) = 36 bytes per 64 elements.
