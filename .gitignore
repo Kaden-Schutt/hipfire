@@ -2,6 +2,7 @@
 /target
 *.o
 *.so
+*.triattn.bin
 *.dll
 
 # Editor
