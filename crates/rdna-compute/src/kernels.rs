@@ -284,6 +284,15 @@ pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../ke
 /// per-layer wo + w_down at B>1.
 pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
 
+/// HFQ4 sibling of `GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC` (issue #276,
+/// Gap 2 from the HFQ4/HFQ6 dp4a parity audit). Same structural pattern
+/// as the HFQ4 lm-head `gemm_hfq4g256_wave64_dp4a` with `+=` residual
+/// write semantic. Closes the dispatch gap where MQ4 at gfx906 B>1 below
+/// the MMQ cutover (B ∈ [2, 7]) falls to FP16 wave64; the dp4a path wins
+/// on per-call ALU and reuses the Q8_1 scratch. Ships BATCH_TILE=16 from
+/// the start per the HFQ6 Phase B.1.1 measurement (commit ff9e2105).
+pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64_dp4a.hip");
+
 /// Phase A.3 (plan v3.2.3 §5.1 item 3): wave64+dp4a batched fused
 /// GEMMs for HFQ6/MQ6 prefill. Sibling of A.2 with multi-output row
 /// routing (qkvza 4-way, qkv 3-way, gate_up 2-way). Overwrite output

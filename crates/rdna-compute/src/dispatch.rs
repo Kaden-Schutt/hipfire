@@ -9028,6 +9028,23 @@ impl Gpu {
                 }
             }
 
+            // gfx906 dp4a batched residual (issue #276 Gap 2, HFQ4 sibling of
+            // HFQ6 Phase A.2). Fires for B>1 below the MMQ cutover (typically
+            // B ∈ [2, 7] on gfx906 by `should_use_mmq`'s gfx906 default of 8)
+            // and when MMQ screening rejects the weight (`use_mmq=false` above
+            // falls through here). Wins on per-call ALU (4× vs FP wave64's 2×)
+            // and reuses the existing Q8_1 scratch.
+            //
+            // The `!self.capture_mode` guard: `ensure_q8_1_mmq_x` (and the
+            // downstream `ensure_kernel` for this kernel) can fire `hipMalloc`
+            // / JIT-compile on first use, both unsafe inside an active capture.
+            // The internal Q8_1 quantize launch itself goes through
+            // `launch_maybe_blob` and IS recorded into the captured graph;
+            // the guard protects only first-use-only side effects.
+            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+                return self.gemm_hfq4g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
+            }
+
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             if is_gcn5_wave64(&self.arch) {
                 return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
@@ -10271,6 +10288,81 @@ impl Gpu {
             [64, 1, 1],
             0,
             &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(xq); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Batched HFQ4-G256 residual GEMM with fused dp4a inner loop on gfx906.
+    /// HFQ4 sibling of `gemm_hfq6g256_residual_wave64_dp4a` (HFQ6 Phase A.2,
+    /// commit 1b9f3747 → merged via #187). Closes the dispatch gap where MQ4
+    /// at gfx906 B>1 below the MMQ cutover (B ∈ [2, 7] per `should_use_mmq`'s
+    /// gfx906 default) falls to `gemm_hfq4g256_residual_fp16_wave64`; the
+    /// dp4a path wins on per-call ALU (4× vs FP wave64's 2×) and reuses the
+    /// existing Q8_1 activation scratch (shared with HFQ4 MMQ + the GEMV-
+    /// shape fused dp4a kernels).
+    ///
+    /// Issue #276 Gap 2. Ships with `BATCH_TILE = 16` from the start per the
+    /// HFQ6 Phase B.1.1 measurement (commit ff9e2105: BT=8→16 halves A-reload
+    /// trips per row, +7-17% per-call on the structurally identical HFQ6
+    /// sibling). MUST stay in sync with the kernel's `#define BATCH_TILE 16`
+    /// at `kernels/src/gemm_hfq4g256_residual_wave64_dp4a.hip:38`.
+    pub fn gemm_hfq4g256_residual_wave64_dp4a(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_wave64_dp4a",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC,
+            "gemm_hfq4g256_residual_wave64_dp4a",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let bs_val = batch_size as i32;
+        let mut xq = xq_ptr;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &bs_val as *const _ as *mut c_void,
+        ];
+
+        // BATCH_TILE MUST match the kernel's `#define BATCH_TILE 16`.
+        const BATCH_TILE: usize = 16;
+        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let grid_x = ((m as u32) + 1) / 2;
+
+        // bytes = weight read (HFQ4: 136 B/group) + X read (Q8_1 scratch:
+        // ~1 byte/element + scale) + Y read+write (residual: 2× batch*m*4).
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_hfq4g256_residual_wave64_dp4a", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_residual_wave64_dp4a",
+            [grid_x, batch_tiles as u32, 1],
+            [64, 1, 1], 0, &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr); b.push_ptr(xq); b.push_ptr(y_ptr);
