@@ -346,6 +346,18 @@ fn main() {
     let mut drafts_generated_total = 0usize;  // sum of drafts_generated across cycles
     let mut replay_skipped_cycles = 0usize;  // full-accept cycles that skipped replay
 
+    // HIPFIRE_PROFILE=1 + HIPFIRE_PROFILE_CYCLES=N: per-kernel profiling
+    // armed after cycle 1 (post-JIT warmup), drained after N more cycles.
+    // Prints kernel time breakdown so we can see where the 72 ms/cycle wall
+    // actually goes.
+    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    let profile_cycles_target: usize = std::env::var("HIPFIRE_PROFILE_CYCLES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let mut profile_armed = false;
+    let mut profile_done = false;
+
     let t_decode = Instant::now();
     let mut hit_eos = tokenizer.is_terminator(seed_token);
     while !hit_eos && emitted.len() < max_tokens {
@@ -376,6 +388,55 @@ fn main() {
         drafts_generated_total += result.drafts_generated;
         if result.chain_truncated { truncated_cycles += 1; }
         if result.replay_skipped { replay_skipped_cycles += 1; }
+
+        // Arm per-kernel profiler after cycle 1 (post-JIT warmup), drain after
+        // profile_cycles_target additional cycles. Print kernel breakdown.
+        if do_profile && cycles == 1 && !profile_armed {
+            rdna_compute::profile::start();
+            profile_armed = true;
+        }
+        if do_profile && profile_armed && !profile_done
+            && cycles >= 1 + profile_cycles_target
+        {
+            profile_done = true;
+            if let Some(entries) = rdna_compute::profile::stop() {
+                use std::collections::HashMap;
+                let measured = cycles - 1;
+                let mut by_kernel: HashMap<&str, (f64, usize, usize)> = HashMap::new();
+                for e in &entries {
+                    let ent = by_kernel.entry(e.kernel).or_insert((0.0, 0, 0));
+                    ent.0 += e.time_us;
+                    ent.1 += 1;
+                    ent.2 += e.bytes;
+                }
+                let mut kerns: Vec<_> = by_kernel.into_iter().collect();
+                kerns.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+                let total_us: f64 = kerns.iter().map(|(_, (t, _, _))| t).sum();
+                eprintln!(
+                    "\n=== PROFILE: {} kernel calls over {} cycles, {:.1}ms total kernel time ===",
+                    entries.len(), measured, total_us / 1000.0,
+                );
+                eprintln!(
+                    "  per-cycle kernel total: {:.2} ms",
+                    total_us / 1000.0 / measured as f64,
+                );
+                eprintln!(
+                    "  {:50} {:>6} {:>10} {:>10} {:>7} {:>10}",
+                    "kernel", "calls", "total_ms", "us/call", "%", "MB",
+                );
+                for (kern, (us, n, bytes)) in &kerns {
+                    if *us / total_us < 0.005 { continue; }
+                    eprintln!(
+                        "  {kern:50} {n:>6} {:>10.2} {:>10.0} {:>6.1}% {:>10.1}",
+                        us / 1000.0,
+                        us / *n as f64,
+                        us / total_us * 100.0,
+                        *bytes as f64 / 1.0e6,
+                    );
+                }
+                eprintln!("=== /PROFILE ===\n");
+            }
+        }
         if !result.hit_eos || (result.committed.last().copied() != Some(eos_token)
                                && result.accept_count < max_n) {
             // bonus committed unless we EOS-broke inside the chain. Counts
