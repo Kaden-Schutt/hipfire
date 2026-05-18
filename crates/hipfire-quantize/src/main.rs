@@ -57,6 +57,13 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 static AWQ_FORMULA: OnceLock<bool> = OnceLock::new();  // true = autoawq formula, false/unset = paper
+// AWQ scope. Default (None or true) = F1-only (input-side projections only — q/k/v,
+// gate/up, in_proj_*, router). F2 (false) extends to output-side (o_proj/down_proj/
+// out_proj) but empirically regresses KLD when stacked with AWQ-aware GPTQ:
+// v3 (F1) = 0.1257 vs F2 = 0.1386 on 9B Qwen3.5 c512 q8 prefill. F1 is the v3 winner
+// recipe and the production default. Opt into F2 via --awq-scope f2 or
+// HIPFIRE_AWQ_F1_ONLY=0 env-var override.
+static AWQ_SCOPE_F1: OnceLock<bool> = OnceLock::new();
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -1873,7 +1880,9 @@ fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
 ///
 /// `kmap_mode`: 0 = full (all candidates promoted), 1 = alternating
 /// (experts + ffn_down every 3rd middle layer, edge layers always),
-/// 2 = typed (ffn_down + attn_v everywhere).
+/// 2 = typed (ffn_down + attn_v everywhere, plus edge blanket),
+/// 3 = typed-lite (ffn_down + attn_v only),
+/// 4 = down-only (ffn_down only).
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
@@ -1914,6 +1923,27 @@ fn kmap_resolve_mode(name: &str, n_layers: usize, is_moe: bool, kmap_mode: u8) -
             }
         }
         return QuantLevel::Promote6;
+    }
+
+    // Mode 4 (down-only): promote ffn_down in all layers, with no edge blanket.
+    if kmap_mode == 4 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        if is_down {
+            return QuantLevel::Promote6;
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 3 (typed-lite): promote ffn_down and attn_v in all layers, with no
+    // edge blanket. This isolates the typed promotion from the extra edge
+    // tensors that can cost decode throughput.
+    if kmap_mode == 3 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        return QuantLevel::Base;
     }
 
     // Mode 2 (typed): promote ffn_down and attn_v in all layers.
@@ -2629,14 +2659,21 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
 /// in a future arch fails closed (no AWQ) until someone confirms its
 /// runtime path is AWQ-aware.
 fn awq_eligible(name: &str) -> bool {
-    // F1-vs-F2 A/B gate. When `HIPFIRE_AWQ_F1_ONLY=1` is set, the F2
-    // additions below (o_proj / wo / out_proj / down_proj / w_down)
-    // are excluded — produces an F1-equivalent quant for comparison
-    // bench against the same binary's F2 quant. Default (env unset):
-    // the full F2 whitelist applies.
-    let f1_only = std::env::var("HIPFIRE_AWQ_F1_ONLY")
-        .ok()
-        .as_deref() == Some("1");
+    // F1-vs-F2 scope gate. Default is F1-only (production v3 recipe):
+    // PR #273's F2 extension to output-side projections (o_proj/down_proj/
+    // out_proj/w_down) empirically regresses KLD when stacked with
+    // AWQ-aware GPTQ (v3 F1=0.1257 vs F2=0.1386 on 9B Qwen3.5 c512 q8).
+    //
+    // Priority order:
+    //   1. HIPFIRE_AWQ_F1_ONLY=0 env-var explicitly enables F2 (override)
+    //   2. HIPFIRE_AWQ_F1_ONLY=1 env-var forces F1 (existing compat)
+    //   3. --awq-scope f1|f2 CLI sets AWQ_SCOPE_F1 (default: F1)
+    //   4. Unset: default F1
+    let f1_only = match std::env::var("HIPFIRE_AWQ_F1_ONLY").ok().as_deref() {
+        Some("1") => true,
+        Some("0") => false,
+        _ => AWQ_SCOPE_F1.get().copied().unwrap_or(true),  // default: F1
+    };
     let f1_match =
     // Full-attention input projections (HF naming + fused variants).
     name.ends_with("q_proj.weight")
@@ -2992,7 +3029,14 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
             map.insert(out_name, level);
         }
         if !map.is_empty() {
-            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            let mode_label = match kmap_mode {
+                0 => "full",
+                1 => "alternating",
+                2 => "typed",
+                3 => "typed-lite",
+                4 => "down-only",
+                _ => "?",
+            };
             eprintln!("K-map plan ({} base, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
                 if is_moe { ", MoE" } else { "" });
@@ -3248,8 +3292,11 @@ fn main() {
     // Conv1d (DeltaNet) defaults to Q8 regardless of --format — the tensor is
     // small (~32K elem) but runs every token and lossy 4-bit FWHT formats
     // measurably hurt the gated-delta path. Override with --no-q8-conv1d to
-    // keep conv1d at the same quant as the rest of the model.
-    let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
+    // keep conv1d at the same quant as the rest of the model, or use
+    // --f16-conv1d / --mq6-conv1d for quality ablations.
+    let f16_conv1d = args.iter().any(|a| a == "--f16-conv1d");
+    let mq6_conv1d = args.iter().any(|a| a == "--mq6-conv1d");
+    let q8_conv1d_default = !f16_conv1d && !mq6_conv1d && !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
@@ -3317,8 +3364,18 @@ fn main() {
             std::process::exit(1);
         }
         AWQ_FORMULA.set(awq_formula == "autoawq").ok();
+
+        let awq_scope = args.iter().position(|a| a == "--awq-scope")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+            .unwrap_or("f1");
+        if !matches!(awq_scope, "f1" | "f2") {
+            eprintln!("error: --awq-scope must be 'f1' or 'f2', got '{awq_scope}'");
+            std::process::exit(1);
+        }
+        AWQ_SCOPE_F1.set(awq_scope == "f1").ok();
         let formula_label = if awq_formula == "autoawq" { "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)" } else { "s[j]=(RMS_act[j])^alpha" };
-        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
+        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, scope={awq_scope}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -3327,7 +3384,8 @@ fn main() {
     // help ONLY (never on dense)" by default.
     let kmap_dense = args.iter().any(|a| a == "--kmap-dense");
     // K-map mode: 0=full (all candidates promoted), 1=alternating (edge + every 3rd),
-    // 2=typed (ffn_down+attn_v everywhere). Default: alternating — same PPL as full
+    // 2=typed (ffn_down+attn_v everywhere + edge blanket), 3=typed-lite
+    // (ffn_down+attn_v only), 4=down-only. Default: alternating — same PPL as full
     // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
     let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
         .and_then(|i| args.get(i + 1))
@@ -3335,6 +3393,8 @@ fn main() {
             "full" | "0" => 0,
             "alternating" | "alt" | "1" => 1,
             "typed" | "2" => 2,
+            "typed-lite" | "typed_lite" | "lite" | "3" => 3,
+            "down-only" | "down_only" | "down" | "4" => 4,
             _ => { eprintln!("warning: unknown --kmap-mode '{v}', using alternating"); 1 }
         })
         .unwrap_or(1);
@@ -3552,7 +3612,14 @@ fn main() {
             map.insert(name.to_string(), level);
         }
         if !map.is_empty() {
-            let mode_label = match kmap_mode { 0 => "full", 1 => "alternating", 2 => "typed", _ => "?" };
+            let mode_label = match kmap_mode {
+                0 => "full",
+                1 => "alternating",
+                2 => "typed",
+                3 => "typed-lite",
+                4 => "down-only",
+                _ => "?",
+            };
             eprintln!("K-map plan ({format} base, {n_layers} layers{}, mode={mode_label}):",
                 if is_moe { ", MoE" } else { "" });
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
@@ -3759,7 +3826,22 @@ fn main() {
             // inference time.
             let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
-            let (quantized, qt, gs, label) = if q8_conv1d_default && is_conv1d_tensor(name) {
+            let (quantized, qt, gs, label) = if mq6_conv1d && is_conv1d_tensor(name) {
+                // DeltaNet conv1d MQ6 ablation. Runtime loads this tensor as
+                // F32 through load_any_as_f32, so this isolates quant quality.
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+            } else if f16_conv1d && is_conv1d_tensor(name) {
+                // DeltaNet conv1d F16 ablation. Runtime loads this path as F32,
+                // same as Q8/MQ4/MQ6 conv1d, so this isolates quant quality.
+                let f16_bytes: Vec<u8> = f32_data
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect();
+                (f16_bytes, QuantType::F16, 0u32, "F16")
+            } else if q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
@@ -4568,6 +4650,42 @@ mod tests {
         // gate_proj stays base
         assert_eq!(
             kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_typed_lite_has_no_edge_blanket() {
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 3),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 3),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.gate_proj.weight", 40, false, 3),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.linear_attn.in_proj_qkv.weight", 40, false, 3),
+            QuantLevel::Base
+        );
+    }
+
+    #[test]
+    fn kmap_down_only_promotes_only_down() {
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 4),
+            QuantLevel::Promote6
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 4),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.mlp.gate_proj.weight", 40, false, 4),
             QuantLevel::Base
         );
     }
