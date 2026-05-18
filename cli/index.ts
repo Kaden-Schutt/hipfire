@@ -976,7 +976,10 @@ async function runViaHttp(
 
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
-  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private reader: {
+    read(): Promise<{ done: boolean; value?: Uint8Array }>;
+    releaseLock(): void;
+  } | null = null;
   private lines: string[] = [];
   private buffer = "";
 
@@ -992,15 +995,18 @@ class Engine {
     if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
-    this.reader = this.proc.stdout!.getReader();
+    const stdout = this.proc.stdout;
+    if (!stdout || typeof stdout === "number") throw new Error("daemon stdout pipe unavailable");
+    this.reader = stdout.getReader();
     this.buffer = "";
     this.lines = [];
   }
 
   async send(msg: object) {
-    if (!this.proc?.stdin) throw new Error("not running");
-    this.proc.stdin.write(JSON.stringify(msg) + "\n");
-    await this.proc.stdin.flush();
+    const stdin = this.proc?.stdin;
+    if (!stdin || typeof stdin === "number") throw new Error("not running");
+    stdin.write(JSON.stringify(msg) + "\n");
+    await stdin.flush();
   }
 
   async recv(): Promise<any> {

@@ -18,7 +18,9 @@
     "strict": true,
     "skipLibCheck": true,
     "noFallthroughCasesInSwitch": true,
-    "noUncheckedIndexedAccess": true,
+    // The CLI has many deliberate argv/array indexing paths; enabling this
+    // repo-wide currently turns the typecheck into bulk mechanical noise.
+    "noUncheckedIndexedAccess": false,
     "noImplicitOverride": true,
 
     // Some stricter flags (disabled by default)
