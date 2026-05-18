@@ -28,7 +28,7 @@ GPU" to "I landed a port".
 - Privileged repo access (no commit bit required — this is fork +
   PR).
 - A high-bandwidth conversation with the maintainer. The skill in
-  `.skills/hipfire-arch-port/` and the codebase patterns are
+  `.agents/skills/hipfire-arch-port/` and the codebase patterns are
   enough to do a port end-to-end without supervision.
 - An LLM agent — but **agent assistance is genuinely helpful**.
   Most of this skill is written assuming you're collaborating with
@@ -65,8 +65,8 @@ rocminfo | grep gfx
 
 ### 2. Read the playbook + matrix
 
-`.skills/hipfire-arch-port/playbook.md` end-to-end. Then
-`.skills/hipfire-arch-port/wmma-matrix.md` for the operand-shape
+`.agents/skills/hipfire-arch-port/playbook.md` end-to-end. Then
+`.agents/skills/hipfire-arch-port/wmma-matrix.md` for the operand-shape
 table.
 
 The most common arch-port mistake: assuming a single-file
@@ -156,6 +156,7 @@ that exercises your new kernel on the new arch.
 
 ```bash
 ./scripts/coherence-gate.sh
+./scripts/coherence-gate-dflash.sh
 ./scripts/speed-gate.sh --fast
 cargo run --release -p hipfire-runtime --example test_kernels
 ```
@@ -202,7 +203,7 @@ This skill (the one you're reading) is **designed for agent
 collaboration**. If you're working with Claude Code:
 
 ```
-> Read .skills/hipfire-arch-port/ first. I want to port gfx1201
+> Read .agents/skills/hipfire-arch-port/ first. I want to port gfx1201
 > WMMA. I have a 9070 XT to test on.
 ```
 
@@ -225,10 +226,10 @@ review the plan before any code is written, then iterate.
 - The agent **cannot bypass the speed-gate with `--no-verify`**.
   This is enforced by repo policy. If the agent suggests
   `--no-verify`, push back — it's almost always wrong.
-- The agent **must run `./scripts/coherence-gate.sh` after kernel
-  changes**, not just claim "should be fine". The gate is fast
-  (~2-4 min) and the false negatives from skipping it are
-  silent corruption.
+- The agent **must run `./scripts/coherence-gate-dflash.sh` after kernel
+  changes**, not just claim "should be fine". `./scripts/coherence-gate.sh`
+  is still useful as an AR smoke gate, but the DFlash gate is the canonical
+  correctness gate for the silent-corruption class.
 - The agent **must check git status before each commit** to make
   sure no stray test files / debug prints land.
 
@@ -265,19 +266,18 @@ review the plan before any code is written, then iterate.
   a rebuild before drawing any conclusion from a re-bench.
 - This skill was authored to capture the lessons before the next
   port attempt (commits `a088396` → `f676520`).
-- The gfx12 dispatch fallback ships in 6e100c2: gfx12 routes to the
-  dot2 path until per-arch WMMA kernels land. 9070 XT users now have
-  a working baseline.
+- The gfx12 dispatch fallback in 6e100c2 provided the original working
+  baseline for 9070 XT users after the codegen crash report.
 - The first gfx12 WMMA kernel (`gemm_qkv_hfq4g256_wmma.gfx12.hip`)
-  ships in 6924f2a as the canonical pattern reference. Five more
-  gfx11 WMMA kernels still need ports — fork the canonical file.
+  shipped in 6924f2a as the canonical pattern reference. Current checkouts
+  include additional gfx12 sibling kernels and selectors; inspect
+  `kernels.rs`, `dispatch.rs`, and env gates such as `HIPFIRE_LLOYD_GFX12`
+  before claiming a path is enabled by default.
 - `scripts/compile-kernels.sh` now resolves family tags
   (`.gfxNN.hip`) in addition to chip tags (`.gfxNNNN.hip`), so a
   single `name.gfx12.hip` file covers both gfx1200 and gfx1201.
-- kmbandy (GitHub) volunteered to do the gfx1201 port with R9700
-  hardware — see issue #45 comment for context. The runtime
-  channel-test on the canonical kernel's C-mapping hypothesis is
-  the next blocker.
+- External RDNA4 hardware remains the source of truth for channel-test and
+  coherence data on any newly routed gfx12 path.
 
 ## You're contributing into a small, opinionated codebase
 

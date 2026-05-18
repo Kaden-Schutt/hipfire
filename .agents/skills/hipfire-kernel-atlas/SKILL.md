@@ -30,7 +30,7 @@ format and kernel use an AMD GPU ISA target. The primary tool is
    - Prefer rows with a known `arch`; source ranking is target-arch-aware when arch-specific kernel files exist.
 
 4. **Render the ISA Fit View**
-   - Use `.skills/hipfire-kernel-atlas/render-fit.sh`.
+   - Use `.agents/skills/hipfire-kernel-atlas/render-fit.sh`.
    - If a row has `artifacts.profile_kernels`, the view joins profiled kernel names to ISA object kernel names/symbols and summarizes only matched objects.
    - If a row has dispatch provenance, the view prints hot-kernel op/source/dispatch attribution.
    - Report the visual plus a short readout of `likely limit` and `left on table`.
@@ -60,7 +60,7 @@ format and kernel use an AMD GPU ISA target. The primary tool is
 Render an existing row:
 
 ```bash
-.skills/hipfire-kernel-atlas/render-fit.sh \
+.agents/skills/hipfire-kernel-atlas/render-fit.sh \
   --row .codeinsight+research/kernel-atlas/runs/atlas.jsonl \
   --row-index 0 \
   --isa .codeinsight+research/kernel-atlas/runs/isa.json

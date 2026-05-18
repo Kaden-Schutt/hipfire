@@ -96,7 +96,7 @@ If your branch had perf-sensitive changes:
 If your branch touched kernels / quant / dispatch / fusion / rotation /
 forward-pass:
 ```bash
-./scripts/coherence-gate.sh
+./scripts/coherence-gate-dflash.sh
 ```
 
 ### 4. Push
@@ -120,6 +120,10 @@ git tag -d rebase-onto-modular-backup-<timestamp>
 The backup tag is created at the very start of the script and persists
 until you delete it.
 
+Agents must ask the user before running destructive rollback commands or
+force-pushing a rewritten branch. The commands above are human recovery
+instructions, not permission to discard unreviewed work.
+
 ## When NOT to use this skill
 
 - Brand-new branches authored against post-modular master — they don't
@@ -135,4 +139,3 @@ until you delete it.
 - Crate topology: `CONTRIBUTING.md` "Crate topology" section
 - Architecture trait: `crates/hipfire-runtime/src/arch.rs`
 - Toy arch template: `crates/hipfire-arch-toy/`
-- Modularization PRD: `docs/plans/engine-modularization.prd`

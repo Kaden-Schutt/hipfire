@@ -68,14 +68,12 @@ the deployed baseline across all dominant prefill GEMMs
 `gemm_qkvza_hfq4g256_wmma`, residual). The K2 step is fully shipped.
 
 **K4 step status**: `gemm_hfq4g256_residual_wmma_k4.hip` had a
-swapped output mapping (commit `2135513` fixed it 2026-05-01,
-case-studies §8). After fix, K4 ties K2 byte-for-byte at m=4096
-on 9B residual but loses to ksplit by ~33% per-call at small
-batch (CU-starved grid: 3.3 vs 13 blocks/CU under K4's
-`__launch_bounds__(32, 1)`). Auto-dispatcher correctly picks K2
-at m≥8192 and ksplit at m<8192 (`dispatch.rs:5253`). K4 vs K2 at
-m≥8192 has not been benched on available models — future work on
-70B-class. K4 stays opt-in via `HIPFIRE_WO_WMMA_VARIANT=k4`.
+swapped-output-mapping investigation (case-studies §8). After fix, K4
+ties K2 byte-for-byte at m=4096 on 9B residual but loses to ksplit by
+~33% per-call at small batch (CU-starved grid: 3.3 vs 13 blocks/CU under
+K4's `__launch_bounds__(32, 1)`). Verify the current dispatch policy
+before using K4, and do not cite an exact historical hash unless it exists
+in the checkout you are reporting from.
 
 **Reference (NEGATIVE — null result, important to know)**: commit
 `f670e16` — "experiment(gemm): k2x32 wider-row lm_head — null
@@ -94,7 +92,7 @@ path.
 
 **Pattern**: 16×16×16 fp16→fp32 tile is the workhorse. The actual
 builtin name + operand layout differs per arch family — see
-`.skills/hipfire-arch-port/wmma-matrix.md` if you're porting to a
+`.agents/skills/hipfire-arch-port/wmma-matrix.md` if you're porting to a
 new arch.
 
 **Reference (positive)**: PR #56 — gfx12 WMMA port, channel-tested
@@ -211,7 +209,7 @@ correctness pass.
 
 ### LDS-staged X share on gate_up (gfx1100)
 
-Commit `feb16a1` — variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip`
+Historical branch note: variant kernel `gemm_gate_up_hfq4g256_wmma_ldsx.hip`
 opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`, default off. ISA-clean (75 VGPRs vs
 80 baseline, single-wave block makes `__syncthreads()` a no-op so
 the compiler kept weight prefetch above the LDS-write phase) but

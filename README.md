@@ -6,7 +6,7 @@ in the hot path. Ollama-style UX.
 ```bash
 hipfire pull qwen3.5:9b
 hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve -d        # background daemon, OpenAI-compatible API on :11435
+hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
 ```
 
 Current release: **v0.1.20** — engine modularization. See [CHANGELOG.md](CHANGELOG.md).

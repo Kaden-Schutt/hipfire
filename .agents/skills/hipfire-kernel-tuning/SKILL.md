@@ -63,7 +63,7 @@ gfx94x matrix.
 
 ## What's not in this skill
 
-- **New arch ports** — see `.skills/hipfire-arch-port/` instead. That
+- **New arch ports** — see `.agents/skills/hipfire-arch-port/` instead. That
   skill covers porting an EXISTING kernel to a new GPU family. This
   skill covers MAKING an existing kernel faster on the archs it
   already runs on.
@@ -79,6 +79,8 @@ gfx94x matrix.
   prompt-md5 discipline).
 - [`docs/QUANTIZATION.md`](../../docs/QUANTIZATION.md) — MQ4/HF4 design
   + asym KV math; required reading before touching quant kernels.
+  If this doc conflicts with `AGENTS.md` on MQ3/DFlash release status, treat
+  `AGENTS.md` and current code as the fresher source.
 - [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) — the dispatch
   layering + two-model-paths surface that constrains where new
   variants can plug in.

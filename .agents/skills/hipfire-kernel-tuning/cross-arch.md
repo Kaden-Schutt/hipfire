@@ -38,7 +38,7 @@ that's still correct.
 
 When you add a more-specific check that absorbs an arch the broader
 check used to handle, **narrow the broader check in the same diff**.
-The skill `.skills/hipfire-arch-port/` enforces this — it's how the
+The skill `.agents/skills/hipfire-arch-port/` enforces this — it's how the
 gfx12 dispatch (PR #56) didn't introduce a dead `|| starts_with("gfx12")`
 clause in the gfx11 branch.
 

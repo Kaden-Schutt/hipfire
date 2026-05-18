@@ -1,5 +1,5 @@
 import type { HipfireConfig } from "./index.ts";
-import { findModel, resolveModelTag, isServeUp } from "./index.ts";
+import { findModel, resolveModelTag, isServeUp, serveProbeHost, formatServeBind } from "./index.ts";
 import {
   graphemes, sanitizePaste, estimateTokens,
   computeTokPerSec, trimTokenWindow,
@@ -22,6 +22,7 @@ interface ChatState {
   lastAbortTime: number | null;
   modelTag: string;
   daemonPid: number | null;
+  daemonHost: string;
   daemonPort: number;
   paste: PasteParserState;        // bracketed-paste accumulator
   escBuf: string;
@@ -76,6 +77,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig, opts: ChatTuiOpti
     lastAbortTime: null,
     modelTag,
     daemonPid: null,
+    daemonHost: cfg.host,
     daemonPort: cfg.port,
     paste: { inPaste: false, buf: "" },
     escBuf: "",
@@ -107,16 +109,18 @@ export async function chatTui(tag: string, cfg: HipfireConfig, opts: ChatTuiOpti
 
   // ─── Daemon management ──────────────────────────────────
 
-  const existingServe = await isServeUp(cfg.port);
+  const existingServe = await isServeUp(cfg.port, cfg.host);
   if (existingServe) {
+    state.daemonHost = cfg.host;
     state.daemonPort = cfg.port;
-    we(`[hipfire] Using existing serve on port ${cfg.port}\n`);
+    we(`[hipfire] Using existing serve on ${formatServeBind(cfg.host, cfg.port)}\n`);
   } else {
+    state.daemonHost = cfg.host;
     state.daemonPort = cfg.port;
-    we(`[hipfire] Starting serve on port ${state.daemonPort}...\n`);
+    we(`[hipfire] Starting serve on ${formatServeBind(state.daemonHost, state.daemonPort)}...\n`);
 
     const proc = Bun.spawn(
-      [process.argv[0], process.argv[1], "serve", String(state.daemonPort)],
+      [process.argv[0], process.argv[1], "serve", state.daemonHost, String(state.daemonPort)],
       {
         stdout: "pipe",
         // Pipe instead of inherit so daemon log lines don't bleed into the chat UI.
@@ -145,20 +149,20 @@ export async function chatTui(tag: string, cfg: HipfireConfig, opts: ChatTuiOpti
     let si = 0;
     while (Date.now() < deadline) {
       await new Promise<void>(r => setTimeout(r, 500));
-      if (await isServeUp(state.daemonPort)) break;
+      if (await isServeUp(state.daemonPort, state.daemonHost)) break;
       si = (si + 1) % 4;
       we(`\r  Waiting for serve... ${spin[si]}       `);
     }
     we("\r\x1b[K");
 
-    if (!await isServeUp(state.daemonPort)) {
+    if (!await isServeUp(state.daemonPort, state.daemonHost)) {
       we("Daemon failed to start within 120s. Check logs.\n");
       if (state.daemonPid) {
         try { process.kill(state.daemonPid, "SIGTERM"); } catch {}
       }
       process.exit(1);
     }
-    we(`[hipfire] Serve ready on port ${state.daemonPort}\n`);
+    we(`[hipfire] Serve ready on ${formatServeBind(state.daemonHost, state.daemonPort)}\n`);
   }
 
   // ─── Raw mode setup ─────────────────────────────────────
@@ -413,7 +417,7 @@ export async function chatTui(tag: string, cfg: HipfireConfig, opts: ChatTuiOpti
     let resp: Response;
     try {
       resp = await fetch(
-        `http://127.0.0.1:${state.daemonPort}/v1/chat/completions`,
+        `http://${serveProbeHost(state.daemonHost)}:${state.daemonPort}/v1/chat/completions`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },

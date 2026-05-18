@@ -1,4 +1,4 @@
-# Known issues — v0.1.5
+# Known issues — current plus historical runtime caveats
 
 Tracked bugs that don't yet have full fixes. Check here before filing a
 GitHub issue.
@@ -86,7 +86,7 @@ gather/scatter fallback.
 
 ## Reporting new issues
 
-Run `.skills/hipfire-autoheal/triage.sh` and paste its output at the top of
+Run `.agents/skills/hipfire-autoheal/triage.sh` and paste its output at the top of
 the GitHub issue. Include:
 
 1. `triage.sh` output (full)

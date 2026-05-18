@@ -3,7 +3,7 @@
 You are helping a tester bring up hipfire on an RDNA GPU, run the standard
 test matrix, and report results back upstream. Works for any agent framework.
 
-## Supported GPUs (v0.1.5 "redline")
+## Supported GPUs (v0.1.9-alpha baseline)
 
 | Card | Arch | VRAM | Status | Default KV |
 |---|---|---|---|---|
@@ -16,14 +16,18 @@ test matrix, and report results back upstream. Works for any agent framework.
 | RX 7900 XT | gfx1101 | 16GB | expected | asym3 |
 | RX 7800 XT | gfx1102 | 12GB | expected | asym3 |
 | Strix Halo | gfx1151 | 16GB APU | expected | asym2 |
-| RX 9070 XT | gfx1200/1201 | 16GB (RDNA4) | expected | asym3 |
+| RX 9070 XT | gfx1200/1201 | 16GB (RDNA4) | MQ3 supported | asym3 |
 
 ## Phase 1: Install + verify
 
 ```bash
-curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 hipfire diag
 ```
+
+For a local checkout, build or install from the checked-out source before
+testing. If you use the release installer, inspect `scripts/install.sh` first
+and run it directly from a trusted checkout rather than piping remote shell to
+`bash`.
 
 `hipfire diag` should report:
 - Your arch (e.g. `GPU arch: gfx1030`)
@@ -66,7 +70,7 @@ kernel JIT cost (2-5 min on slow hardware, cached at
 
 ## Phase 4: Multi-turn recall test
 
-This is the key v0.1.5 regression gate — ensures asym3 K kernel head_dim=256
+This is the key recall regression gate — ensures asym3 K kernel head_dim=256
 fix is intact:
 
 ```bash
@@ -95,7 +99,7 @@ for size in 0.8b 4b 9b 27b; do
   [ -f "$m" ] || { echo "$size: MISSING"; continue; }
   for pp in 32 128 512 2048; do
     r=$(HIPFIRE_KV_MODE=asym3 ~/.hipfire/bin/bench_qwen35_mq4 "$m" \
-        --prefill $pp --gen 30 --warmup 10 2>&1 | grep -m1 "^SUMMARY")
+        --prefill $pp --gen 30 --warmup 10 2>&1 | rg -m1 "^SUMMARY")
     p=$(echo "$r" | sed -nE 's/.*prefill_tok_s=([0-9.]+).*/\1/p')
     d=$(echo "$r" | sed -nE 's/.*gen_tok_s=([0-9.]+).*/\1/p')
     bw=$(echo "$r" | sed -nE 's/.*bw_gib_s=([0-9.]+).*/\1/p')
@@ -122,8 +126,8 @@ If TUI doesn't render, report terminal + $TERM env var.
 ## Phase 7: Quantize smoke (optional)
 
 ```bash
-hipfire quantize Qwen/Qwen3.5-0.8B --format mq4 -o /tmp/test.mq4
-hipfire run /tmp/test.mq4 "Hi"
+hipfire quantize Qwen/Qwen3.5-0.8B --format mq4 -o ~/.hipfire/models/test-qwen35-0.8b.mq4
+hipfire run ~/.hipfire/models/test-qwen35-0.8b.mq4 "Hi"
 ```
 
 Should produce coherent output. Fresh quant → no cached kernels → slow first
@@ -144,29 +148,37 @@ Submit via GitHub issue or PR with:
 - notes: any unusual behavior, hangs, etc.
 ```
 
-## Quantization formats (v0.1.5)
+## Quantization formats (v0.1.9-alpha)
 
 | Format | B/weight | Speed | Quality | Use case |
 |---|---|---|---|---|
-| `mq4` | 0.53 | Fastest | ~Q8 on quality gate | **Default** |
+| `mq3` | 0.41 | Fast on gfx11/gfx12 | production on dense models | Sub-4-bit target |
+| `mq4` | 0.53 | Fastest broad path | ~Q8 on coherence gates | **Default broad path** |
 | `mq6` | 0.78 | Fast | Near-FP16 | Quality-critical |
 | `hfq4` | 0.53 | Fastest | Good | Legacy — loads but not produced |
 | `hfq6` | 0.78 | Fast | Better | Legacy |
 | `q8` | 1.06 | Moderate | Reference | Correctness debug |
 
 MQ4 is the production default — FWHT-rotated 4-bit with a byte-exact quality
-gate on every change. HF4/HF6 are legacy formats that still load but aren't
+lineage but current correctness claims use `./scripts/coherence-gate-dflash.sh`.
+MQ3 is production on gfx11/gfx12 dense models and falls back correctly but more
+slowly on older archs. MQ2 is refused by default unless explicitly opted in for
+known-broken experiments. HF4/HF6 are legacy formats that still load but aren't
 freshly produced.
 
 ## Known quirks
 
 - **BC-250:** daemon HTTP multi-turn hangs on specific request sequences.
-  Workaround: `pkill -9 daemon bun` between tests. See
-  `.skills/hipfire-autoheal/known-issues.md`.
+  Workaround, with user approval before killing processes: `pkill -9 daemon bun`
+  between tests. See
+  `.agents/skills/hipfire-autoheal/known-issues.md`.
 - **0.8B + hipGraph:** don't set `HIPFIRE_GRAPH=1` for 0.8B — known panic.
   Other sizes are fine.
 - **Qwen 3 on asym:** use `HIPFIRE_KV_MODE=q8` for non-Qwen-3.5 models;
   asym modes are flash-only and Qwen 3 falls back to per-token otherwise.
+- **DFlash drafts:** pulling a draft does not enable DFlash. Use
+  `hipfire config set dflash_mode auto` or a per-model setting, then confirm
+  daemon logs show the paired draft was detected.
 
 ## If stuck, chain to `hipfire-autoheal`
 

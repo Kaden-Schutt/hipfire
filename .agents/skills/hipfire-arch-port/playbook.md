@@ -194,9 +194,11 @@ A new arch port is merge-ready ONLY when:
    target arch). This is correctness — `cargo run --release -p
    hipfire-runtime --example test_kernels` (or the QA variant)
    emits "OK" for every dispatched kernel on the new arch.
-2. **Coherence-gate passes** (`./scripts/coherence-gate.sh`). No
-   panics, no zero-tokens, no timeouts on the canonical
-   small-prompt battery.
+2. **Coherence gates pass.** Run `./scripts/coherence-gate.sh` for AR
+   arch smoke and `./scripts/coherence-gate-dflash.sh` for the canonical
+   correctness gate when the port touches kernels, quant formats, dispatch,
+   fusion, rotation, rmsnorm, or spec-decode behavior. No panics, no
+   zero-tokens, no timeouts, and no attractor-loop failures.
 3. **Speed-gate passes** on the regression-baseline arch
    (`./scripts/speed-gate.sh --fast`). The new code path **cannot
    regress gfx1100** (or whichever arch the baseline lives on).
@@ -229,6 +231,6 @@ If you don't have hardware for the target arch, you cannot merge
 
 ## Skill discoverability
 
-This skill lives at `.skills/hipfire-arch-port/`. Triggers in
+This skill lives at `.agents/skills/hipfire-arch-port/`. Triggers in
 `skill.json` cover the obvious phrases. Future agents asking
 "how do I support gfx1XYZ?" should land here directly.

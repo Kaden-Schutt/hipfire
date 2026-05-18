@@ -24,6 +24,7 @@ Run from the hipfire repo root:
 
 ```bash
 python3 scripts/astrea.py inspect --model MODEL [--imatrix IMATRIX] [--format FORMAT] [--pretty] [--out PATH]
+python3 scripts/astrea.py imatrix-join --model MODEL --imatrix IMATRIX [--max-tensors N] [--pretty] [--out PATH]
 python3 scripts/astrea.py fingerprint [--engine-root REPO] [--pretty] [--out PATH]
 python3 scripts/astrea.py plan --model MODEL --format FORMAT --method METHOD [--recipe-stage STAGE:METHOD] [--imatrix IMATRIX] [--source-dir BF16_DIR] [--eval-command CMD] [--atlas-command CMD] [--pretty] [--out PATH]
 python3 scripts/astrea.py calibrate --plan PLAN.json [--source-dir BF16_DIR] [--write-candidate] [--max-tensors N] [--tensor-filter NAME] [--workers N] --pretty [--out PATH]
@@ -45,6 +46,8 @@ empty.
 1. Identify the target model, desired format, reference model, eval dataset,
    and budget.
 2. Run `inspect` to fingerprint the model and imatrix inputs.
+   Use `imatrix-join` when you need a focused report of GGUF imatrix tensor
+   coverage against HFQ tensor names before planning a calibration run.
 3. Run `fingerprint` to capture the engine path. This records git state,
    relevant source hashes, `HIPFIRE_ROPE_INTERLEAVED_LEGACY`, and whether the
    default Qwen3.5 FA RoPE path is `halfsplit`, `interleaved_legacy`, or
