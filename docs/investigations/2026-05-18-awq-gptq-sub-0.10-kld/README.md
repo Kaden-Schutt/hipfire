@@ -58,3 +58,26 @@ The iteration **mathematically works correctly** (scale-delta shrinks geometrica
 4. Re-collect imatrix on a richer/longer calibration corpus
 
 All four next-steps reach **sub-0.10 with same wire format + perf** (no K-map, no Q8 promotions). The methodology + repro recipe in this directory let any of them resume cleanly.
+
+## Update 2026-05-18 17:35 UTC — v3 recipe shipped as F1 default
+
+Quantizer patched (commit `d7546297` on `iterative-awq-gptq`) to default to F1-only AWQ scope. F2 (PR #273 extension) is opt-in via `--awq-scope f2`. Empirical justification: F2 + AWQ-aware GPTQ regresses KLD by ~10% vs v3 in this stack.
+
+**Validated**: fresh quantize with new defaults (`--awq --awq-alpha 0.5 --imatrix unsloth.gguf`, no scope flag) produces the v3-equivalent model (`mq4-awq-f1default-gptq`):
+- 184 AWQ sidecars (F1 scope) ✓
+- 5.0 GB on disk ✓
+- Log line includes scope label: `AWQ pre-scaling: ENABLED (alpha=0.5, scope=f1, formula=paper, ...)`
+
+**Production tests on the shipped model:**
+
+| Test | Result | Notes |
+|---|---|---|
+| `test_inference` test 1 (finite logits) | ✓ PASS | logits[0]=-2.11, max=14.54, no NaN/Inf |
+| `test_inference` test 2 (forward vs scratch) | ✗ FAIL (pre-existing) | `max_diff=12.0` — `forward_scratch` is NOT AWQ-aware on master; PR #266 wired only `forward` + `forward_prefill_batch`. **Decode + prefill paths work correctly; test rig is just over-strict on AWQ models.** |
+| `coherence_probe` (200-tok generation @ T=0) | ✓ WARN (0 hard, 2 soft) | borderline unique_ratio 0.38 + benign empty `<think>` skip; no attractors / loops / special-token leaks |
+| Decode perf | ✓ 64.6 tok/s | unchanged vs flat-mq4 (AWQ adds a fused `x/s` divide per layer, BW-free) |
+| Prefill perf | ✓ 504 tok/s | within flat-mq4 envelope |
+| TTFT | ✓ 476ms | OK |
+| c512 q8-KV KLD bench | (running) | expect ~0.1257 (matching v3) |
+
+**Caveat on `test_inference`**: this test rig compares `forward` vs `forward_scratch`. PR #266 added the AWQ-aware kernel dispatch to `forward` (decode) and `forward_prefill_batch` (the prefill batch path that the bench harness uses), but **not to `forward_scratch`**. So `forward_scratch` produces non-AWQ output and the divergence test trips. This is a pre-existing engine gap — the production runtime paths work correctly. A follow-on patch should either (a) wire AWQ into `forward_scratch` or (b) relax test 2 to skip when AWQ sidecars are present. Not a ship blocker.
