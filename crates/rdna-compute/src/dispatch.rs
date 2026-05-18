@@ -446,6 +446,62 @@ impl DType {
             DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::Raw => 1, // byte-level
         }
     }
+
+    /// Whether a `WeightTensor` of this dtype should have the
+    /// `<weight>.awq_scale.weight` F16 sidecar attached at load time.
+    ///
+    /// Centralizes the gate that previously lived inline at every
+    /// loader call site (qwen35.rs `load_weight_tensor`, etc.). The
+    /// motivation is the May 2026 regression where `qwen35.rs:907`
+    /// gated on `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently
+    /// dropped AWQ sidecars for `MQ3G256`-quantized Qwen3.5 weights,
+    /// producing fluent-but-nonsensical token soup for ~5 hours
+    /// before the missing arm was traced. Adding a new AWQ-eligible
+    /// dtype is now a one-line edit here instead of two scattered
+    /// edits per loader.
+    ///
+    /// Current allow-list = the empirical truth of which dtypes ship
+    /// AWQ sidecars from the quantizer AND have an AWQ-aware forward
+    /// path (`rotate_x_mq_for` etc., wired through `awq_scale.is_some()`).
+    ///
+    /// **Forward-path-ready candidates not currently in the allow-list**
+    /// (forward kernels exist but no `.hfq` file in tree ships sidecars
+    /// for them — widen only after the quantizer side is verified to
+    /// emit sidecars and at least one coherence-gate row exercises the
+    /// combination):
+    /// - `MQ6G256`
+    /// - `MQ2G256`, `MQ2G256Lloyd`
+    /// - `MQ3G256Lloyd`
+    /// - `MFP4G32` (forward path has explicit `awq_scale.is_some()`
+    ///   branching at llama.rs:609 but the quantizer comment says
+    ///   "AWQ is gated to MQ4G256 today" — confirm before widening)
+    ///
+    /// `MQ8G256` is explicitly **not** a candidate: it uses its own
+    /// INT8-quantized scratch path (`gemv_mq8g256_with_rotate`,
+    /// `rotate_quantize_x_mq8`) and does not flow through
+    /// `rotate_x_mq_for`, so there is no AWQ-aware kernel to dispatch
+    /// to.
+    ///
+    /// **lm_head / embed_tokens callers:** as of the lm_head-AWQ
+    /// runtime PR, this helper IS safe for the `output` weight in
+    /// `qwen35.rs::load_weights` / `load_weights_vl`. Both dispatch
+    /// paths that consume `weights.output` now route through
+    /// AWQ-aware rotations when a sidecar is attached:
+    /// - Decode: `weight_gemv` → `rotate_x_mq_for` (llama.rs)
+    /// - Spec-decode verify: `speculative.rs::rotate_x_mq_batched_for`
+    ///
+    /// Pre-runtime-fix, attaching a sidecar on lm_head would have
+    /// produced `(W·s)·x ≠ W·x` via the spec-verify path's plain
+    /// `rotate_x_mq_batched` and driven the KLD 0.67 → 13.5
+    /// corruption documented at `docs/plans/awq_fix_claude.md`. The
+    /// quantizer-side `awq_eligible` whitelist
+    /// (`hipfire-quantize/src/main.rs:3849`) still gates which
+    /// tensors actually receive `W' = W·s` pre-multiplication at
+    /// quant time — this helper governs only whether the loader
+    /// attaches an already-emitted sidecar.
+    pub fn supports_awq_sidecar(self) -> bool {
+        matches!(self, DType::MQ4G256 | DType::MQ3G256)
+    }
 }
 
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
@@ -501,15 +557,15 @@ pub struct Gpu {
     // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
     // max abs error. Weights exceeding the threshold fall back to WMMA.
     //
-    // Enabled by default on RDNA3/3.5. Configurable via:
+    // Disabled by default on all arches as of 2026-05-18; opt-in for
+    // defensive screening when adding new quant formats. Configurable via:
     //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
     //   - per-model config overlay
     //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
-    //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
+    //   - env override: `HIPFIRE_MMQ_SCREEN=1` to enable,
     //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
     mmq_screen_cache: HashMap<usize, bool>,
-    /// Whether MMQ per-weight screening is enabled.
-    /// Per-arch default (set in `Gpu::init`): true on gfx906, false elsewhere.
+    /// Whether MMQ per-weight screening is enabled. Default: false on all arches.
     pub mmq_screen: bool,
     /// Max per-row abs error threshold for screening. Weights with any row
     /// exceeding this fall back to WMMA.
@@ -744,7 +800,22 @@ impl Gpu {
 
         // Per-arch defaults for MMQ screening. See the mmq_screen and
         // mmq_screen_threshold fields below for rationale.
-        let mmq_screen_default: bool = arch == "gfx906";
+        //
+        // gfx906 was previously default-on out of caution because the MMQ
+        // kernels were ported from the gfx11xx i8-WMMA path that motivated
+        // #87, but gfx906 uses dp4a (`__builtin_amdgcn_sdot4`), not WMMA,
+        // and empirically tolerates the row-3994 weight outliers within the
+        // 0.50 threshold. Audit on 2026-05-18 across qwen3.5-{0.8B, 9B} mq4
+        // (AWQ + non-AWQ) showed 0/248 weights flagged at threshold 0.50 —
+        // the screen reference dispatch (~700 µs/weight via
+        // `gemm_hfq4g256_residual_fp16_wave64`) was pure overhead, costing
+        // ~145 ms on the first prefill. Users on new quant formats can
+        // re-enable defensively via `HIPFIRE_MMQ_SCREEN=1`.
+        //
+        // RDNA3/3.5: unchanged behavior. Already default-off here; clients
+        // that need #87 protection (daemon callers loading on i8-WMMA archs)
+        // explicitly pass `mmq_screen: true` at load time.
+        let mmq_screen_default: bool = false;
         let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
 
         Ok(Self {

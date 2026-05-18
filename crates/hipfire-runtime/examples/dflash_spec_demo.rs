@@ -1001,6 +1001,7 @@ fn main() {
     if ar_baseline {
         eprintln!("AR-BASELINE MODE: pure greedy target decode (no DFlash)");
         let t_ar = Instant::now();
+        let mut ar_first_tok_secs: Option<f64> = None;
         // Position already advanced to prompt_tokens.len() during prefill.
         // seed_token = target's argmax at position `prompt_len` (first emit).
         let mut cur_token = seed_token;
@@ -1024,6 +1025,9 @@ fn main() {
                 if v > bv { (i as u32, v) } else { (best, bv) }
             }).0;
             emitted.push(next);
+            if ar_first_tok_secs.is_none() {
+                ar_first_tok_secs = Some(t_ar.elapsed().as_secs_f64());
+            }
             position += 1;
             if let Some(ref p) = cask_policy {
                 if let Some(ev) = p.maybe_evict(&mut gpu, &mut target.kv_cache, position)
@@ -1046,6 +1050,26 @@ fn main() {
         eprintln!("emitted: {} tokens in {:.2}s  ({:.2} tok/s)",
                   emitted.len(), ar_elapsed, emitted.len() as f64 / ar_elapsed);
         eprintln!("AR tokens: {:?}", emitted);
+        // Mirror BENCH METRICS block from the DFlash path so downstream
+        // bench harnesses (scripts/bench_humaneval_dflash.py) can extract
+        // prefill_tok_s + ttft_ms + decode stats from AR runs too.
+        let ar_ttft_ms = (prefill_secs + ar_first_tok_secs.unwrap_or(0.0)) * 1000.0;
+        let (vram_free_bytes, vram_total_bytes) = gpu.hip.get_vram_info().unwrap_or((0, 0));
+        let vram_used_mb = ((vram_total_bytes.saturating_sub(vram_free_bytes)) as f64 / (1024.0 * 1024.0)) as u64;
+        let vram_total_mb = (vram_total_bytes as f64 / (1024.0 * 1024.0)) as u64;
+        eprintln!("=== BENCH METRICS ===");
+        eprintln!("prompt_tokens: {}", prompt_tokens.len());
+        eprintln!("prefill_secs: {:.4}", prefill_secs);
+        eprintln!("prefill_tok_s: {:.2}", prefill_tok_s);
+        eprintln!("ttft_ms: {:.2}", ar_ttft_ms);
+        eprintln!("decode_tokens_emitted: {}", emitted.len());
+        eprintln!("decode_secs: {:.4}", ar_elapsed);
+        eprintln!("decode_tok_s: {:.2}", emitted.len() as f64 / ar_elapsed.max(1e-9));
+        eprintln!("decode_tau: 1.0000");
+        eprintln!("decode_accept_rate: 1.0000");
+        eprintln!("vram_used_mb: {}", vram_used_mb);
+        eprintln!("vram_total_mb: {}", vram_total_mb);
+        eprintln!("=====================");
         return;
     }
 

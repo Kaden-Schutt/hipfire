@@ -120,6 +120,35 @@ SHORT_TESTS=(
     # defaults don't disturb the mq6 dispatch routing. Skipped if model
     # absent (download via `hipfire pull qwen3.5-9b.mq6`).
     "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # MQ3-AWQ coverage — regression catcher for the 2026-05-18 loader bug
+    # where `qwen35.rs:907` gated AWQ-sidecar attachment on
+    # `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently dropped sidecars
+    # for MQ3G256 weights (fixed by extending to MQ4G256|MQ3G256 and then
+    # centralized behind `DType::supports_awq_sidecar` — see the
+    # `mq3-awq-paris` case below for the corresponding hard-fail check).
+    # Uses the 4B-awq-only variant because it produces a verbose answer
+    # containing "Paris" reliably at temp=0 + repeat_penalty=1.05; the
+    # awq-gptq sibling terses out on this prompt (7 tokens, no Paris), so
+    # it would false-positive the gate. Skipped if the canonical file
+    # isn't symlinked into MODELS_DIR — symlink it as:
+    #   ln -s /data/hipfire/mq3-sweep/qwen3.5-4b.mq3-awq-only.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-4b.mq3-awq-only"
+    "qwen3.5-4b.mq3-awq-only|mq3-awq-paris|What is the capital of France? Answer in one short sentence.|80"
+    # lm_head AWQ coverage — regression catcher for the AWQ-aware lm_head
+    # dispatch landed in 2026-05-18's lm-head-awq-runtime PR. The 9B file
+    # ships `lm_head.awq_scale.weight` alongside the 248 per-layer
+    # sidecars; the runtime applies `x /= s` before the lm_head matmul
+    # via `weight_gemv` → `rotate_x_mq_for` (decode) and
+    # `speculative.rs::rotate_x_mq_batched_for` (spec-verify). With
+    # those wirings in place, the model produces coherent output;
+    # without them, the lm_head computes `(W·s)·x ≠ W·x` and emits
+    # gibberish at the output projection (KLD 0.67 → 13.5 class —
+    # see docs/plans/awq_fix_claude.md). max_tokens=300 because 9B
+    # Qwen3.5 thinking mode spends more tokens in `<think>` before
+    # emitting the final answer. Symlink to enable:
+    #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
+    "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
@@ -241,6 +270,30 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
                 # be quantization noise (small model decided to answer
                 # directly); not a corruption signal.
                 status="OK (soft: no <tool_call> emitted; model answered inline)"
+            fi
+            ;;
+        mq3-awq-paris|lmhead-awq-paris)
+            # Regression catcher for AWQ-sidecar load + dispatch bugs.
+            # Two flavors share this hard-fail check:
+            #   - mq3-awq-paris (4B): catches the 2026-05-18 loader bug
+            #     where `qwen35.rs:907` gated AWQ-sidecar attachment on
+            #     `matches!(_, DType::MQ4G256)` and silently dropped MQ3
+            #     sidecars.
+            #   - lmhead-awq-paris (9B): catches the 2026-05-18 spec-verify
+            #     dispatch bug where `speculative.rs`'s lm_head path
+            #     called the non-AWQ `rotate_x_mq_batched` even when an
+            #     lm_head sidecar was attached. Same dispatch class as
+            #     the DFlash drafter bug fixed in PR #290.
+            # A healthy Qwen3.5 MQ4-AWQ answer always contains "Paris"
+            # verbatim at temp=0 — even the lowest-PPL calibration gets
+            # the capital right. Anything else means the AWQ rescale is
+            # not being applied at some stage.
+            text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
+            if ! printf '%s' "$text" | grep -q 'Paris'; then
+                status="HARD_ERROR (AWQ regression: answer missing 'Paris' — AWQ rescale likely not applied; check DType::supports_awq_sidecar gate and rotate_x_mq_for / rotate_x_mq_batched_for dispatch)"
+                hard_errors=$((hard_errors + 1))
             fi
             ;;
     esac

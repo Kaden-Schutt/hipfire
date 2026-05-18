@@ -195,7 +195,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
     let (info, data) = hfq
         .tensor_data(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    match info.quant_type {
+    let mut wt = match info.quant_type {
         1 => {
             // F16 on disk. Default: upload as F16 (no lift) and dispatch through
             // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
@@ -242,7 +242,39 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, awq_scale: None })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
+    }?;
+    // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
+    // and qwen35.rs::load_weight_tensor. Routed through the centralized
+    // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
+    // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
+    // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
+    //
+    // Logic is inlined rather than calling out to hfq.rs's closure or
+    // qwen35.rs's `load_awq_scale_for` to avoid pulling in a cross-crate
+    // dependency for what is structurally a third copy of the same load.
+    // Factor-out (one shared `pub fn load_awq_scale_for` in this crate)
+    // is tracked as a follow-up.
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        let sidecar_name = match name.strip_suffix(".weight") {
+            Some(stem) => format!("{stem}.awq_scale.weight"),
+            None => format!("{name}.awq_scale.weight"),
+        };
+        if let Some((sc_info, sc_data)) = hfq.tensor_data(&sidecar_name) {
+            if sc_info.quant_type != 1 {
+                eprintln!("warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping", sc_info.quant_type);
+            } else if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+                eprintln!("warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping", sc_info.shape, k);
+            } else {
+                let f32_data: Vec<f32> = sc_data
+                    .chunks_exact(2)
+                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                wt.awq_scale = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok();
+            }
+        }
     }
+    Ok(wt)
 }
 
 impl DflashWeights {
@@ -619,7 +651,12 @@ fn gemm_dispatch(
                 let x_chunk = x.sub_offset(row * w.k, n * w.k);
                 let y_chunk = y.sub_offset(row * w.m, n * w.m);
                 let rot_view = scratch.sub_offset(0, n * w.k);
-                if let Err(e) = gpu.rotate_x_mq_batched(&x_chunk, &rot_view, w.k, n) {
+                // AWQ-aware FWHT rotation. When the drafter weight ships an
+                // AWQ sidecar (`w.awq_scale.is_some()`), `_for` dispatches
+                // the `x /= awq_scale` + FWHT kernel; otherwise falls
+                // through to the plain `rotate_x_mq_batched` and is
+                // numerically identical to the prior dispatch.
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
                     chunked = Err(e);
                     break;
                 }
@@ -655,7 +692,12 @@ fn gemm_dispatch(
                 let x_chunk = x.sub_offset(row * w.k, n * w.k);
                 let y_chunk = y.sub_offset(row * w.m, n * w.m);
                 let rot_view = scratch.sub_offset(0, n * w.k);
-                if let Err(e) = gpu.rotate_x_mq_batched(&x_chunk, &rot_view, w.k, n) {
+                // Same AWQ-aware FWHT rotation as the MQ4 arm. Drafters
+                // that ship MQ3 AWQ sidecars (via the loader fix in
+                // `hfq_weight`) now actually receive the `x /= s` divide
+                // before the HFQ3 GEMM; pre-fix this silently produced
+                // wrong drafts on AWQ-calibrated drafters.
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
                     chunked = Err(e);
                     break;
                 }
