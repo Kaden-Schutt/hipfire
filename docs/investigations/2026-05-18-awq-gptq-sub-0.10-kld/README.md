@@ -81,3 +81,23 @@ Quantizer patched (commit `d7546297` on `iterative-awq-gptq`) to default to F1-o
 | c512 q8-KV KLD bench | (running) | expect ~0.1257 (matching v3) |
 
 **Caveat on `test_inference`**: this test rig compares `forward` vs `forward_scratch`. PR #266 added the AWQ-aware kernel dispatch to `forward` (decode) and `forward_prefill_batch` (the prefill batch path that the bench harness uses), but **not to `forward_scratch`**. So `forward_scratch` produces non-AWQ output and the divergence test trips. This is a pre-existing engine gap — the production runtime paths work correctly. A follow-on patch should either (a) wire AWQ into `forward_scratch` or (b) relax test 2 to skip when AWQ sidecars are present. Not a ship blocker.
+
+## ✅ Ship validation complete 2026-05-18 17:57 UTC
+
+F1-default quantizer produces **byte-identical KLD to v3**:
+
+```
+eval_hipfire: slice-mean KLD = 0.125730  mean NLL = 2.231066  PPL = 9.3098
+```
+
+vs v3's earlier bench: KLD 0.125730 / NLL 2.231066 / PPL 9.3098 — match to 6 decimal places.
+
+**The v3 recipe is now the default in `hipfire-quantize`** at commit `d7546297` on `iterative-awq-gptq`. Users get v3 quality with:
+```
+hipfire-quantize --format mq4 --awq --awq-alpha 0.5 --imatrix <gguf>
+mq4_masked_calib.py quantize --method gptq --gpu N --awq-aware-hessian <base> ...
+```
+
+No flag-tweaking needed; `--awq-scope f2` is opt-in for users who want the PR #273 extended whitelist.
+
+**Sub-0.10 was not achieved** in this investigation (4 hour grind across iterate runs 001-006, autoawq formula, alpha sweep). v3 (0.1257) remains the 9B Pareto winner. The methodology + repro recipe + branch state are committed for downstream resumption when better data or algorithmic levers (per-tensor α, iterative with raw-sum2 source) are available.
