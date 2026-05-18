@@ -169,7 +169,7 @@ to the exact generic kernel source instead of substring matches or stale docs.
 Render a terminal view that combines an Atlas row with an ISA manifest:
 
 ```bash
-.skills/hipfire-kernel-atlas/render-fit.sh \
+.agents/skills/hipfire-kernel-atlas/render-fit.sh \
   --row .codeinsight+research/kernel-atlas/runs/atlas-gfx1201.jsonl \
   --row-index 0 \
   --isa .codeinsight+research/kernel-atlas/runs/isa-gfx1201.json \
@@ -306,7 +306,7 @@ in the task/eval environment if multiple GPUs are visible. Do not compare a
 hiptrx row to hipx rows unless the prompt, binary md5, git diff md5, model,
 and variant env match.
 
-Agent-facing instructions live in `.skills/hipfire-kernel-atlas/`. Agents
+Agent-facing instructions live in `.agents/skills/hipfire-kernel-atlas/`. Agents
 should use that skill when a user asks for a visual readout of how a quant or
 kernel occupies the target ISA.
 
