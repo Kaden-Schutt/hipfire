@@ -479,7 +479,18 @@ production-realistic.
    - **Floor: median ≥ +15% prefill at n ≥ 128 on gfx1100.** Floor for gfx1151 set by Phase 1.0 ALU-only ceiling minus 1.5× the dequant tax.
    - Document BIOS/EC/DPM state for gfx1151 runs (per `tests/speed-baselines/gfx1151.txt:33-44` — same binary+prompt swings 245→151 across BIOS configs).
 
-## Phase 1.1.5 — sub_batch alignment fix (~1.5-3 hours)
+## Phase 1.1.5 — sub_batch alignment fix (~1.5-3 hours) — **BLOCKING for Phase 1.2 and Phase 1.3**
+
+> **Status (2026-05-18):** promoted from "recommended" to **required** after
+> a second measurement on gfx1100 reproduced the dilution pattern. Two
+> independent fresh-process A/Bs — one on the bench iGPU (gfx1151), one
+> on a dGPU (gfx1100) — both show the WMMA win pinned below the CLAUDE.md
+> Δ≥5% ship gate while a large fraction of the prefill silently runs the
+> scalar fallback. **All downstream phases (1.2 asym2, 1.3 default flip,
+> Phase 2) are blocked on Phase 1.1.5 landing and producing a clean
+> long-prefill measurement**, because that measurement — not the current
+> short-prefill numbers — is the signal that says whether further work is
+> justified.
 
 Phase 1.1 surfaced a real-deployment limitation: the WMMA auto-route
 gate requires `batch_size % WMMA_BLOCK_M == 0 && sub_batch % WMMA_BLOCK_M
@@ -490,12 +501,36 @@ grows past ~4 (i.e. prefill > ~512 tokens). For prefill=1024 we measured
 scalar.
 
 This means the WMMA path **only fires on the short-prefill regime**
-(~256-512 tokens for 9B). The +1.81% fresh-process win measured at
-prefill=2048 includes scalar runs for any chunk where sub_batch missed
-alignment, diluting the true WMMA contribution. Long prefill is where
-FA is the largest fraction of total prefill compute time (15-25% vs
-~7.5% at short prefill on 9B), so the real win is likely larger but
-masked.
+(~256-512 tokens for 9B). Two independent fresh-process A/Bs at
+n_ctx=2048 (where most chunks are running scalar fallback) bear this
+out:
+
+| GPU | model | Δ pipeline | paired t | source |
+|---|---|---:|---:|---|
+| gfx1151 | 9B mq3   | +1.81% | +9.46  | `devlog_20260517_wmma_fa_phase11_fresh_ab.md` |
+| gfx1151 | 0.8B mq4 | +4.06% | +34.87 | `devlog_20260517_wmma_fa_phase11_fresh_ab.md` |
+| gfx1100 | 4B mq4   | +2.04% | +18.55 | `devlog_20260518_wmma_fa_phase11_gfx1100.md` |
+| gfx1100 | 0.8B mq4 | +0.95% | +12.85 | `devlog_20260518_wmma_fa_phase11_gfx1100.md` |
+
+All four measurements are statistically clean (every paired round
+positive, no inversions) but none clear +5%. **The gfx1100 0.8B number
+(+0.95%) is particularly damning**: gfx1100 was the plan's primary
+target arch under the "ALU-bound on dGPU" hypothesis, and a clean t=12.85
+sub-1% lift on a small model says either (a) the FA fraction is even
+smaller than estimated once kernel-launch overhead is accounted for, or
+(b) silent scalar fallback is masking the win even at small prefills,
+or both. **Phase 1.1.5 is the cheapest experiment that disambiguates
+this** — once chunk_size unblocks the WMMA route across all sub_batches,
+the new long-prefill A/B is the signal we need.
+
+Long prefill is where FA is the largest fraction of total prefill
+compute time (15-25% vs ~7.5% at short prefill on 9B), so the real win
+is likely larger but masked. **Without Phase 1.1.5 we cannot tell the
+difference between "kernel is correct but FA is too small a fraction of
+prefill to matter" and "kernel works fine but is dilution-hidden by
+scalar fallback."** Those two diagnoses imply very different downstream
+plans — one says ship default-off and move on, the other says push
+further into the asym2 / hd=256 / RDNA4 stack.
 
 Two approaches exist; do **Approach B first**, then Approach A only if
 B's long-prefill bench shows enough lift to justify the memory cost.
@@ -560,12 +595,24 @@ complexity and Phase 1.3 (default flip) becomes defensible.
 
 ### Recommendation
 
-**Do Approach B (1.5-2 hours) before Phase 1.2.** Without it, the +1.81%
-measurement is misleading (it's averaging WMMA chunks with silent scalar
-fallbacks). After Approach B, the new long-prefill A/B gives the *real*
-WMMA win on this hardware. That number — not the current +1.81% — is
-what determines whether Phase 1.2 (asym2) and Phase 1.3 (default flip)
-are worth pursuing.
+**Approach B (1.5-2 hours) blocks Phase 1.2.** Without it, the current
+0.95–4.06% pipeline numbers across two GPUs are misleading — they're
+averaging WMMA chunks with silent scalar fallbacks. After Approach B,
+the new long-prefill A/B (n_ctx ≥ 4096) gives the *real* WMMA win on
+each hardware target. That number — not any of the current Phase 1.1
+measurements — is what determines whether Phase 1.2 (asym2), Phase 1.3
+(default flip), and Phase 2 (hd=256 + asym3) are worth pursuing.
+
+**Decision tree post-Phase-1.1.5:**
+
+- **Long-prefill ≥ +5% on at least one target arch** → Phase 1.2 and
+  Phase 1.3 are defensible. Proceed.
+- **Long-prefill +2-5% on both targets** → kernel is correct but
+  pipeline lift is structurally capped. Keep default-off, ship as
+  research scaffolding, drop Phase 1.2 / 1.3 / Phase 2 for now.
+- **Long-prefill < +2% on both targets** → kernel cost (LDS round-trip,
+  asym dequant overhead) is eating the WMMA win. Park the whole effort,
+  pivot to a different lever from issue #237.
 
 Approach A becomes a follow-up *only if* Approach B's number is high
 enough to justify the memory cost. If Approach B shows ~+5-10% on long
@@ -574,15 +621,32 @@ calls where `batch_size` itself is non-16-aligned) is worth the ~2-3
 hours. If Approach B still shows ~+2%, Approach A wouldn't move the
 needle and isn't worth doing.
 
-## Phase 1.2 — Asym2 + final gates (2-3 days)
+## Phase 1.2 — Asym2 + final gates (2-3 days) — **blocked on Phase 1.1.5**
+
+**Do not start until Phase 1.1.5 lands and its long-prefill A/B clears
+the decision tree above.** Without that signal there is no evidence the
+asym2 kernel would clear any ship gate — the asym2 kernel inherits the
+same dilution problem the asym4 kernel currently has.
 
 - **Asym2 source file** `kernels/src/attention_flash_asym2_wmma_tile_batched.hip` (~300 lines). 2-bit packing, `TURBO_C2` LUT. Same structural template as asym4; the dequant inner block changes.
 - **Re-run all Phase 1.1 acceptance gates** on asym2 model paths (Qwen 3.5 9B asym2 on gfx1151 specifically — this is the gfx1151 default-config path).
 - Coverage matrix: {gfx1100, gfx1151} × {asym4 explicit, asym2 default} × {9B, 27B} × {short, long-context}.
 
-## Phase 1.3 — Default flip (separate PR, after independent reproduction)
+## Phase 1.3 — Default flip (separate PR, after independent reproduction) — **blocked on Phase 1.1.5 + Phase 1.2**
 
-Mirror the `prompt_normalize` default-flip pattern (opt-in 2026-04-25 → default-flip 2026-04-26, separate commit 9a2c667). Only after Phase 1.2 lands and shows reproducible ≥ +15% across two independent bench runs (different sessions, fresh processes).
+Mirror the `prompt_normalize` default-flip pattern (opt-in 2026-04-25 →
+default-flip 2026-04-26, separate commit 9a2c667). Two prerequisites,
+both required:
+
+1. **Phase 1.1.5 long-prefill A/B clears ≥ +5% on at least one target
+   arch.** This replaces the prior "≥ +15%" bar, which the Phase 1.1
+   numbers across two GPUs make clear is structurally unreachable
+   without a much larger kernel-side change than what's planned. The
+   +5% bar matches the CLAUDE.md ship gate and is the lowest defensible
+   bar for moving a kernel default-on.
+2. **Phase 1.2 has landed** with reproducible numbers across two
+   independent bench runs (different sessions, fresh processes) on
+   both asym4 and asym2 paths.
 
 ## Phase 2 — head_dim=256 + asym3 (~3-4 days)
 
