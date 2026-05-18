@@ -1762,6 +1762,11 @@ def materialize_round_stats(round_dir: Path, stats_npz, stats_json) -> tuple[Pat
 
 
 def collect_iterate_round_stats(args, round_index: int, previous_model: str | None, round_dir: Path):
+    initial_npz = getattr(args, "initial_stats_npz", None)
+    if round_index == 0 and initial_npz:
+        initial_json = getattr(args, "initial_stats_json", None) or ""
+        print(f"[iterate] round 0: using --initial-stats-npz {initial_npz}", flush=True)
+        return materialize_round_stats(round_dir, initial_npz, initial_json)
     collect_dir = round_dir / "collect"
     collect_args = SimpleNamespace(
         hf_model=args.hf_model,
