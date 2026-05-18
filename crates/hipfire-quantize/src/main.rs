@@ -56,6 +56,7 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // AWQ at alpha=0.55; --awq <value> sets explicit alpha. Alpha=0 disables;
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
+static AWQ_FORMULA: OnceLock<bool> = OnceLock::new();  // true = autoawq formula, false/unset = paper
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -2499,6 +2500,52 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
 ///
 /// Cost: O(K). For 9B Qwen3.5 ~32 calls × ~4096 elements = ~131K ops total
 /// across the whole quantize. Negligible.
+/// AutoAWQ canonical formula:
+///   s[j] = RMS_act[j]^alpha * RMS_w[j]^(1-alpha)
+///
+/// Adds the weight-magnitude term that PR #266 deferred as small-effect.
+/// When stacked with AWQ-aware GPTQ, the weight RMS term balances per-channel
+/// quantization-error budget more evenly.
+fn compute_awq_scales_autoawq(in_sum2: &[f32], w_rms: &[f32], alpha: f32) -> Vec<f32> {
+    let k = in_sum2.len();
+    debug_assert!(k > 0, "empty imatrix vector");
+    debug_assert_eq!(w_rms.len(), k, "w_rms length must match imatrix");
+    let alpha = alpha as f64;
+    let one_minus_alpha = 1.0 - alpha;
+    let half_alpha = alpha * 0.5;
+    let mut log_s_raw = Vec::with_capacity(k);
+    let mut sum_log: f64 = 0.0;
+    for (&act_sq, &w) in in_sum2.iter().zip(w_rms.iter()) {
+        let act_clamped = (act_sq as f64).max(1e-12);
+        let w_clamped = (w as f64).max(1e-12);
+        // log(s) = alpha*0.5*log(act_sq) + (1-alpha)*log(w_rms)
+        let log_s = half_alpha * act_clamped.ln() + one_minus_alpha * w_clamped.ln();
+        log_s_raw.push(log_s);
+        sum_log += log_s;
+    }
+    let mean_log = sum_log / (k as f64);
+    log_s_raw.into_iter()
+        .map(|l| ((l - mean_log).exp()) as f32)
+        .collect()
+}
+
+/// Per-input-channel RMS over a row-major [m, k] weight tensor:
+/// `RMS_w[j] = sqrt((1/m) * Σ_i W[i,j]^2)`. fp64 accumulation.
+fn compute_weight_rms_per_input(weights: &[f32], m: usize, k: usize) -> Vec<f32> {
+    debug_assert_eq!(weights.len(), m * k, "weight buffer size mismatch");
+    let mut sums = vec![0.0f64; k];
+    for r in 0..m {
+        let row = &weights[r * k..(r + 1) * k];
+        for j in 0..k {
+            sums[j] += (row[j] as f64).powi(2);
+        }
+    }
+    let inv_m = 1.0 / (m as f64);
+    sums.into_iter()
+        .map(|s| ((s * inv_m).sqrt()) as f32)
+        .collect()
+}
+
 fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     let k = in_sum2.len();
     debug_assert!(k > 0, "empty imatrix vector");
@@ -3260,7 +3307,18 @@ fn main() {
             eprintln!("warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway");
         }
         AWQ_ALPHA.set(awq_alpha).expect("AWQ_ALPHA set twice — should not happen");
-        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)");
+
+        let awq_formula = args.iter().position(|a| a == "--awq-formula")
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+            .unwrap_or("paper");
+        if !matches!(awq_formula, "paper" | "autoawq") {
+            eprintln!("error: --awq-formula must be 'paper' or 'autoawq', got '{awq_formula}'");
+            std::process::exit(1);
+        }
+        AWQ_FORMULA.set(awq_formula == "autoawq").ok();
+        let formula_label = if awq_formula == "autoawq" { "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)" } else { "s[j]=(RMS_act[j])^alpha" };
+        eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -3855,7 +3913,13 @@ fn main() {
                             debug_assert_eq!(im_weights.len(), k_dim,
                                 "imatrix length ({}) != K dim ({}) for {}",
                                 im_weights.len(), k_dim, name);
-                            let scales = compute_awq_scales(im_weights, alpha);
+                            let m_dim_awq = meta.shape[0];
+                            let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
+                                let w_rms = compute_weight_rms_per_input(&f32_data, m_dim_awq, k_dim);
+                                compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                            } else {
+                                compute_awq_scales(im_weights, alpha)
+                            };
                             // Stash for sidecar emission after the main tensor push.
                             awq_sidecar_scales = Some(scales.clone());
                             let m_dim = meta.shape[0];
