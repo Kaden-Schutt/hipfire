@@ -1016,6 +1016,13 @@ def quantize_candidate(args):
                 scale = awq_hessian_scales.get(awq_sidecar_name)
                 if scale is not None:
                     hrot = apply_awq_hessian_transform(hrot, scale)
+                    # AWQ-aware GPTQ also needs source weights pre-scaled by s
+                    # so the GPTQ solve targets W·diag(s), matching the runtime
+                    # invariant: (W·s)·(x/s) = W·x. Without this, GPTQ aims at
+                    # raw W and the runtime x/s divide produces per-channel
+                    # corruption (KLD ~1.75 vs expected ~0.10–0.13).
+                    import numpy as _np
+                    values = _np.asarray(values, dtype=_np.float32) * scale[_np.newaxis, :]
             if gptq_device is not None:
                 packed, method_stats = quantize_mq4_gptq_torch(
                     values,
