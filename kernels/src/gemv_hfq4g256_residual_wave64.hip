@@ -6,8 +6,18 @@
 //
 // block=[64,1,1] packs two rows per block (one per warp); grid halves from
 // M to (M + 1) / 2. Each warp's 32-lane reduction is byte-exact with the
-// wave32 base kernel's pyramid (lane 0 per warp writes output; the
-// `__shfl_down` chain stays within the 32-lane warp).
+// wave32 base kernel's pyramid: only lane 0 of each half-warp writes its
+// row's output, so only lanes 0 and 32 need a correct partial sum.
+//
+// CAUTION on the `__shfl_down` width: on wave64 archs `__shfl_down`
+// defaults to `width=warpSize=64`, so `offset=16` reads from `lane+16`
+// which crosses the 32-lane boundary. The math is still byte-exact
+// with the wave32 base kernel because lanes 16-31 read cross-warp data
+// but DON'T write output — only lanes 0 and 32 write their row's
+// result, and each lane-0 final reduction only consumes values from
+// its own 32-lane half. Do NOT add `width=32` to "match" this comment
+// — the current code intentionally relies on the default width=64
+// semantics; changing it would alter the pyramid's read pattern.
 //
 // Identical math to gemv_hfq4g256_residual: 4-accumulator interleave + tail
 // per-quad-bucket + final pairwise combine. Output line at the end uses

@@ -284,6 +284,15 @@ pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../ke
 /// per-layer wo + w_down at B>1.
 pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
 
+/// HFQ4 sibling of `GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC` (issue #276,
+/// Gap 2 from the HFQ4/HFQ6 dp4a parity audit). Same structural pattern
+/// as the HFQ4 lm-head `gemm_hfq4g256_wave64_dp4a` with `+=` residual
+/// write semantic. Closes the dispatch gap where MQ4 at gfx906 B>1 below
+/// the MMQ cutover (B ∈ [2, 7]) falls to FP16 wave64; the dp4a path wins
+/// on per-call ALU and reuses the Q8_1 scratch. Ships BATCH_TILE=16 from
+/// the start per the HFQ6 Phase B.1.1 measurement (commit ff9e2105).
+pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64_dp4a.hip");
+
 /// Phase A.3 (plan v3.2.3 §5.1 item 3): wave64+dp4a batched fused
 /// GEMMs for HFQ6/MQ6 prefill. Sibling of A.2 with multi-output row
 /// routing (qkvza 4-way, qkv 3-way, gate_up 2-way). Overwrite output
@@ -292,6 +301,19 @@ pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../
 pub const GEMM_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wave64_dp4a.hip");
 pub const GEMM_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wave64_dp4a.hip");
 pub const GEMM_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wave64_dp4a.hip");
+
+/// HFQ4 siblings of the HFQ6 Phase A.3 fused dp4a kernels (issue #276
+/// Gap 2 part 2 of 4). Wave64+dp4a batched fused GEMMs at gfx906 for
+/// MQ4 prefill at B>1. Close the dispatch fallthroughs where MQ4 today
+/// drops to `gemm_*_hfq4g256_fp16_wave64` for the multi-output paths.
+/// Ship `BATCH_TILE=16` from the start per HFQ6 Phase B.1.1 (commits
+/// 2bee6e6b / ff9e2105). Math identity: signed 4-bit nibble unpack +
+/// `zp_eff = zp + 8*sc` matching the HFQ4 lm-head dp4a sibling
+/// `gemm_hfq4g256_wave64_dp4a.hip` and the HFQ4 residual dp4a
+/// `gemm_hfq4g256_residual_wave64_dp4a.hip`.
+pub const GEMM_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_QKV_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wave64_dp4a.hip");
 
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
@@ -309,6 +331,16 @@ pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g2
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
+/// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
+/// when the upcoming linear carries an `awq_scale` sidecar. Math:
+/// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
+pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
+/// for the down_proj / w_down input stage. Dispatched when down_proj
+/// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE
+/// signs1 gather and FWHT.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.

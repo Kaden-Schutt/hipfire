@@ -22,7 +22,7 @@ use std::sync::OnceLock;
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
-// 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.5]), each linear-layer
+// 2023). When AWQ_ALPHA is set (via --awq [<alpha>=0.55]), each linear-layer
 // weight gets per-input-channel pre-scaling applied BEFORE the standard
 // quantize+rotation path:
 //
@@ -52,8 +52,8 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 //     (g=16 NVFP4, g=32 MXFP4), "outlier mitigation is provably neutralized".
 //     This applies to MFP4G32 but NOT to MQ4G256 — AWQ should work on MQ4.
 //
-// Default alpha = 0.5 (AWQ paper's grid-search center). --awq alone enables
-// AWQ at alpha=0.5; --awq <value> sets explicit alpha. Alpha=0 disables;
+// Default alpha = 0.55 (hipfire F2 sweep winner). --awq alone enables
+// AWQ at alpha=0.55; --awq <value> sets explicit alpha. Alpha=0 disables;
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 
@@ -2557,30 +2557,47 @@ fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
 }
 
 /// AWQ pre-scaling is mathematically valid only for weights whose runtime
-/// path applies the inverse divide-by-scale. Those are the weights fed via
-/// `fused_rmsnorm_rotate_mq` / `fused_rmsnorm_rotate_mq_awq` (the AWQ-aware
-/// variant dispatches when `awq_scale.is_some()`): the post-RMSNorm linear
-/// projections.
+/// path applies the inverse divide-by-scale. As of F2 (2026-05-14), this
+/// covers both the input-side projections (fed via the AWQ-aware variants
+/// of `fused_rmsnorm_rotate_mq` from F1) AND the output-side projections
+/// (`o_proj` / `out_proj` / `down_proj` / `w_down`, fed via the AWQ-aware
+/// variants `rotate_x_mq_awq` and `fused_silu_mul_mq_rotate_awq` from F2).
 ///
-/// Weights NOT on this whitelist — `o_proj` / `wo` (full-attn output),
-/// `out_proj` (linear-attn output), `down_proj` / `w_down` (MLP output)
-/// — are fed by `rotate_x_mq` or `fused_silu_mul_rotate_mq`, neither of
-/// which has AWQ awareness. Pre-scaling those weights without a runtime
-/// compensating divide produces `(W·s) · x ≠ W · x` — catastrophic logits
-/// (measured: 0.8B Qwen3.5 KLD blowup 0.6721 → 13.4893, see
-/// `docs/plans/awq_fix_claude.md`).
+/// Runtime path mapping for AWQ inverse divide-by-scale:
+/// - `fused_rmsnorm_mq_rotate_awq`: post-RMSNorm input projections
+///   (q/k/v/qkv, gate/up, in_proj_*, router, gate_up_proj)
+/// - `rotate_x_mq_awq`: post-attention input to o_proj / out_proj
+/// - `fused_silu_mul_mq_rotate_awq`: post-SwiGLU input to down_proj
 ///
-/// Whitelist (vs blacklist) is the safe default: a new tensor name in a
-/// future arch fails closed (no AWQ) until someone confirms its runtime
-/// path is AWQ-aware. A blacklist would silently corrupt new weights.
+/// Pre-F2 history: until 2026-05-14, output-side projections (o_proj /
+/// out_proj / down_proj / w_down) were NOT on this whitelist because
+/// their runtime path lacked AWQ-aware kernels. Pre-scaling them without
+/// a runtime compensating divide produces `(W·s) · x ≠ W · x` — measured
+/// 0.8B Qwen3.5 KLD blowup 0.6721 → 13.4893; see `awq_fix_claude.md`.
+/// F2 added those kernels (`rotate_x_mq_awq` / `fused_silu_mul_mq_rotate_awq`)
+/// plus `_for` helper routing in hipfire-runtime/llama.rs, so the whitelist
+/// is now safe to expand.
+///
+/// Whitelist (vs blacklist) is still the safe default: a new tensor name
+/// in a future arch fails closed (no AWQ) until someone confirms its
+/// runtime path is AWQ-aware.
 fn awq_eligible(name: &str) -> bool {
-    // Full-attention pre-RMSNorm projections (HF naming + fused variants).
+    // F1-vs-F2 A/B gate. When `HIPFIRE_AWQ_F1_ONLY=1` is set, the F2
+    // additions below (o_proj / wo / out_proj / down_proj / w_down)
+    // are excluded — produces an F1-equivalent quant for comparison
+    // bench against the same binary's F2 quant. Default (env unset):
+    // the full F2 whitelist applies.
+    let f1_only = std::env::var("HIPFIRE_AWQ_F1_ONLY")
+        .ok()
+        .as_deref() == Some("1");
+    let f1_match =
+    // Full-attention input projections (HF naming + fused variants).
     name.ends_with("q_proj.weight")
         || name.ends_with("k_proj.weight")
         || name.ends_with("v_proj.weight")
         || name.ends_with("qkv_proj.weight")
         || name.ends_with("wqkv.weight")
-        // MLP pre-RMSNorm projections (HF + hipfire-internal naming).
+        // MLP input projections (HF + hipfire-internal naming).
         || name.ends_with("gate_proj.weight")
         || name.ends_with("up_proj.weight")
         || name.ends_with("w_gate.weight")
@@ -2589,10 +2606,7 @@ fn awq_eligible(name: &str) -> bool {
         // experts.gate_up_proj is [num_experts, 2*intermediate, hidden]
         // with rows split between gate and up halves). Same input-side
         // semantics as gate_proj/up_proj: post-RMSNorm hidden state
-        // routed via the MoE dispatch. Counterpart `experts.down_proj`
-        // is intentionally NOT on the whitelist — its input is
-        // silu(gate)*up and the runtime uses fused_silu_mul_rotate_mq
-        // (no AWQ inverse), same as the dense `down_proj` case.
+        // routed via the MoE dispatch.
         || name.ends_with("gate_up_proj.weight")
         // Linear-attention input projections (Qwen3.5 Gated-DeltaNet).
         // Suffix varies (in_proj_qkv / _z / _a / _b); the substring is
@@ -2607,7 +2621,24 @@ fn awq_eligible(name: &str) -> bool {
         // correctness. `router.weight` would be a non-HF naming an
         // arch might choose; kept for safety.
         || name.ends_with("mlp.gate.weight")
-        || name.ends_with("router.weight")
+        || name.ends_with("router.weight");
+    if f1_only { return f1_match; }
+    let f2_match =
+        // ── F2 (2026-05-14): output-side projections ────────────────────
+        // These now have AWQ-aware runtime kernels (rotate_x_mq_awq for
+        // o_proj/out_proj/wo; fused_silu_mul_mq_rotate_awq for down_proj/w_down).
+        // Runtime dispatch routes through _for helpers in llama.rs based on
+        // WeightTensor.awq_scale.
+        //
+        // FullAttention output projection (HF + hipfire-internal naming).
+        name.ends_with("o_proj.weight")
+        || name.ends_with("wo.weight")
+        // LinearAttention output projection (Qwen3.5 Gated-DeltaNet).
+        || name.ends_with("out_proj.weight")
+        // MLP down projection (HF + hipfire-internal naming).
+        || name.ends_with("down_proj.weight")
+        || name.ends_with("w_down.weight");
+    f1_match || f2_match
 }
 
 /// True if the tensor is the token embedding. We Q8 these (matches the
@@ -3199,7 +3230,7 @@ fn main() {
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
-    // --awq           → enable AWQ at default alpha=0.5
+    // --awq           → enable AWQ at default alpha=0.55
     // --awq-alpha <f> → enable AWQ at explicit alpha (overrides default)
     // Requires --imatrix (we derive RMS_act from imatrix's in_sum2 values).
     // Per-channel scaling: W' = W · diag(s) at quantize time, sidecar
@@ -3219,7 +3250,7 @@ fn main() {
     let awq_alpha = args.iter().position(|a| a == "--awq-alpha")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<f32>().ok())
-        .unwrap_or(0.5);
+        .unwrap_or(0.55);
     if awq_enabled {
         if IMATRIX.get().is_none() {
             eprintln!("error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)");

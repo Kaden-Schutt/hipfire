@@ -5,6 +5,9 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, WeightTensor, weight_gemv,
                               weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               fused_rmsnorm_rotate_mq_batched_for,
+                              rotate_x_mq_for, rotate_x_mq_batched_for,
+                              fused_silu_mul_rotate_mq_for,
+                              fused_silu_mul_rotate_mq_batched_for,
                               weight_gemv_residual, weight_gemv_swiglu_residual};
 use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
@@ -2046,7 +2049,14 @@ fn moe_ffn_decode_impl(
     let x_rot_local = if gate_side_mq4 {
         gpu.ensure_mq_signs()?;
         if !x_rot_prerotated {
-            gpu.rotate_x_mq(x_norm, s.x_rot_local, config.dim)?;
+            // F2 / F1: AWQ-aware rotate. All gate-side downstream linears
+            // (router, shared_expert_gate, shared_expert.{gate,up}, all
+            // experts.gate_up) share the same input basis → identical
+            // imatrix → byte-identical AWQ scales. Pick `ffn.router` as a
+            // representative (it's on the F1 whitelist for AWQ scales).
+            // When AWQ is disabled (no sidecar), routes to the non-AWQ
+            // kernel — byte-identical to pre-F2.
+            rotate_x_mq_for(gpu, &ffn.router, x_norm, s.x_rot_local, config.dim)?;
         }
         // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
         Some(s.x_rot_local)
@@ -2147,7 +2157,8 @@ fn moe_ffn_decode_impl(
             shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
-        gpu.fused_silu_mul_rotate_mq(&shared_gate, &shared_up, &x_rot_alias, smi)?;
+        // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
+        fused_silu_mul_rotate_mq_for(gpu, &ffn.shared_expert.down, &shared_gate, &shared_up, &x_rot_alias, smi)?;
         gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
             &ffn.shared_expert.down.buf, &x_rot_alias, x_residual, scalar_buf,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k,
@@ -2180,7 +2191,10 @@ fn moe_ffn_decode_impl(
             xr, s.gate_batch, s.up_batch,
             2 * mi, gate_up_k,
         )?;
-        gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+        // F2: AWQ-aware silu_mul+rotate. All experts in this MoE layer
+        // share the same input residual basis → same imatrix → byte-
+        // identical AWQ scales; experts[0].down is representative.
+        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
         gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
             &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
             s.rot_batch, x_residual,
@@ -2211,7 +2225,9 @@ fn moe_ffn_decode_impl(
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, e0.gate_up.k,
             )?;
-            gpu.fused_silu_mul_rotate_mq_batched(s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+            // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative
+            // (all experts share imatrix at this layer's residual basis).
+            fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
             let scales = [
                 topk_weights[0], topk_weights[1], topk_weights[2], topk_weights[3],
                 topk_weights[4], topk_weights[5], topk_weights[6], topk_weights[7],
@@ -2240,7 +2256,8 @@ fn moe_ffn_decode_impl(
                         shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                         dtype: DType::F32,
                     };
-                    gpu.fused_silu_mul_rotate_mq(&gate_view, &up_view, &x_rot_alias, mi)?;
+                    // F2: AWQ-aware silu_mul+rotate for this expert's down input.
+                    fused_silu_mul_rotate_mq_for(gpu, &expert.down, &gate_view, &up_view, &x_rot_alias, mi)?;
                     gpu.gemv_hfq4g256_residual_scaled_cpu(
                         &expert.down.buf, &x_rot_alias, x_residual, weight,
                         expert.down.m, expert.down.k,
@@ -4163,7 +4180,8 @@ fn prefill_moe_ffn_body_batched(
     // fused_silu_mul_rotate_mq_batched expects [batch × k] gate/up with
     // batch on grid.y and writes FWHT(silu(gate) * up) into x_rot. Here
     // batch=N, k=smi; the shared-rot output buffer is [N × smi].
-    gpu.fused_silu_mul_rotate_mq_batched(shared_gate, shared_up, shared_rot, smi, n)?;
+    // F2: AWQ-aware silu_mul+rotate for the batched shared-expert down input.
+    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
 
     // ── 5. Shared-expert down with sigmoid-scaled residual, batched ──
     //
@@ -4191,7 +4209,9 @@ fn prefill_moe_ffn_body_batched(
 
     // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
     // expert ranks, k=mi is per-row width.
-    gpu.fused_silu_mul_rotate_mq_batched(gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+    // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative (all
+    // experts at this layer share imatrix at the same residual basis).
+    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
 
     // Down projection with per-(token, expert) scaling and atomic
     // residual-add into pbs.x_batch.
@@ -4653,7 +4673,9 @@ fn forward_prefill_chunk(
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let wo_input = if wo_is_mq {
-                    gpu.rotate_x_mq_batched(
+                    // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
+                    rotate_x_mq_batched_for(
+                        gpu, &layer.wo,
                         &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
                     )?;
                     &pbs.dn_normed_rot_batch
@@ -4787,7 +4809,9 @@ fn forward_prefill_chunk(
                 let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 if w_down_is_mq {
-                    gpu.fused_silu_mul_rotate_mq_batched(
+                    // F2: AWQ-aware silu_mul+rotate for w_down input.
+                    fused_silu_mul_rotate_mq_batched_for(
+                        gpu, &layer.w_down,
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                         hidden_dim, n,
                     )?;
@@ -5233,7 +5257,9 @@ fn forward_prefill_chunk(
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_input = if fa_wo_is_mq {
-                    gpu.rotate_x_mq_batched(
+                    // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
+                    rotate_x_mq_batched_for(
+                        gpu, &layer.wo,
                         &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
                     )?;
                     &pbs.fa_attn_out_rot_batch
@@ -5356,7 +5382,9 @@ fn forward_prefill_chunk(
                 let fa_w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
                 if fa_w_down_is_mq {
-                    gpu.fused_silu_mul_rotate_mq_batched(
+                    // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
+                    fused_silu_mul_rotate_mq_batched_for(
+                        gpu, &layer.w_down,
                         &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                         hidden_dim, n,
                     )?;
@@ -5575,7 +5603,9 @@ fn forward_prefill_chunk(
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
                 // wo + residual. Eligibility gate ensured layer.wo is MQ4.
-                gpu.rotate_x_mq_batched(
+                // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
+                rotate_x_mq_batched_for(
+                    gpu, &layer.wo,
                     &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
                 )?;
                 gpu.gemm_hfq4g256_residual(
@@ -5880,7 +5910,9 @@ fn forward_prefill_chunk(
                 }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Eligibility gate ensured layer.wo is MQ4.
-                gpu.rotate_x_mq_batched(
+                // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
+                rotate_x_mq_batched_for(
+                    gpu, &layer.wo,
                     &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
                 )?;
                 gpu.gemm_hfq4g256_residual(

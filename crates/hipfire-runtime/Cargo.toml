@@ -163,6 +163,10 @@ name = "dump_logits_qwen35"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "greedy_dump"
 required-features = ["arch-qwen35"]
 

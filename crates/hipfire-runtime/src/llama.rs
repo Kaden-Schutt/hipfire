@@ -576,6 +576,23 @@ pub fn weight_gemv(
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
         DType::HFP4G32 => gpu.gemv_hfp4g32(&w.buf, x, y, w.m, w.k),
+        // ── MQ-family GEMVs ─────────────────────────────────────────
+        // F2 fix (2026-05-14): the `_with_rotate` variants below all
+        // internally call bare `gpu.rotate_x_mq` (non-AWQ). When the
+        // weight carries an AWQ sidecar, that produces `(W·s)·x ≠ W·x`
+        // corruption. Route AWQ-carrying weights through
+        // `rotate_x_mq_for` (AWQ-aware) + prerotated GEMV instead. When
+        // no AWQ scale is present, the helper falls through to the
+        // non-AWQ rotate kernel — byte-identical to the prior
+        // `_with_rotate` path.
+        //
+        // Today only MQ4G256 can carry AWQ sidecars (the quantizer
+        // gates AWQ to that branch — see hipfire-quantize/src/main.rs
+        // §"Phase A Stage A: AWQ"). The other MQ-family arms still
+        // route through `rotate_x_mq_for`, which is correct by virtue
+        // of `awq_scale` being None on those tensors today — and
+        // remains correct if AWQ support is ever extended to other
+        // MQ formats.
         DType::MFP4G32 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -583,7 +600,18 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mfp4g32_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            // Preserve the gfx12 dual-FP8 fast path inside
+            // `gemv_mfp4g32_with_rotate` when AWQ is not in play. The
+            // quantizer cannot emit AWQ sidecars for MFP4G32 today (AWQ
+            // is gated to MQ4G256), so the `is_some()` branch is
+            // unreachable from today's pipeline — kept for forward
+            // compatibility if AWQ is ever widened to MFP4.
+            if w.awq_scale.is_some() {
+                rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+                gpu.gemv_mfp4g32_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
+            } else {
+                gpu.gemv_mfp4g32_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            }
         }
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
@@ -592,7 +620,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq4g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ6G256 => {
             gpu.ensure_mq_signs()?;
@@ -601,7 +630,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq6g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq6g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256 => {
             gpu.ensure_mq_signs()?;
@@ -610,7 +640,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq3g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq3g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ2G256 => {
             gpu.ensure_mq_signs()?;
@@ -619,7 +650,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq2g256_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq2g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ2G256Lloyd => {
             gpu.ensure_mq_signs()?;
@@ -628,7 +660,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq2g256_lloyd_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq2g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256Lloyd => {
             gpu.ensure_mq_signs()?;
@@ -637,7 +670,8 @@ pub fn weight_gemv(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.gemv_mq3g256_lloyd_with_rotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq3g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ8G256 => {
             gpu.ensure_mq_signs()?;
@@ -759,7 +793,17 @@ pub fn rotate_x_for_mq<'a>(
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
         | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
-            gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
+            // Phase A Stage A — F2: route to AWQ variant when the
+            // downstream linear (the GEMV consuming x_rot) carries an
+            // `awq_scale` sidecar. `sample_weight` IS that downstream
+            // linear (callers pass o_proj / out_proj here). For Stage A
+            // pre-F2 quants, awq_scale is None on these tensors so the
+            // non-AWQ kernel runs — byte-identical to pre-F2 behavior.
+            if let Some(awq) = sample_weight.awq_scale.as_ref() {
+                gpu.rotate_x_mq_awq(x, awq, x_rot_scratch, sample_weight.k)?;
+            } else {
+                gpu.rotate_x_mq(x, x_rot_scratch, sample_weight.k)?;
+            }
             Ok(Some(x_rot_scratch))
         }
         DType::MQ8G256 => {
@@ -767,6 +811,89 @@ pub fn rotate_x_for_mq<'a>(
             Ok(None)
         }
         _ => Ok(None),
+    }
+}
+
+/// Phase A Stage A — F2: standalone AWQ-aware variant of `rotate_x_mq`.
+///
+/// Wraps `Gpu::rotate_x_mq` / `Gpu::rotate_x_mq_awq` with AWQ-aware
+/// dispatch. The `next_linear` is the downstream weight that consumes
+/// `x_rot` (typically `o_proj` / `out_proj` / `down_proj`). When its
+/// `awq_scale` is `Some`, dispatches the AWQ kernel which divides
+/// activations by `awq_scale[i]` before the FWHT — completes the math
+/// `(W·s) · (x/s) = W·x`.
+///
+/// Byte-identical to `Gpu::rotate_x_mq` on .hfq files without AWQ
+/// sidecars (which is the only state that exists pre-F2).
+pub fn rotate_x_mq_for(
+    gpu: &mut Gpu,
+    next_linear: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.rotate_x_mq_awq(x, awq, x_rot, k)
+    } else {
+        gpu.rotate_x_mq(x, x_rot, k)
+    }
+}
+
+/// Phase A Stage A — F2: batched AWQ-aware variant of `rotate_x_mq`.
+/// Grid.y is the batch dim. See `rotate_x_mq_for` for routing logic.
+pub fn rotate_x_mq_batched_for(
+    gpu: &mut Gpu,
+    next_linear: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.rotate_x_mq_awq_batched(x, awq, x_rot, k, batch_size)
+    } else {
+        gpu.rotate_x_mq_batched(x, x_rot, k, batch_size)
+    }
+}
+
+/// Phase A Stage A — F2: standalone AWQ-aware variant of
+/// `fused_silu_mul_rotate_mq`. The `down_proj_weight` is the downstream
+/// linear consuming x_rot (e.g. `w_down` / `down_proj`). When its
+/// `awq_scale` is `Some`, dispatches the AWQ kernel which divides
+/// silu(gate)*up by `awq_scale[i]` before the FWHT.
+///
+/// Byte-identical to `Gpu::fused_silu_mul_rotate_mq` on .hfq files
+/// without AWQ sidecars (pre-F2 state).
+pub fn fused_silu_mul_rotate_mq_for(
+    gpu: &mut Gpu,
+    down_proj_weight: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
+        gpu.fused_silu_mul_rotate_mq_awq(gate, up, awq, x_rot, k)
+    } else {
+        gpu.fused_silu_mul_rotate_mq(gate, up, x_rot, k)
+    }
+}
+
+/// Phase A Stage A — F2: batched AWQ-aware variant of
+/// `fused_silu_mul_rotate_mq`. Grid.y is the batch dim.
+pub fn fused_silu_mul_rotate_mq_batched_for(
+    gpu: &mut Gpu,
+    down_proj_weight: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
+        gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
+    } else {
+        gpu.fused_silu_mul_rotate_mq_batched(gate, up, x_rot, k, batch_size)
     }
 }
 
@@ -872,7 +999,10 @@ pub fn weight_gemv_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            // F2: AWQ-aware routing. `w` is the downstream linear that
+            // consumes x_rot; route via _for helper so its awq_scale (if
+            // any) is applied via the AWQ kernel variant.
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq6g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ4G256 => {
@@ -882,7 +1012,10 @@ pub fn weight_gemv_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            // F2: AWQ-aware routing. `w` is the downstream linear that
+            // consumes x_rot; route via _for helper so its awq_scale (if
+            // any) is applied via the AWQ kernel variant.
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq4g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256 => {
@@ -897,7 +1030,10 @@ pub fn weight_gemv_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            // F2: AWQ-aware routing. `w` is the downstream linear that
+            // consumes x_rot; route via _for helper so its awq_scale (if
+            // any) is applied via the AWQ kernel variant.
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_hfq3g256_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         DType::MQ3G256Lloyd => {
@@ -912,7 +1048,10 @@ pub fn weight_gemv_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.rotate_x_mq(x, &x_rot_alias, w.k)?;
+            // F2: AWQ-aware routing. `w` is the downstream linear that
+            // consumes x_rot; route via _for helper so its awq_scale (if
+            // any) is applied via the AWQ kernel variant.
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
         _ => {
@@ -957,7 +1096,9 @@ pub fn weight_gemv_swiglu_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            // F2: AWQ-aware routing for the down_proj input stage.
+            // `w_down` IS the downstream weight; route through _for helper.
+            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq4g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ3G256 => {
@@ -972,7 +1113,9 @@ pub fn weight_gemv_swiglu_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            // F2: AWQ-aware routing for the down_proj input stage.
+            // `w_down` IS the downstream weight; route through _for helper.
+            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq3g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ3G256Lloyd => {
@@ -986,7 +1129,9 @@ pub fn weight_gemv_swiglu_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            // F2: AWQ-aware routing for the down_proj input stage.
+            // `w_down` IS the downstream weight; route through _for helper.
+            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ6G256 => {
@@ -998,7 +1143,9 @@ pub fn weight_gemv_swiglu_residual(
                 shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
-            gpu.fused_silu_mul_rotate_mq(gate, up, &x_rot_alias, w_down.k)?;
+            // F2: AWQ-aware routing for the down_proj input stage.
+            // `w_down` IS the downstream weight; route through _for helper.
+            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         _ => {
@@ -1787,7 +1934,9 @@ fn forward_prefill_chunk(
         let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
         let wo_input = if wo_is_mq {
-            gpu.rotate_x_mq_batched(
+            // F2: AWQ-aware rotate for wo (FullAttention output projection) input.
+            rotate_x_mq_batched_for(
+                gpu, &layer.wo,
                 &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
             )?;
             &pbs.fa_attn_out_rot_batch
@@ -1878,7 +2027,9 @@ fn forward_prefill_chunk(
         let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
         if w_down_is_mq {
-            gpu.fused_silu_mul_rotate_mq_batched(
+            // F2: AWQ-aware silu_mul+rotate for w_down input.
+            fused_silu_mul_rotate_mq_batched_for(
+                gpu, &layer.w_down,
                 &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch,
                 hidden_dim, n,
             )?;
