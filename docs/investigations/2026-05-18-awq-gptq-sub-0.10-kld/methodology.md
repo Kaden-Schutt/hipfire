@@ -157,3 +157,33 @@ Codex implementation on branch `iterative-awq-gptq` (commit `f286bade`). Parity 
 - Sub-0.10 is guaranteed — iterative rounds may converge above 0.10 if v3 is already near the AWQ+GPTQ local optimum
 - These numbers transfer to non-9B Qwen models (per-model retuning may be needed)
 - Decode tok/s is identical to flat-mq4 (not measured directly; expected to match within ~0% based on kernel design but should be confirmed if it's a ship axis)
+
+## Phase 8a: iterative pipeline (run-001) — AWQ scope mismatch discovered
+
+**Approach**: spawned Codex to implement an `iterate` subcommand on `mq4_masked_calib.py` chaining the KM steps. Branch `iterative-awq-gptq` at commit `f286bade`. Parity tests passed in synthetic (identity-round byte-match, damping=0 stability, 3-round damped FPI deltas halving).
+
+**Real-data run** with `--awq-alpha 0.5 --damping 0.5 --max-rounds 4 --bench-each-round`:
+
+| Round | KLD c512 | PPL | scale-delta vs prev | Elapsed | Notes |
+|---:|---:|---:|---:|---:|---|
+| 0 | 0.6999 | 11.66 | — | 1810 s | should match v3's 0.1257 but doesn't |
+| 1 | 0.4521 | 8.75 | 0.039 (3.9%) | 1945 s | iterating but converging to wrong fixed point |
+| 2-3 | aborted | — | — | — | killed once scope bug diagnosed |
+
+**Root cause**: Codex's `selected_iterate_targets` selected ALL 91 packable_flat_mq4 tensors from the mask as the AWQ scope — **including lm_head and other output-side projections**. On master without PR-#273 F2 kernels, those tensors have no runtime `x/s` inverse (they don't pass through the AWQ-aware fused rotate kernel). Applying AWQ pre-scaling produces `(W·s)·x ≠ W·x` per-channel corruption — same failure-mode signature as Path 1.
+
+v3 keeps AWQ and GPTQ scopes separate:
+- AWQ scope: 184 tensors (Rust quantizer's `awq_eligible(name)` F1 whitelist — suffix-match on q/k/v_proj, gate/up_proj, in_proj_*, router, mlp.gate)
+- GPTQ scope: 67 tensors (a different `mask.json` produced by `mq4_masked_calib.py mask` step)
+
+Codex's iterate conflated these → 91 sidecars total, wrong subset, corruption on the misaligned ones.
+
+**Fix** (commit `63ba8aa1`): added `_is_awq_eligible_f1` in `scripts/mq4_masked_calib.py` mirroring Rust's `awq_eligible()` F1 scope exactly. `selected_iterate_targets` now filters by this predicate, so AWQ scales are only computed for input-side projections.
+
+**Lesson**: when porting AWQ-eligibility logic across languages, mirror the source-of-truth function exactly (suffix-match list). Don't infer eligibility from adjacent metadata like `packable_flat_mq4` — that's a GPTQ-target marker, not an AWQ-eligibility marker.
+
+## Phase 8b: iterative pipeline (run-002) — F1-scope-fixed
+
+Same command as run-001 but with the F1-scope fix at commit `63ba8aa1`. Expected round 0 KLD: close to v3's 0.1257 (some residual difference from in-process imatrix collection vs unsloth's pre-collected imatrix).
+
+(Results populating to [results.md](results.md) as monitor fires.)

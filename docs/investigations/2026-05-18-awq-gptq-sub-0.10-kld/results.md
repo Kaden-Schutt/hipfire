@@ -56,3 +56,19 @@ GPTQ writes per-tensor reconstruction metric (`metric=` field per tensor). v3's 
 | 4 | ⏳ | ⏳ | ⏳ | ⏳ | last round (max-rounds=4) |
 
 Damping β=0.5, ε=0.01 stopping criterion. Will populate as monitor fires.
+
+## Iterative pipeline run-001 (deprecated — AWQ scope bug)
+
+**Status**: aborted after round 1. Codex's iterate selected 91 AWQ targets (= GPTQ mask scope) instead of v3's 184 F1-AWQ-eligible scope. Output-side tensors like lm_head got AWQ pre-scaling without runtime inverse → corruption.
+
+| Round | KLD c512 | PPL | scale-delta | Elapsed | Status |
+|---:|---:|---:|---:|---:|---|
+| 0 | 0.6999 | 11.66 | — | 30 min | broken (lm_head AWQ corruption) |
+| 1 | 0.4521 | 8.75 | 3.9% | 32 min | iterating toward wrong fixed point |
+| 2-3 | — | — | — | — | aborted |
+
+Recorded as negative result. Fix at commit `63ba8aa1` (`fix(iterate): restrict AWQ scope to F1-eligible tensors`).
+
+## Iterative pipeline run-002 (F1-scope-fixed)
+
+(Populating as monitor fires.)
