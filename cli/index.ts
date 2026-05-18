@@ -14,6 +14,7 @@ import { homedir } from "os";
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
@@ -31,6 +32,7 @@ export interface HipfireConfig {
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
@@ -169,6 +171,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_seq: 32768,
   thinking: "on",
   max_think_tokens: 0,
+  host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
   experimental_budget_alert: false,
@@ -221,6 +224,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
+    case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
@@ -289,7 +293,7 @@ const cfg = loadConfig();
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 
-// Fields that make sense to override per-model. port + idle_timeout + default_model
+// Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
@@ -857,10 +861,15 @@ function readServePid(): number | null {
   } catch { return null; }
 }
 
-function serveProbeHost(host: string): string {
+export function serveProbeHost(host: string): string {
   if (host === "0.0.0.0" || host === "::" || host === "") return "127.0.0.1";
   if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
   return host;
+}
+
+export function formatServeBind(host: string, port: number): string {
+  const h = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `${h}:${port}`;
 }
 
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
@@ -875,7 +884,7 @@ export async function isServeUp(port: number, host = "127.0.0.1"): Promise<boole
 // Drive `hipfire run` through an existing serve's /v1/chat/completions stream.
 // Returns false if it couldn't connect (caller falls back to local spawn).
 async function runViaHttp(
-  port: number, model: string, prompt: string,
+  port: number, host: string, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
   system?: string,
@@ -896,7 +905,7 @@ async function runViaHttp(
 
   let resp: Response;
   try {
-    resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    resp = await fetch(`http://${serveProbeHost(host)}:${port}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -1224,8 +1233,8 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
   const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
-  if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
+  if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
+    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1305,7 +1314,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
-async function serve(port: number, host?: string) {
+async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
@@ -1417,10 +1426,10 @@ async function serve(port: number, host?: string) {
     else busy = false;
   }
 
-  console.error(`[hipfire] http://${host ?? "localhost"}:${port}/v1/chat/completions`);
+  console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
 
   Bun.serve({
-    ...(host ? { hostname: host } : {}),
+    hostname: host,
     port,
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
@@ -3348,6 +3357,10 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
     },
+    host: {
+      label: "host",
+      desc: "listen address for `hipfire serve` (examples: 127.0.0.1, 0.0.0.0, ::1)",
+    },
     port: {
       label: "port",
       desc: "HTTP port for `hipfire serve` (OpenAI-compatible API)",
@@ -4096,7 +4109,7 @@ switch (cmd) {
       }
       else if (a === "-h" || a === "--help") {
         console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
-          + `  [host]     Bind address (examples: 127.0.0.1, 0.0.0.0, ::1)\n`
+          + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
           + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
           + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
@@ -4109,6 +4122,7 @@ switch (cmd) {
         process.exit(0);
       } else setHost(a);
     }
+    host = host ?? cfg.host;
     port = port ?? cfg.port;
 
     if (detach) {
@@ -4126,7 +4140,7 @@ switch (cmd) {
       const self = process.argv[0];
       const script = process.argv[1];
       const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const childArgs = host ? ["serve", host, String(port)] : ["serve", String(port)];
+      const childArgs = ["serve", host, String(port)];
       const child = Bun.spawn([...runBg, self, script, ...childArgs], {
         stdin: "ignore",
         stdout: logFd,
@@ -4143,15 +4157,15 @@ switch (cmd) {
       console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 500));
-        if (await isServeUp(port, host ?? "127.0.0.1")) break;
+        if (await isServeUp(port, host)) break;
         // Show progress every 30s
         const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
         if (elapsed > 0 && elapsed % 30 === 0) {
           process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
         }
       }
-      if (await isServeUp(port, host ?? "127.0.0.1")) {
-        const bind = host ? `${host}:${port}` : String(port);
+      if (await isServeUp(port, host)) {
+        const bind = formatServeBind(host, port);
         console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
         console.log(`  log:  ${SERVE_LOG_FILE}`);
         console.log(`  stop: hipfire stop`);
@@ -4161,7 +4175,7 @@ switch (cmd) {
       }
       break;
     }
-    await serve(port, host ?? undefined);
+    await serve(port, host);
     break;
   }
   case "stop": {
@@ -4330,16 +4344,18 @@ switch (cmd) {
       for (const e of g.entries) console.log(e);
     }
     // Show local serve port availability + detached PID (if any)
+    const host = cfg.host;
     const port = cfg.port;
     const portInUse = sh(`ss -tlnp 2>/dev/null | grep :${port}`);
     const detachedPid = readServePid();
+    const bind = formatServeBind(host, port);
     if (detachedPid) {
-      console.log(`\nserve port ${port}: ACTIVE (detached, PID ${detachedPid})`);
+      console.log(`\nserve ${bind}: ACTIVE (detached, PID ${detachedPid})`);
       console.log(`  stop: hipfire stop    |    log: tail -f ${SERVE_LOG_FILE}`);
     } else if (portInUse) {
-      console.log(`\nserve port ${port}: ACTIVE (foreground)`);
+      console.log(`\nserve ${bind}: ACTIVE (foreground)`);
     } else {
-      console.log(`\nserve port ${port}: free`);
+      console.log(`\nserve ${bind}: free`);
     }
     break;
   }
@@ -5125,6 +5141,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
           max_seq: "KV cache capacity (tokens). Integer 512-524288",
           thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
+          host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
