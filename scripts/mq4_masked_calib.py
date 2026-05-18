@@ -149,6 +149,77 @@ def read_stats_counts(stats_npz_path: str | None, stats_json_path: str | None = 
     return {str(name): int(count) for name, count in counts.items()}
 
 
+def awq_hessian_sidecar_name(tensor_name: str) -> str:
+    stem = tensor_name[: -len(".weight")] if tensor_name.endswith(".weight") else tensor_name
+    return f"{stem}.awq_scale.weight"
+
+
+def apply_awq_hessian_transform(hessian, scales):
+    import numpy as np
+
+    h = np.asarray(hessian)
+    s = np.asarray(scales, dtype=np.float32)
+    if h.ndim != 3 or h.shape[1] != h.shape[2]:
+        raise ValueError(f"AWQ Hessian transform expects [G,K,K], got {h.shape}")
+    if s.ndim != 1:
+        raise ValueError(f"AWQ scale vector must be 1D, got {s.shape}")
+    n_groups, group_k, _ = h.shape
+    expected_k = n_groups * group_k
+    if s.shape[0] != expected_k:
+        raise ValueError(f"AWQ scale length mismatch: {s.shape[0]} vs Hessian K={expected_k}")
+    if np.array_equal(s, np.ones_like(s)):
+        return h.copy()
+    if not np.all(np.isfinite(s) & (s > 0.0)):
+        raise ValueError("AWQ Hessian scales must be finite and positive")
+    work_dtype = h.dtype if np.issubdtype(h.dtype, np.floating) else np.float32
+    grouped = s.reshape(n_groups, group_k).astype(work_dtype, copy=False)
+    denom = grouped[:, :, None] * grouped[:, None, :]
+    return (h.astype(work_dtype, copy=False) / denom).astype(work_dtype, copy=False)
+
+
+def apply_awq_hessian_transform_torch(hessian, scales, *, device=None):
+    torch = require_torch_for_gptq()
+
+    if device is None and hasattr(hessian, "device"):
+        device = hessian.device
+    if device is None:
+        device = torch.device("cpu")
+    h = torch.as_tensor(hessian, dtype=torch.float32, device=device)
+    s = torch.as_tensor(scales, dtype=torch.float32, device=device)
+    if h.dim() != 3 or h.shape[1] != h.shape[2]:
+        raise ValueError(f"AWQ Hessian transform expects [G,K,K], got {tuple(h.shape)}")
+    if s.dim() != 1:
+        raise ValueError(f"AWQ scale vector must be 1D, got {tuple(s.shape)}")
+    n_groups, group_k, _ = h.shape
+    expected_k = n_groups * group_k
+    if int(s.shape[0]) != expected_k:
+        raise ValueError(f"AWQ scale length mismatch: {int(s.shape[0])} vs Hessian K={expected_k}")
+    if bool(torch.all(s == 1.0).detach().cpu()):
+        return h.clone()
+    if not bool(torch.all(torch.isfinite(s) & (s > 0.0)).detach().cpu()):
+        raise ValueError("AWQ Hessian scales must be finite and positive")
+    grouped = s.reshape(n_groups, group_k)
+    return h / (grouped[:, :, None] * grouped[:, None, :])
+
+
+def read_awq_hessian_scales(path) -> dict[str, object]:
+    import numpy as np
+
+    _, tensors = ASTREA.read_hfq_index(path, max_tensors=0)
+    scales = {}
+    for name, info in tensors.items():
+        if not name.endswith(".awq_scale.weight"):
+            continue
+        if int(info["quant_type"]) != 1 or len(info["shape"]) != 1:
+            continue
+        payload = read_hfq_payload(path, info)
+        expected_bytes = int(info["shape"][0]) * 2
+        if len(payload) != expected_bytes:
+            continue
+        scales[name] = np.frombuffer(payload, dtype="<f2").astype(np.float32)
+    return scales
+
+
 def parse_max_memory(value: str | None):
     if not value:
         return None
@@ -879,6 +950,7 @@ def quantize_candidate(args):
     mask = read_json(args.mask)
     stats = np.load(args.stats_npz) if args.stats_npz else None
     stats_counts = read_stats_counts(args.stats_npz, args.stats_json)
+    awq_hessian_scales = read_awq_hessian_scales(args.awq_aware_hessian) if args.awq_aware_hessian else None
     _, base_tensors = ASTREA.read_hfq_index(args.base, max_tensors=0)
     source_summary, source_tensors = ASTREA.read_safetensors_dir_index(args.source_dir)
     ASTREA.copy_candidate_file(args.base, args.output)
@@ -938,6 +1010,12 @@ def quantize_candidate(args):
                 raise ValueError(f"GPTQ currently supports only 2D linear tensors: {name}")
             if hrot is None or hrot.ndim != 3:
                 raise ValueError(f"GPTQ requires full hessian stats for {name}")
+            awq_sidecar_name = None
+            if awq_hessian_scales is not None:
+                awq_sidecar_name = awq_hessian_sidecar_name(name)
+                scale = awq_hessian_scales.get(awq_sidecar_name)
+                if scale is not None:
+                    hrot = apply_awq_hessian_transform(hrot, scale)
             if gptq_device is not None:
                 packed, method_stats = quantize_mq4_gptq_torch(
                     values,
@@ -955,6 +1033,9 @@ def quantize_candidate(args):
                     damp=args.gptq_damp,
                     refit_iters=args.gptq_refit_iters,
                 )
+            if awq_hessian_scales is not None:
+                method_stats["awq_hessian_sidecar"] = awq_sidecar_name
+                method_stats["awq_hessian_applied"] = awq_sidecar_name in awq_hessian_scales
             metric = method_stats["mean_group_objective"]
         else:
             packed, metric = quantize_mq4_weighted(
@@ -1018,6 +1099,9 @@ def quantize_candidate(args):
         "mutations": mutations,
         "next_step": "run test_inference, KLD/PPL, then Atlas AR perf if quality improves",
     }
+    if awq_hessian_scales is not None:
+        result["awq_aware_hessian"] = str(Path(args.awq_aware_hessian).expanduser())
+        result["awq_hessian_scale_count"] = len(awq_hessian_scales)
     write_json(args.out, result, pretty=True)
 
 
@@ -1292,6 +1376,7 @@ def main(argv=None):
     p.add_argument("--ls-iters", type=int, default=5)
     p.add_argument("--method", choices=("wls", "gptq"), default="wls")
     p.add_argument("--gpu", type=int, help="Run GPTQ solve on CUDA device N; omit for CPU numpy path")
+    p.add_argument("--awq-aware-hessian", help="HFQ model containing AWQ .awq_scale.weight sidecars for GPTQ Hessian scaling")
     p.add_argument("--gptq-damp", type=float, default=0.01)
     p.add_argument("--gptq-refit-iters", type=int, default=2)
     p.add_argument("--skip-unsupported", action="store_true")

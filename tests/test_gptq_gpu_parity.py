@@ -10,6 +10,11 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from mq4_masked_calib import (
+    apply_awq_hessian_transform,
+    apply_awq_hessian_transform_torch,
+)
+
 
 def unpack_mq4_blocks(payload: bytes) -> np.ndarray:
     blocks = np.frombuffer(payload, dtype=np.uint8).reshape(-1, 136)
@@ -20,6 +25,54 @@ def unpack_mq4_blocks(payload: bytes) -> np.ndarray:
     q[:, 0::2] = packed & np.uint8(0x0F)
     q[:, 1::2] = (packed >> np.uint8(4)) & np.uint8(0x0F)
     return q.astype(np.float32) * scale[:, None] + zero[:, None]
+
+
+def test_awq_hessian_ones_is_byte_identical_noop():
+    rng = np.random.default_rng(123)
+    h = rng.standard_normal((2, 256, 256), dtype=np.float32)
+    scales = np.ones(512, dtype=np.float32)
+
+    transformed = apply_awq_hessian_transform(h, scales)
+
+    assert transformed.dtype == h.dtype
+    assert transformed.shape == h.shape
+    assert transformed.tobytes() == h.tobytes()
+
+
+def test_awq_hessian_transform_matches_outer_product_math_and_preserves_spd():
+    rng = np.random.default_rng(456)
+    x = rng.standard_normal((768, 256), dtype=np.float32)
+    h = (x.T @ x).astype(np.float32).reshape(1, 256, 256)
+    scales = rng.uniform(0.25, 2.0, size=256).astype(np.float32)
+
+    transformed = apply_awq_hessian_transform(h, scales)
+    expected = h / (scales.reshape(1, 256, 1) * scales.reshape(1, 1, 256))
+
+    np.testing.assert_allclose(transformed, expected, rtol=1.0e-6, atol=1.0e-6)
+    np.testing.assert_allclose(transformed, np.swapaxes(transformed, -1, -2), rtol=1.0e-6, atol=1.0e-6)
+    np.linalg.cholesky(transformed[0] + np.eye(256, dtype=np.float32) * np.float32(1.0e-4))
+
+
+def test_awq_hessian_torch_transform_matches_numpy_when_torch_available():
+    try:
+        import torch
+    except ImportError:
+        return
+
+    rng = np.random.default_rng(789)
+    x = rng.standard_normal((512, 256), dtype=np.float32)
+    h = (x.T @ x).astype(np.float32).reshape(1, 256, 256)
+    scales = rng.uniform(0.25, 2.0, size=256).astype(np.float32)
+
+    expected = apply_awq_hessian_transform(h, scales)
+    actual = apply_awq_hessian_transform_torch(
+        torch.as_tensor(h, dtype=torch.float32),
+        torch.as_tensor(scales, dtype=torch.float32),
+        device=torch.device("cpu"),
+    ).cpu().numpy()
+
+    rel_l2 = float(np.linalg.norm(actual - expected) / max(float(np.linalg.norm(expected)), 1.0e-12))
+    assert rel_l2 < 1.0e-5
 
 
 def main() -> int:
