@@ -584,7 +584,8 @@ fn main() {
 
                 // MMQ per-weight screening (#87): detect outlier rows that
                 // cause Q8_1 precision loss and fall back to WMMA for those
-                // weights. Enabled by default; disable with mmq_screen=false.
+                // weights. Disabled by default; enable with mmq_screen=true
+                // (or HIPFIRE_MMQ_SCREEN=1) when adding new quant formats.
                 if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
                     gpu.mmq_screen = v;
                 }
@@ -1481,7 +1482,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
         // Results are cached by device pointer in gpu.mmq_screen_cache.
-        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
+        // Disabled by default on all arches; opt-in via mmq_screen=true or
+        // HIPFIRE_MMQ_SCREEN=1. gfx906 is included for the opt-in case so
+        // its ~700 µs/weight screening-reference dispatch doesn't surprise
+        // first prefill if a user enables it.
+        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx906" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
             let t0 = std::time::Instant::now();
             let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
             let elapsed = t0.elapsed();

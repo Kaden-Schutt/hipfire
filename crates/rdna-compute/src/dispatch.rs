@@ -557,15 +557,15 @@ pub struct Gpu {
     // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
     // max abs error. Weights exceeding the threshold fall back to WMMA.
     //
-    // Enabled by default on RDNA3/3.5. Configurable via:
+    // Disabled by default on all arches as of 2026-05-18; opt-in for
+    // defensive screening when adding new quant formats. Configurable via:
     //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
     //   - per-model config overlay
     //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
-    //   - env override: `HIPFIRE_MMQ_SCREEN=0` to disable,
+    //   - env override: `HIPFIRE_MMQ_SCREEN=1` to enable,
     //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
     mmq_screen_cache: HashMap<usize, bool>,
-    /// Whether MMQ per-weight screening is enabled.
-    /// Per-arch default (set in `Gpu::init`): true on gfx906, false elsewhere.
+    /// Whether MMQ per-weight screening is enabled. Default: false on all arches.
     pub mmq_screen: bool,
     /// Max per-row abs error threshold for screening. Weights with any row
     /// exceeding this fall back to WMMA.
@@ -800,7 +800,22 @@ impl Gpu {
 
         // Per-arch defaults for MMQ screening. See the mmq_screen and
         // mmq_screen_threshold fields below for rationale.
-        let mmq_screen_default: bool = arch == "gfx906";
+        //
+        // gfx906 was previously default-on out of caution because the MMQ
+        // kernels were ported from the gfx11xx i8-WMMA path that motivated
+        // #87, but gfx906 uses dp4a (`__builtin_amdgcn_sdot4`), not WMMA,
+        // and empirically tolerates the row-3994 weight outliers within the
+        // 0.50 threshold. Audit on 2026-05-18 across qwen3.5-{0.8B, 9B} mq4
+        // (AWQ + non-AWQ) showed 0/248 weights flagged at threshold 0.50 —
+        // the screen reference dispatch (~700 µs/weight via
+        // `gemm_hfq4g256_residual_fp16_wave64`) was pure overhead, costing
+        // ~145 ms on the first prefill. Users on new quant formats can
+        // re-enable defensively via `HIPFIRE_MMQ_SCREEN=1`.
+        //
+        // RDNA3/3.5: unchanged behavior. Already default-off here; clients
+        // that need #87 protection (daemon callers loading on i8-WMMA archs)
+        // explicitly pass `mmq_screen: true` at load time.
+        let mmq_screen_default: bool = false;
         let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
 
         Ok(Self {
