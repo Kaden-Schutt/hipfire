@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCHEMA_MASK = "hipfire.astrea.mq4_masked.mask.v0"
@@ -27,6 +28,7 @@ SCHEMA_STATS = "hipfire.astrea.mq4_masked.stats.v0"
 SCHEMA_CANDIDATE = "hipfire.astrea.mq4_masked.candidate.v0"
 SCHEMA_TENSOR_SWEEP = "hipfire.astrea.mq4_masked.tensor_sweep.v0"
 SCHEMA_COMPOSE = "hipfire.astrea.mq4_masked.compose.v0"
+SCHEMA_ITERATE = "hipfire.astrea.mq4_masked.iterate.v0"
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -220,6 +222,167 @@ def read_awq_hessian_scales(path) -> dict[str, object]:
     return scales
 
 
+def compute_awq_scales(in_sum2, alpha: float):
+    """Python twin of hipfire-quantize's paper-formula AWQ scale helper."""
+    import numpy as np
+
+    values = np.asarray(in_sum2, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError("empty imatrix vector")
+    half_alpha = float(alpha) * 0.5
+    log_s = half_alpha * np.log(np.maximum(values, 1.0e-12))
+    log_s -= np.mean(log_s)
+    return np.exp(log_s).astype(np.float32)
+
+
+def compute_awq_scales_autoawq(in_sum2, w_rms, alpha: float):
+    """Python twin of hipfire-quantize's AutoAWQ scale helper."""
+    import numpy as np
+
+    values = np.asarray(in_sum2, dtype=np.float64).reshape(-1)
+    weights = np.asarray(w_rms, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        raise ValueError("empty imatrix vector")
+    if weights.shape != values.shape:
+        raise ValueError(f"w_rms length {weights.size} does not match imatrix length {values.size}")
+    alpha64 = float(alpha)
+    log_s = (
+        (alpha64 * 0.5) * np.log(np.maximum(values, 1.0e-12))
+        + (1.0 - alpha64) * np.log(np.maximum(weights, 1.0e-12))
+    )
+    log_s -= np.mean(log_s)
+    return np.exp(log_s).astype(np.float32)
+
+
+def compute_awq_scales_from_hessian(hessian, alpha: float):
+    import numpy as np
+
+    h = np.asarray(hessian)
+    if h.ndim == 3:
+        if h.shape[1] != h.shape[2]:
+            raise ValueError(f"hessian groups must be square, got {h.shape}")
+        diag = np.diagonal(h, axis1=1, axis2=2).reshape(-1)
+    elif h.ndim == 1:
+        diag = h.reshape(-1)
+    else:
+        raise ValueError(f"AWQ scale computation expects [G,K,K] or [K], got {h.shape}")
+    return compute_awq_scales(diag, alpha)
+
+
+def relative_l2_delta(prev_scales: dict[str, object] | None, scales: dict[str, object]) -> float:
+    import numpy as np
+
+    if not prev_scales:
+        return 0.0
+    numer = 0.0
+    denom = 0.0
+    for name, current in scales.items():
+        if name not in prev_scales:
+            continue
+        cur = np.asarray(current, dtype=np.float64).reshape(-1)
+        prev = np.asarray(prev_scales[name], dtype=np.float64).reshape(-1)
+        if cur.shape != prev.shape:
+            raise ValueError(f"scale shape mismatch for {name}: {cur.shape} vs {prev.shape}")
+        diff = cur - prev
+        numer += float(diff @ diff)
+        denom += float(prev @ prev)
+    if denom <= 0.0:
+        return 0.0
+    return float((numer / denom) ** 0.5)
+
+
+def load_round_hessians(stats_npz_path: str, selected: list[dict[str, object]]) -> dict[str, object]:
+    import numpy as np
+
+    data = np.load(stats_npz_path)
+    hessians = {}
+    for item in selected:
+        name = item["hfq_name"]
+        key = safe_key(name)
+        if key not in data.files:
+            raise ValueError(f"missing imatrix stats for {name} in {stats_npz_path}")
+        hessians[name] = data[key].astype(np.float64)
+    return hessians
+
+
+def compute_awq_scale_dict(hessians: dict[str, object], *, alpha: float) -> dict[str, object]:
+    return {name: compute_awq_scales_from_hessian(h, alpha) for name, h in hessians.items()}
+
+
+def damp_awq_scale_dict(
+    previous: dict[str, object] | None,
+    raw: dict[str, object],
+    *,
+    damping: float,
+) -> dict[str, object]:
+    import numpy as np
+
+    beta = float(damping)
+    if beta < 0.0 or beta > 1.0:
+        raise ValueError(f"damping must be in [0, 1], got {damping}")
+    if previous is None:
+        return {name: np.asarray(scale, dtype=np.float32).copy() for name, scale in raw.items()}
+    out = {}
+    for name, raw_scale in raw.items():
+        if name not in previous:
+            out[name] = np.asarray(raw_scale, dtype=np.float32).copy()
+            continue
+        prev = np.asarray(previous[name], dtype=np.float32)
+        cur = np.asarray(raw_scale, dtype=np.float32)
+        if prev.shape != cur.shape:
+            raise ValueError(f"scale shape mismatch for {name}: {prev.shape} vs {cur.shape}")
+        out[name] = ((np.float32(1.0 - beta) * prev) + (np.float32(beta) * cur)).astype(np.float32)
+    return out
+
+
+def save_awq_scales_npz(path, raw: dict[str, object], damped: dict[str, object]) -> None:
+    import numpy as np
+
+    payload = {}
+    for name, scale in raw.items():
+        payload[f"raw__{safe_key(name)}"] = np.asarray(scale, dtype=np.float32)
+    for name, scale in damped.items():
+        payload[f"damped__{safe_key(name)}"] = np.asarray(scale, dtype=np.float32)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **payload)
+
+
+def awq_scales_to_f16_bytes(scales) -> bytes:
+    import numpy as np
+
+    return np.asarray(scales, dtype="<f2").reshape(-1).tobytes()
+
+
+def write_awq_sidecar_hfq(base_hfq, output_hfq, scales_by_weight: dict[str, object]) -> None:
+    layout = ASTREA.read_hfq_layout(base_hfq)
+    records = layout["records"]
+    by_name = {record["name"]: i for i, record in enumerate(records)}
+    inserts = []
+    for weight_name, scales in scales_by_weight.items():
+        payload = awq_scales_to_f16_bytes(scales)
+        sidecar_name = awq_hessian_sidecar_name(weight_name)
+        record = {
+            "name": sidecar_name,
+            "quant_type": 1,
+            "quant_type_name": "F16",
+            "shape": [len(payload) // 2],
+            "group_size": 0,
+            "data_size": len(payload),
+            "data": payload,
+        }
+        if sidecar_name in by_name:
+            records[by_name[sidecar_name]].update(record)
+            continue
+        parent_index = by_name.get(weight_name)
+        if parent_index is None:
+            inserts.append((len(records), record))
+        else:
+            inserts.append((parent_index + 1, record))
+    for index, record in sorted(inserts, key=lambda item: item[0], reverse=True):
+        records.insert(index, record)
+    ASTREA.write_hfq_layout(output_hfq, layout)
+
+
 def parse_max_memory(value: str | None):
     if not value:
         return None
@@ -312,6 +475,205 @@ def conv1d_flat_sumsq(x, kernel_size: int):
     per_channel = x.to(torch.float32).square().sum(dim=(0, 2)).detach().cpu().to(torch.float64).numpy()
     flat = per_channel.repeat(kernel_size)
     return flat, int(b * t)
+
+
+def dequantize_mq4g256_payload(payload: bytes, shape: list[int]):
+    import numpy as np
+
+    if len(shape) != 2:
+        raise ValueError(f"MQ4G256 dequant expects 2D tensor shape, got {shape}")
+    m, k = int(shape[0]), int(shape[1])
+    if k % 256 != 0:
+        raise ValueError(f"MQ4G256 dequant requires K%256==0, got K={k}")
+    n_groups = k // 256
+    expected_blocks = m * n_groups
+    expected_bytes = expected_blocks * 136
+    if len(payload) != expected_bytes:
+        raise ValueError(f"MQ4G256 payload size mismatch: {len(payload)} vs {expected_bytes}")
+    blocks = np.frombuffer(payload, dtype=np.uint8).reshape(expected_blocks, 136)
+    scale = blocks[:, 0:4].copy().view("<f4").reshape(expected_blocks)
+    zero = blocks[:, 4:8].copy().view("<f4").reshape(expected_blocks)
+    packed = blocks[:, 8:]
+    q = np.empty((expected_blocks, 256), dtype=np.uint8)
+    q[:, 0::2] = packed & np.uint8(0x0F)
+    q[:, 1::2] = (packed >> np.uint8(4)) & np.uint8(0x0F)
+    rotated = q.astype(np.float32) * scale[:, None].astype(np.float32) + zero[:, None].astype(np.float32)
+    unrotated = ASTREA.inverse_fwht_256_numpy(rotated.reshape(m, n_groups, 256)).reshape(m, k)
+    return unrotated.astype(np.float32, copy=False)
+
+
+def read_hfq_f16_vector(path, tensor_info):
+    import numpy as np
+
+    payload = read_hfq_payload(path, tensor_info)
+    return np.frombuffer(payload, dtype="<f2").astype(np.float32)
+
+
+def load_awq_scales_by_weight(path) -> dict[str, object]:
+    _, tensors = ASTREA.read_hfq_index(path, max_tensors=0)
+    out = {}
+    for name, info in tensors.items():
+        if not name.endswith(".awq_scale.weight"):
+            continue
+        weight_name = name[: -len(".awq_scale.weight")] + ".weight"
+        out[weight_name] = read_hfq_f16_vector(path, info)
+    return out
+
+
+def install_candidate_mq4_weights(model, candidate_mq4):
+    import torch
+
+    _, tensors = ASTREA.read_hfq_index(candidate_mq4, max_tensors=0)
+    module_map = dict(model.named_modules())
+    awq_scales = load_awq_scales_by_weight(candidate_mq4)
+    installed = []
+    missing_modules = []
+    hooks = []
+
+    for name, info in tensors.items():
+        if not name.endswith(".weight") or name.endswith(".awq_scale.weight"):
+            continue
+        if int(info["quant_type"]) != 13 or len(info["shape"]) != 2:
+            continue
+        module_name = hfq_to_module_name(name)
+        module = module_map.get(module_name)
+        if module is None or not hasattr(module, "weight"):
+            missing_modules.append(module_name)
+            continue
+        deq = dequantize_mq4g256_payload(read_hfq_payload(candidate_mq4, info), [int(x) for x in info["shape"]])
+        weight = torch.as_tensor(deq, dtype=torch.float32, device=module.weight.device)
+        if tuple(module.weight.shape) != tuple(weight.shape):
+            missing_modules.append(f"{module_name}:shape {tuple(module.weight.shape)}!={tuple(weight.shape)}")
+            continue
+        module.weight.data.copy_(weight.to(dtype=module.weight.dtype))
+        installed.append(name)
+        scale = awq_scales.get(name)
+        if scale is not None:
+            scale_tensor = torch.as_tensor(scale, dtype=torch.float32, device=module.weight.device)
+
+            def pre_hook(_module, inputs, scale_tensor=scale_tensor):
+                if not inputs:
+                    return inputs
+                x = inputs[0]
+                local_scale = scale_tensor.to(device=x.device, dtype=x.dtype)
+                return (x / local_scale,) + tuple(inputs[1:])
+
+            hooks.append(module.register_forward_pre_hook(pre_hook))
+
+    return {"installed": installed, "missing_modules": missing_modules, "hooks": hooks}
+
+
+def collect_stats_candidate_mq4(args, targets, chunks, run_dir):
+    import numpy as np
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    device = torch.device("cpu")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.hf_model,
+        torch_dtype=torch.float32,
+        local_files_only=True,
+        trust_remote_code=True,
+    ).to(device)
+    model.eval()
+    install_summary = install_candidate_mq4_weights(model, args.candidate_mq4)
+    input_device = model_input_device(model, device)
+    module_map = dict(model.named_modules())
+    sign_cache = {}
+    stats = {}
+    counts = {}
+    handles = []
+
+    def signs_for(tensor_device):
+        key = str(tensor_device)
+        if key not in sign_cache:
+            sign_cache[key] = (
+                torch.tensor(ASTREA.FWHT_SIGNS1, dtype=torch.float32, device=tensor_device).reshape(1, 256),
+                torch.tensor(ASTREA.FWHT_SIGNS2, dtype=torch.float32, device=tensor_device).reshape(1, 256),
+            )
+        return sign_cache[key]
+
+    def make_hook(item):
+        hfq_name = item["hfq_name"]
+        shape = [int(x) for x in item["shape"]]
+        is_conv = len(shape) == 3 and "conv1d" in item["module_name"]
+        kernel_size = int(shape[-1]) if is_conv else 0
+
+        def hook(_module, inputs, _output):
+            if not inputs:
+                return
+            x = inputs[0].detach()
+            if is_conv:
+                delta, n = conv1d_flat_sumsq(x, kernel_size)
+            elif args.stats_mode == "hessian":
+                signs1, signs2 = signs_for(x.device)
+                delta, n = linear_rotated_hessian(x, signs1, signs2)
+            else:
+                signs1, signs2 = signs_for(x.device)
+                delta, n = linear_rotated_sumsq(x, signs1, signs2)
+            if delta is None or n <= 0:
+                return
+            stats[hfq_name] = delta if hfq_name not in stats else stats[hfq_name] + delta
+            counts[hfq_name] = counts.get(hfq_name, 0) + n
+
+        return hook
+
+    missing_modules = []
+    for item in targets:
+        module = module_map.get(item["module_name"])
+        if module is None:
+            missing_modules.append(item["module_name"])
+            continue
+        handles.append(module.register_forward_hook(make_hook(item)))
+
+    for input_ids in chunks:
+        ids = torch.tensor([input_ids], dtype=torch.long, device=input_device)
+        with torch.no_grad():
+            _ = model(input_ids=ids, use_cache=False)
+
+    for handle in handles:
+        handle.remove()
+    for handle in install_summary["hooks"]:
+        handle.remove()
+
+    stats_npz = run_dir / "stats-merged.npz"
+    np.savez_compressed(stats_npz, **{safe_key(k): v for k, v in stats.items()})
+    result = {
+        "schema": SCHEMA_STATS,
+        "captured_at_utc": utc_now(),
+        "stats_mode": args.stats_mode,
+        "hf_model": args.hf_model,
+        "candidate_mq4": str(Path(args.candidate_mq4).expanduser()),
+        "mask": str(Path(args.mask)),
+        "calib_text": str(Path(args.calib_text)),
+        "ctx": args.ctx,
+        "requested_chunks": args.chunks,
+        "actual_chunks": len(chunks),
+        "devices": ["cpu"],
+        "device_map": "candidate-mq4-cpu",
+        "max_memory": None,
+        "target_count": len(targets),
+        "stat_count": len(stats),
+        "counts": counts,
+        "rank_summaries": [
+            {
+                "device": "cpu",
+                "input_device": str(input_device),
+                "chunk_count": len(chunks),
+                "target_count": len(targets),
+                "stat_count": len(stats),
+                "missing_modules": missing_modules,
+                "candidate_install": {
+                    "installed_count": len(install_summary["installed"]),
+                    "missing_modules": install_summary["missing_modules"],
+                },
+                "counts": counts,
+            }
+        ],
+        "stats_npz": str(stats_npz),
+    }
+    write_json(run_dir / "stats.json", result, pretty=True)
+    return result
 
 
 def stats_worker(worker):
@@ -461,6 +823,9 @@ def collect_stats(args):
     if run_dir.exists() and args.overwrite:
         shutil.rmtree(run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    if getattr(args, "candidate_mq4", None):
+        collect_stats_candidate_mq4(args, targets, chunks, run_dir)
+        return
 
     workers = []
     for rank, device in enumerate(devices):
@@ -1343,6 +1708,329 @@ def tensor_sweep(args):
     write_json(out_dir / "tensor-sweep.json", result, pretty=True)
 
 
+def selected_iterate_targets(mask: dict[str, object]) -> list[dict[str, object]]:
+    targets = [row for row in mask["tensors"] if row.get("packable_flat_mq4")]
+    if not targets:
+        raise ValueError("iterate requires at least one packable MQ4 tensor in the mask")
+    return targets
+
+
+def materialize_round_stats(round_dir: Path, stats_npz, stats_json) -> tuple[Path, Path]:
+    dst_npz = round_dir / "imatrix.npz"
+    dst_json = round_dir / "stats.json"
+    src_npz = Path(stats_npz)
+    src_json = Path(stats_json) if stats_json else src_npz.resolve().parent / "stats.json"
+    if src_npz.resolve() != dst_npz.resolve():
+        shutil.copy2(src_npz, dst_npz)
+    if src_json.exists() and src_json.resolve() != dst_json.resolve():
+        shutil.copy2(src_json, dst_json)
+    elif not dst_json.exists():
+        dst_json.write_text(json.dumps({"counts": {}}, indent=2, sort_keys=True) + "\n")
+    return dst_npz, dst_json
+
+
+def collect_iterate_round_stats(args, round_index: int, previous_model: str | None, round_dir: Path):
+    collect_dir = round_dir / "collect"
+    collect_args = SimpleNamespace(
+        hf_model=args.hf_model,
+        mask=args.imatrix_mask,
+        calib_text=args.calib_text,
+        out_dir=str(collect_dir),
+        devices=args.collect_devices,
+        device_map="none",
+        max_memory=None,
+        ctx=args.ctx,
+        chunks=args.chunks,
+        offset=args.offset,
+        stats_mode="hessian",
+        max_tensors=None,
+        tensor_filter=None,
+        overwrite=True,
+        candidate_mq4=previous_model if round_index > 0 else None,
+    )
+    collect_stats(collect_args)
+    return materialize_round_stats(round_dir, collect_dir / "stats-merged.npz", collect_dir / "stats.json")
+
+
+def run_round_bench(args, round_dir: Path, model_path: Path):
+    if not args.bench_each_round:
+        return None
+    if not args.bench_ref:
+        raise ValueError("--bench-each-round requires --bench-ref")
+    output = round_dir / "bench.kldseq"
+    log = round_dir / "bench.log"
+    cmd = [
+        args.eval_bin,
+        "--model",
+        str(model_path),
+        "--ref",
+        args.bench_ref,
+        "--output",
+        str(output),
+        "--kv-mode",
+        args.kv_mode,
+        "--scoring-mode",
+        args.scoring_mode,
+        "--max-chunks",
+        str(args.bench_max_chunks),
+    ]
+    env = os.environ.copy()
+    if args.gpu is not None:
+        env["HIP_VISIBLE_DEVICES"] = str(args.gpu)
+    proc = subprocess.run(cmd, text=True, capture_output=True, env=env)
+    log.write_text(proc.stdout + proc.stderr)
+    metrics = reduce_kldseq_metrics(output) if proc.returncode == 0 and output.exists() else None
+    return {
+        "status": "ok" if proc.returncode == 0 else f"failed_{proc.returncode}",
+        "command": cmd,
+        "output": str(output),
+        "log": str(log),
+        "metrics": metrics,
+    }
+
+
+def reduce_kldseq_metrics(path):
+    try:
+        import numpy as np
+
+        harness = SCRIPT_DIR.parent / "benchmarks" / "quality-baselines" / "harness"
+        sys.path.insert(0, str(harness))
+        from kldref_format import read_per_seq_kld
+
+        means, p99s, nlls = read_per_seq_kld(Path(path))
+        means_arr = np.asarray(means, dtype=np.float64)
+        p99s_arr = np.asarray(p99s, dtype=np.float64)
+        nlls_arr = np.asarray(nlls, dtype=np.float64)
+        finite_nll = nlls_arr[np.isfinite(nlls_arr)]
+        return {
+            "kld_mean": float(means_arr.mean()) if means_arr.size else None,
+            "kld_p99": float(np.percentile(p99s_arr, 99)) if p99s_arr.size else None,
+            "ppl": float(np.exp(finite_nll.mean())) if finite_nll.size else None,
+        }
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def write_round_summary(round_dir: Path, record: dict[str, object]) -> None:
+    bench = record.get("bench")
+    metrics = bench.get("metrics") if bench else None
+    lines = [
+        f"# Iterative AWQ+GPTQ round {record['round']}",
+        "",
+        f"- scale_delta: {record['scale_delta']:.8g}",
+        f"- kld_mean: {metrics.get('kld_mean') if metrics and 'kld_mean' in metrics else 'not_run'}",
+        f"- kld_p99: {metrics.get('kld_p99') if metrics and 'kld_p99' in metrics else 'not_run'}",
+        f"- ppl: {metrics.get('ppl') if metrics and 'ppl' in metrics else 'not_run'}",
+        f"- imatrix: {record['imatrix_npz']}",
+        f"- awq_scales: {record['awq_scales_npz']}",
+        f"- model: {record['model']}",
+        f"- elapsed_seconds: {record['elapsed_seconds']:.3f}",
+    ]
+    if bench:
+        lines.append(f"- bench_status: {bench['status']}")
+        lines.append(f"- bench_output: {bench['output']}")
+    else:
+        lines.append("- bench_status: not_run")
+    round_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n")
+
+
+def quantize_iterate_round(
+    *,
+    round_dir: Path,
+    base_hfq: str,
+    hf_model: str,
+    mask_path: str,
+    stats_npz: Path,
+    stats_json: Path,
+    scales: dict[str, object],
+    gpu: int | None,
+    gptq_damp: float,
+    gptq_refit_iters: int,
+) -> Path:
+    sidecar_base = round_dir / "awq_sidecar_base.hfq"
+    output = round_dir / "model.hfq"
+    candidate_json = round_dir / "candidate.json"
+    write_awq_sidecar_hfq(base_hfq, sidecar_base, scales)
+    quantize_candidate(
+        SimpleNamespace(
+            base=str(sidecar_base),
+            source_dir=hf_model,
+            mask=mask_path,
+            stats_npz=str(stats_npz),
+            stats_json=str(stats_json),
+            output=str(output),
+            out=str(candidate_json),
+            clip_ratio=1.0,
+            ls_iters=5,
+            method="gptq",
+            gpu=gpu,
+            awq_aware_hessian=str(sidecar_base),
+            gptq_damp=gptq_damp,
+            gptq_refit_iters=gptq_refit_iters,
+            skip_unsupported=False,
+            max_tensors=None,
+            tensor_filter=None,
+            exclude_tensor_filter=None,
+            tensor_name=None,
+            tensor_list=None,
+            sort_by="mask-order",
+            progress_every=0,
+        )
+    )
+    return output
+
+
+def run_iterative_awq_gptq(args, *, stats_provider=None):
+    mask = read_json(args.imatrix_mask)
+    selected = selected_iterate_targets(mask)
+    base_hfq = str(Path(mask.get("base") or "").expanduser())
+    if not base_hfq or not Path(base_hfq).exists():
+        raise ValueError("iterate mask must contain an existing 'base' HFQ path")
+    if int(args.max_rounds) <= 0:
+        raise ValueError("--max-rounds must be positive")
+    if float(args.damping) < 0.0 or float(args.damping) > 1.0:
+        raise ValueError("--damping must be in [0, 1]")
+
+    out_dir = Path(args.base_output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    previous_scales = None
+    previous_model = None
+    trace = []
+    started_all = time.time()
+    provider = stats_provider or collect_iterate_round_stats
+
+    for round_index in range(int(args.max_rounds)):
+        round_started = time.time()
+        round_dir = out_dir / f"round_{round_index}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        stats_npz, stats_json = provider(args, round_index, previous_model, round_dir)
+        hessians = load_round_hessians(str(stats_npz), selected)
+        raw_scales = compute_awq_scale_dict(hessians, alpha=args.awq_alpha)
+        damped_scales = damp_awq_scale_dict(previous_scales, raw_scales, damping=args.damping)
+        scale_delta = relative_l2_delta(previous_scales, damped_scales)
+        scales_npz = round_dir / "awq_scales.npz"
+        save_awq_scales_npz(scales_npz, raw_scales, damped_scales)
+        write_json(
+            round_dir / "scales_delta.json",
+            {
+                "round": round_index,
+                "relative_l2_vs_prev": scale_delta,
+                "epsilon": float(args.epsilon),
+                "converged": round_index > 0 and scale_delta < float(args.epsilon),
+            },
+            pretty=True,
+        )
+        model_path = quantize_iterate_round(
+            round_dir=round_dir,
+            base_hfq=base_hfq,
+            hf_model=args.hf_model,
+            mask_path=args.imatrix_mask,
+            stats_npz=stats_npz,
+            stats_json=stats_json,
+            scales=damped_scales,
+            gpu=args.gpu,
+            gptq_damp=args.gptq_damp,
+            gptq_refit_iters=args.gptq_refit_iters,
+        )
+        bench = run_round_bench(args, round_dir, model_path)
+        elapsed = time.time() - round_started
+        record = {
+            "round": round_index,
+            "imatrix_npz": str(stats_npz),
+            "awq_scales_npz": str(scales_npz),
+            "model": str(model_path),
+            "scale_delta": scale_delta,
+            "elapsed_seconds": elapsed,
+            "bench": bench,
+        }
+        write_round_summary(round_dir, record)
+        trace.append(record)
+        previous_scales = damped_scales
+        previous_model = str(model_path)
+        if round_index > 0 and scale_delta < float(args.epsilon):
+            break
+
+    result = {
+        "schema": SCHEMA_ITERATE,
+        "captured_at_utc": utc_now(),
+        "hf_model": args.hf_model,
+        "mask": args.imatrix_mask,
+        "base_hfq": base_hfq,
+        "base_output_dir": str(out_dir),
+        "awq_alpha": float(args.awq_alpha),
+        "damping": float(args.damping),
+        "epsilon": float(args.epsilon),
+        "max_rounds": int(args.max_rounds),
+        "elapsed_seconds": time.time() - started_all,
+        "rounds": trace,
+    }
+    write_json(out_dir / "iterate-summary.json", result, pretty=True)
+    print("round\tscale_delta\tmodel")
+    for record in trace:
+        print(f"{record['round']}\t{record['scale_delta']:.8g}\t{record['model']}")
+    return result
+
+
+def run_iterative_awq_gptq_with_stats_sequence(
+    *,
+    hf_model: str,
+    mask_path: str,
+    base_output_dir: str,
+    stats_sequence: list[dict[str, object]],
+    awq_alpha: float = 0.5,
+    damping: float = 0.5,
+    epsilon: float = 0.01,
+    max_rounds: int = 6,
+    gpu: int | None = None,
+    gptq_damp: float = 0.01,
+    gptq_refit_iters: int = 2,
+):
+    if not stats_sequence:
+        raise ValueError("stats_sequence must contain at least round 0")
+
+    def provider(_args, round_index, _previous_model, round_dir):
+        import numpy as np
+
+        stats = stats_sequence[min(round_index, len(stats_sequence) - 1)]
+        payload = {safe_key(name): np.asarray(value, dtype=np.float64) for name, value in stats.items()}
+        stats_npz = round_dir / "imatrix.npz"
+        stats_json = round_dir / "stats.json"
+        np.savez_compressed(stats_npz, **payload)
+        stats_json.write_text(
+            json.dumps({"counts": {name: 1 for name in stats}}, indent=2, sort_keys=True) + "\n"
+        )
+        return stats_npz, stats_json
+
+    args = SimpleNamespace(
+        hf_model=hf_model,
+        calib_text="",
+        imatrix_mask=mask_path,
+        base_output_dir=base_output_dir,
+        awq_alpha=awq_alpha,
+        damping=damping,
+        epsilon=epsilon,
+        max_rounds=max_rounds,
+        bench_each_round=False,
+        bench_ref=None,
+        gpu=gpu,
+        collect_devices="",
+        ctx=256,
+        chunks=1,
+        offset=0,
+        eval_bin="target/release/examples/eval_hipfire",
+        kv_mode="q8",
+        scoring_mode="prefill",
+        bench_max_chunks=20,
+        gptq_damp=gptq_damp,
+        gptq_refit_iters=gptq_refit_iters,
+    )
+    return run_iterative_awq_gptq(args, stats_provider=provider)
+
+
+def iterate_awq_gptq(args):
+    run_iterative_awq_gptq(args)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -1366,6 +2054,7 @@ def main(argv=None):
     p.add_argument("--chunks", type=int, default=32)
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--stats-mode", choices=("diag", "hessian"), default="diag")
+    p.add_argument("--candidate-mq4", help="Collect stats from a quantized MQ4 HFQ candidate via CPU dequantized forward")
     p.add_argument("--max-tensors", type=int)
     p.add_argument("--tensor-filter")
     p.add_argument("--overwrite", action="store_true")
@@ -1424,6 +2113,30 @@ def main(argv=None):
     p.add_argument("--tensor-filter")
     p.add_argument("--overwrite", action="store_true")
     p.set_defaults(func=tensor_sweep)
+
+    p = sub.add_parser("iterate", help="run iterative AWQ+GPTQ fixed-point refinement")
+    p.add_argument("--hf-model", required=True)
+    p.add_argument("--calib-text", required=True)
+    p.add_argument("--imatrix-mask", required=True)
+    p.add_argument("--base-output-dir", required=True)
+    p.add_argument("--awq-alpha", type=float, default=0.5)
+    p.add_argument("--damping", type=float, default=0.5)
+    p.add_argument("--epsilon", type=float, default=0.01)
+    p.add_argument("--max-rounds", type=int, default=6)
+    p.add_argument("--bench-each-round", action="store_true")
+    p.add_argument("--bench-ref")
+    p.add_argument("--gpu", type=int)
+    p.add_argument("--collect-devices", default="0,1,2,3")
+    p.add_argument("--ctx", type=int, default=256)
+    p.add_argument("--chunks", type=int, default=32)
+    p.add_argument("--offset", type=int, default=0)
+    p.add_argument("--eval-bin", default="target/release/examples/eval_hipfire")
+    p.add_argument("--kv-mode", default="q8")
+    p.add_argument("--scoring-mode", default="prefill")
+    p.add_argument("--bench-max-chunks", type=int, default=20)
+    p.add_argument("--gptq-damp", type=float, default=0.01)
+    p.add_argument("--gptq-refit-iters", type=int, default=2)
+    p.set_defaults(func=iterate_awq_gptq)
 
     args = parser.parse_args(argv)
     args.func(args)
