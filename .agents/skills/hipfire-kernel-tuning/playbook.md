@@ -116,8 +116,8 @@ that catch C-mapping row swaps.
 ### Gate B — coherence-gate (output sanity)
 
 ```bash
-./scripts/coherence-gate.sh           # AR
-./scripts/coherence-gate-dflash.sh    # spec-decode
+./scripts/coherence-gate.sh           # AR runtime smoke, when relevant
+./scripts/coherence-gate-dflash.sh    # canonical correctness gate
 ```
 
 Hard fails on panics, zero tokens, timeouts, or attractor-loop
@@ -199,7 +199,8 @@ Example shape (from commit `4105035`):
 ```
 perf(cdna3): full wave64 port of all hot HFQ4 kernels — MI300X decode 48.6 → 96 tok/s
 
-Bisect baseline: ddee123 (decode 48.6 tok/s on MI300X 9B AR).
+Bisect baseline: <baseline-sha> (record the exact MI300X 9B AR baseline
+commit and decode tok/s from your run).
 Candidate: this commit (decode 96.0 tok/s on MI300X 9B AR, 2× win).
 Bench: HIPFIRE_BASELINE_ARCH=gfx942 ./scripts/speed-gate.sh
 Binary md5: <hash>

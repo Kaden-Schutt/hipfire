@@ -51,7 +51,8 @@ hipcc compilation failed for <kernel>:
 
 **Affects:** V620 on CachyOS, some other distro-packaged ROCm 7.x builds.
 
-**Fix (hipfire v0.1.5+ does this automatically):**
+**Fix (current hipfire does this automatically; keep the env override for
+older installs or distro-packaged ROCm edge cases):**
 ```bash
 export HIPFIRE_HIPCC_EXTRA_FLAGS="-I/opt/rocm/include"
 # or upgrade:
@@ -94,7 +95,7 @@ Only visible on 9B+ Qwen 3.5 models.
 
 **Fix:**
 ```bash
-hipfire update                              # pull v0.1.5+
+hipfire update                              # pull the current release
 hipfire config set kv_cache asym3
 hipfire stop; hipfire serve -d
 ```
@@ -117,7 +118,8 @@ Expected: `"content":"Kaden"` (think block stripped).
 **Symptom:** `panicked at 'Result::unwrap()': HipError { code: 700, message:
 "hipMemcpy H2D: illegal memory access" }` — always mid-generation.
 
-**Fix (v0.1.5 auto-bumps via `buildLoadMessage`):**
+**Fix (current hipfire auto-bumps via `buildLoadMessage`; use explicit config
+when testing older installs or reproducing a report):**
 ```bash
 hipfire config set max_seq 32768
 # or per-model:

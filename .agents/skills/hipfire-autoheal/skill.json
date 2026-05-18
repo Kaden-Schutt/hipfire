@@ -1,6 +1,6 @@
 {
   "name": "hipfire-autoheal",
-  "version": "0.1.5",
+  "version": "0.1.9",
   "description": "Triage and fix hipfire runtime issues: daemon hangs, kernel JIT failures, port conflicts, multi-turn recall breaks, VRAM OOM. Walks the standard fix catalog in order of likelihood, gathers diagnostics, and ships targeted repairs. Framework-agnostic — works with any AI agent that can read, run shell commands, and edit config.",
   "triggers": [
     "hipfire won't start",
@@ -23,7 +23,7 @@
     "known-issues": "./known-issues.md"
   },
   "requires": {
-    "gpu": "AMD RDNA (gfx1010/gfx1013/gfx1030/gfx1100/gfx1101/gfx1102/gfx1151/gfx1200)",
+    "gpu": "AMD RDNA/CDNA supported by the current checkout",
     "runtime": "ROCm 6+, amdgpu kernel driver",
     "hipfire": "0.1.5+"
   }

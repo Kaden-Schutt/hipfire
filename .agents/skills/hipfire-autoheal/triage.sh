@@ -2,17 +2,40 @@
 # hipfire-autoheal — gather baseline diagnostics + detect common failure modes.
 # Emits structured sections that the interpret playbook maps to fixes.
 #
-# Usage: .skills/hipfire-autoheal/triage.sh [--json]
+# Usage: .agents/skills/hipfire-autoheal/triage.sh [--json]
 set -u
 
 JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
 
-run() { eval "$@" 2>/dev/null; }
 exists() { command -v "$1" >/dev/null 2>&1; }
-section() { [ "$JSON" = "1" ] && echo "{\"section\":\"$1\",\"content\":[" || echo "=== $1 ==="; }
-section_end() { [ "$JSON" = "1" ] && echo "]},"; }
-line() { [ "$JSON" = "1" ] && printf '"%s",\n' "$(echo "$1" | sed 's/"/\\"/g')" || echo "$1"; }
+FIRST_SECTION=1
+FIRST_LINE=1
+json_escape() {
+    printf '%s' "$1" | tr '\t\r\n' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+section() {
+    if [ "$JSON" = "1" ]; then
+        [ "$FIRST_SECTION" = "1" ] || echo ","
+        FIRST_SECTION=0
+        FIRST_LINE=1
+        printf '{"section":"%s","content":[' "$(json_escape "$1")"
+    else
+        echo "=== $1 ==="
+    fi
+}
+section_end() { [ "$JSON" = "1" ] && printf "]}"; }
+line() {
+    if [ "$JSON" = "1" ]; then
+        [ "$FIRST_LINE" = "1" ] || printf ","
+        FIRST_LINE=0
+        printf '"%s"' "$(json_escape "$1")"
+    else
+        echo "$1"
+    fi
+}
+
+[ "$JSON" = "1" ] && printf "["
 
 # ── 1. environment basics ──
 section "environment"
@@ -127,4 +150,4 @@ if grep -q "Kendall" "$LOG" 2>/dev/null; then
 fi
 section_end
 
-if [ "$JSON" = "1" ]; then echo "{}"; fi
+if [ "$JSON" = "1" ]; then echo "]"; fi

@@ -151,7 +151,7 @@ tests is the tool that would have caught this in 30 seconds.
    future WMMA / MFMA channel-test should include it (it would
    have caught this in seconds).
 
-The arch-port skill (`.skills/hipfire-arch-port/`) explicitly cites
+The arch-port skill (`.agents/skills/hipfire-arch-port/`) explicitly cites
 this commit as the cautionary tale for new contributors. PR #56
 followed that guidance and avoided the trap entirely on gfx12.
 
@@ -249,8 +249,9 @@ gfx1100 should pass byte-exact.
 
 ## §7 — LDS-staged X share on gate_up (null result, kept opt-in for posterity)
 
-**Commit**: `feb16a1` — "experiment(gate_up): LDS-staged X share
-variant — pp512 prefill -12% (null result)"
+**Historical branch note**: "experiment(gate_up): LDS-staged X share
+variant — pp512 prefill -12% (null result)". Verify the exact commit exists
+in your checkout before citing a hash externally.
 
 **Variant kernel**: `kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip`,
 opt-in via `HIPFIRE_GATE_UP_VARIANT=ldsx`. Investigation tracked in
@@ -380,13 +381,14 @@ the candidates are:
 
 ## §8 — K4 output-mapping bug fix (correctness restored, no perf change)
 
-**Commit**: `2135513` — "fix(gemm): K4 output mapping — was swapped
-relative to canonical wave32 WMMA C-mapping"
+**Historical branch note**: "fix(gemm): K4 output mapping — was swapped
+relative to canonical wave32 WMMA C-mapping". Verify the exact commit exists
+in your checkout before citing a hash externally.
 
 **Companion commits**:
 
-- `e00ece7` — prerequisite channel-test patch (row-varying weights
-  + K∈{256,512,4096} sweep). The bug was invisible to the original
+- prerequisite channel-test patch: row-varying weights
+  + K∈{256,512,4096} sweep. The bug was invisible to the original
   test at batch=1.
 - Investigation tracked in issue #60 (which has the v2 plan + three
   independent adversarial reviews recorded in the comment thread).
@@ -452,7 +454,7 @@ available locally. Future work.
 
 **Validation path**:
 
-- **Channel-test patched first** (e00ece7) — the original test
+- **Channel-test patched first** — the original test
   used row-invariant weights (`w[r][k] = 1.0` along the diagonal),
   making `C[r][b]` independent of r. That hid row-shuffle errors
   at batch=1 entirely. Patched test uses `w[r][k] = (r+1)*0.05`

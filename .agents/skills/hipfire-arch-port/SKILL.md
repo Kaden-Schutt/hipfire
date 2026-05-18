@@ -75,17 +75,15 @@ have hit are documented here so you don't repeat them.
 
 ## Cross-references (commits + ops notes)
 
-- **gfx12 dispatch fallback (issue #54):** commit `6e100c2` routes
-  gfx1200/gfx1201 to the dot2 path until per-arch WMMA kernels land.
-  Mild perf regression vs peak WMMA, but eliminates the codegen
+- **gfx12 bring-up history (issue #54):** commit `6e100c2` routed
+  gfx1200/gfx1201 to a safe fallback to eliminate the original codegen
   crash on 9070 XT.
-- **First canonical gfx12 WMMA kernel:** commit `6924f2a` adds
+- **Canonical gfx12 WMMA pattern:** commit `6924f2a` added
   `kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip` as the worked-out
-  pattern reference for porting the remaining 5 gfx11 WMMA kernels.
-  Includes inline documentation of the four load-bearing changes
-  (builtin name, operand vector size, K-split lane decomposition,
-  C-mapping hypothesis). NOT YET WIRED into dispatch.rs pending
-  R9700 channel-test of the C-mapping hypothesis.
+  pattern reference. Current checkouts also contain additional gfx12
+  WMMA sibling kernels and selectors; inspect `crates/rdna-compute/src/kernels.rs`,
+  `crates/rdna-compute/src/dispatch.rs`, and env gates such as
+  `HIPFIRE_LLOYD_GFX12` before claiming a path is enabled by default.
 - **WMMA correctness fix (gfx11):** commit `b7ac66a` ("wmma
   correctness fix + MQ6 family + cross-arch prefill + gate
   framework"). The gfx11 C-mapping (`acc[j] = C[2*j + (tid>>4)]

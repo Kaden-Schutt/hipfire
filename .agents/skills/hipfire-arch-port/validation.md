@@ -51,8 +51,10 @@ correctness coverage on its specific kernel.
 
 ## Gate 2: Coherence-gate (output sanity)
 
-`scripts/coherence-gate.sh` runs a small fixed prompt matrix through
-the daemon and writes a markdown report.
+`scripts/coherence-gate.sh` runs a small fixed AR prompt matrix through
+the daemon and writes a markdown report. `scripts/coherence-gate-dflash.sh`
+is the canonical correctness gate for changes touching kernels, quant
+formats, dispatch, fusion, rotation, rmsnorm, or the spec-decode path.
 
 ### What it tests
 
@@ -67,8 +69,9 @@ ing — the human / agent reviewer reads the report.
 ### How to run
 
 ```bash
-./scripts/coherence-gate.sh           # short — 0.8b/4b/9b dense
-./scripts/coherence-gate.sh --full    # adds A3B MoE
+./scripts/coherence-gate.sh           # AR smoke — 0.8b/4b/9b dense
+./scripts/coherence-gate.sh --full    # AR smoke plus A3B MoE
+./scripts/coherence-gate-dflash.sh    # canonical gate for affected code
 ```
 
 ### Important note for arch ports
@@ -172,9 +175,9 @@ diff so reviewers see the trade-off explicitly.
 ## Last verified
 
 This procedure was used to validate gfx1100 (RDNA3) and gfx1030
-(RDNA2) ports. gfx1201 (RDNA4) port is in progress as of 2026-04-27:
-- 6e100c2 — dispatch fallback (gfx12 routes to dot2 path) shipped.
-- 6924f2a — first canonical gfx12 WMMA kernel scaffolded
-  (`kernels/src/gemm_qkv_hfq4g256_wmma.gfx12.hip`); compile-tests
-  green for gfx1200/gfx1201, NOT yet wired into dispatch.rs pending
-  R9700 channel-test (see issue #54).
+(RDNA2) ports. Current checkouts include gfx12 WMMA sibling kernels and
+selectors for multiple paths, while some MQ3-Lloyd gfx12 fast paths remain
+explicitly env-gated (`HIPFIRE_LLOYD_GFX12`) until external RDNA4 parity and
+coherence data is accepted. Before changing an arch route, inspect the current
+`kernels.rs` selector and `dispatch.rs` branch rather than relying on old
+issue status.
