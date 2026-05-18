@@ -601,11 +601,11 @@ pub fn weight_gemv(
                 dtype: DType::F32,
             };
             // Preserve the gfx12 dual-FP8 fast path inside
-            // `gemv_mfp4g32_with_rotate` when AWQ is not in play. The
-            // quantizer cannot emit AWQ sidecars for MFP4G32 today (AWQ
-            // is gated to MQ4G256), so the `is_some()` branch is
-            // unreachable from today's pipeline — kept for forward
-            // compatibility if AWQ is ever widened to MFP4.
+            // `gemv_mfp4g32_with_rotate` when AWQ is not in play. AWQ
+            // is currently gated by `DType::supports_awq_sidecar`
+            // (`MQ4G256 | MQ3G256` today), so the `is_some()` branch
+            // is unreachable from today's pipeline — kept for forward
+            // compatibility if MFP4G32 ever joins the AWQ allow-list.
             if w.awq_scale.is_some() {
                 rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
                 gpu.gemv_mfp4g32_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)

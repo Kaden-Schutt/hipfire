@@ -899,12 +899,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         } else {
             panic!("tensor not found: {name} or {full_name}");
         };
-        // Phase A Stage A — populate awq_scale for MQ4G256 weights when
-        // a sidecar is present. The pread call invalidates the prior
-        // pread_buf borrow, but the weight bytes have already been
-        // uploaded to GPU (owned by `wt.buf`) so the borrow no longer
-        // matters.
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        // Phase A Stage A — populate awq_scale when the dtype is on
+        // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
+        // The pread call invalidates the prior pread_buf borrow, but
+        // the weight bytes have already been uploaded to GPU (owned by
+        // `wt.buf`) so the borrow no longer matters.
+        if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
@@ -916,7 +916,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             .or_else(|| hfq.tensor_data(name))
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
-        if matches!(wt.gpu_dtype, DType::MQ4G256) {
+        if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
@@ -1374,10 +1374,10 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
         load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?
     };
 
-    // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens
+    // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
     let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
         .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1409,6 +1409,23 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // AWQ sidecar attachment for lm_head / tied embed_tokens. Safe now
+    // that both decode (`weight_gemv` → `rotate_x_mq_for`) AND spec-
+    // decode verify (`speculative.rs::rotate_x_mq_batched_for`) apply
+    // the `x /= s` inverse when `output.awq_scale.is_some()`. Pre-fix,
+    // attaching a sidecar here would have driven the 0.67 → 13.5 KLD
+    // corruption documented at `docs/plans/awq_fix_claude.md` because
+    // the spec-verify path used the non-AWQ `rotate_x_mq_batched`.
+    // Try each plausible tensor name; `load_awq_scale_for` returns
+    // None when no sidecar exists, so this is a no-op for current
+    // pre-CUDA-pipeline files.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        eprintln!("  lm_head AWQ sidecar: {}",
+            if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
+    }
 
     let is_moe = config.num_experts > 0;
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -1606,7 +1623,7 @@ fn load_output_into(
     let lm_head_info = hfq
         .tensor_data("lm_head.weight")
         .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
-    let output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
@@ -1645,6 +1662,17 @@ fn load_output_into(
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
         }
     };
+    // AWQ sidecar attachment — sister of the `load_weights` block.
+    // Safe because both `weight_gemv` (decode) and `speculative.rs`
+    // (spec-verify) route through AWQ-aware rotations on
+    // `output.awq_scale.is_some()`. No-op on current files.
+    if output.gpu_dtype.supports_awq_sidecar() {
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        eprintln!("  lm_head AWQ sidecar: {}",
+            if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
+    }
     Ok((output_norm, output))
 }
 

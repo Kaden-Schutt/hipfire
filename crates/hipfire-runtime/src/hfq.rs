@@ -529,7 +529,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
         gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
     };
 
-    match info.quant_type {
+    let mut wt = match info.quant_type {
         0 => { // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, awq_scale: None })
@@ -579,8 +579,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
         }
         13 => { // MQ4-G256 — MagnumQuant FWHT-rotated 4-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            let awq_scale = load_awq_scale();
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, awq_scale })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, awq_scale: None })
         }
         14 => { // MQ8-G256 — MagnumQuant FWHT-rotated symmetric INT8, dp4a
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -629,7 +628,18 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
         }
         _ => panic!("unsupported quant_type {} for weight {st_name}", info.quant_type),
+    }?;
+    // Centralized AWQ sidecar attachment. Replaces the prior per-arm
+    // inline `load_awq_scale()` calls at the qt=13 / qt=17 arms — those
+    // were the only loaders touching `awq_scale` and missing arms (qt=15
+    // MQ6, qt=18 MQ2, qt=19/20 Lloyd, qt=24 MFP4) would silently drop
+    // sidecars if added later. Routed through `DType::supports_awq_sidecar`
+    // so future widening is a single helper edit, not a scattered
+    // per-loader hunt. See dispatch.rs for the allow-list rationale.
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        wt.awq_scale = load_awq_scale();
     }
+    Ok(wt)
 }
 
 /// Load LLaMA weights from an HFQ file onto GPU.
