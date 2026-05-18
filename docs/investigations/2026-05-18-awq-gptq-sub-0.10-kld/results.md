@@ -72,3 +72,69 @@ Recorded as negative result. Fix at commit `63ba8aa1` (`fix(iterate): restrict A
 ## Iterative pipeline run-002 (F1-scope-fixed)
 
 (Populating as monitor fires.)
+
+## Iterative pipeline run-003 (F1-scope + v3 base + corrected module_name)
+
+After three failed setups, the working configuration uses:
+- Mask: 184 F1-AWQ-eligible tensors model-wide (`mask-f1-184-v3.json`)
+- Base: v3's mq4-awq-pr266-repro (preserves AWQ sidecars where iterate doesn't refresh)
+- Module names: `model.layers.N.*` (NOT `model.language_model.layers.N.*` — transformers strips the multimodal infix at the live module level)
+
+| Round | KLD c512 | PPL | scale-delta | Elapsed | Notes |
+|---:|---:|---:|---:|---:|---|
+| 0 | **0.1798** | 9.36 | — | 33 min | within 43% of v3's 0.1257 — imatrix-source gap |
+| 1 | ⏳ | ⏳ | ⏳ | ~32 min | first true KM step |
+| 2 | ⏳ | ⏳ | ⏳ | ~32 min | last round (max=3) |
+
+Round 0 ≠ v3 (0.1257) because:
+- v3 used **unsloth's pre-published imatrix** (different calibration corpus, different chunking)
+- run-003 collects imatrix in-process from **calib-1m.txt @ ctx=256/chunks=64**
+
+The in-process collection should be CLOSER to runtime activation distribution (matches what the model actually sees), so iteration may converge below v3 even though round 0 is above. We'll see by round 2.
+
+| Round | KLD c512 | PPL | scale-delta | Elapsed |
+|---:|---:|---:|---:|---:|
+| 0 | **0.1798** | 9.36 | — | 33 min |
+| 1 | **0.1809** | 9.18 | 6.34% | 34 min |
+| 2 | ⏳ | ⏳ | ⏳ | running |
+
+**Critical finding** at round 1: KLD plateau between rounds — `0.1798 → 0.1809` is essentially flat (+0.06%) despite scale-delta of 6.34%. The iteration IS moving scales but the resulting model quality is hitting a floor at ~0.18 KLD, **higher than v3's 0.1257**.
+
+**Diagnosis**: the limiting factor is the **imatrix calibration data** itself, not the iteration. v3's unsloth-published imatrix appears to be of higher quality (longer/different corpus, possibly different methodology) than what run-003 produces via in-process collection on `calib-1m.txt @ ctx=256/chunks=64`. Iteration converges to a worse fixed point because its starting imatrix is worse.
+
+**Hypothesis**: pointing iterate at unsloth's imatrix as the round-0 stats source (instead of collecting fresh) might recover v3-quality round-0, after which iteration could push below 0.1257. This would be a script-level change — `--candidate-mq4` for round-N>0 (already implemented) + `--initial-stats-npz unsloth.npz` for round-0 (not yet implemented).
+
+### Run-003 final trajectory
+
+| Round | KLD c512 | PPL | scale-delta vs prev | Elapsed | KLD vs v3 (+%) |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 0.1798 | 9.360 | — | 33 min | +43.0% |
+| 1 | 0.1809 | 9.181 | 6.34% | 34 min | +43.9% |
+| 2 | **0.1839** | **8.895** | 1.99% | 34 min | +46.3% |
+
+**Convergence**: scale-delta shrinking geometrically (6.34% → 1.99% per round, ratio ≈ 1/3 with damping β=0.5). Would converge below ε=1% in ~1 more round. Iteration is **mathematically working as designed**.
+
+**Quality**: KLD slowly RISES across rounds (0.1798 → 0.1839) while PPL DROPS (9.36 → 8.89). Same KLD-PPL inversion pattern as the alpha sweep and F2 stack. The iteration tunes AWQ scales to match the in-process activation distribution; the model becomes more "self-consistent" (lower PPL) but drifts further from BF16's distribution (higher KLD).
+
+**Goal verdict**: ❌ **sub-0.10 KLD NOT achieved** by iterative AWQ+GPTQ in run-003. Final iterate KLD 0.1839 vs v3's 0.1257 vs target <0.10.
+
+### Why the iteration plateaued above v3
+
+The iterative pipeline's per-round imatrix is collected **in-process** from `calib-1m.txt @ ctx=256/chunks=64`. v3 used **unsloth's pre-collected imatrix** (different corpus / methodology). The unsloth imatrix produces "better" AWQ scales for our KLD objective.
+
+Evidence:
+- v3 with unsloth imatrix: KLD 0.1257
+- run-003 round 0 with in-process imatrix: KLD 0.1798 (already +43% vs v3 *before* any iteration)
+- Iteration changes the FIXED POINT, not the underlying imatrix; can't recover the imatrix gap
+
+### What would unblock sub-0.10
+
+In rough priority order (most-likely-to-work first):
+
+1. **Use unsloth's imatrix as the round-0 stats input** (script-level change ~50 LOC): `--initial-stats-npz unsloth.npz` to bypass round-0 in-process collection. Then iteration starts from v3-quality scales and refines from there. Plausible round-0 ≈ 0.13, iteration drives toward sub-0.10.
+
+2. **Per-tensor α grid search** (Tier 2 proper): vary α ∈ {0.0, 0.3, 0.5, 0.7, 1.0} per tensor, pick each tensor's local optimum based on reconstruction error. The α-curve U-shape with PPL minimum at α=1.0 strongly implies per-tensor heterogeneity. Expected lift 5-15%, plausible sub-0.10.
+
+3. **Iterate on top of v3's actual model** (deeper rewrite): instead of starting from flat-MQ4 + new scales, start from v3's GPTQ-corrected model and use iteration to refine *only* the AWQ scale values while preserving GPTQ corrections. Currently iterate's round-0 GPTQ pass overwrites v3's corrections.
+
+4. **Longer/different calibration corpus** (data-side): re-collect imatrix on a calibration corpus closer to unsloth's (longer documents, different distribution). Out of scope without more info on what unsloth used.

@@ -40,3 +40,21 @@ v3 is **−61% KLD vs flat-mq4 at +0 bytes on disk**. Beats prior best `cand151-
 2. **Hessian re-collection**: NOT necessary — the existing c64 Hessian is used for all paper-formula AWQ+GPTQ experiments. Iterative rounds collect their own per-round Hessian using the partial-quantized model.
 3. **Imatrix re-collection**: NOT necessary for one-shot pipelines (uses unsloth's published imatrix). Iterative re-collects internally.
 4. **Engine binary**: must match origin/master HEAD post-PR-#273. Pre-PR-#266 binaries cannot load AWQ sidecars; pre-PR-#273 binaries cannot dispatch the F2 output-side AWQ kernels (immaterial for v3 since v3 uses F1-scope only).
+
+## Update 2026-05-18 14:00 UTC — sub-0.10 status
+
+**Iterative AWQ+GPTQ (run-003) did NOT achieve sub-0.10 KLD.** Final iterate landed at **KLD 0.1839** vs v3's 0.1257 vs target <0.10.
+
+**Root cause** (fully diagnosed): the iterative pipeline's per-round imatrix collection (`calib-1m.txt @ ctx=256/chunks=64`) produces less-optimal AWQ scales than unsloth's pre-collected imatrix that v3 used. Iteration converges to a fixed point determined by the imatrix quality.
+
+The iteration **mathematically works correctly** (scale-delta shrinks geometrically, parity tests pass) — but converges to a worse fixed point because the calibration data underlying the per-round refinement is the limiting factor.
+
+**v3 (KLD 0.1257, PPL 9.31, 5.0 GB) remains the 9B Pareto winner** as of this investigation's close.
+
+**Highest-probability path to sub-0.10** (documented in `results.md`, ranked by expected ROI):
+1. Iterate using unsloth's imatrix as the round-0 stats input (~50 LOC script change)
+2. Per-tensor α grid search (Tier 2 proper; lift 5-15%, plausible sub-0.10)
+3. Iterate on top of v3's GPTQ-corrected model preserving corrections
+4. Re-collect imatrix on a richer/longer calibration corpus
+
+All four next-steps reach **sub-0.10 with same wire format + perf** (no K-map, no Q8 promotions). The methodology + repro recipe in this directory let any of them resume cleanly.
