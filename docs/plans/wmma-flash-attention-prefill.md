@@ -479,6 +479,101 @@ production-realistic.
    - **Floor: median ≥ +15% prefill at n ≥ 128 on gfx1100.** Floor for gfx1151 set by Phase 1.0 ALU-only ceiling minus 1.5× the dequant tax.
    - Document BIOS/EC/DPM state for gfx1151 runs (per `tests/speed-baselines/gfx1151.txt:33-44` — same binary+prompt swings 245→151 across BIOS configs).
 
+## Phase 1.1.5 — sub_batch alignment fix (~1.5-3 hours)
+
+Phase 1.1 surfaced a real-deployment limitation: the WMMA auto-route
+gate requires `batch_size % WMMA_BLOCK_M == 0 && sub_batch % WMMA_BLOCK_M
+== 0`. On Qwen 3.5 9B with the default `flash_partials` sizing, `sub_batch`
+gets squeezed by `partials_capacity / per_pos_bytes` once `max_tiles`
+grows past ~4 (i.e. prefill > ~512 tokens). For prefill=1024 we measured
+`sub_batch ∈ {24, 36, 72}` — none 16-aligned, so the kernel falls back to
+scalar.
+
+This means the WMMA path **only fires on the short-prefill regime**
+(~256-512 tokens for 9B). The +1.81% fresh-process win measured at
+prefill=2048 includes scalar runs for any chunk where sub_batch missed
+alignment, diluting the true WMMA contribution. Long prefill is where
+FA is the largest fraction of total prefill compute time (15-25% vs
+~7.5% at short prefill on 9B), so the real win is likely larger but
+masked.
+
+Two approaches exist; do **Approach B first**, then Approach A only if
+B's long-prefill bench shows enough lift to justify the memory cost.
+
+### Approach A — Resize `flash_partials` buffer
+
+Make the partials capacity scale so `sub_batch` always equals
+`min(batch_size, PREFILL_MAX_BATCH)` regardless of `max_tiles`. Touch
+`crates/hipfire-arch-qwen35/src/qwen35.rs:Qwen35Scratch::new`
+(and the `PrefillBatchScratch` allocator) to size `flash_partials` at
+`n_heads × ceil(max_ctx_len / TILE_SIZE) × (2 + head_dim) ×
+PREFILL_MAX_BATCH` floats.
+
+**Effort: ~2-3 hours**
+- 30 min — trace `flash_partials` allocation sites + understand current sizing
+- 30 min — fix allocation to use the worst-case `max_tiles` × max_batch
+- 30 min — graph-capture / address-stability sanity check (the new alloc
+  must remain pinned across replay)
+- 30 min — VRAM footprint regression check on tighter cards (gfx1102 12 GB,
+  gfx1032 8 GB)
+- 30 min — bench at long prefill (n_ctx=2048, 4096) with WMMA enabled
+
+**Risk: Medium.** Memory grows roughly 5× for hd=256 + max_ctx=8K (from
+the current size to the worst-case). Could regress tighter-VRAM
+deployments. The buffer is shared across DFlash, PFlash, regular prefill
+paths — all must agree on the new size.
+
+**Doesn't fully solve the problem on its own** — `batch_size` itself is
+caller-determined; non-16-aligned `batch_size` (e.g. PFlash with B=14)
+still misses the gate. Approach B is needed for full coverage.
+
+### Approach B — `chunk_size` kernel arg + in-kernel OOB masking ← **RECOMMENDED FIRST**
+
+Add an i32 `chunk_size` to the kernel signature. Inside the kernel, mask
+the Q load + `positions[]` read + partials write for lanes where
+`m_start + lane_row >= chunk_size`. Drop the `batch_size %
+WMMA_BLOCK_M == 0` and `sub_batch % WMMA_BLOCK_M == 0` gate clauses;
+keep only `batch_size >= wmma_fa_min_batch()`.
+
+**Effort: ~1.5-2 hours**
+- 30 min — modify `kernels/src/attention_flash_asym4_wmma_tile_batched.hip`
+  to add `chunk_size` arg and OOB-guard the trailing m_tile's lanes
+- 15 min — modify `launch_asym_flash_batched` to push `chunk` into the
+  KernargBlob (and the `Vec<*mut c_void>` mirror)
+- 15 min — drop the alignment clauses from the wmma_ok gate
+- 15 min — build + smoke test (`dump_logits_qwen35` at varied prefills,
+  verify argmax still matches scalar across the firing window)
+- 30 min — fresh-process A/B at long prefills (2048, 4096) via
+  `benchmarks/results/wmma-fa-probe.sh`
+
+**Risk: Low.** Kernel logic is unchanged except for additional guards.
+Backward compatible — when `chunk_size == batch_size` (the typical
+case), behavior is bit-identical to the current kernel. No memory
+changes. No partials-buffer co-ordination needed.
+
+**Pays off the data we don't have yet.** The +1.81% on 9B was measured
+under the gate-failure regime where most chunks ran scalar. Approach B
+unblocks a true long-prefill measurement, which is where FA is the
+largest fraction of total compute and the WMMA win should be most
+visible. If long-prefill shows ≥ +5% pipeline, this kernel earns its
+complexity and Phase 1.3 (default flip) becomes defensible.
+
+### Recommendation
+
+**Do Approach B (1.5-2 hours) before Phase 1.2.** Without it, the +1.81%
+measurement is misleading (it's averaging WMMA chunks with silent scalar
+fallbacks). After Approach B, the new long-prefill A/B gives the *real*
+WMMA win on this hardware. That number — not the current +1.81% — is
+what determines whether Phase 1.2 (asym2) and Phase 1.3 (default flip)
+are worth pursuing.
+
+Approach A becomes a follow-up *only if* Approach B's number is high
+enough to justify the memory cost. If Approach B shows ~+5-10% on long
+prefill, then Approach A's incremental coverage (the few-percent of
+calls where `batch_size` itself is non-16-aligned) is worth the ~2-3
+hours. If Approach B still shows ~+2%, Approach A wouldn't move the
+needle and isn't worth doing.
+
 ## Phase 1.2 — Asym2 + final gates (2-3 days)
 
 - **Asym2 source file** `kernels/src/attention_flash_asym2_wmma_tile_batched.hip` (~300 lines). 2-bit packing, `TURBO_C2` LUT. Same structural template as asym4; the dequant inner block changes.
