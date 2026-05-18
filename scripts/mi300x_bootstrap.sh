@@ -30,6 +30,9 @@ TARGET_ARCH="${TARGET_ARCH:-gfx942}"
 
 mkdir -p "$WORK" "$HF_HOME" "$IMATRIX_DIR" "$RESULTS_DIR"
 export HF_HOME
+# huggingface_hub reads HF_HOME at import time, so child processes (incl.
+# screen sessions invoked later) must inherit it. Re-exporting after mkdir
+# ensures the path exists when first cached.
 
 # HuggingFace revisions pinned for reproducibility against hiptrx baselines.
 # Lines: <hf_repo> <revision>
@@ -116,7 +119,7 @@ patch = '''        # WMMA SKIP for gfx942 (CDNA3 has MFMA, not RDNA WMMA builtin
         # *_wave64.hip family covers MI300x via MFMA.
         if [[ "$arch" == gfx94* ]]; then
             case "$name" in
-                *_wmma*|*wmma_*)
+                *wmma*)
                     echo "  - $name SKIP (RDNA-only WMMA on $arch)"
                     continue
                     ;;
