@@ -7,6 +7,8 @@
 //! RDNA-native quantized weights.
 
 mod gguf_input;
+mod gptq;
+mod hessian_io;
 
 use memmap2::Mmap;
 use std::collections::HashMap;
@@ -64,6 +66,18 @@ static AWQ_FORMULA: OnceLock<bool> = OnceLock::new();  // true = autoawq formula
 // recipe and the production default. Opt into F2 via --awq-scope f2 or
 // HIPFIRE_AWQ_F1_ONLY=0 env-var override.
 static AWQ_SCOPE_F1: OnceLock<bool> = OnceLock::new();
+
+// Phase A Stage B — GPTQ on MQ4G256. When `--gptq <hessian-path>` is set,
+// each MQ4G256 tensor goes through `gptq::gptq_pipeline_mq4g256` instead
+// of plain `quantize_mq4g256`. Stacks with `--awq` (AWQ pre-scaling
+// happens before GPTQ; GPTQ optimizes the AWQ-scaled, FWHT-rotated
+// weights). Algorithm + format details in `docs/plans/gptq.md` v2.
+//
+// The sidecar is mmap'd at quantize-start (cheap header parse + index
+// build); per-tensor Hessian payloads page in as the per-tensor GPTQ
+// loop walks them. ~32 GB sidecar for 9B; the kernel pager evicts the
+// payload after each tensor's Cholesky completes.
+static GPTQ_HESSIAN: OnceLock<hessian_io::HessianSidecar> = OnceLock::new();
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -2036,12 +2050,32 @@ struct TensorSpill {
 }
 
 impl TensorSpill {
+    /// Create a fresh spill file with a per-process unique name to prevent
+    /// concurrent `hipfire-quantize` runs that target the same output
+    /// directory from clobbering each other's scratch state. See
+    /// `docs/plans/gptq_bug.md` for the 14-hour GPTQ work lost on
+    /// 2026-05-14 when two runs sharing `<dir>/.hipfire_quant_spill.tmp`
+    /// produced an `Err(NotFound)` at the read-back step in `write_hfq`.
+    ///
+    /// PID alone is sufficient to disambiguate concurrent processes on
+    /// Linux; the nanosecond suffix protects against the rare PID-reuse
+    /// case (two `hipfire-quantize` runs with the same PID within the
+    /// same epoch tick targeting the same directory). `create_new` makes
+    /// the file open fail loudly instead of silently truncating someone
+    /// else's data if the names ever collide despite both guards.
     fn new(dir: &Path) -> std::io::Result<Self> {
-        let path = dir.join(".hipfire_quant_spill.tmp");
-        let file = std::io::BufWriter::with_capacity(
-            4 * 1024 * 1024,
-            File::create(&path)?,
-        );
+        use std::fs::OpenOptions;
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let path = dir.join(format!(".hipfire_quant_spill.{pid}.{nanos}.tmp"));
+        let raw = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, raw);
         Ok(Self { file, path, offset: 0 })
     }
 
@@ -3377,6 +3411,50 @@ fn main() {
         let formula_label = if awq_formula == "autoawq" { "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)" } else { "s[j]=(RMS_act[j])^alpha" };
         eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, scope={awq_scope}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
     }
+
+    // ── Phase A Stage B — GPTQ on MQ4G256 ─────────────────────────────
+    // --gptq <hessian-path>      → enable GPTQ using the sidecar Hessian
+    // --gptq-damp <f>            → initial damping (default 0.01)
+    // --gptq-max-damp <f>        → adaptive damping cap as multiple of
+    //                              mean(diag(H)) (default 1.0); above this
+    //                              skip GPTQ for that tensor, fall through
+    //                              to plain MQ4
+    // Stacks with --awq. GPTQ runs AFTER AWQ pre-scaling and BEFORE the
+    // existing FWHT+pack step in the MQ4G256 branch. Implementation +
+    // composability rationale: docs/plans/gptq.md v2.
+    let gptq_path = args.iter().position(|a| a == "--gptq")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
+    let gptq_damp = args.iter().position(|a| a == "--gptq-damp")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.01);
+    let gptq_max_damp = args.iter().position(|a| a == "--gptq-max-damp")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
+    if let Some(path) = &gptq_path {
+        if !path.exists() {
+            eprintln!("error: --gptq path not found: {}", path.display());
+            std::process::exit(1);
+        }
+        let sc = match hessian_io::HessianSidecar::open(path) {
+            Ok(sc) => sc,
+            Err(e) => {
+                eprintln!("error: failed to open --gptq sidecar {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "GPTQ: ENABLED via {} ({} Hessians, initial_damp={gptq_damp}, max_damp_mult={gptq_max_damp})",
+            path.display(),
+            sc.n_tensors()
+        );
+        GPTQ_HESSIAN.set(sc).map_err(|_| "GPTQ_HESSIAN set twice").unwrap();
+    }
+    // Cache GPTQ tuning params for the MQ4G256 branch below.
+    let gptq_initial_damp = gptq_damp;
+    let gptq_max_damp_multiplier = gptq_max_damp;
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
     // short context, win at long context — see benchmarks/results/
@@ -3988,38 +4066,85 @@ fn main() {
                     // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
                     // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
                     // this guard landed). See `docs/plans/awq_fix_claude.md`.
-                    let q = if let (Some(alpha), Some(im_weights))
-                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                    {
-                        if awq_eligible(name) {
-                            debug_assert_eq!(im_weights.len(), k_dim,
-                                "imatrix length ({}) != K dim ({}) for {}",
-                                im_weights.len(), k_dim, name);
-                            let m_dim_awq = meta.shape[0];
-                            let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
-                                let w_rms = compute_weight_rms_per_input(&f32_data, m_dim_awq, k_dim);
-                                compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                    //
+                    // Phase A Stage B — GPTQ on MQ4G256 (commit pending).
+                    // When --gptq is enabled AND we have a Hessian for this
+                    // tensor, route through `gptq::gptq_pipeline_mq4g256`
+                    // which does AWQ-Hessian-rescale + FWHT-similarity +
+                    // FWHT-rotate-weights + frozen-grids + column-sequential
+                    // OBS update + pack. Stacks cleanly with AWQ (the
+                    // pipeline takes AWQ scales as input). For non-AWQ
+                    // tensors (o_proj/out_proj/down_proj per the whitelist),
+                    // pass identity scales — Stage B widens GPTQ coverage to
+                    // all MQ4G256 tensors per GLM5 M5.
+                    let m_dim = meta.shape[0];
+                    // Step 1: AWQ pre-scaling (if eligible + enabled).
+                    let (working_weights, awq_scales_for_pipeline_f64) =
+                        if let (Some(alpha), Some(im_weights))
+                            = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                debug_assert_eq!(im_weights.len(), k_dim,
+                                    "imatrix length ({}) != K dim ({}) for {}",
+                                    im_weights.len(), k_dim, name);
+                                let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
+                                    let w_rms = compute_weight_rms_per_input(&f32_data, m_dim, k_dim);
+                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                } else {
+                                    compute_awq_scales(im_weights, alpha)
+                                };
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
+                                (scaled, scales_f64)
                             } else {
-                                compute_awq_scales(im_weights, alpha)
-                            };
-                            // Stash for sidecar emission after the main tensor push.
-                            awq_sidecar_scales = Some(scales.clone());
-                            let m_dim = meta.shape[0];
-                            // Copy weights so we don't mutate to_f32's buffer
-                            // (might be shared/borrowed depending on dtype path).
-                            let mut scaled = f32_data.clone();
-                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                            quantize_mq4g256(&scaled, &signs1, &signs2)
+                                // AWQ-ineligible: plain weights, identity scales.
+                                (f32_data.clone(), vec![1.0_f64; k_dim])
+                            }
                         } else {
-                            // Runtime path for this weight has no AWQ inverse
-                            // (rotate_x_mq for o_proj/out_proj/wo, or
-                            // fused_silu_mul_rotate_mq for down_proj/w_down).
-                            // Skip AWQ for this tensor — emit plain MQ4 and
-                            // no sidecar.
-                            quantize_mq4g256(&f32_data, &signs1, &signs2)
+                            (f32_data.clone(), vec![1.0_f64; k_dim])
+                        };
+
+                    // Step 2: GPTQ (if --gptq enabled + Hessian present) or plain pack.
+                    let q = if let Some(sc) = GPTQ_HESSIAN.get() {
+                        // Strip ".weight" to match collect_hessian.py's key
+                        // convention (HFHS format spec §3.1).
+                        let h_key = name.strip_suffix(".weight").unwrap_or(name);
+                        if let Some(href) = sc.get(h_key, 0) {
+                            if href.k != k_dim {
+                                eprintln!(
+                                    "warning: GPTQ {h_key}: Hessian K={} != tensor K={k_dim}; skipping GPTQ for this tensor",
+                                    href.k
+                                );
+                                quantize_mq4g256(&working_weights, &signs1, &signs2)
+                            } else {
+                                // FP32 view of the K×K Hessian (promoted to FP64 inside the pipeline).
+                                let h_unrot_f32: Vec<f32> = href.iter_f64().map(|v| v as f32).collect();
+                                match gptq::gptq_pipeline_mq4g256(
+                                    &working_weights, m_dim, k_dim,
+                                    &h_unrot_f32, &awq_scales_for_pipeline_f64,
+                                    &signs1, &signs2,
+                                    gptq_initial_damp, gptq_max_damp_multiplier,
+                                    h_key,
+                                ) {
+                                    Ok(packed) => packed,
+                                    Err(e) => {
+                                        eprintln!("warning: GPTQ failed for {name}: {e}; falling back to plain MQ4");
+                                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                    }
+                                }
+                            }
+                        } else {
+                            // No Hessian recorded for this tensor — happens
+                            // for tensors the Python collector didn't hook
+                            // (e.g. embedding layers, or arch additions not
+                            // in GPTQ_TARGET_SUFFIXES). Plain MQ4 pack.
+                            quantize_mq4g256(&working_weights, &signs1, &signs2)
                         }
                     } else {
-                        quantize_mq4g256(&f32_data, &signs1, &signs2)
+                        // --gptq not enabled — Stage A AWQ-only or plain MQ4.
+                        quantize_mq4g256(&working_weights, &signs1, &signs2)
                     };
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                 } else {
@@ -4391,7 +4516,15 @@ fn main() {
     if let Some(ref mut s) = spill {
         maybe_spill(&mut hfq_tensors, s, 0); // spill everything remaining
     }
-    write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()).unwrap();
+    // Fail cleanly (non-zero exit + clear stderr) rather than panicking with
+    // a Rust backtrace — write-step failures otherwise lose hours of GPTQ
+    // Hessian work to an opaque `thread 'main' panicked` message. See
+    // docs/plans/gptq_bug.md (2026-05-14 incident: 14 h of work lost).
+    if let Err(e) = write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()) {
+        eprintln!("error: write_hfq failed for {}: {e}", output_path.display());
+        if let Some(s) = spill { s.cleanup(); }
+        std::process::exit(1);
+    }
     if let Some(s) = spill { s.cleanup(); }
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
@@ -4401,6 +4534,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the 2026-05-14 GPTQ panic
+    /// (`docs/plans/gptq_bug.md`). Two `TensorSpill::new` calls into the
+    /// same directory must produce distinct paths so concurrent
+    /// `hipfire-quantize` runs don't clobber each other's scratch state.
+    /// The previous code path-shared `<dir>/.hipfire_quant_spill.tmp`,
+    /// which led to a 14-hour GPTQ run panicking at write_hfq read-back
+    /// when a second concurrent run had unlinked the path on its Drop.
+    #[test]
+    fn tensor_spill_paths_are_per_process_unique() {
+        let dir = tempfile::tempdir().unwrap();
+        let s1 = TensorSpill::new(dir.path()).expect("first TensorSpill");
+        let s2 = TensorSpill::new(dir.path()).expect("second TensorSpill");
+        assert_ne!(
+            s1.path, s2.path,
+            "spill paths must be unique across overlapping spills \
+             (see docs/plans/gptq_bug.md)"
+        );
+        assert!(s1.path.exists(), "spill 1 file must exist on disk");
+        assert!(s2.path.exists(), "spill 2 file must exist on disk");
+
+        // create_new(true) makes a second open of the same path fail
+        // loudly — guards against PID-reuse-plus-same-nanosecond edge case.
+        let collision = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&s1.path);
+        assert!(
+            collision.is_err(),
+            "second create_new on existing spill path must fail"
+        );
+    }
 
     #[test]
     fn parse_layer_idx_safetensors_dense() {
