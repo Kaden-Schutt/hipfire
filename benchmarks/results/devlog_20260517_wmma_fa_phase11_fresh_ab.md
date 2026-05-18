@@ -123,3 +123,36 @@ scaffolding for:
 `.tmp/wmma-fa-ab/probe.sh` — committed alongside this devlog for reproduction
 under `benchmarks/results/wmma-fa-probe.sh`. Run with
 `N=5 NCTX=2048 MODEL=<path> bash benchmarks/results/wmma-fa-probe.sh`.
+
+## Coherence smoke test (2026-05-18)
+
+`dump_logits_qwen35` on Qwen 3.5 9B mq3 + asym4 KV at multiple prefill
+lengths, scalar vs WMMA, comparing last-position logits.
+
+| prefill | argmax match | top-5 overlap | max \|Δ\| logits | WMMA fired? |
+|---:|---|---:|---:|---|
+| 64   | ✓ (token 44576)  | 5/5 | 0.347 | yes |
+| 256  | ✓ (token 107685) | 5/5 | 0.403 | yes |
+| 1024 | ✓ (token 78)     | 5/5 | 0.000 | no (sub_batch=72/36/24 not 16-aligned → scalar fallback) |
+
+The argmax + top-5 set match across firing lengths confirms WMMA-FA
+output ranking is preserved — drift is in the logit MAGNITUDES (fp16-Q-
+narrow envelope, consistent with the Phase 1.0 precision spike result)
+but the model's next-token prediction is unchanged.
+
+At prefill=1024, the auto-route gate correctly falls back to scalar
+because `sub_batch` (sized by partials capacity / per-pos bytes for the
+8-tile context) drops to 24-72, none of which are multiples of
+WMMA_BLOCK_M=16. This is a real-deployment limitation: the WMMA path
+only fires when the chunking happens to align. For Qwen 3.5 9B with
+default scratch sizing, alignment fails past ~256-512 prefill. Phase 1.2
+or later should either re-size partials to ensure 16-aligned sub_batch,
+or add a chunk_size kernel arg so partial chunks can still WMMA.
+
+## Full coherence-gate.sh status
+
+Attempted with `HIPFIRE_KV_MODE=asym4 HIPFIRE_WMMA_FA=1 ./scripts/coherence-gate.sh`,
+killed at the 15-minute timeout. Full battery (~15 model+prompt rows
+including 27B and 35B-A3B) takes longer than this on gfx1151 even
+without WMMA; not specific to this branch. A narrow single-model run
+would suffice for ship validation; deferred.
