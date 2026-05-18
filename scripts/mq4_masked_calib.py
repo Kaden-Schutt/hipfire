@@ -2168,6 +2168,16 @@ def main(argv=None):
     p.add_argument("--bench-max-chunks", type=int, default=20)
     p.add_argument("--gptq-damp", type=float, default=0.01)
     p.add_argument("--gptq-refit-iters", type=int, default=2)
+    p.add_argument(
+        "--initial-stats-npz",
+        default=None,
+        help="Use this stats-merged.npz as round-0 imatrix; bypasses in-process collection.",
+    )
+    p.add_argument(
+        "--initial-stats-json",
+        default=None,
+        help="Optional stats.json paired with --initial-stats-npz.",
+    )
     p.set_defaults(func=iterate_awq_gptq)
 
     args = parser.parse_args(argv)
