@@ -309,6 +309,59 @@ def compute_awq_scale_dict(hessians: dict[str, object], *, alpha: float) -> dict
     return {name: compute_awq_scales_from_hessian(h, alpha) for name, h in hessians.items()}
 
 
+def load_raw_sumsq_dict(
+    npz_path: str, selected: list[dict[str, object]]
+) -> tuple[dict[str, "object"], list[str]]:
+    """Load raw per-channel sum² vectors for the iterate-selected tensors.
+
+    Returns (mapping, missing) where ``mapping[hfq_name]`` is a 1D
+    float64 array of length K (input channels) and ``missing`` lists
+    the hfq names that had no entry in the npz.
+
+    This is the "AWQ-side" stats source. It exists to bypass the
+    structural bug in ``compute_awq_scales_from_hessian`` where the
+    rotated Hessian's diagonal is fed to the AWQ paper formula:
+    ``diag(R · H · R.T)`` mixes channels under the FWHT and is not the
+    raw ``sum(x_j²)`` AWQ actually needs.
+    """
+    import numpy as np
+
+    data = np.load(npz_path)
+    mapping: dict[str, object] = {}
+    missing: list[str] = []
+    for item in selected:
+        name = item["hfq_name"]
+        key = safe_key(name)
+        if key in data.files:
+            mapping[name] = data[key].astype(np.float64).reshape(-1)
+        else:
+            missing.append(name)
+    return mapping, missing
+
+
+def compute_awq_scale_dict_with_raw(
+    hessians: dict[str, object],
+    raw_sumsq: dict[str, object],
+    *,
+    alpha: float,
+) -> dict[str, object]:
+    """Per-tensor AWQ scales, preferring raw sumsq over Hessian-diagonal.
+
+    ``raw_sumsq[name]`` (if present) is consumed directly by the
+    1D-vector branch of ``compute_awq_scales``. Tensors absent from
+    ``raw_sumsq`` fall back to the legacy Hessian-diagonal path so the
+    flag is incremental and safe to deploy with partial coverage.
+    """
+    out: dict[str, object] = {}
+    for name, h in hessians.items():
+        raw = raw_sumsq.get(name)
+        if raw is not None:
+            out[name] = compute_awq_scales(raw, alpha)
+        else:
+            out[name] = compute_awq_scales_from_hessian(h, alpha)
+    return out
+
+
 def damp_awq_scale_dict(
     previous: dict[str, object] | None,
     raw: dict[str, object],
@@ -1936,13 +1989,34 @@ def run_iterative_awq_gptq(args, *, stats_provider=None):
     started_all = time.time()
     provider = stats_provider or collect_iterate_round_stats
 
+    raw_sumsq_path = getattr(args, "awq_raw_sumsq_npz", None)
+    raw_sumsq_mapping: dict[str, object] = {}
+    if raw_sumsq_path:
+        raw_sumsq_mapping, raw_missing = load_raw_sumsq_dict(str(raw_sumsq_path), selected)
+        print(
+            f"[iterate] AWQ raw-sumsq override: {len(raw_sumsq_mapping)}/{len(selected)} "
+            f"tensors keyed from {raw_sumsq_path}",
+            flush=True,
+        )
+        if raw_missing:
+            print(
+                f"[iterate] {len(raw_missing)} F1 tensors not in raw-sumsq npz; "
+                f"falling back to Hessian-diagonal for those. First 3: {raw_missing[:3]}",
+                flush=True,
+            )
+
     for round_index in range(int(args.max_rounds)):
         round_started = time.time()
         round_dir = out_dir / f"round_{round_index}"
         round_dir.mkdir(parents=True, exist_ok=True)
         stats_npz, stats_json = provider(args, round_index, previous_model, round_dir)
         hessians = load_round_hessians(str(stats_npz), selected)
-        raw_scales = compute_awq_scale_dict(hessians, alpha=args.awq_alpha)
+        if raw_sumsq_mapping:
+            raw_scales = compute_awq_scale_dict_with_raw(
+                hessians, raw_sumsq_mapping, alpha=args.awq_alpha
+            )
+        else:
+            raw_scales = compute_awq_scale_dict(hessians, alpha=args.awq_alpha)
         damped_scales = damp_awq_scale_dict(previous_scales, raw_scales, damping=args.damping)
         scale_delta = relative_l2_delta(previous_scales, damped_scales)
         scales_npz = round_dir / "awq_scales.npz"
@@ -2182,6 +2256,19 @@ def main(argv=None):
         "--initial-stats-json",
         default=None,
         help="Optional stats.json paired with --initial-stats-npz.",
+    )
+    p.add_argument(
+        "--awq-raw-sumsq-npz",
+        default=None,
+        help=(
+            "Per-input-channel raw sum(x²) npz keyed by safe_key(hfq_name). "
+            "When given, AWQ scale derivation reads from this directly "
+            "instead of taking np.diagonal of the rotated Hessian — "
+            "the latter mixes channels under the FWHT and yields wrong "
+            "per-channel statistics (see investigation 2026-05-18). "
+            "Produce one via scripts/convert_gguf_imatrix_to_npz.py from "
+            "a llama.cpp GGUF imatrix file."
+        ),
     )
     p.set_defaults(func=iterate_awq_gptq)
 
