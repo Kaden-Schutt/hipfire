@@ -1708,10 +1708,42 @@ def tensor_sweep(args):
     write_json(out_dir / "tensor-sweep.json", result, pretty=True)
 
 
+def _is_awq_eligible_f1(hfq_name: str) -> bool:
+    """F1-only mirror of crates/hipfire-quantize/src/main.rs::awq_eligible.
+
+    Returns True iff the tensor name matches hipfire's F1 AWQ-eligible
+    whitelist (input-side projections only — q/k/v, gate/up, in_proj_*,
+    router). Output-side projections (lm_head, o_proj, down_proj, etc.)
+    have no runtime x/s inverse on master without F2, so pre-scaling them
+    produces (W·s)·x ≠ W·x corruption (KLD 0.7 → 1.7 measured on path 1).
+    """
+    F1_SUFFIXES = (
+        "q_proj.weight", "k_proj.weight", "v_proj.weight",
+        "qkv_proj.weight", "wqkv.weight",
+        "gate_proj.weight", "up_proj.weight",
+        "w_gate.weight", "w_up.weight",
+        "gate_up_proj.weight",
+        "mlp.gate.weight", "router.weight",
+    )
+    if any(hfq_name.endswith(s) for s in F1_SUFFIXES):
+        return True
+    if ".in_proj_" in hfq_name:
+        return True
+    return False
+
+
 def selected_iterate_targets(mask: dict[str, object]) -> list[dict[str, object]]:
+    """Pick iterate targets: packable_flat_mq4 AND F1 AWQ-eligible.
+
+    The AWQ-eligibility filter avoids corrupting tensors whose runtime
+    path lacks an AWQ inverse divide (lm_head, o_proj, down_proj on
+    master without F2). Without this filter, iterate's round 0 produces
+    KLD ~0.70 vs v3's 0.13 — see investigation 2026-05-18-awq-gptq-sub-0.10-kld.
+    """
     targets = [row for row in mask["tensors"] if row.get("packable_flat_mq4")]
+    targets = [row for row in targets if _is_awq_eligible_f1(row["hfq_name"])]
     if not targets:
-        raise ValueError("iterate requires at least one packable MQ4 tensor in the mask")
+        raise ValueError("iterate requires at least one packable F1-AWQ-eligible MQ4 tensor")
     return targets
 
 
