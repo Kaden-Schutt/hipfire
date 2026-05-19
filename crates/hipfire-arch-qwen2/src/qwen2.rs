@@ -447,12 +447,22 @@ fn load_weight_tensor(
             let buf = gpu.upload_raw(&data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, awq_scale: None })
         }
+        3 => {
+            // Q8F16 (= GGML Q8_0 layout): [F16 scale ‖ 32× INT8]. The fused
+            // qkv_hfq4g256 fast path doesn't apply here; forward_step
+            // falls back to three weight_gemv calls per layer (which
+            // dispatches to gpu.gemv_q8_0 for this gpu_dtype). Used by
+            // the high-precision sweep (`--format q8`) to discriminate
+            // forward-pass correctness from HFQ4 quant noise.
+            let buf = gpu.upload_raw(&data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
+        }
         1 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
         }
         qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
-                     This rev-1 loader handles qt ∈ {{1 (F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
+                     This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
                      Extend load_weight_tensor or wait for the Transformer-extraction PR \
                      to pick up qwen35's full quant_type matrix."),
     }

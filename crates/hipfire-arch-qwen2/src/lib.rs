@@ -25,23 +25,25 @@
 //!   attention → o_proj → residual → FFN norm → SwiGLU → residual,
 //!   then final norm + lm_head. Bumps `state.next_pos`.
 //!
-//! End-to-end validation result against
+//! End-to-end validation results against
 //! `benchmarks/references/qwen2_1p5b_instruct_smoke.json`:
 //!
-//! - **7/7 prefix top-1 matches** (positions 0..7)
-//! - 9/16 total top-1 matches; divergences are at synonym positions
-//!   ("key" vs "crucial") consistent with HFQ4 (4-bit weight) quant
-//!   noise against the F32 reference, not implementation error
-//! - hipfire output is fluent coherent English describing transformer
-//!   attention
+//! - **Q8F16 (qt=3) weights: 16/16 top-1 matches** — definitive
+//!   correctness lock-in. Forward + greedy decode of 16 tokens
+//!   completes in ~300 ms on gfx1151 (140 ms prefill).
+//! - HFQ4G256 (4-bit) weights: 9/16 top-1 matches with a perfect
+//!   7/7 prefix; divergences at synonym positions ("key" vs "crucial")
+//!   are the expected signature of 4-bit weight quant against the
+//!   F32 reference, NOT implementation error (confirmed by the Q8
+//!   sweep above).
 //!
-//! The driver binary `examples/infer_qwen2.rs` runs prefill + 16-token
-//! greedy decode + reference compare; pass criterion is up to the
-//! caller's tolerance for quant-induced divergence.
+//! The driver binary `examples/infer_qwen2.rs` runs prefill + N-token
+//! greedy decode + reference compare; the Q8 path is the recommended
+//! correctness baseline.
 //!
-//! Still pending: daemon dispatch arm (R3), F16-quant precision sweep
-//! for a tighter top-1 baseline, and KV quantisation paths (HFQ4 /
-//! HFQ8 / asym-N / Q8) for serving-time memory budgets.
+//! Still pending: daemon dispatch arm (R3 — phase 3 work), KV
+//! quantisation paths (HFQ4 / HFQ8 / asym-N / Q8) for serving-time
+//! memory budgets, and prefill batching for serving-time latency.
 //!
 //! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the bring-up plan
 //! (the new R2–R5 risk entries in §6 capture the rev-2 review findings
