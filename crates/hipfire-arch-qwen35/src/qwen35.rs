@@ -4319,16 +4319,25 @@ fn prefill_moe_ffn_body_batched(
     let down_k = ffn.experts[0].down.k;
     let gate_up_k = ffn.experts[0].gate_up.k;
 
-    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) is gated by
-    // HIPFIRE_MOE_GROUPED_GEMM=1. Only enabled on RDNA (wave32) where
-    // WMMA is available; CDNA wave64 already amortizes well on the
-    // per-token indexed_batched GEMV and would need a separate kernel.
+    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) — default ON for
+    // gfx11/gfx12, where the grouped-WMMA kernel is validated (gfx11 routes
+    // to `gemm_hfq4g256_moe_grouped_wmma_k2` via the base w32 WMMA builtin,
+    // gfx12 to the `_gfx12` variant). Empirical lift on Qwen3.5-A3B mq4
+    // prefill=256: gfx1100 7900 XTX 1396 → 2983 tok/s (+114%); gfx1201
+    // R9700 1016 → 2966 tok/s (uniform.mq4, +192%). CDNA wave64 (gfx9*)
+    // and pre-WMMA RDNA (gfx10*) stay on the per-token indexed_batched
+    // GEMV path. Opt out with `HIPFIRE_MOE_GROUPED_GEMM=0`.
     // Cached read — getenv on every layer × MoE call adds up.
     static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
     let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
-        std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() == Some("1")
+        match std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() {
+            Some("0") | Some("off") => false,
+            Some("1") | Some("on") => true,
+            _ => true,
+        }
     });
-    let path2_eligible = use_path2 && !gpu.arch.starts_with("gfx9");
+    let arch_supported = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+    let path2_eligible = use_path2 && arch_supported;
     // m_total — computed during gate_up scatter, reused for down. Avoids
     // a second dtoh sync per MoE layer.
     let mut path2_m_total: usize = 0;
