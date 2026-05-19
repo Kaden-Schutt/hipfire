@@ -4,6 +4,26 @@
 // gfx12 (RDNA4) M-direction 2×1 reg-blocked sister of
 // `gemm_hfq6g256_moe_grouped_wmma_gfx12` (v1, commit b2284a11).
 //
+// **STATUS: FALSIFIED on R9700/gfx1201 AWQ A3B prefill 2026-05-19.**
+//   - Hypothesis: HFQ6 is BW-bound, so the dequant cost the HFQ4 m2
+//     falsification suffered from would be hidden behind memory waits.
+//   - Result: -2.4% prefill regression (v1 2400.5 → v2 2343.1 tok/s on
+//     /mnt/nas/kaden/hipfire/mi300x-v3/qwen3-35b-a3b.mq4-awq with the
+//     standard merge-sort code prompt at max_tokens=150, dn_quant=q8).
+//   - Likely cause: same HFQ4-m2-falsification pattern (dequant adds
+//     register pressure / serialization beyond the BW-bound ceiling),
+//     plus possible VGPR-spill from the doubled accumulator + dual
+//     safe_row state at __launch_bounds__(32, 2).
+//
+// Kept as opt-in research artifact under HIPFIRE_MOE_HFQ6_V2=1; do not
+// flip default on. See feedback_v2_sgpr_lut_falsified_2026_05_10
+// (rdna4 SGPR-LUT) and project_mq3_mq4_fdot2_gfx1030_2026_05_18 for
+// patterns: in this codebase + ROCm 7.2, the only levers that cross
+// zero in production are launch-reduction / fusion / format changes;
+// reg-blocking with extra dequant rarely survives synthetic→prod.
+//
+// Original hypothesis below — kept verbatim for future cross-reference.
+//
 // Why this lever for HFQ6 specifically (vs the HFQ4 m2 which was
 // FALSIFIED on MQ4 grouped due to dequant serialization):
 //   - HFQ6 is BW-BOUND (200 B/group, 47% more than HFQ4's 136 B); v1
