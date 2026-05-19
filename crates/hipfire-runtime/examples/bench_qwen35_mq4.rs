@@ -134,28 +134,95 @@ fn main() {
     }
     eprintln!("\n=== prefill ({prefill_len} tokens) ===");
     let mut prefill_samples_ms = Vec::with_capacity(prefill_runs);
-    for run in 0..prefill_runs {
-        if run > 0 {
-            dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
-            kv_cache = match kv_mode.as_str() {
-                "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym4" | "turbo4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                "asym2" | "turbo2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-                _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-            };
+
+    // HIPFIRE_GRAPH_PREFILL=1: route the timed prefill loop through
+    // hipGraph capture/replay. Reuses the DFlash verify_graph_cache
+    // (single-slot keyed by b = prompt_tokens.len()). Run 0 warms,
+    // run 1 captures + launches, runs 2+ replay. dn_state + kv_cache
+    // are NOT re-created between runs (would invalidate baked-in
+    // tensor pointers); state drift is accepted for perf measurement.
+    let use_graph_prefill = std::env::var("HIPFIRE_GRAPH_PREFILL")
+        .ok().as_deref() == Some("1");
+
+    if use_graph_prefill {
+        let pbs = scratch.prefill_batch.as_ref()
+            .expect("HIPFIRE_GRAPH_PREFILL=1 requires PrefillBatchScratch");
+        let b = prompt_tokens.len();
+        if b > pbs.max_batch {
+            panic!("HIPFIRE_GRAPH_PREFILL=1: prompt b={} exceeds pbs.max_batch={}",
+                b, pbs.max_batch);
         }
-        let t_prefill = Instant::now();
-        qwen35::forward_prefill_batch(
-            &mut gpu, &weights, &config, &prompt_tokens, 0,
-            &mut kv_cache, &mut dn_state, &scratch,
-            None, None, None, None,
-        ).expect("prefill forward failed");
-        gpu.hip.device_synchronize().expect("sync after prefill");
-        let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
-        prefill_samples_ms.push(ms);
-        if prefill_runs > 1 {
-            eprintln!("  run {:>2}: {:.1}ms  {:.1} tok/s", run + 1, ms, prefill_len as f64 / (ms / 1000.0));
+        // Pre-upload tokens + positions ONCE — kernels read them from
+        // device buffers, so subsequent replays use the same content.
+        qwen35::upload_prefill_batch_inputs(&mut gpu, pbs, &prompt_tokens, 0)
+            .expect("upload prefill batch inputs");
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+        }
+        eprintln!("  [graph-prefill] b={}, max_batch={}", b, pbs.max_batch);
+
+        for run in 0..prefill_runs {
+            let mode;
+            let t_prefill = Instant::now();
+            if gpu.verify_has_graph(b) {
+                mode = "replay";
+                gpu.verify_graph_launch(b).expect("graph replay");
+            } else if gpu.verify_needs_warmup(b) {
+                mode = "warmup";
+                gpu.verify_mark_warmup_done(b);
+                qwen35::forward_prefill_batch_single_chunk_captured(
+                    &mut gpu, &weights, &config, &prompt_tokens, 0,
+                    &mut kv_cache, &mut dn_state, &scratch, pbs,
+                    None, None, None, None,
+                ).expect("warmup prefill");
+            } else {
+                mode = "capture";
+                gpu.begin_verify_graph_capture(b).expect("begin capture");
+                let r = qwen35::forward_prefill_batch_single_chunk_captured(
+                    &mut gpu, &weights, &config, &prompt_tokens, 0,
+                    &mut kv_cache, &mut dn_state, &scratch, pbs,
+                    None, None, None, None,
+                );
+                if r.is_ok() {
+                    let blob_count = gpu.capture_blobs.len();
+                    gpu.end_verify_graph_capture().expect("end capture");
+                    gpu.verify_graph_launch(b).expect("launch after capture");
+                    eprintln!("  [graph-prefill] captured b={} ({} kernarg blobs)", b, blob_count);
+                } else {
+                    panic!("capture pass failed: {:?}", r);
+                }
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            prefill_samples_ms.push(ms);
+            if prefill_runs > 1 {
+                eprintln!("  run {:>2} ({}): {:.1}ms  {:.1} tok/s", run + 1, mode, ms, prefill_len as f64 / (ms / 1000.0));
+            }
+        }
+    } else {
+        for run in 0..prefill_runs {
+            if run > 0 {
+                dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
+                kv_cache = match kv_mode.as_str() {
+                    "q8" => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym4" | "turbo4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    "asym2" | "turbo2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                    _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+                };
+            }
+            let t_prefill = Instant::now();
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config, &prompt_tokens, 0,
+                &mut kv_cache, &mut dn_state, &scratch,
+                None, None, None, None,
+            ).expect("prefill forward failed");
+            gpu.hip.device_synchronize().expect("sync after prefill");
+            let ms = t_prefill.elapsed().as_secs_f64() * 1000.0;
+            prefill_samples_ms.push(ms);
+            if prefill_runs > 1 {
+                eprintln!("  run {:>2}: {:.1}ms  {:.1} tok/s", run + 1, ms, prefill_len as f64 / (ms / 1000.0));
+            }
         }
     }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
