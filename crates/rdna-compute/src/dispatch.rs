@@ -284,6 +284,9 @@ pub struct Gpu {
     pub flags: Arc<FeatureFlags>,
     pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
+    /// HIP-reported integrated GPU flag. hipfire treats this as the loader's
+    /// UMA signal for deciding whether the slab path should be default-auto.
+    pub integrated: bool,
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
     functions: HashMap<String, hip_bridge::Function>,
@@ -575,6 +578,7 @@ impl Gpu {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or(detected_arch);
+        let integrated = hip.is_integrated_device(id).unwrap_or(false);
         let (_, vram_total) = hip.get_vram_info().unwrap_or((0, 0));
 
         // Check HIP runtime version matches GPU arch requirements
@@ -607,6 +611,7 @@ impl Gpu {
             flags,
             arch_caps,
             device_id: id,
+            integrated,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
