@@ -680,8 +680,15 @@ pub fn dispatch_packet_header() -> u16 {
 ///
 /// Sets completion_signal to 0 by default; caller can overwrite it after
 /// this returns.
+///
+/// # Safety
+///
+/// `slot` must be non-null, properly aligned for `HsaKernelDispatchPacket`,
+/// valid for writes, and refer to a packet slot that is not concurrently read
+/// or written by another CPU thread or by the AQL engine. `kernarg_ptr` must
+/// remain valid for the duration of the dispatched kernel.
 #[inline]
-pub fn build_dispatch_packet(
+pub unsafe fn build_dispatch_packet(
     slot: *mut HsaKernelDispatchPacket,
     kernel: &HsaKernel,
     grid: [u32; 3],
@@ -719,8 +726,15 @@ pub fn build_dispatch_packet(
 
 /// Atomic release-store of the header word. Must be called after the rest
 /// of the packet is filled in. Makes the packet visible to the AQL engine.
+///
+/// # Safety
+///
+/// `slot` must be non-null, properly aligned for `HsaKernelDispatchPacket`,
+/// and point at a packet whose non-header fields have already been fully
+/// initialized. Publishing a header makes the packet visible to the AQL engine,
+/// so callers must not mutate the packet again until the queue has consumed it.
 #[inline]
-pub fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
+pub unsafe fn publish_dispatch_packet(slot: *mut HsaKernelDispatchPacket, header: u16) {
     use std::sync::atomic::{fence, AtomicU16, Ordering};
     unsafe {
         fence(Ordering::Release);

@@ -180,15 +180,19 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
-        publish_dispatch_packet(slot, header);
+        unsafe {
+            // `slot` comes from this queue's mapped packet ring, and `kernarg`
+            // stays live until the dispatch completes.
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+            publish_dispatch_packet(slot, header);
+        }
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
         signal.wait_lt_active(1, u64::MAX);
@@ -256,15 +260,19 @@ fn main() {
         signal.store_relaxed(1);
         let idx = queue.load_write_index_relaxed();
         let slot = queue.packet_slot(idx);
-        build_dispatch_packet(
-            slot,
-            &kernel,
-            [groups, 1, 1],
-            [256, 1, 1],
-            kernarg,
-            signal.raw_handle(),
-        );
-        publish_dispatch_packet(slot, header);
+        unsafe {
+            // `slot` comes from this queue's mapped packet ring, and `kernarg`
+            // stays live until the dispatch completes.
+            build_dispatch_packet(
+                slot,
+                &kernel,
+                [groups, 1, 1],
+                [256, 1, 1],
+                kernarg,
+                signal.raw_handle(),
+            );
+            publish_dispatch_packet(slot, header);
+        }
         queue.store_write_index_release(idx + 1);
         queue.ring_doorbell(idx);
         signal.wait_lt_active(1, u64::MAX);
@@ -329,15 +337,19 @@ fn main() {
                 let idx = base_idx + i as u64;
                 let slot = queue.packet_slot(idx);
                 let completion = if i == burst - 1 { signal.raw_handle() } else { 0 };
-                build_dispatch_packet(
-                    slot,
-                    &kernel,
-                    [groups, 1, 1],
-                    [256, 1, 1],
-                    kernarg,
-                    completion,
-                );
-                publish_dispatch_packet(slot, header);
+                unsafe {
+                    // `slot` comes from this queue's mapped packet ring, and
+                    // `kernarg` stays live until the burst dispatch completes.
+                    build_dispatch_packet(
+                        slot,
+                        &kernel,
+                        [groups, 1, 1],
+                        [256, 1, 1],
+                        kernarg,
+                        completion,
+                    );
+                    publish_dispatch_packet(slot, header);
+                }
             }
             queue.store_write_index_release(base_idx + burst as u64);
             queue.ring_doorbell(base_idx + burst as u64 - 1);
