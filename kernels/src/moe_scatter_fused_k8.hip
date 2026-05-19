@@ -26,7 +26,7 @@ extern "C" __global__ void moe_scatter_fused_k8(
     int*       __restrict__ expert_token_counts, // [E]
     int*       __restrict__ expert_offsets,      // [E+1]
     int*       __restrict__ sorted_slot_index,   // [m_total_max] (-1 padding)
-    int*       __restrict__ expert_tile_ids,     // [m_total / block_m]
+    int*       __restrict__ expert_tile_ids,     // [m_total_max / block_m]
     int*       __restrict__ inverse_perm,        // [total_slots]
     int        total_slots,
     int        num_experts,
@@ -47,6 +47,15 @@ extern "C" __global__ void moe_scatter_fused_k8(
     // the X-gather sentinel.
     for (int i = tid; i < m_total_max; i += bdim) {
         sorted_slot_index[i] = -1;
+    }
+    // Init expert_tile_ids upper bound to -1 sentinel. The grouped-GEMM
+    // dispatcher launches with slot_tiles = m_total_max / block_m to
+    // avoid the m_total dtoh sync; tiles beyond the live m_total / block_m
+    // have expert_id == -1 → kernel early-returns. Saves ~50µs sync per
+    // MoE layer.
+    const int num_tiles_max = m_total_max / block_m;
+    for (int i = tid; i < num_tiles_max; i += bdim) {
+        expert_tile_ids[i] = -1;
     }
     __syncthreads();
 

@@ -56,8 +56,12 @@ extern "C" __global__ void gemm_hfq4g256_moe_grouped_wmma_k2(
 
     if (row_start >= M || slot_start >= m_total) return;
 
-    // Expert lookup for this tile.
+    // Sentinel early-return: expert_tile_ids[tile_y] == -1 marks tiles
+    // beyond the live m_total (the dispatcher may launch up to
+    // m_total_max/16 tiles to skip the m_total dtoh sync).
     const int expert_id = expert_tile_ids[tile_y];
+    if (expert_id < 0) return;
+
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
     // X gather: each lane (tid & 15) gets its own routed slot, recovers

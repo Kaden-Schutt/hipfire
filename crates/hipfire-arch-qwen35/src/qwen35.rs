@@ -4345,7 +4345,10 @@ fn prefill_moe_ffn_body_batched(
         let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
         let total_slots = n * k_top;
         // m_total upper bound — sized in PrefillBatchScratch::new with
-        // max_batch * k_top + n_exp * (BLOCK_M - 1).
+        // max_batch * k_top + n_exp * (BLOCK_M - 1). The scatter fused
+        // kernel pre-fills expert_tile_ids[0..m_total_max/16] with -1;
+        // the grouped GEMM and unscatter early-return on those tiles, so
+        // we can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
         let m_total_max = n * k_top + n_exp * (BLOCK_M - 1);
 
         // Fused scatter pipeline: one launch replaces histogram + offsets
@@ -4355,16 +4358,11 @@ fn prefill_moe_ffn_body_batched(
             total_slots, n_exp, m_total_max, BLOCK_M,
         )?;
 
-        // Read M_total = offsets[n_exp]. One dtoh sync per MoE layer —
-        // ~50µs each on R9700 GDDR. Cached for the down step via
-        // path2_m_total below.
-        let mut m_total_host = [0i32; 1];
-        let m_total_bytes: &mut [u8] = unsafe {
-            std::slice::from_raw_parts_mut(m_total_host.as_mut_ptr() as *mut u8, 4)
-        };
-        gpu.hip.memcpy_dtoh_at(m_total_bytes, &offsets.buf, n_exp * 4)?;
-        let m_total = m_total_host[0] as usize;
-        path2_m_total = m_total;
+        // Use m_total_max as the upper bound for grid sizing — the kernel
+        // early-returns on expert_tile_ids[tile_y] == -1 for the
+        // pre-sentinel'd unused-tile range.
+        path2_m_total = m_total_max;
+        let m_total = m_total_max;
 
         // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
         // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.

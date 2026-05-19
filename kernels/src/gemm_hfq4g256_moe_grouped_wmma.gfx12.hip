@@ -41,11 +41,16 @@ extern "C" __global__ void gemm_hfq4g256_moe_grouped_wmma_gfx12(
 
     if (row_start >= M || slot_start >= m_total) return;
 
+    // Sentinel early-return: expert_tile_ids[tile_y] == -1 marks tiles
+    // beyond the live m_total (the dispatcher may launch up to
+    // m_total_max/16 tiles to skip the m_total dtoh sync, since the
+    // scatter pre-fills the upper-bound range with -1).
+    const int expert_id = expert_tile_ids[tile_y];
+    if (expert_id < 0) return;
+
     const int m_lane = tid & 15;
     const int k_grp  = tid >> 4;
 
-    // Expert lookup for this tile.
-    const int expert_id = expert_tile_ids[tile_y];
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
     // X gather (per m_lane; both k_grp lanes for the same m_lane read the
