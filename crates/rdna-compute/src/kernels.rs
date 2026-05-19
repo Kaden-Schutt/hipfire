@@ -564,6 +564,17 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
 
+/// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
+/// K-substep 2 A-dequants + 1 B-load → 2 WMMAs (vs 1+1+1 in v1). Halves X-gather
+/// BW per output element. Same kernarg layout + BLOCK_M=16 slot stride
+/// (expert-boundary contract unchanged). Lever from `wmma_kernels_optimized.hpp`
+/// extending the HFQ4 m2 trick to BW-bound HFQ6 (where the dequant
+/// serialization that falsified HFQ4-m2 is hidden behind memory waits).
+/// Gated on `HIPFIRE_MOE_HFQ6_V2=1` (default off).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
+
 /// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
 /// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks

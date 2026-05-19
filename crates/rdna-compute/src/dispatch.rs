@@ -9849,8 +9849,27 @@ impl Gpu {
                 self.arch
             );
         }
-        let kernel_name = "gemm_hfq6g256_moe_grouped_wmma_gfx12";
-        let kernel_src = kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC;
+        // v2 lever (M-direction 2×1 reg-block, env-gated). Defaults off;
+        // promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp covers 32 rows
+        // × 16 slots (vs 16×16); B-load halved per output. Compatible with
+        // existing BLOCK_M=16 scatter — only the M (row) dimension is
+        // restrided. The slot tile stride stays at 16 so expert-boundary
+        // safety is unchanged from v1.
+        let use_v2 = std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1");
+        let (kernel_name, kernel_src, row_tile_stride) = if use_v2 {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC,
+                32usize,
+            )
+        } else {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_gfx12",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC,
+                16usize,
+            )
+        };
+        let slot_tile_stride = 16usize;
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
 
@@ -9876,8 +9895,8 @@ impl Gpu {
             &mt_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = ((m + 15) / 16) as u32;
-        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let row_tiles = ((m + row_tile_stride - 1) / row_tile_stride) as u32;
+        let slot_tiles = ((m_total + slot_tile_stride - 1) / slot_tile_stride) as u32;
         // BW estimate uses the HFQ6 weight footprint (200 B/group vs HFQ4's 136 B).
         let bytes = m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq6g256_bytes(m, k));
         let timer = crate::profile::begin_timer(
