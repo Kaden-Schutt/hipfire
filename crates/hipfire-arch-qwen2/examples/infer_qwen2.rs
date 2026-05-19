@@ -12,13 +12,15 @@
 //! 1. Load HFQ → `Qwen2Config` + `Qwen2Weights` via the
 //!    [`hipfire_runtime::arch::Architecture`] trait. **Done in rev 2.**
 //! 2. Build [`hipfire_runtime::tokenizer::Tokenizer`] from the HFQ's
-//!    embedded `tokenizer.json` blob. **Done in rev 2.**
+//!    embedded `tokenizer.json` blob.
 //! 3. Encode the prompt and (optionally) compare its token-id sequence
 //!    against the reference artifact — a tokenizer-parity check that
-//!    can pass before any kernel work lands. **Done in rev 2.**
-//! 4. Forward + greedy decode N tokens. **PENDING (forward port).**
+//!    catches BPE divergence before any kernel work runs.
+//! 4. Forward + greedy decode N tokens via [`qwen2::forward_step`] +
+//!    [`qwen2::forward_step_greedy`] (28-layer Qwen2 stack on GPU).
 //! 5. Compare the generated token IDs against
-//!    `first_16_completion_token_ids` in the reference. **PENDING.**
+//!    `first_16_completion_token_ids` in the reference; print
+//!    per-position PASS/FAIL and exit non-zero on divergence.
 //!
 //! Usage:
 //!
@@ -87,10 +89,10 @@ fn print_help() {
          checks tokenizer parity against the HF reference.\n\
          \n\
          max-new-tokens controls how many continuation tokens the \
-         forward pass will be asked for. Default 16 (matches the plan's \
-         top-1 match acceptance criterion). Note: the forward pass is \
-         not yet implemented — this binary will exit before generating \
-         tokens until that lands."
+         forward pass will generate. Default 16 (matches the plan's \
+         top-1 match acceptance criterion). With both --prompt-file \
+         and --reference, the binary exits non-zero if hipfire's \
+         generated tokens diverge from the reference."
     );
 }
 

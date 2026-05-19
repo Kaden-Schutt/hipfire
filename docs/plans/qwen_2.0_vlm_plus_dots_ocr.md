@@ -33,7 +33,8 @@ status per phase in §5.
 | `00d406af` | R3 mitigation: `infer_qwen2.rs` driver binary — wires the bring-up triple end-to-end. Tokenizer parity confirmed (hipfire's Rust BPE produces byte-identical token IDs to HF on the smoke prompt). |
 | `afd4b059` | Phase 1 forward pass: real `Qwen2State` (KV cache + per-step scratch) + `forward_step` / `forward_step_greedy` (28 layers: RMSNorm → fused QKV + bias adds → RoPE → KV cache → attention → o_proj → residual → FFN norm → SwiGLU → residual; final norm + lm_head). HFQ4G256 path landed 9/16 top-1 matches with 7/7 prefix + fluent output (synonym-position divergence consistent with 4-bit quant noise). |
 | `9bd083f6` | Phase 1 precision sweep: re-quantised at Q8F16. End-to-end run: **16/16 top-1 matches vs HF F32 reference** — definitive correctness lock-in. Forward in 303 ms (140 ms prefill + 163 ms greedy decode of 16 tokens). Confirms (a) the implementation is correct end-to-end, (b) the HFQ4G256 divergence was 4-bit quant noise, not implementation error. Phase 1 closed. |
-| _pending_ | R3 resolved: daemon arm for `arch_id=7`. Wired `hipfire-arch-qwen2` as a runtime dev-dependency (gated behind new `arch-qwen2` feature, default-on); added `qwen2_config / qwen2_weights / qwen2_state` fields to `LoadedModel` with matching `free_gpu` impls; new load arm constructs the bring-up triple via the `Architecture` trait; new `generate_qwen2` function does encode → prefill → greedy decode → JSON `{type:"token"}` stream → `{type:"done"}`. Verified end-to-end: `hipfire run` (production CLI) against `qwen2-1.5b.arch7.q8.hfq` emits the same continuation as the Q8 precision-sweep run (`"A transformer's attention mechanism is a crucial component of its architecture, which is designed to ..."`) at **96.3 tok/s** for 137 generated tokens. Scope-limited bring-up — DFlash / CASK / PFlash / VL / ChatML scaffolding / repeat penalty / top-p / `<think>` budgeting / multi-GPU are all explicitly refused or skipped on this path. |
+| `806680b2` | R3 resolved: daemon arm for `arch_id=7`. Wired `hipfire-arch-qwen2` as a runtime dev-dependency (gated behind new `arch-qwen2` feature, default-on); added `qwen2_config / qwen2_weights / qwen2_state` fields to `LoadedModel` with matching `free_gpu` impls; new load arm constructs the bring-up triple via the `Architecture` trait; new `generate_qwen2` function does encode → prefill → greedy decode → JSON `{type:"token"}` stream → `{type:"done"}`. Verified end-to-end: `hipfire run` (production CLI) against `qwen2-1.5b.arch7.q8.hfq` emits the same continuation as the Q8 precision-sweep run (`"A transformer's attention mechanism is a crucial component of its architecture, which is designed to ..."`) at ~96 tok/s for 137 generated tokens (single-shot, not warmed). Scope-limited bring-up — DFlash / CASK / PFlash / VL / ChatML scaffolding / repeat penalty / top-p / `<think>` budgeting / multi-GPU are all explicitly refused or skipped on this path. |
+| _pending_ | Pre-PR fixes from rev-3 review fold-in (Claude+Gemini+GLM-5): A1 (bench_prefill arch_id=7 panic) + A2 (reset event missed Qwen2State.next_pos) + B1 comment (bias path was option (a) not (c) as claimed) + D1 (dead `let _ = decode_t0`) + MINOR doc refreshes across arch.rs / qwen2.rs / README.md / infer_qwen2.rs. `Qwen2State::reset()` helper added and called from both the daemon's `reset` event AND the `bench_prefill` cold-start path. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -995,6 +996,107 @@ OCR-specific gate. Fluent ≠ correct.
   before phase 2.
 - **Smart-resize off-by-pixel.** Replicate the Python algorithm
   exactly; bbox accuracy depends on identical (H, W) selection.
+
+## 6.1 Deferred follow-ons after pre-PR review fold-in (rev-3)
+
+Captured from the Claude / Gemini / GLM-5 reviews of commits
+`9477fbbb..806680b2` (see `qwen2_post_phase1_rev_claude.md` for the
+synthesis). Real items, ranked, each tagged with the phase that
+ought to absorb them. None blocks the rev-3 PR.
+
+**Perf (Phase 1.5 / post-PR optimisation pass):**
+
+- **Bias-add fusion** — code is currently option (a) from §5 (3
+  separate `bias_add_f32` per QKV per layer = 84 launches per
+  decode step). Promote to option (c) — single batched bias-add of
+  Q/K/V per layer (~28 launches per decode step) — or option (b)
+  fused into `fused_qkv_hfq4g256_bias`. Apply Δ ≥ 5% rule before
+  picking which one ships. (Gemini §3.2, Claude rev-3 B1)
+- **`gemv_hfq4g256_residual` fusion** — o_proj + residual and
+  ffn_out + residual currently run as `weight_gemv` + `add_inplace_f32`
+  (2 launches each). The LLaMA path uses the fused residual variant
+  for both sites; same upgrade saves ~56 launches/decode on Qwen2
+  at HFQ4G256 weights. (Claude rev-3 B2)
+- **`argmax_f32` per-call malloc** — `Gpu::argmax_f32` allocates a
+  4-byte result buffer on every invocation. Greedy decode pays one
+  malloc + memset + memcpy per token. Move to a persistent
+  scratch on `Qwen2State` (`argmax_result: DeviceBuffer`). Cross-arch
+  fix — qwen35 / llama would benefit too. (Claude rev-3 D6)
+- **Prefill batching** — `forward_step` is per-token, so a 2048-token
+  prompt costs ~2048× single-step decode time (Q8 baseline ≈ 10 ms
+  per token at 1.5B). Production serving needs a GEMM-based batched
+  prefill variant (`forward_prefill_batch` analog). Required before
+  Qwen2 ships at non-bring-up scale. (Gemini §3.1, GLM-5 CAVEAT-3,
+  Claude rev-3 B2-adjacent)
+- **KV cache quantisation** — currently F32 (~28 MB at seq=512 for
+  the 1.5B). Wire HFQ4 / HFQ8 / Q8 / asym-N modes (the qwen35 path's
+  kv_mode story) for memory-constrained serving. (Gemini §3.3,
+  Claude rev-3 F-rec)
+- **Tied-embedding VRAM aliasing** — tied `lm_head` re-uploads the
+  embedding bytes (~117 MB on Qwen2-1.5B at HFQ4) because `GpuTensor`
+  is not `Clone`. Resolve via `Arc<GpuTensor>` / shallow-clone in the
+  Transformer-extraction PR. (Gemini §3.4, originally rev-1 B5,
+  acknowledged in Phase 0 progress log.)
+- **Perf-claim hygiene** — the rev-3 commit log compared an HFQ4
+  first-run (4153 ms, JIT contaminated) against a Q8 warm-run
+  (303 ms) without re-running HFQ4 warm. Re-measure both paths fresh
+  before any tok/s ratio enters a perf doc. Single-shot tok/s
+  reported with 2-decimal precision (`96.34 tok/s`) violates the
+  CLAUDE.md ±10-15% noise guard. (Claude rev-3 C1, C2)
+
+**Daemon-arm feature parity (Phase 3 — pre-GA wave):**
+
+- **Chat-template framing on arch_id=7.** `generate_qwen2`
+  short-circuits before the daemon's `prompt_frame::apply_chatml_frame`
+  pipeline runs. `hipfire run` against a Qwen2 model produces
+  continuation, not instruction-following. Wire `apply_chatml_frame`
+  before tokenizing once the `prompt_frame_overrides` taxonomy is
+  finalised for Qwen2-1.5B-Instruct. (GLM-5 CAVEAT-1)
+- **Sampling beyond greedy.** `temp` / `top_p` / `repeat_penalty` /
+  `repeat_window` are all underscored params on `generate_qwen2`.
+  Greedy is the validation contract; non-greedy is a feature gap.
+  Add a sampler call (port the LLaMA sample_top_p path or use the
+  shared sampler infrastructure). (GLM-5 CAVEAT-2)
+- **`pp > 1` + arch_id=7.** Currently falls through to `load_model_pp`
+  which doesn't have an arch_id=7 arm and errors with "non-Qwen3.5
+  architectures". UX-fix: refuse upstream with a Qwen2-specific
+  message; functional fix is multi-GPU pp for Qwen2, which is a
+  separate large task.
+
+**Dots.ocr-specific fixes (Phase 2):**
+
+- **§2.3 patch_embed weight is 4-D `[1536, 3, 14, 14]`, not 5-D.**
+  rev-1 BUG-1, still deferred per rev-2 plan. (GLM-5 §4)
+- **§2.5 `<|endofsystem|>` token-string handling.** Not in
+  `added_tokens_decoder` — must be emitted as raw bytes that the BPE
+  tokenizer fragments. rev-1 BUG-2 deferred. (GLM-5 §4)
+- **R5 dots.ocr EOS in `generation_config.json`.** Quantiser still
+  doesn't pack `generation_config.json`, so the parser falls back to
+  `eos_token_id = 151645` for any model that doesn't carry it in
+  `config.json` (which is most models including dots.ocr). Land the
+  quantiser-side fix OR special-case via `eos_filter_overrides`
+  before phase 2 starts. (Claude rev-3 B4, partly "MITIGATED" by
+  Gemini §4 but the metadata-side gap is real.)
+
+**Cleanup / nice-to-have (any future PR):**
+
+- `Qwen2State` could expose a `pub fn argmax(&mut self, gpu) -> u32`
+  to internalise the logits→token step (currently the daemon does
+  `gpu.argmax_f32(&state.logits, cfg.vocab_size)` directly).
+- `infer_qwen2.rs` could print the decoded English at the end (not
+  just the token IDs).
+- `m.conversation_tokens.push(tok)` is filled by `generate_qwen2`
+  but never read on the arch_id=7 path (it's a repeat-penalty input
+  for qwen35/llama). Either remove or leave for the future sampler
+  wiring.
+- `chat_template = resolve_chat_template(...)` is loaded on the
+  arch_id=7 path but never consulted by `generate_qwen2`. Same
+  status — load now, consume when chat-template framing lands.
+- `parse_arch_id_override` could move from a `unwrap_or_else` with
+  `!`-return to an `if let Some(..) else` pattern. Pure style.
+- `scripts/capture_qwen2_reference.py` hardcodes the HF snapshot
+  path. Acceptable for a phase-0 one-time capture but won't reproduce
+  on another machine without editing.
 
 ## 7. File layout (target)
 

@@ -1052,6 +1052,12 @@ fn main() {
                     }
                     if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
                     if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                    // arch_id=7: rewind the Qwen2State position cursor so
+                    // the next prefill writes from KV[0]. Without this, a
+                    // reset between turns would leak the prior turn's KV
+                    // entries into attention for the new turn — fluent
+                    // garbage, no panic. See `Qwen2State::reset` doc.
+                    if let Some(ref mut s) = m.qwen2_state { s.reset(); }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1164,6 +1170,10 @@ fn main() {
                     for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                     for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                 }
+                // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
+                // and the per-step scratch share `Qwen2State`. Reset its position
+                // cursor here so bench_prefill measures cold prefill.
+                if let Some(ref mut s) = m.qwen2_state { s.reset(); }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -1178,6 +1188,21 @@ fn main() {
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
                     qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
+                } else if m.arch_id == 7 {
+                    // Qwen2 has no batched prefill kernel yet — per-token loop
+                    // mirroring the LLaMA fallback path. The loop seeds
+                    // position via `state.next_pos` (already reset above to 0).
+                    let config = m.qwen2_config.as_ref().unwrap();
+                    let weights = m.qwen2_weights.as_ref().unwrap();
+                    let state = m.qwen2_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for &tok in &synthetic {
+                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -4208,7 +4233,7 @@ fn generate_qwen2(
             "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
             state.next_pos, state.max_seq,
         );
-        state.next_pos = 0;
+        state.reset();
         m.seq_pos = 0;
         m.conversation_tokens.clear();
     }
@@ -4293,7 +4318,6 @@ fn generate_qwen2(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
-    let _ = decode_t0; // silence unused-warn if loop never enters
 }
 
 /// Minimal JSON string escaper for the daemon's token-stream emit

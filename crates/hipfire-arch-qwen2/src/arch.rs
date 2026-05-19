@@ -1,12 +1,17 @@
 //! `Architecture` trait impl for the Qwen2 dense text decoder.
 //!
-//! Rev 0: bring-up skeleton. The five required trait methods delegate
-//! to stub bodies in `qwen2`. Optional overrides set Qwen2-specific
-//! defaults where they diverge from the Qwen3.5 family conventions.
+//! The five required trait methods (`arch_id` / `name` / `config_from_hfq`
+//! / `load_weights` / `new_state`) delegate to real implementations in
+//! [`crate::qwen2`]. Optional overrides set Qwen2-specific defaults
+//! where they diverge from the Qwen3.5 family conventions (mostly
+//! `eos_filter_overrides.strip_think = Some(false)` — Qwen2 isn't a
+//! thinking-mode model).
 //!
 //! Forward pass is intentionally NOT on this trait — see
 //! `hipfire_runtime::arch` module docs for the rationale (static
-//! dispatch in hot path, arch-specific forward signatures).
+//! dispatch in hot path, arch-specific forward signatures). Callers
+//! reach the hot path via [`crate::qwen2::forward_step`] /
+//! [`crate::qwen2::forward_step_greedy`] directly.
 
 use crate::qwen2::{Qwen2Config, Qwen2State, Qwen2Weights};
 use hipfire_runtime::arch::{Architecture, EosFilterOverrides, LoopGuardOverrides,

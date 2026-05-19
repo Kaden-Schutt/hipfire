@@ -1,16 +1,23 @@
-//! Qwen2 model types: Config / Weights / State.
+//! Qwen2 model types: Config / Weights / State, plus the
+//! [`forward_step`] / [`forward_step_greedy`] hot-path entry points.
 //!
-//! Rev 1 status:
-//! - `Qwen2Config::from_hfq` — real metadata parser.
-//! - `Qwen2Weights::load` — real loader for HFQ4G256 + F16 quant types.
-//!   Supports tied-embeddings (no `lm_head` on disk) and Q/K/V bias.
-//!   Other quant types (HFQ4G128, MQ4, MQ3, etc.) panic with a clear
-//!   error — extend as needed.
-//! - `Qwen2State::new` — stub; real KV cache allocation comes with the
-//!   forward pass port.
-//! - Forward pass — not yet present.
+//! Implementation status:
+//! - [`Qwen2Config::from_hfq`] — full HFQ-metadata parser; handles
+//!   scalar + array `eos_token_id`, optional `head_dim`, the
+//!   `attention_bias` default, and `text_config` nesting.
+//! - [`Qwen2Weights::load`] — loads embed_tokens + final norm + lm_head
+//!   (tied or untied; F16-tied path host-expands to F32) + 28 layers.
+//!   Supports HFQ4G256 / HFQ4G128 / Q8F16 / F16 weight quant types.
+//! - [`Qwen2State`] — full per-step scratch graph + F32 KV cache.
+//!   `new_with_max_seq` for explicit KV budget; `reset()` for cheap
+//!   between-turn rewind.
+//! - [`forward_step`] — one decode step through 28 layers (RMSNorm →
+//!   fused QKV + 3× bias_add → RoPE → KV write → attention → o_proj →
+//!   residual → FFN norm → SwiGLU → residual). End-to-end validated
+//!   16/16 top-1 match vs HF F32 reference at Q8F16 precision.
 //!
-//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the full plan.
+//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the
+//! bring-up plan and `lib.rs` for the rev-3 status summary.
 //!
 //! # TODO(transformer-extraction)
 //!
@@ -597,6 +604,18 @@ impl Qwen2State {
         })
     }
 
+    /// Rewind the position cursor to 0 so the next [`forward_step`]
+    /// begins a fresh conversation. The KV cache buffers are not zeroed
+    /// — slots get overwritten in place as `forward_step` writes at the
+    /// new positions — so reset is O(1). The daemon calls this from the
+    /// `reset` event handler and from the `bench_prefill` cold-start
+    /// path; callers driving multi-turn chat through a long-running
+    /// session should call it whenever they want to discard prior
+    /// context.
+    pub fn reset(&mut self) {
+        self.next_pos = 0;
+    }
+
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `ForwardScratch::free_gpu` in `hipfire_runtime::llama`.
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -714,9 +733,14 @@ pub fn forward_step(
         }
 
         // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
-        // per layer (batch=1, n=q_dim or kv_dim). This is the option (c)
-        // path from the plan §5; promotable to a fused fused_qkv_*_bias
-        // kernel later under the Δ ≥ 5% rule.
+        // per layer (batch=1, n=q_dim or kv_dim). This is **option (a)**
+        // from the plan §5 (3 launches per layer × 28 = 84 launches per
+        // decode step), not option (c) as an earlier comment claimed.
+        // The plan's preferred (c) is a single batched bias-add of
+        // Q/K/V per layer (~28 launches per decode step); reaching (c)
+        // needs either a kernel that takes three (buf, bias, n) triples
+        // or a refactor of `bias_add_f32` to accept multi-row inputs.
+        // Promote to (c) / (b) under the Δ ≥ 5% rule.
         gpu.bias_add_f32(&state.q, &layer.wq_bias, 1, q_dim)?;
         gpu.bias_add_f32(&state.k, &layer.wk_bias, 1, kv_dim)?;
         gpu.bias_add_f32(&state.v, &layer.wv_bias, 1, kv_dim)?;
