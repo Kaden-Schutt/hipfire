@@ -141,6 +141,35 @@ fn has_dot2_f32_f16(arch: &str) -> bool {
         | "gfx1200" | "gfx1201")
 }
 
+/// Whether to route HFQ3 batched-prefill through the experimental
+/// wave32 dp4a path (`gemm_qkv_hfq3g256_dp4a` / `gemm_gate_up_hfq3g256_dp4a`)
+/// instead of the default dot2 family on RDNA2+.
+///
+/// Phase 2 of `docs/plans/gfx10_mq3_prefill.md` — an experiment to see
+/// whether the sdot4 4×-ALU lift that helped gfx906 transfers to wave32.
+/// Default off (dot2 ships); flip on with `HIPFIRE_HFQ3_DP4A=1` to bench.
+/// Available on archs with `v_dot4_i32_i8` (gfx1011/1012/1030-1032,
+/// gfx11/12) — NOT gfx1010 / gfx1013.
+fn hfq3_dp4a_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_DP4A").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    if !override_.unwrap_or(false) {
+        return false;
+    }
+    matches!(arch,
+        "gfx1011" | "gfx1012"
+        | "gfx1030" | "gfx1031" | "gfx1032"
+        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+        | "gfx1150" | "gfx1151" | "gfx1152"
+        | "gfx1200" | "gfx1201")
+}
+
 /// Whether this arch has WMMA kernels that compile + run on the user's
 /// ROCm toolchain right now.
 ///
@@ -6133,6 +6162,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
+        // Default off; flip on to bench dp4a vs the shipping dot2 path.
+        if batch_size > 1 && hfq3_dp4a_enabled(&self.arch) {
+            return self.gemm_qkv_hfq3g256_dp4a(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         // FP16 fast paths — gfx10xx admits MQ3 via is_batchable_la, all of
         // these archs support FP16 ISA. Phase 2b (dot2) + Phase 2c (fp16).
         if batch_size > 1 && !fp16_disabled() {
@@ -6336,6 +6372,82 @@ impl Gpu {
                   + crate::profile::gemm_hfq3g256_bytes(v_m, k, batch_size)
                   + batch_size * k * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq3g256_fp16", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [total_m, batch_tiles as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Wave32+dp4a batched 3-way fused HFQ3-G256 GEMM (Q + K + V).
+    /// Phase 2 experimental — port of `gemm_qkv_hfq4g256_wave64_dp4a` from
+    /// gfx906 wave64 to wave32 + HFQ3 unpack. Available on RDNA2+ archs
+    /// with `v_dot4_i32_i8`. Gated by `HIPFIRE_HFQ3_DP4A=1`.
+    pub fn gemm_qkv_hfq3g256_dp4a(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qkv_hfq3g256_dp4a",
+            kernels::GEMM_QKV_HFQ3G256_DP4A_SRC,
+            "gemm_qkv_hfq3g256_dp4a",
+        )?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions["gemm_qkv_hfq3g256_dp4a"];
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const BATCH_TILE: usize = 16;
+        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let total_m = (q_m + k_m + v_m) as u32;
+
+        let bytes = crate::profile::gemm_hfq3g256_bytes(q_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(k_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(v_m, k, batch_size)
+                  + batch_size * k  // Q8_1 mmq X is ~1 byte per element
+                  + batch_size * (q_m + k_m + v_m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_qkv_hfq3g256_dp4a", bytes,
+        );
         let result = unsafe {
             self.hip.launch_kernel(
                 func,
@@ -6795,6 +6907,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
+        if batch_size > 1 && hfq3_dp4a_enabled(&self.arch) {
+            return self.gemm_gate_up_hfq3g256_dp4a(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
         if batch_size > 1 && !fp16_disabled() {
             if has_dot2_f32_f16(&self.arch) {
@@ -6965,6 +7083,73 @@ impl Gpu {
                   + crate::profile::gemm_hfq3g256_bytes(up_m, k, batch_size)
                   + batch_size * k * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq3g256_fp16", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [total_m, batch_tiles as u32, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Wave32+dp4a batched 2-way fused HFQ3-G256 GEMM (gate + up).
+    /// Phase 2 experimental sibling of `gemm_qkv_hfq3g256_dp4a`.
+    pub fn gemm_gate_up_hfq3g256_dp4a(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_gate_up_hfq3g256_dp4a",
+            kernels::GEMM_GATE_UP_HFQ3G256_DP4A_SRC,
+            "gemm_gate_up_hfq3g256_dp4a",
+        )?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions["gemm_gate_up_hfq3g256_dp4a"];
+
+        let mut ag = a_gate.buf.as_ptr();
+        let mut au = a_up.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yg = y_gate.buf.as_ptr();
+        let mut yu = y_up.buf.as_ptr();
+        let mut gate_m_val = gate_m as i32;
+        let mut up_m_val = up_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag as *mut _ as *mut c_void,
+            &mut au as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yg as *mut _ as *mut c_void,
+            &mut yu as *mut _ as *mut c_void,
+            &mut gate_m_val as *mut _ as *mut c_void,
+            &mut up_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const BATCH_TILE: usize = 16;
+        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        let total_m = (gate_m + up_m) as u32;
+
+        let bytes = crate::profile::gemm_hfq3g256_bytes(gate_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(up_m, k, batch_size)
+                  + batch_size * k
+                  + batch_size * (gate_m + up_m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_gate_up_hfq3g256_dp4a", bytes,
+        );
         let result = unsafe {
             self.hip.launch_kernel(
                 func,

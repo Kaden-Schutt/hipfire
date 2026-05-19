@@ -697,6 +697,9 @@ pub const GEMM_QKV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_
 pub const GEMM_QKV_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dot2.hip");
 // FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013 which lack dot2.
 pub const GEMM_QKV_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_fp16.hip");
+// Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
+// Port of gemm_qkv_hfq4g256_wave64_dp4a from gfx906 to wave32 + HFQ3 unpack.
+pub const GEMM_QKV_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dp4a.gfx1030.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
@@ -720,6 +723,8 @@ pub const GEMM_GATE_UP_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/g
 pub const GEMM_GATE_UP_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dot2.hip");
 // FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013.
 pub const GEMM_GATE_UP_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_fp16.hip");
+// Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
+pub const GEMM_GATE_UP_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dp4a.gfx1030.hip");
 
 // ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");

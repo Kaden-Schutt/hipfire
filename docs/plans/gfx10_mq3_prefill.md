@@ -283,34 +283,62 @@ launch geometry delivered +60% on gfx1031; fp16 should give the
 matching uplift on archs without dot2 (≈+30-50% over scalar based
 on the HFQ4 fp16 vs scalar parity reference).
 
-### Phase 2 — dp4a inner loop for the qkv / gate_up GEMMs
+### Phase 2 — dp4a inner loop for the qkv / gate_up GEMMs ⚠️ **NEGATIVE RESULT 2026-05-19**
 
-The HFQ4 wave64-dp4a kernels exist for gfx906. Port the dp4a inner
-loop to wave32 + gfx1030 target for HFQ3:
+Ported the gfx906 wave64-dp4a inner loop to wave32 + HFQ3 unpack on
+RDNA2:
 
 - `kernels/src/gemm_qkv_hfq3g256_dp4a.gfx1030.hip`
 - `kernels/src/gemm_gate_up_hfq3g256_dp4a.gfx1030.hip`
 
-Pattern (per Reference B):
-1. Pre-quantize x to Q8_1 (`block_q8_1_mmq`) — reuse the existing
-   `q8_1_mmq_x_scratch` infrastructure on `Gpu`
-2. Dispatch dp4a inner loop using `__builtin_amdgcn_sdot4`
-3. Unpack 3-bit trits to INT8 bytes (1 trit per byte, low 3 bits)
-   before each dp4a — this is where the bit-extraction VALU
-   pressure lives (gemini 2.1's concern from the decode-perf plan)
+Both kernels compile clean (35 VGPR + 21 SGPR + 0 spills — much
+lower budget than the 98-VGPR dot2 family, plenty of occupancy
+headroom) and emit two `v_dot4_i32_i8` per inner iteration as
+expected. Output is coherent (eyeball matrix fluent across all
+prompts, within INT8 quant noise of the dot2 baseline).
 
-**Risk:** the 3-bit unpack overhead may eat the dp4a 4×
-ALU-throughput uplift. Pre-existing MQ4 v4 (gfx1030 dp4a-packed)
-unpacks 4-bit nibbles which is cheaper. This is the same trade-off
-that closed Phase 3 of the decode plan; for prefill the calculus
-may differ because the amortization is over a larger batch.
+**Perf result on gfx1031, 9B MQ3:**
 
-**Validation gate beyond Phase 1:**
-- KLD eval (n=256, kv-mode=q8) on
-  `/data/hipfire/qwen3.5-9b.mq3-awq-gptq-f2-lmhead-a100.hfq`. Slice-
-  mean KLD ≤ 1.05× the Phase 1 (scalar) baseline. dp4a + x-quant
-  noise must not push KLD beyond the 5% band.
-- Prefill tok/s ≥ 2.5× current (55 → 137+).
+| Prompt | dot2 (Phase 2b, shipping) | dp4a (Phase 2) | Δ |
+|---|---|---|---|
+| paris  | 223 tok/s | 175 tok/s | **−22%** |
+| sheep  | 249 tok/s | 216 tok/s | **−13%** |
+| code   | 224 tok/s | 189 tok/s | **−16%** |
+| awq    | 231 tok/s | 197 tok/s | **−15%** |
+
+**Median ~15% regression vs dot2.** The plan's flagged risk (3-bit
+unpack overhead eating the sdot4 ALU lift) materialized exactly on
+RDNA2. Hypotheses:
+1. **gfx906 win was relative to weak fp16:** gfx906's fp16 path is
+   wave64-only and saw a real lift from dp4a's 4×-ALU throughput.
+   RDNA2 already has a strong dot2 path at native FP16, only 2×
+   ALU but no Q8_1-X conversion. The relative win disappears.
+2. **3-bit unpack costlier than 4-bit:** HFQ4 nibble unpack is 8
+   shifts + 8 masks. HFQ3 trit unpack adds 8 byte subtractions
+   (signed mapping) + uint24 byte-combine. More VALU pressure per
+   K-element offsets the sdot4 win.
+3. **Q8_1 X conversion cost amortized worse at short N:** the
+   `ensure_q8_1_mmq_x` adds a one-shot conversion cost. At the
+   short-prompt regime tested (21-36 prompt tokens), this hurts
+   more than it helps.
+
+**Disposition:** Code is gated behind `HIPFIRE_HFQ3_DP4A=1` (default
+off — dot2 ships). Keep the gated implementation for:
+- Reproducible negative-result reference (this is why we test, not
+  just port)
+- A/B comparison on different RDNA2 SKUs / models / prompt regimes
+  where the calculus might invert (long prefill, larger Infinity
+  Cache, etc.)
+- Future MQ3/Q8 hybrid quantization experiments
+
+**Do NOT enable by default.** Phase 3 (MMQ tile sweep) reuses the
+same Q8_1 infrastructure — should be evaluated with the
+understanding that the dp4a inner-loop did not pan out here.
+
+**Validation:** `verify_hfq3_batched` with `HIPFIRE_HFQ3_DP4A=1`
+exercises both new kernels at 5e-1 tolerance (Q8_1 X adds ~3× the
+dot2 error band). Coherence eyeball produces fluent text across the
+4-prompt matrix.
 
 ### Phase 3 — MMQ tiling for batched-lm_head adjacency
 
@@ -435,7 +463,12 @@ not the priority.
   DONE 2026-05-19. No perf signal on gfx1031 (auto-routes to dot2);
   benches deferred to gfx1010 hardware. Same VGPR/spill budget as
   the dot2 family.
-- **Phase 2 (dp4a)** and **Phase 3 (MMQ tile sweep)** remaining for
-  any further headroom on archs that already have dot2.
+- **Phase 2 (dp4a)** ⚠️ NEGATIVE RESULT 2026-05-19 — port of gfx906
+  wave64-dp4a to RDNA2 wave32 with HFQ3 unpack is ~15% SLOWER than
+  the shipping dot2 path. Code retained behind `HIPFIRE_HFQ3_DP4A=1`
+  for reproducibility / future experiments but does not ship.
+- **Phase 3 (MMQ tile sweep)** remaining as the last lever for any
+  further headroom — should be evaluated against the dot2 baseline,
+  not scalar, and with the Phase 2 negative result in mind.
 - **Phase 0 measurement required first** — same lesson as the
   decode plan. Don't write kernels before measuring.

@@ -142,7 +142,19 @@ fn main() {
 
         // Tolerance: bit-exact at N=1 (scalar both sides); FP16-mantissa
         // tolerance at N>1 (auto-routing hits dot2 or fp16, dequant in FP16).
-        let tol: f32 = if n == 1 { 1e-3 } else { 2e-1 };
+        // dp4a mode (HIPFIRE_HFQ3_DP4A=1) quantizes X to Q8_1 on top of the
+        // FP16 weight dequant, so it needs a wider tolerance (~3× the dot2
+        // error band).
+        let dp4a_mode = std::env::var("HIPFIRE_HFQ3_DP4A")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(false);
+        let tol: f32 = if n == 1 {
+            1e-3
+        } else if dp4a_mode {
+            5e-1
+        } else {
+            2e-1
+        };
 
         // Test 1: gemm_hfq3g256_residual (Y starts zero, accumulates).
         let d_y = alloc_zero(&mut gpu, n * m);
