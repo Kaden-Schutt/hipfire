@@ -3218,9 +3218,14 @@ pub fn forward_scratch(
 pub struct PrefillBatchScratch {
     pub max_batch: usize,
 
-    // Residual stream and rotation scratch — both [N × dim]
+    // Residual stream and rotation scratch — all [N × dim]
     pub x_batch: GpuTensor,
     pub x_rot_batch: GpuTensor,
+    // Rmsnorm-only scratch (no FWHT). Used by MoE prefill body for Q8_0
+    // weights (router + shared_expert_gate) which were quantized against
+    // un-rotated input. MQ4 sibling weights read `x_rot_batch` instead.
+    // Mixed-dtype MoE layers populate both buffers per `prefill_moe_ffn_body_batched`.
+    pub x_norm_batch: GpuTensor,
 
     // LA-layer projection outputs
     pub dn_qkv_batch: GpuTensor,         // [N × qkv_dim]
@@ -3310,6 +3315,7 @@ impl PrefillBatchScratch {
             max_batch,
             x_batch:           gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_rot_batch:       gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
+            x_norm_batch:      gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             dn_qkv_batch:      gpu.alloc_tensor(&[max_batch * qkv_dim], DType::F32)?,
             dn_z_batch:        gpu.alloc_tensor(&[max_batch * v_dim],   DType::F32)?,
             dn_alpha_batch:    gpu.alloc_tensor(&[max_batch * n_v_heads], DType::F32)?,
@@ -3379,7 +3385,7 @@ impl PrefillBatchScratch {
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [
-            self.x_batch, self.x_rot_batch,
+            self.x_batch, self.x_rot_batch, self.x_norm_batch,
             self.dn_qkv_batch, self.dn_z_batch,
             self.dn_alpha_batch, self.dn_beta_batch,
             self.dn_q_raw_batch, self.dn_k_raw_batch, self.dn_v_batch,
@@ -4083,13 +4089,28 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// `(q, k, v, α, β)` tensors per DN layer at rows
 /// `[tape_offset .. tape_offset+N]` right before the batched GDN kernel
 /// runs. Used by the DFlash rollback path.
-/// Is every weight inside a MoE FFN MQ4G256? Gates the batched fast path —
-/// the router + shared-gate + shared.{gate,up,down} + every expert gate_up
-/// + every expert down must be MQ4 for the batched kernels to apply
-/// (they all assume HFQ4-G256 binary layout and group stride 136).
+/// Does the MoE FFN admit the batched prefill fast path?
+///
+/// Router + shared_expert_gate may be Q8_0 (the engine's default — these
+/// small tensors are never quantized to MQ4 to preserve routing
+/// accuracy). They get a separate `gemm_q8_0_batched_chunked` dispatch
+/// against the *un-rotated* `x_norm_batch` inside
+/// `prefill_moe_ffn_body_batched`. All other weights (shared expert
+/// gate/up/down + every expert gate_up/down) must be MQ4G256 — these are
+/// the ones consumed by the FWHT-rotated `_k8_indexed_batched` and
+/// `gemm_hfq4g256` family, which is stride-136 only.
+///
+/// Pre-fix this required ALL weights to be MQ4G256, which made every
+/// A3B model fall back to per-token prefill because router is universally
+/// Q8_0. Widening to accept Q8 router + Q8 shared_expert_gate unlocks
+/// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform.mq4).
+/// Mixed-precision Qwen3.6-A3B (MQ6 in 16/40 layers) still falls back —
+/// needs an MQ6 sibling for `_k8_indexed_batched`, follow-up work.
 fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
-    ffn.router.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
+    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
+    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
+    router_ok
+        && shared_gate_ok
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
@@ -4102,7 +4123,8 @@ fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
 /// residual back into the same buffer in-place.
 ///
 /// Preconditions (caller must guarantee):
-/// - all MoE weights are MQ4G256 (see `moe_ffn_all_mq4`)
+/// - `moe_ffn_all_mq4(ffn)` returns true: router + shared_expert_gate may
+///   be MQ4G256 *or* Q8_0; all other MoE weights must be MQ4G256
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
 /// - `config.num_experts_per_tok == 8` and `config.num_experts <= 1024`
@@ -4137,36 +4159,59 @@ fn prefill_moe_ffn_body_batched(
     let up_batch      = pbs.moe_up_batch.as_ref().expect("moe scratch");
     let rot_batch     = pbs.moe_rot_batch.as_ref().expect("moe scratch");
 
-    // ── 1. rmsnorm + FWHT pre-rotate for MQ4 inputs ──
-    // AWQ-aware: dispatches the _awq_batched kernel if ffn.router carries
-    // an awq_scale sidecar (Phase A Stage A — Q/router/shared all share
-    // the same input rmsnorm output, so any of their AWQ scales is
-    // mathematically equivalent; pick router as canonical).
-    fused_rmsnorm_rotate_mq_batched_for(
-        gpu, &pbs.x_batch, ffn_norm, &ffn.router, &pbs.x_rot_batch, dim, config.norm_eps, n,
-    )?;
+    // ── 1. Split rmsnorm vs FWHT rotate ──
+    //
+    // A3B (and every other MoE here) leaves router + shared_expert_gate
+    // as Q8_0 in the quantizer — these tiny tensors lose too much
+    // accuracy at 4-bit, so the engine never reduces them. Q8 weights
+    // are quantized against the un-rotated rmsnorm output, while the
+    // MQ4 siblings (shared_expert.{gate,up,down} + experts.{gate_up,down})
+    // expect FWHT(rmsnorm(x) / awq_scale). Populate both:
+    //   x_norm_batch ← rmsnorm(x_batch)
+    //   x_rot_batch  ← FWHT(x_norm_batch / awq_scale)  (only if any
+    //                  downstream MQ weight is present, which moe_ffn_all_mq4
+    //                  guarantees — shared_expert.gate is always MQ4 here)
+    //
+    // Pick `shared_expert.gate` as the AWQ representative (instead of
+    // the previous `ffn.router`). Per the F1 imatrix scope every gate-side
+    // MQ4 sibling shares the same input basis and therefore an identical
+    // awq_scale, but the router itself is excluded from F1 (it stays Q8).
+    // Reading awq_scale from router would silently drop AWQ rotation in
+    // v3 AWQ runs — latent until this predicate widened.
+    gpu.rmsnorm_batched(&pbs.x_batch, ffn_norm, &pbs.x_norm_batch, n, dim, config.norm_eps)?;
+    rotate_x_mq_batched_for(gpu, &ffn.shared_expert.gate, &pbs.x_norm_batch, &pbs.x_rot_batch, dim, n)?;
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
     //
-    // The natural fit is `gemm_qkvza_hfq4g256` (4-way fused with one
-    // batched launch), but on gfx11+ it routes to a WMMA fast path whose
-    // 16×16 tiling breaks at the z_m=1 boundary row (the shared-expert
-    // gate is a single row, sandwiched between the 256-row router and
-    // the 512-row shared.gate). Symptom was τ≈0 with repeating tokens
-    // once the batched MoE path was enabled.
-    //
-    // Four separate `gemm_hfq4g256` calls hit the portable scalar
-    // kernel (no WMMA), which stays byte-exact with the reference.
-    // Launch-count cost is +3 per MoE layer; acceptable for correctness.
-    // Follow-up: fix the WMMA qkvza to handle z_m=1 and re-fuse.
-    gpu.gemm_hfq4g256(
-        &ffn.router.buf, &pbs.x_rot_batch, router_logits,
-        ffn.router.m, ffn.router.k, n,
-    )?;
-    gpu.gemm_hfq4g256(
-        &ffn.shared_expert_gate.buf, &pbs.x_rot_batch, shared_scalar,
-        ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
-    )?;
+    // Per-dtype dispatch — Q8 reads `x_norm_batch`, MQ4 reads
+    // `x_rot_batch`. The natural 4-way fuse via `gemm_qkvza_hfq4g256`
+    // is not applicable when router/shared_expert_gate are Q8 (mixed
+    // strides). Four separate launches; +3 per MoE layer over the fused
+    // ideal, acceptable for the structural unlock.
+    match ffn.router.gpu_dtype {
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &ffn.router.buf, &pbs.x_norm_batch, router_logits,
+            ffn.router.m, ffn.router.k, n,
+        )?,
+        DType::MQ4G256 => gpu.gemm_hfq4g256(
+            &ffn.router.buf, &pbs.x_rot_batch, router_logits,
+            ffn.router.m, ffn.router.k, n,
+        )?,
+        other => panic!("prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
+                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
+    }
+    match ffn.shared_expert_gate.gpu_dtype {
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &ffn.shared_expert_gate.buf, &pbs.x_norm_batch, shared_scalar,
+            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
+        )?,
+        DType::MQ4G256 => gpu.gemm_hfq4g256(
+            &ffn.shared_expert_gate.buf, &pbs.x_rot_batch, shared_scalar,
+            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
+        )?,
+        other => panic!("prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
+                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
+    }
     gpu.gemm_hfq4g256(
         &ffn.shared_expert.gate.buf, &pbs.x_rot_batch, shared_gate,
         ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
