@@ -426,15 +426,70 @@ coherent across all prompts.
 
 **Engineering disposition:** still gated behind `HIPFIRE_HFQ3_MMQ=1`
 for safety, but the auto-selector is now safe-by-design (falls back
-to dot2 at small N). Shipping as default-on would require:
-- Coverage of qkv + gate_up MMQ variants (currently residual-only)
-- KLD eval at n=256 to confirm no quality regression on the
-  full daemon pipeline
-- Coherence-gate clean across the model matrix
-- mmq_x=8 deletion (or keep as explicit lever)
+to dot2 at small N).
 
-Each additional kernel ports follow the same body-template pattern;
-~2-3 days more engineering to complete the qkv + gate_up family.
+### Phase 3 — full MMQ family (qkv + gate_up + residual) ✅ **SHIPPED 2026-05-19**
+
+Extended the residual MMQ tile-size family to the two fused
+preambles. Each new family follows the same body+wrapper pattern:
+
+- `gemm_qkv_hfq3g256_mmq_body.cuh`  + 3 tile wrappers (x8/x16/x32)
+- `gemm_gate_up_hfq3g256_mmq_body.cuh` + 3 tile wrappers
+
+VGPR scaling (HFQ3 qkv): 69/87/115 for x8/x16/x32, 0 spills. Same
+for gate_up (with 1 extra SGPR for the 2-way routing branch).
+
+**Routing in the public entry points** (`gemm_qkv_hfq3g256`,
+`gemm_gate_up_hfq3g256`, `gemm_hfq3g256_residual`):
+
+```
+if batch_size > 1
+   && HIPFIRE_HFQ3_MMQ=1
+   && (q_m, k_m, v_m | gate_m, up_m) all multiples of 128:
+    → MMQ auto-selector (gate_size-internal: ≤12 dot2, ≤127 mmq_x16, else mmq_x32)
+else fall through to dot2 / fp16 / scalar
+```
+
+The MMQ_Y=128 alignment requirement is checked at the entry point —
+if any output stride isn't 128-aligned, the dispatch falls through
+to dot2 (no per-row routing kernel needed for unusual shapes).
+Qwen3.5 / Qwen3.5-VL / Qwen3.5-A3B all satisfy this.
+
+**End-to-end perf on gfx1031 / 9B MQ3 (daemon eyeball, warm cache):**
+
+| Prompt | dot2 baseline | MMQ full family | Δ |
+|---|---|---|---|
+| paris (pf=21) | 232 | 249 | +7% |
+| sheep (pf=36) | 248 | **339** | **+37%** |
+| code (pf=21)  | 224 | 262 | +17% |
+| awq (pf=24)   | 230 | **293** | **+27%** |
+| **LRU (pf=240)**  | **290** | **547** | **+89%** |
+
+**Cumulative since Phase 0 baseline (56 tok/s): 9.77×** speedup at
+240-token prefill on gfx1031. Output coherent across the full
+eyeball matrix.
+
+The compounding factor over residual-only MMQ is significant — qkv +
+gate_up are 2/3 of the fused preamble work per layer; adding them to
+the MMQ path triples the per-layer benefit at moderate-to-long
+prefill.
+
+**Validation:**
+- `verify_hfq3_batched` extended with MMQ-direct qkv + gate_up tests
+  at m=256 (MMQ_Y-aligned). All three batch sizes (16/32/128) pass
+  at 5e-1 tolerance (max_err ~0.31-0.33, INT8 quant noise as
+  expected for the Q8_1-X kernels).
+- KLD eval n=30, KV=Q8 with `HIPFIRE_HFQ3_MMQ=1` — TODO
+
+**Shipping disposition (current):** still gated behind
+`HIPFIRE_HFQ3_MMQ=1`. To default-on, recommended steps:
+1. KLD eval at n=256 (full coverage, not n=30)
+2. Coherence-gate clean across the model matrix
+3. Confirm Phase 3 wins on a second RDNA2 SKU (e.g., RX 6800 XT
+   with larger Infinity Cache) — should be additive but worth
+   verifying
+4. Possibly remove the env gate entirely and gate purely on
+   batch_size (the auto-selector already handles low-N safely)
 
 ### Phase 3 — MMQ tiling, minimal probe ⚠️ **POSITIVE RESULT 2026-05-19**
 
@@ -636,8 +691,14 @@ not the priority.
   wave64-dp4a to RDNA2 wave32 with HFQ3 unpack is ~15% SLOWER than
   the shipping dot2 path. Code retained behind `HIPFIRE_HFQ3_DP4A=1`
   for reproducibility / future experiments but does not ship.
-- **Phase 3 (MMQ tile sweep)** remaining as the last lever for any
-  further headroom — should be evaluated against the dot2 baseline,
-  not scalar, and with the Phase 2 negative result in mind.
+- **Phase 3 (MMQ tile family)** ✅ DONE 2026-05-19 —
+  LDS-tiled X reuse + sdot4 with auto-selecting tile size
+  (mmq_x ∈ {16, 32}). Full family covers residual + qkv (3-way fused)
+  + gate_up (2-way fused). End-to-end on gfx1031 / 9B MQ3:
+  **240-token prefill 290 → 547 tok/s (+89%)**.
+  Cumulative since Phase 0 baseline (56 tok/s) → **9.77× speedup**.
+  Currently gated behind `HIPFIRE_HFQ3_MMQ=1`; safe-by-design
+  (auto-selector falls back to dot2 at batch ≤ 12 and at non-
+  MMQ_Y-aligned shapes).
 - **Phase 0 measurement required first** — same lesson as the
   decode plan. Don't write kernels before measuring.

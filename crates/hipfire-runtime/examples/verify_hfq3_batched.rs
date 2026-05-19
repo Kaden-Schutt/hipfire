@@ -270,10 +270,61 @@ fn main() {
     }
     gpu.free_tensor(d_w).unwrap();
 
+    // ── MMQ-direct qkv + gate_up tests at MMQ_Y-aligned m ────────────────
+    // The MMQ qkv/gate_up bodies REQUIRE q_m/k_m/v_m and gate_m/up_m to
+    // each be multiples of MMQ_Y=128. Allocate a separate weight matrix
+    // at m=256 to test these paths properly.
+    {
+        eprintln!("\n-- MMQ-direct (qkv + gate_up at m=256) --");
+        let m_mmq = 256usize;
+        let weight_bytes_mmq = synth_hfq3_bytes(m_mmq, k, 42);
+        let d_w_mmq = gpu.upload_raw(&weight_bytes_mmq, &[weight_bytes_mmq.len()]).unwrap();
+
+        // FP16 mantissa + Q8_1 X tolerance.
+        let mmq_tol = 5e-1_f32;
+        // Test at the batch sizes where MMQ actually fires
+        // (auto-selector routes to mmq_x16 from N=13; mmq_x32 at N≥128).
+        for &n in &[16usize, 32, 128] {
+            let x_mmq = synth_x(n, k, 17);
+            let d_x_mmq = gpu.upload_f32(&x_mmq, &[n * k]).unwrap();
+            let y_ref_mmq = cpu_reference_via_gemv(&mut gpu, &weight_bytes_mmq, &x_mmq, m_mmq, k, n);
+
+            eprintln!("  -- batch_size = {n} --");
+
+            // qkv MMQ auto-selector
+            let d_yq = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_yk = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_yv = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            gpu.gemm_qkv_hfq3g256_mmq(
+                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq,
+                &d_yq, &d_yk, &d_yv, m_mmq, m_mmq, m_mmq, k, n,
+            ).unwrap();
+            let yq = gpu.download_f32(&d_yq).unwrap();
+            any_fail |= !compare_with_tol("mmq qkv (y_q)", &y_ref_mmq, &yq, mmq_tol);
+            gpu.free_tensor(d_yq).unwrap();
+            gpu.free_tensor(d_yk).unwrap();
+            gpu.free_tensor(d_yv).unwrap();
+
+            // gate_up MMQ auto-selector
+            let d_yg = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_yu = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            gpu.gemm_gate_up_hfq3g256_mmq(
+                &d_w_mmq, &d_w_mmq, &d_x_mmq, &d_yg, &d_yu, m_mmq, m_mmq, k, n,
+            ).unwrap();
+            let yg = gpu.download_f32(&d_yg).unwrap();
+            any_fail |= !compare_with_tol("mmq gate_up (gate)", &y_ref_mmq, &yg, mmq_tol);
+            gpu.free_tensor(d_yg).unwrap();
+            gpu.free_tensor(d_yu).unwrap();
+
+            gpu.free_tensor(d_x_mmq).unwrap();
+        }
+        gpu.free_tensor(d_w_mmq).unwrap();
+    }
+
     if any_fail {
         eprintln!("\n[FAIL] At least one batched HFQ3 kernel diverged from per-row gemv_hfq3g256.");
         std::process::exit(1);
     } else {
-        eprintln!("\n[PASS] All HFQ3 batched kernels (scalar + dot2 + fp16) within tolerance.");
+        eprintln!("\n[PASS] All HFQ3 batched kernels (scalar + dot2 + fp16 + mmq) within tolerance.");
     }
 }
