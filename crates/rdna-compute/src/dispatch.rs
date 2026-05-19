@@ -5538,6 +5538,19 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
+        // AND all four output strides are MMQ_Y-aligned. Auto-selector falls
+        // back to dot2 at small batch.
+        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && qkv_m % 128 == 0 && z_m % 128 == 0
+            && beta_m % 128 == 0 && alpha_m % 128 == 0
+        {
+            return self.gemm_qkvza_hfq3g256_mmq(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            );
+        }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
         if batch_size > 1 && !fp16_disabled() {
             if has_dot2_f32_f16(&self.arch) {
@@ -7679,6 +7692,185 @@ impl Gpu {
             a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             32, "gemm_gate_up_hfq3g256_mmq_x32",
             kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_SRC,
+        )
+    }
+
+    // ── HFQ3 qkvza MMQ family — 4-way fused LinearAttention preamble ─────
+
+    /// HFQ3 qkvza MMQ auto-selector (wqkv + wz + w_beta + w_alpha). Gated
+    /// by `HIPFIRE_HFQ3_MMQ=1`. CALLER INVARIANT: qkv_m, z_m, beta_m,
+    /// alpha_m must each be multiples of 128.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq3g256_mmq(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to gemm_qkvza_hfq3g256_{dot2,mmq_xN} which bind.
+        if batch_size <= 12 {
+            self.gemm_qkvza_hfq3g256_dot2(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            )
+        } else if batch_size <= 127 {
+            self.gemm_qkvza_hfq3g256_mmq_x16(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            )
+        } else {
+            self.gemm_qkvza_hfq3g256_mmq_x32(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qkvza_hfq3_mmq_tile(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_qkvza_hfq3g256_mmq_body.cuh\"",
+            kernels::GEMM_QKVZA_HFQ3G256_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut aqkv = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yqkv = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut qkv_m_val = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut beta_m_val = beta_m as i32;
+        let mut alpha_m_val = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aqkv as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yqkv as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut qkv_m_val as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut beta_m_val as *mut _ as *mut c_void,
+            &mut alpha_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemm_hfq3g256_bytes(qkv_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(z_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(beta_m, k, batch_size)
+                  + crate::profile::gemm_hfq3g256_bytes(alpha_m, k, batch_size)
+                  + batch_size * k
+                  + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ3 qkvza MMQ at mmq_x=8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq3g256_mmq_x8(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkvza_hfq3_mmq_tile(
+            a_qkv, a_z, a_beta, a_alpha, x,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            8, "gemm_qkvza_hfq3g256_mmq_x8",
+            kernels::GEMM_QKVZA_HFQ3G256_MMQ_X8_SRC,
+        )
+    }
+
+    /// HFQ3 qkvza MMQ at mmq_x=16 (auto-selector default for batch 13-127).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq3g256_mmq_x16(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkvza_hfq3_mmq_tile(
+            a_qkv, a_z, a_beta, a_alpha, x,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            16, "gemm_qkvza_hfq3g256_mmq_x16",
+            kernels::GEMM_QKVZA_HFQ3G256_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ3 qkvza MMQ at mmq_x=32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq3g256_mmq_x32(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkvza_hfq3_mmq_tile(
+            a_qkv, a_z, a_beta, a_alpha, x,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            32, "gemm_qkvza_hfq3g256_mmq_x32",
+            kernels::GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC,
         )
     }
 

@@ -316,6 +316,23 @@ fn main() {
             gpu.free_tensor(d_yg).unwrap();
             gpu.free_tensor(d_yu).unwrap();
 
+            // qkvza MMQ auto-selector (4-way LA preamble)
+            let d_y1 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_y2 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_y3 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            let d_y4 = gpu.alloc_tensor(&[n * m_mmq], DType::F32).unwrap();
+            gpu.gemm_qkvza_hfq3g256_mmq(
+                &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_w_mmq, &d_x_mmq,
+                &d_y1, &d_y2, &d_y3, &d_y4,
+                m_mmq, m_mmq, m_mmq, m_mmq, k, n,
+            ).unwrap();
+            let y1 = gpu.download_f32(&d_y1).unwrap();
+            any_fail |= !compare_with_tol("mmq qkvza (qkv arm)", &y_ref_mmq, &y1, mmq_tol);
+            gpu.free_tensor(d_y1).unwrap();
+            gpu.free_tensor(d_y2).unwrap();
+            gpu.free_tensor(d_y3).unwrap();
+            gpu.free_tensor(d_y4).unwrap();
+
             gpu.free_tensor(d_x_mmq).unwrap();
         }
         gpu.free_tensor(d_w_mmq).unwrap();

@@ -729,6 +729,13 @@ pub const GEMM_GATE_UP_HFQ3G256_MMQ_BODY_CUH: &str = include_str!("../../../kern
 pub const GEMM_GATE_UP_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x8.gfx1030.hip");
 pub const GEMM_GATE_UP_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x16.gfx1030.hip");
 pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32.gfx1030.hip");
+
+// HFQ3 qkvza (4-way fused: wqkv + wz + w_beta + w_alpha — LinearAttention
+// preamble) MMQ family.
+pub const GEMM_QKVZA_HFQ3G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_body.cuh");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x8.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x16.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x32.gfx1030.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
