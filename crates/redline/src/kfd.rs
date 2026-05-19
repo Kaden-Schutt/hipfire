@@ -77,6 +77,11 @@ struct KfdMapMemoryArgs {
 }
 
 #[repr(C)]
+struct KfdFreeMemoryArgs {
+    handle: u64,
+}
+
+#[repr(C)]
 struct KfdCreateQueueArgs {
     ring_base_address: u64,
     write_pointer_address: u64,
@@ -137,10 +142,12 @@ pub struct AqlPacket {
 }
 
 /// Result of a userptr KFD allocation.
+#[derive(Clone, Copy)]
 struct KfdUserAlloc {
     handle: u64,
     gpu_va: u64,
     cpu_ptr: *mut u8,
+    size: usize,
 }
 
 /// A user-mode AQL compute queue via /dev/kfd.
@@ -151,13 +158,16 @@ pub struct AqlQueue {
     ring_base: *mut u8,          // mmap'd ring buffer
     ring_size: u32,
     write_ptr: *mut AtomicU64,   // mmap'd write pointer (kernel manages)
-    read_ptr: *mut AtomicU64,    // mmap'd read pointer
     doorbell: *mut u32,          // mmap'd doorbell register
-    ring_handle: u64,            // KFD allocation handle for ring
-    eop_handle: u64,             // KFD allocation handle for EOP
     signal_buf: *mut u64,        // mmap'd signal buffer for completion
-    signal_handle: u64,
     signal_va: u64,
+    doorbell_len: usize,
+    ring_alloc: KfdUserAlloc,
+    eop_alloc: KfdUserAlloc,
+    signal_alloc: KfdUserAlloc,
+    cwsr_alloc: KfdUserAlloc,
+    wptr_alloc: KfdUserAlloc,
+    rptr_alloc: KfdUserAlloc,
 }
 
 impl AqlQueue {
@@ -268,11 +278,11 @@ impl AqlQueue {
 
         // Write/read pointers are already CPU-mapped (userptr)
         let write_ptr = wptr_alloc.cpu_ptr as *mut AtomicU64;
-        let read_ptr = rptr_alloc.cpu_ptr as *mut AtomicU64;
 
         // mmap doorbell page
+        let doorbell_len = 8192usize;
         let doorbell_page = unsafe {
-            libc::mmap(std::ptr::null_mut(), 8192, libc::PROT_READ | libc::PROT_WRITE,
+            libc::mmap(std::ptr::null_mut(), doorbell_len, libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED, kfd_fd, cq.doorbell_offset as i64)
         };
         if doorbell_page == libc::MAP_FAILED {
@@ -289,13 +299,16 @@ impl AqlQueue {
             ring_base: ring_base as *mut u8,
             ring_size: RING_SIZE,
             write_ptr,
-            read_ptr,
             doorbell: doorbell_page as *mut u32,
-            ring_handle: ring_alloc.handle,
-            eop_handle: eop_alloc.handle,
             signal_buf,
-            signal_handle: sig_alloc.handle,
             signal_va: sig_alloc.gpu_va,
+            doorbell_len,
+            ring_alloc,
+            eop_alloc,
+            signal_alloc: sig_alloc,
+            cwsr_alloc,
+            wptr_alloc,
+            rptr_alloc,
         })
     }
 
@@ -458,7 +471,7 @@ impl AqlQueue {
                 message: format!("KFD alloc_userptr({} bytes) failed: {}", size, std::io::Error::last_os_error()) });
         }
         let gpu_va = args.va_addr;
-        Ok(KfdUserAlloc { handle: args.handle, gpu_va, cpu_ptr: cpu_ptr as *mut u8 })
+        Ok(KfdUserAlloc { handle: args.handle, gpu_va, cpu_ptr: cpu_ptr as *mut u8, size: size as usize })
     }
 
     /// KFD memory allocation helper (GTT/VRAM). Returns (handle, gpu_va, mmap_offset).
@@ -498,11 +511,85 @@ impl AqlQueue {
         Ok(())
     }
 
-    pub fn destroy(&self) {
+    fn kfd_unmap(kfd_fd: i32, handle: u64, gpu_id: u32) {
+        if kfd_fd < 0 || handle == 0 {
+            return;
+        }
+        let mut gpu_ids = [gpu_id];
+        let mut args = KfdMapMemoryArgs {
+            handle,
+            device_ids_array_ptr: gpu_ids.as_mut_ptr() as u64,
+            n_devices: 1,
+            n_success: 0,
+        };
+        unsafe {
+            libc::ioctl(kfd_fd, kfd_iowr::<KfdMapMemoryArgs>(0x19), &mut args);
+        }
+    }
+
+    fn kfd_free(kfd_fd: i32, handle: u64) {
+        if kfd_fd < 0 || handle == 0 {
+            return;
+        }
+        let mut args = KfdFreeMemoryArgs { handle };
+        unsafe {
+            libc::ioctl(kfd_fd, kfd_iow::<KfdFreeMemoryArgs>(0x17), &mut args);
+        }
+    }
+
+    fn release_userptr(kfd_fd: i32, gpu_id: u32, alloc: &mut KfdUserAlloc) {
+        if alloc.handle != 0 {
+            Self::kfd_unmap(kfd_fd, alloc.handle, gpu_id);
+            Self::kfd_free(kfd_fd, alloc.handle);
+            alloc.handle = 0;
+        }
+        if !alloc.cpu_ptr.is_null() && alloc.size != 0 {
+            unsafe {
+                libc::munmap(alloc.cpu_ptr as *mut libc::c_void, alloc.size);
+            }
+            alloc.cpu_ptr = std::ptr::null_mut();
+            alloc.size = 0;
+        }
+        alloc.gpu_va = 0;
+    }
+
+    fn destroy_inner(&mut self) {
+        if self.kfd_fd < 0 {
+            return;
+        }
         let mut dq = KfdDestroyQueueArgs { queue_id: self.queue_id, pad: 0 };
         unsafe {
             libc::ioctl(self.kfd_fd, kfd_iowr::<KfdDestroyQueueArgs>(0x03), &mut dq);
+            if !self.doorbell.is_null() && self.doorbell_len != 0 {
+                libc::munmap(self.doorbell as *mut libc::c_void, self.doorbell_len);
+                self.doorbell = std::ptr::null_mut();
+                self.doorbell_len = 0;
+            }
+        }
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.rptr_alloc);
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.wptr_alloc);
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.cwsr_alloc);
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.signal_alloc);
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.eop_alloc);
+        Self::release_userptr(self.kfd_fd, self.gpu_id, &mut self.ring_alloc);
+        unsafe {
             libc::close(self.kfd_fd);
         }
+        self.kfd_fd = -1;
+        self.queue_id = 0;
+        self.ring_base = std::ptr::null_mut();
+        self.write_ptr = std::ptr::null_mut();
+        self.signal_buf = std::ptr::null_mut();
+        self.signal_va = 0;
+    }
+
+    pub fn destroy(mut self) {
+        self.destroy_inner();
+    }
+}
+
+impl Drop for AqlQueue {
+    fn drop(&mut self) {
+        self.destroy_inner();
     }
 }
