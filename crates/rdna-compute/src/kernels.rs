@@ -555,6 +555,15 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
 
+/// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
+/// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks
+/// packed across 24 bits per 3-byte slice). Same FWHT-rotated 3-bit
+/// storage applies to MQ3G256 — the kernel handles both buffers (rotation
+/// is applied by the caller, matching the MQ4/HFQ4 dispatch convention).
+pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip");
+
 /// Non-residual WMMA Q8_0 GEMM (gfx12). Direct write to Y[N, M] without
 /// reading prior values (= rather than +=). Drop-in replacement for the
 /// scalar `gemm_q8_0_batched` kernel; rocprof 2026-05-19 showed that
