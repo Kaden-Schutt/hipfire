@@ -147,6 +147,17 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// HFQ3-G256 weight buffer bytes: 104 B per group (8 B header + 96 B 3-bit body).
+pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 104
+}
+
+/// Bytes for a single-row HFQ3 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq3g256_bytes(m: usize, k: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// MQ3-Lloyd GEMV bytes: weight (112 B / group) + x + y.
 pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
     let groups = k / 256;
@@ -157,6 +168,13 @@ pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
 /// vectors).
 pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
+/// Bytes for a B-way batched HFQ3-G256 GEMM. HFQ3 sibling of
+/// `gemm_hfq4g256_bytes`. Used by the gfx10 MQ3 batched-prefill
+/// dispatchers (qkv / qkvza / gate_up / residual).
+pub fn gemm_hfq3g256_bytes(m: usize, k: usize, batch: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + batch * (k + m) * 4
 }
 
 /// HFP4-G32 weight footprint: 16-B row header + (K/32)*17-B blocks per row.

@@ -494,6 +494,14 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 // the same weight matrix.
 pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
 
+// Batched HFQ3-G256 GEMM with fused residual add. HFQ3 sibling of
+// GEMM_HFQ4G256_RESIDUAL_SRC — same dispatch shape and batching tile,
+// 104 B group stride and 3-bit unpack instead of 136 B / 4-bit. Used
+// for batched prefill of MQ3-quantized down + wo projections when
+// `is_batchable_la(MQ3G256, arch)` returns true (non-WMMA archs only;
+// gfx11+ uses the WMMA family).
+pub const GEMM_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual.hip");
+
 // CDNA3 wave64-native batched HFQ4-G256 residual GEMM. 2 rows per block
 // (one per warp), halves grid.x. Byte-exact with the wave32 kernel.
 pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64.hip");
@@ -647,6 +655,12 @@ pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/sr
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
 pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_dot2.hip");
 
+// Batched 4-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_QKVZA_HFQ4G256_SRC;
+// same dispatch shape, 104 B group stride, 3-bit unpack. Wired in alongside
+// GEMM_QKV_HFQ3G256_SRC / GEMM_GATE_UP_HFQ3G256_SRC for the gfx10 MQ3
+// prefill path on dense Qwen3.5 LA layers.
+pub const GEMM_QKVZA_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256.hip");
+
 // Batched 3-way fused HFQ4-G256 GEMM (FA preamble: wq + wk + wv).
 // Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FA layer projection.
@@ -662,6 +676,12 @@ pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
 pub const GEMM_QKV_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_dot2.hip");
 
+// Batched 3-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_QKV_HFQ4G256_SRC
+// with 104 B group stride and 3-bit unpack via uint24 byte-combine.
+// Wired into the gfx10 MQ3 prefill path when `is_batchable_la(MQ3G256, arch)`
+// admits the format (non-WMMA archs only).
+pub const GEMM_QKV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256.hip");
+
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
@@ -675,6 +695,11 @@ pub const GEMM_GATE_UP_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
 // Does NOT work on gfx1010 (5700 XT) or gfx1013 (BC-250 APU) — lack dot instructions.
 pub const GEMM_GATE_UP_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_dot2.hip");
+
+// Batched 2-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_GATE_UP_HFQ4G256_SRC;
+// same dispatch shape, 104 B group stride, 3-bit unpack. Wired in alongside
+// GEMM_QKV_HFQ3G256_SRC for the gfx10 MQ3 prefill path.
+pub const GEMM_GATE_UP_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256.hip");
 
 // ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");

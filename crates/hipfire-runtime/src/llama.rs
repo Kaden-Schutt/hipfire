@@ -1397,7 +1397,16 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
             | "gfx1200" | "gfx1201"
         );
-    wmma_only
+    // gfx10 RDNA1/2 scalar HFQ3 batched-prefill (Phase 1 of
+    // docs/plans/gfx10_mq3_prefill.md). Mirrors the
+    // `mq3_uniform_with_gfx10_scalar` arm in qwen35.rs::is_batchable_la —
+    // both must stay in sync per the matching-pair comment there.
+    let mq3_gfx10_scalar = matches!(dt, DType::MQ3G256)
+        && matches!(arch,
+            "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013"
+            | "gfx1030" | "gfx1031" | "gfx1032"
+        );
+    wmma_only || mq3_gfx10_scalar
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
