@@ -632,6 +632,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-runtime",
  "rdna-compute",
+ "serde_json",
 ]
 
 [[package]]
