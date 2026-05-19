@@ -700,6 +700,10 @@ pub const GEMM_QKV_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/
 // Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
 // Port of gemm_qkv_hfq4g256_wave64_dp4a from gfx906 to wave32 + HFQ3 unpack.
 pub const GEMM_QKV_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dp4a.gfx1030.hip");
+// Wave32 MMQ variant — gfx1030+ Phase 3 minimal probe. Port of the gfx906
+// MMQ residual body (LDS-tiled X reuse, mmq_x=32, MMQ_Y=128). Env-gated.
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel

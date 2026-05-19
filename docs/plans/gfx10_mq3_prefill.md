@@ -353,6 +353,79 @@ exercises both new kernels at 5e-1 tolerance (Q8_1 X adds ~3× the
 dot2 error band). Coherence eyeball produces fluent text across the
 4-prompt matrix.
 
+### Phase 3 — MMQ tiling, minimal probe ⚠️ **POSITIVE RESULT 2026-05-19**
+
+Minimal-scope probe (residual-only, single tile size mmq_x=32) ported
+the gfx906 MMQ Option-C streaming design to wave32 for both HFQ3 and
+HFQ4 on RDNA2:
+
+- `kernels/src/gemm_hfq3g256_residual_mmq.gfx1030.hip`
+- `kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip`
+
+Topology: block (32, 4) = 128 threads = 4 wave32 warps. MMQ_Y=128
+rows × mmq_x=32 cols per workgroup. LDS-tiled X reuse (128 rows ×
+32 batches per WG = 4096× reuse vs dp4a's 16× per-row reuse).
+sdot4 inner loop (b128 LDS read path). 26 KB LDS/WG → 2 WGs/CU
+fit in the 64 KB cap. Kernels: HFQ3 = 110 VGPR, HFQ4 = 107 VGPR,
+0 spills.
+
+**Perf result on gfx1031:**
+
+| Workload | dot2/fp16 baseline | MMQ | Δ |
+|---|---|---|---|
+| MQ3 paris (pf=21) | 220 | 206 | −6% |
+| MQ3 sheep (pf=36) | 249 | 264 | +6% |
+| MQ3 code (pf=21)  | 223 | 268 | +20% |
+| MQ3 awq (pf=24)   | 230 | 234 | +2% |
+| **MQ3 LRU (pf=240)** | **290** | **350** | **+21%** |
+| MQ4 paris (pf=21) | 238 | 202 | −15% |
+| MQ4 sheep (pf=36) | 242 | 261 | +8% |
+| MQ4 code (pf=21)  | 216 | 217 | 0% |
+| MQ4 awq (pf=24)   | 224 | 230 | +3% |
+| **MQ4 LRU (pf=240)** | **288** | **351** | **+22%** |
+
+**MMQ wins on both quants at moderate-to-long prefill (+21-22%).**
+Short-prompt regression on `paris` (pf=21) is the mmq_x=32 tile
+granularity — at 21 batch elements the tile has 11 OOB columns of
+wasted compute.
+
+**Why MMQ wins where dp4a lost:** LDS-tiled X reuse. The dp4a
+kernel had per-row X reads from global memory (16× batch-dim reuse
+within a 1-row workgroup). MMQ loads X into LDS once and reuses
+across 128 output rows × 32 batches per workgroup — 256× more
+reuse. This more than offsets the sdot4-vs-dot2 disadvantage that
+killed dp4a.
+
+**Surprising twist:** HFQ3 MMQ wins +6% at sheep (vs HFQ3 dot2),
+HFQ4 MMQ wins +8% (vs HFQ4 fp16). The unpack-cost hypothesis
+predicted the OPPOSITE — HFQ4 nibble unpack is cheaper than HFQ3
+trit unpack. But the dominant factor isn't unpack cost; it's the
+LDS-tile compute density. Both quants benefit similarly because
+they both get the same X-reuse pattern.
+
+**Disposition for the probe:** code is gated behind
+`HIPFIRE_HFQ3_MMQ=1` and `HIPFIRE_HFQ4_MMQ_RDNA2=1` (default off).
+Shipping this as the default route requires:
+1. **Batch-size-aware routing** — use MMQ when batch ≥ ~32, stay
+   on dot2/fp16 for short prefill where mmq_x granularity hurts.
+2. **Additional tile sizes** — write mmq_x=8 and mmq_x=16 variants
+   to recover the short-prompt regression. Mirrors the gfx906
+   family's 8-tile sweep.
+3. **Full family** — currently only residual. Adding qkv + gate_up
+   MMQ variants (mirroring dp4a's scope) would compound the win
+   across the whole layer.
+
+Engineering cost for full ship: ~3-5 days kernel work + dispatcher
+tile-size-selection logic + bench sweep. Order of magnitude smaller
+than the original plan's 1-2 week estimate because the minimal
+probe de-risks the core hypothesis.
+
+**Validation:** `verify_hfq3_batched` with `HIPFIRE_HFQ3_MMQ=1`
+passes at 5e-1 tolerance (max_err 0.26-0.31). Coherence eyeball
+produces fluent text across all 4 prompts for both MQ3 and MQ4 with
+either MMQ flag enabled. No MMQ screening — `mmq_screen` is
+default-off on RDNA2 (no WMMA fallback target on gfx1030+).
+
 ### Phase 3 — MMQ tiling for batched-lm_head adjacency
 
 Reuse the gfx906 MMQ tile-size sweep pattern for the gfx10 HFQ3

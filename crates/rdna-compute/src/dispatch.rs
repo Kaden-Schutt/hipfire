@@ -170,6 +170,53 @@ fn hfq3_dp4a_enabled(arch: &str) -> bool {
         | "gfx1200" | "gfx1201")
 }
 
+/// Whether to route HFQ3 residual through the experimental wave32 MMQ
+/// kernel (`gemm_hfq3g256_residual_mmq`). Phase 3 minimal probe. Same
+/// arch set as `hfq3_dp4a_enabled`. Gated by `HIPFIRE_HFQ3_MMQ=1`.
+fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_MMQ").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    if !override_.unwrap_or(false) {
+        return false;
+    }
+    matches!(arch,
+        "gfx1011" | "gfx1012"
+        | "gfx1030" | "gfx1031" | "gfx1032"
+        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+        | "gfx1150" | "gfx1151" | "gfx1152"
+        | "gfx1200" | "gfx1201")
+}
+
+/// Whether to route HFQ4 residual through the experimental wave32 MMQ
+/// kernel on RDNA2+. Phase 3 side-win probe — tests whether HFQ4's
+/// cheaper nibble unpack lets MMQ beat the current fp16 fallback on
+/// gfx1030/1031. Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
+fn hfq4_mmq_rdna2_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ4_MMQ_RDNA2").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    if !override_.unwrap_or(false) {
+        return false;
+    }
+    matches!(arch,
+        "gfx1011" | "gfx1012"
+        | "gfx1030" | "gfx1031" | "gfx1032"
+        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
+        | "gfx1150" | "gfx1151" | "gfx1152"
+        | "gfx1200" | "gfx1201")
+}
+
 /// Whether this arch has WMMA kernels that compile + run on the user's
 /// ROCm toolchain right now.
 ///
@@ -7164,6 +7211,139 @@ impl Gpu {
         result
     }
 
+    /// Wave32 MMQ residual kernel for HFQ3 on RDNA2+ — Phase 3 minimal probe.
+    /// 128 rows × 32 cols per workgroup, LDS-tiled X reuse, sdot4 inner loop.
+    /// Gated by `HIPFIRE_HFQ3_MMQ=1`.
+    pub fn gemm_hfq3g256_residual_mmq(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq3g256_residual_mmq",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_SRC,
+            "gemm_hfq3g256_residual_mmq",
+        )?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions["gemm_hfq3g256_residual_mmq"];
+
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        // LDS layout — must match the kernel's macro constants.
+        // x_qs: 128 × 40 ints + x_dm: 128 × float2 + tile_y: 32 × 36 ints.
+        const MMQ_Y: usize = 128;
+        const MMQ_X: usize = 32;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + MMQ_X * Y_STRIDE * 4) as u32;
+
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+
+        let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size)
+                  + batch_size * k
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_mmq", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Wave32 MMQ residual kernel for HFQ4 on RDNA2+ — Phase 3 side-win probe.
+    /// Same topology as the HFQ3 sibling; differs only in 4-bit nibble unpack
+    /// (vs 3-bit trit). Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
+    pub fn gemm_hfq4g256_residual_mmq_rdna2(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // Distinct module + function name from the pre-existing
+        // `gemm_hfq4g256_residual_mmq` (llama.cpp-style, RDNA3+ via
+        // HIPFIRE_WO_MMQ=1) to avoid kernel-cache collision.
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mmq_rdna2",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC,
+            "gemm_hfq4g256_residual_mmq_rdna2",
+        )?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions["gemm_hfq4g256_residual_mmq_rdna2"];
+
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const MMQ_X: usize = 32;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + MMQ_X * Y_STRIDE * 4) as u32;
+
+        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                  + batch_size * k
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_residual_mmq_rdna2", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// FP16-packed batched 2-way fused HFQ4-G256 GEMM (gate + up).
     /// RDNA1/2 fast path — v_pk_fma_f16 inner loop, 2× scalar FP32 throughput.
     /// Requires FP16-converted X (provided via ensure_fp16_x).
@@ -10298,6 +10478,14 @@ impl Gpu {
             }
         }
 
+        // Phase 3 experimental: HFQ4 wave32 MMQ on RDNA2+ if
+        // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
+        // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
+        // gate is OnceLock-cached. Default off.
+        if batch_size > 1 && hfq4_mmq_rdna2_enabled(&self.arch) {
+            return self.gemm_hfq4g256_residual_mmq_rdna2(a_raw, x, y, m, k, batch_size);
+        }
+
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !fp16_disabled() {
             // gfx906 dp4a MMQ residual path — default-on at batch ≥ 8 per
@@ -10450,6 +10638,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Phase 3 experimental: wave32 MMQ if HIPFIRE_HFQ3_MMQ=1. Env gate is
+        // OnceLock-cached so the env read is one-shot per process; the arch
+        // match is a handful of cycles per dispatch call (not in any inner
+        // loop). Default off.
+        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) {
+            return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
+        }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
         if batch_size > 1 && !fp16_disabled() {
             if has_dot2_f32_f16(&self.arch) {

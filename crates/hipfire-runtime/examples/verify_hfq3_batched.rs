@@ -142,15 +142,15 @@ fn main() {
 
         // Tolerance: bit-exact at N=1 (scalar both sides); FP16-mantissa
         // tolerance at N>1 (auto-routing hits dot2 or fp16, dequant in FP16).
-        // dp4a mode (HIPFIRE_HFQ3_DP4A=1) quantizes X to Q8_1 on top of the
-        // FP16 weight dequant, so it needs a wider tolerance (~3× the dot2
-        // error band).
-        let dp4a_mode = std::env::var("HIPFIRE_HFQ3_DP4A")
+        // dp4a / MMQ modes quantize X to Q8_1 on top of the FP16 weight
+        // dequant, so they need a wider tolerance (~3× the dot2 error band).
+        let env_truthy = |k: &str| std::env::var(k)
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
             .unwrap_or(false);
+        let int8_x_mode = env_truthy("HIPFIRE_HFQ3_DP4A") || env_truthy("HIPFIRE_HFQ3_MMQ");
         let tol: f32 = if n == 1 {
             1e-3
-        } else if dp4a_mode {
+        } else if int8_x_mode {
             5e-1
         } else {
             2e-1
