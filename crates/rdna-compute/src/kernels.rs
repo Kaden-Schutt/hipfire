@@ -545,6 +545,14 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip");
 
+/// Non-residual WMMA Q8_0 GEMM (gfx12). Direct write to Y[N, M] without
+/// reading prior values (= rather than +=). Drop-in replacement for the
+/// scalar `gemm_q8_0_batched` kernel; rocprof 2026-05-19 showed that
+/// scalar version was 65% of A3B prefill GPU time (invisible to
+/// HIPFIRE_PROFILE, no begin_timer wired).
+pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx12.hip");
+
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
 /// × mi] via the inverse permutation in sorted_slot_index.
