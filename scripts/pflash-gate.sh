@@ -24,7 +24,7 @@
 # Hooks into scripts/coherence-gate.sh as a follow-up stage.
 
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 2
 
 BASELINE="scripts/pflash-baselines/gfx1100-2026-05-02.json"
 TOLERANCE_PCT=10
@@ -145,11 +145,11 @@ run_fixture() {
         *multi*)     maxgen="$MAXGEN_MULTI" ;;
         *longcode*|*longprose*) maxgen="$MAXGEN_LONG" ;;
     esac
-    local extra="--pretok"
+    local -a extra=(--pretok)
     if [ "$mode" = "pflash" ]; then
-        extra="$extra --pflash $DRAFTER --keep-ratio 0.30 --block-size 64"
+        extra+=(--pflash "$DRAFTER" --keep-ratio 0.30 --block-size 64)
     fi
-    "$EXE" "$TARGET" "$fixture" --maxgen "$maxgen" --asym3 $extra 2>&1
+    "$EXE" "$TARGET" "$fixture" --maxgen "$maxgen" --asym3 "${extra[@]}" 2>&1
 }
 
 extract_total() {
