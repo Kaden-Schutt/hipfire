@@ -98,6 +98,30 @@ fn gemv_prefetch_enabled(arch: &str) -> bool {
     override_.unwrap_or(arch == "gfx906")
 }
 
+/// gfx94x (MI300X CDNA3) LDS-cached, 8-rows-per-WG HFQ4 GEMV variant.
+///
+/// The prior `*_wave64` kernels were tuned for CDNA1/2 (80 CUs, modest
+/// HBM). gfx942 has 304 CUs + 5.3 TB/s HBM; the 2-rows-per-WG geometry
+/// leaves the GPU starved (2560 WGs / 304 CUs = 8 launch rounds, each
+/// reading x[K] from L1 with no explicit sharing).
+///
+/// gfx942 variant: 256 threads/WG × 8 rows/WG × cooperative LDS load
+/// of x → 4× fewer WGs, 4× less x-HBM traffic. Same inner-loop math.
+///
+/// Default ON for gfx94x. Override with HIPFIRE_GFX942_LDS_GEMV={0,1}.
+fn gfx942_lds_gemv_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX942_LDS_GEMV").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    override_.unwrap_or(false)  // gfx942 LDS GEMV: +1.9% on K=5120 attn_out alone
+    // but neutral overall on 27B-3.6 AR; opt-in for research
+}
+
 /// Per-arch default R for the multi-row HFQ4 GEMV kernel family.
 ///
 /// - RDNA3 (gfx1100/1101/1102): R=1. Measured negative on 7900 XTX —
@@ -8515,29 +8539,48 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
         let result = if cdna3 {
-            let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
-                (
-                    "gemv_hfq4g256_residual_wave64_prefetch",
-                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+            // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
+            // when enabled; gfx906/908 (or env override) keep wave64 base.
+            if gfx942_lds_gemv_enabled(&self.arch) && !gemv_prefetch_enabled(&self.arch) && (k as u32) * 4 <= 32768 {
+                let kname = "gemv_hfq4g256_residual_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 7) / 8;
+                let lds_bytes = (k as u32) * 4;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
                 )
             } else {
-                (
-                    "gemv_hfq4g256_residual_wave64",
-                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+                    (
+                        "gemv_hfq4g256_residual_wave64_prefetch",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                    )
+                } else {
+                    (
+                        "gemv_hfq4g256_residual_wave64",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                    )
+                };
+                self.ensure_kernel(kname, ksrc, kname)?;
+                let grid = ((m as u32) + 1) / 2;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
                 )
-            };
-            self.ensure_kernel(kname, ksrc, kname)?;
-            let grid = ((m as u32) + 1) / 2;
-            self.launch_maybe_blob(
-                kname,
-                [grid, 1, 1], [64, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                    b.push_i32(m_val); b.push_i32(k_val);
-                    b
-                },
-            )
+            }
         } else if use_multirow {
             let (func_name, grid_div) = match rows {
                 2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),

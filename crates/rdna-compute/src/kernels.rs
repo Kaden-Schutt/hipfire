@@ -393,6 +393,7 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx942.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
