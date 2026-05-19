@@ -4172,26 +4172,47 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// projection per layer. The 4 grouped/fused dispatch sites in
 /// `prefill_moe_ffn_body_batched` branch on the actual dtype, so a
 /// layer admitted here is dispatchable end-to-end.
+///
+/// MQ6 admit is gated behind `HIPFIRE_MOE_MQ6_ADMIT=1` because of a
+/// known correctness regression on AWQ A3B (token attractor `!!!!!`)
+/// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
+/// pass synthetic channel tests at FP16 ULP precision but produce
+/// garbage activations in production. Bisection of the offending
+/// dispatch site is pending. Default-off preserves the pre-fan-out
+/// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
 fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
     let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
     let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
 
-    // shared.gate and .up must match (fused gate+up kernel handles a single dtype).
-    let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
-    let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
-        && ffn.shared_expert.up.gpu_dtype == shared_gu_dt;
-    // shared.down may be independently MQ4 or MQ6 (separate dispatch site).
-    let shared_dn_ok = matches!(ffn.shared_expert.down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+    // MQ6 admit env gate (default off — see comment above)
+    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let admit_mq6 = *MQ6_ADMIT.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() == Ok("1")
+    });
 
-    // experts: gate_up uniform across all experts, down uniform across all experts.
-    let experts_gu = ffn.experts[0].gate_up.gpu_dtype;
-    let experts_dn = ffn.experts[0].down.gpu_dtype;
-    let experts_ok = matches!(experts_gu, DType::MQ4G256 | DType::MQ6G256)
-        && matches!(experts_dn, DType::MQ4G256 | DType::MQ6G256)
-        && ffn.experts.iter().all(|e|
-            e.gate_up.gpu_dtype == experts_gu && e.down.gpu_dtype == experts_dn);
-
-    router_ok && shared_gate_ok && shared_gu_ok && shared_dn_ok && experts_ok
+    if admit_mq6 {
+        // Per-projection MQ4 OR MQ6 admit.
+        let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
+        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
+            && ffn.shared_expert.up.gpu_dtype == shared_gu_dt;
+        let shared_dn_ok = matches!(ffn.shared_expert.down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+        let experts_gu = ffn.experts[0].gate_up.gpu_dtype;
+        let experts_dn = ffn.experts[0].down.gpu_dtype;
+        let experts_ok = matches!(experts_gu, DType::MQ4G256 | DType::MQ6G256)
+            && matches!(experts_dn, DType::MQ4G256 | DType::MQ6G256)
+            && ffn.experts.iter().all(|e|
+                e.gate_up.gpu_dtype == experts_gu && e.down.gpu_dtype == experts_dn);
+        router_ok && shared_gate_ok && shared_gu_ok && shared_dn_ok && experts_ok
+    } else {
+        // Strict MQ4 (pre-fan-out behavior).
+        router_ok
+            && shared_gate_ok
+            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
+            && ffn.experts.iter().all(|e|
+                e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256)
+    }
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
