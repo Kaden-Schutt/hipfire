@@ -29,7 +29,8 @@ status per phase in §5.
 | `45913eb0` | Rev-2 review fold-in: §2/§5/§6 amendments, tied-F16 lm_head fix (B1), EOS array semantics, lib.rs / doc refreshes, plan rename |
 | `9477fbbb` | R1: `hipfire-quantize --arch-id <u32>` flag + re-quantised `qwen2-1.5b.arch7.hfq4` (arch_id byte = `0x07` verified, inspect_hfq --load succeeds) |
 | `51e05b99` | R2: LLaMA-family loader (`load_weights_hfq`) now hard-fails when `q_proj.bias` is in the manifest — closes the silent-wrong-output footgun for mis-tagged Qwen2 HFQ files |
-| _pending_ | Phase 0 item 6 + 7: HF reference for Qwen2-1.5B-Instruct captured at `benchmarks/references/qwen2_1p5b_instruct_smoke.json` (transformers 5.5.1; 25 KB artifact carries first-16 completion IDs + top-100 logits at pos 0/8/14 for future forward-pass top-1 match validation) |
+| `d7a2ebab` | Phase 0 items 6 + 7: HF reference captured at `benchmarks/references/qwen2_1p5b_instruct_smoke.json` (transformers 5.5.1; 25 KB artifact with first-16 completion IDs + top-100 logits at pos 0/8/14) |
+| _pending_ | R3 mitigation: `crates/hipfire-arch-qwen2/examples/infer_qwen2.rs` driver binary — wires the bring-up triple end-to-end (config + weight load + tokenizer + reference compare). Tokenizer parity confirmed: hipfire's Rust BPE produces byte-identical token IDs to HF on the smoke prompt. Forward pass stubbed pending phase-1 port. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
