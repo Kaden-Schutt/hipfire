@@ -16,7 +16,7 @@
 
 #define BATCH_TILE 8
 
-__launch_bounds__(32, 8)
+__launch_bounds__(32, 6)
 extern "C" __global__ void gemm_qkvza_hfq3g256(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,

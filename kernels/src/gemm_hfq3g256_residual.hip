@@ -15,7 +15,7 @@
 
 #define BATCH_TILE 8
 
-__launch_bounds__(32, 8)
+__launch_bounds__(32, 6)
 extern "C" __global__ void gemm_hfq3g256_residual(
     const char* __restrict__ A,
     const float* __restrict__ X,   // [batch_size, K], row-major
