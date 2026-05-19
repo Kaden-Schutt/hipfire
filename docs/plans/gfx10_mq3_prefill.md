@@ -299,6 +299,8 @@ prompts, within INT8 quant noise of the dot2 baseline).
 
 **Perf result on gfx1031, 9B MQ3:**
 
+Short-prefill (eyeball matrix, 21-36 prompt tokens):
+
 | Prompt | dot2 (Phase 2b, shipping) | dp4a (Phase 2) | Δ |
 |---|---|---|---|
 | paris  | 223 tok/s | 175 tok/s | **−22%** |
@@ -306,7 +308,18 @@ prompts, within INT8 quant noise of the dot2 baseline).
 | code   | 224 tok/s | 189 tok/s | **−16%** |
 | awq    | 231 tok/s | 197 tok/s | **−15%** |
 
-**Median ~15% regression vs dot2.** The plan's flagged risk (3-bit
+Long-prefill probe (testing whether Q8_1 X conversion amortizes):
+
+| Prefill tokens | dot2 | dp4a | Δ |
+|---|---|---|---|
+| ~30 (median of eyeball) | 234 tok/s | 194 tok/s | **−17%** |
+| 240 (LRU PEP-8) | 292 tok/s | 242 tok/s | **−17%** |
+| 1188 (LRU ×5) | 278 tok/s | 244 tok/s | **−12%** |
+
+**Median ~15% regression vs dot2, persists across short and long
+prefill.** The gap narrows slightly at very long N (one-shot
+conversion better amortized) but dp4a never catches dot2 — the
+disadvantage is per-batch-element, not a fixed overhead. The plan's flagged risk (3-bit
 unpack overhead eating the sdot4 ALU lift) materialized exactly on
 RDNA2. Hypotheses:
 1. **gfx906 win was relative to weak fp16:** gfx906's fp16 path is
