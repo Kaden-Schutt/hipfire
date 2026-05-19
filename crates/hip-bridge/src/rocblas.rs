@@ -167,8 +167,13 @@ impl Rocblas {
     }
 
     /// Bind this rocBLAS handle to a HIP stream so calls execute on it.
-    /// Passing null stream (default stream) is also valid.
-    pub fn set_stream(&self, stream_handle: *mut c_void) -> RocblasResult<()> {
+    ///
+    /// # Safety
+    ///
+    /// `stream_handle` must be either null for default-stream semantics or a
+    /// valid HIP stream handle that remains alive while rocBLAS work is queued
+    /// against it.
+    pub unsafe fn set_stream(&self, stream_handle: *mut c_void) -> RocblasResult<()> {
         let st = unsafe { (self.fn_set_stream)(self.handle, stream_handle) };
         if st == ROCBLAS_STATUS_SUCCESS { Ok(()) } else {
             Err(RocblasError { status: st, context: "rocblas_set_stream".into() })
@@ -184,6 +189,12 @@ impl Rocblas {
     /// Note: rocBLAS is column-major. Our engine stores matrices row-major,
     /// so callers flip the operation (A_row · B_row == (B_col^T · A_col^T)^T)
     /// and swap (m, n) / (a, b) / (lda, ldb) / transA, transB when dispatching.
+    ///
+    /// # Safety
+    ///
+    /// Matrix pointers and scalar pointers must be valid for the dimensions and
+    /// datatypes passed here. Device buffers must remain alive until the queued
+    /// rocBLAS operation has completed.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_ex(
         &self,

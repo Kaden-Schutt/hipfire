@@ -68,6 +68,9 @@ impl DeviceBuffer {
     }
 
     /// Create a non-owning DeviceBuffer from a raw pointer and size.
+    ///
+    /// # Safety
+    ///
     /// The caller must ensure the pointer is valid GPU memory.
     /// The resulting buffer must NOT be freed (it doesn't own the memory).
     pub unsafe fn from_raw(ptr: *mut std::ffi::c_void, size: usize) -> DeviceBuffer {

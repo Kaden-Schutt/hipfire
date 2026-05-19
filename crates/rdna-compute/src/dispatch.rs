@@ -922,8 +922,8 @@ impl Gpu {
                 // the default (null) stream, which still works — just bigger
                 // host-side sync cost.
                 if let Some(stream) = self.active_stream.as_ref() {
-                    let raw = stream as *const _ as *mut c_void;
-                    let _ = rb.set_stream(raw);
+                    let raw = stream.as_raw();
+                    let _ = unsafe { rb.set_stream(raw) };
                 }
                 eprintln!("[rocblas] loaded for {}", self.arch);
                 self.rocblas = Some(rb);

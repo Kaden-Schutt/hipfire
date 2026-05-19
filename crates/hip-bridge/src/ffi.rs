@@ -523,7 +523,6 @@ impl HipRuntime {
     /// Caller must ensure the buffer is not in use by any pending GPU operations.
     pub fn free(&self, buf: DeviceBuffer) -> HipResult<()> {
         let code = unsafe { (self.fn_free)(buf.ptr) };
-        std::mem::forget(buf); // prevent double-free
         self.check(code, "hipFree")
     }
 
@@ -767,7 +766,6 @@ impl HipRuntime {
 
     pub fn stream_destroy(&self, stream: Stream) -> HipResult<()> {
         let code = unsafe { (self.fn_stream_destroy)(stream.0) };
-        std::mem::forget(stream);
         self.check(code, "hipStreamDestroy")
     }
 
@@ -931,7 +929,6 @@ impl HipRuntime {
 
     pub fn event_destroy(&self, event: Event) -> HipResult<()> {
         let code = unsafe { (self.fn_event_destroy)(event.0) };
-        std::mem::forget(event);
         self.check(code, "hipEventDestroy")
     }
 
@@ -1050,13 +1047,11 @@ impl HipRuntime {
 
     pub fn graph_exec_destroy(&self, exec: GraphExec) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_exec_destroy)(exec.0) };
-        std::mem::forget(exec);
         self.check(code, "hipGraphExecDestroy")
     }
 
     pub fn graph_destroy(&self, graph: Graph) -> HipResult<()> {
         let code = unsafe { (self.fn_graph_destroy)(graph.0) };
-        std::mem::forget(graph);
         self.check(code, "hipGraphDestroy")
     }
 
@@ -1134,7 +1129,8 @@ impl HipRuntime {
 
 // ── Handle wrappers ─────────────────────────────────────────────
 
-/// GPU stream handle.
+/// GPU stream handle. This wrapper is manually destroyed through
+/// `HipRuntime::stream_destroy`; it is not RAII-owned.
 pub struct Stream(HipStream);
 unsafe impl Send for Stream {}
 
@@ -1143,6 +1139,12 @@ impl Stream {
     /// handle but where callers deliberately want default-stream semantics.
     pub fn null() -> Self {
         Self(ptr::null_mut())
+    }
+
+    /// Return the raw HIP stream handle for FFI calls that need to bind to an
+    /// existing stream without taking ownership of it.
+    pub fn as_raw(&self) -> *mut c_void {
+        self.0
     }
 }
 
@@ -1198,14 +1200,17 @@ unsafe impl Send for Module {}
 pub struct Function(HipFunction);
 unsafe impl Send for Function {}
 
-/// GPU event for timing.
+/// GPU event for timing. This wrapper is manually destroyed through
+/// `HipRuntime::event_destroy`; it is not RAII-owned.
 pub struct Event(HipEvent);
 unsafe impl Send for Event {}
 
-/// Captured GPU operation graph.
+/// Captured GPU operation graph. This wrapper is manually destroyed through
+/// `HipRuntime::graph_destroy`; it is not RAII-owned.
 pub struct Graph(HipGraph);
 unsafe impl Send for Graph {}
 
-/// Executable (instantiated) graph ready for replay.
+/// Executable (instantiated) graph ready for replay. This wrapper is manually
+/// destroyed through `HipRuntime::graph_exec_destroy`; it is not RAII-owned.
 pub struct GraphExec(HipGraphExec);
 unsafe impl Send for GraphExec {}
