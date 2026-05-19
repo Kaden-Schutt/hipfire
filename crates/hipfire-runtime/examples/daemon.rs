@@ -658,8 +658,8 @@ fn main() {
                 let raw_draft = msg.get("params").and_then(|p| p.get("draft")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty());
                 let draft_path = if dflash_mode == "off" {
-                    if raw_draft.is_some() {
-                        eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({})", raw_draft.unwrap());
+                    if let Some(draft) = raw_draft {
+                        eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({draft})");
                     }
                     None
                 } else {
@@ -1052,8 +1052,8 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
-                if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                if let (Some(image), Some(_)) = (image, m.vision_config.as_ref()) {
+                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image, temp, top_p, max_tokens, repeat_penalty, repeat_window);
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
                     // and apply any per-request overrides from `params`.

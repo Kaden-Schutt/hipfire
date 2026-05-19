@@ -4924,14 +4924,8 @@ fn main() {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_hfq3g128 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 128 == 0 {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
+                let q = quantize_hfq3g128(&f32_data);
+                (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
             } else if use_hfq3g256 {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {

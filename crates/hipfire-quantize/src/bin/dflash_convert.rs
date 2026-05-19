@@ -659,9 +659,7 @@ fn main() {
         // zeros. That's safe for weights since the padded lanes are never read
         // at inference. We still require N ≥ 256 to ensure a full first group
         // (per-group scale/min carries meaning).
-        let (quant_type, group_size, bytes) = if is_norm_tensor(name) {
-            (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
-        } else if keep_f32 {
+        let (quant_type, group_size, bytes) = if is_norm_tensor(name) || keep_f32 {
             (QuantType::F32, 0u32, f32_slice_to_f32_bytes(&f32_data))
         } else if use_mq4 && n_elements >= 256 {
             let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
