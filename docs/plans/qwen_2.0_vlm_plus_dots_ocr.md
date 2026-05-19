@@ -1,10 +1,12 @@
 # dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
 
-Status: rev 3 (in progress on `feat/dots-ocr-qwen2`), 2026-05-19
-Filename note: filed under `qwen_2.5_vlm.md` per the original request,
-but the actual backbone is **Qwen2**, not Qwen2.5 — both crates land
-under the Qwen2 family. Generalising to true Qwen2.5-VL is a stretch
-goal once dots.ocr lands.
+Status: rev 4 (in progress on `feat/dots-ocr-qwen2`), 2026-05-19
+Filename note: originally filed as `qwen_2.5_vlm.md` matching the
+initial request; renamed to `qwen_2.0_vlm_plus_dots_ocr.md` once
+verification against the safetensors index confirmed the backbone is
+plain Qwen2 (not Qwen2.5). Both crates — `hipfire-arch-qwen2` and
+`hipfire-arch-dots-ocr` — land under the Qwen2 family. Generalising
+to true Qwen2.5-VL is a stretch goal once dots.ocr lands.
 
 This revision folds in adversarial review findings from three
 reviewers (Claude / Gemini / GLM5) on the original draft. The
@@ -25,16 +27,24 @@ status per phase in §5.
 | `4bf9f6d4` | HFQ4 quantisation of Qwen2-1.5B validated (820 MB, 100% coverage); `inspect_hfq` example |
 | `e034c44b` | Real `Qwen2Weights::load` — 28 layers + tied-lm_head + Q/K/V bias; cross-arch TODO markers on both sides |
 
-Verified end-to-end on gfx1151:
+Verified at *load* time on gfx1151 via `inspect_hfq --load`
+(no forward pass, no token output yet):
 - Quantiser handles Qwen2 layer naming (closes risk M9 in §6).
 - Config parser yields exact match with Qwen2-1.5B-Instruct on all 13
   fields, including the two non-trivial defaults (`attention_bias=true`
   via Qwen2 modeling default; `tie_word_embeddings=true` extracted).
-- All 28 layers load to GPU with correct dimensions (wq 1536×1536,
-  wk 256×1536, lm_head 151936×1536).
+- All 28 layers + tied lm_head + Q/K/V bias upload to GPU without
+  error; dimensions match config (wq 1536×1536, wk 256×1536, lm_head
+  151936×1536).
 - Tied-embedding detection works; lm_head re-uploads embed_tokens
   (~117 MB extra) since `GpuTensor` is not `Clone` — documented as a
   follow-up consolidation candidate (see §6).
+
+**Not yet verified**: forward pass correctness against HF, logit /
+token-id match, coherence gate. These are blocked on phase 0 items
+5/6/7 (HF reference) plus the forward-pass port plus a standalone
+forward driver (since the crate isn't wired into the daemon — see R3
+in §6).
 
 Discovered during implementation (not in original plan):
 - `HipResult` lives in `hip_bridge::error`, not `rdna_compute`.
@@ -50,6 +60,20 @@ Discovered during implementation (not in original plan):
   Qwen2/3 default). Our `hipfire-arch-qwen2` claims `arch_id=7` to
   avoid colliding with the LLaMA crate, so the HFQ needs a per-file
   arch_id remap (or a quantiser CLI flag) before daemon dispatch.
+- `hipfire_runtime::llama::EmbeddingFormat` has no `F16` variant — the
+  llama / qwen35 loaders always expand F16 source → F32 on host before
+  upload for tied embeddings. The qwen2 loader must follow the same
+  pattern; a naive `upload_raw(&data, ...)` on F16 bytes paired with
+  `gpu_dtype: F32` produces a corrupted lm_head (caught and fixed in
+  the rev-2 patch; was latent because all current HFQ files use
+  HFQ4G256 for embeddings).
+- The dots.ocr `eos_token_id` lives in `generation_config.json`, not
+  `config.json`. `hipfire-quantize` does **not** pack
+  `generation_config.json` into HFQ metadata, so the config parser's
+  EOS lookup silently mis-defaults for dots.ocr (Qwen2-1.5B-Instruct
+  is unaffected because its `config.json` does carry `eos_token_id`).
+  Phase 3 must either teach the quantiser to merge `generation_config`
+  or special-case the EOS via `eos_filter_overrides`.
 
 ## 1. Goal and scope
 
@@ -139,30 +163,62 @@ vision); the earlier "~760M" agent estimate was wrong.
 | spatial_merge_size | 2 |
 | temporal_patch_size | 1 |
 | num_channels | 3 |
-| use_bias | false (attention QKV/proj only — patch_embed has bias) |
+| use_bias | false — applies to **both** attention (qkv + proj) AND SwiGLU FFN (fc1, fc2, fc3). Only `patch_embed.proj` and the merger linears carry bias. |
 | post_norm | true |
 | rms_norm_eps | 1e-5 |
 | hidden_size (post-merger out) | 1536 (matches LM) |
+
+The `use_bias` flag controls every `nn.Linear` in `DotsVisionBlock`,
+not just attention. Verified at
+`modeling_dots_vision.py:329-333` (`DotsSwiGLUFFN.__init__`):
+
+```python
+bias = config.use_bias
+self.fc1 = nn.Linear(in_features, hidden_features, bias=bias)
+self.fc2 = nn.Linear(hidden_features, in_features, bias=bias)
+self.fc3 = nn.Linear(in_features, hidden_features, bias=bias)
+```
+
+and confirmed against the manifest (no `vision_tower.blocks.*.mlp.fc*.bias`
+or `*.attn.{qkv,proj}.bias` entries — only the merger and patch_embed
+have biases on disk).
 
 Block layout: pre-norm RMSNorm → attention (qkv merged, **non-causal**)
 → residual → pre-norm RMSNorm → SwiGLU MLP → residual. Final RMSNorm
 if `post_norm=true`.
 
-### 2.3. Patch embedding — has bias
+### 2.3. Patch embedding — has bias; weight is 4-D
 
-The vision config sets `use_bias: false` but **this applies to
-attention QKV/proj only**. The patch embedding Conv2d (which can be
-realised as a GEMM since stride = kernel = patch_size) has its own
-bias:
+The vision config sets `use_bias: false` but this **does not** apply
+to the patch embed: `patch_embed.patchifier.proj` is an
+`nn.Conv2d(num_channels, embed_dim, kernel=patch_size,
+stride=patch_size)` constructed independently of `use_bias`, and the
+manifest confirms a bias tensor on disk:
 
 ```
-vision_tower.patch_embed.patchifier.proj.weight   [1536, 3, 1, 14, 14]
+vision_tower.patch_embed.patchifier.proj.weight   [1536, 3, 14, 14]   ← 4-D
 vision_tower.patch_embed.patchifier.proj.bias     [1536]
 vision_tower.patch_embed.patchifier.norm.weight   [1536]   (RMSNorm)
 ```
 
-The 5-D weight (with the `temporal_patch_size=1` axis) needs an
-explicit `.squeeze(2)` (or equivalent reshape) before the GEMM.
+The weight is the standard 4-D `[out_channels, in_channels, kH, kW]`
+Conv2d weight; reshape directly to `[1536, 588]` for the GEMM, no
+`.squeeze(2)` needed.
+
+The `temporal_patch_size=1` axis lives on the **input** tensor, not on
+the weight. `modeling_dots_vision.py:357-358` applies it to the input
+right before the Conv2d call:
+
+```python
+x = x.view(-1, self.num_channels, self.temporal_patch_size,
+           self.patch_size, self.patch_size)[:, :, 0]
+x = self.proj(x).view(-1, self.embed_dim)
+```
+
+For `temporal_patch_size=1` (dots.ocr's setting), the `[:, :, 0]` slice
+is a no-op the porter can skip — patch tensors already arrive in
+`[N, C, H, W]` layout when the upstream image processor uses
+`temporal_patch_size=1`.
 
 ### 2.4. PatchMerger — LayerNorm (NOT RMSNorm), MLP has bias
 
@@ -191,24 +247,46 @@ Use `gpu.layernorm_batched` (already exists in
 
 ### 2.5. Chat template — custom framing, NOT ChatML; primary EOS = 151673
 
-The chat template from `tokenizer_config.json`:
+The chat template from `tokenizer_config.json` (Python `repr()` of the
+JSON string):
 
 ```jinja2
-{% for m in messages %}
-  {% if m.role == 'system' %}
-    {{ '<|system|>' + m.content + '<|endofsystem|>\n' }}
-  {% elif m.role == 'user' %}
-    {{ '<|user|>' + m.content + '<|endofuser|>' }}
-  {% elif m.role == 'assistant' %}
-    {{ '<|assistant|>' + m.content }}
-    {% if not loop.last %}{{ '<|endofassistant|>' }}{% endif %}
-  {% endif %}
-{% endfor %}
-{% if messages[-1].role != 'assistant' %}{{ '<|assistant|>' }}{% endif %}
+{%- for m in messages %}
+  {%- if m.role == 'system' %}
+    {{- '<|system|>' + m.content + '<|endofsystem|>\n' }}
+  {%- elif m.role == 'user' %}
+    {{- '<|user|>' + m.content + '<|endofuser|>' }}
+  {%- elif m.role == 'assistant' %}
+    {{- '<|assistant|>' + m.content }}
+    {%- if not loop.last %}{{- '<|endofassistant|>' }}{%- endif %}
+  {%- endif %}
+{%- endfor %}
+{%- if messages[-1].role != 'assistant' %}{{- '<|assistant|>' }}{%- endif %}
 ```
 
-`generation_config.json` declares `eos_token_id: [151643, 151673]`.
-Token 151673 `<|endofassistant|>` is the **primary** turn-end marker.
+**Framing token taxonomy — special vs BPE-fragmented.** The six framing
+literals split into two groups against `added_tokens_decoder`:
+
+| literal in template | special-token ID | how the runtime emits it |
+|---|---|---|
+| `<\|user\|>`          | 151670 | single special-token ID |
+| `<\|endofuser\|>`     | 151671 | single special-token ID |
+| `<\|assistant\|>`     | 151672 | single special-token ID (note: includes the closing `>`; verified verbatim against the JSON) |
+| `<\|endofassistant\|>`| 151673 | single special-token ID |
+| `<\|system\|>`        | **NOT in vocab** | emit raw bytes, let BPE fragment |
+| `<\|endofsystem\|>`   | **NOT in vocab** | emit raw bytes, let BPE fragment |
+
+The `<|systemprompt|>` (151668) and `<|endofsystemprompt|>` (151669)
+tokens *do* exist in `added_tokens_decoder`, but the chat template
+does **not** use them. They are vestigial; do not emit either.
+
+**EOS.** `generation_config.json` declares `eos_token_id: [151643,
+151673]`. The array form means *either* token terminates a turn,
+but the chat template's `<|endofassistant|>` (151673) is the
+load-bearing one for assistant turn-end. 151643 `<|endoftext|>` is
+the wire-EOS used outside of chat (e.g., raw completion). Both must
+be in the runtime's stop-set; neither alone is sufficient.
+
 Token 151645 `<|im_end|>` exists in the vocab but the dots.ocr chat
 template does not use it — the default hipfire EOS filter (which
 looks for `<|im_end|>`) will never fire on a correct dots.ocr
@@ -216,6 +294,14 @@ response.
 
 Both `prompt_frame_overrides` and `eos_filter_overrides` **must be
 customised** for dots.ocr — they cannot stay at the qwen35 default.
+
+**BPE-fragmentation verification.** Phase 3 must include an empirical
+test that hipfire's Rust BPE produces the same token ID sequence for
+the literal byte strings `<|system|>` and `<|endofsystem|>` as the HF
+tokenizer does. If they diverge, the prefill substring won't match
+the training distribution and the model output will degrade in a way
+that's hard to localise. Cheap to test (round-trip a known prompt
+through both tokenizers); only needs to run once per tokenizer change.
 
 ### 2.6. RoPE
 
@@ -246,7 +332,45 @@ customised** for dots.ocr — they cannot stay at the qwen35 default.
 
 ### 2.7. Image preprocessing
 
-Smart-resize (`dots_ocr/utils/image_utils.py:29-63`):
+**Patch extraction order (critical — silent-failure trap).** The HF
+`Qwen2VLImageProcessor` (which dots.ocr uses per
+`preprocessor_config.json:image_processor_type:"Qwen2VLImageProcessor"`)
+performs a non-obvious reshape+transpose on the raw pixel array
+*before* tokens leave the image processor. From
+`image_processing_qwen2_vl.py:281-295`:
+
+```python
+patches = patches.reshape(
+    grid_t, temporal_patch_size, channel,
+    grid_h // merge_size, merge_size, patch_size,
+    grid_w // merge_size, merge_size, patch_size,
+)
+patches = patches.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
+flatten_patches = patches.reshape(
+    grid_t * grid_h * grid_w,
+    channel * temporal_patch_size * patch_size * patch_size,
+)
+```
+
+The `transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)` is the **patch-side**
+counterpart to the position-ID permute in §2.6: both reorder
+raster-scan neighbours into grid-block order so the merger's later
+`view(-1, 6144)` groups the right 2×2 blocks.
+
+If the hipfire image preprocessor emits patches in raw raster order
+without this transpose, the merger will fuse horizontally-adjacent
+patches instead of 2×2 spatial blocks. The model still produces
+plausible-looking JSON output but **bounding-box coordinates are
+wrong by a 2×2-tile-sized offset that varies by image width**. This
+is the canonical silent-failure mode for this model family.
+
+The phase 4 coherence gate's box-IoU check (§5 phase 4) catches this
+empirically. The phase 2 implementation should also write a unit test
+that, given a known synthetic input, reproduces the HF processor's
+exact `flatten_patches` byte sequence — independent of any forward
+pass.
+
+**Smart-resize** (`dots_ocr/utils/image_utils.py:29-63`):
 
 - IMAGE_FACTOR = 28 (= 2 × patch_size); resized H and W must both be
   divisible by 28.
@@ -417,11 +541,11 @@ plan review; this phase makes the artifacts reproducible.
    Deferrable until phase 2 (vision tower) starts.
 
 3. **[DONE]** dots.ocr safetensors manifest captured at
-   `docs/plans/qwen_2.5_vlm.dots_ocr_manifest.txt` (642 lines, 338
+   `docs/plans/qwen_2.0_vlm_plus_dots_ocr.dots_ocr_manifest.txt` (642 lines, 338
    tensors). Param count to be confirmed during phase 2 weight load.
 
 4. **[DONE]** Qwen2-1.5B safetensors manifest captured at
-   `docs/plans/qwen_2.5_vlm.qwen2_1p5b_manifest.txt` (339 lines, 338
+   `docs/plans/qwen_2.0_vlm_plus_dots_ocr.qwen2_1p5b_manifest.txt` (339 lines, 338
    tensors). No `lm_head.weight` confirms `tie_word_embeddings=true`;
    `q/k/v_proj.bias` entries confirm `attention_bias=true`.
 
@@ -580,8 +704,18 @@ first logit mismatch takes 3-5 hr to localise. With it, ~30 min.
 - Swap resize to the dots.ocr 28-divisible + beta-scaling algorithm
   exactly (§2.7). Include AR > 200:1 guard.
 - CLIP-style normalisation constants (§2.7).
-- Unit tests: smart-resize clamps within bounds and lands on
-  28-multiples for a 100×3000 input; AR guard rejects 1×500.
+- **Apply the patch-extraction reshape+transpose from §2.7 exactly**
+  (`reshape(grid_t, tps, c, gh/sm, sm, ps, gw/sm, sm, ps)` followed by
+  `transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)`). This puts patches in 2×2
+  grid-block order so the merger groups correctly. Silent-failure trap
+  if skipped — see §2.7.
+- Unit tests:
+  - smart-resize clamps within bounds and lands on 28-multiples for a
+    100×3000 input; AR guard rejects 1×500.
+  - patch-order test: synthetic 56×28 RGB input (1×4 patch grid with
+    `merge_size=2`) produces flatten_patches byte-identical to the HF
+    `Qwen2VLImageProcessor` reference for the same input. Catches the
+    transpose bug independently of any GPU code.
 
 **`vision_forward(gpu, weights, &patches, image_grid_thw) -> Vec<f16>`:**
 
@@ -604,8 +738,18 @@ first logit mismatch takes 3-5 hr to localise. With it, ~30 min.
   - Output projection (no bias)
   - Residual
   - RMSNorm
-  - SwiGLU MLP: `fc13` (merged gate+up, no bias) → SiLU+mul → `fc2`
-    (no bias)
+  - SwiGLU MLP. On disk the FFN has three separate linears
+    (`mlp.fc1.weight [4224, 1536]`, `mlp.fc3.weight [4224, 1536]`,
+    `mlp.fc2.weight [1536, 4224]`); all have no bias since
+    `use_bias=false` covers FFN per §2.2. Two implementation choices:
+    (a) **load-time fuse** fc1+fc3 into a single `fc13_proj [8448, 1536]`
+    (vllm pattern via `stacked_params_mapping`), then SwiGLU = `silu(y[:H]) * y[H:]`
+    where `y = fc13(x)`, then `fc2`; or
+    (b) keep fc1 and fc3 separate and run two GEMMs per block in the
+    forward pass.
+    Prefer (a) for fewer launches; pick (b) only if quantisation per
+    half ends up different. Note: the merge is a tensor concat at load
+    time, not a runtime fusion choice.
   - Residual
 - **Post-norm** (RMSNorm) since `post_norm=true`.
 - **Merger:**
@@ -750,6 +894,55 @@ OCR-specific gate. Fluent ≠ correct.
     immediate bring-up; doesn't require re-quantising.
   - **Daemon dispatcher change** that routes `arch_id=1` to qwen2
     when a future config flag is set. Most invasive; deferred.
+- **[NEW — R2] LLaMA path silently drops Qwen2 Q/K/V bias.**
+  `hipfire_runtime::llama::LayerWeights`
+  (`crates/hipfire-runtime/src/llama.rs:525-537`) has no bias fields,
+  and `load_weights_hfq` (`hfq.rs:646-731`) never reads
+  `q_proj.bias` / `k_proj.bias` / `v_proj.bias`. The quantiser tags
+  every Qwen2 HFQ as `arch_id=1`, which the daemon today routes
+  through the LLaMA crate — so every existing Qwen2 HFQ on disk runs
+  without bias and produces wrong outputs without any warning.
+  Resolution paths (pick one when R1 lands):
+  - **Hard guard in `load_weights_hfq`** that refuses to load when
+    `arch_id == 1` AND `q_proj.bias` is present in the manifest,
+    with a message pointing at `hipfire-arch-qwen2`. ~5 lines.
+  - **Bias-aware LLaMA loader** that reads the biases when present
+    and threads them through forward. Larger; only worth it if we
+    decide to migrate `arch_id=1` to the new crate via R1 path 3.
+- **[NEW — R3] New crate is daemon-unwired.** `hipfire-arch-qwen2` is
+  a workspace member but nothing depends on it
+  (`grep -l hipfire-arch-qwen2 crates/*/Cargo.toml` lists only the
+  crate itself). The only entry point is `inspect_hfq`. Phase 1's
+  acceptance criterion (top-1 token match vs HF) cannot fire from
+  here. Mitigation: add a `crates/hipfire-arch-qwen2/examples/
+  infer_qwen2.rs` driver binary in phase 1 that loads + forwards +
+  greedy-samples in-process (no daemon), bypassing R1 entirely for
+  bring-up correctness work. Defer daemon wiring to phase 3.
+- **[NEW — R4] Tied F16 lm_head corruption (latent).**
+  `load_lm_head` in `qwen2.rs` originally took `gpu.upload_raw(&data,
+  ...)` for the `quant_type == 1` (F16) tied-embedding branch while
+  the `WeightTensor.gpu_dtype` was set to `F32` (because the embedding
+  upstream is promoted to F32 — `EmbeddingFormat` has no `F16`
+  variant). The kernel would have read F16 bytes as F32 → garbage.
+  Caught at rev-2 review; fixed in the rev-2 patch by mirroring
+  qwen35's host-side F16→F32 expansion. Latent (didn't fire) because
+  the current `qwen2-1.5b.hfq4` uses HFQ4G256 for the embedding, not
+  F16. Tagged here so the test matrix doesn't regress.
+- **[NEW — R5] dots.ocr `eos_token_id` is in `generation_config.json`,
+  not `config.json`.** The quantiser doesn't load
+  `generation_config.json`; the config parser then defaults
+  `eos_token_id` to 151645 (ChatML `<|im_end|>`), which is wrong for
+  dots.ocr (correct primary is 151673 `<|endofassistant|>`). Two
+  resolution paths (pick one before phase 3):
+  - Extend `hipfire-quantize` to also pack `generation_config.json`
+    into metadata when present.
+  - Special-case dots.ocr's EOS in `eos_filter_overrides` (already
+    planned per §2.5) and accept that the `cfg.eos_token_id` scalar
+    is for sampler-level termination only, not for streaming EOS.
+  Plus a parser improvement: keep the *full* `eos_token_id` array
+  rather than collapsing to the first scalar. The daemon's stop-set
+  wants a multi-element set, and the current `arr.first()` semantics
+  silently pick `151643` over `151673` on dots.ocr.
 - **[RESOLVED — M9] Quantiser support for Qwen2 layer naming.**
   Verified working in `4bf9f6d4` — Qwen2-1.5B quantises to HFQ4 at
   100% param coverage. Q/K/V bias tensors correctly preserved in
@@ -823,9 +1016,9 @@ benchmarks/
 docs/
   architecture-ids.md                 # phase 1: record ids 7, 8
 docs/plans/
-  qwen_2.5_vlm.md                     # this file
-  qwen_2.5_vlm.dots_ocr_manifest.txt  # phase 0
-  qwen_2.5_vlm.qwen2_1p5b_manifest.txt # phase 0
+  qwen_2.0_vlm_plus_dots_ocr.md                     # this file
+  qwen_2.0_vlm_plus_dots_ocr.dots_ocr_manifest.txt  # phase 0
+  qwen_2.0_vlm_plus_dots_ocr.qwen2_1p5b_manifest.txt # phase 0
 scripts/
   coherence-gate-dots-ocr.sh          # phase 4
 ```

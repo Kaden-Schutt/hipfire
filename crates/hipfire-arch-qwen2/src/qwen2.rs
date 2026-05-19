@@ -10,7 +10,7 @@
 //!   forward pass port.
 //! - Forward pass — not yet present.
 //!
-//! See `docs/plans/qwen_2.5_vlm.md` phase 1 for the full plan.
+//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the full plan.
 //!
 //! # TODO(transformer-extraction)
 //!
@@ -36,6 +36,17 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 ///   has `false`. Loader handles both.
 /// - `rope_theta`: 1_000_000 for all Qwen2 variants seen so far.
 /// - `rms_norm_eps`: 1e-6.
+/// - `eos_token_id` / `eos_token_ids`: HF stores either a scalar or an
+///   array. `eos_token_id` is the first/primary element (back-compat
+///   accessor); `eos_token_ids` carries the full set so the runtime
+///   can build a multi-element stop-set (e.g. dots.ocr's
+///   `[151643, 151673]` — without both, streaming EOS misses one).
+///   Note: dots.ocr's `config.json` doesn't carry `eos_token_id` at
+///   all — it lives in `generation_config.json`, which the quantiser
+///   does not pack today. Parser falls back to 151645 (`<|im_end|>`)
+///   in that case, which is wrong for dots.ocr; phase 3 must either
+///   teach the quantiser to merge `generation_config` or special-case
+///   via `eos_filter_overrides`. See R5 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`.
 #[derive(Debug, Clone)]
 pub struct Qwen2Config {
     pub hidden_size: usize,
@@ -50,7 +61,13 @@ pub struct Qwen2Config {
     pub rms_norm_eps: f32,
     pub attention_bias: bool,
     pub tie_word_embeddings: bool,
+    /// Primary EOS for back-compat with the daemon's scalar consumer.
+    /// Equal to `eos_token_ids[0]` when the array form is present.
     pub eos_token_id: u32,
+    /// Full EOS set. Single-element vec for scalar configs; multi-element
+    /// for array configs (Qwen2-1.5B: `[151645, 151643]`; dots.ocr:
+    /// `[151643, 151673]`). Always non-empty.
+    pub eos_token_ids: Vec<u32>,
 }
 
 /// Parse a Qwen2 config out of an HFQ file's metadata.
@@ -91,11 +108,22 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
     let tie_word_embeddings = tc.get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let eos_token_id = tc.get("eos_token_id")
-        .and_then(|v| v.as_u64().or_else(|| {
-            v.as_array().and_then(|arr| arr.first().and_then(|e| e.as_u64()))
-        }))
-        .unwrap_or(151645) as u32;
+    // Build the full EOS set first, then the scalar accessor is its
+    // first element. Both array and scalar config layouts are accepted;
+    // missing field falls back to [151645] (ChatML `<|im_end|>`).
+    let eos_token_ids: Vec<u32> = match tc.get("eos_token_id") {
+        Some(v) if v.is_array() => v.as_array().unwrap().iter()
+            .filter_map(|e| e.as_u64().map(|n| n as u32))
+            .collect(),
+        Some(v) if v.is_number() => v.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let eos_token_ids = if eos_token_ids.is_empty() {
+        vec![151645]
+    } else {
+        eos_token_ids
+    };
+    let eos_token_id = eos_token_ids[0];
 
     Some(Qwen2Config {
         hidden_size,
@@ -111,6 +139,7 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
         attention_bias,
         tie_word_embeddings,
         eos_token_id,
+        eos_token_ids,
     })
 }
 
@@ -213,10 +242,20 @@ fn load_embed_tokens(
     let name = "model.embed_tokens.weight";
     let (info, data) = hfq.tensor_data_vec(name)
         .unwrap_or_else(|| panic!("qwen2: tensor not found: {name}"));
+    // Quant-type coverage matches `load_lm_head` tied branch above, so a
+    // tied-embeddings model produces consistent embed + lm_head paths.
     match info.quant_type {
         6 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
             Ok((buf, EmbeddingFormat::HFQ4G256))
+        }
+        7 => {
+            let buf = gpu.upload_raw(&data, &[data.len()])?;
+            Ok((buf, EmbeddingFormat::HFQ4G128))
+        }
+        3 => {
+            let buf = gpu.upload_raw(&data, &[data.len()])?;
+            Ok((buf, EmbeddingFormat::Q8_0))
         }
         1 => {
             let f32_data: Vec<f32> = data.chunks_exact(2)
@@ -226,14 +265,23 @@ fn load_embed_tokens(
             Ok((buf, EmbeddingFormat::F32))
         }
         qt => panic!("qwen2: unsupported embedding quant_type {qt}; \
-                     expected 1 (F16) or 6 (HFQ4G256). Extend load_embed_tokens to handle this format."),
+                     handled: 1 (F16→F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128). \
+                     Extend load_embed_tokens to handle this format."),
     }
 }
 
 /// Load the lm_head. For tied-embedding configs, re-upload the embedding
 /// bytes as a separate GPU allocation (matches qwen35's pattern at
-/// `qwen35.rs:1384-1410`; `GpuTensor` is not `Clone` so we can't alias).
+/// `qwen35.rs:1414-1448`; `GpuTensor` is not `Clone` so we can't alias).
 /// For untied configs, load the separate `lm_head.weight` tensor.
+///
+/// **F16 source caveat:** `EmbeddingFormat` has no `F16` variant
+/// (`hipfire_runtime::llama::EmbeddingFormat` is F32 / Q4K / HFQ4G256 /
+/// HFQ4G128 / Q8_0). `load_embed_tokens` promotes F16 source to F32 on
+/// the host before upload; the tied-lm_head path here must do the
+/// same. Uploading raw F16 bytes while tagging `gpu_dtype = F32`
+/// produces a corrupted matmul (kernel reads F16 bytes as F32 values).
+/// See R4 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` §6 for the catch history.
 ///
 /// TODO(transformer-extraction): the tied-embedding re-upload and the
 /// DType↔EmbeddingFormat mapping below are cross-arch primitives that
@@ -262,8 +310,19 @@ fn load_lm_head(
         let buf = match info.quant_type {
             6 | 7 | 3 => gpu.upload_raw(&data, &[data.len()])?,
             1 => {
-                // F16 → upload raw; the kernel handles F16 natively.
-                gpu.upload_raw(&data, &[data.len()])?
+                // F16 source: load_embed_tokens promoted to F32 on host.
+                // We must do the same so gpu_dtype=F32 matches the actual
+                // buffer contents. Mirror qwen35.rs:1438-1447.
+                let f32_data: Vec<f32> = data.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        f32_data.as_ptr() as *const u8,
+                        f32_data.len() * 4,
+                    )
+                };
+                gpu.upload_raw(bytes, &[cfg.vocab_size, cfg.hidden_size])?
             }
             qt => panic!("qwen2: unsupported tied embedding quant_type {qt}"),
         };
@@ -403,11 +462,26 @@ fn load_weight_tensor(
 
 /// Qwen2 per-decode GPU scratch (KV cache + attention workspace).
 ///
-/// Rev 0: stub. Real implementation allocates GPU buffers for the KV
-/// cache (sized by `num_key_value_heads × head_dim × max_seq_len ×
-/// num_hidden_layers`) and the per-layer attention workspace. See
-/// `ForwardScratch::new` in `hipfire-runtime::llama` for the dense-FA
-/// reference shape.
+/// Rev 2: stub. The real implementation is *not* a single KV-cache
+/// allocation — it's the entire scratch graph mirroring
+/// `hipfire_runtime::llama::ForwardScratch::new`:
+///
+/// - KV cache: `num_key_value_heads × head_dim × max_seq_len ×
+///   num_hidden_layers` (quantised per `--kv-mode`).
+/// - Q/K/V projection scratch: `n_heads × head_dim` for Q,
+///   `n_kv_heads × head_dim` for K and V, per layer.
+/// - RMSNorm output scratch, RoPE cos/sin tables (or precomputed
+///   inv_freq).
+/// - Attention output scratch (`n_heads × head_dim`) and logit
+///   scratch (`vocab_size`).
+/// - FFN intermediate scratch (`intermediate_size`).
+///
+/// Budget: several hours of porting, not a single-buffer allocation.
+/// The trait's `new_state(gpu: &mut Gpu, cfg)` signature already
+/// passes `gpu` for this reason; the rev-2 stub drops it. See
+/// `hipfire-runtime/src/llama.rs` for the dense-FA reference shape
+/// and the qwen35 `ForwardScratch` for the qwen-family kv-mode
+/// extensions.
 pub struct Qwen2State {
     pub token_count: usize,
 }
@@ -478,6 +552,7 @@ mod tests {
         assert!(cfg.attention_bias);
         assert!(cfg.tie_word_embeddings);
         assert_eq!(cfg.eos_token_id, 151645);
+        assert_eq!(cfg.eos_token_ids, vec![151645]);
     }
 
     #[test]
@@ -486,7 +561,15 @@ mod tests {
             .expect("parser returned None on a valid dots.ocr text config");
         assert!(cfg.attention_bias);
         assert!(!cfg.tie_word_embeddings);
+        // The array form is preserved; scalar is the first element.
+        // dots.ocr's real `eos_token_id: [151643, 151673]` — both
+        // tokens must end up in the stop-set so streaming EOS doesn't
+        // miss the `<|endofassistant|>` 151673 case. The test fixture
+        // mimics what would happen if `generation_config.json` got
+        // merged into the metadata (which it currently doesn't — see
+        // R5 in the plan).
         assert_eq!(cfg.eos_token_id, 151643);
+        assert_eq!(cfg.eos_token_ids, vec![151643, 151673]);
         assert_eq!(cfg.max_position_embeddings, 131072);
     }
 
@@ -512,7 +595,29 @@ mod tests {
         assert_eq!(cfg.head_dim, 64);
         assert!(cfg.attention_bias);
         assert!(!cfg.tie_word_embeddings);
+        // Missing eos falls back to the ChatML scalar [151645].
         assert_eq!(cfg.eos_token_id, 151645);
+        assert_eq!(cfg.eos_token_ids, vec![151645]);
         assert!((cfg.rope_theta - 1_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn eos_array_preserves_full_set() {
+        // Qwen2-1.5B-Instruct's generation_config has [151645, 151643]
+        // (note order differs from dots.ocr). Verify the parser
+        // preserves order and arity, not just the scalar accessor.
+        let with_array = r#"{
+            "config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "intermediate_size": 8960,
+                "vocab_size": 151936,
+                "eos_token_id": [151645, 151643]
+            }
+        }"#;
+        let cfg = config_from_metadata_json(with_array).expect("array eos should parse");
+        assert_eq!(cfg.eos_token_id, 151645);
+        assert_eq!(cfg.eos_token_ids, vec![151645, 151643]);
     }
 }

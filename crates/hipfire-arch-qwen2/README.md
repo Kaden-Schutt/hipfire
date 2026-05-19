@@ -6,7 +6,7 @@ Plain Qwen2 dense text decoder for hipfire. arch_id = 7.
 
 Rev 0: bring-up skeleton from `hipfire-arch-toy` template.
 `config_from_hfq` and `load_weights` are stubs; forward pass is not yet
-implemented. See `docs/plans/qwen_2.5_vlm.md` phase 1 for the full
+implemented. See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the full
 implementation plan.
 
 ## Architecture

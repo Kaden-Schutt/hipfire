@@ -30,7 +30,7 @@ impl Architecture for Qwen2 {
     /// `config_from_hfq` branch. The daemon dispatch at
     /// `daemon.rs:1494` routes everything `< 5` to the LLaMA path.
     /// Taking the next-free slot 7 avoids restructuring that.
-    /// See `docs/architecture-ids.md` and `docs/plans/qwen_2.5_vlm.md`
+    /// See `docs/architecture-ids.md` and `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`
     /// §3a.
     fn arch_id() -> u32 {
         7
