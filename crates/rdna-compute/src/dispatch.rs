@@ -9682,7 +9682,15 @@ impl Gpu {
         // gfx12 (RDNA4) needs the _gfx12 WMMA intrinsic; gfx11 (RDNA3) and
         // older RDNA archs use the base _w32 intrinsic from the k2 sibling.
         let is_gfx12 = self.arch.starts_with("gfx12");
-        let (kernel_name, kernel_src) = if is_gfx12 {
+        // 2×1 M-direction reg-blocked variant (gfx12 only for now). Env-gated.
+        let use_m2 = is_gfx12
+            && std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1");
+        let (kernel_name, kernel_src) = if use_m2 {
+            (
+                "gemm_hfq4g256_moe_grouped_wmma_m2_gfx12",
+                kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC,
+            )
+        } else if is_gfx12 {
             (
                 "gemm_hfq4g256_moe_grouped_wmma_gfx12",
                 kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC,
@@ -9718,7 +9726,8 @@ impl Gpu {
             &mt_val as *const _ as *mut c_void,
         ];
 
-        let row_tiles = ((m + 15) / 16) as u32;
+        let row_tile_stride = if use_m2 { 32 } else { 16 };
+        let row_tiles = ((m + row_tile_stride - 1) / row_tile_stride) as u32;
         let slot_tiles = ((m_total + 15) / 16) as u32;
         // BW estimate: each tile loads one expert weight row band (m_total/16 tiles
         // share the same expert avg ~ m_total/E times) + gathers X + writes Y.

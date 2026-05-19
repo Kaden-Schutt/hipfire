@@ -537,6 +537,14 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma.gfx12.hip");
 
+/// 2×1 M-direction reg-blocked sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Each warp covers a 32-row × 16-slot output tile; B-load shared across both
+/// M-blocks halves X-gather BW per output. Same kernarg layout. Lever from
+/// glovepost/wmma_ops (`wmma_kernels_optimized.hpp`). Gated on
+/// `HIPFIRE_MOE_GROUPED_M2=1`.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip");
+
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
 /// × mi] via the inverse permutation in sorted_slot_index.
