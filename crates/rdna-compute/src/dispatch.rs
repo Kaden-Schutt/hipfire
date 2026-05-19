@@ -18782,6 +18782,76 @@ impl Gpu {
         result
     }
 
+    /// Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave(Q,K).
+    /// Replaces fused_qk_l2_norm_scale_f32_batched +
+    /// repeat_interleave_qk_f32_batched (2 launches → 1). Each block
+    /// (key_head, batch) computes norms once and replicates across the
+    /// `ratio` value-head slots. Used only when n_key_heads < n_v_heads.
+    ///
+    /// `q_src`/`k_src`: [N × n_key_heads × head_dim] (unchanged on exit).
+    /// `q_dst`/`k_dst`: [N × n_value_heads × head_dim] (n_value = n_key*ratio).
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_qk_l2_norm_scale_interleave_f32_batched(
+        &mut self,
+        q_src: &GpuTensor,
+        k_src: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_key_heads: usize,
+        ratio: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_qk_l2_norm_scale_interleave_f32_batched",
+            kernels::FUSED_QK_L2_NORM_SCALE_INTERLEAVE_F32_BATCHED_SRC,
+            "fused_qk_l2_norm_scale_interleave_f32_batched",
+        )?;
+        let qsp = q_src.buf.as_ptr();
+        let ksp = k_src.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nkh = n_key_heads as i32;
+        let r_val = ratio as i32;
+        let hd = head_dim as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &qsp as *const _ as *mut c_void,
+            &ksp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &r_val as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::elementwise1_bytes(n_key_heads * ratio * head_dim) * 2 * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_qk_l2_norm_scale_interleave_f32_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_qk_l2_norm_scale_interleave_f32_batched",
+            [n_key_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qsp); b.push_ptr(ksp); b.push_ptr(qdp); b.push_ptr(kdp);
+                b.push_i32(nkh); b.push_i32(r_val); b.push_i32(hd);
+                b.push_f32(qs); b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// 1D causal conv (kernel_size=4) for decode. Updates ring buffer state.
     #[cfg(feature = "deltanet")]
     pub fn conv1d_decode_f32(

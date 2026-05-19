@@ -4824,25 +4824,30 @@ fn forward_prefill_chunk(
                     )?;
                 }
 
-                // Batched L2-norm(Q) + L2-norm(K) + scale(Q).
-                gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads, hd,
-                    1.0 / (hd as f32).sqrt(), config.norm_eps, n,
-                )?;
-
-                // Repeat-interleave Q/K if n_key_heads < n_v_heads.
-                // 0.8B has n_key=n_value=16 so the memcpy path runs.
+                // Fused L2-norm(Q) + scale(Q) + L2-norm(K) + repeat-interleave
+                // when n_key_heads < n_v_heads. One launch instead of two —
+                // ~200µs saved per LA layer × ~30 LA layers ≈ 6ms per prefill
+                // on A3B (R9700/gfx1201).
+                //
+                // The fused kernel reads q_raw/k_raw (unchanged on exit), so
+                // the conv1d output is preserved if downstream readers need it
+                // (no current consumer reads _raw after this).
                 if config.linear_num_key_heads < n_v_heads {
                     let ratio = n_v_heads / config.linear_num_key_heads;
-                    // Batched repeat-interleave: one kernel launch for all N tokens.
-                    gpu.repeat_interleave_qk_f32_batched(
+                    gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
                         &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
                         &pbs.dn_q_batch, &pbs.dn_k_batch,
-                        config.linear_num_key_heads, ratio, hd, n,
+                        config.linear_num_key_heads, ratio, hd,
+                        1.0 / (hd as f32).sqrt(), config.norm_eps, n,
                     )?;
                 } else {
-                    // n_key_heads == n_v_heads → k_dim == v_dim, memcpy the whole block.
+                    // n_key_heads == n_v_heads → no replication; keep the
+                    // original sequence (norm in place, then memcpy).
+                    gpu.fused_qk_l2_norm_scale_f32_batched(
+                        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
+                        config.linear_num_key_heads, hd,
+                        1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+                    )?;
                     gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
                     gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
                 }

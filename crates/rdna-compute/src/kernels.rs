@@ -556,6 +556,12 @@ pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
 pub const MOE_SCATTER_FUSED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
 
+/// LA-layer fusion: fused L2-norm(Q) + scale(Q) + L2-norm(K) +
+/// repeat-interleave(Q,K). Replaces fused_qk_l2_norm_scale_f32_batched
+/// + repeat_interleave_qk_f32_batched. Saves 1 launch per LA layer.
+pub const FUSED_QK_L2_NORM_SCALE_INTERLEAVE_F32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/fused_qk_l2_norm_scale_interleave_f32_batched.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
