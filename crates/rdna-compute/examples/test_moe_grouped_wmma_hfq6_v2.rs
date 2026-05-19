@@ -338,20 +338,22 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     // Tolerance band matches the v1 sister's measured ULP behavior on
     // gfx1201 + ROCm 7.2 (since v2 produces bit-equivalent output to v1
     // for the kept M-rows; only the discarded second-M-block touches
-    // anything new). max_abs scales with K (more accumulation steps);
-    // max_rel is unreliable on small-K cases where ref values dip
-    // near zero, so we use abs-only gating below K=1024.
+    // anything new). max_abs scales with K (more accumulation steps).
     //
-    // Empirical bounds at this commit: toy/small ~5e-3, medium ~1e-2,
-    // a3b-slice ~5e-2 (K=7168 with WMMA FP32-acc + FP16-mul ULP drift).
-    let strict_rel = k >= 4096;
-    let abs_ok = max_abs <= 6e-2;
-    let rel_ok = !strict_rel || max_rel <= 5e-1;
-    if !abs_ok || !rel_ok {
-        println!("  FAIL — exceeds tolerance (strict_rel={})", strict_rel);
+    // max_rel is unreliable on this test family because the CPU
+    // reference produces ref values that dip below 1e-6 in some cells
+    // (random X gather averaged → narrow distribution around zero),
+    // amplifying small abs diffs to enormous rel diffs. We gate
+    // purely on abs (matches `test_gemm_q8_residual_wmma` precedent).
+    //
+    // Empirical bounds: toy ~3.6e-3, small ~4.7e-3, medium ~1e-2,
+    // a3b-slice ~2.1e-2 (K=7168 with WMMA FP32-acc + FP16-mul ULP drift).
+    let abs_bound = if k >= 4096 { 5e-2 } else { 2e-2 };
+    if max_abs > abs_bound {
+        println!("  FAIL — exceeds abs tolerance {} (got {:.3e})", abs_bound, max_abs);
         std::process::exit(1);
     } else {
-        println!("  PASS{}", if strict_rel { "" } else { " (abs-only)" });
+        println!("  PASS (abs-only; max_rel={:.3e} ignored)", max_rel);
     }
 }
 
