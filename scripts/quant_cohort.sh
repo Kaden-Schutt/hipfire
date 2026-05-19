@@ -65,7 +65,7 @@ usage() {
     echo "usage: $0 <cohort-label> <bf16-ref-dir-or-file> <variant-spec.tsv> [flags...]"
     echo
     echo "variant-spec.tsv format (TAB-separated):"
-    echo "  <variant-name>\t<hfq-path>\t<arch>"
+    printf '  <variant-name>\t<hfq-path>\t<arch>\n'
     echo
     echo "Optional flags: --kldref PATH, --max-chunks N, --kv-mode MODE, --scoring-mode MODE"
 }
@@ -240,7 +240,7 @@ while IFS=$'\t' read -r VARIANT HFQ_PATH ARCH; do
 
     # ─── 1. Per-tensor MSE ──────────────────────────────────────────────
     echo "  [1/4] per-tensor MSE..."
-    ./target/release/examples/quant_quality_mse "$ST_DIR" "$HFQ_PATH" 2>&1 > "${PV}.mse.txt" \
+    ./target/release/examples/quant_quality_mse "$ST_DIR" "$HFQ_PATH" > "${PV}.mse.txt" 2>&1 \
         || { echo "    (MSE run failed; output captured anyway)"; }
 
     # Extract the aggregate 4-bit MSE (mean over qts ∈ {13, 21, 24} == MQ4/HFP4/MFP4).
@@ -291,6 +291,7 @@ else:
 
         # GPU lock — eval_hipfire takes hours; coordinate with other jobs.
         if [ -f "scripts/gpu-lock.sh" ]; then
+            # shellcheck disable=SC1091
             source scripts/gpu-lock.sh
             gpu_acquire "quant_cohort-${LABEL}-${VARIANT}" 2>&1 | tail -1 || true
         fi
