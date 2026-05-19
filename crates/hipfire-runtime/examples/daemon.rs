@@ -2228,7 +2228,6 @@ fn load_dflash_state(
 /// persist KV across HTTP requests are out of scope for this integration —
 /// they can keep using the AR path.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,

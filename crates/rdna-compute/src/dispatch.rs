@@ -5256,8 +5256,6 @@ impl Gpu {
                 let r2 = if r1.is_ok() { self.rocblas_gemm_hfq4_prefill(&wz_b, &xb, &y_z.buf, z_m, batch_size, k) } else { Ok(()) };
                 let r3 = if r2.is_ok() { self.rocblas_gemm_hfq4_prefill(&wb, &xb, &y_beta.buf, beta_m, batch_size, k) } else { Ok(()) };
                 let r4 = if r3.is_ok() { self.rocblas_gemm_hfq4_prefill(&wa, &xb, &y_alpha.buf, alpha_m, batch_size, k) } else { Ok(()) };
-                std::mem::forget(xb); std::mem::forget(wq); std::mem::forget(wz_b);
-                std::mem::forget(wb); std::mem::forget(wa);
                 if let Some(t) = timer { t.finish(&self.hip); }
                 return r1.and(r2).and(r3).and(r4);
             }
@@ -5720,7 +5718,6 @@ impl Gpu {
                 let r1 = self.rocblas_gemm_hfq4_prefill(&wq, &xb, &y_q.buf, q_m, batch_size, k);
                 let r2 = if r1.is_ok() { self.rocblas_gemm_hfq4_prefill(&wk, &xb, &y_k.buf, k_m, batch_size, k) } else { Ok(()) };
                 let r3 = if r2.is_ok() { self.rocblas_gemm_hfq4_prefill(&wv, &xb, &y_v.buf, v_m, batch_size, k) } else { Ok(()) };
-                std::mem::forget(xb); std::mem::forget(wq); std::mem::forget(wk); std::mem::forget(wv);
                 if let Some(t) = timer { t.finish(&self.hip); }
                 return r1.and(r2).and(r3);
             }
@@ -6119,9 +6116,6 @@ impl Gpu {
                     let r2 = if r1.is_ok() {
                         self.rocblas_gemm_hfq4_prefill(&wup, &xb, &y_up.buf, up_m, batch_size, k)
                     } else { Ok(()) };
-                    std::mem::forget(xb);
-                    std::mem::forget(wgate);
-                    std::mem::forget(wup);
                     if let Some(t) = timer { t.finish(&self.hip); }
                     return r1.and(r2);
                 }
@@ -9425,8 +9419,6 @@ impl Gpu {
                 let result = self.rocblas_gemm_hfq4_prefill_residual(
                     &w_buf, &x_buf, &y.buf, m, batch_size, k,
                 );
-                std::mem::forget(w_buf);
-                std::mem::forget(x_buf);
                 if let Some(t) = timer { t.finish(&self.hip); }
                 return result;
             }
@@ -10611,10 +10603,6 @@ impl Gpu {
                     &w_buf, &x_buf, &y.buf,
                     m, batch_size, k,
                 );
-                // Suppress the non-owning DeviceBuffer drop; HipError::Drop on
-                // hip_free would clobber memory we don't own.
-                std::mem::forget(w_buf);
-                std::mem::forget(x_buf);
                 if let Some(t) = timer { t.finish(&self.hip); }
                 return result;
             }

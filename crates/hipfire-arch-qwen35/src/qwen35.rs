@@ -580,9 +580,7 @@ impl ModelGpuStorage {
 }
 
 fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor: GpuTensor) {
-    if slabs.is_some_and(|s| s.contains_tensor(&tensor)) {
-        std::mem::forget(tensor);
-    } else {
+    if !slabs.is_some_and(|s| s.contains_tensor(&tensor)) {
         let _ = gpu.free_tensor(tensor);
     }
 }
