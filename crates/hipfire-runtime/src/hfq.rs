@@ -90,7 +90,6 @@ impl HfqFile {
         // We need to find where the index starts - it's right after metadata
         // The index starts with a u32 tensor count
         // Let's scan for it by reading from metadata_offset until we find the tensor count
-        let index_start = metadata_offset;
         // First, find the metadata end by looking for the tensor count in the index
         // The metadata is a JSON blob. The index follows immediately.
         // We know data_offset, so index is between metadata_offset and data_offset.
