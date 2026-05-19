@@ -32,7 +32,8 @@ status per phase in §5.
 | `d7a2ebab` | Phase 0 items 6 + 7: HF reference captured at `benchmarks/references/qwen2_1p5b_instruct_smoke.json` (transformers 5.5.1; 25 KB artifact with first-16 completion IDs + top-100 logits at pos 0/8/14) |
 | `00d406af` | R3 mitigation: `infer_qwen2.rs` driver binary — wires the bring-up triple end-to-end. Tokenizer parity confirmed (hipfire's Rust BPE produces byte-identical token IDs to HF on the smoke prompt). |
 | `afd4b059` | Phase 1 forward pass: real `Qwen2State` (KV cache + per-step scratch) + `forward_step` / `forward_step_greedy` (28 layers: RMSNorm → fused QKV + bias adds → RoPE → KV cache → attention → o_proj → residual → FFN norm → SwiGLU → residual; final norm + lm_head). HFQ4G256 path landed 9/16 top-1 matches with 7/7 prefix + fluent output (synonym-position divergence consistent with 4-bit quant noise). |
-| _pending_ | Phase 1 precision sweep: re-quantised at Q8F16 (`--format q8 --arch-id 7` → `qwen2-1.5b.arch7.q8.hfq`, 1.65 GB). `load_weight_tensor` extended for qt=3 → DType::Q8_0. End-to-end run: **16/16 top-1 matches vs HF F32 reference** — definitive correctness lock-in. Forward in 303 ms (140 ms prefill + 163 ms greedy decode of 16 tokens). Confirms (a) the implementation is correct end-to-end, (b) the HFQ4G256 divergence was 4-bit quant noise, not implementation error. Phase 1 closed. |
+| `9bd083f6` | Phase 1 precision sweep: re-quantised at Q8F16. End-to-end run: **16/16 top-1 matches vs HF F32 reference** — definitive correctness lock-in. Forward in 303 ms (140 ms prefill + 163 ms greedy decode of 16 tokens). Confirms (a) the implementation is correct end-to-end, (b) the HFQ4G256 divergence was 4-bit quant noise, not implementation error. Phase 1 closed. |
+| _pending_ | R3 resolved: daemon arm for `arch_id=7`. Wired `hipfire-arch-qwen2` as a runtime dev-dependency (gated behind new `arch-qwen2` feature, default-on); added `qwen2_config / qwen2_weights / qwen2_state` fields to `LoadedModel` with matching `free_gpu` impls; new load arm constructs the bring-up triple via the `Architecture` trait; new `generate_qwen2` function does encode → prefill → greedy decode → JSON `{type:"token"}` stream → `{type:"done"}`. Verified end-to-end: `hipfire run` (production CLI) against `qwen2-1.5b.arch7.q8.hfq` emits the same continuation as the Q8 precision-sweep run (`"A transformer's attention mechanism is a crucial component of its architecture, which is designed to ..."`) at **96.3 tok/s** for 137 generated tokens. Scope-limited bring-up — DFlash / CASK / PFlash / VL / ChatML scaffolding / repeat penalty / top-p / `<think>` budgeting / multi-GPU are all explicitly refused or skipped on this path. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -927,15 +928,14 @@ OCR-specific gate. Fluent ≠ correct.
   - **Bias-aware LLaMA loader** that reads the biases when present
     and threads them through forward. Larger; only worth it if we
     decide to migrate `arch_id=1` to the new crate via R1 path 3.
-- **[NEW — R3] New crate is daemon-unwired.** `hipfire-arch-qwen2` is
-  a workspace member but nothing depends on it
-  (`grep -l hipfire-arch-qwen2 crates/*/Cargo.toml` lists only the
-  crate itself). The only entry point is `inspect_hfq`. Phase 1's
-  acceptance criterion (top-1 token match vs HF) cannot fire from
-  here. Mitigation: add a `crates/hipfire-arch-qwen2/examples/
-  infer_qwen2.rs` driver binary in phase 1 that loads + forwards +
-  greedy-samples in-process (no daemon), bypassing R1 entirely for
-  bring-up correctness work. Defer daemon wiring to phase 3.
+- **[RESOLVED — R3] Daemon wired for arch_id=7.** Standalone
+  `infer_qwen2.rs` driver binary landed first (commit `00d406af`),
+  then full daemon arm: load_model arm + LoadedModel fields +
+  `generate_qwen2` JSON-stream emit + `arch-qwen2` cargo feature.
+  `hipfire run` (production CLI) on `qwen2-1.5b.arch7.q8.hfq`
+  generates coherent text at 96.3 tok/s. Bring-up scope —
+  DFlash / CASK / PFlash / VL / ChatML / repeat penalty / top-p /
+  `<think>` / multi-GPU are explicitly refused or skipped.
 - **[NEW — R4] Tied F16 lm_head corruption (latent).**
   `load_lm_head` in `qwen2.rs` originally took `gpu.upload_raw(&data,
   ...)` for the `quant_type == 1` (F16) tied-embedding branch while

@@ -195,6 +195,29 @@ impl Qwen2Weights {
         load_weights(hfq, cfg, gpu)
             .map_err(|e| format!("qwen2: load_weights failed: {e:?}"))
     }
+
+    /// Release every GPU buffer back to the pool. Consumes self.
+    /// Mirrors `LlamaWeights::free_gpu` and `Qwen35Weights::free_gpu`
+    /// — the daemon calls this on unload to actually return VRAM.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.token_embd);
+        let _ = gpu.free_tensor(self.output_norm);
+        let _ = gpu.free_tensor(self.output.buf);
+        for l in self.layers {
+            let _ = gpu.free_tensor(l.attn_norm);
+            let _ = gpu.free_tensor(l.wq.buf);
+            let _ = gpu.free_tensor(l.wq_bias);
+            let _ = gpu.free_tensor(l.wk.buf);
+            let _ = gpu.free_tensor(l.wk_bias);
+            let _ = gpu.free_tensor(l.wv.buf);
+            let _ = gpu.free_tensor(l.wv_bias);
+            let _ = gpu.free_tensor(l.wo.buf);
+            let _ = gpu.free_tensor(l.ffn_norm);
+            let _ = gpu.free_tensor(l.w_gate.buf);
+            let _ = gpu.free_tensor(l.w_up.buf);
+            let _ = gpu.free_tensor(l.w_down.buf);
+        }
+    }
 }
 
 /// Free-function loader, takes a borrowed `Gpu` so the trait impl in
@@ -572,6 +595,19 @@ impl Qwen2State {
             max_seq,
             next_pos: 0,
         })
+    }
+
+    /// Release every GPU buffer back to the pool. Consumes self.
+    /// Mirrors `ForwardScratch::free_gpu` in `hipfire_runtime::llama`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [self.x, self.tmp, self.q, self.k, self.v, self.attn_out,
+                  self.o, self.gate, self.up, self.ffn_hidden,
+                  self.ffn_out, self.logits] {
+            let _ = gpu.free_tensor(t);
+        }
+        for t in self.k_cache { let _ = gpu.free_tensor(t); }
+        for t in self.v_cache { let _ = gpu.free_tensor(t); }
+        let _ = gpu.hip.free(self.pos_buf);
     }
 }
 

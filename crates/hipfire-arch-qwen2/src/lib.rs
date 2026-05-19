@@ -41,9 +41,16 @@
 //! greedy decode + reference compare; the Q8 path is the recommended
 //! correctness baseline.
 //!
-//! Still pending: daemon dispatch arm (R3 — phase 3 work), KV
-//! quantisation paths (HFQ4 / HFQ8 / asym-N / Q8) for serving-time
-//! memory budgets, and prefill batching for serving-time latency.
+//! R3 resolved: daemon arm wired (arch_id=7 → `generate_qwen2` in
+//! daemon.rs). `hipfire run /path/to/qwen2.hfq "prompt"` works
+//! end-to-end at ~96 tok/s on the Q8 model. Bring-up scope —
+//! DFlash / CASK / PFlash / VL / ChatML / repeat penalty / top-p /
+//! `<think>` / multi-GPU are explicitly refused or skipped on this
+//! path.
+//!
+//! Still pending: KV quantisation paths (HFQ4 / HFQ8 / asym-N / Q8)
+//! for serving-time memory budgets, and prefill batching for
+//! serving-time latency.
 //!
 //! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the bring-up plan
 //! (the new R2–R5 risk entries in §6 capture the rev-2 review findings
