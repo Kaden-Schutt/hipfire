@@ -1,0 +1,750 @@
+# dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
+
+Status: proposal rev 2, 2026-05-19
+Filename note: filed under `qwen_2.5_vlm.md` per the original request,
+but the actual backbone is **Qwen2**, not Qwen2.5 — both crates land
+under the Qwen2 family. Generalising to true Qwen2.5-VL is a stretch
+goal once dots.ocr lands.
+
+This revision folds in adversarial review findings from three
+reviewers (Claude / Gemini / GLM5) on the original draft. The
+critical corrections all stem from direct verification against the
+dots.ocr safetensors index, `tokenizer_config.json` /
+`generation_config.json`, vllm's `dots_ocr.py`, the daemon dispatch
+code, and the LLaMA-arch crate header.
+
+## 1. Goal and scope
+
+Two crates land in this plan:
+
+1. **`hipfire-arch-qwen2`** — plain Qwen2 text decoder. Validated
+   against the downloaded Qwen2-1.5B-Instruct checkpoint at
+   `/home/kread/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct/`
+   (config: hidden=1536, 28 layers, 12 heads, 2 KV heads, head_dim=128,
+   intermediate=8960, vocab=151936, `tie_word_embeddings=True`). The
+   transformer body shape is identical to dots.ocr's text backbone,
+   so getting Qwen2-1.5B to run correctly in hipfire solves the
+   dots.ocr text path. Claims **`arch_id = 7`** (next-free slot;
+   `arch_id = 1` is already covered by `hipfire-arch-llama`'s
+   Qwen2/Qwen3 branch — see §3a).
+2. **`hipfire-arch-dots-ocr`** — the dots.ocr-specific vision tower
+   plus a text trait impl that delegates to `hipfire-arch-qwen2`
+   directly (no weight remap needed — dots.ocr stores text weights
+   as `model.*`, identical to plain Qwen2). Claims **`arch_id = 8`**
+   (Qwen2-VL family). Minimum success: load the bf16 weights from
+   `/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr`,
+   process one page image, emit the JSON layout output that the
+   upstream model produces. Quantised path (HFQ4 / MQ4) is a stretch
+   phase.
+
+True Qwen2.5-VL coverage (m-rope + window/full attention split + the
+Qwen2.5 text backbone) is treated as a follow-on.
+
+## 2. Architecture (verified)
+
+The HF modeling code in the snapshot
+(`models--rednote-hilab--dots.ocr/snapshots/c0111ce6.../modeling_dots_ocr.py`)
+inherits **`Qwen2ForCausalLM`**, not Qwen2.5. vllm's `dots_ocr.py`
+uses `Qwen2_5_VLProcessor` for chat-template plumbing only — the
+model class is Qwen2-derived. Implications:
+
+- Text decoder = plain Qwen2 (GQA, RMSNorm, SwiGLU, 1-D RoPE, no
+  m-rope, no DeltaNet recurrence, no MoE, **`attention_bias = true`
+  on Q/K/V projections**).
+- Vision tower = custom `DotsVisionTransformer` (RMSNorm + SwiGLU FFN,
+  full attention, non-causal).
+- Image-token wrapper sequence inside the chat is
+  `<|img|> <|imgpad|>×N <|endofimg|>` (151666 / 151665 / 151667).
+- Chat framing is **custom, not ChatML** (see §2.5).
+
+### 2.1. Text backbone (from dots.ocr config.json)
+
+| field | value | notes |
+|---|---|---|
+| hidden_size | 1536 | |
+| num_hidden_layers | 28 | |
+| num_attention_heads | 12 | |
+| num_key_value_heads | 2 | GQA, 6:1 |
+| head_dim | 128 | |
+| intermediate_size | 8960 | |
+| vocab_size | 151936 | |
+| max_position_embeddings | 131072 | |
+| rope_theta | 1_000_000 | |
+| rope_scaling | null | 1-D RoPE, no m-rope |
+| attention_bias | true | Q/K/V projections have bias |
+| hidden_act | silu | |
+| rms_norm_eps | 1e-6 | |
+| tie_word_embeddings | false | **separate lm_head.weight on disk** |
+| use_sliding_window | false | SWA disabled; plan ignores it |
+| torch_dtype | bfloat16 | |
+
+For comparison, **Qwen2-1.5B-Instruct** has the same transformer
+body shape with two deltas: `tie_word_embeddings = true` (no
+separate lm_head tensor; reuses embed_tokens) and `attention_bias`
+not set in config (Qwen2 modeling-code default is `true`, same as
+dots.ocr). The `hipfire-arch-qwen2` loader must detect
+`tie_word_embeddings` from config and either alias lm_head to
+embed_tokens or copy at load time.
+
+Parameter count verified at ~3.04B total (~2.37B text + ~670M
+vision); the earlier "~760M" agent estimate was wrong.
+
+### 2.2. Vision tower (from `vision_config`)
+
+| field | value |
+|---|---|
+| embed_dim | 1536 |
+| num_hidden_layers | 42 |
+| num_attention_heads | 12 |
+| intermediate_size | 4224 |
+| patch_size | 14 |
+| spatial_merge_size | 2 |
+| temporal_patch_size | 1 |
+| num_channels | 3 |
+| use_bias | false (attention QKV/proj only — patch_embed has bias) |
+| post_norm | true |
+| rms_norm_eps | 1e-5 |
+| hidden_size (post-merger out) | 1536 (matches LM) |
+
+Block layout: pre-norm RMSNorm → attention (qkv merged, **non-causal**)
+→ residual → pre-norm RMSNorm → SwiGLU MLP → residual. Final RMSNorm
+if `post_norm=true`.
+
+### 2.3. Patch embedding — has bias
+
+The vision config sets `use_bias: false` but **this applies to
+attention QKV/proj only**. The patch embedding Conv2d (which can be
+realised as a GEMM since stride = kernel = patch_size) has its own
+bias:
+
+```
+vision_tower.patch_embed.patchifier.proj.weight   [1536, 3, 1, 14, 14]
+vision_tower.patch_embed.patchifier.proj.bias     [1536]
+vision_tower.patch_embed.patchifier.norm.weight   [1536]   (RMSNorm)
+```
+
+The 5-D weight (with the `temporal_patch_size=1` axis) needs an
+explicit `.squeeze(2)` (or equivalent reshape) before the GEMM.
+
+### 2.4. PatchMerger — LayerNorm (NOT RMSNorm), MLP has bias
+
+The merger's pre-norm is **LayerNorm with eps=1e-6**, not RMSNorm.
+Verified directly: safetensors index contains
+`vision_tower.merger.ln_q.bias` (LayerNorm has bias; RMSNorm does
+not). vllm `dots_ocr.py:184-198` defaults `pre_norm="layernorm"`.
+
+The merger MLP has bias on both linears:
+```
+vision_tower.merger.ln_q.weight     [1536]
+vision_tower.merger.ln_q.bias       [1536]
+vision_tower.merger.mlp.0.weight    [6144, 6144]
+vision_tower.merger.mlp.0.bias      [6144]
+vision_tower.merger.mlp.2.weight    [1536, 6144]
+vision_tower.merger.mlp.2.bias      [1536]
+```
+
+Forward: `LayerNorm(x) → view(-1, 6144) → linear(6144→6144) + bias
+→ GELU → linear(6144→1536) + bias`.
+
+Use `gpu.layernorm_batched` (already exists in
+`kernels/src/layernorm.hip`) for the pre-norm. Apply bias via
+`bias_add_f32` after each linear (precedent: vision QKV bias in
+`qwen35_vl.rs:52`).
+
+### 2.5. Chat template — custom framing, NOT ChatML; primary EOS = 151673
+
+The chat template from `tokenizer_config.json`:
+
+```jinja2
+{% for m in messages %}
+  {% if m.role == 'system' %}
+    {{ '<|system|>' + m.content + '<|endofsystem|>\n' }}
+  {% elif m.role == 'user' %}
+    {{ '<|user|>' + m.content + '<|endofuser|>' }}
+  {% elif m.role == 'assistant' %}
+    {{ '<|assistant|>' + m.content }}
+    {% if not loop.last %}{{ '<|endofassistant|>' }}{% endif %}
+  {% endif %}
+{% endfor %}
+{% if messages[-1].role != 'assistant' %}{{ '<|assistant|>' }}{% endif %}
+```
+
+`generation_config.json` declares `eos_token_id: [151643, 151673]`.
+Token 151673 `<|endofassistant|>` is the **primary** turn-end marker.
+Token 151645 `<|im_end|>` exists in the vocab but the dots.ocr chat
+template does not use it — the default hipfire EOS filter (which
+looks for `<|im_end|>`) will never fire on a correct dots.ocr
+response.
+
+Both `prompt_frame_overrides` and `eos_filter_overrides` **must be
+customised** for dots.ocr — they cannot stay at the qwen35 default.
+
+### 2.6. RoPE
+
+- **Text:** standard 1-D RoPE, theta=1e6. Reuse hipfire's existing
+  text-side RoPE infrastructure.
+- **Vision:** 2-D spatial RoPE over the (H, W) patch grid, theta=10000.
+  hipfire does not currently have a 2-D RoPE kernel; the existing
+  `rope_partial_halfsplit_f32` is 1-D text RoPE. Need either a new
+  `rope_2d_f32` kernel variant or a careful CPU-side cos/sin table
+  generator that emits per-patch frequencies for the head_dim halves
+  (one half rotated by h-frequency, the other by w-frequency).
+
+  Critically: position IDs must be **reshape-permute-flattened**
+  before RoPE application. Per `dots_ocr.py:572-597`:
+
+  ```python
+  hpos_ids = hpos_ids.reshape(h//sm, sm, w//sm, sm)
+  hpos_ids = hpos_ids.permute(0, 2, 1, 3)   # group 2×2 neighbours
+  hpos_ids = hpos_ids.flatten()
+  # same for wpos_ids
+  ```
+
+  This groups 2×2 spatial neighbours to be contiguous in the
+  sequence dimension *before* the merger's `view(-1, 6144)`. Without
+  this permutation: RoPE applies wrong frequencies to wrong patches
+  **and** the merger groups the wrong 4 patches together → garbage
+  visual tokens that still produce plausible-looking JSON.
+
+### 2.7. Image preprocessing
+
+Smart-resize (`dots_ocr/utils/image_utils.py:29-63`):
+
+- IMAGE_FACTOR = 28 (= 2 × patch_size); resized H and W must both be
+  divisible by 28.
+- Clamp total pixels to `[min_pixels=3136, max_pixels=11_289_600]`.
+- Algorithm: `round_by_factor` to 28-multiples first; if the result
+  exceeds `max_pixels`, apply a `beta` scaling factor to bring it
+  back under the limit while preserving aspect ratio.
+- Preserve aspect ratio; reject AR > 200:1.
+- Normalise to CLIP-style mean
+  `[0.48145466, 0.4578275, 0.40821073]` / std
+  `[0.26862954, 0.26130258, 0.27577711]`.
+- RGB; convert RGBA → RGB on white background.
+
+Port the exact algorithm (including beta scaling and AR guard) —
+off-by-pixel rounding will misalign bboxes in the JSON output.
+
+### 2.8. Output
+
+Pure text generation. Layout JSON, Markdown, or SVG depending on the
+prompt template (`dots_ocr/utils/prompts.py`). No separate detection
+head — tokens encode bboxes, categories, and content directly.
+
+## 3. Reusable hipfire infrastructure
+
+### 3a. The `Architecture` trait (bring-up contract)
+
+`crates/hipfire-runtime/src/arch.rs` is the spec. Forward is **not**
+on the trait (static dispatch in hot path), so the arch crate
+exposes its own typed forward functions.
+
+Required methods:
+- `arch_id() -> u32`, `name() -> &'static str`
+- `config_from_hfq`, `load_weights`, `new_state`
+
+Existing arch_id assignments (verified):
+- `0` = LLaMA / Mistral (covered by `hipfire-arch-llama`)
+- `1` = plain Qwen3 / Qwen2 (also covered by `hipfire-arch-llama`
+  per its `lib.rs:4`; the daemon dispatch at `daemon.rs:1494` routes
+  everything `< 5` to LLaMA's path).
+- `5` = Qwen3.5 dense
+- `6` = Qwen3.5/3.6 MoE
+- `0xFF` = toy
+
+**Implication for this plan:** `arch_id = 1` is **not free**.
+Taking the next-free slots `7` (qwen2) and `8` (qwen2-vl / dots.ocr)
+avoids restructuring the LLaMA crate's dispatch. The id=1 slot can
+be migrated to the new Qwen2 crate as a follow-on once it's proven.
+
+Optional override hooks (defaults are qwen35 conventions —
+ChatML + `<|im_end|>` EOS):
+- `loop_guard_overrides`, `sampler_overrides`,
+  `prompt_frame_overrides`, `eos_filter_overrides`.
+
+dots.ocr MUST customise both `prompt_frame_overrides` (custom
+framing tokens, not ChatML) and `eos_filter_overrides` (151673 as
+primary stop, not `<|im_end|>`). Possibly also
+`loop_guard_overrides` if layout JSON's short repeats trip the
+default n-gram threshold (verify in phase 4).
+
+### 3b. The template: `crates/hipfire-arch-toy/`
+
+`hipfire-arch-toy` is the worked-out trait template. Per
+`crates/hipfire-arch-toy/README.md:30-56`:
+
+1. Copy `crates/hipfire-arch-toy/` → `crates/hipfire-arch-<name>/`.
+2. Update `Cargo.toml` (`name`, `description`) and add to workspace
+   `Cargo.toml` `members`.
+3. Replace stub types in `src/toy_model.rs`.
+4. Update `src/arch.rs` `impl Architecture` calls.
+5. Implement forward as free functions in the model module.
+6. Claim an `arch_id` and record it in `docs/architecture-ids.md`
+   (create this file as part of phase 1; both the toy README and
+   the trait doc reference it as future).
+
+### 3c. Production reference: `hipfire-arch-qwen35-vl`
+
+Closest analog for the **vision** side. Reusable:
+
+- **Trait-impl split pattern** — qwen35-vl has its own `Architecture`
+  impl with `type State = ()`; the text decoder is a separate impl.
+  Same pattern here: one trait impl for Qwen2 text decoder, one for
+  dots.ocr vision tower (which holds the text-side delegation).
+- **Image preprocessing skeleton** in
+  `crates/hipfire-arch-qwen35-vl/src/image.rs` — generic over
+  `patch_size` and `spatial_merge_size`. Need to swap the resize
+  policy to dots.ocr's 28-divisible + beta-scaling algorithm.
+  Verify whether the [R, B, G] channel reordering quirk asserted by
+  `tests/channel_order.rs:44-81` applies — dots.ocr's vision encoder
+  is different, so likely **not**, but inspect the patch_embed
+  tensor layout before assuming.
+- **Daemon vision plumbing** (`daemon.rs:240-242, 4077-4194`) — the
+  IMAGE_PAD_ID / VISION_START_ID / VISION_END_ID constants and the
+  prefill substitution loop. We add a new triple
+  `(IMGPAD=151665, IMG_START=151666, IMG_END=151667)` for dots.ocr.
+  **However**, the entire VL path is currently gated `arch_id == 5
+  || 6` and the `LoadedModel` struct only holds `q35_*` fields. See
+  §5 phase 3 for the daemon plumbing work this entails.
+- **HFQ4 quantize pipeline** at
+  `crates/hipfire-quantize/src/main.rs:5076-5122` already understands
+  `--include-vision` with `--vision-quant {hfq4|bf16}`. Same flow
+  applies here, modulo verifying Qwen2 layer naming is supported.
+- **rdna-compute kernels** in scope: `GEMM_F16`, `layernorm_batched`,
+  `gelu_tanh_f32`, `vit_attention_f32`, `transpose_f32`. Text-side
+  RMSNorm/SwiGLU/RoPE live in `hipfire-arch-qwen35`. New kernels
+  required: 2-D RoPE for vision, fused QKV+bias for text (or a
+  separate bias_add pass — see §5 phase 1, M-level finding).
+
+## 4. Gaps vs. qwen35-vl
+
+The dots.ocr vision tower differs from qwen35-vl's enough that this
+is a fork, not a parametrisation:
+
+1. **RMSNorm in vision blocks** (eps=1e-5) — qwen35-vl uses
+   `layernorm_batched` (LayerNorm). Vision-shape RMSNorm is **new
+   code**, not reuse. The text-side RMSNorm kernel may need a
+   variant for `[N_patches, embed_dim]` strides.
+2. **SwiGLU in vision FFN** — qwen35-vl uses GELU. Vision-shape
+   SwiGLU is new code; check the text-side kernel's shape
+   assumptions.
+3. **Full non-causal attention** — qwen35-vl already does this via
+   `vit_attention_f32`. Direct reuse; verify the kernel supports
+   non-causal explicitly (config has `is_causal: false`).
+4. **PatchMerger uses LayerNorm + bias, not RMSNorm** — see §2.4.
+5. **PatchMerger MLP has bias** — see §2.4.
+6. **2-D vision RoPE with position-ID permutation** — see §2.6. Both
+   the kernel/algorithm and the permute are new.
+7. **Different text backbone** — qwen35-vl is bolted onto the
+   `Qwen35` decoder (DeltaNet hybrid). dots.ocr uses plain Qwen2.
+   **Decision: fork** to a new `hipfire-arch-qwen2` crate. Qwen2 vs
+   Qwen3 differ in two ways that would otherwise turn into config-
+   flag bloat in qwen35:
+   (a) Qwen3 applies q/k RMSNorm before RoPE; Qwen2 doesn't.
+   (b) Qwen2 has `attention_bias=true` on Q/K/V projections; qwen35
+   likely hardcodes `bias=false` in `fused_qkv_hfq4g256`. See §5
+   phase 1 for kernel-variant choices.
+8. **Custom token IDs and chat template** — see §2.5.
+9. **Smart-resize policy** — 28-divisible H/W with min/max-pixels
+   clamp and beta scaling. New code in image preprocessing.
+10. **Patch_embed has bias** — see §2.3.
+11. **Tied embeddings differ between Qwen2-1.5B-Instruct
+    (tie=True) and dots.ocr (tie=False)** — the qwen2 crate loader
+    must handle both cases. See §2.1.
+
+## 5. Phased implementation
+
+Time estimates are revised 2-3× upward from the original draft per
+review consensus. Treat this as a 1-2 week effort, not a long
+weekend.
+
+### Phase 0 — verify ground truth + capture references (4-6 hr, blocking)
+
+Goal: capture HF reference outputs that subsequent phases compare
+against. Most "verify X" sub-steps below are already done during
+plan review; this phase makes the artifacts reproducible.
+
+1. **Already verified during plan review** (no rework needed):
+   - Merger uses LayerNorm + bias (§2.4)
+   - Merger MLP has bias on both linears (§2.4)
+   - Chat template is custom, EOS = 151673 (§2.5)
+   - Vision position IDs use permute(0,2,1,3) (§2.6)
+   - Patch embed Conv2d has bias (§2.3)
+   - dots.ocr text weights stored as `model.*` (no remap needed)
+   - arch_id=1 already claimed by LLaMA crate (using 7 instead)
+
+2. **Read dots_ocr.py end-to-end** for any subtleties not surfaced
+   in review (e.g. how `image_grid_thw` is constructed for batch
+   sizes > 1, attention scale factor, weight-init quirks).
+
+3. **Capture dots.ocr safetensors manifest:**
+   ```bash
+   python -c "import json; idx=json.load(open(...)); ..." \
+     > docs/plans/qwen_2.5_vlm.dots_ocr_manifest.txt
+   ```
+   Sum tensor numels to confirm the ~3.04B total param count.
+
+4. **Capture Qwen2-1.5B safetensors manifest** to confirm tied-
+   embeddings layout (no lm_head.weight on disk):
+   `qwen_2.5_vlm.qwen2_1p5b_manifest.txt`.
+
+5. **End-to-end run dots.ocr under HF transformers** on a single
+   committed page image (commit the image bytes to
+   `benchmarks/images/dots_ocr_smoke_001.png`, record md5). Use
+   `transformers==4.56.1` (dots.ocr pinned version),
+   `trust_remote_code=True` (intentional — modeling code is shipped
+   in the HF repo, we've already read it). Capture:
+   - Token IDs for first 200 positions
+   - Logits at positions 0 / 32 / 128 (numpy `.npz`, F32)
+   - Parsed JSON layout output
+   Reference becomes the phase-4 oracle. Without it, "looks fluent"
+   is the only correctness signal.
+
+6. **End-to-end run Qwen2-1.5B-Instruct under HF transformers** on a
+   short committed text prompt
+   (`benchmarks/prompts/qwen2_smoke.txt`, record md5). Greedy
+   temperature=0, 32 tokens. Capture token IDs and logits at
+   positions 0/8/16. Reference for phase 1.
+
+7. **Set up venv:**
+   `python -m venv .venv && .venv/bin/pip install transformers==4.56.1
+   torch safetensors`. Per `feedback_use_venv_for_python_installs`.
+
+**Contingency:** if any phase-0 assumption fails verification, halt
+phase 1 and amend §2 before proceeding. Most likely surprises:
+- vllm code shows a feature not surfaced in review (handle ad hoc).
+- HF reference run OOMs on the page image (use a smaller test image).
+
+### Phase 1 — Qwen2 text decoder, standalone crate (1-3 days)
+
+Bring up `hipfire-arch-qwen2` against Qwen2-1.5B-Instruct first.
+arch_id = 7. Independently useful (fills the long-empty plain-Qwen2
+slot) and unblocks the dots.ocr text path.
+
+**Bring-up:**
+- Copy `crates/hipfire-arch-toy/` → `crates/hipfire-arch-qwen2/`
+  per the toy README procedure.
+- Add to workspace `members` and `hipfire-runtime/Cargo.toml`
+  dev-deps.
+- Create `docs/architecture-ids.md` recording slots 0/1/5/6/0xFF
+  (existing) and 7 (qwen2) reserved for this work. (8 added in
+  phase 3.)
+
+**Forward-pass port** from `crates/hipfire-arch-qwen35/src/qwen35.rs`:
+- **Remove** q/k-RMSNorm-pre-RoPE (Qwen3-only).
+- **Remove** DeltaNet hybrid LA layers — Qwen2 is pure FA.
+- **Remove** MoE expert routing — Qwen2 is dense FFN.
+- **Add** bias terms to Q/K/V projections. `fused_qkv_hfq4g256`
+  doesn't currently accept bias. Three options, recommend (c) for
+  initial bring-up:
+  - (a) Separate `bias_add_f32` after each QKV: 3 extra launches per
+    layer × 28 = 84 extra launches per decode step.
+  - (b) New fused `fused_qkv_hfq4g256_bias` kernel: zero runtime cost
+    but more upfront work.
+  - (c) Batched bias-add of Q/K/V in one launch after fused QKV: ~28
+    extra launches per decode step, ~half the cost of (a).
+  Promote to (b) only if (c) measurably regresses tok/s under the
+  Δ ≥ 5% rule.
+- **Add** tied-embeddings handling. Detect `tie_word_embeddings`
+  from config; when true, alias lm_head to embed_tokens (avoid
+  copying a vocab × hidden tensor).
+- **Keep**: GQA attention, 1-D RoPE (theta=1e6), SwiGLU FFN,
+  RMSNorm (eps=1e-6), KV cache layout.
+
+**Maintenance note** (deferrable to a future PR): consider
+extracting the shared forward primitives (GQA attention, RMSNorm,
+RoPE, SwiGLU, KV cache) into a `qwen_common` module under
+`hipfire-runtime`, with qwen35.rs and qwen2.rs as composition
+layers. The fork-then-share split keeps phase 1 small, but a future
+kernel improvement to qwen35.rs won't auto-propagate. Document the
+divergence point at minimum.
+
+**Layer-dump infrastructure (highly recommended):** before
+debugging logit mismatches, add a `HIPFIRE_DUMP_ACTIVATIONS=path`
+env-gated hook in the qwen2 forward path that writes per-layer
+activations as `.npy` for layer-by-layer diffing against HF
+reference. Without this, the first logit mismatch takes 3-5 hr to
+localise. With it, ~30 min.
+
+**Quantisation:**
+- Run `hipfire-quantize --dry-run` on Qwen2-1.5B-Instruct first to
+  confirm every tensor is claimed by a quant target (Qwen2 layer
+  naming may not all be in the quantiser's allowlist).
+- Then quantise to HFQ4. Test against fp16 forward before claiming
+  the quantised path works.
+
+**Validation:**
+- Smoke test: feed prompt from `benchmarks/prompts/qwen2_smoke.txt`
+  with temperature=0 + greedy, decode 32 tokens.
+- **Pass criterion: top-1 token match against the phase-0 HF
+  reference for the first 16 positions.** Logit absolute diff is
+  diagnostic-only; max(abs_diff) < 5e-2 OR cosine similarity > 0.999
+  at positions 0/8/16 is the diagnostic threshold (F16 accumulation
+  drift over 28 layers can reach ~2-5e-2 even when correct, so the
+  original 1e-2 criterion would produce false negatives).
+- Run on both fp16 and HFQ4 paths.
+- Run `./scripts/coherence-gate.sh` — pre-commit hook will trigger
+  it anyway.
+
+### Phase 2 — dots.ocr vision tower (16-30 hr)
+
+- New crate `hipfire-arch-dots-ocr` depending on `hipfire-arch-qwen2`.
+- **Text-side trait impl** is a thin delegation to
+  `hipfire-arch-qwen2::Qwen2::load_weights` / `forward_scratch`. No
+  weight-key remap required (dots.ocr stores text weights as
+  `model.*`, same as plain Qwen2). The dots.ocr Weights struct
+  contains a `Qwen2Weights` plus the vision-tower weights side-by-
+  side.
+- **Vision trait impl** owns the custom `DotsVisionTransformer`
+  encoder. `type State = ()` (one-shot encoder, no KV cache).
+
+**Image preprocessing:**
+- Port `image.rs` from qwen35-vl as a starting skeleton.
+- Swap resize to the dots.ocr 28-divisible + beta-scaling algorithm
+  exactly (§2.7). Include AR > 200:1 guard.
+- CLIP-style normalisation constants (§2.7).
+- Unit tests: smart-resize clamps within bounds and lands on
+  28-multiples for a 100×3000 input; AR guard rejects 1×500.
+
+**`vision_forward(gpu, weights, &patches, image_grid_thw) -> Vec<f16>`:**
+
+- **Patch embed.** Reshape the 5-D weight `[1536,3,1,14,14]` to
+  `[1536, 588]`. Linear projection via GEMM_F16; apply patch-embed
+  bias via `bias_add_f32`; then patch-embed RMSNorm (eps=1e-5).
+- **2-D RoPE preparation.** Generate hpos/wpos via the
+  reshape-permute-flatten in §2.6. Compute cos/sin tables for each
+  axis. Choose between a new `rope_2d_f32` kernel and a CPU-side
+  pre-computation + the existing `rope_partial_halfsplit_f32`
+  applied to head_dim halves. Start with CPU pre-comp + existing
+  kernel; promote to a fused kernel only under the Δ ≥ 5% rule.
+- **42× block:**
+  - RMSNorm (eps=1e-5)
+  - QKV via single GEMM (no bias — vision QKV has `use_bias: false`)
+  - Apply 2-D RoPE to Q and K
+  - `vit_attention_f32` with `causal=false` (verify the kernel
+    supports this mode; qwen35-vl already uses it non-causally so
+    likely fine)
+  - Output projection (no bias)
+  - Residual
+  - RMSNorm
+  - SwiGLU MLP: `fc13` (merged gate+up, no bias) → SiLU+mul → `fc2`
+    (no bias)
+  - Residual
+- **Post-norm** (RMSNorm) since `post_norm=true`.
+- **Merger:**
+  - Reshape: contiguous 2×2 groups are already adjacent thanks to
+    the position-ID permutation — `view(-1, 6144)` gives the right
+    grouping.
+  - LayerNorm with bias (eps=1e-6) — `gpu.layernorm_batched`.
+  - linear(6144→6144) + bias → GELU → linear(6144→1536) + bias.
+
+**Kernel work required:**
+- Vision-shape RMSNorm (verify text kernel handles `[N, embed_dim]`
+  strides; if not, thin variant).
+- Vision-shape SwiGLU (same question).
+- 2-D RoPE (CPU pre-comp variant first, kernel later if needed).
+- Confirm `vit_attention_f32` (a) supports non-causal and (b)
+  handles up to ~14400 post-merge patches without materialising the
+  full N² attention matrix at fp32 (memory budget at fp32 is
+  N²×4 ≈ 800 MB for N=14400).
+
+**Validation:**
+- Capture HF reference activations at: first block output, final
+  block pre-merger, post-merger. Save as `.npy` per phase 0.
+- Diff hipfire output against HF at each capture point. Tolerance:
+  absolute < 1e-2 OR cosine > 0.999 (bf16 → F16 cast loss allows
+  some slack at deeper layers).
+- Channel-order test: load the patch_embed weight, run on a known
+  test image with known expected first-block output, verify [R, G, B]
+  matches (NOT [R, B, G] — that quirk is qwen35-vl-specific; verify
+  it doesn't apply here).
+
+### Phase 3 — assembly + daemon plumbing (6-10 hr)
+
+Daemon currently has VL infrastructure only for arch_id 5/6. The
+`LoadedModel` struct holds `q35_config`, `q35_weights`,
+`q35_scratch` and `generate_vl()` unwraps them. arch_id=8 needs
+parallel plumbing — not "add a match arm" but new fields + new
+dispatch arms.
+
+**arch_id registry:**
+- Add `arch_id = 8` for `hipfire-arch-dots-ocr` to
+  `docs/architecture-ids.md`.
+
+**Daemon `LoadedModel` extension:**
+- Add `dots_ocr_config`, `dots_ocr_weights`, `dots_ocr_scratch`
+  (or Qwen2 equivalents — the text-side delegation pattern means
+  we hold a `Qwen2Weights` plus dots.ocr vision weights). Decide:
+  one combined struct or two parallel structs.
+
+**Daemon dispatch:**
+- New arm in `load_model` (currently `daemon.rs:672-677,
+  :1494, :1719, :3158, :3516`) for arch_id == 8.
+- New `generate_vl_dots_ocr()` (or refactor `generate_vl()` into a
+  generic dispatcher branching on arch_id).
+
+**Token-id constants:** `IMGPAD_ID = 151665`, `IMG_START_ID = 151666`,
+`IMG_END_ID = 151667`. New triple alongside the existing qwen35-vl
+triple.
+
+**Architecture trait overrides (MANDATORY, not optional):**
+- `prompt_frame_overrides`: emit the custom dots.ocr framing per
+  §2.5. **Decision point:** does the daemon's chat-template
+  renderer evaluate arbitrary Jinja2, or only ChatML?
+  - If Jinja2: register the dots.ocr template, done.
+  - If ChatML-only: hardcode the framing in the override
+    (`<|system|>...<|endofsystem|>\n<|user|>...<|endofuser|>...`).
+- `eos_filter_overrides`:
+  ```rust
+  stop_at: vec![b"<|endofassistant|>".to_vec()],   // primary EOS (151673)
+  holdback_prefixes: vec![b"<|end".to_vec()],
+  strip_think: Some(false),                         // OCR model, no <think>
+  ```
+  Plus add 151643 (`<|endoftext|>`) and 151673 to the runtime's
+  blocked-EOS-for-streaming list.
+
+**Vision token splicing:**
+- Hook the daemon prefill loop the same way qwen35-vl does
+  (`daemon.rs:4178-4186` template): on IMGPAD_ID, call
+  `forward_scratch_embed` with the next merged visual embedding.
+- Plumb `image_grid_thw` through the daemon's generate request
+  payload (currently no path for this in non-Qwen3.5 VL).
+
+**Example binary:**
+- `crates/hipfire-runtime/examples/infer_dots_ocr.rs`: takes
+  `--image path.png --prompt-template layout-all-en`, emits JSON
+  layout to stdout.
+
+### Phase 4 — correctness gate (8-12 hr)
+
+OCR-specific gate. Fluent ≠ correct.
+
+**Coherence gate (mandatory):**
+- `./scripts/coherence-gate.sh` — pre-commit hook triggers on
+  kernel/forward-pass changes.
+
+**New `scripts/coherence-gate-dots-ocr.sh`:**
+- Inputs: committed 2-image reference set
+  (`benchmarks/images/dots_ocr_smoke_001.png`,
+  `benchmarks/images/dots_ocr_smoke_002.png`), md5s recorded.
+- Run hipfire dots.ocr forward on each image with layout-all-en
+  prompt. Save JSON output.
+- Compare against phase-0 HF reference JSON:
+  - **Parse failure** (invalid JSON) → HARD FAIL.
+  - **Box matching:** Hungarian assignment by IoU between HF and
+    hipfire box sets; require ≥80% of HF boxes paired with IoU ≥
+    0.85.
+  - **Category equivalence:** Jaccard on category strings per pair
+    ≥ 0.9 (allows for `"title"` vs `"heading"` near-equivalence;
+    can be tightened later).
+  - **Coverage:** unpaired HF boxes count > 20% → HARD FAIL.
+- Reject the commit if any HARD FAIL fires.
+- Δ ≥ 5% perf investigation rule applies as usual.
+
+**Reference image set selection:**
+- Pick one English-text-heavy academic-paper-style page and one
+  mixed-content page (figures, tables, text). Commit at original
+  resolution so smart-resize is exercised end-to-end.
+
+### Phase 5 — quantisation (stretch, post-merge)
+
+- Run `hipfire-quantize --include-vision --vision-quant bf16` for
+  text-quantised + vision-bf16 first cut.
+- Re-run `coherence-gate-dots-ocr.sh`. Hard-fail thresholds
+  unchanged.
+- Only then attempt `--vision-quant hfq4`. Per
+  `project_mq3_lm_head_awq_regresses_kld_2026_05_19`, sub-4-bit
+  quant can break structured output even when PPL looks fine.
+
+## 6. Risks and unknowns
+
+- **2-D RoPE kernel + position-ID permute.** New algorithm + likely
+  new kernel variant. Budget per phase 2.
+- **Vision-shape RMSNorm/SwiGLU kernels.** Text-side kernels may
+  not handle vision strides. May need new variants.
+- **`vit_attention_f32` N² scaling at max image size.** ~14400
+  post-merge patches → 800 MB fp32 attention matrix per block if
+  materialised. Verify tiling before committing to max image size.
+- **QKV bias kernel path.** Three options (a/b/c) in phase 1;
+  recommend (c) for initial bring-up. Promote to (b) only under the
+  Δ ≥ 5% rule.
+- **Quantiser support for Qwen2 layer naming.** Dry-run check in
+  phase 1.
+- **Daemon dispatch restructuring.** Phase 3 is wiring-heavy, not a
+  trivial branch addition.
+- **Chat-template Jinja2 vs ChatML-only renderer.** Decision point
+  in phase 3; affects how `prompt_frame_overrides` is implemented.
+- **F16 vs HF-F32 reference debugging.** Without layer-dump
+  infrastructure (recommended in phase 1), single bugs cost 3-5 hr
+  to localise.
+- **Maintenance divergence cost of forking qwen35.rs.** Document
+  the divergence point; consider a follow-on PR for `qwen_common`
+  refactor.
+- **bf16 → F16 cast loss on RoPE inv_freq.** Keep inv_freq tables in
+  F32; F16 underflow risk at small magnitudes.
+- **Memory budget on gfx1151.** dots.ocr ~6 GB F16 weights + ~1.8 GB
+  KV cache @ 128K context + vision activations at max image. Unified
+  memory means host pressure visible too. Back-of-envelope budget
+  before phase 2.
+- **Smart-resize off-by-pixel.** Replicate the Python algorithm
+  exactly; bbox accuracy depends on identical (H, W) selection.
+
+## 7. File layout (target)
+
+```
+crates/
+  hipfire-arch-qwen2/                 # phase 1
+    Cargo.toml
+    README.md
+    src/
+      lib.rs            # crate root
+      arch.rs           # impl Architecture for Qwen2 (arch_id=7)
+      qwen2.rs          # Qwen2Config, Qwen2Weights, Qwen2State
+                        # forward + forward_scratch free fns
+  hipfire-arch-dots-ocr/              # phase 2-3
+    Cargo.toml
+    README.md
+    src/
+      lib.rs
+      arch.rs           # impl Architecture for DotsOcr (arch_id=8)
+      dots_ocr.rs       # DotsOcrConfig (text-cfg + vision-cfg),
+                        # DotsOcrWeights (qwen2-weights + vision-weights),
+                        # vision_forward + helpers
+      image.rs          # smart-resize + patch extraction
+    tests/
+      smart_resize.rs
+      channel_order.rs  # if needed
+crates/hipfire-runtime/
+  examples/
+    infer_qwen2.rs                    # phase 1 text-only smoke binary
+    infer_dots_ocr.rs                 # phase 3 end-to-end image+text
+benchmarks/
+  prompts/
+    qwen2_smoke.txt                   # phase 0/1 committed prompt
+  images/
+    dots_ocr_smoke_001.png            # phase 0/4 reference image 1
+    dots_ocr_smoke_002.png            # phase 0/4 reference image 2
+docs/
+  architecture-ids.md                 # phase 1: record ids 7, 8
+docs/plans/
+  qwen_2.5_vlm.md                     # this file
+  qwen_2.5_vlm.dots_ocr_manifest.txt  # phase 0
+  qwen_2.5_vlm.qwen2_1p5b_manifest.txt # phase 0
+scripts/
+  coherence-gate-dots-ocr.sh          # phase 4
+```
+
+## 8. Out of scope (for now)
+
+- True Qwen2.5-VL (m-rope, window/full attention split, Qwen2.5
+  text backbone). Defer until dots.ocr is green.
+- Video / temporal patching. dots.ocr has `temporal_patch_size=1`;
+  the code paths shouldn't assume it but no t-axis support needed.
+- Vulkan / cross-vendor backend. Out of scope project-wide per
+  CLAUDE.md rule 7.
+- Training. Inference only.
+- Migrating arch_id=1 from LLaMA to the new Qwen2 crate — keep
+  separate slots (7, 8) for the initial bring-up; consolidation is
+  a follow-on PR.
+- `qwen_common` shared-primitives extraction — document the
+  divergence in phase 1, refactor later.

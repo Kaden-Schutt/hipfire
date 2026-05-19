@@ -626,6 +626,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen2"
+version = "0.1.20"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+]
+
+[[package]]
 name = "hipfire-arch-qwen35"
 version = "0.1.20"
 dependencies = [
