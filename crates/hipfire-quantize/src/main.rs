@@ -179,6 +179,34 @@ impl SafetensorsFile {
 
 // ─── FP16/BF16 Conversion ───────────────────────────────────────────────────
 
+/// Read `--arch-id <u32>` from `std::env::args` if present. Used by
+/// both the GGUF and safetensors entry paths to override the
+/// auto-detected `arch_id` stamped into the HFQ header.
+///
+/// Why an override exists: the auto-detection maps every Qwen2 input
+/// to `arch_id=1`, which the daemon dispatches through
+/// `hipfire-arch-llama`. That loader doesn't read Q/K/V proj bias,
+/// so a Qwen2 model loaded by default would produce wrong outputs.
+/// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
+/// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
+/// See docs/architecture-ids.md and docs/plans/
+/// qwen_2.0_vlm_plus_dots_ocr.md §6 R1.
+fn parse_arch_id_override() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    let pos = args.iter().position(|a| a == "--arch-id")?;
+    let raw = args.get(pos + 1).unwrap_or_else(|| {
+        eprintln!("error: --arch-id requires a u32 value");
+        std::process::exit(1);
+    });
+    match raw.parse::<u32>() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            eprintln!("error: --arch-id value '{raw}' is not a valid u32: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = ((bits >> 15) & 1) as u32;
     let exp = ((bits >> 10) & 0x1F) as u32;
@@ -3113,7 +3141,7 @@ fn run_gguf_pipeline(
         .meta_str("general.architecture")
         .unwrap_or("llama")
         .to_string();
-    let arch_id: u32 = match arch_str.as_str() {
+    let auto_arch_id: u32 = match arch_str.as_str() {
         "llama" => 0,
         "qwen3" | "qwen2" => 1,
         "qwen3moe" => 6,
@@ -3122,7 +3150,18 @@ fn run_gguf_pipeline(
             0
         }
     };
-    eprintln!("Architecture: {arch_str} (id={arch_id})");
+    // --arch-id <u32> overrides the auto-detected id. Use when the
+    // model's family maps to a different crate than the default
+    // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
+    // instead of the LLaMA-family default 1, which silently drops
+    // Q/K/V bias on the LLaMA loader path). See docs/plans/
+    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
+    if arch_id != auto_arch_id {
+        eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
+    } else {
+        eprintln!("Architecture: {arch_str} (id={arch_id})");
+    }
 
     // Metadata JSON: must populate `config.*` so engine's `config_from_hfq`
     // can reconstruct LlamaConfig at load time. Also keep the raw GGUF
@@ -3474,11 +3513,11 @@ fn main() {
 
     let input_dir = args.iter().position(|a| a == "--input")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>] [--arch-id <u32>]"); std::process::exit(1); });
 
     let output_path = args.iter().position(|a| a == "--output")
         .map(|i| &args[i + 1])
-        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>]"); std::process::exit(1); });
+        .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>] [--arch-id <u32>]"); std::process::exit(1); });
 
     let format = args.iter().position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
@@ -3854,7 +3893,7 @@ fn main() {
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
     let arch_str = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("llama");
-    let arch_id = match arch_str {
+    let auto_arch_id = match arch_str {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
         "qwen3_5" | "qwen3_5_text" => 5,
@@ -3864,7 +3903,18 @@ fn main() {
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
-    eprintln!("Architecture: {arch_str} (id={arch_id})");
+    // --arch-id <u32> overrides the auto-detected id. Use when the
+    // model's family maps to a different crate than the default
+    // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
+    // instead of the LLaMA-family default 1, which silently drops
+    // Q/K/V bias on the LLaMA loader path). See docs/plans/
+    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
+    if arch_id != auto_arch_id {
+        eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
+    } else {
+        eprintln!("Architecture: {arch_str} (id={arch_id})");
+    }
     let is_moe = arch_id == 6;
     // Q8 router: always on for MoE models. 4-bit router quantization destroys
     // routing precision on precision-sensitive models (Qwen3.6-A3B: 152/256

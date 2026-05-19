@@ -26,6 +26,8 @@ status per phase in §5.
 | `8ab7ec62` | Real `Qwen2Config::from_hfq` parser + Qwen2-1.5B manifest + 4 unit tests |
 | `4bf9f6d4` | HFQ4 quantisation of Qwen2-1.5B validated (820 MB, 100% coverage); `inspect_hfq` example |
 | `e034c44b` | Real `Qwen2Weights::load` — 28 layers + tied-lm_head + Q/K/V bias; cross-arch TODO markers on both sides |
+| `45913eb0` | Rev-2 review fold-in: §2/§5/§6 amendments, tied-F16 lm_head fix (B1), EOS array semantics, lib.rs / doc refreshes, plan rename |
+| _pending_ | R1: `hipfire-quantize --arch-id <u32>` flag + re-quantise `qwen2-1.5b.arch7.hfq4` (arch_id byte = `0x07` verified) |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -879,21 +881,21 @@ OCR-specific gate. Fluent ≠ correct.
 
 ## 6. Risks and unknowns
 
-- **[NEW — R1] HFQ `arch_id` mismatch.** `hipfire-quantize`
-  auto-assigns `arch_id=1` for Qwen2 inputs (its existing
-  Qwen2/Qwen3 default). `hipfire-arch-qwen2` claims `arch_id=7`
-  (next-free slot to avoid colliding with the LLaMA crate's
-  Qwen2/Qwen3 coverage at id=1). Three resolution paths, pick one
-  before wiring into the daemon:
-  - **Add `hipfire-quantize --arch-id <u32>` CLI flag** that
-    overrides the auto-detected id. Cleanest long-term; ~20 lines
-    of code in hipfire-quantize/src/main.rs.
-  - **Write a small in-place `hfq-rewrite-arch-id` tool** that
-    patches the 4-byte arch_id field at HFQ header offset 0x08
-    (per `docs/QUANTIZATION.md:178`). Lowest-friction for the
-    immediate bring-up; doesn't require re-quantising.
-  - **Daemon dispatcher change** that routes `arch_id=1` to qwen2
-    when a future config flag is set. Most invasive; deferred.
+- **[RESOLVED — R1] HFQ `arch_id` mismatch.** `hipfire-quantize`
+  now accepts `--arch-id <u32>` (added in the R1 commit; see §0
+  progress log) which overrides the auto-detected id at HFQ write
+  time. Applied to both the GGUF and safetensors entry paths via the
+  shared `parse_arch_id_override()` helper. Re-quantised
+  `qwen2-1.5b.arch7.hfq4` at `/data/cache/hipfire/` carries
+  `arch_id = 0x07` at header offset 0x08 (`xxd` verified); load
+  through `hipfire-arch-qwen2::inspect_hfq --load` completes
+  successfully with the correct config (`arch_id=7`, 28 layers,
+  tied lm_head, HFQ4G256 embeddings).
+  Other paths that were on the menu but not taken:
+  - in-place `hfq-rewrite-arch-id` tool — superseded by the CLI flag
+  - daemon dispatcher change routing arch_id=1 → qwen2 — still on
+    the table for the eventual id=1 retirement (a follow-on once
+    the new crate has shipped a forward pass); deferred per §8.
 - **[NEW — R2] LLaMA path silently drops Qwen2 Q/K/V bias.**
   `hipfire_runtime::llama::LayerWeights`
   (`crates/hipfire-runtime/src/llama.rs:525-537`) has no bias fields,
