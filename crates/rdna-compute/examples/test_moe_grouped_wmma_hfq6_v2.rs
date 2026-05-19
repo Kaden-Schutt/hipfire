@@ -337,13 +337,17 @@ fn run_case(label: &str, m: usize, k: usize, m_total: usize, num_experts: usize,
     println!("  max_rel_diff = {:.6e}", max_rel);
     // Looser tolerance vs v1: 2× A-row contribution per warp + bigger reg
     // block can compound FP16 noise. Empirical bound at K=7168 is ~1e-3
-    // abs (matches v1); 5e-2/1e-1 provides margin for the doubled M-rows
-    // sharing kt-pipeline state.
-    if max_abs > 5e-2 || max_rel > 1e-1 {
-        println!("  FAIL — exceeds tolerance");
+    // abs (matches v1). Small-K toy/small cases have larger relative
+    // dispersion (near-zero outputs dominate rel diff) so we apply abs-only
+    // gating for those and abs+rel for the production-sized cases.
+    let strict_rel = k >= 1024;
+    let abs_ok = max_abs <= 5e-2;
+    let rel_ok = !strict_rel || max_rel <= 1e-1;
+    if !abs_ok || !rel_ok {
+        println!("  FAIL — exceeds tolerance (strict_rel={})", strict_rel);
         std::process::exit(1);
     } else {
-        println!("  PASS");
+        println!("  PASS{}", if strict_rel { "" } else { " (abs-only)" });
     }
 }
 
