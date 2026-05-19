@@ -1,29 +1,37 @@
+// Shared body for the HFQ3-G256 wave32 MMQ residual kernels.
+// Each tile-size instantiation defines MMQ_X (kernel-side batch tile) and
+// MMQ_X_NAME (symbol suffix) before #including this header.
+//
+// Templated on MMQ_X via the preprocessor. The body assumes:
+//   - MMQ_Y = 128 rows per workgroup
+//   - block_dim = (32, 4, 1) = 128 threads / 4 wave32 warps
+//   - X_STRIDE = 40 (b128 LDS reads, 16-B aligned)
+//   - Y_STRIDE = 36
+//
+// For very small MMQ_X (e.g. 8), the LDS pipeline may favor b32 reads
+// over b128 — but the gfx906 body's mmq_x≥32 cliff was a PMC-tuned
+// optimum, not a correctness requirement. We keep b128 everywhere for
+// simplicity in this minimal probe; if PMC shows ds_read pipeline
+// starvation at small MMQ_X, a per-MMQ_X X_STRIDE switch (40 vs 33)
+// can be added later.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-// HFQ3-G256 × Q8_1 dp4a MMQ residual kernel — wave32 RDNA2.
-//
-// HFQ3 sibling of gemm_hfq4g256_residual_mmq.gfx1030.hip. Same MMQ_Y/mmq_x
-// topology and LDS streaming pipeline; only the X tile loader differs:
-//   - 104 B/group (vs 136 for HFQ4)
-//   - 96 B body (vs 128 for HFQ4) — 8 trits per 3-byte group per thread
-//   - Signed mapping `trit - 4` → [-4, 3] for sdot4
-//   - zp_eff = zp + 4*sc (vs zp + 8*sc for HFQ4)
-//   - uint24 byte-combine (OOB-safe) for trit reads
-//
-// Phase 3 minimal probe (docs/plans/gfx10_mq3_prefill.md). Co-test with
-// HFQ4 MMQ sibling: if HFQ4 MMQ beats HFQ4 fp16 but HFQ3 MMQ loses to
-// HFQ3 dot2, the 3-bit unpack overhead is the smoking gun. If both win
-// or both lose, the LDS-tiling pattern is the dominant factor.
-
 #define MMQ_Y 128
-#define MMQ_X 32
 #define MMQ_NWARPS 4
 #define WAVE_SIZE 32
 #define QK8_1 32
 #define X_STRIDE 40
 #define Y_STRIDE 36
+
+#ifndef MMQ_X
+#error "MMQ_X must be defined before #including this body"
+#endif
+#ifndef KERNEL_NAME
+#error "KERNEL_NAME must be defined before #including this body"
+#endif
 
 struct block_q8_1_mmq {
     half2 ds4[4];
@@ -32,7 +40,7 @@ struct block_q8_1_mmq {
 static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
 __launch_bounds__(128, 2)
-extern "C" __global__ void gemm_hfq3g256_residual_mmq(
+extern "C" __global__ void KERNEL_NAME(
     const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
     float* __restrict__ Y,
@@ -53,10 +61,6 @@ extern "C" __global__ void gemm_hfq3g256_residual_mmq(
     float sum[(MMQ_X / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE)] = {0.0f};
 
     for (int kg = 0; kg < groups_per_row; ++kg) {
-        // HFQ3 group spans 256 K-elements = 2 Q8_1 kblocks of 128 K each.
-        // Each kg iter processes ONE 104-B HFQ3 group split into 2 windows.
-        // Window 0 → kblock 2*kg+0 (first 128 K) → bytes [0..47] of HFQ3 body
-        // Window 1 → kblock 2*kg+1 (second 128 K) → bytes [48..95] of HFQ3 body
         #pragma unroll 1
         for (int window = 0; window < 2; ++window) {
             const int kb = 2 * kg + window;
@@ -72,40 +76,25 @@ extern "C" __global__ void gemm_hfq3g256_residual_mmq(
                 tile_y[u] = valid ? src[slot] : 0;
             }
 
-            // ── Load X tile (unpack 3-bit trits → signed INT8 packed) ─────
+            // ── Load X tile (HFQ3 3-bit unpack → signed INT8 packed) ──────
             if (window == 0 && tid < 128) {
                 const int i = tid;
                 const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
                 const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
                 const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
                 const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-                // Signed mapping: w_unsigned = sc*trit + zp = sc*(trit_signed+4) + zp
-                //                            = sc*trit_signed + (zp + 4*sc)
                 x_dm[i] = make_float2(sc, zp + 4.0f * sc);
             }
 
-            // 128 rows × 16 ints/row in LDS = 2048 ints. But each window
-            // covers 128 K-elements = 16 ints worth of LDS slots per row.
-            // Each row's HFQ3 body for THIS window is 48 bytes (window 0
-            // = bytes [0..47], window 1 = bytes [48..95]). 16 thread-loads
-            // per row × 3 bytes per load = 48 bytes per row. Matches.
-            //
-            // 128 rows × 16 loads/row = 2048 task IDs / 128 threads = 16 each.
             #pragma unroll
             for (int loop = 0; loop < 16; ++loop) {
                 const int task_id = tid * 16 + loop;
-                const int i = task_id / 16;       // row 0..127
-                const int chunk = task_id % 16;   // 0..15 within row
+                const int i = task_id / 16;
+                const int chunk = task_id % 16;
 
                 const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
                 const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
 
-                // chunk maps to 8 trits within the window. Each chunk loads 3
-                // bytes (= 8 trits = 1 uint24). The window's body byte offset:
-                // window 0: byte 8 + chunk*3       (chunks 0..15 → bytes 8..53)
-                // window 1: byte 8 + 48 + chunk*3  (chunks 0..15 → bytes 56..101)
-                // Body ends at byte 103 (= 8 + 96). Last chunk in window 1
-                // would read bytes 101..103, which is in-bounds.
                 const unsigned char* d = (const unsigned char*)(gp + 8 + window * 48 + chunk * 3);
                 const unsigned int pk = (unsigned int)d[0]
                                       | ((unsigned int)d[1] << 8)

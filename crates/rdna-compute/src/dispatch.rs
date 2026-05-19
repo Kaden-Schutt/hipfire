@@ -7211,9 +7211,19 @@ impl Gpu {
         result
     }
 
-    /// Wave32 MMQ residual kernel for HFQ3 on RDNA2+ — Phase 3 minimal probe.
-    /// 128 rows × 32 cols per workgroup, LDS-tiled X reuse, sdot4 inner loop.
-    /// Gated by `HIPFIRE_HFQ3_MMQ=1`.
+    /// Wave32 MMQ residual kernel for HFQ3 on RDNA2+ — Phase 3 tile-size
+    /// family auto-selector. Picks the best path per batch_size, falling
+    /// back to `gemm_hfq3g256_residual_dot2` when MMQ would lose at small
+    /// N. Gate boundaries from the microbench at
+    /// `examples/bench_hfq3_mmq_sweep.rs` (m=4096, k=2048 on gfx1031):
+    ///   batch ≤ 12       → dot2 (MMQ tile granularity wastes compute)
+    ///   13 ≤ batch ≤ 127 → mmq_x=16 (best across this whole range,
+    ///                       within ~5% of mmq_x=32 even at N=96)
+    ///   batch ≥ 128      → mmq_x=32 (b128 LDS path pulls ahead +4-10%)
+    /// Gated by `HIPFIRE_HFQ3_MMQ=1`. mmq_x=8 is never best in the
+    /// sweep (lost to scalar/dot2 at small N, lost to mmq_x=16 at large
+    /// N) so it's not in the auto-selector — kept available as
+    /// `gemm_hfq3g256_residual_mmq_x8` for further experimentation.
     pub fn gemm_hfq3g256_residual_mmq(
         &mut self,
         a_raw: &GpuTensor,
@@ -7223,14 +7233,35 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_hfq3g256_residual_mmq",
-            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_SRC,
-            "gemm_hfq3g256_residual_mmq",
-        )?;
+        if batch_size <= 12 {
+            self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size)
+        } else if batch_size <= 127 {
+            self.gemm_hfq3g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
+        } else {
+            self.gemm_hfq3g256_residual_mmq_x32(a_raw, x, y, m, k, batch_size)
+        }
+    }
+
+    fn launch_hfq3_mmq_tile(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        // Inline the body .cuh — same pattern as the gfx906 MMQ family.
+        let inlined = src.replace(
+            "#include \"gemm_hfq3g256_residual_mmq_body.cuh\"",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-        let func = &self.functions["gemm_hfq3g256_residual_mmq"];
+        let func = &self.functions[kernel_name];
 
         let mut ap = a_raw.buf.as_ptr();
         let mut xq = xq_ptr;
@@ -7248,21 +7279,21 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        // LDS layout — must match the kernel's macro constants.
-        // x_qs: 128 × 40 ints + x_dm: 128 × float2 + tile_y: 32 × 36 ints.
+        // LDS layout — must match the body.cuh constants:
+        //   x_qs: 128 × X_STRIDE(40) ints + x_dm: 128 × float2
+        //   tile_y: mmq_x × Y_STRIDE(36) ints
         const MMQ_Y: usize = 128;
-        const MMQ_X: usize = 32;
         const X_STRIDE: usize = 40;
         const Y_STRIDE: usize = 36;
-        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + MMQ_X * Y_STRIDE * 4) as u32;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
 
         let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
-        let col_tiles = (batch_size + MMQ_X - 1) / MMQ_X;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size)
                   + batch_size * k
                   + batch_size * m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq3g256_residual_mmq", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = unsafe {
             self.hip.launch_kernel(
                 func,
@@ -7275,6 +7306,48 @@ impl Gpu {
         };
         if let Some(t) = timer { t.finish(&self.hip); }
         result
+    }
+
+    /// HFQ3 MMQ residual at mmq_x=8 (short-prefill tile).
+    pub fn gemm_hfq3g256_residual_mmq_x8(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile(
+            a_raw, x, y, m, k, batch_size,
+            8, "gemm_hfq3g256_residual_mmq_x8",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X8_SRC,
+        )
+    }
+
+    /// HFQ3 MMQ residual at mmq_x=16 (mid-prefill tile).
+    pub fn gemm_hfq3g256_residual_mmq_x16(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile(
+            a_raw, x, y, m, k, batch_size,
+            16, "gemm_hfq3g256_residual_mmq_x16",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ3 MMQ residual at mmq_x=32 (long-prefill tile, b128 LDS path).
+    pub fn gemm_hfq3g256_residual_mmq_x32(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile(
+            a_raw, x, y, m, k, batch_size,
+            32, "gemm_hfq3g256_residual_mmq_x32",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC,
+        )
     }
 
     /// Wave32 MMQ residual kernel for HFQ4 on RDNA2+ — Phase 3 side-win probe.

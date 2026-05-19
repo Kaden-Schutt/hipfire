@@ -353,6 +353,89 @@ exercises both new kernels at 5e-1 tolerance (Q8_1 X adds ~3× the
 dot2 error band). Coherence eyeball produces fluent text across the
 4-prompt matrix.
 
+### Phase 3 — MMQ tiling with tile-size auto-selector ✅ **POSITIVE RESULT 2026-05-19**
+
+**Tile-size sweep** (commit superseding the minimal probe at adc15583):
+
+Three variants instantiated from a shared body (`gemm_hfq3g256_residual_mmq_body.cuh`):
+- `gemm_hfq3g256_residual_mmq_x8.gfx1030.hip` (89 VGPR)
+- `gemm_hfq3g256_residual_mmq_x16.gfx1030.hip` (91 VGPR)
+- `gemm_hfq3g256_residual_mmq_x32.gfx1030.hip` (110 VGPR)
+
+Microbench (`examples/bench_hfq3_mmq_sweep.rs`) on gfx1031,
+m=4096, k=2048, head-to-head all 5 methods (scalar, dot2, mmq_x8,
+mmq_x16, mmq_x32) across batches 1..1024:
+
+```
+   N    scalar    dot2  mmq_x8 mmq_x16 mmq_x32     best  vs dot2
+   1     62.8    66.4   144.4   155.1   190.9   scalar    1.06x
+   4     31.4    32.0    47.4    55.7    93.6   scalar    1.02x
+   8     41.8    41.4    50.5    57.9    95.6     dot2    1.00x
+  12     59.9    56.4    70.4    60.3    98.1     dot2    1.00x
+  16     75.5    70.3    71.7    61.6   100.9    mmq16    1.14x
+  20     96.3    90.2    87.4    82.8   103.9    mmq16    1.09x
+  24    105.9   103.9    89.2    82.9   106.4    mmq16    1.25x
+  32    139.1   131.5   120.1    86.5   111.0    mmq16    1.52x
+  48    206.2   193.2   161.9   104.7   131.8    mmq16    1.84x
+  64    274.9   268.9   215.6   154.1   149.9    mmq32    1.79x
+ 128    571.2   515.0   410.2   273.7   251.3    mmq32    2.05x
+ 240   1054.5   976.8   747.9   464.1   491.7    mmq16    2.10x
+ 512   2128.3  2093.2  1532.3   955.5   916.7    mmq32    2.28x
+1024   4236.0  4357.5  3025.0  1929.9  1728.8    mmq32    2.52x
+```
+
+**Key findings:**
+- **mmq_x=8 is never the best.** Lost to scalar/dot2 at small N
+  (tile overhead exceeds compute savings) and to mmq_x=16 at large N
+  (worse compute density). Kept in the codebase as an explicit
+  variant for further experiments but dropped from auto-selector.
+- **mmq_x=16 is shockingly versatile.** Wins from N=16 to N=48 by
+  large margins (1.14× to 1.84×); within ~5% of mmq_x=32 at most
+  larger N (sometimes faster, e.g. N=240).
+- **mmq_x=32 wins only at N ≥ 64 and even then narrowly** vs mmq_x=16
+  (4-10% delta). The b128 LDS path's benefits at large N are real
+  but modest.
+- **dot2 wins at N ≤ 12.** scalar wins at N ≤ 4. Below the MMQ tile
+  granularity break-even, the simpler dispatch dominates.
+
+**Auto-selector gate (shipping in this commit):**
+```
+batch ≤ 12        → dot2 (existing path)
+13 ≤ batch ≤ 127  → mmq_x=16
+batch ≥ 128       → mmq_x=32
+```
+
+The gate falls back to dot2 inside the MMQ auto-selector itself,
+so `HIPFIRE_HFQ3_MMQ=1` is safe at any batch size — it never
+regresses below the dot2 baseline.
+
+**End-to-end daemon eyeball on gfx1031 / 9B MQ3 (warm cache):**
+
+| Prompt | dot2 baseline | MMQ auto-tile | Δ |
+|---|---|---|---|
+| paris (pf=21) | 223 | 221 | −1% |
+| sheep (pf=36) | 248 | **276** | **+11%** |
+| code (pf=21)  | 223 | **286** | **+28%** |
+| awq (pf=24)   | 231 | 246 | +7% |
+| LRU (pf=240)  | 290 | **349** | **+20%** |
+
+The auto-selector also beats the naive mmq_x=32 from the initial
+probe (code: 286 vs 268; sheep: 276 vs 264) because mmq_x=16
+wastes less compute on OOB columns at moderate batches. Output
+coherent across all prompts.
+
+**Engineering disposition:** still gated behind `HIPFIRE_HFQ3_MMQ=1`
+for safety, but the auto-selector is now safe-by-design (falls back
+to dot2 at small N). Shipping as default-on would require:
+- Coverage of qkv + gate_up MMQ variants (currently residual-only)
+- KLD eval at n=256 to confirm no quality regression on the
+  full daemon pipeline
+- Coherence-gate clean across the model matrix
+- mmq_x=8 deletion (or keep as explicit lever)
+
+Each additional kernel ports follow the same body-template pattern;
+~2-3 days more engineering to complete the qkv + gate_up family.
+
 ### Phase 3 — MMQ tiling, minimal probe ⚠️ **POSITIVE RESULT 2026-05-19**
 
 Minimal-scope probe (residual-only, single tile size mmq_x=32) ported

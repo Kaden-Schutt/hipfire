@@ -700,9 +700,22 @@ pub const GEMM_QKV_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/
 // Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
 // Port of gemm_qkv_hfq4g256_wave64_dp4a from gfx906 to wave32 + HFQ3 unpack.
 pub const GEMM_QKV_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dp4a.gfx1030.hip");
-// Wave32 MMQ variant — gfx1030+ Phase 3 minimal probe. Port of the gfx906
-// MMQ residual body (LDS-tiled X reuse, mmq_x=32, MMQ_Y=128). Env-gated.
-pub const GEMM_HFQ3G256_RESIDUAL_MMQ_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq.gfx1030.hip");
+// Wave32 MMQ residual family — gfx1030+ Phase 3 probe. Tile-size templates
+// over the shared body in `gemm_hfq3g256_residual_mmq_body.cuh`. The body
+// defines MMQ_Y=128 rows × MMQ_X cols per workgroup with LDS-tiled X reuse;
+// each instantiation specializes MMQ_X for a batch-size regime.
+//   x8  → batch ≤ ~12 (short prefill, tile granularity dominates)
+//   x16 → batch 12-24 (mid-prefill)
+//   x32 → batch ≥ 24  (long prefill, b128 LDS path is profitable)
+//
+// The body is included via the shared `_BODY_CUH` const at dispatch time
+// (string-replace into each tile wrapper) — the runtime hipcc compile
+// happens in cache_dir which doesn't have kernels/src on its -I path.
+// Same pattern as the gfx906 MMQ family.
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_body.cuh");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x8.gfx1030.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x16.gfx1030.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x32.gfx1030.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
