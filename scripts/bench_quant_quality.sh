@@ -19,7 +19,7 @@
 # Output is a markdown report with:
 # - Per-tensor MSE table (top 50 by MSE descending)
 # - Aggregate MSE stats by quant type (qt → mean / p99 / max)
-# - Train-pursuit reasoning smoke test result (default and workaround mode)
+# - Train-pursuit reasoning smoke test result
 #
 # When iterating on quantizer formats / scale-search algorithms, run this
 # before and after the change. The MSE delta on attention/FFN tensors
@@ -159,7 +159,6 @@ if ! command -v hipfire >/dev/null 2>&1; then
     echo "  (skip: hipfire CLI not on PATH)" >> "$OUT"
     echo "Skipping reasoning smoke test (no hipfire CLI)"
 else
-    # Phase 1: default mode (rmsnorm fix active)
     hipfire stop 2>&1 | head -1 || true
     sleep 2
     HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -2
@@ -180,8 +179,6 @@ else
     {
         echo "Model: \`$MODEL_ID\`"
         echo
-        echo "### Default (rmsnorm fix active)"
-        echo
         echo '```'
     } >> "$OUT"
 
@@ -201,62 +198,6 @@ print(json.dumps({
 import json
 try:
     d=json.load(open('/tmp/_smoke_default.json'))
-    c=d['choices'][0]
-    print('finish_reason:', c['finish_reason'])
-    print('completion_tokens:', d['usage']['completion_tokens'])
-    print('content_len:', len(c['message']['content']))
-    if len(c['message']['content']) == 0:
-        print('VERDICT: SPIRAL (empty content after <think> strip)')
-    elif len(c['message']['content']) > 800:
-        print('VERDICT: COHERENT (' + str(len(c['message']['content'])) + ' chars)')
-    else:
-        print('VERDICT: PARTIAL (' + str(len(c['message']['content'])) + ' chars)')
-    print()
-    print('--- preview (first 400 chars) ---')
-    print(c['message']['content'][:400])
-except Exception as e:
-    print('ERROR:', e)
-" >> "$OUT"
-
-    echo '```' >> "$OUT"
-
-    # Phase 2: workaround mode
-    hipfire stop 2>&1 | head -1 || true
-    sleep 2
-    HIPFIRE_MODEL="$HFQ_PATH" HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 hipfire serve 8080 -d 2>&1 | tail -2
-    if ! wait_for_model_ready "$HFQ_PATH" 300; then
-        echo "  daemon failed to list requested model in workaround mode: $(basename "$HFQ_PATH")" | tee -a "$OUT"
-        hipfire stop 2>&1 | head -1 || true
-        exit 1
-    fi
-    MODEL_ID=$(model_id_for_path "$HFQ_PATH")
-    if [ -z "$MODEL_ID" ]; then
-        MODEL_ID="$(basename "$HFQ_PATH")"
-    fi
-
-    {
-        echo
-        echo "### Workaround (HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1)"
-        echo
-        echo '```'
-    } >> "$OUT"
-
-    timeout 240 curl -sS http://127.0.0.1:8080/v1/chat/completions \
-        -H 'Content-Type: application/json' \
-        -d "$(python3 -c "
-import json
-print(json.dumps({
-  'model': '$MODEL_ID',
-  'messages': [{'role':'user','content':'''$PROMPT'''}],
-  'temperature': 0,
-  'max_tokens': 400,
-}))
-")" > /tmp/_smoke_workaround.json 2>&1 || true
-
-    python3 -c "
-import json
-try:
-    d=json.load(open('/tmp/_smoke_workaround.json'))
     c=d['choices'][0]
     print('finish_reason:', c['finish_reason'])
     print('completion_tokens:', d['usage']['completion_tokens'])

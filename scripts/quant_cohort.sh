@@ -6,7 +6,7 @@
 #   - KLD vs FP16 reference  [STUB — fills in once chore/113-quant-eval-plan lands]
 #   - PPL on wikitext-2-test [STUB — same source]
 #   - HumanEval completion capture (bench_humaneval_completion.sh)
-#   - Train-pursuit reasoning smoke (default + workaround mode)
+#   - Train-pursuit reasoning smoke
 #
 # Output layout matches chore/113-quant-eval-plan's results/ schema so
 # kld_reduce.py can pick up the per-seq files unchanged once eval_hipfire
@@ -181,8 +181,8 @@ fi
     echo
     echo "## Per-variant metrics"
     echo
-    echo "| Variant | Arch | MSE mean (4-bit qts) | KLD mean ± CI | KLD p99 | PPL | HE tokens (sum) | Smoke (default) | Smoke (workaround) |"
-    echo "|---|---|---:|---|---:|---:|---:|---|---|"
+    echo "| Variant | Arch | MSE mean (4-bit qts) | KLD mean ± CI | KLD p99 | PPL | HE tokens (sum) | Smoke |"
+    echo "|---|---|---:|---|---:|---:|---:|---|"
 } > "$PROGRESS"
 
 # Spiral-detection prompt (matches existing bench_quant_quality.sh; intentionally
@@ -387,19 +387,16 @@ print(s)
         echo "    (skip: hipfire CLI not on PATH)"
     fi
 
-    # ─── 4. Reasoning smoke (default + workaround) ─────────────────────
+    # ─── 4. Reasoning smoke ─────────────────────────────────────────────
     echo "  [4/4] reasoning smoke..."
-    SMOKE_DEFAULT="—"
-    SMOKE_WORKAROUND="—"
+    SMOKE="—"
     if command -v hipfire >/dev/null 2>&1; then
-        # Default mode
         hipfire stop 2>&1 | head -1 || true; sleep 2
         HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
         if ! wait_for_model_ready "$HFQ_PATH" 300; then
-            SMOKE_DEFAULT="ERR_DAEMON_NOT_READY"
-            SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
+            SMOKE="ERR_DAEMON_NOT_READY"
             hipfire stop 2>&1 | head -1 || true
-            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE_DEFAULT} | ${SMOKE_WORKAROUND} |" >> "$PROGRESS"
+            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >> "$PROGRESS"
             continue
         fi
 
@@ -413,38 +410,12 @@ import json
 print(json.dumps({'model':'$MODEL_ID','messages':[{'role':'user','content':'''$PROMPT'''}],'temperature':0,'max_tokens':400}))
 ")
         timeout 300 curl -sS http://127.0.0.1:8080/v1/chat/completions \
-            -H 'Content-Type: application/json' -d "$body" > "${PV}.smoke-default.json" 2>&1 || true
+            -H 'Content-Type: application/json' -d "$body" > "${PV}.smoke.json" 2>&1 || true
 
-        SMOKE_DEFAULT=$(python3 -c "
+        SMOKE=$(python3 -c "
 import json
 try:
-    d = json.load(open('${PV}.smoke-default.json'))
-    c = d['choices'][0]['message']['content']
-    n = len(c)
-    if n == 0: print('SPIRAL')
-    elif n > 800: print(f'COHERENT_{n}c')
-    else: print(f'PARTIAL_{n}c')
-except Exception as e:
-    print(f'ERR_{e}')
-")
-        hipfire stop 2>&1 | head -1 || true
-
-        # Workaround mode (HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1)
-        sleep 2
-        HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1 HIPFIRE_MODEL="$HFQ_PATH" hipfire serve 8080 -d 2>&1 | tail -1 >/dev/null
-        if ! wait_for_model_ready "$HFQ_PATH" 300; then
-            SMOKE_WORKAROUND="ERR_DAEMON_NOT_READY"
-            hipfire stop 2>&1 | head -1 || true
-            echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE_DEFAULT} | ${SMOKE_WORKAROUND} |" >> "$PROGRESS"
-            continue
-        fi
-        timeout 300 curl -sS http://127.0.0.1:8080/v1/chat/completions \
-            -H 'Content-Type: application/json' -d "$body" > "${PV}.smoke-workaround.json" 2>&1 || true
-
-        SMOKE_WORKAROUND=$(python3 -c "
-import json
-try:
-    d = json.load(open('${PV}.smoke-workaround.json'))
+    d = json.load(open('${PV}.smoke.json'))
     c = d['choices'][0]['message']['content']
     n = len(c)
     if n == 0: print('SPIRAL')
@@ -456,7 +427,7 @@ except Exception as e:
         hipfire stop 2>&1 | head -1 || true
     fi
 
-    echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE_DEFAULT} | ${SMOKE_WORKAROUND} |" >> "$PROGRESS"
+    echo "| ${VARIANT} | ${ARCH} | ${MSE_MEAN} | ${KLD_MEAN} | ${KLD_P99} | ${PPL_VAL} | ${HE_TOK_SUM} | ${SMOKE} |" >> "$PROGRESS"
 
 done < "$SPEC"
 

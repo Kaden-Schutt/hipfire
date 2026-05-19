@@ -1,7 +1,23 @@
 # Qwen3.5/3.6-A3B MoE coherence investigation
 
-**Date:** 2026-05-10 (in progress)
+**Date:** 2026-05-10 (in progress) — **resolved 2026-05-17**
 **Trigger:** Validating PR #228 (rmsnorm fix for MoE final norm) re-exposed a pre-existing `<think>` infinite-loop spiral on Qwen3.6-35B-A3B reasoning prompts. The spiral exists at correct GemmaRMSNorm scale and partly resists the env-var workaround that restores under-scaled behavior. This document tracks the investigation into the underlying precision attractor.
+
+## Resolution (2026-05-17)
+
+The underlying attractor was **not** a precision cliff in the MoE / router / final-norm path. It was the daemon's `repeat_penalty` default of 1.3 over a 128-token window penalizing legitimately repeated chain-of-thought formatting tokens (bullet markers, indentation), dropping the trajectory off the model's well-trained reasoning path into a self-doubt / number-hallucination attractor. The pattern matched llama.cpp's `--repeat-penalty 1.0` and HF transformers' `generate(repetition_penalty=1.0)` defaults; both produce clean structured CoT on the same prompts at greedy decode. Commit `9b4ab74a` (PR #267) flipped the daemon default from 1.3 → 1.0, dissolving the spiral on Qwen3.6-35B-A3B at correct GemmaRMSNorm scale without any precision-path change. A/B verified on `/local/hipfire/qwen3.6-35b-a3b.mq4`:
+
+- **rp=1.0, no workaround:** clean step-by-step reasoning to 60(t+2)=90t → t=4 hours ✓
+- **rp=1.3 (prior default), no workaround:** classic self-doubt spiral ("Wait, re-reading prompt…", hallucinated numbers, looping Step B/C/D)
+- **rp=1.0 + `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW=1`:** equivalent quality to rp=1.0 plain
+
+The env-var fallback (`HIPFIRE_QWEN_MOE_FINAL_NORM_RAW`) is therefore redundant and was removed together with this investigation closure. The router-precision / fast-path-eligibility hypotheses below are not falsified, but are no longer load-bearing for the documented spiral; the precision interactions remain a real consideration for future MoE quality work but they're not the reasoning-loop cause.
+
+Reproducer: `scripts/test_pr228_spiral_check.sh` (A/B/C against the same prompt + daemon).
+
+---
+
+## Original (pre-resolution) investigation follows.
 
 ## TL;DR (live, will update)
 
