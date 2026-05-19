@@ -27,7 +27,9 @@ status per phase in §5.
 | `4bf9f6d4` | HFQ4 quantisation of Qwen2-1.5B validated (820 MB, 100% coverage); `inspect_hfq` example |
 | `e034c44b` | Real `Qwen2Weights::load` — 28 layers + tied-lm_head + Q/K/V bias; cross-arch TODO markers on both sides |
 | `45913eb0` | Rev-2 review fold-in: §2/§5/§6 amendments, tied-F16 lm_head fix (B1), EOS array semantics, lib.rs / doc refreshes, plan rename |
-| _pending_ | R1: `hipfire-quantize --arch-id <u32>` flag + re-quantise `qwen2-1.5b.arch7.hfq4` (arch_id byte = `0x07` verified) |
+| `9477fbbb` | R1: `hipfire-quantize --arch-id <u32>` flag + re-quantised `qwen2-1.5b.arch7.hfq4` (arch_id byte = `0x07` verified, inspect_hfq --load succeeds) |
+| `51e05b99` | R2: LLaMA-family loader (`load_weights_hfq`) now hard-fails when `q_proj.bias` is in the manifest — closes the silent-wrong-output footgun for mis-tagged Qwen2 HFQ files |
+| _pending_ | Phase 0 item 6 + 7: HF reference for Qwen2-1.5B-Instruct captured at `benchmarks/references/qwen2_1p5b_instruct_smoke.json` (transformers 5.5.1; 25 KB artifact carries first-16 completion IDs + top-100 logits at pos 0/8/14 for future forward-pass top-1 match validation) |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -558,15 +560,26 @@ plan review; this phase makes the artifacts reproducible.
    IDs (first 200 positions), logits at 0/32/128, parsed JSON
    output. Required for phase 4 OCR gate.
 
-6. **[PENDING]** End-to-end run Qwen2-1.5B-Instruct under HF
-   transformers on `benchmarks/prompts/qwen2_smoke.txt` (commit
-   prompt bytes, record md5). Greedy temp=0, 32 tokens. Capture
-   token IDs + logits at 0/8/16. Required for phase 1 validation
-   step (currently blocking the forward-pass acceptance criterion).
+6. **[DONE]** End-to-end Qwen2-1.5B-Instruct HF reference captured.
+   - Prompt at `benchmarks/prompts/qwen2_smoke.txt` (83 bytes,
+     md5 `4800a2ddde4312e40d692bd4d6ac193f`).
+   - Capture script `scripts/capture_qwen2_reference.py`.
+   - Reference artifact `benchmarks/references/qwen2_1p5b_instruct_smoke.json`
+     (25 KB) records: prompt token IDs (15 tokens), greedy-decoded
+     continuation (32 tokens), top-100 logits at positions 0 / 8 / 14
+     (= n_prompt-1, the first-completion-token predictor), generation
+     config, transformers version, torch version, snapshot path.
+   - Note: actual transformers version is 5.5.1 (not 4.56.1 — the
+     installed venv was newer; reference re-capture needed only if
+     transformers version drift changes outputs).
+   - Sanity check: top-1 at `pos_14` = token 362, which matches
+     `first_16_completion_token_ids[0]` (= 362). Greedy + logit dump
+     are self-consistent.
 
-7. **[PENDING]** venv setup: `python -m venv .venv && .venv/bin/pip
-   install transformers==4.56.1 torch safetensors`. Per
-   `feedback_use_venv_for_python_installs`. Needed for items 5/6.
+7. **[DONE]** venv setup: `.venv` already exists at repo root from
+   a prior session, with transformers 5.5.1 / torch 2.6.0 (CPU) /
+   safetensors 0.7.0 installed. Per
+   `feedback_use_venv_for_python_installs`.
 
 **Contingency:** if any phase-0 assumption fails verification, halt
 phase 1 and amend §2 before proceeding.
