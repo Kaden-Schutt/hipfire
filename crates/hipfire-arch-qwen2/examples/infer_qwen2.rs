@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    eprintln!("[5/5] loading weights to GPU");
+    eprintln!("[5/5] loading weights + allocating Qwen2State");
     let mut gpu = Gpu::init()?;
     let weights = qwen2::load_weights(&mut hfq, &cfg, &mut gpu)?;
     eprintln!(
@@ -177,22 +177,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         weights.embd_format,
     );
 
+    let mut state = qwen2::Qwen2State::new(&mut gpu, &cfg)
+        .map_err(|e| format!("Qwen2State::new failed: {e}"))?;
+    eprintln!("      KV budget = {} positions", state.max_seq);
+
+    if prompt_ids.is_empty() {
+        eprintln!("ok (loaded; no --prompt-file → skipping forward)");
+        return Ok(());
+    }
+
+    // Prefill: run forward_step for each prompt token. We keep only the
+    // *last* logits — earlier positions are written to the KV cache but
+    // their logits are discarded because we want the prediction
+    // *after* the final prompt token.
+    eprintln!("[forward] prefilling {} prompt tokens", prompt_ids.len());
+    let prefill_start = std::time::Instant::now();
+    for (i, &tok) in prompt_ids.iter().enumerate() {
+        qwen2::forward_step(&mut gpu, &weights, &cfg, &mut state, tok)?;
+        if i % 8 == 0 || i + 1 == prompt_ids.len() {
+            eprintln!("  prompt pos {i:3}: token {tok} → pos_after={}", state.next_pos);
+        }
+    }
+    let prefill_ms = prefill_start.elapsed().as_millis();
+
+    // Greedy-decode max_new_tokens from the post-prefill logits.
     eprintln!(
-        "\nNOTE: forward pass not yet implemented in hipfire-arch-qwen2 \
-         (rev 2). Once it lands, this binary will greedy-decode \
-         max_new_tokens={} from prompt_ids[{}] and compare against the \
-         reference's first_16_completion_token_ids field.\n\
-         \n\
-         For now, the validation work this binary performs is:\n\
-         (a) HFQ header / config parse / weight load succeeds end-to-end\n\
-         (b) tokenizer parity against HF for the smoke prompt\n\
-         \n\
-         Both of (a) and (b) are prerequisites for top-1 token match.",
-        args.max_new_tokens,
+        "[forward] greedy-decoding {} continuation tokens",
+        args.max_new_tokens
+    );
+    let mut generated: Vec<u32> = Vec::with_capacity(args.max_new_tokens);
+    // The first continuation token is argmax of the logits already in
+    // state.logits (set by the last prefill forward_step).
+    let mut next_tok = gpu.argmax_f32(&state.logits, cfg.vocab_size)?;
+    generated.push(next_tok);
+    eprintln!("  gen 0: {next_tok}");
+    for i in 1..args.max_new_tokens {
+        next_tok = qwen2::forward_step_greedy(&mut gpu, &weights, &cfg, &mut state, next_tok)?;
+        generated.push(next_tok);
+        eprintln!("  gen {i}: {next_tok}");
+    }
+    let total_ms = prefill_start.elapsed().as_millis();
+    eprintln!(
+        "[forward] done: {} prompt + {} gen tokens in {} ms (prefill {} ms)",
         prompt_ids.len(),
+        generated.len(),
+        total_ms,
+        prefill_ms,
     );
 
+    // Reference compare on the generated tokens.
+    if let Some(ref_path) = args.reference.as_deref() {
+        check_completion_parity(ref_path, &generated)?;
+    } else {
+        eprintln!("(no --reference; skipping completion parity check)");
+    }
+
+    eprintln!("ok");
     Ok(())
+}
+
+fn check_completion_parity(
+    ref_path: &str,
+    hipfire_ids: &[u32],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ref_bytes = std::fs::read(ref_path)?;
+    let ref_json: serde_json::Value = serde_json::from_slice(&ref_bytes)?;
+    let ref_first16: Vec<u32> = ref_json
+        .get("first_16_completion_token_ids")
+        .and_then(|v| v.as_array())
+        .ok_or("reference JSON missing first_16_completion_token_ids array")?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|n| n as u32))
+        .collect();
+
+    let n = ref_first16.len().min(hipfire_ids.len());
+    eprintln!(
+        "[validate] comparing first {n} generated tokens vs HF reference"
+    );
+
+    let mut matches = 0usize;
+    for i in 0..n {
+        let h = hipfire_ids[i];
+        let r = ref_first16[i];
+        let mark = if h == r { "✓" } else { "✗" };
+        eprintln!("  {mark} pos {i:2}: hipfire={h:6}  ref={r:6}");
+        if h == r {
+            matches += 1;
+        }
+    }
+    eprintln!("[validate] {matches} / {n} top-1 matches");
+    if matches == n {
+        eprintln!("[validate] PASS — top-1 match on all {n} positions");
+        Ok(())
+    } else {
+        Err(format!(
+            "top-1 token match FAILED: {matches}/{n} positions match \
+             between hipfire and HF reference. First divergence at \
+             position {}.",
+            (0..n).find(|&i| hipfire_ids[i] != ref_first16[i]).unwrap_or(n)
+        )
+        .into())
+    }
 }
 
 fn check_tokenizer_parity(

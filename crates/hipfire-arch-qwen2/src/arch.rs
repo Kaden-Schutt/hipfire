@@ -52,8 +52,8 @@ impl Architecture for Qwen2 {
         Qwen2Weights::load(hfq, cfg, gpu)
     }
 
-    fn new_state(_gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
-        Qwen2State::new(cfg)
+    fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
+        Qwen2State::new(gpu, cfg)
     }
 
     // ── Optional overrides ────────────────────────────────────────────

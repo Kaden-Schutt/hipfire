@@ -20,9 +20,9 @@
 //! pull these into `hipfire_runtime::transformer::*` so every arch
 //! crate shares one implementation. Marked individually below.
 
-use hip_bridge::HipResult;
+use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -460,36 +460,277 @@ fn load_weight_tensor(
 
 // ─── State ───────────────────────────────────────────────────────────────
 
-/// Qwen2 per-decode GPU scratch (KV cache + attention workspace).
+/// Qwen2 per-decode GPU scratch (KV cache + per-step workspace).
 ///
-/// Rev 2: stub. The real implementation is *not* a single KV-cache
-/// allocation — it's the entire scratch graph mirroring
-/// `hipfire_runtime::llama::ForwardScratch::new`:
+/// Rev 3: real. Mirrors `hipfire_runtime::llama::ForwardScratch` with
+/// three deltas:
 ///
-/// - KV cache: `num_key_value_heads × head_dim × max_seq_len ×
-///   num_hidden_layers` (quantised per `--kv-mode`).
-/// - Q/K/V projection scratch: `n_heads × head_dim` for Q,
-///   `n_kv_heads × head_dim` for K and V, per layer.
-/// - RMSNorm output scratch, RoPE cos/sin tables (or precomputed
-///   inv_freq).
-/// - Attention output scratch (`n_heads × head_dim`) and logit
-///   scratch (`vocab_size`).
-/// - FFN intermediate scratch (`intermediate_size`).
+/// - **F32 KV cache** only. The bring-up validation path is greedy
+///   decode against an HF F32 reference, so any KV quantisation would
+///   add a confound to top-1 match debugging. Quantised KV (HFQ4 /
+///   HFQ8 / asym-N / Q8) is a phase-1.5 follow-on under the existing
+///   `kv_mode` story.
+/// - **No sampler scratch.** `sample_buf` / `repeat_buf` are unused
+///   because we drive validation with `argmax_f32` (greedy). Sampling
+///   wiring is a follow-on when the daemon arm is added (R3).
+/// - **No `x_rot`.** Qwen2 uses HFQ4 weights with no FWHT rotation
+///   per row; the MagnumQuant `x_rot` scratch in `ForwardScratch` is
+///   dead weight here.
 ///
-/// Budget: several hours of porting, not a single-buffer allocation.
-/// The trait's `new_state(gpu: &mut Gpu, cfg)` signature already
-/// passes `gpu` for this reason; the rev-2 stub drops it. See
-/// `hipfire-runtime/src/llama.rs` for the dense-FA reference shape
-/// and the qwen35 `ForwardScratch` for the qwen-family kv-mode
-/// extensions.
+/// Sizes:
+/// - `x`, `tmp`, `o`, `ffn_out` : `hidden_size` (residual stream)
+/// - `q`, `attn_out`            : `n_heads × head_dim`
+/// - `k`, `v`                   : `n_kv_heads × head_dim`
+/// - `gate`, `up`, `ffn_hidden` : `intermediate_size`
+/// - `logits`                   : `vocab_size`
+/// - `k_cache[layer]`, `v_cache[layer]`: `max_seq × n_kv_heads × head_dim`
+/// - `pos_buf`                  : 4 bytes (single i32, device-side
+///   position counter for `rope_f32` / `kv_cache_write` / `attention_f32`)
+///
+/// `max_seq` is the KV cache budget set at allocation time. Bring-up
+/// uses 512 which fits the smoke prompt + 32-token continuation with
+/// headroom; bump via `Qwen2State::new_with_max_seq` for longer runs.
 pub struct Qwen2State {
-    pub token_count: usize,
+    pub x: GpuTensor,
+    pub tmp: GpuTensor,
+    pub q: GpuTensor,
+    pub k: GpuTensor,
+    pub v: GpuTensor,
+    pub attn_out: GpuTensor,
+    pub o: GpuTensor,
+    pub gate: GpuTensor,
+    pub up: GpuTensor,
+    pub ffn_hidden: GpuTensor,
+    pub ffn_out: GpuTensor,
+    pub logits: GpuTensor,
+    pub pos_buf: DeviceBuffer,
+    pub k_cache: Vec<GpuTensor>,
+    pub v_cache: Vec<GpuTensor>,
+    pub max_seq: usize,
+    /// Tracks the next free KV slot — i.e. the absolute position the
+    /// next forward step will write. Bumped by [`forward_step`].
+    pub next_pos: usize,
 }
 
+/// Default KV budget for the bring-up validation path. Smoke prompt is
+/// 15 tokens + 32-token continuation = 47 positions consumed; 512 leaves
+/// 10× headroom and only costs `28 × 2 × 512 × 256 × 4 ≈ 28 MB` VRAM
+/// at f32 KV (28 layers, k+v, kv_dim=256, f32).
+pub const DEFAULT_MAX_SEQ: usize = 512;
+
 impl Qwen2State {
-    pub fn new(_cfg: &Qwen2Config) -> Result<Self, String> {
-        Ok(Qwen2State { token_count: 0 })
+    /// Construct with the default KV budget. Wraps the trait surface.
+    pub fn new(gpu: &mut Gpu, cfg: &Qwen2Config) -> Result<Self, String> {
+        Self::new_with_max_seq(gpu, cfg, DEFAULT_MAX_SEQ)
+            .map_err(|e| format!("qwen2: Qwen2State::new failed: {e:?}"))
     }
+
+    /// Allocate the full scratch graph + KV cache at the given seq budget.
+    pub fn new_with_max_seq(
+        gpu: &mut Gpu,
+        cfg: &Qwen2Config,
+        max_seq: usize,
+    ) -> HipResult<Self> {
+        let dim = cfg.hidden_size;
+        let q_dim = cfg.num_attention_heads * cfg.head_dim;
+        let kv_dim = cfg.num_key_value_heads * cfg.head_dim;
+        let hidden_dim = cfg.intermediate_size;
+
+        let mut k_cache = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut v_cache = Vec::with_capacity(cfg.num_hidden_layers);
+        for _ in 0..cfg.num_hidden_layers {
+            k_cache.push(gpu.zeros(&[max_seq * kv_dim], DType::F32)?);
+            v_cache.push(gpu.zeros(&[max_seq * kv_dim], DType::F32)?);
+        }
+
+        Ok(Self {
+            x:           gpu.alloc_tensor(&[dim], DType::F32)?,
+            tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
+            q:           gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            k:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            v:           gpu.alloc_tensor(&[kv_dim], DType::F32)?,
+            attn_out:    gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            o:           gpu.alloc_tensor(&[dim], DType::F32)?,
+            gate:        gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            up:          gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_hidden:  gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
+            ffn_out:     gpu.alloc_tensor(&[dim], DType::F32)?,
+            logits:      gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
+            pos_buf:     gpu.hip.malloc(4)?,
+            k_cache,
+            v_cache,
+            max_seq,
+            next_pos: 0,
+        })
+    }
+}
+
+// ─── Forward pass ───────────────────────────────────────────────────────
+
+/// Single-token decode step. Reads `token` at `state.next_pos`, runs
+/// the full 28-layer stack, writes K/V into the cache at the same
+/// position, and leaves the final logits in `state.logits`. Bumps
+/// `state.next_pos` by 1.
+///
+/// Returns Ok(()) on success; `state.logits` holds the f32 vocab-sized
+/// distribution and the caller drives sampling (e.g. via
+/// [`forward_step_greedy`], or future top-p / repeat-penalty paths).
+///
+/// Layer body, in order:
+///
+/// 1. RMSNorm(x → tmp) with `attn_norm`
+/// 2. `fused_qkv_hfq4g256(tmp → q,k,v)` (assumes HFQ4G256 attn weights;
+///    other dtypes fall back to three `weight_gemv` calls)
+/// 3. `bias_add_f32` on each of q, k, v (Qwen2 has attention_bias=true)
+/// 4. RoPE on q,k (1-D, theta=cfg.rope_theta)
+/// 5. KV cache write at `next_pos`
+/// 6. `attention_f32` (GQA via `n_heads` vs `n_kv_heads`)
+/// 7. `o_proj` via `weight_gemv` → o
+/// 8. Residual add x += o
+/// 9. RMSNorm(x → tmp) with `ffn_norm`
+/// 10. SwiGLU: `gate = w_gate(tmp)`, `up = w_up(tmp)`,
+///     `ffn_hidden = silu(gate) * up`, `ffn_out = w_down(ffn_hidden)`
+/// 11. Residual add x += ffn_out
+///
+/// Then final RMSNorm + lm_head GEMV → logits.
+///
+/// What this does NOT do:
+/// - Prefill batching (we run one token at a time; prefill = N
+///   sequential calls). Adequate for greedy validation on short prompts;
+///   prefill batching is a follow-on for serving perf.
+/// - KV quantisation (cache is F32; see Qwen2State doc for rationale).
+/// - Sampling (caller picks argmax or top-p).
+pub fn forward_step(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    token: u32,
+) -> HipResult<()> {
+    let pos = state.next_pos;
+    if pos >= state.max_seq {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: forward_step pos={pos} >= max_seq={}; \
+                 rebuild Qwen2State with a larger budget via \
+                 Qwen2State::new_with_max_seq",
+                state.max_seq
+            ),
+        ));
+    }
+
+    // Upload pos to GPU buffer (single i32, used by rope/kv_write/attention).
+    let pos_i32 = pos as i32;
+    gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
+
+    // Embedding lookup → x.
+    let dim = cfg.hidden_size;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+    }
+
+    let n_heads = cfg.num_attention_heads;
+    let n_kv_heads = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let layer = &weights.layers[layer_idx];
+
+        // (1) RMSNorm(x → tmp) with input_layernorm.
+        gpu.rmsnorm_f32(&state.x, &layer.attn_norm, &state.tmp, cfg.rms_norm_eps)?;
+
+        // (2) QKV projection. fused_qkv_hfq4g256 expects all three weights
+        // to be HFQ4G256; otherwise fall through to three individual
+        // weight_gemv calls. This keeps the bring-up path open for F16
+        // weights (qt=1) while the HFQ4G256 fast path is the default.
+        let all_hfq4g256 = layer.wq.gpu_dtype == DType::HFQ4G256
+            && layer.wk.gpu_dtype == DType::HFQ4G256
+            && layer.wv.gpu_dtype == DType::HFQ4G256;
+        if all_hfq4g256 {
+            gpu.fused_qkv_hfq4g256(
+                &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                &state.tmp,
+                &state.q, &state.k, &state.v,
+                layer.wq.m, layer.wk.m, layer.wv.m,
+                layer.wq.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.wq, &state.tmp, &state.q)?;
+            weight_gemv(gpu, &layer.wk, &state.tmp, &state.k)?;
+            weight_gemv(gpu, &layer.wv, &state.tmp, &state.v)?;
+        }
+
+        // (3) QKV bias. attention_bias=true on Qwen2 — three small adds
+        // per layer (batch=1, n=q_dim or kv_dim). This is the option (c)
+        // path from the plan §5; promotable to a fused fused_qkv_*_bias
+        // kernel later under the Δ ≥ 5% rule.
+        gpu.bias_add_f32(&state.q, &layer.wq_bias, 1, q_dim)?;
+        gpu.bias_add_f32(&state.k, &layer.wk_bias, 1, kv_dim)?;
+        gpu.bias_add_f32(&state.v, &layer.wv_bias, 1, kv_dim)?;
+
+        // (4) RoPE on q,k (1-D, theta from config). Qwen2 does NOT apply
+        // q/k RMSNorm pre-RoPE (Qwen3-only — see lib.rs doc).
+        gpu.rope_f32(&state.q, &state.k, &state.pos_buf, n_heads, n_kv_heads, head_dim, cfg.rope_theta)?;
+
+        // (5) KV cache write at pos.
+        gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&state.v_cache[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
+
+        // (6) Attention (F32 KV cache; GQA via n_heads / n_kv_heads).
+        gpu.attention_f32(
+            &state.q,
+            &state.k_cache[layer_idx],
+            &state.v_cache[layer_idx],
+            &state.attn_out,
+            &state.pos_buf,
+            pos + 1, // seq_len_hint = pos+1 (newest token included)
+            n_heads, n_kv_heads, head_dim,
+            state.max_seq,
+        )?;
+
+        // (7) o_proj (no bias) + (8) residual.
+        weight_gemv(gpu, &layer.wo, &state.attn_out, &state.o)?;
+        gpu.add_inplace_f32(&state.x, &state.o)?;
+
+        // (9) FFN norm.
+        gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
+
+        // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
+        weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
+        weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
+        weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.ffn_out)?;
+
+        // (11) Residual.
+        gpu.add_inplace_f32(&state.x, &state.ffn_out)?;
+    }
+
+    // Final RMSNorm + lm_head.
+    gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
+    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+
+    state.next_pos = pos + 1;
+    Ok(())
+}
+
+/// Convenience: run [`forward_step`] then greedy-argmax the logits.
+/// Returns the next token id.
+pub fn forward_step_greedy(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    token: u32,
+) -> HipResult<u32> {
+    forward_step(gpu, weights, cfg, state, token)?;
+    gpu.argmax_f32(&state.logits, cfg.vocab_size)
 }
 
 #[cfg(test)]
