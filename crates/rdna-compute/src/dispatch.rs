@@ -4998,13 +4998,30 @@ impl Gpu {
 
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_qkv_hfq4g256_wave64",
-                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
-                "fused_qkv_hfq4g256_wave64",
-            )?;
-            let total = (q_m + k_m + v_m) as u32;
-            ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_v2_gfx942",
+                    kernels::FUSED_QKV_HFQ4G256_V2_GFX942_SRC,
+                    "fused_qkv_hfq4g256_v2_gfx942",
+                )?;
+                let total = (q_m + k_m + v_m) as u32;
+                ("fused_qkv_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_wave64",
+                    kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
+                    "fused_qkv_hfq4g256_wave64",
+                )?;
+                let total = (q_m + k_m + v_m) as u32;
+                ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256",
@@ -5093,13 +5110,30 @@ impl Gpu {
         // wave64, so it is safe for Vega 20 as well as CDNA.
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256_wave64",
-                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
-                "fused_qkvza_hfq4g256_wave64",
-            )?;
-            let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
-            ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_qkvza_hfq4g256_v2_gfx942",
+                    kernels::FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC,
+                    "fused_qkvza_hfq4g256_v2_gfx942",
+                )?;
+                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                ("fused_qkvza_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_qkvza_hfq4g256_wave64",
+                    kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
+                    "fused_qkvza_hfq4g256_wave64",
+                )?;
+                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256",
@@ -8541,7 +8575,35 @@ impl Gpu {
         let result = if cdna3 {
             // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
             // when enabled; gfx906/908 (or env override) keep wave64 base.
-            if gfx942_lds_gemv_enabled(&self.arch) && !gemv_prefetch_enabled(&self.arch) && (k as u32) * 4 <= 32768 {
+            if std::env::var("HIPFIRE_GFX942_GEMV_V3").map(|v| v == "1").unwrap_or(false) {
+                let kname = "gemv_hfq4g256_residual_v3_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 7) / 8;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [256, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            } else if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") && std::env::var("HIPFIRE_GFX942_GEMV_V2").map(|v| v != "0").unwrap_or(true) {
+                let kname = "gemv_hfq4g256_residual_v2_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 3) / 4;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [128, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            } else if gfx942_lds_gemv_enabled(&self.arch) && !gemv_prefetch_enabled(&self.arch) && (k as u32) * 4 <= 32768 {
                 let kname = "gemv_hfq4g256_residual_gfx942";
                 self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_GFX942_SRC, kname)?;
                 let grid = ((m as u32) + 7) / 8;
@@ -14696,13 +14758,30 @@ impl Gpu {
 
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_gate_up_hfq4g256_wave64",
-                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
-                "fused_gate_up_hfq4g256_wave64",
-            )?;
-            let total = (gate_m + up_m) as u32;
-            ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_gate_up_hfq4g256_v2_gfx942",
+                    kernels::FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC,
+                    "fused_gate_up_hfq4g256_v2_gfx942",
+                )?;
+                let total = (gate_m + up_m) as u32;
+                ("fused_gate_up_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_gate_up_hfq4g256_wave64",
+                    kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
+                    "fused_gate_up_hfq4g256_wave64",
+                )?;
+                let total = (gate_m + up_m) as u32;
+                ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256",

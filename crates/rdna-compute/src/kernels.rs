@@ -394,6 +394,11 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kern
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v2.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v3.gfx942.hip");
+pub const FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKV_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_v2.gfx942.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
