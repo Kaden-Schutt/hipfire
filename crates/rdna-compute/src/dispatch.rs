@@ -12212,6 +12212,11 @@ impl Gpu {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !fp16_disabled() {
+            // WMMA on gfx12 (RDNA4): _w32_gfx12 builtin (gfx11 builtin
+            // does NOT pattern-match on gfx12 — see has_wmma_f16 comment).
+            if has_wmma_f16_gfx12(&self.arch) {
+                return self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
+            }
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
             if self.arch.starts_with("gfx11") {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
@@ -12374,6 +12379,67 @@ impl Gpu {
                 &mut params,
             )
         };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// gfx12 sister of `gemm_hfq6g256_residual_wmma` (wo / w_down post-projection
+    /// for MQ6 LA/FA attention). Caller seeds Y with the residual; kernel does
+    /// `Y += X @ A^T`. Mirrors `gemm_q8_0_residual_wmma_gfx12` kernarg layout
+    /// and grid.
+    pub fn gemm_hfq6g256_residual_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        debug_assert_eq!(k % 256, 0, "gemm_hfq6g256_residual_wmma_gfx12: K must be a multiple of 256 (got K={k})");
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq6g256_residual_wmma_gfx12",
+            kernels::GEMM_HFQ6G256_RESIDUAL_WMMA_GFX12_SRC,
+            "gemm_hfq6g256_residual_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2  // FP16 X
+            + batch_size * m * 4 * 2; // residual read + write
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq6g256_residual_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq6g256_residual_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
