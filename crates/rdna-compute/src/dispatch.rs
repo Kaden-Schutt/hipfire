@@ -8786,6 +8786,68 @@ impl Gpu {
         result
     }
 
+    /// HFQ6/MQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched`.
+    /// Same kernel shape (grid = `M × batch`, block = 32, one warp per
+    /// `(row, token)`), but reads HFQ6's 200 B / group layout (4 B scale +
+    /// 4 B zero + 192 B packed 6-bit nibbles). MQ6G256 shares storage with
+    /// HFQ6G256 — caller applies the FWHT rotation upstream, same convention
+    /// as MQ4 / HFQ4. Used by the batched MoE FFN shared-expert `down`
+    /// projection in the AWQ-style mixed-precision path where shared.down
+    /// is MQ6 (12 of 40 layers in AWQ A3B fall into this case).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        c_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq6g256_residual_sigmoid_scaled",
+            kernels::GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC,
+            "gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_batch.buf.as_ptr();
+        let y_ptr = y_batch.buf.as_ptr();
+        let c_ptr = c_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // HFQ6 weight footprint: m * (k / 256) * 200 bytes per row + 4 B per
+        // input/output cell. No dedicated profile helper yet (HFQ6 GEMV
+        // currently doesn't appear in profile.rs); inlined here.
+        let groups = k / 256;
+        let weight_bytes = m * groups * 200;
+        let bytes = batch_size * (weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched",
+            [m as u32, batch_size as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_ptr(c_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in a
     /// single launch. Caller passes the 8 selected experts' weight
     /// tensors (in top-K order); the kernel's grid.y picks which expert

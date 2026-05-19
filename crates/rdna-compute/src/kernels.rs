@@ -401,6 +401,15 @@ pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../..
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
+///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
+/// HFQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` —
+/// unlocks the batched MoE-FFN shared-expert `down` projection for the
+/// AWQ-style mixed-precision path where shared.down is MQ6 (storage-
+/// compatible with HFQ6G256, 200 B / group of 256).
+pub const GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_residual_sigmoid_scaled.hip");
+
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
 /// expert's weight base from the W0..W7 kernarg array and runs the
