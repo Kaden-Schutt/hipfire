@@ -1,6 +1,6 @@
 # dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
 
-Status: proposal rev 2, 2026-05-19
+Status: rev 3 (in progress on `feat/dots-ocr-qwen2`), 2026-05-19
 Filename note: filed under `qwen_2.5_vlm.md` per the original request,
 but the actual backbone is **Qwen2**, not Qwen2.5 — both crates land
 under the Qwen2 family. Generalising to true Qwen2.5-VL is a stretch
@@ -12,6 +12,44 @@ critical corrections all stem from direct verification against the
 dots.ocr safetensors index, `tokenizer_config.json` /
 `generation_config.json`, vllm's `dots_ocr.py`, the daemon dispatch
 code, and the LLaMA-arch crate header.
+
+## 0. Progress log
+
+Live tracker, updated as commits land on `feat/dots-ocr-qwen2`. Detailed
+status per phase in §5.
+
+| commit | scope |
+|---|---|
+| `c6d4e539` | Bootstrap `hipfire-arch-qwen2` crate (skeleton from toy), `docs/architecture-ids.md`, rev-2 plan |
+| `8ab7ec62` | Real `Qwen2Config::from_hfq` parser + Qwen2-1.5B manifest + 4 unit tests |
+| `4bf9f6d4` | HFQ4 quantisation of Qwen2-1.5B validated (820 MB, 100% coverage); `inspect_hfq` example |
+| `e034c44b` | Real `Qwen2Weights::load` — 28 layers + tied-lm_head + Q/K/V bias; cross-arch TODO markers on both sides |
+
+Verified end-to-end on gfx1151:
+- Quantiser handles Qwen2 layer naming (closes risk M9 in §6).
+- Config parser yields exact match with Qwen2-1.5B-Instruct on all 13
+  fields, including the two non-trivial defaults (`attention_bias=true`
+  via Qwen2 modeling default; `tie_word_embeddings=true` extracted).
+- All 28 layers load to GPU with correct dimensions (wq 1536×1536,
+  wk 256×1536, lm_head 151936×1536).
+- Tied-embedding detection works; lm_head re-uploads embed_tokens
+  (~117 MB extra) since `GpuTensor` is not `Clone` — documented as a
+  follow-up consolidation candidate (see §6).
+
+Discovered during implementation (not in original plan):
+- `HipResult` lives in `hip_bridge::error`, not `rdna_compute`.
+- `GpuTensor` doesn't implement `Clone`; tied embeddings cost ~117 MB
+  VRAM duplication on Qwen2-1.5B at HFQ4. Resolvable via
+  `GpuTensor::shallow_clone()` or `Arc<GpuTensor>` in the
+  Transformer-extraction PR.
+- The qwen35 weight-loading helpers (`load_norm_weight*`,
+  `load_weight_tensor*`) are all private. Cross-arch reuse currently
+  requires duplication; both sides marked with
+  `TODO(transformer-extraction)` for the future consolidation PR.
+- `hipfire-quantize` auto-assigns `arch_id=1` to Qwen2 inputs (existing
+  Qwen2/3 default). Our `hipfire-arch-qwen2` claims `arch_id=7` to
+  avoid colliding with the LLaMA crate, so the HFQ needs a per-file
+  arch_id remap (or a quantiser CLI flag) before daemon dispatch.
 
 ## 1. Goal and scope
 
@@ -364,7 +402,7 @@ Goal: capture HF reference outputs that subsequent phases compare
 against. Most "verify X" sub-steps below are already done during
 plan review; this phase makes the artifacts reproducible.
 
-1. **Already verified during plan review** (no rework needed):
+1. **[DONE]** Verified during plan review:
    - Merger uses LayerNorm + bias (§2.4)
    - Merger MLP has bias on both linears (§2.4)
    - Chat template is custom, EOS = 151673 (§2.5)
@@ -373,47 +411,39 @@ plan review; this phase makes the artifacts reproducible.
    - dots.ocr text weights stored as `model.*` (no remap needed)
    - arch_id=1 already claimed by LLaMA crate (using 7 instead)
 
-2. **Read dots_ocr.py end-to-end** for any subtleties not surfaced
-   in review (e.g. how `image_grid_thw` is constructed for batch
-   sizes > 1, attention scale factor, weight-init quirks).
+2. **[PENDING]** Read dots_ocr.py end-to-end for subtleties not
+   surfaced in review (e.g. how `image_grid_thw` is constructed for
+   batch sizes > 1, attention scale factor, weight-init quirks).
+   Deferrable until phase 2 (vision tower) starts.
 
-3. **Capture dots.ocr safetensors manifest:**
-   ```bash
-   python -c "import json; idx=json.load(open(...)); ..." \
-     > docs/plans/qwen_2.5_vlm.dots_ocr_manifest.txt
-   ```
-   Sum tensor numels to confirm the ~3.04B total param count.
+3. **[DONE]** dots.ocr safetensors manifest captured at
+   `docs/plans/qwen_2.5_vlm.dots_ocr_manifest.txt` (642 lines, 338
+   tensors). Param count to be confirmed during phase 2 weight load.
 
-4. **Capture Qwen2-1.5B safetensors manifest** to confirm tied-
-   embeddings layout (no lm_head.weight on disk):
-   `qwen_2.5_vlm.qwen2_1p5b_manifest.txt`.
+4. **[DONE]** Qwen2-1.5B safetensors manifest captured at
+   `docs/plans/qwen_2.5_vlm.qwen2_1p5b_manifest.txt` (339 lines, 338
+   tensors). No `lm_head.weight` confirms `tie_word_embeddings=true`;
+   `q/k/v_proj.bias` entries confirm `attention_bias=true`.
 
-5. **End-to-end run dots.ocr under HF transformers** on a single
-   committed page image (commit the image bytes to
-   `benchmarks/images/dots_ocr_smoke_001.png`, record md5). Use
-   `transformers==4.56.1` (dots.ocr pinned version),
-   `trust_remote_code=True` (intentional — modeling code is shipped
-   in the HF repo, we've already read it). Capture:
-   - Token IDs for first 200 positions
-   - Logits at positions 0 / 32 / 128 (numpy `.npz`, F32)
-   - Parsed JSON layout output
-   Reference becomes the phase-4 oracle. Without it, "looks fluent"
-   is the only correctness signal.
+5. **[PENDING]** End-to-end run dots.ocr under HF transformers on a
+   committed page image. Commit image bytes to
+   `benchmarks/images/dots_ocr_smoke_001.png`, record md5. Use
+   `transformers==4.56.1`, `trust_remote_code=True`. Capture token
+   IDs (first 200 positions), logits at 0/32/128, parsed JSON
+   output. Required for phase 4 OCR gate.
 
-6. **End-to-end run Qwen2-1.5B-Instruct under HF transformers** on a
-   short committed text prompt
-   (`benchmarks/prompts/qwen2_smoke.txt`, record md5). Greedy
-   temperature=0, 32 tokens. Capture token IDs and logits at
-   positions 0/8/16. Reference for phase 1.
+6. **[PENDING]** End-to-end run Qwen2-1.5B-Instruct under HF
+   transformers on `benchmarks/prompts/qwen2_smoke.txt` (commit
+   prompt bytes, record md5). Greedy temp=0, 32 tokens. Capture
+   token IDs + logits at 0/8/16. Required for phase 1 validation
+   step (currently blocking the forward-pass acceptance criterion).
 
-7. **Set up venv:**
-   `python -m venv .venv && .venv/bin/pip install transformers==4.56.1
-   torch safetensors`. Per `feedback_use_venv_for_python_installs`.
+7. **[PENDING]** venv setup: `python -m venv .venv && .venv/bin/pip
+   install transformers==4.56.1 torch safetensors`. Per
+   `feedback_use_venv_for_python_installs`. Needed for items 5/6.
 
 **Contingency:** if any phase-0 assumption fails verification, halt
-phase 1 and amend §2 before proceeding. Most likely surprises:
-- vllm code shows a feature not surfaced in review (handle ad hoc).
-- HF reference run OOMs on the page image (use a smaller test image).
+phase 1 and amend §2 before proceeding.
 
 ### Phase 1 — Qwen2 text decoder, standalone crate (1-3 days)
 
@@ -421,19 +451,62 @@ Bring up `hipfire-arch-qwen2` against Qwen2-1.5B-Instruct first.
 arch_id = 7. Independently useful (fills the long-empty plain-Qwen2
 slot) and unblocks the dots.ocr text path.
 
-**Bring-up:**
-- Copy `crates/hipfire-arch-toy/` → `crates/hipfire-arch-qwen2/`
-  per the toy README procedure.
-- Add to workspace `members` and `hipfire-runtime/Cargo.toml`
-  dev-deps.
-- Create `docs/architecture-ids.md` recording slots 0/1/5/6/0xFF
-  (existing) and 7 (qwen2) reserved for this work. (8 added in
-  phase 3.)
+**Bring-up:** [DONE in `c6d4e539`]
+- ✅ Copied `crates/hipfire-arch-toy/` → `crates/hipfire-arch-qwen2/`.
+- ✅ Added to workspace `members`.
+- ✅ Created `docs/architecture-ids.md` recording slots
+  0/1/5/6/7/8/0xFF (slot 8 reserved for dots.ocr in phase 3).
+- ✅ `Architecture` trait impl with `arch_id() = 7`, `name() =
+  "qwen2"`, `eos_filter_overrides` setting `strip_think: Some(false)`.
+
+**Config parser:** [DONE in `8ab7ec62`]
+- ✅ Real `Qwen2Config::from_hfq` parsing 13 fields with sensible
+  defaults (`attention_bias` → `true`, `tie_word_embeddings` →
+  `false`, `rope_theta` → `1_000_000`, `eos_token_id` accepts both
+  int and array forms).
+- ✅ Split into testable `config_from_metadata_json(&str)` plus
+  trait-facing `config_from_hfq(&HfqFile)`.
+- ✅ 4 unit tests pass (1.5B-Instruct fixture, dots.ocr text-config
+  fixture, missing-required-field, defaults-only).
+
+**Quantisation:** [DONE in `4bf9f6d4`]
+- ✅ `hipfire-quantize --format hfq4` on Qwen2-1.5B-Instruct →
+  ~820 MB HFQ output, 100% param coverage, q/k/v bias preserved in
+  F16. Resolves §6 risk M9. No `--dry-run` flag exists in the CLI;
+  ran the real thing.
+- ⚠️ HFQ emits `arch_id=1` (existing Qwen2/Qwen3 default).
+  `hipfire-arch-qwen2` claims `arch_id=7`. Need per-file remap or a
+  `hipfire-quantize --arch-id` flag before daemon can dispatch our
+  HFQ to our crate. See §6 new risk R1.
+
+**Weight loader:** [DONE in `e034c44b`]
+- ✅ Real `Qwen2Weights::load` ports the qwen35 pattern:
+  embed_tokens → final norm → tied lm_head re-upload → 28 layers
+  (input_layernorm + qkv with bias + o_proj + post_attention_layernorm
+  + gate/up/down).
+- ✅ Verified end-to-end on gfx1151: 28 layers loaded, dims match
+  Qwen2-1.5B exactly (wq 1536×1536, wk 256×1536, lm_head
+  151936×1536). Tied-lm_head correctly detected.
+- ✅ `TODO(transformer-extraction)` markers on every cross-arch
+  duplicate, on both sides (`hipfire-arch-qwen2::qwen2` and
+  `hipfire-arch-qwen35::qwen35`).
+- ⚠️ Loader currently handles quant_types {1 (F16), 6 (HFQ4G256),
+  7 (HFQ4G128)}. Add MQ4/MQ3/etc. on demand.
+- ⚠️ Tied embeddings re-upload the embedding bytes for the lm_head
+  GpuTensor (`GpuTensor` is not `Clone`) — costs ~117 MB extra VRAM
+  on Qwen2-1.5B at HFQ4. Resolvable via `GpuTensor::shallow_clone()`
+  or `Arc<GpuTensor>` during the Transformer-extraction PR.
 
 **Forward-pass port** from `crates/hipfire-arch-qwen35/src/qwen35.rs`:
+[PENDING — largest remaining chunk in phase 1]
 - **Remove** q/k-RMSNorm-pre-RoPE (Qwen3-only).
 - **Remove** DeltaNet hybrid LA layers — Qwen2 is pure FA.
 - **Remove** MoE expert routing — Qwen2 is dense FFN.
+- **RMSNorm convention:** Qwen2 uses standard `weight * x *
+  rsqrt(...)`, NOT Qwen3.5's `(1 + weight) * ...`. The loader
+  already loads norm weights without the `+= 1.0` offset (see
+  `load_norm_weight_raw` in qwen2.rs); the forward path must apply
+  norm without the offset to match.
 - **Add** bias terms to Q/K/V projections. `fused_qkv_hfq4g256`
   doesn't currently accept bias. Three options, recommend (c) for
   initial bring-up:
@@ -445,35 +518,39 @@ slot) and unblocks the dots.ocr text path.
     extra launches per decode step, ~half the cost of (a).
   Promote to (b) only if (c) measurably regresses tok/s under the
   Δ ≥ 5% rule.
-- **Add** tied-embeddings handling. Detect `tie_word_embeddings`
-  from config; when true, alias lm_head to embed_tokens (avoid
-  copying a vocab × hidden tensor).
+- **Tied-embeddings forward path:** loader already detects
+  `tied_lm_head` and produces a usable `WeightTensor` for the
+  lm_head whether tied or not. Forward path can use
+  `weights.output` uniformly without branching on the tied flag.
 - **Keep**: GQA attention, 1-D RoPE (theta=1e6), SwiGLU FFN,
   RMSNorm (eps=1e-6), KV cache layout.
 
-**Maintenance note** (deferrable to a future PR): consider
-extracting the shared forward primitives (GQA attention, RMSNorm,
-RoPE, SwiGLU, KV cache) into a `qwen_common` module under
-`hipfire-runtime`, with qwen35.rs and qwen2.rs as composition
-layers. The fork-then-share split keeps phase 1 small, but a future
-kernel improvement to qwen35.rs won't auto-propagate. Document the
-divergence point at minimum.
+**Real `Qwen2State`:** [PENDING] currently a stub `token_count`
+counter. Real impl allocates KV cache buffers
+(`num_key_value_heads × head_dim × max_seq_len × num_hidden_layers`)
+plus attention scratch. Mirror `ForwardScratch::new` in
+`hipfire-runtime::llama`. `KvCache` is on the upstream consolidation
+list — mark with `TODO(transformer-extraction)`.
 
-**Layer-dump infrastructure (highly recommended):** before
-debugging logit mismatches, add a `HIPFIRE_DUMP_ACTIVATIONS=path`
-env-gated hook in the qwen2 forward path that writes per-layer
-activations as `.npy` for layer-by-layer diffing against HF
-reference. Without this, the first logit mismatch takes 3-5 hr to
-localise. With it, ~30 min.
+**Maintenance note** (deferrable to a future PR): every cross-arch
+primitive duplicated from qwen35 carries a
+`TODO(transformer-extraction)` marker on both sides (qwen35 source
+and qwen2 destination). The future consolidation PR can
+`git grep TODO(transformer-extraction)` to find every duplicate
+and lift the shared primitives into
+`hipfire_runtime::transformer::*` per upstream's plan. Identified
+consolidation candidates so far: `load_norm_weight*`,
+`load_weight_tensor*`, the tied-lm_head pattern, and (when added)
+`KvCache` allocation.
 
-**Quantisation:**
-- Run `hipfire-quantize --dry-run` on Qwen2-1.5B-Instruct first to
-  confirm every tensor is claimed by a quant target (Qwen2 layer
-  naming may not all be in the quantiser's allowlist).
-- Then quantise to HFQ4. Test against fp16 forward before claiming
-  the quantised path works.
+**Layer-dump infrastructure (highly recommended):** [PENDING]
+before debugging logit mismatches, add a
+`HIPFIRE_DUMP_ACTIVATIONS=path` env-gated hook in the qwen2
+forward path that writes per-layer activations as `.npy` for
+layer-by-layer diffing against HF reference. Without this, the
+first logit mismatch takes 3-5 hr to localise. With it, ~30 min.
 
-**Validation:**
+**Validation:** [PENDING — blocked on phase 0 items 5/6/7]
 - Smoke test: feed prompt from `benchmarks/prompts/qwen2_smoke.txt`
   with temperature=0 + greedy, decode 32 tokens.
 - **Pass criterion: top-1 token match against the phase-0 HF
@@ -658,6 +735,25 @@ OCR-specific gate. Fluent ≠ correct.
 
 ## 6. Risks and unknowns
 
+- **[NEW — R1] HFQ `arch_id` mismatch.** `hipfire-quantize`
+  auto-assigns `arch_id=1` for Qwen2 inputs (its existing
+  Qwen2/Qwen3 default). `hipfire-arch-qwen2` claims `arch_id=7`
+  (next-free slot to avoid colliding with the LLaMA crate's
+  Qwen2/Qwen3 coverage at id=1). Three resolution paths, pick one
+  before wiring into the daemon:
+  - **Add `hipfire-quantize --arch-id <u32>` CLI flag** that
+    overrides the auto-detected id. Cleanest long-term; ~20 lines
+    of code in hipfire-quantize/src/main.rs.
+  - **Write a small in-place `hfq-rewrite-arch-id` tool** that
+    patches the 4-byte arch_id field at HFQ header offset 0x08
+    (per `docs/QUANTIZATION.md:178`). Lowest-friction for the
+    immediate bring-up; doesn't require re-quantising.
+  - **Daemon dispatcher change** that routes `arch_id=1` to qwen2
+    when a future config flag is set. Most invasive; deferred.
+- **[RESOLVED — M9] Quantiser support for Qwen2 layer naming.**
+  Verified working in `4bf9f6d4` — Qwen2-1.5B quantises to HFQ4 at
+  100% param coverage. Q/K/V bias tensors correctly preserved in
+  F16. No quantiser-side changes needed.
 - **2-D RoPE kernel + position-ID permute.** New algorithm + likely
   new kernel variant. Budget per phase 2.
 - **Vision-shape RMSNorm/SwiGLU kernels.** Text-side kernels may
