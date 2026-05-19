@@ -366,6 +366,93 @@ struct LoadedModel {
     chat_template: Option<String>,
 }
 
+struct CachedLoadedModel {
+    key: String,
+    model: LoadedModel,
+    pflash_state: Option<hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig>,
+}
+
+fn load_cache_key(msg: &serde_json::Value) -> String {
+    let model = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+    let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
+    format!("{model}\n{}", serde_json::to_string(&params).unwrap_or_default())
+}
+
+fn loaded_model_shape(m: &LoadedModel) -> (&'static str, usize, usize, usize, bool) {
+    let arch = match m.arch_id {
+        5 => "qwen3_5",
+        6 => "qwen3_5_moe",
+        _ => "qwen3",
+    };
+    let vl = m.vision_config.is_some();
+    let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
+        (c.dim, c.n_layers, c.vocab_size)
+    } else if let Some(ref c) = m.llama_config {
+        (c.dim, c.n_layers, c.vocab_size)
+    } else {
+        (0, 0, 0)
+    };
+    (arch, dim, layers, vocab, vl)
+}
+
+fn reset_model_state(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    if m.pp > 1 {
+        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
+            m.dn_state.as_ref(),
+            m.pp_gpus.as_mut(),
+            m.pp_dn_la_to_device.as_ref(),
+        ) {
+            for (i, s) in dn.s_matrices.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.s_scales.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.conv_states.iter().enumerate() {
+                let g = &mut gpus.devices[la[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+    } else if let Some(ref dn) = m.dn_state {
+        for s in &dn.s_matrices {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.s_scales {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for s in &dn.conv_states {
+            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+        }
+    }
+    if let Some(kv) = m.kv_cache.as_mut() {
+        kv.compact_offset = 0;
+    }
+    if let Some(kv) = m.llama_kv.as_mut() {
+        kv.compact_offset = 0;
+    }
+}
+
+fn unload_cached_model(mut cached: CachedLoadedModel, gpu: &mut rdna_compute::Gpu) {
+    if let Some(mut pf) = cached.pflash_state.take() {
+        pf.unload_drafter(gpu);
+    }
+    unload_model(cached.model, gpu);
+}
+
+fn drain_model_cache(cache: &mut Vec<CachedLoadedModel>, gpu: &mut rdna_compute::Gpu) {
+    while let Some(cached) = cache.pop() {
+        unload_cached_model(cached, gpu);
+    }
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -453,6 +540,8 @@ fn main() {
         Err(e) => { report_gpu_init_failure(&e); std::process::exit(1); }
     };
     let mut model: Option<LoadedModel> = None;
+    let mut current_key: Option<String> = None;
+    let mut retained_models: Vec<CachedLoadedModel> = Vec::new();
     // PFlash speculative-prefill state. None unless the load message
     // includes a `prefill_drafter` path AND `prefill_compression` != "off".
     // Lives alongside `model` so unload_model + this state are paired
@@ -486,19 +575,68 @@ fn main() {
 
         match msg_type {
             "load" => {
-                // Unload previous if any. PFlash drafter goes first so
-                // its tensors join the pool before unload_model drains
-                // it -- otherwise free_tensor would queue them into the
-                // pool just-emptied by drain_pool with no follow-up
-                // drain, leaving drafter VRAM resident across the next
-                // load (the explicit "unload" handler has the same
-                // ordering for the same reason).
-                if let Some(mut pf) = pflash_state.take() {
-                    pf.unload_drafter(&mut gpu);
+                let load_key = load_cache_key(&msg);
+                let retain_on_load = msg.get("params").and_then(|p| p.get("retain_on_load"))
+                    .and_then(|v| v.as_bool()).unwrap_or(false);
+                let unload_policy = msg.get("params").and_then(|p| p.get("unload_policy"))
+                    .and_then(|v| v.as_str()).unwrap_or("immediate");
+
+                if current_key.as_deref() == Some(load_key.as_str()) {
+                    if let Some(ref m) = model {
+                        let (arch, dim, layers, vocab, vl) = loaded_model_shape(m);
+                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cached":true}}"#, arch, dim, layers, vocab, vl);
+                        let _ = stdout.flush();
+                        continue;
+                    }
                 }
-                pflash_cfg = None;
+
+                if retain_on_load {
+                    if let Some(pos) = retained_models.iter().position(|m| m.key == load_key) {
+                        if let Some(cur) = model.take() {
+                            retained_models.push(CachedLoadedModel {
+                                key: current_key.take().unwrap_or_else(|| "<unknown>".to_string()),
+                                model: cur,
+                                pflash_state: pflash_state.take(),
+                                pflash_cfg: pflash_cfg.take(),
+                            });
+                        }
+                        let cached = retained_models.remove(pos);
+                        model = Some(cached.model);
+                        pflash_state = cached.pflash_state;
+                        pflash_cfg = cached.pflash_cfg;
+                        current_key = Some(load_key.clone());
+                        if let Some(ref mut m) = model {
+                            reset_model_state(m, &mut gpu);
+                            let (arch, dim, layers, vocab, vl) = loaded_model_shape(m);
+                            eprintln!("[hipfire-daemon] restored retained model from memory-pressure cache");
+                            let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cached":true}}"#, arch, dim, layers, vocab, vl);
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
+                }
+
+                // Unload previous if any. With unload_policy=memory_pressure,
+                // keep the old model resident in a retained cache so switching
+                // back can avoid a reload; explicit unload/idle eviction drains
+                // the cache. PFlash drafter stays paired with its target model.
                 if let Some(m) = model.take() {
-                    unload_model(m, &mut gpu);
+                    if retain_on_load {
+                        eprintln!("[hipfire-daemon] retaining current model across load (unload_policy={unload_policy})");
+                        retained_models.push(CachedLoadedModel {
+                            key: current_key.take().unwrap_or_else(|| "<unknown>".to_string()),
+                            model: m,
+                            pflash_state: pflash_state.take(),
+                            pflash_cfg: pflash_cfg.take(),
+                        });
+                    } else {
+                        if let Some(mut pf) = pflash_state.take() {
+                            pf.unload_drafter(&mut gpu);
+                        }
+                        pflash_cfg = None;
+                        current_key = None;
+                        unload_model(m, &mut gpu);
+                    }
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
@@ -669,17 +807,7 @@ fn main() {
 
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(m) => {
-                        let arch = match m.arch_id {
-                            5 => "qwen3_5",
-                            6 => "qwen3_5_moe",
-                            _ => "qwen3",
-                        };
-                        let vl = m.vision_config.is_some();
-                        let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
-                            (c.dim, c.n_layers, c.vocab_size)
-                        } else if let Some(ref c) = m.llama_config {
-                            (c.dim, c.n_layers, c.vocab_size)
-                        } else { (0, 0, 0) };
+                        let (arch, dim, layers, vocab, vl) = loaded_model_shape(&m);
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
                         // Pins the GPU at high sclk/mclk so the first `generate`
@@ -730,6 +858,7 @@ fn main() {
                                         r#"{{"type":"pflash_load_failed","reason":"invalid load param: {}"}}"#,
                                         reason.replace('"', "'"));
                                     let _ = stdout.flush();
+                                    current_key = Some(load_key.clone());
                                     model = Some(m);
                                     continue;
                                 }
@@ -781,6 +910,7 @@ fn main() {
                             }
                         }
 
+                        current_key = Some(load_key);
                         model = Some(m);
                     }
                     Err(e) => {
@@ -999,49 +1129,7 @@ fn main() {
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
-                    m.seq_pos = 0;
-                    m.conversation_tokens.clear();
-                    // Multi-GPU branch: route per-LA-layer memsets through
-                    // pp_dn_la_to_device so each buffer is zeroed on its
-                    // owning device. The single-GPU `gpu` parameter is left
-                    // alone — its scratch state isn't aliased to per-device
-                    // tensors when pp > 1.
-                    if m.pp > 1 {
-                        if let (Some(ref dn), Some(ref mut gpus), Some(ref la)) = (
-                            m.dn_state.as_ref(),
-                            m.pp_gpus.as_mut(),
-                            m.pp_dn_la_to_device.as_ref(),
-                        ) {
-                            for (i, s) in dn.s_matrices.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for (i, s) in dn.s_scales.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                            for (i, s) in dn.conv_states.iter().enumerate() {
-                                let g = &mut gpus.devices[la[i] as usize];
-                                let _ = g.bind_thread();
-                                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
-                            }
-                        }
-                    } else if let Some(ref dn) = m.dn_state {
-                        // Zero DeltaNet recurrent state (Qwen3.5)
-                        for s in &dn.s_matrices {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.s_scales {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                        for s in &dn.conv_states {
-                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-                        }
-                    }
-                    if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
-                    if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                    reset_model_state(m, &mut gpu);
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1062,9 +1150,11 @@ fn main() {
                     pf.unload_drafter(&mut gpu);
                 }
                 pflash_cfg = None;
+                current_key = None;
                 if let Some(m) = model.take() {
                     unload_model(m, &mut gpu);
                 }
+                drain_model_cache(&mut retained_models, &mut gpu);
                 let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                 let _ = stdout.flush();
             }

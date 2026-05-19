@@ -35,6 +35,7 @@ export interface HipfireConfig {
   host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
+  unload_policy: "immediate" | "memory_pressure"; // serve: model-switch unload behavior
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
   // Gates the daemon's `budget_alert_at_tok` + `budget_alert_text` generate
   // params. When false (default), the daemon ignores those params entirely.
@@ -174,6 +175,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
+  unload_policy: "immediate",
   experimental_budget_alert: false,
   dflash_adaptive_b: true,
   dflash_mode: "off",
@@ -227,6 +229,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
+    case "unload_policy": return ["immediate", "memory_pressure"].includes(value);
     case "default_model": return typeof value === "string" && value.trim().length > 0;
     case "experimental_budget_alert": return typeof value === "boolean";
     case "dflash_adaptive_b": return typeof value === "boolean";
@@ -606,6 +609,8 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // #87 tool-call corruption).
   params.mmq_screen = resolved.mmq_screen !== "off";
   params.mmq_screen_threshold = resolved.mmq_screen_threshold;
+  params.unload_policy = resolved.unload_policy;
+  params.retain_on_load = resolved.unload_policy === "memory_pressure";
 
   // PFlash speculative prefill (Phase 4 #93). Params are forwarded to
   // the daemon only when compression is enabled AND a drafter path is
@@ -1445,6 +1450,7 @@ async function serve(port: number, host: string) {
           status: "ok",
           model: current,
           idle_timeout_sec: cfg.idle_timeout,
+          unload_policy: cfg.unload_policy,
           pid: process.pid,
         });
       }
@@ -1651,14 +1657,26 @@ async function serve(port: number, host: string) {
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
 
         if (needReload) {
-          if (current) { await e.send({ type: "unload" }); await e.recv(); }
+          if (current && cfg.unload_policy === "immediate") {
+            await e.send({ type: "unload" });
+            await e.recv();
+          }
           const loadMsg = buildLoadMessage(path, body.model);
           if (requiredMaxSeq > loadMsg.params.max_seq) {
             console.error(`[hipfire] request max_tokens=${requestMaxTokens} needs max_seq >= ${requiredMaxSeq} — bumping load (was ${loadMsg.params.max_seq})`);
             loadMsg.params.max_seq = requiredMaxSeq;
           }
           await e.send(loadMsg);
-          const loadResult = await e.recv();
+          let loadResult = await e.recv();
+          if (loadResult.type === "error" && cfg.unload_policy === "memory_pressure") {
+            console.error(`[hipfire] model load hit pressure under unload_policy=memory_pressure — dropping retained models and retrying once`);
+            await e.send({ type: "unload" });
+            await e.recv();
+            current = null;
+            currentMaxSeq = null;
+            await e.send(loadMsg);
+            loadResult = await e.recv();
+          }
           if (loadResult.type === "error") {
             current = null;
             currentMaxSeq = null;
@@ -3376,6 +3394,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "idle_timeout",
       desc: "serve: seconds idle before unloading model (frees VRAM; 0 = never unload)",
       range: [0, 86400], step: 30,
+    },
+    unload_policy: {
+      label: "unload_policy",
+      desc: "serve model switch policy. immediate unloads before every model reload; memory_pressure keeps switched-away models cached until pressure/idle unload.",
+      options: ["immediate", "memory_pressure"],
     },
     experimental_budget_alert: {
       label: "experimental_budget_alert",
@@ -5150,6 +5173,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
           host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
+          unload_policy: "one of: immediate, memory_pressure",
           default_model: "non-empty model tag",
         };
         console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
