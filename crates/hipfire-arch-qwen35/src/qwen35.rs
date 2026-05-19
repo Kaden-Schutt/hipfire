@@ -13,6 +13,12 @@ use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::collections::HashMap;
+
+#[cfg(unix)]
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
+
+const GPU_SLAB_ALIGN: usize = 4096;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -362,6 +368,7 @@ pub struct Qwen35Weights {
     pub output_norm: GpuTensor,
     pub output: WeightTensor,
     pub layers: Vec<LayerWeights>,
+    pub slab_storage: Option<ModelGpuStorage>,
 
     /// Weight pager (MAD-93 v0.1). `Some` only when the model was loaded
     /// with `Qwen35Config::paged_experts == true`. The forward path uses
@@ -374,72 +381,85 @@ pub struct Qwen35Weights {
 impl Qwen35Weights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.token_embd);
-        let _ = gpu.free_tensor(self.output_norm);
-        let _ = gpu.free_tensor(self.output.buf);
-        for layer in self.layers {
+        let Qwen35Weights {
+            token_embd,
+            output_norm,
+            output,
+            layers,
+            pager,
+            slab_storage,
+            ..
+        } = self;
+        let slabs = slab_storage.as_ref();
+        free_tensor_maybe_slab(gpu, slabs, token_embd);
+        free_tensor_maybe_slab(gpu, slabs, output_norm);
+        free_weight_tensor_maybe_slab(gpu, slabs, output);
+        for layer in layers {
             match layer {
                 LayerWeights::DeltaNet(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    free_tensor_maybe_slab(gpu, slabs, l.attn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wqkv);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wz);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_alpha);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_beta);
+                    free_tensor_maybe_slab(gpu, slabs, l.a_log);
+                    free_tensor_maybe_slab(gpu, slabs, l.dt_bias);
+                    free_tensor_maybe_slab(gpu, slabs, l.conv_weight);
+                    free_tensor_maybe_slab(gpu, slabs, l.norm_weight);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wo);
+                    free_tensor_maybe_slab(gpu, slabs, l.ffn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_gate);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_up);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_down);
                 }
                 LayerWeights::FullAttn(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    let _ = gpu.free_tensor(l.w_gate.buf);
-                    let _ = gpu.free_tensor(l.w_up.buf);
-                    let _ = gpu.free_tensor(l.w_down.buf);
+                    free_tensor_maybe_slab(gpu, slabs, l.attn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wq);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wk);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wv);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wo);
+                    free_tensor_maybe_slab(gpu, slabs, l.q_norm);
+                    free_tensor_maybe_slab(gpu, slabs, l.k_norm);
+                    free_tensor_maybe_slab(gpu, slabs, l.ffn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_gate);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_up);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_down);
                 }
                 LayerWeights::DeltaNetMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wqkv.buf);
-                    let _ = gpu.free_tensor(l.wz.buf);
-                    let _ = gpu.free_tensor(l.w_alpha.buf);
-                    let _ = gpu.free_tensor(l.w_beta.buf);
-                    let _ = gpu.free_tensor(l.a_log);
-                    let _ = gpu.free_tensor(l.dt_bias);
-                    let _ = gpu.free_tensor(l.conv_weight);
-                    let _ = gpu.free_tensor(l.norm_weight);
-                    let _ = gpu.free_tensor(l.wo.buf);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
+                    free_tensor_maybe_slab(gpu, slabs, l.attn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wqkv);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wz);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_alpha);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.w_beta);
+                    free_tensor_maybe_slab(gpu, slabs, l.a_log);
+                    free_tensor_maybe_slab(gpu, slabs, l.dt_bias);
+                    free_tensor_maybe_slab(gpu, slabs, l.conv_weight);
+                    free_tensor_maybe_slab(gpu, slabs, l.norm_weight);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wo);
+                    free_tensor_maybe_slab(gpu, slabs, l.ffn_norm);
+                    free_moe_ffn_maybe_slab(gpu, slabs, l.ffn);
                 }
                 LayerWeights::FullAttnMoe(l) => {
-                    let _ = gpu.free_tensor(l.attn_norm);
-                    let _ = gpu.free_tensor(l.wq.buf);
-                    let _ = gpu.free_tensor(l.wk.buf);
-                    let _ = gpu.free_tensor(l.wv.buf);
-                    let _ = gpu.free_tensor(l.wo.buf);
-                    let _ = gpu.free_tensor(l.q_norm);
-                    let _ = gpu.free_tensor(l.k_norm);
-                    let _ = gpu.free_tensor(l.ffn_norm);
-                    free_moe_ffn(gpu, l.ffn);
+                    free_tensor_maybe_slab(gpu, slabs, l.attn_norm);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wq);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wk);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wv);
+                    free_weight_tensor_maybe_slab(gpu, slabs, l.wo);
+                    free_tensor_maybe_slab(gpu, slabs, l.q_norm);
+                    free_tensor_maybe_slab(gpu, slabs, l.k_norm);
+                    free_tensor_maybe_slab(gpu, slabs, l.ffn_norm);
+                    free_moe_ffn_maybe_slab(gpu, slabs, l.ffn);
                 }
             }
         }
         // MAD-93 v0.1: in paged mode, the pager owns expert weight allocations
         // (the per-layer `free_moe_ffn` loops ran no-ops since `ffn.experts`
         // was empty). Drain the pager's resident set back to the GPU pool here.
-        if let Some(pager_cell) = self.pager {
+        if let Some(pager_cell) = pager {
             pager_cell.into_inner().free_all(gpu);
+        }
+        if let Some(storage) = slab_storage {
+            storage.free_gpu(gpu);
         }
     }
 
@@ -530,6 +550,69 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     for e in ffn.experts {
         let _ = gpu.free_tensor(e.gate_up.buf);
         let _ = gpu.free_tensor(e.down.buf);
+    }
+}
+
+pub struct ModelGpuStorage {
+    slabs: Vec<GpuTensor>,
+    bytes: usize,
+}
+
+impl ModelGpuStorage {
+    fn new(slabs: Vec<GpuTensor>, bytes: usize) -> Self {
+        Self { slabs, bytes }
+    }
+
+    fn contains_tensor(&self, tensor: &GpuTensor) -> bool {
+        let ptr = tensor.buf.as_ptr() as usize;
+        self.slabs.iter().any(|slab| {
+            let start = slab.buf.as_ptr() as usize;
+            let end = start.saturating_add(slab.buf.size());
+            ptr >= start && ptr < end
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) {
+        for slab in self.slabs {
+            let _ = gpu.free_tensor(slab);
+        }
+    }
+}
+
+fn free_tensor_maybe_slab(gpu: &mut Gpu, slabs: Option<&ModelGpuStorage>, tensor: GpuTensor) {
+    if slabs.is_some_and(|s| s.contains_tensor(&tensor)) {
+        std::mem::forget(tensor);
+    } else {
+        let _ = gpu.free_tensor(tensor);
+    }
+}
+
+fn free_weight_tensor_maybe_slab(
+    gpu: &mut Gpu,
+    slabs: Option<&ModelGpuStorage>,
+    wt: WeightTensor,
+) {
+    if let Some(scale) = wt.awq_scale {
+        let _ = gpu.free_tensor(scale);
+    }
+    free_tensor_maybe_slab(gpu, slabs, wt.buf);
+}
+
+fn free_moe_ffn_maybe_slab(
+    gpu: &mut Gpu,
+    slabs: Option<&ModelGpuStorage>,
+    ffn: MoeFfnWeights,
+) {
+    free_weight_tensor_maybe_slab(gpu, slabs, ffn.router);
+    free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert_gate);
+    free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert.gate);
+    free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert.up);
+    free_weight_tensor_maybe_slab(gpu, slabs, ffn.shared_expert.down);
+    let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
+    let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+    for e in ffn.experts {
+        free_weight_tensor_maybe_slab(gpu, slabs, e.gate_up);
+        free_weight_tensor_maybe_slab(gpu, slabs, e.down);
     }
 }
 
@@ -839,6 +922,50 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
     }
 }
 
+fn alias_raw_tensor(slab: &GpuTensor, byte_offset: usize, len: usize) -> GpuTensor {
+    let ptr = unsafe {
+        (slab.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void
+    };
+    GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, len) },
+        shape: vec![len],
+        dtype: DType::Raw,
+    }
+}
+
+fn load_weight_tensor_from_slabs(
+    slabs: Option<&SlabTensorIndex>,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Option<WeightTensor> {
+    let idx = slabs?;
+    let full_name = format!("model.language_model.{name}");
+    let (entry_name, entry) = idx.entries
+        .get_key_value(&full_name)
+        .or_else(|| idx.entries.get_key_value(name))?;
+    let dtype = slab_dtype_for_quant(entry.quant_type, k)?;
+    if matches!(dtype, DType::HFP4G32 | DType::MFP4G32) {
+        assert!(k % 256 == 0, "{entry_name} has K={k} but kernel requires K%256==0");
+    }
+    let slab = &idx.storage.slabs[entry.slab_idx];
+    Some(WeightTensor {
+        buf: alias_raw_tensor(slab, entry.rel, entry.len),
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        awq_scale: None,
+    })
+}
+
+fn load_gpu_tensor_from_slabs(slabs: Option<&SlabTensorIndex>, name: &str) -> Option<(u8, GpuTensor)> {
+    let idx = slabs?;
+    let entry = idx.entries.get(name)?;
+    let slab = &idx.storage.slabs[entry.slab_idx];
+    Some((entry.quant_type, alias_raw_tensor(slab, entry.rel, entry.len)))
+}
+
 /// Phase A Stage A — AWQ sidecar loader for the Qwen3.5 forward path.
 ///
 /// The .hfq quantizer emits `<weight>.awq_scale.weight` (1D F16, length K)
@@ -885,7 +1012,17 @@ fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
-fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+fn load_weight_tensor(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    slabs: Option<&SlabTensorIndex>,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    if let Some(wt) = load_weight_tensor_from_slabs(slabs, name, m, k) {
+        return Ok(wt);
+    }
     let full_name = format!("model.language_model.{name}");
     // Use pread path to avoid page cache buildup on unified-memory APUs.
     #[cfg(unix)]
@@ -1329,7 +1466,289 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     load_any_as_f32(hfq, gpu, name, n)
 }
 
+fn gib(bytes: usize) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+}
+
+fn load_throughput_gibs(bytes: usize, seconds: f64) -> f64 {
+    gib(bytes) / seconds.max(f64::MIN_POSITIVE)
+}
+
+struct SlabTensorEntry {
+    slab_idx: usize,
+    rel: usize,
+    len: usize,
+    quant_type: u8,
+}
+
+struct SlabTensorIndex {
+    entries: HashMap<String, SlabTensorEntry>,
+    storage: ModelGpuStorage,
+}
+
+struct SlabPlanBank {
+    offset: usize,
+    len: usize,
+    tensor_indices: Vec<usize>,
+}
+
+fn gpu_slab_load_enabled(gpu: &Gpu) -> bool {
+    match std::env::var("HIPFIRE_GPU_SLAB_LOAD").ok().as_deref() {
+        Some("0" | "false" | "off" | "none") => false,
+        Some("1" | "true" | "on" | "direct" | "slab") => true,
+        Some("auto" | "uma") | None => gpu.integrated,
+        Some(other) => {
+            eprintln!(
+                "  warning: unknown HIPFIRE_GPU_SLAB_LOAD={other:?}; using UMA auto-detect"
+            );
+            gpu.integrated
+        }
+    }
+}
+
+fn gpu_slab_bank_size() -> usize {
+    std::env::var("HIPFIRE_GPU_SLAB_MIB")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512)
+        .max(1)
+        * 1024
+        * 1024
+}
+
+fn slab_dtype_for_quant(qt: u8, k: usize) -> Option<DType> {
+    match qt {
+        3 => Some(DType::Q8_0),
+        6 => Some(DType::HFQ4G256),
+        7 => Some(DType::HFQ4G128),
+        8 => Some(DType::HFQ6G256),
+        11 => Some(DType::HFQ3G256),
+        12 => Some(DType::HFQ3G128),
+        13 => Some(DType::MQ4G256),
+        14 => Some(DType::MQ8G256),
+        15 => Some(DType::MQ6G256),
+        17 => Some(DType::MQ3G256),
+        18 => Some(DType::MQ2G256),
+        19 => Some(DType::MQ2G256Lloyd),
+        20 => Some(DType::MQ3G256Lloyd),
+        21 if k % 256 == 0 => Some(DType::HFP4G32),
+        24 if k % 256 == 0 => Some(DType::MFP4G32),
+        _ => None,
+    }
+}
+
+fn build_slab_banks(hfq: &HfqFile, bank_size: usize) -> Vec<SlabPlanBank> {
+    let mut banks = Vec::new();
+    let mut cur: Option<SlabPlanBank> = None;
+    for (idx, info) in hfq.tensors().iter().enumerate() {
+        if slab_dtype_for_quant(info.quant_type, 256).is_none() {
+            continue;
+        }
+        let start = info.data_offset;
+        let end = info.data_offset + info.data_size;
+        match cur.as_mut() {
+            Some(bank) => {
+                let next_len = end - bank.offset;
+                if next_len <= bank_size || bank.tensor_indices.is_empty() {
+                    bank.len = next_len;
+                    bank.tensor_indices.push(idx);
+                } else {
+                    banks.push(cur.take().unwrap());
+                    cur = Some(SlabPlanBank {
+                        offset: start,
+                        len: info.data_size,
+                        tensor_indices: vec![idx],
+                    });
+                }
+            }
+            None => {
+                cur = Some(SlabPlanBank {
+                    offset: start,
+                    len: info.data_size,
+                    tensor_indices: vec![idx],
+                });
+            }
+        }
+    }
+    if let Some(bank) = cur {
+        banks.push(bank);
+    }
+    banks
+}
+
+fn load_gpu_slabs(hfq: &HfqFile, gpu: &mut Gpu) -> HipResult<SlabTensorIndex> {
+    #[cfg(not(unix))]
+    {
+        let _ = (hfq, gpu);
+        return Err(hip_bridge::HipError::new(0, "GPU slab loader requires unix O_DIRECT"));
+    }
+    #[cfg(unix)]
+    {
+        gpu.bind_thread()?;
+        let bank_size = gpu_slab_bank_size();
+        let banks = build_slab_banks(hfq, bank_size);
+        let file_len = std::fs::metadata(hfq.path())
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("stat {}: {e}", hfq.path().display())))?
+            .len() as usize;
+        let mut entries = HashMap::new();
+        let mut slabs = Vec::with_capacity(banks.len());
+        let mut total_bytes = 0usize;
+        let t_alloc = std::time::Instant::now();
+        for bank in &banks {
+            let buf = gpu.hip.malloc(bank.len)?;
+            slabs.push(GpuTensor {
+                buf,
+                shape: vec![bank.len],
+                dtype: DType::Raw,
+            });
+            total_bytes += bank.len;
+        }
+        let alloc_s = t_alloc.elapsed().as_secs_f64();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(hfq.path())
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("open O_DIRECT {}: {e}", hfq.path().display())))?;
+        let max_direct_len = banks
+            .iter()
+            .map(|b| {
+                let start = align_down(b.offset, GPU_SLAB_ALIGN);
+                let end = align_up((b.offset + b.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+                end - start
+            })
+            .max()
+            .unwrap_or(GPU_SLAB_ALIGN);
+        let mut staging = AlignedLoadBuffer::new(max_direct_len.max(GPU_SLAB_ALIGN), GPU_SLAB_ALIGN)
+            .map_err(|e| hip_bridge::HipError::new(0, &format!("posix_memalign staging: {e}")))?;
+
+        let mut read_s = 0.0;
+        let mut copy_s = 0.0;
+        let t_load = std::time::Instant::now();
+        for (bank_idx, bank) in banks.iter().enumerate() {
+            let aligned_start = align_down(bank.offset, GPU_SLAB_ALIGN);
+            let aligned_end = align_up((bank.offset + bank.len).min(file_len), GPU_SLAB_ALIGN).min(file_len);
+            let aligned_len = aligned_end - aligned_start;
+            let rel = bank.offset - aligned_start;
+            let t_read = std::time::Instant::now();
+            let got = read_direct_allow_eof(&file, staging.as_mut_slice(aligned_len), aligned_start as u64)
+                .map_err(|e| hip_bridge::HipError::new(0, &format!(
+                    "O_DIRECT read offset={} len={} aligned_offset={} aligned_len={}: {e}",
+                    bank.offset, bank.len, aligned_start, aligned_len
+                )))?;
+            if got < rel + bank.len {
+                return Err(hip_bridge::HipError::new(0, &format!(
+                    "short O_DIRECT read offset={} len={} got={} need={}",
+                    bank.offset,
+                    bank.len,
+                    got,
+                    rel + bank.len
+                )));
+            }
+            read_s += t_read.elapsed().as_secs_f64();
+            let t_copy = std::time::Instant::now();
+            gpu.hip.memcpy_htod(&slabs[bank_idx].buf, &staging.as_slice(got)[rel..rel + bank.len])?;
+            copy_s += t_copy.elapsed().as_secs_f64();
+
+            for &tensor_idx in &bank.tensor_indices {
+                let info = &hfq.tensors()[tensor_idx];
+                entries.insert(info.name.clone(), SlabTensorEntry {
+                    slab_idx: bank_idx,
+                    rel: info.data_offset - bank.offset,
+                    len: info.data_size,
+                    quant_type: info.quant_type,
+                });
+            }
+        }
+        let load_s = t_load.elapsed().as_secs_f64();
+        eprintln!(
+            "  GPU slab preload: banks={} tensors={} payload={:.2} GiB prealloc={:.2}s load={:.2}s read={:.2}s copy={:.2}s total_bw={:.2} GiB/s load_bw={:.2} GiB/s",
+            banks.len(),
+            entries.len(),
+            gib(total_bytes),
+            alloc_s,
+            load_s,
+            read_s,
+            copy_s,
+            load_throughput_gibs(total_bytes, alloc_s + load_s),
+            load_throughput_gibs(total_bytes, load_s),
+        );
+        Ok(SlabTensorIndex {
+            entries,
+            storage: ModelGpuStorage::new(slabs, total_bytes),
+        })
+    }
+}
+
+fn align_down(v: usize, align: usize) -> usize {
+    v & !(align - 1)
+}
+
+fn align_up(v: usize, align: usize) -> usize {
+    (v + align - 1) & !(align - 1)
+}
+
+#[cfg(unix)]
+fn read_direct_allow_eof(file: &std::fs::File, dst: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut done = 0usize;
+    while done < dst.len() {
+        let remaining = dst.len() - done;
+        let n = file.read_at(&mut dst[done..], offset + done as u64)?;
+        if n == 0 {
+            break;
+        }
+        done += n;
+        if n < remaining {
+            break;
+        }
+    }
+    Ok(done)
+}
+
+struct AlignedLoadBuffer {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl AlignedLoadBuffer {
+    fn new(len: usize, align: usize) -> std::io::Result<Self> {
+        let mut ptr = std::ptr::null_mut();
+        let rc = unsafe { libc::posix_memalign(&mut ptr, align, len.max(1)) };
+        if rc != 0 {
+            return Err(std::io::Error::from_raw_os_error(rc));
+        }
+        Ok(Self {
+            ptr: ptr.cast(),
+            len,
+        })
+    }
+
+    fn as_mut_slice(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    }
+
+    fn as_slice(&self, len: usize) -> &[u8] {
+        assert!(len <= self.len);
+        unsafe { std::slice::from_raw_parts(self.ptr, len) }
+    }
+}
+
+impl Drop for AlignedLoadBuffer {
+    fn drop(&mut self) {
+        unsafe { libc::free(self.ptr.cast()) };
+    }
+}
+
 pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
+    let load_t0 = std::time::Instant::now();
+    let file_payload_bytes: usize = hfq.tensors().iter().map(|t| t.data_size).sum();
+    let mut loaded_bytes = 0usize;
+    eprintln!(
+        "  loading weights: {} tensors, {:.2} GiB HFQ payload",
+        hfq.tensors().len(),
+        gib(file_payload_bytes),
+    );
     // Drop the mmap on unix to avoid double-buffering on UMA systems.
     // All tensor data reads go through pread + fadvise_dontneed, which
     // doesn't require the mmap. On discrete-GPU systems this is harmless
@@ -1337,27 +1756,65 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     #[cfg(unix)]
     hfq.drop_mmap();
 
+    let slab_index = if gpu_slab_load_enabled(gpu) {
+        if std::env::var("HIPFIRE_GPU_SLAB_LOAD").ok().is_none() {
+            eprintln!("  GPU slab load: auto-enabled for integrated/UMA GPU");
+        }
+        Some(load_gpu_slabs(hfq, gpu)?)
+    } else {
+        None
+    };
+    let slabs = slab_index.as_ref();
+    if let Some(idx) = slabs {
+        loaded_bytes = loaded_bytes.saturating_add(idx.storage.bytes);
+    }
+
     eprintln!("  loading token_embd...");
-    let (embd_meta, embd_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight")
+    let embd_name = "model.language_model.embed_tokens.weight";
+    let embd_info = hfq
+        .tensors()
+        .iter()
+        .find(|t| t.name == embd_name)
         .expect("embed_tokens not found");
-    let embd_qt = embd_meta.quant_type;
-    let (token_embd, embd_fmt) = if embd_qt == 6 {
+    let embd_qt = embd_info.quant_type;
+    let (token_embd, embd_fmt) = if let Some((qt, tensor)) = load_gpu_tensor_from_slabs(slabs, embd_name) {
+        match qt {
+            6 => (tensor, EmbeddingFormat::HFQ4G256),
+            7 => (tensor, EmbeddingFormat::HFQ4G128),
+            3 => (tensor, EmbeddingFormat::Q8_0),
+            _ => {
+                let (embd_meta, embd_data) = hfq.tensor_data_vec(embd_name).expect("embed_tokens not found");
+                loaded_bytes += embd_data.len();
+                let f32_data: Vec<f32> = embd_data.chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let _ = embd_meta;
+                (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
+            }
+        }
+    } else if embd_qt == 6 {
+        let (_, embd_data) = hfq.tensor_data_vec(embd_name).expect("embed_tokens not found");
+        loaded_bytes += embd_data.len();
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_data.len() / 1_000_000);
         (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::HFQ4G256)
     } else if embd_qt == 7 {
+        let (_, embd_data) = hfq.tensor_data_vec(embd_name).expect("embed_tokens not found");
+        loaded_bytes += embd_data.len();
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_data.len() / 1_000_000);
         (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::HFQ4G128)
     } else if embd_qt == 3 {
-        // Q8_0: [f16 scale][32 × int8] per block — upload raw, use Q8 embedding lookup
+        let (_, embd_data) = hfq.tensor_data_vec(embd_name).expect("embed_tokens not found");
+        loaded_bytes += embd_data.len();
         eprintln!("    (Q8_0 raw, {} MB)", embd_data.len() / 1_000_000);
         (gpu.upload_raw(&embd_data, &[embd_data.len()])?, EmbeddingFormat::Q8_0)
     } else {
+        let (_, embd_data) = hfq.tensor_data_vec(embd_name).expect("embed_tokens not found");
+        loaded_bytes += embd_data.len();
         let f32_data: Vec<f32> = embd_data.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         (gpu.upload_f32(&f32_data, &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
     };
-    drop(embd_data); // free source buffer before loading more tensors
 
     eprintln!("  loading output_norm...");
     // Final output norm: on Qwen3.5/3.6-MoE (A3B, arch_id=6) this tensor is
@@ -1375,14 +1832,35 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     };
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
-    let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
-        .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
-    let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
+    let mut output = if let Some(wt) =
+        load_weight_tensor_from_slabs(slabs, "lm_head.weight", config.vocab_size, config.dim)
+            .or_else(|| {
+                load_weight_tensor_from_slabs(
+                    slabs,
+                    "model.language_model.lm_head.weight",
+                    config.vocab_size,
+                    config.dim,
+                )
+            }) {
+        eprintln!("  loading output (separate lm_head, slab-backed qt={:?})...", wt.gpu_dtype);
+        wt
+    } else if let Some((lm_info, lm_data)) = hfq.tensor_data_vec("lm_head.weight")
+        .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight")) {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
+        loaded_bytes += lm_data.len();
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
+        if let Some(wt) = load_weight_tensor_from_slabs(
+            slabs,
+            "model.language_model.embed_tokens.weight",
+            config.vocab_size,
+            config.dim,
+        ) {
+            wt
+        } else {
         let (_, tied_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight").unwrap();
+        loaded_bytes += tied_data.len();
         if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             let dtype = match embd_qt {
@@ -1407,6 +1885,7 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
             };
             let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
             WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
+        }
         }
     };
     // AWQ sidecar attachment for lm_head / tied embed_tokens. Safe now
@@ -1446,22 +1925,22 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 
                 layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
                     attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                    wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                    w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                    wqkv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                    wz: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                    w_alpha: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_a.weight"),
                         config.linear_num_value_heads, config.dim)?,
-                    w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                    w_beta: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_b.weight"),
                         config.linear_num_value_heads, config.dim)?,
                     a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
                     dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
                     conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
                         qkv_dim * config.conv_kernel_dim)?,  // flatten [channels, 1, kernel] → [channels * kernel]
                     norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                    wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    w_gate: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                    w_up: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                    w_down: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
                 }));
             }
             (LayerType::FullAttention, false) => {
@@ -1470,16 +1949,16 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 
                 layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
                     attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                    wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                    wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                    wq: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                    wk: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                    wv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                    wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
                     q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                     k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                    w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                    w_gate: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                    w_up: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                    w_down: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
                 }));
             }
             (LayerType::LinearAttention, true) => {
@@ -1489,20 +1968,20 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 
                 layers.push(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
                     attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                    wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                    w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                    wqkv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                    wz: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                    w_alpha: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_a.weight"),
                         config.linear_num_value_heads, config.dim)?,
-                    w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                    w_beta: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_b.weight"),
                         config.linear_num_value_heads, config.dim)?,
                     a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
                     dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
                     conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
                         qkv_dim * config.conv_kernel_dim)?,
                     norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                    wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
+                    ffn: load_moe_ffn(hfq, gpu, slabs, &p, config, i as u16)?,
                 }));
             }
             (LayerType::FullAttention, true) => {
@@ -1511,29 +1990,53 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 
                 layers.push(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
                     attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                    wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                    wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                    wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                    wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                    wq: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                    wk: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                    wv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                    wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
                     q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                     k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                     ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                    ffn: load_moe_ffn(hfq, gpu, &p, config, i as u16)?,
+                    ffn: load_moe_ffn(hfq, gpu, slabs, &p, config, i as u16)?,
                 }));
             }
         }
         // Drop mmap page cache for this layer (supplements pread-based loading).
-        if let Some((start, end)) = layer_page_start {
+        if slabs.is_none() {
+            if let Some((start, end)) = layer_page_start {
+            loaded_bytes = loaded_bytes.saturating_add(end.saturating_sub(start));
             hfq.drop_pages_range(start, end - start);
+            }
         }
+        let elapsed = load_t0.elapsed().as_secs_f64();
+        eprintln!(
+            "  load progress: layer {}/{} elapsed={:.2}s throughput={:.2} GiB/s ({:.2}/{:.2} GiB)",
+            i + 1,
+            config.n_layers,
+            elapsed,
+            load_throughput_gibs(loaded_bytes, elapsed),
+            gib(loaded_bytes),
+            gib(file_payload_bytes),
+        );
     }
 
+    let elapsed = load_t0.elapsed().as_secs_f64();
+    eprintln!(
+        "  weights loaded: elapsed={:.2}s throughput={:.2} GiB/s payload={:.2} GiB streamed={:.2} GiB",
+        elapsed,
+        load_throughput_gibs(loaded_bytes, elapsed),
+        gib(file_payload_bytes),
+        gib(loaded_bytes),
+    );
+
+    let slab_storage = slab_index.map(|idx| idx.storage);
     Ok(Qwen35Weights {
         token_embd, embd_format: embd_fmt, output_norm, output, layers,
         // MAD-93: paged construction goes through `load_weights_paged` (added
         // alongside the moe_ffn_decode_impl wiring in a follow-up commit).
         // The non-paged `load_weights` always returns `None` so today's
         // callers see no behavior change.
+        slab_storage,
         pager: None,
     })
 }
@@ -1566,13 +2069,14 @@ pub fn load_weights_multi(
         );
         let p = format!("layers.{i}");
         let layer_page_start = hfq.layer_data_range(&p);
-        layers.push(load_layer_into(hfq, config, i, &p, &mut gpus.devices[dev_idx])?);
+        layers.push(load_layer_into(hfq, config, i, &p, &mut gpus.devices[dev_idx], None)?);
         if let Some((start, end)) = layer_page_start {
             hfq.drop_pages_range(start, end - start);
         }
     }
     Ok(Qwen35Weights {
         token_embd, embd_format: embd_fmt, output_norm, output, layers,
+        slab_storage: None,
         pager: None,
     })
 }
@@ -1686,6 +2190,7 @@ fn load_layer_into(
     layer_idx: usize,
     p: &str,
     gpu: &mut Gpu,
+    slabs: Option<&SlabTensorIndex>,
 ) -> HipResult<LayerWeights> {
     let is_moe = config.num_experts > 0;
     Ok(match (config.layer_types[layer_idx], is_moe) {
@@ -1695,22 +2200,22 @@ fn load_layer_into(
             let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
             LayerWeights::DeltaNet(DeltaNetLayerWeights {
                 attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                wqkv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                wz: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                w_alpha: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_a.weight"),
                     config.linear_num_value_heads, config.dim)?,
-                w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                w_beta: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_b.weight"),
                     config.linear_num_value_heads, config.dim)?,
                 a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
                 dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
                 conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
                     qkv_dim * config.conv_kernel_dim)?,
                 norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                w_gate: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                w_up: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                w_down: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
             })
         }
         (LayerType::FullAttention, false) => {
@@ -1718,16 +2223,16 @@ fn load_layer_into(
             let kv_dim = config.n_kv_heads * config.head_dim;
             LayerWeights::FullAttn(FullAttnLayerWeights {
                 attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                wq: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                wk: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                wv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
                 q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                 k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                w_gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
-                w_up: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
-                w_down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
+                w_gate: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+                w_up: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+                w_down: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
             })
         }
         (LayerType::LinearAttention, true) => {
@@ -1736,20 +2241,20 @@ fn load_layer_into(
             let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
             LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
                 attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                wqkv: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
-                wz: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
-                w_alpha: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+                wqkv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, config.dim)?,
+                wz: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_z.weight"), d_inner, config.dim)?,
+                w_alpha: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_a.weight"),
                     config.linear_num_value_heads, config.dim)?,
-                w_beta: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+                w_beta: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.in_proj_b.weight"),
                     config.linear_num_value_heads, config.dim)?,
                 a_log: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
                 dt_bias: load_raw_f32(hfq, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
                 conv_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.conv1d.weight"),
                     qkv_dim * config.conv_kernel_dim)?,
                 norm_weight: load_any_as_f32(hfq, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
-                wo: load_weight_tensor(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
+                wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.linear_attn.out_proj.weight"), config.dim, d_inner)?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+                ffn: load_moe_ffn(hfq, gpu, slabs, p, config, layer_idx as u16)?,
             })
         }
         (LayerType::FullAttention, true) => {
@@ -1757,14 +2262,14 @@ fn load_layer_into(
             let kv_dim = config.n_kv_heads * config.head_dim;
             LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
                 attn_norm: load_norm_weight(hfq, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
-                wq: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
-                wk: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
-                wv: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
-                wo: load_weight_tensor(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
+                wq: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+                wk: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+                wv: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+                wo: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.self_attn.o_proj.weight"), config.dim, config.n_heads * config.head_dim)?,
                 q_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
                 k_norm: load_norm_weight(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
                 ffn_norm: load_norm_weight(hfq, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
-                ffn: load_moe_ffn(hfq, gpu, p, config, layer_idx as u16)?,
+                ffn: load_moe_ffn(hfq, gpu, slabs, p, config, layer_idx as u16)?,
             })
         }
     })
@@ -1777,6 +2282,7 @@ fn load_layer_into(
 fn load_moe_ffn(
     hfq: &HfqFile,
     gpu: &mut Gpu,
+    slabs: Option<&SlabTensorIndex>,
     p: &str,
     config: &Qwen35Config,
     layer_idx: u16,
@@ -1786,29 +2292,29 @@ fn load_moe_ffn(
     let smi = config.shared_expert_intermediate_size;
 
     // Router: hidden_size → num_experts. Precision-sensitive but small.
-    let router = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
+    let router = load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.gate.weight"), n_exp, config.dim)?;
 
     // Shared expert (always-on, contributes to every token). Unlike routed
     // experts, gate_proj + up_proj are stored separately in the safetensors
     // (routed experts store them fused as `gate_up_proj`).
     let shared_expert = SharedExpertWeights {
-        gate: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?,
-        up:   load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.up_proj.weight"),   smi, config.dim)?,
-        down: load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert.down_proj.weight"), config.dim, smi)?,
+        gate: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.shared_expert.gate_proj.weight"), smi, config.dim)?,
+        up:   load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.shared_expert.up_proj.weight"),   smi, config.dim)?,
+        down: load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.shared_expert.down_proj.weight"), config.dim, smi)?,
     };
     // Scalar gate on the shared-expert add: sigmoid(shared_expert_gate · x).
     // Stored as a 1×hidden row-vector.
-    let shared_expert_gate = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
+    let shared_expert_gate = load_weight_tensor(hfq, gpu, slabs, &format!("{p}.mlp.shared_expert_gate.weight"), 1, config.dim)?;
 
     // Routed experts — quantizer wrote per-expert tensors named
     // `{p}.mlp.experts.{X}.gate_up_proj.weight` (shape [2*moe_intermediate, hidden_size])
     // and `{p}.mlp.experts.{X}.down_proj.weight` (shape [hidden_size, moe_intermediate]).
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
-        let gate_up = load_weight_tensor(hfq, gpu,
+        let gate_up = load_weight_tensor(hfq, gpu, slabs,
             &format!("{p}.mlp.experts.{x}.gate_up_proj.weight"),
             2 * mi, config.dim)?;
-        let down = load_weight_tensor(hfq, gpu,
+        let down = load_weight_tensor(hfq, gpu, slabs,
             &format!("{p}.mlp.experts.{x}.down_proj.weight"),
             config.dim, mi)?;
         experts.push(ExpertWeights { gate_up, down });

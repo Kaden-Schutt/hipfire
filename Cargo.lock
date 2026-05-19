@@ -631,6 +631,7 @@ version = "0.1.20"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
+ "libc",
  "rdna-compute",
  "serde",
  "serde_json",

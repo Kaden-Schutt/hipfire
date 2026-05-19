@@ -107,6 +107,10 @@ name = "gpus_smoke"
 required-features = []
 
 [[example]]
+name = "load_transport_probe"
+required-features = ["deltanet"]
+
+[[example]]
 name = "infer_qwen35"
 required-features = ["arch-qwen35"]
 

@@ -10,7 +10,7 @@ pub use error::{
     HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
     HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-pub use ffi::{Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, Module, Stream};
+pub use ffi::{Event, Function, Graph, GraphExec, HipPointerAttribute, HipRuntime, HostBuffer, Module, Stream};
 pub use ffi::launch_counters;
 pub use kernarg::KernargBlob;
 pub use rocblas::{Rocblas, RocblasDatatype, RocblasError, RocblasOperation, RocblasResult};
