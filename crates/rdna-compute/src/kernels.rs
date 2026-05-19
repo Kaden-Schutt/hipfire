@@ -740,6 +740,13 @@ pub const GEMM_GATE_UP_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../ker
 pub const GEMM_QKVZA_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.hip");
 pub const GEMM_QKVZA_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.gfx12.hip");
 
+// HFP4-G32 grouped-WMMA-GEMM for MoE prefill on gfx12. Sister of the
+// HFQ4 grouped variant — same tile geometry / expert_tile_ids sentinel
+// pattern, with HFP4G32's 18 B/group dequant (1 B UE8M0 + 16 B packed
+// FP4 + LUT) and the G32 inner loop. MFP4G32 shares storage with HFP4G32.
+pub const GEMM_HFP4G32_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfp4g32_moe_grouped_wmma.gfx12.hip");
+
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
