@@ -5960,10 +5960,15 @@ fn forward_prefill_chunk(
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
-                // quantized against un-rotated activations); MQ4 wo requires
-                // FWHT(awq_scale-adjusted) rotation. Mirrors the dense FA
-                // wo dispatch (qwen35.rs:5388-5411).
+                // quantized against un-rotated activations); MQ4/MQ6 wo
+                // require FWHT(awq_scale-adjusted) rotation. Mirrors the
+                // dense LA wo dispatch (qwen35.rs:5000-5043) — the MQ6
+                // branch is required for AWQ A3B where 4/40 LA layers
+                // ship MQ6 wo and would otherwise corrupt the residual
+                // stream when dispatched through the HFQ4 kernel against
+                // 200 B/group MQ6-layout bytes.
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_input = if dn_wo_is_q8 {
                     &pbs.dn_normed_batch
                 } else {
@@ -5974,7 +5979,12 @@ fn forward_prefill_chunk(
                     )?;
                     &pbs.dn_normed_rot_batch
                 };
-                if dn_wo_is_q8 && q8_wmma_arch {
+                if dn_wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, dn_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if dn_wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_residual_wmma(
                         &layer.wo.buf, dn_wo_input, &x_n,
@@ -6316,9 +6326,15 @@ fn forward_prefill_chunk(
                 }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Mirrors the dense FA wo dispatch at
-                // qwen35.rs:5388-5411 — Q8 wo skips rotation (un-rotated
-                // input expected); MQ4 wo applies FWHT(awq_scale-adjusted).
+                // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
+                // input expected); MQ4/MQ6 wo apply FWHT(awq_scale-adjusted).
+                // MQ6 branch added alongside MQ6_ADMIT (without it, MQ6 wo
+                // bytes get fed to gemm_hfq4g256_residual which reads them
+                // as 136 B/group HFQ4 layout vs the actual 200 B/group MQ6
+                // — catastrophic stride mismatch produces a single-token
+                // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_input = if fa_wo_is_q8 {
                     &pbs.fa_attn_out_batch
                 } else {
@@ -6329,7 +6345,12 @@ fn forward_prefill_chunk(
                     )?;
                     &pbs.fa_attn_out_rot_batch
                 };
-                if fa_wo_is_q8 && q8_wmma_arch {
+                if fa_wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if fa_wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_residual_wmma(
                         &layer.wo.buf, fa_wo_input, &x_n,
