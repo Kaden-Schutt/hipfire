@@ -7,10 +7,20 @@ with our Qwen3.5 target (e.g. cache layout, position_ids, etc).
 
 If this gives τ>1, our tau_probe has a reproducible bug to find.
 """
-import sys, torch
-sys.path.insert(0, "/root/hipfire/.dflash-reference")
-from dflash.model import DFlashDraftModel
+import os
+import sys
+from pathlib import Path
+
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DFLASH_REFERENCE = Path(os.environ.get("HIPFIRE_DFLASH_REFERENCE", REPO_ROOT / ".dflash-reference"))
+if not (DFLASH_REFERENCE / "dflash" / "model.py").exists():
+    raise SystemExit(f"missing DFlash reference at {DFLASH_REFERENCE}")
+sys.path.insert(0, str(DFLASH_REFERENCE))
+
+from dflash.model import DFlashDraftModel  # type: ignore[import-not-found]  # noqa: E402
 
 device = torch.device("cuda")
 dtype = torch.bfloat16
@@ -19,7 +29,7 @@ print("[target] loading...", flush=True)
 tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 target = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3.5-4B", torch_dtype=dtype, attn_implementation="eager",
-).to(device)
+).to(device)  # type: ignore[arg-type]
 target.eval()
 
 print("[draft] loading z-lab 4B DFlash...", flush=True)
@@ -52,6 +62,6 @@ try:
     gen = tok.decode(gen_ids, skip_special_tokens=False)
     print(f"[out] shape={out.shape}  new_len={len(gen_ids)}", flush=True)
     print(f"[gen] {gen[:400]!r}", flush=True)
-except Exception as e:
+except Exception:
     import traceback
     traceback.print_exc()

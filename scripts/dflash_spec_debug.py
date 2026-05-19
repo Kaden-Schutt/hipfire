@@ -4,13 +4,23 @@
 The goal: figure out why the draft+target loop produces 'useruser...'
 while target.generate alone produces '<think>\\nThinking Process:'.
 """
-import sys, torch
-sys.path.insert(0, "/root/hipfire/scripts")
-sys.path.insert(0, "/root/hipfire/.dflash-reference")
-from dflash_train_poc import build_draft_config
-from dflash.model import DFlashDraftModel, extract_context_feature, sample
+import os
+import sys
+from pathlib import Path
+
+import torch
 from safetensors.torch import load_file
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DFLASH_REFERENCE = Path(os.environ.get("HIPFIRE_DFLASH_REFERENCE", REPO_ROOT / ".dflash-reference"))
+if not (DFLASH_REFERENCE / "dflash" / "model.py").exists():
+    raise SystemExit(f"missing DFlash reference at {DFLASH_REFERENCE}")
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(DFLASH_REFERENCE))
+
+from dflash_train_poc import build_draft_config  # noqa: E402
+from dflash.model import DFlashDraftModel, extract_context_feature, sample  # type: ignore[import-not-found]  # noqa: E402
 
 device = torch.device("cuda")
 dtype = torch.bfloat16
@@ -20,15 +30,21 @@ tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-4B")
 tgt_cfg = AutoConfig.from_pretrained("Qwen/Qwen3.5-4B")
 target = AutoModelForCausalLM.from_pretrained(
     "Qwen/Qwen3.5-4B", torch_dtype=dtype, attn_implementation="eager",
-).to(device)
+).to(device)  # type: ignore[arg-type]
 target.eval()
 
 print("[draft] loading z-lab weights...", flush=True)
 cfg = build_draft_config(tgt_cfg, 5, 16, 248070, match_zlab_arch=True)
 draft = DFlashDraftModel(cfg).to(device=device, dtype=dtype)
 sd = load_file(
-    "/root/.cache/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash/snapshots/"
-    "96899cc270945f554998309580b08a04a05a3187/model.safetensors"
+    os.environ.get(
+        "HIPFIRE_DFLASH_ZLAB_SAFETENSORS",
+        str(
+            Path.home()
+            / ".cache/huggingface/hub/models--z-lab--Qwen3.5-4B-DFlash/snapshots"
+            / "96899cc270945f554998309580b08a04a05a3187/model.safetensors"
+        ),
+    )
 )
 miss, unex = draft.load_state_dict(sd, strict=False)
 print(f"[draft]   missing={len(miss)} unexpected={len(unex)}", flush=True)
@@ -112,7 +128,7 @@ def debug_spec(max_cycles=3, B=16):
         pkv_t.crop(start)
         th = extract_context_feature(o.hidden_states, draft.target_layer_ids)[:, :al+1, :]
 
-    print(f"\n=== FINAL DECODE ===", flush=True)
+    print("\n=== FINAL DECODE ===", flush=True)
     print(f"out[{num_in}:{start+1}] = {tok.decode(out[0, num_in:start+1].cpu().tolist(), skip_special_tokens=False)!r}", flush=True)
 
 debug_spec(max_cycles=3)

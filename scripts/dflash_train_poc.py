@@ -57,7 +57,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import sys
 import time
@@ -73,7 +72,7 @@ from torch.optim.lr_scheduler import LambdaLR
 # `pip install -e` it (avoids transformers-version conflicts).
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".dflash-reference"))
-from dflash.model import DFlashDraftModel, build_target_layer_ids, extract_context_feature  # noqa: E402
+from dflash.model import DFlashDraftModel, build_target_layer_ids, extract_context_feature  # type: ignore[import-not-found]  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,7 +162,7 @@ def tau_probe(draft, target, tokenizer, prompt: str, max_new: int, device):
     try:
         # Patch spec_generate to also return acceptance_lengths via a hack:
         # we re-run the decode logic inline to capture τ cheaply.
-        from dflash.model import extract_context_feature, sample
+        from dflash.model import extract_context_feature, sample  # type: ignore[import-not-found]
         from transformers import DynamicCache
 
         num_input = input_ids.shape[1]
@@ -300,7 +299,7 @@ def build_draft_config(target_config, draft_layers: int, block_size: int, mask_t
     # embeddings, intermediate_size=9728. Keeps hidden_size from target (the
     # fc layer needs len(target_layer_ids) * target.hidden_size → draft.hidden_size
     # match — z-lab's 2560 matches Qwen3.5-4B target's 2560).
-    attn_overrides = {}
+    attn_overrides: dict[str, int] = {}
     if match_zlab_arch:
         attn_overrides.update(
             num_attention_heads=32,
@@ -387,7 +386,7 @@ def main() -> int:
         args.target_repo,
         torch_dtype=dtype,
         attn_implementation="eager",   # safer on ROCm; swap to sdpa once verified
-    ).to(device)
+    ).to(device)  # type: ignore[arg-type]
     target.eval()
     for p in target.parameters():
         p.requires_grad_(False)
@@ -554,7 +553,6 @@ def main() -> int:
             #       * attends to noise q'_j ONLY IF q'_j is in the same block k
             #         (bidirectional within-block; no cross-block leakage).
             q_len = K * B
-            k_len_total = L + q_len
             q_block = torch.arange(q_len, device=device) // B                   # [q_len] which block
             q_anchor = anchors[b][q_block]                                      # [q_len] abs anchor of q
             # Context visibility: [q_len, L] — j < anchor(q)
@@ -721,7 +719,7 @@ def main() -> int:
         "batch_size": args.batch_size,
     }, indent=2))
     print(f"[done] final HF-format draft at {final_dir}", flush=True)
-    print(f"[done] convert to .hfq with:", flush=True)
+    print("[done] convert to .hfq with:", flush=True)
     print(f"       target/release/dflash_convert --input {final_dir} "
           f"--output {final_dir}.hfq --mq4", flush=True)
     return 0

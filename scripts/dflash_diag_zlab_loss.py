@@ -38,7 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / ".dflash-reference"))
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
-from dflash.model import DFlashDraftModel, extract_context_feature  # noqa: E402
+from dflash.model import DFlashDraftModel, extract_context_feature  # type: ignore[import-not-found]  # noqa: E402
 
 
 def parse_args():
