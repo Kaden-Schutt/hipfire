@@ -6294,8 +6294,11 @@ fn forward_prefill_chunk(
             weight_gemv(gpu, &weights.output, &last_view, &s.logits)?;
         } else {
             // Legacy path: only last-token logits.
+            // Use _auto so the D→D copy routes through the active stream
+            // during hipGraph capture (bare memcpy_dtod_at uses the legacy
+            // null stream and breaks capture: HIP error 906).
             let last = n - 1;
-            gpu.hip.memcpy_dtod_at(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
+            gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs.x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
             gpu.rmsnorm_f32(&s.x, &weights.output_norm, &s.tmp, config.norm_eps)?;
             weight_gemv(gpu, &weights.output, &s.tmp, &s.logits)?;
         }
