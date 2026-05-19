@@ -487,6 +487,75 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
+/// Atomic-free batched indexed MoE down — writes per-(token, krank) row into
+/// an expanded [N × K_TOP × M] output buffer instead of atomicAdd'ing into
+/// a shared residual row. Pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
+/// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
+/// contention per output cell).
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
+/// slots per (token, m) with topk_weights applied; accumulates into the
+/// per-token residual row. No cross-token contention.
+pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram
+/// over flattened topk_indices. Single workgroup, LDS atomics.
+pub const MOE_SCATTER_HISTOGRAM_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_histogram_k8.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 2: pad raw histogram up to
+/// BLOCK_M and exclusive prefix-sum into expert_offsets[E+1]. Rewrites
+/// expert_token_counts in place from raw → padded. expert_offsets[E] is
+/// M_total (total padded slot count).
+pub const MOE_SCATTER_OFFSETS_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_offsets_k8.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 3: scatter each flat slot
+/// (n*K_TOP + k) into sorted_slot_index at offsets[e] + bucket[e]. Pads
+/// with -1 sentinel. Emits expert_tile_ids[M_total/BLOCK_M] for the
+/// grouped-GEMM dispatch loop (Stage 2).
+pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_permute_k8.hip");
+
+/// Path 2 grouped-GEMM kernel for MoE prefill gate_up (and reusable
+/// for moe down). WMMA 16×16×16 F16, 2× K-tile pipeline. Per-tile
+/// expert lookup + sorted_slot_index X gather; -1 padding lanes
+/// substitute zero. Writes Y_grouped[m_total × M] directly (no
+/// residual; combine kernel handles the fanout into per-token
+/// gate_batch/up_batch). **gfx11 (RDNA3) only** — the gfx12 sister
+/// kernel below uses the _gfx12 WMMA intrinsic.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
+/// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
+/// width (half8_t vs half16_t), and K-lane split (K split across 2
+/// lane groups). K4 unroll like the gfx12 residual variant.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma.gfx12.hip");
+
+/// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
+/// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
+/// × mi] via the inverse permutation in sorted_slot_index.
+pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
+
+/// Path 2 combine for down: per (token, m) iterates K_TOP slots via
+/// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
+/// x_residual. No atomic contention (each token's m column is owned by
+/// a unique thread).
+pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_grouped_k8.hip");
+
+/// Fused single-CTA SGLang-style MoE scatter pipeline: combines
+/// histogram + padded prefix-sum + permutation in one launch. Saves
+/// 2 kernel launches per MoE layer (~75µs each).
+pub const MOE_SCATTER_FUSED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used

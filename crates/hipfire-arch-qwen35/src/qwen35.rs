@@ -13,6 +13,7 @@ use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::sync::OnceLock;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -3284,6 +3285,32 @@ pub struct PrefillBatchScratch {
     pub moe_gate_batch:          Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_up_batch:            Option<GpuTensor>,   // [N × k_top × mi]
     pub moe_rot_batch:           Option<GpuTensor>,   // [N × k_top × mi]
+    // Atomic-free MoE down expansion buffer — [N × k_top × dim] f32.
+    // Paired with `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
+    // `moe_down_combine_k8_batched`: the down kernel writes each
+    // (token, krank) result to its own row here (no atomic), then the
+    // combine kernel folds K_TOP slots into x_batch with topk_weights
+    // applied. RDNA-only (atomic on GDDR is slow); the wave64/CDNA path
+    // stays on the residual_scaled atomic kernel.
+    pub moe_down_expanded_batch: Option<GpuTensor>,
+
+    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
+    // allocated when num_experts > 0; gated at runtime by
+    // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max = max_batch * k_top +
+    // num_experts * (BLOCK_M - 1) with BLOCK_M=16.
+    //
+    //   moe_expert_token_counts: [num_experts] i32 (raw → padded)
+    //   moe_expert_offsets:      [num_experts + 1] i32 (exclusive prefix)
+    //   moe_sorted_slot_index:   [m_total_max] i32 (flat slot or -1 padding)
+    //   moe_expert_tile_ids:     [m_total_max / 16] i32 (per-tile expert id)
+    //   moe_y_gate_up_grouped:   [m_total_max × (2*mi)] f32 (grouped GEMM output)
+    pub moe_expert_token_counts: Option<GpuTensor>,
+    pub moe_expert_offsets:      Option<GpuTensor>,
+    pub moe_sorted_slot_index:   Option<GpuTensor>,
+    pub moe_inverse_perm:        Option<GpuTensor>,    // [total_slots] i32: flat → sorted_pos
+    pub moe_expert_tile_ids:     Option<GpuTensor>,
+    pub moe_y_gate_up_grouped:   Option<GpuTensor>,    // [m_total × (2*mi)]
+    pub moe_y_down_grouped:      Option<GpuTensor>,    // [m_total × dim] for the down step
 
     // ── Tree-aware LA scratch (Phase 3b of Task #101) ──
     // Per-token S-state tape consumed by gated_delta_net_q8_tree kernel
@@ -3373,6 +3400,38 @@ impl PrefillBatchScratch {
             moe_rot_batch: if config.num_experts > 0 {
                 Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.moe_intermediate_size], DType::F32)?)
             } else { None },
+            moe_down_expanded_batch: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(&[max_batch * config.num_experts_per_tok * config.dim], DType::F32)?)
+            } else { None },
+            // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
+            // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
+            // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
+            moe_expert_token_counts: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(&[config.num_experts * 4], DType::Raw)?)
+            } else { None },
+            moe_expert_offsets: if config.num_experts > 0 {
+                Some(gpu.alloc_tensor(&[(config.num_experts + 1) * 4], DType::Raw)?)
+            } else { None },
+            moe_sorted_slot_index: if config.num_experts > 0 {
+                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                Some(gpu.alloc_tensor(&[m_total_max * 4], DType::Raw)?)
+            } else { None },
+            moe_inverse_perm: if config.num_experts > 0 {
+                let total_slots_max = max_batch * config.num_experts_per_tok;
+                Some(gpu.alloc_tensor(&[total_slots_max * 4], DType::Raw)?)
+            } else { None },
+            moe_expert_tile_ids: if config.num_experts > 0 {
+                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                Some(gpu.alloc_tensor(&[(m_total_max / 16 + 1) * 4], DType::Raw)?)
+            } else { None },
+            moe_y_gate_up_grouped: if config.num_experts > 0 {
+                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                Some(gpu.alloc_tensor(&[m_total_max * 2 * config.moe_intermediate_size], DType::F32)?)
+            } else { None },
+            moe_y_down_grouped: if config.num_experts > 0 {
+                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                Some(gpu.alloc_tensor(&[m_total_max * config.dim], DType::F32)?)
+            } else { None },
             dn_s_tape_q8: if config.linear_num_value_heads > 0 {
                 let bytes = max_batch * config.linear_num_value_heads * config.linear_value_head_dim * config.linear_value_head_dim;
                 Some(gpu.alloc_tensor(&[bytes], DType::Raw)?)
@@ -3405,6 +3464,7 @@ impl PrefillBatchScratch {
             self.moe_shared_gate_batch, self.moe_shared_up_batch, self.moe_shared_rot_batch,
             self.moe_topk_indices_batch, self.moe_topk_weights_batch,
             self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
+            self.moe_down_expanded_batch,
             self.dn_s_tape_q8, self.dn_s_tape_scales,
         ] {
             if let Some(t) = t { let _ = gpu.free_tensor(t); }
@@ -3847,24 +3907,19 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.w_up.gpu_dtype, arch)
                     && is_batchable_la(l.w_down.gpu_dtype, arch),
             LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
-            // MoE batched path: LA/FA projections must be MQ4 + every
-            // routed/shared MoE weight must be MQ4. Top-K=8 and the
-            // scratch tensors must exist on `pbs`.
-            //
-            // Q8_0 weights in a MoE layer fall back to per-token: the
-            // MoE batched dispatch arms below (fused_qkvza_hfq4g256 +
-            // gemm_qkvza_hfq4g256 family) are HFQ4-stride-only — adding
-            // Q8 arms here is deferred until MoE+Q8 becomes a real eval
-            // target. Dense Q8 (LayerWeights::DeltaNet/FullAttn) is
-            // fully batched; only MoE+Q8 takes the per-token slow path.
+            // MoE batched path: LA/FA projections + routed/shared MoE
+            // weights must be batchable per their respective dispatches.
+            // Q8_0 is now admitted alongside MQ4G256 for LA/FA — the
+            // MoE-layer qkvza + wo dispatches handle Q8 via the same
+            // `gemm_qkvza_q8_0_wmma` / `gemm_q8_0_batched_chunked` family
+            // already wired into the dense LA/FA branches (qwen35.rs:4500
+            // + 5404). Engine policy quantizes A3B's attention weights
+            // as Q8 (alongside its Q8 router + shared_expert_gate) so
+            // pre-Q8-admit the batched path was unreachable for every
+            // A3B variant — see commit log.
             LayerWeights::DeltaNetMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && !matches!(l.wqkv.gpu_dtype,    DType::Q8_0)
-                    && !matches!(l.wz.gpu_dtype,      DType::Q8_0)
-                    && !matches!(l.w_beta.gpu_dtype,  DType::Q8_0)
-                    && !matches!(l.w_alpha.gpu_dtype, DType::Q8_0)
-                    && !matches!(l.wo.gpu_dtype,      DType::Q8_0)
                     && is_batchable_la(l.wqkv.gpu_dtype, arch)
                     && is_batchable_la(l.wz.gpu_dtype, arch)
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
@@ -3874,10 +3929,6 @@ pub fn forward_prefill_batch_with_pbs(
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && !matches!(l.wq.gpu_dtype, DType::Q8_0)
-                    && !matches!(l.wk.gpu_dtype, DType::Q8_0)
-                    && !matches!(l.wv.gpu_dtype, DType::Q8_0)
-                    && !matches!(l.wo.gpu_dtype, DType::Q8_0)
                     && is_batchable_la(l.wq.gpu_dtype, arch)
                     && is_batchable_la(l.wk.gpu_dtype, arch)
                     && is_batchable_la(l.wv.gpu_dtype, arch)
@@ -4158,6 +4209,7 @@ fn prefill_moe_ffn_body_batched(
     let gate_batch    = pbs.moe_gate_batch.as_ref().expect("moe scratch");
     let up_batch      = pbs.moe_up_batch.as_ref().expect("moe scratch");
     let rot_batch     = pbs.moe_rot_batch.as_ref().expect("moe scratch");
+    let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
 
     // ── 1. Split rmsnorm vs FWHT rotate ──
     //
@@ -4212,13 +4264,14 @@ fn prefill_moe_ffn_body_batched(
         other => panic!("prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
                          — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
     }
-    gpu.gemm_hfq4g256(
-        &ffn.shared_expert.gate.buf, &pbs.x_rot_batch, shared_gate,
-        ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
-    )?;
-    gpu.gemm_hfq4g256(
-        &ffn.shared_expert.up.buf, &pbs.x_rot_batch, shared_up,
-        ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
+    // Fused gate+up dispatch for the shared expert — halves the kernel
+    // launch count vs back-to-back gemm_hfq4g256 (~75µs/launch × 40
+    // MoE layers = ~3ms saved on R9700 A3B prefill at bs=256).
+    gpu.gemm_gate_up_hfq4g256(
+        &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+        &pbs.x_rot_batch, shared_gate, shared_up,
+        ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+        ffn.shared_expert.gate.k, n,
     )?;
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
@@ -4265,11 +4318,74 @@ fn prefill_moe_ffn_body_batched(
     let down_m = ffn.experts[0].down.m;
     let down_k = ffn.experts[0].down.k;
     let gate_up_k = ffn.experts[0].gate_up.k;
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-        &ffn.expert_gate_up_ptrs, topk_indices,
-        &pbs.x_rot_batch, gate_batch, up_batch,
-        2 * mi, gate_up_k, k_top, n,
-    )?;
+
+    // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) is gated by
+    // HIPFIRE_MOE_GROUPED_GEMM=1. Only enabled on RDNA (wave32) where
+    // WMMA is available; CDNA wave64 already amortizes well on the
+    // per-token indexed_batched GEMV and would need a separate kernel.
+    // Cached read — getenv on every layer × MoE call adds up.
+    static USE_PATH2_GATE_UP: OnceLock<bool> = OnceLock::new();
+    let use_path2 = *USE_PATH2_GATE_UP.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref() == Some("1")
+    });
+    let path2_eligible = use_path2 && !gpu.arch.starts_with("gfx9");
+    // m_total — computed during gate_up scatter, reused for down. Avoids
+    // a second dtoh sync per MoE layer.
+    let mut path2_m_total: usize = 0;
+    if path2_eligible {
+        // Stage 1 scatter pipeline. The scratch buffers are sized for
+        // m_total_max = max_batch * k_top + n_exp * 15; here m_total ≤
+        // n * k_top + n_exp * 15. Block size 16 (the WMMA tile row count).
+        const BLOCK_M: usize = 16;
+        let counts = pbs.moe_expert_token_counts.as_ref().expect("path2 scratch");
+        let offsets = pbs.moe_expert_offsets.as_ref().expect("path2 scratch");
+        let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
+        let inverse_perm = pbs.moe_inverse_perm.as_ref().expect("path2 scratch");
+        let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
+        let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
+        let total_slots = n * k_top;
+        // m_total upper bound — sized in PrefillBatchScratch::new with
+        // max_batch * k_top + n_exp * (BLOCK_M - 1).
+        let m_total_max = n * k_top + n_exp * (BLOCK_M - 1);
+
+        // Fused scatter pipeline: one launch replaces histogram + offsets
+        // + permute. Saves 2 launches × ~75µs × MoE layers.
+        gpu.moe_scatter_fused_k8(
+            topk_indices, counts, offsets, sorted, tile_ids, inverse_perm,
+            total_slots, n_exp, m_total_max, BLOCK_M,
+        )?;
+
+        // Read M_total = offsets[n_exp]. One dtoh sync per MoE layer —
+        // ~50µs each on R9700 GDDR. Cached for the down step via
+        // path2_m_total below.
+        let mut m_total_host = [0i32; 1];
+        let m_total_bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(m_total_host.as_mut_ptr() as *mut u8, 4)
+        };
+        gpu.hip.memcpy_dtoh_at(m_total_bytes, &offsets.buf, n_exp * 4)?;
+        let m_total = m_total_host[0] as usize;
+        path2_m_total = m_total;
+
+        // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
+        // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.
+        gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+            &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+            &pbs.x_rot_batch, y_gu_grouped,
+            2 * mi, gate_up_k, k_top, m_total, n,
+        )?;
+
+        // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
+        gpu.moe_gate_up_unscatter_k8(
+            y_gu_grouped, sorted, gate_batch, up_batch,
+            mi, k_top, m_total,
+        )?;
+    } else {
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            &ffn.expert_gate_up_ptrs, topk_indices,
+            &pbs.x_rot_batch, gate_batch, up_batch,
+            2 * mi, gate_up_k, k_top, n,
+        )?;
+    }
 
     // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
     // expert ranks, k=mi is per-row width.
@@ -4277,13 +4393,59 @@ fn prefill_moe_ffn_body_batched(
     // experts at this layer share imatrix at the same residual basis).
     fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
 
-    // Down projection with per-(token, expert) scaling and atomic
-    // residual-add into pbs.x_batch.
-    gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
-        &ffn.expert_down_ptrs, topk_indices, topk_weights,
-        rot_batch, &pbs.x_batch,
-        down_m, down_k, k_top, n,
-    )?;
+    // Down projection. Three paths:
+    //   Path 2 (HIPFIRE_MOE_GROUPED_GEMM=1, RDNA): grouped-WMMA-GEMM
+    //     reusing the gate_up scatter + inverse_perm + a non-atomic combine.
+    //   Path 1 (RDNA, default): atomic-free expanded GEMV write + combine.
+    //   Path 0 (CDNA wave64 fallback): residual_scaled atomic GEMV.
+    //
+    // Path 1: K_TOP-way atomicAdd contention per output cell — 387 GiB/s
+    // observed vs 954 on the sister gate_up. Path 2 amortizes weights via
+    // WMMA across the m_total tokens routed to each expert; ~67ms saved on
+    // the down kernel for A3B prefill at batch 256 (R9700).
+    // CDNA (wave64, HBM2/3) stays on Path 0 — cheap HBM atomics +
+    // expanded scratch cost makes the GEMV pattern competitive.
+    if path2_eligible {
+        let y_down_grouped = pbs.moe_y_down_grouped.as_ref().expect("path2 scratch");
+        let inverse_perm = pbs.moe_inverse_perm.as_ref().expect("path2 scratch");
+        let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
+        let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
+        // m_total already computed during gate_up scatter — reuse to skip
+        // a second dtoh sync per MoE layer (~50µs each × 40 layers = 2ms).
+        let m_total = path2_m_total;
+
+        // Grouped GEMM on down: x_src = rot_batch [N*K_TOP × mi], x_row_div = 1
+        // (sorted_slot_index[slot] directly indexes the source row).
+        gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+            &ffn.expert_down_ptrs, tile_ids, sorted,
+            rot_batch, y_down_grouped,
+            down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+        )?;
+        // Non-atomic combine via inverse_perm + topk_weights.
+        gpu.moe_down_combine_grouped_k8(
+            y_down_grouped, inverse_perm, topk_weights, &pbs.x_batch,
+            down_m, k_top, n,
+        )?;
+    } else {
+        let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
+        if use_atomic_free_down {
+            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, topk_indices,
+                rot_batch, down_expanded,
+                down_m, down_k, k_top, n,
+            )?;
+            gpu.moe_down_combine_k8_batched(
+                down_expanded, topk_weights, &pbs.x_batch,
+                down_m, k_top, n,
+            )?;
+        } else {
+            gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched(
+                &ffn.expert_down_ptrs, topk_indices, topk_weights,
+                rot_batch, &pbs.x_batch,
+                down_m, down_k, k_top, n,
+            )?;
+        }
+    }
 
     Ok(())
 }
@@ -5542,13 +5704,16 @@ fn forward_prefill_chunk(
                 // `forward_prefill_batch_with_pbs` rejects any MoE layer
                 // with MQ3/Lloyd-MQ3 weights anywhere (attention OR FFN),
                 // mirroring the captured-path guard at line 3367+. So
-                // `layer.wqkv.gpu_dtype` is restricted to MQ4G256 / HFQ4G256
-                // / MQ6G256 / HFQ6G256 here. Adding MQ3 to the matcher AND
-                // the QKV dispatch is insufficient — the wo path below
-                // (line 5072) is hardcoded MQ4 too — so the all-or-nothing
-                // wiring lives in a separate PR (see followup issue).
+                // `layer.wqkv.gpu_dtype` is restricted here to MQ4G256 /
+                // HFQ4G256 / MQ6G256 / HFQ6G256 / Q8_0. Q8 admit landed
+                // alongside the moe_ffn router/gate Q8 unlock (A3B's LA
+                // attention weights are Q8 — engine quantizer keeps q/k/v/o
+                // at Q8 alongside the Q8 router + shared_expert_gate).
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
+                let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
+                    || gpu.arch.starts_with("gfx12");
 
                 if is_mq {
                     // AWQ-aware: next linear is LA's fused wqkv.
@@ -5569,6 +5734,30 @@ fn forward_prefill_chunk(
                         layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                         layer.wqkv.k, n,
                     )?;
+                } else if is_q8 && q8_wmma_arch {
+                    // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
+                    // stride; mixed Q8/other layers within DNMoe are rejected
+                    // upstream by `moe_ffn_all_mq4` (router/gate Q8 OK, but
+                    // shared_expert + experts must be MQ4) and would otherwise
+                    // re-introduce Tier-1 stride corruption.
+                    debug_assert!(
+                        matches!(layer.wz.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.w_beta.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0),
+                        "DNMoe LA qkvza Q8 WMMA dispatch requires all of wqkv/wz/w_beta/w_alpha to be Q8_0",
+                    );
+                    gpu.gemm_qkvza_q8_0_wmma(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k, n,
+                    )?;
+                } else if is_q8 {
+                    gpu.gemm_q8_0_batched_chunked(&layer.wqkv.buf,    &pbs.x_rot_batch, &pbs.dn_qkv_batch,   layer.wqkv.m,    layer.wqkv.k, n)?;
+                    gpu.gemm_q8_0_batched_chunked(&layer.wz.buf,      &pbs.x_rot_batch, &pbs.dn_z_batch,     layer.wz.m,      layer.wz.k,   n)?;
+                    gpu.gemm_q8_0_batched_chunked(&layer.w_beta.buf,  &pbs.x_rot_batch, &pbs.dn_beta_batch,  layer.w_beta.m,  layer.w_beta.k, n)?;
+                    gpu.gemm_q8_0_batched_chunked(&layer.w_alpha.buf, &pbs.x_rot_batch, &pbs.dn_alpha_batch, layer.w_alpha.m, layer.w_alpha.k, n)?;
                 } else {
                     gpu.gemm_qkvza_hfq4g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
@@ -5666,16 +5855,44 @@ fn forward_prefill_chunk(
                     &pbs.dn_normed_batch,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
-                // wo + residual. Eligibility gate ensured layer.wo is MQ4.
-                // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
-                rotate_x_mq_batched_for(
-                    gpu, &layer.wo,
-                    &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
-                )?;
-                gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.dn_normed_rot_batch, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
-                )?;
+                // wo + residual. Q8 wo lands un-rotated (Q8 weights were
+                // quantized against un-rotated activations); MQ4 wo requires
+                // FWHT(awq_scale-adjusted) rotation. Mirrors the dense FA
+                // wo dispatch (qwen35.rs:5388-5411).
+                let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let dn_wo_input = if dn_wo_is_q8 {
+                    &pbs.dn_normed_batch
+                } else {
+                    // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
+                    rotate_x_mq_batched_for(
+                        gpu, &layer.wo,
+                        &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n,
+                    )?;
+                    &pbs.dn_normed_rot_batch
+                };
+                if dn_wo_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(
+                        &layer.wo.buf, dn_wo_input, &x_n,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if dn_wo_is_q8 {
+                    // Non-WMMA Q8: gemm into a scratch then add into x_batch.
+                    // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
+                    // path didn't run here) as the GEMM scratch.
+                    let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wo.buf, dn_wo_input, &scratch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf, dn_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                }
 
                 // Batched MoE FFN replaces the dense (rmsnorm + gate+up +
                 // silu_mul + w_down) block. Takes pbs.x_batch as input AND
@@ -5713,6 +5930,9 @@ fn forward_prefill_chunk(
                 // wiring lives in a separate PR (see followup issue).
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+                let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
+                    || gpu.arch.starts_with("gfx12");
                 // Fused QKV requires uniform dtype — see issue #249 for
                 // the dense FA variant. Gate the same way here.
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
@@ -5737,6 +5957,22 @@ fn forward_prefill_chunk(
                         layer.wq.m, layer.wk.m, layer.wv.m,
                         layer.wq.k, n,
                     )?;
+                } else if qkv_is_q8 && q8_wmma_arch && qkv_same_dtype {
+                    debug_assert!(
+                        matches!(layer.wk.gpu_dtype, DType::Q8_0)
+                        && matches!(layer.wv.gpu_dtype, DType::Q8_0),
+                        "FAMoe qkv Q8 WMMA dispatch requires all of wq/wk/wv to be Q8_0",
+                    );
+                    gpu.gemm_qkv_q8_0_wmma(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        &pbs.x_rot_batch,
+                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                        layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k, n,
+                    )?;
+                } else if qkv_is_q8 && qkv_same_dtype {
+                    gpu.gemm_q8_0_batched_chunked(&layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch, layer.wq.m, layer.wq.k, n)?;
+                    gpu.gemm_q8_0_batched_chunked(&layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch,      layer.wk.m, layer.wk.k, n)?;
+                    gpu.gemm_q8_0_batched_chunked(&layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch,      layer.wv.m, layer.wv.k, n)?;
                 } else if qkv_same_dtype {
                     gpu.gemm_qkv_hfq4g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
@@ -5746,7 +5982,9 @@ fn forward_prefill_chunk(
                         layer.wq.k, n,
                     )?;
                 } else {
-                    // Mixed-format fallback (issue #249).
+                    // Mixed-format fallback (issue #249). batched_gemm_single_weight
+                    // covers MQ4/HFQ4 + MQ6/HFQ6 + Q8_0; mixed-Q8/MQ4 within FAMoe
+                    // routes here.
                     batched_gemm_single_weight(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_full_batch, n)?;
                     batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
                     batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
@@ -5973,16 +6211,43 @@ fn forward_prefill_chunk(
                     )?;
                 }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
-                // wo + residual. Eligibility gate ensured layer.wo is MQ4.
-                // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
-                rotate_x_mq_batched_for(
-                    gpu, &layer.wo,
-                    &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
-                )?;
-                gpu.gemm_hfq4g256_residual(
-                    &layer.wo.buf, &pbs.fa_attn_out_rot_batch, &pbs.x_batch,
-                    layer.wo.m, layer.wo.k, n,
-                )?;
+                // wo + residual. Mirrors the dense FA wo dispatch at
+                // qwen35.rs:5388-5411 — Q8 wo skips rotation (un-rotated
+                // input expected); MQ4 wo applies FWHT(awq_scale-adjusted).
+                let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let fa_wo_input = if fa_wo_is_q8 {
+                    &pbs.fa_attn_out_batch
+                } else {
+                    // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
+                    rotate_x_mq_batched_for(
+                        gpu, &layer.wo,
+                        &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n,
+                    )?;
+                    &pbs.fa_attn_out_rot_batch
+                };
+                if fa_wo_is_q8 && q8_wmma_arch {
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_residual_wmma(
+                        &layer.wo.buf, fa_wo_input, &x_n,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if fa_wo_is_q8 {
+                    // Non-WMMA Q8: GEMM into a scratch then add into x_batch.
+                    // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
+                    // didn't run here) as scratch.
+                    let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_q8_0_batched_chunked(
+                        &layer.wo.buf, fa_wo_input, &scratch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else {
+                    gpu.gemm_hfq4g256_residual(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                }
 
                 // Batched MoE FFN.
                 prefill_moe_ffn_body_batched(gpu, &layer.ffn, &layer.ffn_norm, config, pbs, n)?;
@@ -6372,12 +6637,20 @@ fn batched_gemm_single_weight(
             }
             gpu.gemm_hfq6g256_residual(&w.buf, x, y, w.m, w.k, n)
         }
+        DType::Q8_0 => {
+            // Q8 weights consume the un-rotated rmsnorm output. Callers
+            // routing here must pass `pbs.x_rot_batch` containing
+            // `rmsnorm(x_batch)` *without* FWHT — the existing pattern is
+            // to gate the `fused_rmsnorm_rotate_*_for(...)` call on
+            // `is_mq` and fall through to `gpu.rmsnorm_batched(...)` for
+            // Q8 (see DNMoe LA preamble for a representative).
+            gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, n)
+        }
         other => Err(hip_bridge::HipError::new(0, &format!(
             "mixed-format batched prefill: weight dtype {other:?} has no \
-             single-weight batched dispatch yet. Currently only MQ4/HFQ4 and \
-             MQ6/HFQ6 mixes are wired (covers `hipfire-quantize --kmap-dense \
-             --kmap-mode 2`, issue #249). Re-quantize with uniform format or \
-             extend `batched_gemm_single_weight` to cover this format."
+             single-weight batched dispatch yet. Currently MQ4/HFQ4, \
+             MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with uniform \
+             format or extend `batched_gemm_single_weight` to cover this format."
         ))),
     }
 }

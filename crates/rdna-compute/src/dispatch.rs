@@ -9383,6 +9383,544 @@ impl Gpu {
         result
     }
 
+    /// Atomic-free counterpart to
+    /// `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`. Writes
+    /// each (token, krank) result to its own row of `expert_outputs`
+    /// ([N × K_TOP × M], f32) instead of atomicAdd'ing the scaled sum into
+    /// `x_residual`. Pair with `moe_down_combine_k8_batched` to fold the
+    /// K_TOP slots back into the residual with topk_weights applied.
+    ///
+    /// Observed lift on R9700/gfx1201: 387 → ~900 GiB/s for the down GEMV
+    /// (no K_TOP-way atomic contention per output cell). Wave32-only
+    /// (RDNA) for now — the CDNA wave64 path stays on the residual_scaled
+    /// kernel; atomicAdd on HBM is faster there and the contention pattern
+    /// is different.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp  = expert_ptrs.buf.as_ptr();
+        let ip  = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp  as *const _ as *mut c_void,
+            &ip  as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(rbp); b.push_ptr(eop);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
+    /// outputs per (token, m) weighted by topk_weights, accumulates into
+    /// the residual stream. No cross-token contention — each token writes
+    /// to its own M-column slice.
+    pub fn moe_down_combine_k8_batched(
+        &mut self,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        topk_weights: &GpuTensor,   // [batch_size × k_top] f32
+        x_residual: &GpuTensor,     // [batch_size × m] f32 in-place +=
+        m: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_k8_batched",
+            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+            "moe_down_combine_k8_batched",
+        )?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp  = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp  as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // BW: expert_outputs read N*K_TOP*M, topk_weights N*K_TOP, x_residual r+w 2*N*M.
+        let bytes = (batch_size * k_top * m + batch_size * k_top + 2 * batch_size * m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_down_combine_k8_batched", bytes,
+        );
+        let block_m: u32 = 256;
+        let grid_x = (m as u32 + block_m - 1) / block_m;
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_k8_batched",
+            [grid_x, batch_size as u32, 1], [block_m, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop); b.push_ptr(wp); b.push_ptr(xrp);
+                b.push_i32(m_val); b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram.
+    /// Single-CTA LDS-atomic histogram of `topk_indices[total_slots]`.
+    /// Output `expert_token_counts[num_experts]` holds RAW counts; Phase 2
+    /// rewrites them in place as padded counts.
+    pub fn moe_scatter_histogram_k8(
+        &mut self,
+        topk_indices: &GpuTensor,        // [total_slots] i32
+        expert_token_counts: &GpuTensor, // [num_experts] i32, written
+        total_slots: usize,
+        num_experts: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_histogram_k8",
+            kernels::MOE_SCATTER_HISTOGRAM_K8_SRC,
+            "moe_scatter_histogram_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + num_experts) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_scatter_histogram_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_scatter_histogram_k8",
+            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip); b.push_ptr(cp);
+                b.push_i32(ts_val); b.push_i32(ne_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// SGLang-style MoE scatter pipeline — Phase 2: pad + exclusive scan.
+    /// Rewrites `expert_token_counts` raw → padded (to a multiple of
+    /// `block_m`) and writes `expert_offsets[num_experts + 1]` with the
+    /// exclusive prefix sum. `expert_offsets[num_experts]` is M_total.
+    pub fn moe_scatter_offsets_k8(
+        &mut self,
+        expert_token_counts: &GpuTensor, // [E] i32, in: raw, out: padded
+        expert_offsets: &GpuTensor,      // [E+1] i32, written
+        num_experts: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_offsets_k8",
+            kernels::MOE_SCATTER_OFFSETS_K8_SRC,
+            "moe_scatter_offsets_k8",
+        )?;
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let ne_val = num_experts as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (3 * num_experts + 1) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_scatter_offsets_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_scatter_offsets_k8",
+            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(cp); b.push_ptr(op);
+                b.push_i32(ne_val); b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// SGLang-style MoE scatter pipeline — Phase 3: scatter + tile ids.
+    /// Writes `sorted_slot_index[m_total]` with each flat slot index at
+    /// its bucket position (padding stays at the -1 sentinel) and
+    /// `expert_tile_ids[m_total / block_m]` for the grouped-GEMM loop.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_permute_k8(
+        &mut self,
+        topk_indices: &GpuTensor,      // [total_slots] i32
+        expert_offsets: &GpuTensor,    // [E+1] i32, exclusive padded scan
+        sorted_slot_index: &GpuTensor, // [m_total] i32, written
+        expert_tile_ids: &GpuTensor,   // [m_total / block_m] i32, written
+        inverse_perm: &GpuTensor,      // [total_slots] i32, written: flat → sorted_pos
+        total_slots: usize,
+        num_experts: usize,
+        m_total: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_permute_k8",
+            kernels::MOE_SCATTER_PERMUTE_K8_SRC,
+            "moe_scatter_permute_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mt_val = m_total as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        // BW: topk_indices + offsets + sorted_slot_index (init + writes)
+        //     + expert_tile_ids (writes).
+        let bytes = (total_slots + num_experts + 2 * m_total + m_total / block_m.max(1)) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_scatter_permute_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_scatter_permute_k8",
+            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip); b.push_ptr(op); b.push_ptr(sp); b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(ts_val); b.push_i32(ne_val);
+                b.push_i32(mt_val); b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Path 2 grouped-WMMA-GEMM for MoE prefill (gate_up or down).
+    /// Each WMMA tile picks its expert via `expert_tile_ids[tile_y]` and
+    /// gathers its B-operand rows via `sorted_slot_index`; -1 padding
+    /// lanes contribute zeros. Writes `Y_grouped[m_total × M]` direct.
+    ///
+    /// The companion combine kernel (Stage 3) fans Y_grouped back to the
+    /// per-token gate_batch/up_batch streams (or applies topk_weights for
+    /// the down combine).
+    /// `x_row_div` selects the X gather layout:
+    ///   gate_up: x_src = x_rot_batch [N × K], x_row_div = K_TOP
+    ///   down:    x_src = rot_batch [N*K_TOP × K], x_row_div = 1
+    /// `x_src_rows` is the number of rows in x_src (N or N*K_TOP).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_moe_grouped_wmma_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor, // [E] u64
+        expert_tile_ids: &GpuTensor,    // [m_total / 16] i32
+        sorted_slot_index: &GpuTensor,  // [m_total] i32
+        x_src: &GpuTensor,              // [x_src_rows × K] f32 (auto-converted to FP16)
+        y_grouped: &GpuTensor,          // [m_total × M] f32, written direct
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // gfx12 (RDNA4) needs the _gfx12 WMMA intrinsic; gfx11 (RDNA3) and
+        // older RDNA archs use the base _w32 intrinsic from the k2 sibling.
+        let is_gfx12 = self.arch.starts_with("gfx12");
+        let (kernel_name, kernel_src) = if is_gfx12 {
+            (
+                "gemm_hfq4g256_moe_grouped_wmma_gfx12",
+                kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC,
+            )
+        } else {
+            (
+                "gemm_hfq4g256_moe_grouped_wmma_k2",
+                kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC,
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW estimate: each tile loads one expert weight row band (m_total/16 tiles
+        // share the same expert avg ~ m_total/E times) + gathers X + writes Y.
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + (crate::profile::gemv_hfq4g256_bytes(m, k));
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Fused single-CTA scatter pipeline. Replaces histogram + offsets +
+    /// permute with one launch — saves ~2 launches × ~75µs per MoE layer
+    /// (≈2-3ms across 40 A3B layers).
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_scatter_fused_k8(
+        &mut self,
+        topk_indices: &GpuTensor,        // [total_slots] i32
+        expert_token_counts: &GpuTensor, // [E] i32, out: padded
+        expert_offsets: &GpuTensor,      // [E+1] i32, out: exclusive scan
+        sorted_slot_index: &GpuTensor,   // [m_total_max] i32, out
+        expert_tile_ids: &GpuTensor,     // [m_total / block_m] i32, out
+        inverse_perm: &GpuTensor,        // [total_slots] i32, out
+        total_slots: usize,
+        num_experts: usize,
+        m_total_max: usize,
+        block_m: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_scatter_fused_k8",
+            kernels::MOE_SCATTER_FUSED_K8_SRC,
+            "moe_scatter_fused_k8",
+        )?;
+        let ip = topk_indices.buf.as_ptr();
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let ts_val = total_slots as i32;
+        let ne_val = num_experts as i32;
+        let mtm_val = m_total_max as i32;
+        let bm_val = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &ts_val as *const _ as *mut c_void,
+            &ne_val as *const _ as *mut c_void,
+            &mtm_val as *const _ as *mut c_void,
+            &bm_val as *const _ as *mut c_void,
+        ];
+        let lds_bytes = (num_experts * 4) as u32;
+        let bytes = (total_slots + 2 * num_experts + 2 * total_slots + num_experts) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_scatter_fused_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_scatter_fused_k8",
+            [1, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip); b.push_ptr(cp); b.push_ptr(op);
+                b.push_ptr(sp); b.push_ptr(tp); b.push_ptr(invp);
+                b.push_i32(ts_val); b.push_i32(ne_val);
+                b.push_i32(mtm_val); b.push_i32(bm_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Path 2 down combine. Per (token, m) iterates K_TOP slots via
+    /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
+    /// `x_residual`. No atomic contention (each (token, m) is owned by
+    /// one thread).
+    pub fn moe_down_combine_grouped_k8(
+        &mut self,
+        y_down_grouped: &GpuTensor, // [m_total × dim] f32
+        inverse_perm: &GpuTensor,   // [N*K_TOP] i32
+        topk_weights: &GpuTensor,   // [N × K_TOP] f32
+        x_residual: &GpuTensor,     // [N × dim] f32 in-place +=
+        dim: usize,
+        k_top: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_grouped_k8",
+            kernels::MOE_DOWN_COMBINE_GROUPED_K8_SRC,
+            "moe_down_combine_grouped_k8",
+        )?;
+        let yp = y_down_grouped.buf.as_ptr();
+        let ip = inverse_perm.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let xrp = x_residual.buf.as_ptr();
+        let dim_val = dim as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (dim as u32 + block - 1) / block;
+        let bytes = (n * dim * 4 * 2 + n * k_top * 4 + n * k_top * 4) as usize;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_down_combine_grouped_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_grouped_k8",
+            [grid_x, n as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(ip); b.push_ptr(wp); b.push_ptr(xrp);
+                b.push_i32(dim_val); b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Path 2 unscatter combine for gate_up. Reads Y_grouped[m_total ×
+    /// 2*mi] and writes the gate half (rows 0..mi) into `y_gate[token,
+    /// k_rank, :]` and the up half (rows mi..2*mi) into `y_up[token,
+    /// k_rank, :]`, where (token, k_rank) is recovered from
+    /// `sorted_slot_index[slot]`. Padding slots are skipped.
+    pub fn moe_gate_up_unscatter_k8(
+        &mut self,
+        y_grouped: &GpuTensor,         // [m_total × (2*mi)] f32
+        sorted_slot_index: &GpuTensor, // [m_total] i32
+        y_gate: &GpuTensor,            // [N × K_TOP × mi] f32, written
+        y_up: &GpuTensor,              // [N × K_TOP × mi] f32, written
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_gate_up_unscatter_k8",
+            kernels::MOE_GATE_UP_UNSCATTER_K8_SRC,
+            "moe_gate_up_unscatter_k8",
+        )?;
+        let yp = y_grouped.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = y_gate.buf.as_ptr();
+        let up = y_up.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = k_top as i32;
+        let mt_val = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &up as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (mi as u32 + block - 1) / block;
+        // BW: Y_grouped read (m_total*2*mi*4) + y_gate write (m_total*mi*4)
+        //     + y_up write (m_total*mi*4) + sorted_slot_index (m_total*4).
+        let bytes = (m_total * 2 * mi + m_total * 2 * mi + m_total) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_gate_up_unscatter_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_gate_up_unscatter_k8",
+            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp); b.push_ptr(up);
+                b.push_i32(mi_val); b.push_i32(kt_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///
