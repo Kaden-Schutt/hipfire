@@ -5,6 +5,7 @@ mod dispatch;
 mod kernels;
 pub mod pool;
 pub mod profile;
+pub mod profile_rocprof;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
