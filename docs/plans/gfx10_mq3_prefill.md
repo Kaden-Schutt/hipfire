@@ -251,6 +251,38 @@ unchanged. The dot2 quality signal comes from the eyeball
 
 Decode unchanged at 55 tok/s.
 
+### Phase 2c — `v_pk_fma_f16` family for gfx1010 / gfx1013 ✅ **DONE 2026-05-19**
+
+Mirrors Phase 2b for archs without the dot extension (gfx1010 Navi 10 /
+RX 5700 XT — the project's primary target — and gfx1013 Van Gogh /
+BC-250 APU). Four new HFQ3 kernels using `v_pk_fma_f16`
+(`__hmul2` + 3× `__hfma2` + extract + add, FP32 cross-group
+accumulation):
+
+- `kernels/src/gemm_qkv_hfq3g256_fp16.hip`
+- `kernels/src/gemm_qkvza_hfq3g256_fp16.hip`
+- `kernels/src/gemm_gate_up_hfq3g256_fp16.hip`
+- `kernels/src/gemm_hfq3g256_residual_fp16.hip`
+
+Each scalar HFQ3 dispatcher's fan-out is now: `batch_size > 1 &&
+!fp16_disabled()` → `has_dot2_f32_f16(arch)` → dot2, else fp16.
+Mirrors the HFQ4 fan-out exactly (which goes WMMA → dot2 → fp16).
+
+All 4 kernels: 98 VGPR + 52 SGPR + 0 spills + 0 LDS (identical
+budget to the dot2 family — same loop structure, different
+inner-op set).
+
+Validation: `verify_hfq3_batched` extended with fp16-direct calls
+(bypassing auto-routing since gfx1031 prefers dot2). All passes
+at 2e-1 max-abs-err tolerance against the FP32 per-row reference
+— ~0.14 max_err which matches the FP16 mantissa precision over a
+512-element accumulation. The end-to-end perf signal on gfx1010
+can't be measured on the current dev host (gfx1031 doesn't route
+through fp16), but the dot2 family at the same dispatch shape +
+launch geometry delivered +60% on gfx1031; fp16 should give the
+matching uplift on archs without dot2 (≈+30-50% over scalar based
+on the HFQ4 fp16 vs scalar parity reference).
+
 ### Phase 2 — dp4a inner loop for the qkv / gate_up GEMMs
 
 The HFQ4 wave64-dp4a kernels exist for gfx906. Port the dp4a inner
@@ -398,8 +430,12 @@ not the priority.
 - **Phase 2b** (HFQ3 dot2 family — qkv + qkvza + gate_up + residual
   using `v_dot2_f32_f16`) ✅ DONE 2026-05-19 — 148 → 234 tok/s
   (+58%). **Cumulative 56 → 234 tok/s (4.18×).**
+- **Phase 2c** (HFQ3 fp16-packed family for gfx1010/1013 — same
+  4 kernels using `v_pk_fma_f16`, dispatcher fan-out: dot2 → fp16) ✅
+  DONE 2026-05-19. No perf signal on gfx1031 (auto-routes to dot2);
+  benches deferred to gfx1010 hardware. Same VGPR/spill budget as
+  the dot2 family.
 - **Phase 2 (dp4a)** and **Phase 3 (MMQ tile sweep)** remaining for
-  archs without the dot extension (gfx1010 / gfx1013) and for any
-  remaining headroom at high N.
+  any further headroom on archs that already have dot2.
 - **Phase 0 measurement required first** — same lesson as the
   decode plan. Don't write kernels before measuring.
