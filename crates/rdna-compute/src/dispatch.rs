@@ -19342,7 +19342,7 @@ impl Gpu {
     /// Pre-compile all kernels needed for Qwen3.5 inference with a given
     /// weight quantization and KV cache type. Runs hipcc in parallel.
     #[cfg(feature = "deltanet")]
-    pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+    pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, _head_dim: usize) -> HipResult<()> {
         self.bind_thread()?;
         // asym kernels #include "turbo_common.h" + "givens_common.h"; the
         // runtime dispatch path (see ensure_givens4_kernel) prepends the

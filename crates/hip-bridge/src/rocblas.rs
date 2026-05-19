@@ -56,7 +56,6 @@ pub enum RocblasDatatype {
 #[derive(Debug, Clone, Copy)]
 pub enum RocblasGemmAlgo {
     Standard = 160,
-    SolutionIndex = 161,
 }
 
 type RocblasHandle = *mut c_void;
@@ -66,7 +65,6 @@ pub struct Rocblas {
     _lib: Library,
     handle: RocblasHandle,
 
-    fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32,
     fn_destroy_handle: unsafe extern "C" fn(RocblasHandle) -> u32,
     fn_set_stream: unsafe extern "C" fn(RocblasHandle, *mut c_void) -> u32,
     fn_gemm_ex: unsafe extern "C" fn(
@@ -158,7 +156,6 @@ impl Rocblas {
             Ok(Self {
                 _lib: lib,
                 handle,
-                fn_create_handle,
                 fn_destroy_handle,
                 fn_set_stream,
                 fn_gemm_ex,

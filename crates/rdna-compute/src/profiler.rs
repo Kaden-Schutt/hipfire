@@ -306,7 +306,6 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
 
             let meta = RawKernelMeta {
                 pgm_rsrc1: u32_le(elf, kd_off + 48),
-                pgm_rsrc2: u32_le(elf, kd_off + 52),
                 group_segment_size: u32_le(elf, kd_off),
                 private_segment_size: u32_le(elf, kd_off + 4),
                 kernarg_size: u64_le(elf, kd_off + 8),
@@ -345,7 +344,6 @@ fn profile_hsaco(module_name: &str, data: &[u8], cap: &GpuCapability) -> Option<
 
 struct RawKernelMeta {
     pgm_rsrc1: u32,
-    pgm_rsrc2: u32,
     group_segment_size: u32,
     private_segment_size: u32,
     kernarg_size: u64,
