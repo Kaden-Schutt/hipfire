@@ -334,6 +334,8 @@ pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/r
 pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v2.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v3.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
