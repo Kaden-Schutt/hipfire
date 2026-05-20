@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 alpineq
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Multi-GPU pipeline-parallel gate.
 #
 # Validates that pp>1 paths still match pp=1 byte-for-byte under the

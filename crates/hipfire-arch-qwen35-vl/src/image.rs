@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 nickfinease
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Image loading and preprocessing for Qwen3.5-VL vision encoder.
 //! Loads PNG/JPEG, resizes to target resolution, normalizes to [-1, 1].
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Run inference on a .hfq (hipfire-quantized) model.
 //! Usage: cargo run --release --example infer_qwen3 <model.hfq> [flags] [prompt text...]
 //! Flags: --q8kv, --fp32kv, --givens4, --givens2, --hfq4kv, --temp T, --guards on|off

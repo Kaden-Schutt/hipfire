@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Probe a list of commits for 9B decode perf. Stashes/restores Cargo.lock
 # automatically. Skips commits whose build fails. Output per commit:
 #   <hash>  <gen_tok_s>  <short message>

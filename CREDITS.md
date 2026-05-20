@@ -131,4 +131,17 @@ new PRs merge). Hand-edits inside the auto block will be overwritten.
 
 ## License
 
-hipfire is MIT-licensed (see [LICENSE](LICENSE)). Upstream sources retain their own licenses.
+hipfire is dual-licensed under MIT or Apache-2.0 at your option (see
+[LICENSE](LICENSE), [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE)). The
+canonical repository transitioned from MIT-only to dual-licensing in
+May 2026; see
+[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
+for the full decision record including the course correction from
+a unilateral Apache-2.0 relicense to dual licensing.
+
+This CREDITS.md is the authoritative contributor inventory referenced
+by NOTICE; Apache-2.0 § 4(c) requires preservation of attribution
+notices in the Source form, which includes this file when
+distribution is under Apache-2.0. Upstream sources listed above
+retain their own licenses.

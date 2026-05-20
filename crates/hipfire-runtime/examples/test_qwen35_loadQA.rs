@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! QA mirror for Qwen3.5 HFQ loading and config validation.
 
 use hipfire_runtime::gguf::GgufFile;

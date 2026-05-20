@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Deterministic forward-pass benchmark for Qwen3.5. Warms up and measures
 //! N forward_scratch calls at a fixed KV position, removing sampling variance.
 //!

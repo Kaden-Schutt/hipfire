@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! T3-2 correctness — `gemm_q8_0_residual_wmma` vs (substrate + add_inplace).
 //! Tests both the WMMA matmul AND the fused `+=` residual semantics.
 //!

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 1 smoke test: run one forward pass through A3B (or any qwen3_5_moe
 //! HFQ) and verify logits are finite. Exercises both the MoE FFN helper and
 //! the new DeltaNetMoe/FullAttnMoe match arms in forward_scratch_layers.

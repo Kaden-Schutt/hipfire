@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Peer-access smoke: bidirectional enable_peer_access, hipMemcpyPeer
 //! byte-equality round-trip, pointer_get_attributes device verification.
 //!

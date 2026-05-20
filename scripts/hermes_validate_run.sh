@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # hermes_validate_run.sh — Stage B (GPU work, runs after current chain drains):
 # quantize Carnice-9b, calibrate agentic sidecars on hermes corpus, smoke-test
 # hipfire-daemon + OpenAI-compatible HTTP, configure hermes-agent, run a

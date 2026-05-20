@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness test for the 3 new HFQ4 fused dp4a kernels (gfx906).
 //!
 //! Issue #276 Gap 2:

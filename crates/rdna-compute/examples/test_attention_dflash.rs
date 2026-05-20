@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Parity test for `attention_dflash_f32` against a CPU naive softmax reference.
 //!
 //! Sweeps L × head_dim per the reviewer matrix on PR #222:

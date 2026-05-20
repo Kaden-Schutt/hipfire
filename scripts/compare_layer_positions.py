@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Per-position drift breakdown for a single layer between HF oracle and
 hipfire dumps. Distinguishes "drift grows with state-step index" (recurrent
 accumulation) vs "drift roughly constant" (input-amplification at the layer

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness test for all HFQ6-G256 GEMM kernels (residual, gate_up, qkv, qkvza).
 //! Compares WMMA + scalar variants against a CPU reference dequant + FMA.
 

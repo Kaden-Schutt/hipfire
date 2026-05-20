@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Phase-timed variant of attention_q8_0_kv. Functionally equivalent to
 // the baseline kernel but records cycle counts for each of the three
 // internal phases (QK^T, softmax, V-weighted-sum) into a per-head output

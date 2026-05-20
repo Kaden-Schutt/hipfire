@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! FFI bindings to libamdhip64.so via dlopen.
 //! No link-time dependency — runtime loads the shared library.
 

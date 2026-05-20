@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! eval_gguf — KLD eval for GGUF quant variants against a hipfire-β BF16 reference.
 //!
 //! Spawns `llama-perplexity --kl-divergence-base <fifo>` on a GGUF candidate,

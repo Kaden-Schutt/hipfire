@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Björn Bösel
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Sweep MMQ screening thresholds and compare token output vs WMMA baseline.
 # Reports which thresholds produce byte-identical token sequences.
 set -uo pipefail

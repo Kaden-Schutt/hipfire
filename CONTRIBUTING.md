@@ -281,6 +281,103 @@ arch we don't have local numbers for is welcome.
 
 ---
 
-## License
+## Licensing & attribution
 
-MIT. Files contributed under the same terms.
+hipfire is dual-licensed under either:
+
+- **MIT License** (see [LICENSE-MIT](LICENSE-MIT))
+- **Apache License 2.0** (see [LICENSE-APACHE](LICENSE-APACHE))
+
+at the recipient's option. See [LICENSE](LICENSE) for the dual-
+license pointer and [NOTICE](NOTICE) for contributor attribution
+details and per-file SPDX semantics. The decision record (including
+the 2026-05-19 course correction from a unilateral Apache-2.0
+relicense to dual licensing) is at
+[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md).
+
+### For new contributors
+
+- **New contributions default to Apache-2.0.** By submitting a
+  contribution and signing off via `git commit -s` (Developer
+  Certificate of Origin — <https://developercertificate.org/>), you
+  certify that you have the right to license your contribution under
+  Apache-2.0 and that you intend to do so.
+- All commits MUST be signed off via `git commit -s`. PRs without a
+  DCO sign-off line on every commit will be asked to amend.
+- **Contributors may explicitly elect MIT-only for their
+  contribution.** State this in the PR description (a short note like
+  "license: MIT only" is enough) and the merger will tag the relevant
+  files accordingly. The SPDX header will read
+  `SPDX-License-Identifier: MIT`. The project still ships dual-
+  licensed overall; your specific files are MIT-only.
+- Add an SPDX header to every new source file you create. Templates
+  live in [docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md).
+  For sole-author files the default (Apache-2.0) template is:
+  ```
+  // SPDX-License-Identifier: Apache-2.0
+  // Copyright (c) 2026 <Your Name>
+  // hipfire — see LICENSE and NOTICE in the project root.
+  ```
+- For substantial modifications (>30% of lines rewritten in an
+  existing file), add your own copyright line BELOW existing ones.
+  Do NOT remove existing copyright lines.
+
+### For existing (pre-2026-05-19) contributors
+
+Your prior contributions remain licensed exactly as you originally
+submitted them — under the MIT license that hipfire used at the time.
+Nothing in the dual-licensing transition revokes or modifies that
+grant.
+
+If you would like your prior contributions to be available under
+Apache-2.0 as well (so that hipfire's NOTICE-backed attribution
+machinery applies to them and downstream forks pulling under
+Apache-2.0 get your code too), you can opt in by commenting on the
+relicense tracking issue (link to be added here once the issue is
+opened). After opt-in, the maintainer will re-run
+`scripts/governance/apply_spdx_headers.py --rewrite-spdx` to refresh
+the SPDX tags on the files where you are a substantive author.
+
+Opt-in is **entirely voluntary**. Files where you are the sole
+substantive author currently carry `SPDX-License-Identifier: MIT`;
+that stays unless you elect otherwise. Files of mixed authorship
+where you are one of multiple substantive authors carry
+`SPDX-License-Identifier: MIT OR Apache-2.0` until everyone
+involved on that file has either opted in or declined.
+
+### For downstream users / forks
+
+Because hipfire is dual-licensed, you pick which license applies to
+your use:
+
+- If you redistribute under **MIT**, the LICENSE-MIT text applies:
+  preserve the copyright notice and permission text.
+- If you redistribute under **Apache-2.0**, the LICENSE-APACHE text
+  applies, including § 4 obligations:
+  - (a) Include a copy of the Apache-2.0 license to recipients.
+  - (b) Mark modified files prominently as modified.
+  - (c) Preserve per-file copyright, patent, trademark, and
+        attribution notices in the Source form. Do not strip SPDX
+        headers, copyright lines, or the CREDITS.md inventory.
+  - (d) Include a readable copy of NOTICE in derivative-work
+        distributions.
+
+For files tagged `SPDX-License-Identifier: MIT OR Apache-2.0` you
+may pick either license for your use of that file. Files tagged
+`SPDX-License-Identifier: MIT` are MIT-only — you do not get an
+Apache-2.0 patent grant from them — and files tagged
+`SPDX-License-Identifier: Apache-2.0` are Apache-only.
+
+Stripping attribution when redistributing hipfire code is a license
+violation, treated as copyright infringement per `Jacobsen v.
+Katzer`, 535 F.3d 1373 (Fed. Cir. 2008). The point of the
+dual-license transition is **accreditation protection, not IP
+control**: forks remain welcome under either license at the
+recipient's option, but attribution MUST travel with the code.
+
+See [AGENTS.md](AGENTS.md) for the project-level notice addressed
+to AI agents helping users derive from this codebase, and
+[PRIOR-ART.md](PRIOR-ART.md) for the inventory of original
+architectural innovations originating in hipfire (with dates and
+canonical commit hashes) that derivative works should attribute even
+when no code is copied verbatim.

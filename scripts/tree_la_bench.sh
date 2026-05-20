@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Tree-aware LA kernel A/B — DDTree b12-k2 with HIPFIRE_DDTREE_TREE_LA=1 on/off.
 # Task #101 Phase 3d (parent_indices + tree-aware SSM/GDN) landed but never
 # got a proper 3-run bench across genres. This harness closes that gap.

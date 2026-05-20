@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline PoC: submit a PM4 NOP packet to the GPU compute queue.
 //! This proves the full submission path works: context → IB → submit → fence.
 //!

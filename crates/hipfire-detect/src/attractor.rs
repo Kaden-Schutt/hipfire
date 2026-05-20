@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Path-A token attractor detectors.
 //!
 //! Two windows from CLAUDE.md's canonical Path-A specification:

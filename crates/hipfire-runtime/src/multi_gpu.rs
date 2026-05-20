@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Multi-GPU pipeline-parallel orchestration. Layer bands, boundary copy,
 //! peer-access plumbing.
 //!

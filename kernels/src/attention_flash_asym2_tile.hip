@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Flash attention tile for asym2: K at givens2 (rotated 2-bit), V at Q8_0.
 // Handles head_dim ∈ {128, 256} via 2-pass loop (same structure as asym4).
 // Output in normal space → reuses Q8_0 flash reduce.

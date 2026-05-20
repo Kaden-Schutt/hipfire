@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! T3-1b correctness test — `gemm_qkv_q8_0_wmma` (production fused 3-way QKV)
 //! vs the Tier 2 substrate (`gemm_q8_0_batched_chunked` × 3).
 //!

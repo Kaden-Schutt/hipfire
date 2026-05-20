@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # dflash_branch_bench.sh — comprehensive local 7900 XTX bench for 0.1.7-alpha
 # release notes. Runs through each available target + its DFlash draft + new
 # sidecar, measuring AR speed, DFlash τ, FlashTriAttn long-ctx wins, and

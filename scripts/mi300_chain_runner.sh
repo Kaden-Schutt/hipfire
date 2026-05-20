@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # mi300_chain_runner.sh — sequential auto-chain for MI300X training jobs.
 #
 # Runs jobs back-to-back so the GPU isn't idle between training runs.

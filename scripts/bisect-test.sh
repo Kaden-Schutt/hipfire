@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # ── hipfire regression bisect test ──────────────────────────────────────────
 # Full checkout + rebuild + requantize + inference test for a given commit.
 # Tests both Qwen3-0.6B (Q8 + HFQ4 variants) and Qwen3-8B (HFQ4).

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs.
 
 mod compiler;
@@ -5,6 +9,7 @@ mod dispatch;
 mod kernels;
 pub mod pool;
 pub mod profile;
+pub mod profile_rocprof;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;

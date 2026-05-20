@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention long-context decode with *constant* KV memory footprint.
 //!
 //! Allocates `KvCache` at `max_seq = budget + beta + 2` — the minimum that

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness test for fused_gate_up_hfq4g256_wave64_dp4a vs the
 //! FP wave64 reference. Both produce y_gate = A_gate · x and
 //! y_up = A_up · x; they differ by Q8_1 quantization noise on x

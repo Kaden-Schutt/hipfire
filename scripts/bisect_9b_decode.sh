@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Bisect driver for the 9B decode regression between c825dfa (good, 130.8
 # tok/s) and 0532579 (bad, 112 tok/s) on gfx1100.
 #

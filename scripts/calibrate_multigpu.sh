@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # calibrate_multigpu.sh — fan out TriAttention sidecar calibration across
 # all visible GPUs. Each job owns one GPU via HIP_VISIBLE_DEVICES. If there
 # are more models than GPUs, the extras queue up and start as earlier ones
