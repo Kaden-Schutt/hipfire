@@ -372,6 +372,35 @@ pub struct MoeFfnWeights {
     /// Qwen3.5-MoE-A3B has uniform per-expert shape so one descriptor per
     /// layer suffices for v0.1.
     pub expert_shape: Option<hipfire_runtime::weight_pager::ExpertShape>,
+
+    /// ParoQuant only: shared per-layer rotation sidecars for the routed
+    /// experts. shisa-ai's PARO checkpoint quantizes all 256 experts with
+    /// one rotation tuple per projection-group (gate||up vs down), so we
+    /// upload the sidecars ONCE per layer and broadcast a non-owning
+    /// `ParoRotation` (built via `DeviceBuffer::from_raw`) into every
+    /// `ExpertWeights.gate_up.paro` / `ExpertWeights.down.paro`. The
+    /// owning storage lives here so the aliases stay valid for the
+    /// lifetime of the layer. `None` for HFQ MoE (per-tensor PARO sidecars
+    /// or no PARO at all).
+    pub paro_shared: Option<MoeParoSidecars>,
+}
+
+/// Owning storage for the per-layer shared ParoQuant rotation sidecars.
+/// One tuple per projection-group:
+///   - `gate_up_*`: applied to the post-RMSNorm hidden activation (K = hidden_dim).
+///     Shared by all 256 experts' gate AND up projections, and by the fused
+///     gate_up `WeightTensor`'s `paro` alias.
+///   - `down_*`: applied to the post-SiLU intermediate activation (K = mi).
+///     Shared by all 256 experts' down projection.
+pub struct MoeParoSidecars {
+    pub gate_up_pairs: GpuTensor,
+    pub gate_up_theta: GpuTensor,
+    pub gate_up_channel_scales: GpuTensor,
+    pub down_pairs: GpuTensor,
+    pub down_theta: GpuTensor,
+    pub down_channel_scales: GpuTensor,
+    pub krot: u32,
+    pub group_size: u32,
 }
 
 pub struct DeltaNetMoeLayerWeights {
@@ -586,6 +615,16 @@ fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
     for e in ffn.experts {
         let _ = gpu.free_tensor(e.gate_up.buf);
         let _ = gpu.free_tensor(e.down.buf);
+    }
+    // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
+    // alias these and must NOT be freed separately — they're non-owning views).
+    if let Some(s) = ffn.paro_shared {
+        let _ = gpu.free_tensor(s.gate_up_pairs);
+        let _ = gpu.free_tensor(s.gate_up_theta);
+        let _ = gpu.free_tensor(s.gate_up_channel_scales);
+        let _ = gpu.free_tensor(s.down_pairs);
+        let _ = gpu.free_tensor(s.down_theta);
+        let _ = gpu.free_tensor(s.down_channel_scales);
     }
 }
 
@@ -1143,6 +1182,211 @@ fn load_fp16_weight_from_source(
     };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
     Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
+}
+
+// ─── ParoQuant MoE expert loading (Option A — per-expert qweight, shared sidecars) ──
+
+/// Repack a single per-expert AWQ projection (gate, up, or down) into HFQ4G128
+/// byte rows. Returns the row-major byte buffer (size `out_dim * groups_per_row * 72`).
+///
+/// Caller is responsible for uploading the buffer to GPU (or concatenating with
+/// another projection's rows before upload — gate||up fusion path).
+fn paro_repack_moe_projection(
+    source: &dyn ModelSource,
+    full_prefix: &str,    // e.g. "model.language_model.layers.0.mlp.experts.5.gate_proj"
+    out_dim: usize,
+    in_dim: usize,
+    group_size: usize,
+) -> Vec<u8> {
+    let qw_name = format!("{full_prefix}.qweight");
+    let qz_name = format!("{full_prefix}.qzeros");
+    let sc_name = format!("{full_prefix}.scales");
+    let (_, qw_data) = source.tensor_data(&qw_name)
+        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {qw_name}"));
+    let (_, qz_data) = source.tensor_data(&qz_name)
+        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {qz_name}"));
+    let (_, sc_data) = source.tensor_data(&sc_name)
+        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {sc_name}"));
+    repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size)
+}
+
+/// Upload the per-layer shared PARO rotation sidecars (one tuple for gate||up,
+/// one for down). All 256 experts will reference these via non-owning
+/// `ParoRotation` aliases.
+///
+/// Shisa-ai's PARO checkpoint stores these at:
+///   `model.language_model.layers.{L}.mlp.experts.{gate_up,down}_weight_{pairs,theta,channel_scales}`
+fn paro_load_moe_shared_sidecars(
+    source: &dyn ModelSource,
+    gpu: &Gpu,
+    p: &str, // e.g. "layers.0"
+) -> HipResult<MoeParoSidecars> {
+    let base = format!("model.language_model.{p}.mlp.experts");
+    let load = |name: &str| -> HipResult<GpuTensor> {
+        let full = format!("{base}.{name}");
+        let (_, data) = source.tensor_data(&full)
+            .unwrap_or_else(|| panic!("ParoQuant MoE shared sidecar not found: {full}"));
+        gpu.upload_raw(data, &[data.len()])
+    };
+    let qc = source.quant_config().expect("ParoQuant config required");
+    Ok(MoeParoSidecars {
+        gate_up_pairs: load("gate_up_weight_pairs")?,
+        gate_up_theta: load("gate_up_weight_theta")?,
+        gate_up_channel_scales: load("gate_up_weight_channel_scales")?,
+        down_pairs: load("down_weight_pairs")?,
+        down_theta: load("down_weight_theta")?,
+        down_channel_scales: load("down_weight_channel_scales")?,
+        krot: qc.krot as u32,
+        group_size: qc.group_size,
+    })
+}
+
+/// Build a non-owning `ParoRotation` whose tensor fields alias `src`'s
+/// underlying GPU memory. The returned rotation must NOT outlive `src`;
+/// callers store the owning `MoeParoSidecars` in `MoeFfnWeights.paro_shared`
+/// to guarantee that.
+fn alias_paro_rotation(
+    pairs_src: &GpuTensor, theta_src: &GpuTensor, cs_src: &GpuTensor,
+    krot: u32, group_size: u32,
+) -> ParoRotation {
+    let alias = |t: &GpuTensor| -> GpuTensor {
+        GpuTensor {
+            buf: unsafe { t.buf.alias() },
+            shape: t.shape.clone(),
+            dtype: t.dtype,
+        }
+    };
+    ParoRotation {
+        pairs: alias(pairs_src),
+        theta: alias(theta_src),
+        channel_scales: alias(cs_src),
+        krot,
+        group_size,
+    }
+}
+
+/// Load the full ParoQuant MoE FFN block for one layer:
+///   - dense FP16 router (`mlp.gate.weight [n_exp, hidden]`)
+///   - dense FP16 shared-expert scalar gate (`mlp.shared_expert_gate.weight [1, hidden]`)
+///   - shared expert (three per-projection PARO tensors: gate, up, down)
+///   - 256 routed experts, each with a fused gate||up HFQ4G128 buffer + a down
+///     HFQ4G128 buffer, all referencing layer-shared PARO sidecars
+fn paro_load_moe_ffn(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    p: &str,                  // e.g. "layers.0"
+    config: &Qwen35Config,
+    layer_idx: u16,
+) -> HipResult<MoeFfnWeights> {
+    let n_exp = config.num_experts;
+    let mi    = config.moe_intermediate_size;
+    let smi   = config.shared_expert_intermediate_size;
+    let dim   = config.dim;
+    let qc = source.quant_config().expect("ParoQuant MoE requires quant_config");
+    let gs = qc.group_size;
+    let kr = qc.krot;
+
+    // ── Router (FP16 dense in shisa-ai's PARO checkpoint) ──
+    // mlp.gate.weight is NOT PARO-quantized — only the expert FFN matmuls are.
+    let router = load_fp16_weight_from_source(
+        source, gpu, &format!("model.language_model.{p}.mlp.gate.weight"), n_exp, dim,
+    )?;
+
+    // Scalar gate on the shared-expert add — also FP16 dense.
+    let shared_expert_gate = load_fp16_weight_from_source(
+        source, gpu, &format!("model.language_model.{p}.mlp.shared_expert_gate.weight"), 1, dim,
+    )?;
+
+    // ── Shared expert (its own per-projection PARO sidecars, no sharing) ──
+    let shared_expert = SharedExpertWeights {
+        gate: paro_load_wt(source, gpu, &format!("{p}.mlp.shared_expert.gate_proj"), smi, dim, gs, kr)?,
+        up:   paro_load_wt(source, gpu, &format!("{p}.mlp.shared_expert.up_proj"),   smi, dim, gs, kr)?,
+        down: paro_load_wt(source, gpu, &format!("{p}.mlp.shared_expert.down_proj"), dim, smi, gs, kr)?,
+    };
+
+    // ── Routed experts ──
+    // shisa-ai stores per-expert qweight/qzeros/scales but ONE shared
+    // pairs/theta/channel_scales tuple per projection-group (gate||up vs down)
+    // for ALL experts in the layer. Upload sidecars once, alias into each
+    // expert's WeightTensor.paro.
+    let shared = paro_load_moe_shared_sidecars(source, gpu, p)?;
+
+    let groups_per_row_hidden = dim / (gs as usize);            // 2048/128 = 16
+    let bytes_per_row_hidden  = groups_per_row_hidden * 72;     // 1152
+    let groups_per_row_mi     = mi / (gs as usize);             // 512/128 = 4
+    let bytes_per_row_mi      = groups_per_row_mi * 72;         // 288
+
+    let mut experts = Vec::with_capacity(n_exp);
+    for x in 0..n_exp {
+        // Per-expert prefixes (full dot-path is constructed inside the helper).
+        let gate_prefix = format!("model.language_model.{p}.mlp.experts.{x}.gate_proj");
+        let up_prefix   = format!("model.language_model.{p}.mlp.experts.{x}.up_proj");
+        let down_prefix = format!("model.language_model.{p}.mlp.experts.{x}.down_proj");
+
+        // Fuse gate || up at HFQ4G128 row level: each row is independent
+        // (`bytes_per_row` bytes, no cross-row state), so concat works.
+        // Final shape: [2*mi, dim], rows [0..mi] = gate, rows [mi..2*mi] = up.
+        let gate_bytes = paro_repack_moe_projection(source, &gate_prefix, mi, dim, gs as usize);
+        let up_bytes   = paro_repack_moe_projection(source, &up_prefix,   mi, dim, gs as usize);
+        debug_assert_eq!(gate_bytes.len(), mi * bytes_per_row_hidden);
+        debug_assert_eq!(up_bytes.len(),   mi * bytes_per_row_hidden);
+        let mut gate_up_bytes = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
+        gate_up_bytes.extend_from_slice(&gate_bytes);
+        gate_up_bytes.extend_from_slice(&up_bytes);
+        let gate_up_buf = gpu.upload_raw(&gate_up_bytes, &[gate_up_bytes.len()])?;
+
+        let down_bytes = paro_repack_moe_projection(source, &down_prefix, dim, mi, gs as usize);
+        debug_assert_eq!(down_bytes.len(), dim * bytes_per_row_mi);
+        let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()])?;
+
+        let gate_up = WeightTensor {
+            buf: gate_up_buf,
+            gpu_dtype: DType::ParoQ4G128,
+            m: 2 * mi,
+            k: dim,
+            row_stride: 0,
+            paro: Some(alias_paro_rotation(
+                &shared.gate_up_pairs, &shared.gate_up_theta, &shared.gate_up_channel_scales,
+                shared.krot, shared.group_size,
+            )),
+            awq_scale: None,
+        };
+        let down = WeightTensor {
+            buf: down_buf,
+            gpu_dtype: DType::ParoQ4G128,
+            m: dim,
+            k: mi,
+            row_stride: 0,
+            paro: Some(alias_paro_rotation(
+                &shared.down_pairs, &shared.down_theta, &shared.down_channel_scales,
+                shared.krot, shared.group_size,
+            )),
+            awq_scale: None,
+        };
+        experts.push(ExpertWeights { gate_up, down });
+    }
+
+    // ── Device-side expert pointer tables (mirrors load_moe_ffn) ──
+    let mut gu_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+    let mut dn_ptrs: Vec<u64> = Vec::with_capacity(n_exp);
+    for e in &experts {
+        gu_ptrs.push(e.gate_up.buf.buf.as_ptr() as u64);
+        dn_ptrs.push(e.down.buf.buf.as_ptr()    as u64);
+    }
+    let gu_bytes: Vec<u8> = gu_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
+    let dn_bytes: Vec<u8> = dn_ptrs.iter().flat_map(|q| q.to_ne_bytes()).collect();
+    let expert_gate_up_ptrs = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    let expert_down_ptrs    = gpu.alloc_tensor(&[2 * n_exp], DType::F32)?;
+    gpu.hip.memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)?;
+    gpu.hip.memcpy_htod(&expert_down_ptrs.buf,    &dn_bytes)?;
+
+    Ok(MoeFfnWeights {
+        router, experts, shared_expert, shared_expert_gate,
+        expert_gate_up_ptrs, expert_down_ptrs,
+        layer_idx,
+        expert_shape: None,
+        paro_shared: Some(shared),
+    })
 }
 
 // ─── Standard HFQ loading ───────────────────────────────────────────────────
@@ -1803,17 +2047,6 @@ fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[
     gpu.upload_f32(&v, shape)
 }
 
-fn paro_load_norm_raw(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    let full = format!("model.language_model.{name}");
-    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
-    let v: Vec<f32> = if info.dtype == "F16" {
-        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
-    } else {
-        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
-    };
-    gpu.upload_f32(&v, shape)
-}
-
 fn paro_load_f32(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let full = format!("model.language_model.{name}");
     let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
@@ -1840,14 +2073,25 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
 
     eprintln!("  loading output_norm...");
     let output_norm = if config.num_experts > 0 {
-        paro_load_norm_raw(source, gpu, "norm.weight", &[config.dim])?
+        paro_load_norm(source, gpu, "norm.weight", &[config.dim])?
     } else {
-        paro_load_norm_raw(source, gpu, "norm.weight", &[config.dim])?
+        paro_load_norm(source, gpu, "norm.weight", &[config.dim])?
     };
 
-    eprintln!("  loading output (tied embeddings)...");
+    // Prefer separate lm_head when checkpoint provides one (tie_word_embeddings:false);
+    // fall back to embed_tokens for tied checkpoints. shisa-ai/Qwen3.6-35B-A3B-PARO
+    // ships a distinct lm_head.weight; tying would project logits against the wrong
+    // matrix and produce coherent-but-semantically-wrong output (decoded as token 118401
+    // "出错" on the smoke prompt before this fix).
+    let lm_head_name = "lm_head.weight";
+    let (output_src_name, output_tied) = if source.tensor_data(lm_head_name).is_some() {
+        (lm_head_name, false)
+    } else {
+        (embd_name, true)
+    };
+    eprintln!("  loading output ({})...", if output_tied { "tied embeddings" } else { "separate lm_head" });
     let output = {
-        let (_, td) = source.tensor_data(embd_name).expect("embed_tokens for lm_head");
+        let (_, td) = source.tensor_data(output_src_name).expect("output projection tensor");
         let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
@@ -1866,7 +2110,7 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
                             + config.linear_num_value_heads * config.linear_value_head_dim;
                 let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
                 layers.push(LayerWeights::DeltaNet(DeltaNetLayerWeights {
-                    attn_norm: paro_load_norm_raw(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
                     wqkv: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_qkv"), qkv_dim, config.dim, gs, kr)?,
                     wz: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_z"), d_inner, config.dim, gs, kr)?,
                     w_alpha: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_a"), config.linear_num_value_heads, config.dim, gs, kr)?,
@@ -1876,7 +2120,7 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
                     conv_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.conv1d.weight"), qkv_dim * config.conv_kernel_dim)?,
                     norm_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
                     wo: paro_load_wt(source, gpu, &format!("{p}.linear_attn.out_proj"), config.dim, d_inner, gs, kr)?,
-                    ffn_norm: paro_load_norm_raw(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
                     w_gate: paro_load_wt(source, gpu, &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
                     w_up: paro_load_wt(source, gpu, &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
                     w_down: paro_load_wt(source, gpu, &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
@@ -1886,20 +2130,55 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
                 let q_out_dim = config.n_heads * config.head_dim * 2;
                 let kv_dim = config.n_kv_heads * config.head_dim;
                 layers.push(LayerWeights::FullAttn(FullAttnLayerWeights {
-                    attn_norm: paro_load_norm_raw(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
                     wq: paro_load_wt(source, gpu, &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
                     wk: paro_load_wt(source, gpu, &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
                     wv: paro_load_wt(source, gpu, &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
                     wo: paro_load_wt(source, gpu, &format!("{p}.self_attn.o_proj"), config.dim, config.n_heads * config.head_dim, gs, kr)?,
-                    q_norm: paro_load_norm_raw(source, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
-                    k_norm: paro_load_norm_raw(source, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
-                    ffn_norm: paro_load_norm_raw(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    q_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                    k_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
                     w_gate: paro_load_wt(source, gpu, &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
                     w_up: paro_load_wt(source, gpu, &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
                     w_down: paro_load_wt(source, gpu, &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
                 }));
             }
-            _ => panic!("ParoQuant MoE loading not yet implemented (layer {i})"),
+            (LayerType::LinearAttention, true) => {
+                let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+                            + config.linear_num_value_heads * config.linear_value_head_dim;
+                let d_inner = config.linear_num_value_heads * config.linear_value_head_dim;
+                layers.push(LayerWeights::DeltaNetMoe(DeltaNetMoeLayerWeights {
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wqkv: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_qkv"), qkv_dim, config.dim, gs, kr)?,
+                    wz: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_z"), d_inner, config.dim, gs, kr)?,
+                    // in_proj_a / in_proj_b are dense FP16 in PARO checkpoints
+                    // (paro_load_wt auto-falls-back to FP16 when no `.qweight` sibling exists).
+                    w_alpha: paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_a"), config.linear_num_value_heads, config.dim, gs, kr)?,
+                    w_beta:  paro_load_wt(source, gpu, &format!("{p}.linear_attn.in_proj_b"), config.linear_num_value_heads, config.dim, gs, kr)?,
+                    a_log: paro_load_f32(source, gpu, &format!("{p}.linear_attn.A_log"), config.linear_num_value_heads)?,
+                    dt_bias: paro_load_f32(source, gpu, &format!("{p}.linear_attn.dt_bias"), config.linear_num_value_heads)?,
+                    conv_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.conv1d.weight"), qkv_dim * config.conv_kernel_dim)?,
+                    norm_weight: paro_load_f32(source, gpu, &format!("{p}.linear_attn.norm.weight"), config.linear_value_head_dim)?,
+                    wo: paro_load_wt(source, gpu, &format!("{p}.linear_attn.out_proj"), config.dim, d_inner, gs, kr)?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn: paro_load_moe_ffn(source, gpu, &p, config, i as u16)?,
+                }));
+            }
+            (LayerType::FullAttention, true) => {
+                let q_out_dim = config.n_heads * config.head_dim * 2;
+                let kv_dim = config.n_kv_heads * config.head_dim;
+                layers.push(LayerWeights::FullAttnMoe(FullAttnMoeLayerWeights {
+                    attn_norm: paro_load_norm(source, gpu, &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+                    wq: paro_load_wt(source, gpu, &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
+                    wk: paro_load_wt(source, gpu, &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
+                    wv: paro_load_wt(source, gpu, &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
+                    wo: paro_load_wt(source, gpu, &format!("{p}.self_attn.o_proj"), config.dim, config.n_heads * config.head_dim, gs, kr)?,
+                    q_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?,
+                    k_norm: paro_load_norm(source, gpu, &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?,
+                    ffn_norm: paro_load_norm(source, gpu, &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+                    ffn: paro_load_moe_ffn(source, gpu, &p, config, i as u16)?,
+                }));
+            }
         }
     }
 
@@ -2206,6 +2485,7 @@ fn load_moe_ffn(
         // directly when paged_experts==false).
         layer_idx,
         expert_shape: None,
+        paro_shared: None,
     })
 }
 
@@ -7184,22 +7464,6 @@ pub fn forward_scratch_embed(
     forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)
 }
 
-/// Debug: dump first `n` F32 elements from a GPU tensor to stderr.
-/// Gated by HIPFIRE_PARO_DEBUG=1 env var.
-#[inline(always)]
-fn paro_debug_dump(gpu: &mut Gpu, label: &str, tensor: &GpuTensor, n: usize) {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let enabled = *ENABLED.get_or_init(|| std::env::var("HIPFIRE_PARO_DEBUG").map_or(false, |v| v == "1"));
-    if !enabled { return; }
-    let count = n.min(tensor.buf.size() / 4);
-    let mut buf = vec![0f32; count];
-    let bytes = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, count * 4) };
-    if gpu.hip.memcpy_dtoh(bytes, &tensor.buf).is_ok() {
-        let vals: Vec<String> = buf.iter().map(|v| format!("{v:.6}")).collect();
-        eprintln!("  [PARO_DEBUG] {label} = [{vals}]", vals = vals.join(", "));
-    }
-}
-
 /// Batched single-weight GEMM used by the mixed-format fallback in
 /// `forward_prefill_chunk`'s FA QKV path. The fused `gemm_qkv_hfq*` kernels
 /// require wq/wk/wv to share a bit-width — they index all three weight
@@ -7310,7 +7574,6 @@ fn forward_scratch_layers(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
                 if layer_idx == 0 {
-                    paro_debug_dump(gpu, "L0 x_normed[0:8]", &s.tmp, 8);
                 }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
@@ -7376,10 +7639,6 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
                 if layer_idx == 0 {
-                    paro_debug_dump(gpu, "L0 qkv[0:8]", &s.dn_qkv, 8);
-                    paro_debug_dump(gpu, "L0 z[0:8]", &s.dn_z, 8);
-                    paro_debug_dump(gpu, "L0 beta_raw[0:8]", &s.dn_beta, 8);
-                    paro_debug_dump(gpu, "L0 alpha_raw[0:8]", &s.dn_alpha, 8);
                 }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
@@ -7388,8 +7647,6 @@ fn forward_scratch_layers(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
                 if layer_idx == 0 {
-                    paro_debug_dump(gpu, "L0 beta_gated[0:4]", &s.dn_beta, 4);
-                    paro_debug_dump(gpu, "L0 alpha_gated[0:4]", &s.dn_alpha, 4);
                 }
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
@@ -7402,9 +7659,6 @@ fn forward_scratch_layers(
                     k_dim, v_dim,
                 )?;
                 if layer_idx == 0 {
-                    paro_debug_dump(gpu, "L0 q_raw[0:8]", &s.dn_q_raw, 8);
-                    paro_debug_dump(gpu, "L0 k_raw[0:8]", &s.dn_k_raw, 8);
-                    paro_debug_dump(gpu, "L0 v[0:8]", &s.dn_v, 8);
                 }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
@@ -7811,9 +8065,13 @@ fn forward_scratch_layers(
             // does its own internal MQ rotation once per call. Re-rotation
             // overhead is one of the items targeted by Phase 2/3 speedups.
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                if layer_idx == 0 {
+                }
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                }
                 let dt = layer.wqkv.gpu_dtype;
                 let la4_same_dtype = layer.wz.gpu_dtype == dt
                     && layer.w_beta.gpu_dtype == dt
@@ -7850,15 +8108,21 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
+                if layer_idx == 0 {
+                }
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
+                if layer_idx == 0 {
+                }
                 gpu.conv1d_silu_split_f32(
                     &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
                     &s.dn_qkv, &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
+                if layer_idx == 0 {
+                }
                 gpu.fused_qk_l2_norm_scale_f32(
                     &s.dn_q_raw, &s.dn_k_raw,
                     config.linear_num_key_heads, hd,
@@ -7895,9 +8159,15 @@ fn forward_scratch_layers(
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                 }
+                if layer_idx == 0 {
+                }
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                if layer_idx == 0 {
+                }
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                if layer_idx == 0 {
+                }
 
                 // ── MoE FFN ──
                 // Fuse rmsnorm + FWHT-rotate when all MoE weights are MQ4:
@@ -7915,7 +8185,11 @@ fn forward_scratch_layers(
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
+                    if layer_idx == 0 {
+                    }
                     moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
+                    if layer_idx == 0 {
+                    }
                 }
 
                 if let Some(ref rb) = hidden_rb {
