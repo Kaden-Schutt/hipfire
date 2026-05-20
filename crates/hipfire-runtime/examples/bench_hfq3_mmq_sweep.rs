@@ -145,4 +145,68 @@ fn main() {
         gpu.free_tensor(d_y).unwrap();
     }
     gpu.free_tensor(d_w).unwrap();
+
+    // ─── Gate_up sweep: y128 vs y64 across batch sizes ───────────────────
+    // The daemon-level test at N=240 showed gate_up y64 regresses (-4%) but
+    // the residual sweep showed y64 wins more at moderate N (128-512) than
+    // very large N (1024 tied). Need to find if there's any gate_up batch
+    // size where y64 wins.
+    eprintln!("\n=== gate_up sweep: y128 vs y64 ===");
+    let weight_bytes_gu = synth_hfq3_bytes(m, k, 43);
+    let d_w_gate = gpu.upload_raw(&weight_bytes_gu, &[weight_bytes_gu.len()]).unwrap();
+    let weight_bytes_gu2 = synth_hfq3_bytes(m, k, 44);
+    let d_w_up = gpu.upload_raw(&weight_bytes_gu2, &[weight_bytes_gu2.len()]).unwrap();
+
+    println!("# gate_up: m={m}+{m}, k={k}");
+    println!("{:>6}  {:>10}  {:>10}  {:>10}",
+             "N", "y128_us", "y64_us", "y64/y128");
+    println!("{}", "-".repeat(50));
+
+    for &n in &[64usize, 96, 128, 192, 240, 384, 512, 768, 1024] {
+        let x = synth_x(n, k, 17);
+        let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
+        let d_yg = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+        let d_yu = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+
+        let iters = if n <= 64 { 50 } else if n <= 256 { 20 } else { 10 };
+
+        // Warmup
+        for _ in 0..3 {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y128 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y64 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let ratio = t_y64 / t_y128;
+        println!("{:>6}  {:>10.1}  {:>10.1}  {:>10.3}",
+                 n, t_y128 * 1e6, t_y64 * 1e6, ratio);
+
+        gpu.free_tensor(d_x).unwrap();
+        gpu.free_tensor(d_yg).unwrap();
+        gpu.free_tensor(d_yu).unwrap();
+    }
+    gpu.free_tensor(d_w_gate).unwrap();
+    gpu.free_tensor(d_w_up).unwrap();
 }
