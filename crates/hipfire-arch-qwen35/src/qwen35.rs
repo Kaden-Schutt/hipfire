@@ -1221,7 +1221,8 @@ fn paro_load_moe_shared_sidecars(
     gpu: &Gpu,
     p: &str, // e.g. "layers.0"
 ) -> HipResult<MoeParoSidecars> {
-    let base = format!("model.language_model.{p}.mlp.experts");
+    let mp = paro_text_prefix(source);
+    let base = format!("{mp}.{p}.mlp.experts");
     let load = |name: &str| -> HipResult<GpuTensor> {
         let full = format!("{base}.{name}");
         let (_, data) = source.tensor_data(&full)
@@ -1286,15 +1287,17 @@ fn paro_load_moe_ffn(
     let gs = qc.group_size;
     let kr = qc.krot;
 
+    let mp = paro_text_prefix(source);
+
     // ── Router (FP16 dense in shisa-ai's PARO checkpoint) ──
     // mlp.gate.weight is NOT PARO-quantized — only the expert FFN matmuls are.
     let router = load_fp16_weight_from_source(
-        source, gpu, &format!("model.language_model.{p}.mlp.gate.weight"), n_exp, dim,
+        source, gpu, &format!("{mp}.{p}.mlp.gate.weight"), n_exp, dim,
     )?;
 
     // Scalar gate on the shared-expert add — also FP16 dense.
     let shared_expert_gate = load_fp16_weight_from_source(
-        source, gpu, &format!("model.language_model.{p}.mlp.shared_expert_gate.weight"), 1, dim,
+        source, gpu, &format!("{mp}.{p}.mlp.shared_expert_gate.weight"), 1, dim,
     )?;
 
     // ── Shared expert (its own per-projection PARO sidecars, no sharing) ──
@@ -1319,9 +1322,9 @@ fn paro_load_moe_ffn(
     let mut experts = Vec::with_capacity(n_exp);
     for x in 0..n_exp {
         // Per-expert prefixes (full dot-path is constructed inside the helper).
-        let gate_prefix = format!("model.language_model.{p}.mlp.experts.{x}.gate_proj");
-        let up_prefix   = format!("model.language_model.{p}.mlp.experts.{x}.up_proj");
-        let down_prefix = format!("model.language_model.{p}.mlp.experts.{x}.down_proj");
+        let gate_prefix = format!("{mp}.{p}.mlp.experts.{x}.gate_proj");
+        let up_prefix   = format!("{mp}.{p}.mlp.experts.{x}.up_proj");
+        let down_prefix = format!("{mp}.{p}.mlp.experts.{x}.down_proj");
 
         // Fuse gate || up at HFQ4G128 row level: each row is independent
         // (`bytes_per_row` bytes, no cross-row state), so concat works.
@@ -2026,8 +2029,26 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 
 // ─── ParoQuant safetensors loading ──────────────────────────────────────────
 
+/// Resolve the text-tower prefix this PARO checkpoint uses.
+///   - `"model.language_model"` for Qwen3.5 / 3.6 (multimodal layout — even
+///     the text-only A3B inherits the prefix from the multimodal config).
+///   - `"model"` for Qwen3 v1 / pure-text-LLM PARO checkpoints (e.g.
+///     z-lab/Qwen3-0.6B-PARO).
+/// Probed via `embed_tokens.weight` which exists in both layouts. Panics if
+/// neither form is present — caller is exercising a non-Qwen3 family.
+fn paro_text_prefix(source: &dyn ModelSource) -> &'static str {
+    if source.tensor_info("model.language_model.embed_tokens.weight").is_some() {
+        "model.language_model"
+    } else if source.tensor_info("model.embed_tokens.weight").is_some() {
+        "model"
+    } else {
+        panic!("ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout");
+    }
+}
+
 fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: usize, gs: u32, kr: u8) -> HipResult<WeightTensor> {
-    let fp = format!("model.language_model.{prefix}");
+    let mp = paro_text_prefix(source);
+    let fp = format!("{mp}.{prefix}");
     if source.tensor_info(&format!("{fp}.qweight")).is_some() {
         load_paroquant_weight(source, gpu, &fp, m, k, gs, kr)
     } else {
@@ -2036,7 +2057,8 @@ fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: 
 }
 
 fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    let full = format!("model.language_model.{name}");
+    let mp = paro_text_prefix(source);
+    let full = format!("{mp}.{name}");
     let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
     let mut v: Vec<f32> = if info.dtype == "F16" {
         data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
@@ -2048,7 +2070,8 @@ fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[
 }
 
 fn paro_load_f32(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let full = format!("model.language_model.{name}");
+    let mp = paro_text_prefix(source);
+    let full = format!("{mp}.{name}");
     let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
     let v: Vec<f32> = if info.dtype == "F16" {
         data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
@@ -2063,9 +2086,11 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
     let gs = qc.group_size;
     let kr = qc.krot;
 
+    let mp = paro_text_prefix(source);
     eprintln!("  loading token_embd (ParoQuant)...");
-    let embd_name = "model.language_model.embed_tokens.weight";
-    let (_, embd_data) = source.tensor_data(embd_name).expect("embed_tokens not found");
+    let embd_name = format!("{mp}.embed_tokens.weight");
+    let (_, embd_data) = source.tensor_data(&embd_name)
+        .unwrap_or_else(|| panic!("embed_tokens not found at {embd_name}"));
     let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
     let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
@@ -2083,15 +2108,15 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
     // ships a distinct lm_head.weight; tying would project logits against the wrong
     // matrix and produce coherent-but-semantically-wrong output (decoded as token 118401
     // "出错" on the smoke prompt before this fix).
-    let lm_head_name = "lm_head.weight";
-    let (output_src_name, output_tied) = if source.tensor_data(lm_head_name).is_some() {
+    let lm_head_name = String::from("lm_head.weight");
+    let (output_src_name, output_tied) = if source.tensor_data(&lm_head_name).is_some() {
         (lm_head_name, false)
     } else {
         (embd_name, true)
     };
     eprintln!("  loading output ({})...", if output_tied { "tied embeddings" } else { "separate lm_head" });
     let output = {
-        let (_, td) = source.tensor_data(output_src_name).expect("output projection tensor");
+        let (_, td) = source.tensor_data(&output_src_name).expect("output projection tensor");
         let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
