@@ -14,6 +14,7 @@
 //! [`arch::Architecture`] trait.
 
 pub mod arch;
+pub mod bf16_loader;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
