@@ -45,6 +45,7 @@ status per phase in §5.
 | `544822b4` | **R5** — quantiser packs `generation_config.json` into HFQ metadata. Qwen2 parser walks fallback (`config.eos_token_id` → `generation_config.eos_token_id` → default). Fixes dots.ocr's silent EOS-default-to-`<\|im_end\|>` (151645, never fires) by surfacing the real `[151643, 151673]`. Tests: 8 passing (+2 new for the new fallback path). |
 | `1115486a` | **Phase 0 item 2** — read `modeling_dots_ocr.py` + `modeling_dots_vision.py` end-to-end. No plan contradictions. New §2.9 captures: attention scale = plain `1/sqrt(head_dim)`, multi-image batching packs into single flattened sequence (i32 cu_seqlens), bf16 cast at vision forward entry, vision-text integration via `masked_scatter()` with no projection layer, all 42 blocks structurally identical, no dropout/droppath in inference. Gotchas mirrored on `vision_forward` doc. |
 | _wip_ | **Phase 2b** — image preprocessing complete. `smart_resize` (28-divisible, beta scaling, AR>200 guard, zero-dim guard), `clip_normalise` (RGB→CHW f32, CLIP constants), `extract_patches` (the §2.7 silent-failure trap — 2×2-grouped-block-major enumeration), `preprocess_image` top-level wrapper with RGBA→RGB compositing over white. 14 unit tests, no GPU needed. Silent-failure-trap gated by `extract_patches_uses_grid_block_order` against a per-pixel-tagged 28×56 synthetic input. |
+| _wip_ | **Phase 0 item 5** — dots.ocr HF reference captured across two complementary artifacts. (a) `dots_ocr_smoke_001.json` via HF/CPU/bf16/eager — prefill logits at positions 0/32/128/5094 (last prompt position; top-1='[' with +11 nats gap, confirming valid forward pass through prompt + image embeds). Greedy decode degrades after 5 tokens (documented CPU+bf16 limitation). (b) `dots_ocr_smoke_001_vllm.json` via vLLM 0.13.0/GPU/bf16/flash_attn — 13-element layout JSON, parse_status ok, real ground truth for the phase-4 OCR coherence gate. Image is `dots_ocr/demo/demo_image1.jpg` (1700×2250 medical-paper page, md5 `a434c567a2dfa0664ce75291508bad85`). |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -644,12 +645,67 @@ plan review; this phase makes the artifacts reproducible.
    tensors). No `lm_head.weight` confirms `tie_word_embeddings=true`;
    `q/k/v_proj.bias` entries confirm `attention_bias=true`.
 
-5. **[PENDING]** End-to-end run dots.ocr under HF transformers on a
-   committed page image. Commit image bytes to
-   `benchmarks/images/dots_ocr_smoke_001.png`, record md5. Use
-   `transformers==4.56.1`, `trust_remote_code=True`. Capture token
-   IDs (first 200 positions), logits at 0/32/128, parsed JSON
-   output. Required for phase 4 OCR gate.
+5. **[DONE]** End-to-end dots.ocr reference captured on
+   `benchmarks/images/dots_ocr_smoke_001.jpg` (md5
+   `a434c567a2dfa0664ce75291508bad85`, sourced from
+   `dots.ocr/demo/demo_image1.jpg`, a 1700×2250 medical-paper page).
+   Captured across TWO complementary artifacts, each addressing a
+   different downstream consumer:
+
+   **(a) HF transformers / CPU+bf16 — prefill logits ground truth.**
+   `benchmarks/references/dots_ocr_smoke_001.json` (~91 KB) via
+   `scripts/capture_dots_ocr_reference.py`. transformers 5.5.1, torch
+   2.12.0+cu130 (CPU runtime), `attn_implementation=eager`,
+   `dtype=torch.bfloat16` (matches the model's native bf16 cast at
+   vision forward entry — loading at f32 produces a Conv2d dtype
+   mismatch). Captures: full input_token_ids (5095 tokens with vision
+   embeds, padded image-token wrapper, layout prompt), image_grid_thw
+   `[1, 160, 122]`, top-100 logits at positions 0 / 32 / 128 / 5094.
+   Prefill logits are coherent (pos_0='task'/+13 nats top-1 gap,
+   pos_5094='['/+11 nats — both confidence-strong, sensible
+   first-completion-token prediction). The captured greedy decode
+   collapses into a repeated-token attractor after ~5 tokens (correct
+   JSON skeleton, then numerical drift) — this is a known CPU+bf16
+   limitation for this model. The `decode_quality` field +
+   `decode_quality_note` field in the artifact document this so
+   downstream consumers don't mistake the completion_token_ids for a
+   usable layout reference; the per-position LOGITS are the actual
+   ground truth for hipfire phase-2c forward-pass validation.
+
+   Three runtime patches were needed against transformers 5.5.1
+   (recorded in the script for future-resilience):
+   - dots.ocr's `prepare_inputs_for_generation` dereferences
+     `cache_position[0]` without a None guard; transformers 5.5.1's
+     `_prefill` calls it with cache_position=None. Patched via
+     MRO bypass to `GenerationMixin.prepare_inputs_for_generation`
+     plus first-step detection on the parent-populated
+     cache_position.
+   - dots.ocr's processor returns `mm_token_type_ids`; transformers'
+     `_validate_model_kwargs` rejects it. Filtered explicitly
+     before calling `generate`.
+   - The validator's introspection misses dots.ocr's `pixel_values`/
+     `image_grid_thw`/`attention_mask` forward params (likely picks
+     up a parent's forward signature via reflection). No-op'd
+     `_validate_model_kwargs` since we manually filter
+     `mm_token_type_ids` ourselves.
+
+   **(b) vLLM 0.13.0 / GPU+bf16+flash_attn — Phase 4 OCR gate
+   ground truth.** `benchmarks/references/dots_ocr_smoke_001_vllm.json`
+   (~32 KB) via `scripts/capture_dots_ocr_vllm.py
+   http://<host>:8000`. Sends the same image + canonical
+   `prompt_layout_all_en` prompt as an OpenAI-compatible
+   `/v1/chat/completions` POST. Captures the real layout output: 13
+   well-formed layout elements (`{"bbox": [x1, y1, x2, y2], "category":
+   "...", "text": "..."}`), 6 Text / 3 Table / 2 Page-header / 2
+   Caption — realistic for this medical-paper page. parse_status: ok.
+   4634 completion tokens, 5097 prompt tokens (matches HF capture's
+   5095 ±2, attributable to chat-template detail). 82s wall on the
+   user's RTX 3060 vLLM instance.
+
+   The two artifacts are kept side-by-side rather than consolidated:
+   the HF path gives prefill logits (phase 2c); the vLLM path gives
+   end-to-end layout JSON (phase 4 coherence gate). Neither path
+   alone covers both needs.
 
 6. **[DONE]** End-to-end Qwen2-1.5B-Instruct HF reference captured.
    - Prompt at `benchmarks/prompts/qwen2_smoke.txt` (83 bytes,
