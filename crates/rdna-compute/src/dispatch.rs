@@ -8178,6 +8178,25 @@ impl Gpu {
         )
     }
 
+    /// HFQ3 gate_up MMQ mmq_x=32, MMQ_Y=96 — sweet-spot probe between
+    /// y=64 (regressed) and y=128 (current default). 20 KB LDS/WG → 3
+    /// WG/CU → ~37% occupancy.
+    pub fn gemm_gate_up_hfq3g256_mmq_x32_y96(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            32, 96,
+            "gemm_gate_up_hfq3g256_mmq_x32_y96",
+            kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y96_SRC,
+        )
+    }
+
     /// HFQ3 gate_up MMQ mmq_x=32, MMQ_Y=64 — higher-occupancy variant.
     /// Halves the row tile to drop LDS to ~15 KB/WG (4 WG/CU instead of 2).
     /// Issue #300 follow-up. Used by the auto-selector at batch ≥ 64.

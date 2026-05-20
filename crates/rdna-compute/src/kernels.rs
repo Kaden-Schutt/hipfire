@@ -1026,6 +1026,8 @@ pub const GEMM_GATE_UP_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_GATE_UP_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dp4a.gfx1030.hip");
 // MMQ_Y=64 variant of gate_up mmq_x32. Higher-occupancy probe (issue #300).
 pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32_y64.gfx1030.hip");
+// MMQ_Y=96 variant — sweet-spot probe between y=64 (loses) and y=128 (wins).
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y96_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32_y96.gfx1030.hip");
 
 // ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");

@@ -158,9 +158,9 @@ fn main() {
     let d_w_up = gpu.upload_raw(&weight_bytes_gu2, &[weight_bytes_gu2.len()]).unwrap();
 
     println!("# gate_up: m={m}+{m}, k={k}");
-    println!("{:>6}  {:>10}  {:>10}  {:>10}",
-             "N", "y128_us", "y64_us", "y64/y128");
-    println!("{}", "-".repeat(50));
+    println!("{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+             "N", "y128_us", "y96_us", "y64_us", "y96/y128", "y64/y128");
+    println!("{}", "-".repeat(70));
 
     for &n in &[64usize, 96, 128, 192, 240, 384, 512, 768, 1024] {
         let x = synth_x(n, k, 17);
@@ -173,6 +173,9 @@ fn main() {
         // Warmup
         for _ in 0..3 {
             gpu.gemm_gate_up_hfq3g256_mmq_x32(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y96(
                 &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
             ).unwrap();
             gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
@@ -192,6 +195,15 @@ fn main() {
 
         let t0 = Instant::now();
         for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y96(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y96 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
             gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
                 &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
             ).unwrap();
@@ -199,9 +211,10 @@ fn main() {
         let _ = gpu.download_f32(&d_yg).unwrap();
         let t_y64 = t0.elapsed().as_secs_f64() / iters as f64;
 
-        let ratio = t_y64 / t_y128;
-        println!("{:>6}  {:>10.1}  {:>10.1}  {:>10.3}",
-                 n, t_y128 * 1e6, t_y64 * 1e6, ratio);
+        let r96 = t_y96 / t_y128;
+        let r64 = t_y64 / t_y128;
+        println!("{:>6}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.3}  {:>10.3}",
+                 n, t_y128 * 1e6, t_y96 * 1e6, t_y64 * 1e6, r96, r64);
 
         gpu.free_tensor(d_x).unwrap();
         gpu.free_tensor(d_yg).unwrap();
