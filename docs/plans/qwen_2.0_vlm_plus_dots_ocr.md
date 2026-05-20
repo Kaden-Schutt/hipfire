@@ -1,9 +1,11 @@
 # dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
 
-Status: rev 4 — phase 1 closed, PR open
-(`feat/dots-ocr-qwen2` → upstream `master`,
-[Kaden-Schutt/hipfire#297](https://github.com/Kaden-Schutt/hipfire/pull/297)),
-2026-05-19. Phase 2 (dots.ocr vision tower) begins after merge.
+Status: rev 5 — phase 1 closed (PR #297 merged upstream), phase 2a +
+2b landed, phase 2c sub-tasks 1-4 of 5 landed. 2026-05-20.
+`feat/dots-ocr-qwen2-phase-2` is the active branch; phase 2c-5
+(vision_forward assembly + per-stage validation against the 2c-1
+.npy refs + end-to-end Qwen2-prefill logit match) is the remaining
+work before phase 3 (daemon plumbing) can start.
 
 Filename note: originally filed as `qwen_2.5_vlm.md` matching the
 initial request; renamed to `qwen_2.0_vlm_plus_dots_ocr.md` once
@@ -44,9 +46,13 @@ status per phase in §5.
 | `acd75473` | Merge `upstream/master` into `feat/dots-ocr-qwen2`: 47 commits / 779 files / +23.8k lines (license relicense, HFQ6 family, BF16 loader, MoE grouped-WMMA, gfx94x MFMA, Qwen3.5 MoE norm fix). 1 real conflict resolved: `qwen35.rs` dropped `load_norm_weight_raw` (superseded by upstream PR #228 GemmaRMSNorm convention fix). PR #297 mergeable. |
 | `544822b4` | **R5** — quantiser packs `generation_config.json` into HFQ metadata. Qwen2 parser walks fallback (`config.eos_token_id` → `generation_config.eos_token_id` → default). Fixes dots.ocr's silent EOS-default-to-`<\|im_end\|>` (151645, never fires) by surfacing the real `[151643, 151673]`. Tests: 8 passing (+2 new for the new fallback path). |
 | `1115486a` | **Phase 0 item 2** — read `modeling_dots_ocr.py` + `modeling_dots_vision.py` end-to-end. No plan contradictions. New §2.9 captures: attention scale = plain `1/sqrt(head_dim)`, multi-image batching packs into single flattened sequence (i32 cu_seqlens), bf16 cast at vision forward entry, vision-text integration via `masked_scatter()` with no projection layer, all 42 blocks structurally identical, no dropout/droppath in inference. Gotchas mirrored on `vision_forward` doc. |
-| _wip_ | **Phase 2b** — image preprocessing complete. `smart_resize` (28-divisible, beta scaling, AR>200 guard, zero-dim guard), `clip_normalise` (RGB→CHW f32, CLIP constants), `extract_patches` (the §2.7 silent-failure trap — 2×2-grouped-block-major enumeration), `preprocess_image` top-level wrapper with RGBA→RGB compositing over white. 14 unit tests, no GPU needed. Silent-failure-trap gated by `extract_patches_uses_grid_block_order` against a per-pixel-tagged 28×56 synthetic input. |
-| _wip_ | **Phase 0 item 5** — dots.ocr HF reference captured across two complementary artifacts. (a) `dots_ocr_smoke_001.json` via HF/CPU/bf16/eager — prefill logits at positions 0/32/128/5094 (last prompt position; top-1='[' with +11 nats gap, confirming valid forward pass through prompt + image embeds). Greedy decode degrades after 5 tokens (documented CPU+bf16 limitation). (b) `dots_ocr_smoke_001_vllm.json` via vLLM 0.13.0/GPU/bf16/flash_attn — 13-element layout JSON, parse_status ok, real ground truth for the phase-4 OCR coherence gate. Image is `dots_ocr/demo/demo_image1.jpg` (1700×2250 medical-paper page, md5 `a434c567a2dfa0664ce75291508bad85`). |
-| _wip_ | **Phase 2c-1** — captured 6 intermediate vision-tower activations via PyTorch forward hooks on the same HF/CPU/bf16/eager run: `patch_embed`, blocks 0/21/41, `post_trunk_norm`, `merger`. Full tensors (~120 MB each, [19520, 1536] for patch-shape stages and [4880, 1536] for the merger output) saved to `/data/cache/hipfire/dots_ocr_activations_full/` for local-only use. A uniform 256-row (64 for merger) linspace sample plus the sample-indices list is committed to `benchmarks/references/dots_ocr_smoke_001_activations/` for git (7.9 MB total). Phase 2c per-stage validation reads from the committed sample; full-tensor consumers regenerate locally via the capture script. Statistics across the stack look healthy (std 0.25 → 0.29 → 0.56 → ...; expected residual-network growth). |
+| `bfe1f56d` | **Phase 2b** — image preprocessing complete. `smart_resize` (28-divisible, beta scaling, AR>200 guard, zero-dim guard), `clip_normalise` (RGB→CHW f32, CLIP constants), `extract_patches` (the §2.7 silent-failure trap — 2×2-grouped-block-major enumeration), `preprocess_image` top-level wrapper with RGBA→RGB compositing over white. 14 unit tests, no GPU needed. Silent-failure-trap gated by `extract_patches_uses_grid_block_order` against a per-pixel-tagged 28×56 synthetic input. |
+| `bc4640b7` | Merge `upstream/master` into `feat/dots-ocr-qwen2` (round 2): 2 commits / 1 conflict in `daemon.rs` (PR #312 OpenAI vision refactored generate_vl to GenerateVLParams; kept our generate_qwen2 + json_escape unchanged, took upstream's new signature). PR #297 still mergeable. |
+| `8c04ba46` | **Phase 0 item 5** — dots.ocr HF reference captured across two complementary artifacts. (a) `dots_ocr_smoke_001.json` via HF/CPU/bf16/eager — prefill logits at positions 0/32/128/5094 (last prompt position; top-1='[' with +11 nats gap, confirming valid forward pass through prompt + image embeds). Greedy decode degrades after 5 tokens (documented CPU+bf16 limitation). (b) `dots_ocr_smoke_001_vllm.json` via vLLM 0.13.0/GPU/bf16/flash_attn — 13-element layout JSON, parse_status ok, real ground truth for the phase-4 OCR coherence gate. Image is `dots_ocr/demo/demo_image1.jpg` (1700×2250 medical-paper page, md5 `a434c567a2dfa0664ce75291508bad85`). |
+| `7ba3c749` | **Phase 2c-1** — captured 6 intermediate vision-tower activations via PyTorch forward hooks on the same HF/CPU/bf16/eager run: `patch_embed`, blocks 0/21/41, `post_trunk_norm`, `merger`. Full tensors (~120 MB each, [19520, 1536] for patch-shape stages and [4880, 1536] for the merger output) saved to `/data/cache/hipfire/dots_ocr_activations_full/` for local-only use. A uniform 256-row (64 for merger) linspace sample plus the sample-indices list is committed to `benchmarks/references/dots_ocr_smoke_001_activations/` for git (7.9 MB total). Phase 2c per-stage validation reads from the committed sample; full-tensor consumers regenerate locally via the capture script. Statistics across the stack look healthy (std 0.25 → 0.29 → 0.56 → ...; expected residual-network growth). |
+| `7051d6e9` | **Phase 2c-2** — vision weight loader. Wires all 17 vision-tensor names: patch_embed (Conv2d → linear reshape [embed_dim,3,14,14] → [1536, 588], bias, RMSNorm), 42× DotsVisionBlock (norm1, attn.qkv, attn.proj, norm2, fc13_proj load-time concat, fc2), post_trunk_norm, merger (ln_q + bias, mlp.{0,2} + biases). Load-time SwiGLU fusion via fc1+fc3 → fc13_proj concat (initially byte-level on raw quant; refactored to F16 byte-level in 2c-4). 4 helpers (`load_norm_weight_raw`, `load_bias_f32`, `load_weight_tensor`, `load_weight_tensor_concat_rows`) all carry `TODO(transformer-extraction)` markers. Tests: 19 still passing. |
+| `22d47330` | **Phase 2c-3** — 2-D RoPE prep helper (`rope::build_rope_2d_tables`). Ports `get_pos_ids_by_grid` + `VisionRotaryEmbedding` + `apply_rotary_pos_emb_vision` quarter-repeat layout from `modeling_dots_vision.py` into a single CPU function emitting per-patch [N_patches, head_dim] cos/sin tables in dots.ocr's exact `[hc, wc, hc, wc]` layout. Patch enumeration in 2×2-block-major order matches `image::extract_patches`. 7 new tests including a hand-computed 2×2/head_dim=8 case and a reshape-permute-flatten equivalence check on a 4×6 grid. 26 tests total. |
+| `9f738911` | **Phase 2c-4** — vision GPU primitives. (1) New kernel `rope_2d_halfsplit_f32` (`kernels/src/rope_2d_halfsplit.hip` + dispatch fn) — applies the 2c-3 precomputed cos/sin tables to Q/K in-place; halfsplit pairs `(d, d+head_dim/2)`. (2) Loader refactor: vision linear weights now stored as F16 GpuTensor on GPU (HFQ4 / Q8 / F32 source quant types dequantise to F16 at load time per the qwen35-vl pattern — N=~20k patches makes batched HFQ4 GEMM the bottleneck; dequant-on-load + gemm_f16 sidesteps it). DotsVisionBlockWeights + DotsVisionWeights field types changed from WeightTensor → GpuTensor; load_f16_or_dequant + load_f16_or_dequant_concat_rows + dequant_hfq4 helpers added. (3) `linear_f16` + `linear_f16_no_bias` private helpers in dots_ocr.rs (the latter for the use_bias=false vision-block linears). Vision-shape primitive audit confirmed: `rmsnorm_f32`, `silu_mul_f32`, `vit_attention_f32` (non-causal), `bias_add_f32`, `gelu_tanh_f32`, `layernorm_batched`, `gemm_f16`, `add_inplace_f32`, `transpose_f32` all accept [N_patches, hidden] strides — CAVEAT: large-N attention needs `vit_attention_opt` instead of `vit_attention_f32` (the latter materialises N² scores in shared mem, ~77 KB at N≈19520 exceeds RDNA per-CU SLM cap). 26 tests still passing. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -866,7 +872,7 @@ than a 28-block dense decoder.
 - **Vision trait impl** owns the custom `DotsVisionTransformer`
   encoder. `type State = ()` (one-shot encoder, no KV cache).
 
-**Image preprocessing:** [DONE in phase 2b commit]
+**Image preprocessing:** [DONE in `bfe1f56d` (phase 2b)]
 - ✅ `image.rs` ported from qwen35-vl as skeleton, swapped to
   dots.ocr's resize policy.
 - ✅ `smart_resize` matches `dots_ocr/utils/image_utils.py` exactly:
@@ -905,63 +911,79 @@ sequences and asserts on the latter — any drift to raster order
 fails with a diagnostic that names both candidates.
 
 **`vision_forward(gpu, weights, &patches, image_grid_thw) -> Vec<f16>`:**
+*(Sub-tasks 2c-1 through 2c-4 landed; 2c-5 assembly + per-stage
+validation is the remaining work — see progress log entries above
+for commit-by-commit detail.)*
 
-- **Patch embed.** Reshape the 5-D weight `[1536,3,1,14,14]` to
-  `[1536, 588]`. Linear projection via GEMM_F16; apply patch-embed
-  bias via `bias_add_f32`; then patch-embed RMSNorm (eps=1e-5).
-- **2-D RoPE preparation.** Generate hpos/wpos via the
-  reshape-permute-flatten in §2.6. Compute cos/sin tables for each
-  axis. Choose between a new `rope_2d_f32` kernel and a CPU-side
-  pre-computation + the existing `rope_partial_halfsplit_f32`
-  applied to head_dim halves. Start with CPU pre-comp + existing
-  kernel; promote to a fused kernel only under the Δ ≥ 5% rule.
+- **Patch embed** — patch_embed_w stored as F16 [1536, 588] on GPU
+  (the 4-D `[1536, 3, 14, 14]` Conv2d weight reshapes to 2-D linear
+  at load via `load_f16_or_dequant`). Forward: `linear_f16` (GEMM +
+  bias_add) → `rmsnorm_f32` with `eps=1e-5`. *(Loader: 2c-2 / 2c-4;
+  forward call: 2c-5.)*
+- **2-D RoPE preparation** [DONE in 2c-3 / 2c-4]:
+  - ✅ CPU table builder `rope::build_rope_2d_tables(grid_h, grid_w,
+    head_dim=128, sm=2, theta=10000)` emits per-patch [N_patches,
+    head_dim] cos/sin in dots.ocr's exact `[hc, wc, hc, wc]` quarter-
+    repeat layout. Patch enumeration matches `image::extract_patches`.
+  - ✅ GPU application kernel `rope_2d_halfsplit_f32` +
+    `Gpu::rope_2d_halfsplit_f32` dispatch fn — applies the
+    precomputed tables to Q/K in-place via the halfsplit rotation
+    convention. Decision made: new fused kernel rather than re-using
+    `rope_partial_halfsplit_f32` because the latter generates
+    cos/sin from a single position counter and can't accept
+    precomputed tables.
 - **42× block:**
   - RMSNorm (eps=1e-5)
-  - QKV via single GEMM (no bias — vision QKV has `use_bias: false`)
-  - Apply 2-D RoPE to Q and K
-  - `vit_attention_f32` with `causal=false` (verify the kernel
-    supports this mode; qwen35-vl already uses it non-causally so
-    likely fine)
-  - Output projection (no bias)
-  - Residual
+  - QKV via single GEMM (no bias — vision QKV has `use_bias=false`).
+    Use `linear_f16_no_bias` against the F16 qkv_w on GPU.
+  - Apply 2-D RoPE via `gpu.rope_2d_halfsplit_f32(q, k, cos_tab, sin_tab, ...)`.
+  - **`vit_attention_opt`** (NOT `vit_attention_f32`) — the basic
+    variant materialises an N²-scores buffer in shared memory
+    (~77 KB at N≈19520 for the smoke image; exceeds RDNA per-CU SLM
+    cap). The `_opt` variant uses tiled K/V loading + 4 queries per
+    block. Both are non-causal.
+  - Output projection (no bias) via `linear_f16_no_bias`
+  - Residual via `add_inplace_f32`
   - RMSNorm
-  - SwiGLU MLP. On disk the FFN has three separate linears
-    (`mlp.fc1.weight [4224, 1536]`, `mlp.fc3.weight [4224, 1536]`,
-    `mlp.fc2.weight [1536, 4224]`); all have no bias since
-    `use_bias=false` covers FFN per §2.2. Two implementation choices:
-    (a) **load-time fuse** fc1+fc3 into a single `fc13_proj [8448, 1536]`
-    (vllm pattern via `stacked_params_mapping`), then SwiGLU = `silu(y[:H]) * y[H:]`
-    where `y = fc13(x)`, then `fc2`; or
-    (b) keep fc1 and fc3 separate and run two GEMMs per block in the
-    forward pass.
-    Prefer (a) for fewer launches; pick (b) only if quantisation per
-    half ends up different. Note: the merge is a tensor concat at load
-    time, not a runtime fusion choice.
+  - SwiGLU MLP: `linear_f16_no_bias(fc13_proj)` → `silu_mul_f32(y[:H], y[H:])`
+    → `linear_f16_no_bias(fc2)`. The `fc13_proj` row concatenation
+    happens at load time (option (a) of phase 2c) — verified
+    landed in 2c-4 via `load_f16_or_dequant_concat_rows`.
   - Residual
-- **Post-norm** (RMSNorm) since `post_norm=true`.
+- **Post-norm** [DONE — weight loaded in 2c-2] — `rmsnorm_f32`
+  against `post_trunk_norm` with `eps=1e-5`.
 - **Merger:**
   - Reshape: contiguous 2×2 groups are already adjacent thanks to
-    the position-ID permutation — `view(-1, 6144)` gives the right
+    the position-ID permutation in `image::extract_patches` +
+    `rope::build_rope_2d_tables` — `view(-1, 6144)` gives the right
     grouping.
-  - LayerNorm with bias (eps=1e-6) — `gpu.layernorm_batched`.
-  - linear(6144→6144) + bias → GELU → linear(6144→1536) + bias.
+  - `gpu.layernorm_batched(merger_ln_w, merger_ln_b, ..., eps=1e-6)`.
+  - `linear_f16(merger_fc1_w, merger_fc1_b, ...)` → `gelu_tanh_f32`
+    → `linear_f16(merger_fc2_w, merger_fc2_b, ...)`.
 
 **Kernel work required:**
-- Vision-shape RMSNorm (verify text kernel handles `[N, embed_dim]`
-  strides; if not, thin variant).
-- Vision-shape SwiGLU (same question).
-- 2-D RoPE (CPU pre-comp variant first, kernel later if needed).
-- Confirm `vit_attention_f32` (a) supports non-causal and (b)
-  handles up to ~14400 post-merge patches without materialising the
-  full N² attention matrix at fp32 (memory budget at fp32 is
-  N²×4 ≈ 800 MB for N=14400).
+- ✅ Vision-shape RMSNorm — existing `gpu.rmsnorm_f32` accepts the
+  vision `[N_patches, embed_dim]` shape directly (uses
+  `x.shape[0]` as batch). Confirmed in 2c-4 audit.
+- ✅ Vision-shape SwiGLU — existing `gpu.silu_mul_f32` is
+  element-wise / shape-agnostic. Confirmed in 2c-4 audit.
+- ✅ 2-D RoPE — landed in 2c-3 (`rope::build_rope_2d_tables` CPU
+  builder) + 2c-4 (`rope_2d_halfsplit_f32` GPU apply kernel). The
+  plan's "CPU pre-comp first, fused kernel later" pattern carried
+  out exactly.
+- ⚠️ `vit_attention_f32` materialises `(n + block_size) * 4` bytes
+  in shared mem; for the smoke image's N=19520 that's ~77 KB,
+  over RDNA per-CU SLM caps. Use `vit_attention_opt` (tiled K/V,
+  ~3-5× faster anyway) in 2c-5 instead. Both are non-causal.
 
-**Validation:**
-- Capture HF reference activations at: first block output, final
-  block pre-merger, post-merger. Save as `.npy` per phase 0.
-- Diff hipfire output against HF at each capture point. Tolerance:
-  absolute < 1e-2 OR cosine > 0.999 (bf16 → F16 cast loss allows
-  some slack at deeper layers).
+**Validation [PENDING — 2c-5]:**
+- HF reference activations captured in 2c-1 at: `patch_embed`,
+  blocks 0/21/41, `post_trunk_norm`, `merger`. Sampled refs (256 /
+  64 rows) at `benchmarks/references/dots_ocr_smoke_001_activations/`;
+  full tensors at `/data/cache/hipfire/dots_ocr_activations_full/`.
+- 2c-5 will diff hipfire output against HF at each capture point.
+  Tolerance: absolute < 1e-2 OR cosine > 0.999 (bf16 → F16 cast
+  loss allows some slack at deeper layers).
 - Channel-order test: load the patch_embed weight, run on a known
   test image with known expected first-block output, verify [R, G, B]
   matches (NOT [R, B, G] — that quirk is qwen35-vl-specific; verify
