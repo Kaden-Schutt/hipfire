@@ -1,0 +1,4 @@
+alpha	quantize_sec	eval_sec	kldseq_path
+0.4	109	3402	benchmarks/quality-baselines/results/2026-05-14-awq-phase2-n512-9b-gfx906/per-variant/a0_4/awq-a0_4.kldseq
+0.5	109	3395	benchmarks/quality-baselines/results/2026-05-14-awq-phase2-n512-9b-gfx906/per-variant/a0_5/awq-a0_5.kldseq
+0.6	110	3401	benchmarks/quality-baselines/results/2026-05-14-awq-phase2-n512-9b-gfx906/per-variant/a0_6/awq-a0_6.kldseq

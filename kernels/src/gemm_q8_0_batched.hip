@@ -22,7 +22,7 @@
 // the per-batch slice of the output equals what the per-row GEMV would
 // produce — preserves greedy parity for spec decode.
 
-#define MAX_BATCH 16
+#define MAX_BATCH 64
 
 extern "C" __global__ void gemm_q8_0_batched(
     const unsigned char* __restrict__ A_q8,  // [M, K/32 * 34] packed Q8_0

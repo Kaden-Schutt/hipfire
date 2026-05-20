@@ -202,7 +202,7 @@ and any first-time arch transition.
 
 ## Where to start contributing
 
-- **A new arch port**: read `.skills/hipfire-arch-port/` first — it
+- **A new arch port**: read `.agents/skills/hipfire-arch-port/` first — it
   has the WMMA matrix, dispatch routing rules, validation gates, and
   the contributor onboarding workflow.
 - **A new kernel variant**: `kernels/src/<existing>.<chip>.hip` and

@@ -84,6 +84,7 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-detect = { path = "../hipfire-detect" }
+hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -161,6 +162,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "dump_logits_qwen35"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "greedy_dump"
@@ -269,3 +274,43 @@ required-features = ["arch-qwen35", "deltanet"]
 [[example]]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
+
+# build_kld_ref needs no GPU / arch features — it just orchestrates
+# llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
+[[example]]
+name = "build_kld_ref"
+required-features = []
+
+[[example]]
+name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
+# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
+# eval_hipfire, but the forward path goes through
+# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
+# the qwen35 arch. Per-token scoring only — llama-arch
+# `forward_prefill_batch` doesn't expose the hidden-state capture hook
+# that eval_hipfire's prefill mode relies on.
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
+# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
+# No GPU / arch features needed (tokenizer is pure CPU).
+[[example]]
+name = "tokenize_slice"
+required-features = []
+
+# eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "eval_gguf"
+required-features = []
+
+# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
+# llama-imatrix for the activation-weighted-LS calibration pipeline.
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "imatrix_collect"
+required-features = []

@@ -19,7 +19,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N]");
+        eprintln!("Usage: bench_qwen35_mq4 <model.hfq> [--prefill N] [--prefill-runs N] [--gen N] [--warmup N] [--emit-atlas <path.jsonl>]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -29,6 +29,10 @@ fn main() {
     let mut prefill_runs: usize = 1;
     let mut gen_len: usize = 100;
     let mut warmup_len: usize = 5;
+    // Optional kernel-atlas emission: when set, write one typed AtlasRow
+    // per timed phase (prefill, decode_ar) to this JSONL file. Replaces
+    // stdout-scraping by external collectors like scripts/kernel_atlas.py.
+    let mut atlas_out: Option<String> = None;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -36,6 +40,7 @@ fn main() {
             "--prefill-runs" => { prefill_runs = args[i + 1].parse::<usize>().unwrap().max(1); i += 2; }
             "--gen"     => { gen_len     = args[i + 1].parse().unwrap(); i += 2; }
             "--warmup"  => { warmup_len  = args[i + 1].parse().unwrap(); i += 2; }
+            "--emit-atlas" => { atlas_out = Some(args[i + 1].clone()); i += 2; }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
         }
     }
@@ -154,6 +159,9 @@ fn main() {
         }
     }
     let prefill_ms = *prefill_samples_ms.last().unwrap();
+    // Captured outside `do_profile` so SUMMARY can split kernel vs wall.
+    // None when profiling is disabled (HIPFIRE_PROFILE != 1).
+    let mut prefill_kernel_ms: Option<f64> = None;
     if do_profile {
         if let Some(entries) = rdna_compute::profile::stop() {
             let mut by_kernel: std::collections::HashMap<&str, (f64, usize, usize)> = Default::default();
@@ -177,6 +185,7 @@ fn main() {
                     us / 1000.0, us / *n as f64, us / total_us * 100.0, gib_s);
             }
             eprintln!("  {:45} {:5}   {:.1}ms", "TOTAL (serialized)", "", total_us / 1000.0);
+            prefill_kernel_ms = Some(total_us / 1000.0);
         }
     }
     let prefill_tok_s = prefill_len as f64 / (prefill_ms / 1000.0);
@@ -189,6 +198,45 @@ fn main() {
     eprintln!("  total: {prefill_ms:.1}ms");
     eprintln!("  tok/s: {prefill_tok_s:.1}");
     eprintln!("  NOTE: first prefill run includes kernel JIT compile cost");
+
+    // Emit prefill-only SUMMARY right here so prefill metrics survive any
+    // failure in the gen phase that follows (the existing argmax-on-NaN
+    // panic in graph-captured gen warmup blocks the end-of-run SUMMARY).
+    eprintln!("PREFILL_SUMMARY  prefill_tok_s={prefill_tok_s:.1}  prefill_wall_ms={prefill_ms:.2}{}",
+        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+
+    // Atlas row: typed prefill measurement. Emitted right here so it
+    // survives any panic in the gen phase. Eliminates the stdout-scrape
+    // round-trip the Python harness would otherwise do.
+    if let Some(ref atlas_path) = atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("prefill", "bench_qwen35_mq4");
+        row.set_metric_f64("prefill_tok_s", prefill_tok_s)
+            .set_metric_f64("prefill_wall_ms", prefill_ms)
+            .set_metric_u64("prefill_tokens", prefill_len as u64)
+            .set_metric_u64("prefill_runs", prefill_runs as u64)
+            .set_metric_str("kv_mode", &kv_mode)
+            .set_metric_str("arch", &gpu.arch)
+            .set_metric_str("model_path", model_path)
+            .set_metric_u64("model_bytes", model_bytes)
+            .set_extra("captured_at_unix_s", serde_json::Value::from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+            ));
+        if let Some(kernel_ms) = prefill_kernel_ms {
+            let prefill_tok_s_kernel = prefill_len as f64 / (kernel_ms / 1000.0);
+            row.set_metric_f64("prefill_kernel_ms", kernel_ms);
+            row.set_metric_f64("prefill_tok_s_kernel", prefill_tok_s_kernel);
+            row.set_metric_f64("startup_overhead_ms", prefill_ms - kernel_ms);
+            if prefill_ms > 0.0 {
+                row.set_metric_f64("cold_overhead_pct", (prefill_ms - kernel_ms) / prefill_ms * 100.0);
+            }
+        }
+        if let Err(e) = row.append_to_jsonl(atlas_path) {
+            eprintln!("WARN: failed to append atlas row to {atlas_path}: {e}");
+        }
+    }
 
     // (deferred-conversion mode removed with givens — asym modes are natively
     //  batched so there's no prefill/decode cache swap to measure.)
@@ -280,7 +328,8 @@ fn main() {
         eprintln!("  total: {gen_total_ms:.1}ms over 0 tokens");
         eprintln!("  tok/s (gen): 0.0");
         eprintln!();
-        eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00");
+        eprintln!("SUMMARY  gen_tok_s=0.0  bw_gib_s=0.0  prefill_tok_s={prefill_tok_s:.1}  avg_ms=0.00  p50_ms=0.00{}",
+            split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
         return;
     }
     let sum: f64 = sorted.iter().sum();
@@ -303,5 +352,51 @@ fn main() {
     eprintln!("  effective BW: {bw_gbps:.1} GiB/s (model {:.2} GiB × {gen_tok_s:.1} tok/s)",
         model_bytes as f64 / (1024.0 * 1024.0 * 1024.0));
     eprintln!();
-    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}");
+    eprintln!("SUMMARY  gen_tok_s={gen_tok_s:.1}  bw_gib_s={bw_gbps:.1}  prefill_tok_s={prefill_tok_s:.1}  avg_ms={avg_ms:.2}  p50_ms={p50_ms:.2}{}",
+        split_prefill_summary(prefill_len, prefill_ms, prefill_kernel_ms));
+
+    // Decode atlas row (gen phase). Pairs with the prefill row emitted
+    // earlier so a single bench invocation produces two phase-tagged rows.
+    if let Some(ref atlas_path) = atlas_out {
+        let mut row = hipfire_atlas::AtlasRow::new("decode_ar", "bench_qwen35_mq4");
+        row.set_metric_f64("gen_tok_s", gen_tok_s)
+            .set_metric_f64("bw_gib_s", bw_gbps)
+            .set_metric_f64("avg_ms", avg_ms)
+            .set_metric_f64("p50_ms", p50_ms)
+            .set_metric_f64("p90_ms", p90_ms)
+            .set_metric_f64("p99_ms", p99_ms)
+            .set_metric_f64("min_ms", min_ms)
+            .set_metric_f64("max_ms", max_ms)
+            .set_metric_u64("gen_tokens", n as u64)
+            .set_metric_str("kv_mode", &kv_mode)
+            .set_metric_str("arch", &gpu.arch)
+            .set_metric_str("model_path", model_path)
+            .set_metric_u64("model_bytes", model_bytes);
+        if let Err(e) = row.append_to_jsonl(atlas_path) {
+            eprintln!("WARN: failed to append atlas row to {atlas_path}: {e}");
+        }
+    }
+}
+
+/// Emit the latency-class split for prefill when profiling captured the
+/// per-kernel time. `prefill_tok_s` in the main SUMMARY is the wall-clock
+/// figure (includes first-process JIT compile + graph capture). The
+/// `*_kernel` figures here are steady-state kernel throughput — what every
+/// call after the first one converges to once JIT amortizes. The gap is
+/// `startup_overhead_ms`. AOT-shipped HSACOs should drop that gap to ~0.
+///
+/// Returns an empty string if profiling was disabled so the SUMMARY line
+/// stays parseable by older tooling.
+#[cfg(feature = "deltanet")]
+fn split_prefill_summary(prefill_len: usize, prefill_ms: f64, prefill_kernel_ms: Option<f64>) -> String {
+    if let Some(kernel_ms) = prefill_kernel_ms {
+        let prefill_tok_s_kernel = prefill_len as f64 / (kernel_ms / 1000.0);
+        let startup_overhead_ms = prefill_ms - kernel_ms;
+        let cold_pct = if prefill_ms > 0.0 { (startup_overhead_ms / prefill_ms) * 100.0 } else { 0.0 };
+        format!(
+            "  prefill_tok_s_kernel={prefill_tok_s_kernel:.1}  prefill_kernel_ms={kernel_ms:.2}  startup_overhead_ms={startup_overhead_ms:.2}  cold_overhead_pct={cold_pct:.1}"
+        )
+    } else {
+        String::new()
+    }
 }

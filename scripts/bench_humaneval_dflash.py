@@ -4,7 +4,8 @@
 # in code-token regime. Matches Lucebox methodology.
 #
 # Usage:
-#   python3 scripts/bench_humaneval_dflash.py            # default: 33 prompts (every 5th of 164)
+#   python3 scripts/bench_humaneval_dflash.py            # default: 33 prompts, DFlash mode
+#   python3 scripts/bench_humaneval_dflash.py --ar       # AR baseline mode (no draft used)
 #   python3 scripts/bench_humaneval_dflash.py --n 25     # sample size
 #   python3 scripts/bench_humaneval_dflash.py --jsonl PATH --max 128
 
@@ -20,17 +21,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jsonl", default="/tmp/humaneval/HumanEval.jsonl")
     ap.add_argument("--target", default=os.path.expanduser("~/.hipfire/models/qwen3.5-27b.mq4"))
-    ap.add_argument("--draft", default=os.path.expanduser("~/.hipfire/models/qwen35-27b-dflash.mq4"))
+    ap.add_argument("--draft", default=os.path.expanduser("~/.hipfire/models/qwen35-27b-dflash-mq4.hfq"))
     ap.add_argument("--demo", default="./target/release/examples/dflash_spec_demo")
     ap.add_argument("--max", type=int, default=128, help="max tokens per prompt")
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n", type=int, default=33, help="sample size (0..164)")
     ap.add_argument("--kv-mode", default="q8", help="q8 | asym3 | asym4 | asym2")
+    ap.add_argument("--ar", action="store_true", help="AR baseline mode (passes --ar-baseline; no spec decode)")
     ap.add_argument("--ddtree-batched", action="store_true", help="enable --ddtree-batched")
     ap.add_argument("--ddtree-budget", type=int, default=None)
     ap.add_argument("--ddtree-topk", type=int, default=None)
     ap.add_argument("--label", default="", help="label printed in the summary (e.g. 'linear-asym3')")
     args = ap.parse_args()
+    if args.ar and (args.ddtree_batched or args.ddtree_budget is not None or args.ddtree_topk is not None):
+        print("--ar is incompatible with --ddtree-* flags", file=sys.stderr); sys.exit(2)
 
     with open(args.jsonl) as f:
         tasks = [json.loads(l) for l in f]
@@ -43,13 +47,15 @@ def main():
     print(f"# target: {args.target}")
     print(f"# draft:  {args.draft}")
     extra_args = ["--kv-mode", args.kv_mode]
+    if args.ar:
+        extra_args.append("--ar-baseline")
     if args.ddtree_batched:
         extra_args.append("--ddtree-batched")
     if args.ddtree_budget is not None:
         extra_args += ["--ddtree-budget", str(args.ddtree_budget)]
     if args.ddtree_topk is not None:
         extra_args += ["--ddtree-topk", str(args.ddtree_topk)]
-    label = args.label or ("ddtree" if args.ddtree_batched else "linear")
+    label = args.label or ("ar" if args.ar else "ddtree" if args.ddtree_batched else "linear")
     print(f"# label={label}  max={args.max} ctx={args.ctx} --no-chatml kv={args.kv_mode}  "
           f"extra={' '.join(extra_args)}")
     print()
@@ -78,14 +84,15 @@ def main():
         m_cyc  = re.search(r"cycles: (\d+)", out)
         m_acc  = re.search(r"accepted: (\d+)", out)
 
-        if not m_toks or not m_tau:
+        # In AR mode there is no τ / cycles / accepted — only emitted+tok_s are required.
+        if not m_toks or (not args.ar and not m_tau):
             print(f"{tid:<16} PARSE_FAIL  run_s={dt:.1f}")
             results.append((tid, None, None, None, None, None, dt))
             continue
 
         emitted = int(m_toks.group(1))
         tok_s = float(m_toks.group(3))
-        tau = float(m_tau.group(1) or m_tau.group(2))
+        tau = float(m_tau.group(1) or m_tau.group(2)) if m_tau else float("nan")
         cyc = int(m_cyc.group(1)) if m_cyc else -1
         acc = int(m_acc.group(1)) if m_acc else -1
 
@@ -98,15 +105,16 @@ def main():
         print("\nno valid results"); sys.exit(2)
 
     tok_s = sorted([r[1] for r in valid])
-    taus = sorted([r[2] for r in valid])
     print()
     print(f"=== SUMMARY (n={len(valid)}/{len(sampled)}) ===")
     print(f"tok/s  mean={sum(tok_s)/len(tok_s):7.2f}  median={pct(tok_s,50):7.2f}  "
           f"p10={pct(tok_s,10):7.2f}  p90={pct(tok_s,90):7.2f}  "
           f"min={tok_s[0]:7.2f}  max={tok_s[-1]:7.2f}")
-    print(f"tau    mean={sum(taus)/len(taus):7.3f}  median={pct(taus,50):7.3f}  "
-          f"p10={pct(taus,10):7.3f}  p90={pct(taus,90):7.3f}  "
-          f"min={taus[0]:7.3f}  max={taus[-1]:7.3f}")
+    if not args.ar:
+        taus = sorted([r[2] for r in valid])
+        print(f"tau    mean={sum(taus)/len(taus):7.3f}  median={pct(taus,50):7.3f}  "
+              f"p10={pct(taus,10):7.3f}  p90={pct(taus,90):7.3f}  "
+              f"min={taus[0]:7.3f}  max={taus[-1]:7.3f}")
 
 if __name__ == "__main__":
     main()

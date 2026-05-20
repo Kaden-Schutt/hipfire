@@ -156,7 +156,11 @@ OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
 
 A3B_35="$MODELS_DIR/qwen3.5-35b-a3b.mq4"
-A3B_36="$MODELS_DIR/qwen3.6-35b-a3b.mq4"
+# 2026-05-15: qwen3.6-35b-a3b.mq4 hangs / emits zero tokens during this gate
+# (per issue #262 side-finding). Switched the "3.6" cell to dense qwen3.6-27b
+# while that's investigated — agentic tool-call shape testing doesn't strictly
+# require A3B, dense 27B exercises the same JSON-output predicates.
+A3B_36="$MODELS_DIR/qwen3.6-27b.mq4"
 PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"

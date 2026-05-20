@@ -159,6 +159,17 @@ pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
 }
 
+/// HFP4-G32 weight footprint: 16-B row header + (K/32)*17-B blocks per row.
+pub fn hfp4g32_weight_bytes(m: usize, k: usize) -> usize {
+    let blocks = k / 32;
+    m * (16 + blocks * 17)
+}
+
+/// Single-row HFP4-G32 GEMV bytes: weight + x (FP32) + y (FP32).
+pub fn gemv_hfp4g32_bytes(m: usize, k: usize) -> usize {
+    hfp4g32_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// FWHT rotation kernel: read x, read two sign tables, write x_rot.
 pub fn mq_rotate_bytes(k: usize) -> usize {
     k * 4 + 256 * 4 * 2 + k * 4

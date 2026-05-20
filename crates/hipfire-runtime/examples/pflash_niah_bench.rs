@@ -256,8 +256,15 @@ fn main() {
     let model_path = &args[1];
     let fixture_path = &args[2];
     let max_gen: usize = parse_arg(&args, "--maxgen").unwrap_or(64);
+    // KV mode selection. --q8kv / --asym3 retained as back-compat shortcuts;
+    // --kv-mode NAME accepts any of: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2.
     let use_q8 = args.iter().any(|a| a == "--q8kv");
-    let kv_label = if use_q8 { "q8" } else { "asym3" };
+    let kv_mode_arg: Option<String> = parse_arg(&args, "--kv-mode");
+    let kv_label: String = match kv_mode_arg.as_deref() {
+        Some(name) => name.to_string(),
+        None if use_q8 => "q8".to_string(),
+        None => "asym3".to_string(),
+    };
     let drafter_path: Option<String> = args.iter().position(|a| a == "--pflash")
         .and_then(|i| args.get(i + 1)).cloned();
     let keep_ratio: f32 = parse_arg(&args, "--keep-ratio").unwrap_or(0.30);
@@ -511,12 +518,24 @@ fn main() {
     eprintln!("prefill tokens md5: {tokens_md5} ({} tokens)", tokens.len());
 
     let kv_seq = (tokens.len() + max_gen + 256).next_power_of_two().max(2048);
-    let mut kv = if use_q8 {
-        KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv q8")
-    } else {
-        KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq)
-            .expect("kv asym3")
+    let is_kv_layer: Vec<bool> = config.layer_types.iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+    let mut kv = match kv_label.as_str() {
+        "q8" => KvCache::new_gpu_q8_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv q8"),
+        "asym4" => KvCache::new_gpu_asym4_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv asym4"),
+        "asym3" => KvCache::new_gpu_asym3_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv asym3"),
+        "asym2" => KvCache::new_gpu_asym2_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv asym2"),
+        "fwht4" => KvCache::new_gpu_fwht4_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv fwht4"),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv fwht3"),
+        "fwht2" => KvCache::new_gpu_fwht2_filtered(&mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_seq)
+            .expect("kv fwht2"),
+        other => panic!("unknown --kv-mode: {other} (q8|asym4|asym3|asym2|fwht4|fwht3|fwht2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).expect("dn_state");
     let scratch = qwen35::Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).expect("scratch");

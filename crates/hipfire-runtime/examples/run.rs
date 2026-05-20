@@ -7,15 +7,43 @@ fn main() { eprintln!("Build with --features deltanet"); }
 #[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::llama;
     use std::io::Write;
     use std::path::Path;
     use std::time::Instant;
 
+    fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
+        hfq.tensors()
+            .iter()
+            .map(|t| {
+                t.shape
+                    .iter()
+                    .fold(1u128, |acc, &dim| acc.saturating_mul(dim as u128))
+            })
+            .sum()
+    }
+
+    fn warn_tiny_model_state(path: &str, q: qwen35::StateQuant) {
+        const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
+        if q == qwen35::StateQuant::FP32 {
+            return;
+        }
+        if let Ok(hfq) = HfqFile::open(Path::new(path)) {
+            let params = hfq_parameter_count(&hfq);
+            if params < TINY_MODEL_PARAMS {
+                eprintln!(
+                    "warning: model has ~{:.2}B params; FP32 DeltaNet state is recommended below 2B for long-generation coherence (current: {:?})",
+                    params as f64 / 1.0e9,
+                    q
+                );
+            }
+        }
+    }
+
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N]");
+        eprintln!("Usage: run <model.hfq> [--draft-model <path>] [--system \"prompt\"] [--kv givens4|givens2] [--temp F] [--max-seq N] [--fp32-state|--q8-state|--q4-state]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -25,7 +53,7 @@ fn main() {
     let mut kv_mode_str: String = "q8".to_string();
     let mut temp: f32 = 0.3;
     let mut max_seq: usize = 4096;
-    let mut q4_state = false;
+    let mut state_quant = qwen35::StateQuant::Q8;
     let mut draft_model: Option<String> = None;
     let mut speculative = false;
     let mut spec_k: usize = 4;
@@ -35,7 +63,9 @@ fn main() {
         match args[i].as_str() {
             "--system" | "-s" => { i += 1; system_prompt = Some(args[i].clone()); }
             "--kv" => { i += 1; kv_mode_str = args[i].clone(); }
-            "--q4-state" => { q4_state = true; }
+            "--fp32-state" => { state_quant = qwen35::StateQuant::FP32; }
+            "--q8-state" => { state_quant = qwen35::StateQuant::Q8; }
+            "--q4-state" => { state_quant = qwen35::StateQuant::Q4; }
             "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
             "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
             "--draft-model" => { i += 1; draft_model = Some(args[i].clone()); }
@@ -52,8 +82,12 @@ fn main() {
     eprintln!("Loading {}...", model_path);
 
     use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
-    let state_quant = if q4_state { qwen35::StateQuant::Q4 } else { qwen35::StateQuant::Q8 };
-    if q4_state { eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"); }
+    match state_quant {
+        qwen35::StateQuant::FP32 => eprintln!("DeltaNet state: FP32"),
+        qwen35::StateQuant::Q8 => eprintln!("DeltaNet state: Q8"),
+        qwen35::StateQuant::Q4 => eprintln!("DeltaNet state: Q4 (half VRAM vs Q8)"),
+    }
+    warn_tiny_model_state(model_path, state_quant);
     eprintln!("KV cache: {kv_mode_str}");
     let target_kv_mode = KvMode::Q8;
     let target_cfg = ModelSlotConfig {

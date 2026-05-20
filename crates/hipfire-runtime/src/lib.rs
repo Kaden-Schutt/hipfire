@@ -10,6 +10,7 @@
 //! [`arch::Architecture`] trait.
 
 pub mod arch;
+pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod llama;

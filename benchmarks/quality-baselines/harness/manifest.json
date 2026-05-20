@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "comment": "SHA-pinned index of BF16 reference dumps for the quant-quality eval. Each ref is content-addressed by sha256; producer_cmd + llamacpp_commit + slice_md5 are the reproduction recipe. See docs/plans/issue-113-quant-quality-eval.md \u00a7'Reference dump \u2192 HF Hub'.",
+  "llamacpp_commit_pinned": "9dcf83552887bb898b4a98a5761361e504e31fc3",
+  "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+  "format": {
+    "version": 1,
+    "default_top_k": 256,
+    "spec": "docs/plans/issue-113-quant-quality-eval.md \u00a7'Hipfire-derived top-K format'",
+    "magic_hex": "48464b4c44520000",
+    "magic_ascii": "HFKLDR + 2 nul bytes"
+  },
+  "references": {
+    "qwen3.5-0.8b-bf16.kldref.bin": {
+      "sha256": "9c78a501efe46edcea3dd8ff35c9406c24074f2901c62fc87fb9b2cc4747984b",
+      "size_bytes": 2480989032,
+      "host_arch": "gfx1151",
+      "llamacpp_commit": "9dcf83552887bb898b4a98a5761361e504e31fc3",
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256,
+      "n_ctx": 2048,
+      "n_vocab": 248320,
+      "n_chunk": 1175,
+      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf /data/models/unsloth/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
+      "source_gguf": "unsloth/Qwen3.5-0.8B-GGUF :: Qwen3.5-0.8B-BF16.gguf",
+      "source_gguf_sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
+      "hf_repo": null,
+      "hf_repo_type": null,
+      "comment": "0.8B BF16 reference dump, 2026-05-11, ~16 min wall, 1238 reduced tok/s on gfx1151. Source GGUF pulled from unsloth (same lineage as 9B ref); local-only pending HF upload to hipfire-models/qwen-kldref."
+    },
+    "qwen3.5-9b-bf16.kldref.bin": {
+      "sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
+      "size_bytes": 2480989032,
+      "host_arch": "gfx1151",
+      "llamacpp_commit": "9dcf83552887bb898b4a98a5761361e504e31fc3",
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256,
+      "n_ctx": 2048,
+      "n_vocab": 248320,
+      "n_chunk": 1175,
+      "producer_cmd": "cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf /data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+      "hf_repo": "hipfire-models/qwen-kldref",
+      "hf_repo_type": "dataset",
+      "comment": "9B BF16 reference dump, 2026-05-08, ~53 min wall, 375 reduced tok/s. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
+    },
+    "qwen3.6-27b-bf16.kldref.bin": {
+      "sha256": "8af83b38710fbc8e5ee46ce2b84b3545381c834f17bf6dfaa15fd817e4734446",
+      "size_bytes": 2480989032,
+      "host_arch": "gfx1151",
+      "llamacpp_commit": "9dcf83552887bb898b4a98a5761361e504e31fc3",
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256,
+      "n_ctx": 2048,
+      "n_vocab": 248320,
+      "n_chunk": 1175,
+      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref -- --bf16-gguf /home/kread/models-local/Qwen3.6-27B/Qwen3.6-27B-BF16-00001-of-00002.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
+      "hf_repo": "hipfire-models/qwen-kldref",
+      "hf_repo_type": "dataset",
+      "comment": "27B BF16 reference dump, 2026-05-09, 2h 3m wall, 162 reduced tok/s. Required --no-mmap flag (passed automatically by build_kld_ref) — without it, demand-paging on 50 GB BF16 weights caused eviction-cycle stall on 124 GB UMA. GGUF copied locally to /home/kread/models-local/ from NFS to reduce per-page-fault read time. VM (enertree) shut down to free working-set RAM. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
+    }
+  }
+}

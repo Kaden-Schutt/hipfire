@@ -85,7 +85,35 @@ fn main() {
         "asym3" => KvCache::new_gpu_asym3(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
         ).unwrap(),
-        other => panic!("unknown --kv-mode: {other} (q8, asym4, asym3)"),
+        "asym2" => {
+            let is_kv_layer: Vec<bool> = config.layer_types.iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            KvCache::new_gpu_asym2_filtered(
+                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+            ).unwrap()
+        }
+        "fwht4" => {
+            let is_kv_layer: Vec<bool> = config.layer_types.iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            KvCache::new_gpu_fwht4_filtered(
+                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+            ).unwrap()
+        }
+        "fwht3" => {
+            let is_kv_layer: Vec<bool> = config.layer_types.iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            KvCache::new_gpu_fwht3_filtered(
+                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+            ).unwrap()
+        }
+        "fwht2" => {
+            let is_kv_layer: Vec<bool> = config.layer_types.iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention).collect();
+            KvCache::new_gpu_fwht2_filtered(
+                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+            ).unwrap()
+        }
+        other => panic!("unknown --kv-mode: {other} (q8, asym4, asym3, asym2, fwht4, fwht3, fwht2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 64).unwrap();

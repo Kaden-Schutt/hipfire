@@ -11,6 +11,7 @@ members = [
     "crates/hipfire-arch-toy",
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
+    "crates/hipfire-atlas",
     "crates/redline",
 ]
 

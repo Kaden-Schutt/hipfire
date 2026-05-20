@@ -274,6 +274,7 @@ profile, sparse_threshold).
 
 | Key | Default | Range |
 |---|---|---|
+| `host` | 0.0.0.0 | bind address / hostname |
 | `port` | 11435 | 1–65535 |
 | `idle_timeout` | 300 | 0–86400 (seconds) |
 | `default_model` | "" (none) | tag or path |
