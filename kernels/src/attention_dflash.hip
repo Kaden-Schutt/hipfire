@@ -77,14 +77,44 @@ extern "C" __global__ void attention_dflash_f32(
         if (tile_len > tile_size) tile_len = tile_size;
 
         // Phase A: compute scores for this tile, track tile-local max.
+        //
+        // Inner dot product is unrolled by 8 with 8 independent
+        // accumulators so the FMA chain isn't serially dependent on
+        // a single accumulator. RDNA3 FMA latency is ~4 cycles, so a
+        // 128-element single-accumulator chain stalls for ~512 cycles
+        // per j; 8-way ILP lets up to 8 FMAs be in flight at once,
+        // bringing the per-j latency close to the 16 sequential adds
+        // of the final tree reduce.
+        //
+        // Requires head_dim divisible by 8 for the fast path. Tail
+        // loop handles the remainder; in practice the configurations
+        // we care about (head_dim ∈ {64, 72, 128, 256, 512}) are all
+        // multiples of 8.
         float local_max = -INFINITY;
         for (int j = tid; j < tile_len; j += nthreads) {
             int abs_j = tile_start + j;
             const float* k_ptr = k + abs_j * kv_stride + kv_head * head_dim;
-            float dot = 0.0f;
-            for (int d = 0; d < head_dim; ++d) {
-                dot += q_ptr[d] * k_ptr[d];
+            float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            float a4 = 0.0f, a5 = 0.0f, a6 = 0.0f, a7 = 0.0f;
+            const int head_dim_8 = head_dim & ~7;
+            #pragma unroll 4
+            for (int d = 0; d < head_dim_8; d += 8) {
+                a0 += q_ptr[d    ] * k_ptr[d    ];
+                a1 += q_ptr[d + 1] * k_ptr[d + 1];
+                a2 += q_ptr[d + 2] * k_ptr[d + 2];
+                a3 += q_ptr[d + 3] * k_ptr[d + 3];
+                a4 += q_ptr[d + 4] * k_ptr[d + 4];
+                a5 += q_ptr[d + 5] * k_ptr[d + 5];
+                a6 += q_ptr[d + 6] * k_ptr[d + 6];
+                a7 += q_ptr[d + 7] * k_ptr[d + 7];
             }
+            // Tail for head_dim % 8 != 0 (no-op for hd ∈ {64,72,128,256,512}).
+            for (int d = head_dim_8; d < head_dim; ++d) {
+                a0 += q_ptr[d] * k_ptr[d];
+            }
+            // Tree reduce 8 accumulators → 1.
+            float r01 = a0 + a1, r23 = a2 + a3, r45 = a4 + a5, r67 = a6 + a7;
+            float dot = (r01 + r23) + (r45 + r67);
             float s = dot * scale;
             tile_scores[j] = s;
             if (s > local_max) local_max = s;
@@ -169,10 +199,24 @@ extern "C" __global__ void attention_dflash_f32(
             int j_start_local = j_chunk_id * j_per_chunk;
             int j_end_local = j_start_local + j_per_chunk;
             if (j_end_local > tile_len) j_end_local = tile_len;
-            for (int j = j_start_local; j < j_end_local; ++j) {
-                int abs_j = tile_start + j;
-                partial += tile_scores[j] * v[abs_j * kv_stride + kv_head * head_dim + d_lane];
+            // 4-way ILP on the j-loop: same motivation as phase A —
+            // break the FMA chain into 4 independent accumulators so
+            // the v load + score multiply + accumulate can overlap.
+            const int v_lane_off = kv_head * head_dim + d_lane;
+            float p0 = 0.0f, p1 = 0.0f, p2 = 0.0f, p3 = 0.0f;
+            int j = j_start_local;
+            for (; j + 4 <= j_end_local; j += 4) {
+                int base = tile_start + j;
+                p0 += tile_scores[j    ] * v[(base    ) * kv_stride + v_lane_off];
+                p1 += tile_scores[j + 1] * v[(base + 1) * kv_stride + v_lane_off];
+                p2 += tile_scores[j + 2] * v[(base + 2) * kv_stride + v_lane_off];
+                p3 += tile_scores[j + 3] * v[(base + 3) * kv_stride + v_lane_off];
             }
+            // Tail (≤ 3 iterations).
+            for (; j < j_end_local; ++j) {
+                p0 += tile_scores[j] * v[(tile_start + j) * kv_stride + v_lane_off];
+            }
+            partial = (p0 + p1) + (p2 + p3);
         }
         // Threads with tid >= j_chunks * head_dim are idle (when
         // `nthreads % head_dim != 0`); their partial stays 0.
