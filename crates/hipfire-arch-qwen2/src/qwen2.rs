@@ -48,12 +48,12 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 ///   accessor); `eos_token_ids` carries the full set so the runtime
 ///   can build a multi-element stop-set (e.g. dots.ocr's
 ///   `[151643, 151673]` — without both, streaming EOS misses one).
-///   Note: dots.ocr's `config.json` doesn't carry `eos_token_id` at
-///   all — it lives in `generation_config.json`, which the quantiser
-///   does not pack today. Parser falls back to 151645 (`<|im_end|>`)
-///   in that case, which is wrong for dots.ocr; phase 3 must either
-///   teach the quantiser to merge `generation_config` or special-case
-///   via `eos_filter_overrides`. See R5 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`.
+///   Lookup order: `config.eos_token_id` (scalar or array) →
+///   `generation_config.eos_token_id` → default `[151645]` (ChatML
+///   `<|im_end|>`). dots.ocr's `config.json` carries no EOS at all;
+///   the array lives only in `generation_config.json`, which the
+///   quantiser packs into HFQ metadata as of R5. See
+///   `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` §6 R5.
 #[derive(Debug, Clone)]
 pub struct Qwen2Config {
     pub hidden_size: usize,
@@ -116,15 +116,32 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     // Build the full EOS set first, then the scalar accessor is its
-    // first element. Both array and scalar config layouts are accepted;
-    // missing field falls back to [151645] (ChatML `<|im_end|>`).
-    let eos_token_ids: Vec<u32> = match tc.get("eos_token_id") {
-        Some(v) if v.is_array() => v.as_array().unwrap().iter()
-            .filter_map(|e| e.as_u64().map(|n| n as u32))
-            .collect(),
-        Some(v) if v.is_number() => v.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
-        _ => Vec::new(),
+    // first element. Both array and scalar config layouts are accepted.
+    //
+    // Lookup order:
+    //   1. text_config.eos_token_id / config.eos_token_id (Qwen2-1.5B carries this)
+    //   2. generation_config.eos_token_id (dots.ocr's [151643, 151673]
+    //      lives only here per R5 — the quantiser now packs this sibling
+    //      JSON into HFQ metadata so this fallback is reachable)
+    //   3. Default [151645] (ChatML `<|im_end|>`)
+    let parse_eos = |val: &serde_json::Value| -> Vec<u32> {
+        match val {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u32))
+                .collect(),
+            serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+            _ => Vec::new(),
+        }
     };
+    let mut eos_token_ids: Vec<u32> = tc.get("eos_token_id")
+        .map(parse_eos)
+        .unwrap_or_default();
+    if eos_token_ids.is_empty() {
+        if let Some(gc_eos) = meta.get("generation_config").and_then(|gc| gc.get("eos_token_id")) {
+            eos_token_ids = parse_eos(gc_eos);
+        }
+    }
     let eos_token_ids = if eos_token_ids.is_empty() {
         vec![151645]
     } else {
@@ -930,5 +947,56 @@ mod tests {
         let cfg = config_from_metadata_json(with_array).expect("array eos should parse");
         assert_eq!(cfg.eos_token_id, 151645);
         assert_eq!(cfg.eos_token_ids, vec![151645, 151643]);
+    }
+
+    #[test]
+    fn eos_falls_back_to_generation_config_when_absent_from_config() {
+        // dots.ocr's real shape: config.json carries NO eos_token_id at
+        // all; the [151643, 151673] array lives only in
+        // generation_config.json. The quantiser-side R5 fix packs
+        // generation_config into HFQ metadata so the parser can find
+        // it. Without this fallback the parser would default to the
+        // ChatML [151645] which never fires on a correct dots.ocr
+        // response (151645 `<|im_end|>` is not in the dots.ocr template).
+        let json = r#"{
+            "config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "intermediate_size": 8960,
+                "vocab_size": 151936
+            },
+            "generation_config": {
+                "eos_token_id": [151643, 151673],
+                "pad_token_id": 151643
+            }
+        }"#;
+        let cfg = config_from_metadata_json(json)
+            .expect("config + generation_config should parse");
+        assert_eq!(cfg.eos_token_id, 151643);
+        assert_eq!(cfg.eos_token_ids, vec![151643, 151673]);
+    }
+
+    #[test]
+    fn eos_in_config_takes_precedence_over_generation_config() {
+        // If config.eos_token_id IS set, it wins — generation_config
+        // is only consulted as a fallback. Guards against a future
+        // quantiser that packs both with conflicting values.
+        let json = r#"{
+            "config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "intermediate_size": 8960,
+                "vocab_size": 151936,
+                "eos_token_id": 151645
+            },
+            "generation_config": {
+                "eos_token_id": [151643, 151673]
+            }
+        }"#;
+        let cfg = config_from_metadata_json(json).expect("should parse");
+        assert_eq!(cfg.eos_token_id, 151645);
+        assert_eq!(cfg.eos_token_ids, vec![151645]);
     }
 }

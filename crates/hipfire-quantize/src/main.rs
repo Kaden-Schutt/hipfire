@@ -3958,12 +3958,31 @@ fn main() {
         None
     };
 
+    // Read generation_config.json. HF stores some sampler-side defaults
+    // here (eos_token_id, pad_token_id, bos_token_id, do_sample, etc.)
+    // separately from config.json. For most checkpoints these duplicate
+    // config.json fields, but dots.ocr's config.json carries no
+    // eos_token_id at all — the [151643, 151673] array lives only in
+    // generation_config.json. Packing it here lets the arch-side parser
+    // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
+    // generation_config when config.eos_token_id is absent. Resolves
+    // R5 in docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §6.
+    let generation_config_path = input_dir.join("generation_config.json");
+    let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
+        std::fs::read_to_string(&generation_config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
     // Build metadata JSON for .hfq
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
+        "generation_config": generation_config,
     });
     let metadata_json = serde_json::to_string(&metadata).unwrap();
 
