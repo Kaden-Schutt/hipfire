@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stage 6 smoke: PP=1 vs PP=2 token-stream parity on a real model.
 //! Loads qwen3.5:0.8b twice — once via the single-GPU forward_scratch
 //! and once via the multi-GPU forward_scratch_multi — and asserts the

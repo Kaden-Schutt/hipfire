@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // MagnumQuant 2-bit GEMV with per-block 4-entry fp16 Lloyd-Max codebook.
 //
 // Block layout (72 B/group, bandwidth-identical to uniform MQ2):

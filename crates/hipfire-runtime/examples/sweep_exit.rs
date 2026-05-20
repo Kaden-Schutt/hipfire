@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Sweep early-exit thresholds and checkpoints.
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, KvCache, ForwardScratch};

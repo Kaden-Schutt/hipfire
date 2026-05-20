@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # scripts/_detect-gpu.sh — sourced helper that exports detected GPU
 # arch / marketing name / VRAM. Mirrors the detection chain in
 # scripts/speed-gate.sh so every bench/test script picks up the same

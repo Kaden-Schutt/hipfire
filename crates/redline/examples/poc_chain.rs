@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Proof: chained dispatch with compute barrier in a single IB submission.
 //! Chain: A+B→C | barrier | C+D→E in one amdgpu_cs_submit call.
 //! If E=[13,13,...], the barrier correctly serialized dependent dispatches.

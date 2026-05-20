@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # 3-fresh-process NIAH wrapper for PFlash claims (PRD §6 Phase 5).
 #
 # The bench inside a single process is single-shot (no internal repeat),

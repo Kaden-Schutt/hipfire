@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # stage_models.sh — pull + quantize the full MQ4/MQ6 model matrix from
 # HuggingFace on a fresh pod. Uses the pod's HF DL link (~270 MB/s on
 # a datacenter box) to download safetensors, then runs `hipfire-quantize`

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 3a Option C: isolate where forward-pass wall clock goes.
 //!
 //! Splits a single forward pass into three measurements:

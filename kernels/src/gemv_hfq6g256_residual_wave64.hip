@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 
 // Wave64-native counterpart to gemv_hfq6g256_residual for gfx906 / CDNA1+ /

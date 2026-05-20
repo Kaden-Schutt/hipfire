@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Unified correctness + perf test for the three batched HFP4-G32
 //! GEMM kernels:
 //!   * gemm_qkv_hfp4g32           (QKV preamble, 3-way fused)

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Inference integration tests. Runs actual token sequences through the
 //! full forward path and checks for correctness, hangs, and speed.
 //! No model quality checks — just verifies the engine doesn't break.

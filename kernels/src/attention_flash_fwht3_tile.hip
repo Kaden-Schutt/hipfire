@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Flash attention tile — fwht3 KV: K at FWHT-256 rotated 3-bit, V at Q8_0 (normal space).
 //
 // Single-pass 256-element signed-FWHT on Q to match the K-write rotation.

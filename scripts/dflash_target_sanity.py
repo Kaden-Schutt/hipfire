@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Sanity check: does Qwen3.5-4B target alone produce reasonable greedy
 output on our agentic prompt? If target outputs 'useruser...' itself, the
 draft failure might just be a reflection of target's weird behavior.

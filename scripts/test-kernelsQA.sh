@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # QA kernel harness mirror.
 # Builds and runs the hardened QA kernel example with explicit status handling.
 set -euo pipefail

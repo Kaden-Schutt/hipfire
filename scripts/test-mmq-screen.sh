@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Björn Bösel
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Test MMQ screening fix end-to-end on a tool-call prompt.
 # Runs three daemon invocations and checks for <|im_start|> leakage.
 set -uo pipefail

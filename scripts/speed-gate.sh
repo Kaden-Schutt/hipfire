@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # speed-gate.sh — MQ4 prefill/decode speed regression gate.
 #
 # Runs bench_qwen35_mq4 on each available MQ4 model and compares

@@ -14,7 +14,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from mq4_masked_calib import (
+    compute_awq_scale_dict_with_raw,
+    compute_awq_scales,
     compute_awq_scales_from_hessian,
+    load_raw_sumsq_dict,
     quantize_candidate,
     run_iterative_awq_gptq_with_stats_sequence,
     safe_key,
@@ -262,3 +265,58 @@ def test_iterative_awq_gptq_is_reproducible_for_same_inputs(tmp_path):
     assert (tmp_path / "a" / "iter" / "round_0" / "model.hfq").read_bytes() == (
         tmp_path / "b" / "iter" / "round_0" / "model.hfq"
     ).read_bytes()
+
+
+def test_raw_sumsq_override_loads_and_falls_back_on_missing(tmp_path):
+    selected = [
+        {"hfq_name": "model.layers.0.self_attn.q_proj.weight"},
+        {"hfq_name": "model.layers.0.self_attn.k_proj.weight"},
+        {"hfq_name": "model.layers.0.absent.weight"},
+    ]
+    npz = tmp_path / "raw.npz"
+    np.savez_compressed(
+        npz,
+        **{
+            safe_key("model.layers.0.self_attn.q_proj.weight"): np.array([4.0, 1.0, 1.0, 1.0], dtype=np.float32),
+            safe_key("model.layers.0.self_attn.k_proj.weight"): np.array([1.0, 1.0, 1.0, 4.0], dtype=np.float32),
+        },
+    )
+    mapping, missing = load_raw_sumsq_dict(str(npz), selected)
+    assert set(mapping) == {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.k_proj.weight",
+    }
+    assert missing == ["model.layers.0.absent.weight"]
+    assert mapping["model.layers.0.self_attn.q_proj.weight"].dtype == np.float64
+
+
+def test_raw_sumsq_override_changes_scales_vs_hessian_diag(tmp_path):
+    """The override path must produce different scales than the rotated-
+    Hessian-diagonal fallback for the SAME tensors. This is the structural
+    fix for the run-006 plateau diagnosed in
+    docs/investigations/2026-05-18-awq-gptq-sub-0.10-kld/results.md.
+    """
+    name = "model.layers.0.self_attn.q_proj.weight"
+    K = 256  # one group
+    # Skewed activation distribution: one channel dominates → AWQ should
+    # produce a high pre-scale for that channel.
+    raw_sumsq = np.ones(K, dtype=np.float64)
+    raw_sumsq[0] = 10_000.0
+    # Build a [G=1, K, K] Hessian whose diagonal is the *un-rotated* raw_sumsq
+    # but whose off-diagonal mass is large enough that diag(R H R.T) ≠ raw_sumsq.
+    rng = np.random.default_rng(0)
+    M = rng.standard_normal((K, K)).astype(np.float64)
+    H = M @ M.T + np.diag(raw_sumsq)
+    hessians = {name: H[np.newaxis, :, :]}
+    raw_map = {name: raw_sumsq}
+
+    s_hess = compute_awq_scales_from_hessian(H[np.newaxis, :, :], 0.5)
+    s_raw = compute_awq_scales(raw_sumsq, 0.5)
+    # Sanity: distinct
+    assert np.abs(s_hess - s_raw).max() > 0.1
+
+    out = compute_awq_scale_dict_with_raw(hessians, raw_map, alpha=0.5)
+    np.testing.assert_allclose(out[name], s_raw)
+    # Missing-from-raw-map case falls through to Hessian-diag
+    out2 = compute_awq_scale_dict_with_raw(hessians, {}, alpha=0.5)
+    np.testing.assert_allclose(out2[name], s_hess)

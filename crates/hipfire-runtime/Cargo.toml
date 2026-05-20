@@ -315,3 +315,26 @@ required-features = []
 [[example]]
 name = "imatrix_collect"
 required-features = []
+
+# ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
+#
+# `collect_imatrix` and `collect_hessian` are the hipfire-native
+# replacements for the Tier 2 wrappers above. Both currently ship as
+# `unimplemented!()` scaffolds — argument parsing + module docs only —
+# so that the workspace compiles cleanly while follow-on subagent
+# tasks build the forward pass, on-GPU activation/Hessian reductions,
+# and the GGUF/HFHS-v1 writers on top.
+#
+# Stdlib only at this stage; no GPU / arch features required for the
+# scaffold itself. When the forward pass lands these bins will pick up
+# `required-features = ["arch-qwen35", "arch-llama"]` (or whichever
+# arches the Tier 1 path supports).
+[[bin]]
+name = "collect_imatrix"
+path = "src/bin/collect_imatrix.rs"
+required-features = []
+
+[[bin]]
+name = "collect_hessian"
+path = "src/bin/collect_hessian.rs"
+required-features = []

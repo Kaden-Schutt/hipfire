@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Dump per-layer hidden states from `qwen35::forward_scratch_with_hidden`
 //! for offline comparison against an HF transformers oracle.
 //!

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Robin Van Cauter
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Cold-process bench harness — fresh-process distribution for any single
 # kernel-tuning experiment.
 #

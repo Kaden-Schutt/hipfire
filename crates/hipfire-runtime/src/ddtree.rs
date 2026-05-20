@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Grégory D
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! DDTree: tree-structured speculative verification built from DFlash's
 //! per-position draft marginals.
 //!

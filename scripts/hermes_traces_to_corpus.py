@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """
 hermes_traces_to_corpus.py — convert the lambda/hermes-agent-reasoning-traces
 Parquet files to a plain-text corpus that our sidecar calibration and

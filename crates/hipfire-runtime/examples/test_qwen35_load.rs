@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal test: load Qwen3.5 HFQ, parse config, print layer types.
 //! Usage: cargo run --release --features deltanet --example test_qwen35_load -- models/qwen3.5-0.8b.q4.hfq
 

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Debug inline spec_generate step-by-step: dump posterior, block_out, etc.
 
 The goal: figure out why the draft+target loop produces 'useruser...'

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stage 4 smoke: build the full multi-GPU state stack on a real model:
 //! `Qwen35ScratchSet` (per-device), `KvCache::new_gpu_asym3_capped_multi`
 //! (per-layer K/V on band-owning device + per-device givens replicas),

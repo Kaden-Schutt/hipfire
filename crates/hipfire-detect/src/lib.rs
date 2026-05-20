@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Observational coherence/behavior detectors.
 //!
 //! Consumes the daemon's JSONL output and surfaces "model weirdness" — token

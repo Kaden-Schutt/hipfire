@@ -138,3 +138,40 @@ In rough priority order (most-likely-to-work first):
 3. **Iterate on top of v3's actual model** (deeper rewrite): instead of starting from flat-MQ4 + new scales, start from v3's GPTQ-corrected model and use iteration to refine *only* the AWQ scale values while preserving GPTQ corrections. Currently iterate's round-0 GPTQ pass overwrites v3's corrections.
 
 4. **Longer/different calibration corpus** (data-side): re-collect imatrix on a calibration corpus closer to unsloth's (longer documents, different distribution). Out of scope without more info on what unsloth used.
+
+### Infrastructure for lever #1 — SHIPPED, not yet executed
+
+A finer-grained split of lever #1 was shipped on branch `worktree-awq-raw-sumsq-converter` (PR-able to `iterative-awq-gptq`). The original lever bypassed in-process collection wholesale; the shipped version is more surgical and addresses the run-006 diagnosis directly:
+
+- **`scripts/convert_gguf_imatrix_to_npz.py`**: parses a llama.cpp GGUF imatrix (e.g. unsloth's `imatrix_unsloth.gguf_file`), maps each GGUF logical name to the candidate hipfire hfq names (reusing `astrea.gguf_to_hfq_candidates`), and writes a `.npz` keyed by `safe_key(hfq_name) → float32[K]` with raw per-input-channel `sum(x²)`.
+- **`scripts/mq4_masked_calib.py iterate --awq-raw-sumsq-npz PATH`**: new flag. When given, the AWQ scale derivation reads raw per-channel sum² for each tensor directly from the npz instead of taking `np.diagonal(rotated_H)`. This bypasses the structural mismatch (FWHT-rotated Hessian diagonals are not raw per-channel statistics under the FWHT) that capped run-003 at KLD ≈ 0.18.
+- The flag falls back to the Hessian-diagonal path for tensors absent from the npz (e.g. ssm_out, attn_output not in F1), so partial coverage is safe.
+
+**Validation done (CPU-only, no model runtime):**
+
+- Converter end-to-end on unsloth Qwen3.5-9B imatrix: 496 npz entries, geometric mean of AWQ scales ≈ 1.0, predicted log-range matches measured to ≥4 sig figs.
+- Override path produces materially different scales than the Hessian-diagonal path: q_proj layer 7 raw-sumsq gives 14.13× scale range vs 6.40× from the rotated-Hessian-diag fallback. The over-smoothed rotated path was systematically under-applying AWQ correction by ~2× in dynamic range.
+
+**Not yet executed:** the actual end-to-end iterate run + KLD measurement. That requires hiptrx GPU access (1-2h per iterate run; F1-184 mask + base v3 model + imatrix all live on hiptrx). The infrastructure is ready; the lever is one command away.
+
+**Plausible-but-unproven outcome:** sub-0.10 KLD. The diagnosis is structural (rotated Hessian doesn't yield raw sum² under FWHT, so AWQ has been systematically mis-scaled in every iterate round), so the fix is high-leverage *if* the data-side bottleneck from run-003 was actually this and not the calibration corpus. The other plausible outcome is that round 0 lands at ~0.13 (the v3 anchor, slightly perturbed by the more-discriminating scales) and iteration drifts up/down by a few percent — same plateau pattern, different floor. Won't know without running.
+
+**Repro command (to be executed on hiptrx, ~1-2h):**
+
+```bash
+# One-shot: convert unsloth GGUF imatrix to raw-sumsq npz
+python3 scripts/convert_gguf_imatrix_to_npz.py \
+    --in /home/kaden/.hipfire/imatrix/unsloth/Qwen3.5-9B-GGUF/imatrix_unsloth.gguf_file \
+    --out /home/kaden/.hipfire/imatrix/unsloth-9b-raw-sumsq.npz
+
+# Iterate with the override active
+python3 scripts/mq4_masked_calib.py iterate \
+    --hf-model /home/kaden/.cache/huggingface/hub/models--Qwen--Qwen3.5-9B/snapshots/<sha>/ \
+    --calib-text benchmarks/calib/calib-1m.txt \
+    --imatrix-mask <mask-f1-184-v3.json on hiptrx> \
+    --base-output-dir runs/iterate-raw-sumsq-9b/ \
+    --awq-raw-sumsq-npz /home/kaden/.hipfire/imatrix/unsloth-9b-raw-sumsq.npz \
+    --awq-alpha 0.5 --damping 0.5 --max-rounds 4 --epsilon 0.01 --gpu 0
+```
+
+This is the documented lever the user explicitly pivoted away from when calling time on the 6h autoresearch loop. Infrastructure shipped to lower the cost to "execute when convenient" instead of "rebuild the pipeline first."
