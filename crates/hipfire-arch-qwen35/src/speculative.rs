@@ -20,7 +20,7 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hipfire_runtime::tokenizer::Tokenizer;
+use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
@@ -315,8 +315,11 @@ impl ModelSlot {
     /// Load the tokenizer from this slot's HFQ metadata. Each slot technically
     /// carries its own tokenizer; callers should validate that two slots'
     /// tokenizers are compatible via `Tokenizer::is_compatible_with` before
-    /// sharing.
-    pub fn load_tokenizer(&self) -> Option<Tokenizer> {
+    /// sharing. Returns the underlying `TokenizerError` on failure so callers
+    /// can surface specific diagnostics (e.g. `MissingMergeResult` from a
+    /// truncated quantizer output) rather than a generic "no tokenizer"
+    /// message — see #203.
+    pub fn load_tokenizer(&self) -> Result<Tokenizer, TokenizerError> {
         Tokenizer::from_hfq_metadata(&self.hfq.metadata_json)
     }
 
@@ -391,11 +394,11 @@ impl SpecPair {
         let target = ModelSlot::load(gpu, target_path, "target", target_cfg)?;
         let draft = ModelSlot::load(gpu, draft_path, "draft", draft_cfg)?;
 
-        let target_tok = target.load_tokenizer().ok_or_else(|| {
-            hip_bridge::HipError::new(0, "target model has no tokenizer in HFQ metadata")
+        let target_tok = target.load_tokenizer().map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}"))
         })?;
-        let draft_tok = draft.load_tokenizer().ok_or_else(|| {
-            hip_bridge::HipError::new(0, "draft model has no tokenizer in HFQ metadata")
+        let draft_tok = draft.load_tokenizer().map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}"))
         })?;
 
         if target_tok.vocab_size() != draft_tok.vocab_size() {

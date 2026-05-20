@@ -36,6 +36,8 @@ use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use hipfire_arch_qwen35_vl::image;
+use base64::Engine;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -125,6 +127,31 @@ struct CaskConfig {
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
 /// reference for a future per-token attractor block.
+/// CPU-side counterpart that applies the same depth-tracking attractor
+/// block directly to a freshly-downloaded logits vector. Avoids the
+/// htod-memcpy + redownload roundtrip the GPU variant required per token.
+fn block_attractor_unclosed_cpu(
+    logits: &mut [f32],
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 || open_id == close_id { return; }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        if let Some(slot) = logits.get_mut(open_id as usize) {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
 //
 // ─── Probe-mode `committed` event emitter ────────────────────────────────
 //
@@ -240,10 +267,41 @@ fn acquire_daemon_lock() -> std::fs::File {
     f
 }
 
-const IMAGE_SIZE: usize = 448;
-const IMAGE_PAD_ID: u32 = 248056;
-const VISION_START_ID: u32 = 248053;
-const VISION_END_ID: u32 = 248054;
+/// Cap on the *encoded* base64 string length the daemon will accept on the
+/// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
+const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+
+/// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
+/// line on the IPC stream. Uses `serde_json` so user-controlled error
+/// strings (image decoder messages, base64 errors) can't desync the
+/// protocol by injecting embedded `"`, `\`, or newline bytes.
+fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
+    let line = serde_json::json!({
+        "type": "error",
+        "id": id,
+        "message": message,
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+enum ImageSource<'a> {
+    Path(&'a str),
+    Base64(&'a str),
+}
+
+struct GenerateVLParams<'a> {
+    id: &'a str,
+    prompt: &'a str,
+    system_prompt: Option<&'a str>,
+    image_source: ImageSource<'a>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+}
 
 /// Optional DFlash speculative-decoding state. Populated when `load` supplies
 /// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
@@ -816,6 +874,7 @@ fn main() {
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
+                let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
 
                 // Structured-tools + structured-messages support (Phase 1 of
                 // Jinja-everywhere migration). When present, both fields are
@@ -918,6 +977,8 @@ fn main() {
 
                 // assistant_prefix: "plain", "open_think", or "closed_think"
                 // Controls the ChatML framing after the assistant role header.
+                // Consumed by the text path; VL path does not yet propagate
+                // it (tracked as a follow-up to the post-#169 rebase).
                 let assistant_prefix = match msg.get("assistant_prefix")
                     .and_then(|v| v.as_str()).unwrap_or("plain")
                 {
@@ -926,8 +987,40 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
-                if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                let has_image = image_base64.is_some() || image.is_some();
+                let has_vl = m.vision_config.is_some();
+
+                if has_image && !has_vl {
+                    write_error(&mut stdout, id, "model has no vision encoder");
+                } else if has_image && has_vl {
+                    if image_base64.is_some() && image.is_some() {
+                        eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+                    }
+                    let source = if let Some(b64) = image_base64 {
+                        if b64.len() > MAX_BASE64_ENCODED_LEN {
+                            write_error(&mut stdout, id, &format!(
+                                "image payload exceeds maximum encoded size ({} bytes)",
+                                MAX_BASE64_ENCODED_LEN,
+                            ));
+                            continue;
+                        }
+                        ImageSource::Base64(b64)
+                    } else {
+                        ImageSource::Path(image.unwrap())
+                    };
+                    // Plan-mandated Phase-1 stopgap (docs/plans/completions_vision.md §2.1):
+                    // VL dispatch defaults `max_think_tokens` to 256 when the
+                    // client doesn't specify one. Caps runaway thinking
+                    // without needing the full `ThinkState` extraction. Text
+                    // path keeps unwrap_or(0) — it has different defaults
+                    // controlled per-model on the CLI side.
+                    let vl_max_think_tokens = if max_think_tokens == 0 { 256 } else { max_think_tokens };
+                    let params = GenerateVLParams {
+                        id, prompt, system_prompt: system, image_source: source,
+                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        max_think_tokens: vl_max_think_tokens,
+                    };
+                    generate_vl(m, &mut gpu, &mut stdout, &params);
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
                     // and apply any per-request overrides from `params`.
@@ -1370,7 +1463,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     // DFlash speculative-decode requires the target's lm_head to have a
     // batched-GEMM kernel (used for verify and DDTree top-K). Only
@@ -1718,7 +1811,7 @@ fn load_model_pp(
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     if hfq.arch_id != 5 && hfq.arch_id != 6 {
         return Err(format!(
@@ -4073,18 +4166,92 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
-    // Capacity guard — VL prompts include vision tokens + text + ChatML framing
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
+    let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window, max_think_tokens } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
-    let n_patches = (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
+
+    // Vision special-token IDs resolved from the tokenizer rather than
+    // hardcoded constants. Different VL-capable Qwen variants ship with
+    // different IDs for these tokens; a hardcoded mismatch silently
+    // splices the wrong tokens into the prompt. Required at load time —
+    // panic loudly here so the failure is at first-VL-request, not after
+    // a successful but wrong forward pass.
+    let image_pad_id = tokenizer.special_token_id("<|image_pad|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|image_pad|> special token"));
+    let vision_start_id = tokenizer.special_token_id("<|vision_start|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_start|> special token"));
+    let vision_end_id = tokenizer.special_token_id("<|vision_end|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_end|> special token"));
+
+    // Image preprocessing (CPU decode + smart resize). Cheap relative to
+    // the GPU vision encoder, so we run it before the capacity check —
+    // we need img_h/img_w to estimate visual tokens, and rejecting an
+    // over-budget request before vision_forward saves expensive GPU work.
+    let (pixels, img_h, img_w) = match image_source {
+        ImageSource::Path(path) => {
+            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+            image::load_and_preprocess(
+                Path::new(path),
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            )
+        }
+        ImageSource::Base64(b64) => {
+            // Strip optional `data:...;base64,` prefix. A `data:` URL
+            // missing the comma separator is malformed — surface that
+            // explicitly rather than letting it fall through to a
+            // misleading "invalid byte 'd' at index 0" base64 error.
+            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+                match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => {
+                        write_error(stdout, id, "malformed data URL: missing ',' separator");
+                        return;
+                    }
+                }
+            } else {
+                b64
+            };
+            eprintln!("[VL-DEBUG] preprocessing image: <{}-byte buffer>", raw_b64.len());
+            let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    write_error(stdout, id, &format!("failed to decode base64 image data: {e}"));
+                    return;
+                }
+            };
+            match image::load_and_preprocess_from_bytes(
+                &bytes,
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    write_error(stdout, id, &e);
+                    return;
+                }
+            }
+        }
+    };
+    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
+    let n_patches = grid_h * grid_w;
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-    let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20; // text + vision + ChatML overhead
+
+    // Capacity estimate including system prompt — a long system prompt
+    // on first turn would otherwise let an over-budget request through
+    // the soft check, only to fail the hard check after the expensive
+    // vision encoder runs.
+    let system_est = system_prompt.map(|s| tokenizer.encode(s).len()).unwrap_or(0);
+    let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
+
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        // Zero DeltaNet state on reset
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
             for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
@@ -4092,51 +4259,36 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
     }
+
+    if m.eviction.is_none() && prompt_est + max_tokens > m.max_seq {
+        write_error(stdout, id, &format!(
+            "request size ({} tokens) exceeds loaded KV budget ({})",
+            prompt_est + max_tokens, m.max_seq,
+        ));
+        return;
+    }
+
     let config = m.q35_config.as_ref().unwrap();
-    let vision_config = m.vision_config.as_ref().unwrap();
     let vision_weights = m.vision_weights.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
 
-    // Load and preprocess image (smart resize matching HuggingFace)
-    eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
-    let (pixels, img_h, img_w) = hipfire_arch_qwen35_vl::image::load_and_preprocess(
-        Path::new(image_path),
-        vision_config.patch_size,
-        vision_config.spatial_merge_size,
-    );
-    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
-    let grid_h = img_h / vision_config.patch_size;
-    let grid_w = img_w / vision_config.patch_size;
-    let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-
-    // Extract patches and run vision encoder
-    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels, 3, img_h, img_w,
-        vision_config.patch_size, vision_config.temporal_patch_size,
-    );
-    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
-        .expect("vision forward failed");
-
-    // Build VL prompt via hipfire_runtime::prompt_frame. The VL user body splices
-    // vision tokens (`<|vision_start|>` + N × `<|image_pad|>` +
-    // `<|vision_end|>`) BEFORE the textual prompt, separated by a newline.
-    // We pre-assemble that as the user-body token sequence and pass it
-    // through `build_with_user_tokens` so the role/newline/im_end
-    // scaffolding stays canonical.
+    // Build the actual prompt token sequence BEFORE running the GPU vision
+    // encoder so the hard capacity check uses the real prefill length, not
+    // the estimate. The vision tower is the most expensive part of a VL
+    // prefill — failing earlier saves the round-trip on over-budget requests.
     let nl = tokenizer.encode("\n");
     let im_end = tokenizer.encode("<|im_end|>");
     let q_tokens = tokenizer.encode(prompt);
 
     let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
-    user_body.push(VISION_START_ID);
+    user_body.push(vision_start_id);
     for _ in 0..n_visual_tokens {
-        user_body.push(IMAGE_PAD_ID);
+        user_body.push(image_pad_id);
     }
-    user_body.push(VISION_END_ID);
+    user_body.push(vision_end_id);
     user_body.extend_from_slice(&nl);
     user_body.extend_from_slice(&q_tokens);
 
@@ -4160,26 +4312,45 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
     };
     if over_budget {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq"}}"#,
-            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
+        write_error(stdout, id, &format!(
+            "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
+            m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
             if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
-        );
-        let _ = stdout.flush();
+        ));
         return;
     }
+
+    // Now safe to run the expensive GPU vision encoder.
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+        &pixels, 3, img_h, img_w,
+        vision_config.patch_size, vision_config.temporal_patch_size,
+    );
+    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
+        .expect("vision forward failed");
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
-    // Prefill with vision token embedding for IMAGE_PAD positions.
-    // VL prefill is already per-token (forward_scratch_embed isn't batched),
-    // so we advance m.seq_pos in-loop and call maybe_evict after every write.
+    // Mirror the text path: <think>/</think> as paired open/close. The
+    // previous implementation queried "💭" twice (open == close) which
+    // collapsed depth tracking and made `in_think` always-false; the
+    // force-close splice also encoded the open emoji, doubling the
+    // unclosed depth instead of closing it.
+    let think_pair = match (
+        tokenizer.special_token_id("<think>"),
+        tokenizer.special_token_id("</think>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+
+    // Prefill with vision token embedding for image_pad positions. VL
+    // prefill is per-token (forward_scratch_embed isn't batched), so we
+    // advance m.seq_pos in-loop and call maybe_evict after every write.
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
-        if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
+        if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
             qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
                 .expect("forward_scratch_embed failed");
@@ -4195,6 +4366,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             }
         }
     }
+
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     // Generate. CPU-side sampling — VL path predates the GPU sampler
@@ -4204,12 +4376,13 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     //   - subsequent samples: positional ngram-block, then
     //     repeat_penalty, then top-p sample.
     //
-    // The positional ngram block writes -INF to the
-    // *next-token-after-an-earlier-ngram-match* position — a
-    // per-history-pattern decision rather than the identity-only
-    // contract of SamplerConfig::blocked_tokens — so it stays inline
-    // rather than going through the SamplerConfig path.
+    // Attractor-block uses CPU-side mutation of the downloaded logits
+    // vector (`block_attractor_unclosed_cpu`) instead of the previous
+    // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    if let Some((open, close)) = think_pair {
+        block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+    }
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
         top_p,
@@ -4227,18 +4400,50 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
     let t_prefill = Instant::now();
     let mut generated = 0;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut think_count: usize = 0;
+    let mut prev_in_think: bool = false;
 
-    for _ in 0..max_tokens {
+    // N-gram loop detector — mirrors the text path. Catches answer-phase
+    // attractor loops that the think cap and repeat penalty miss.
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+
+    while generated < max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
         emit_committed_event(stdout, id, next_token, generated - 1, t0.elapsed().as_millis() as u64);
-        let text = tokenizer.decode(&[next_token]);
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-        let _ = stdout.flush();
+        streamed_tokens.push(next_token);
+
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let valid_len = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len > 0 {
+            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += valid_len;
+        }
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
         if tokenizer.is_terminator(next_token) { break; }
+
+        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
+            loop_guard.check(&streamed_tokens)
+        {
+            let window_len = loop_guard.window_len(streamed_tokens.len());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+                id, count, window_len,
+            );
+            let _ = stdout.flush();
+            break;
+        }
 
         qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
         m.seq_pos += 1;
@@ -4249,7 +4454,68 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        if let Some((open, close)) = think_pair {
+            block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+        }
+
         next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+
+        if max_think_tokens > 0 {
+            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let open_idx = raw_str.rfind("<think>");
+            let close_idx = raw_str.rfind("</think>");
+            let in_think = match (open_idx, close_idx) {
+                (Some(o), Some(c)) => o > c,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if in_think {
+                if !prev_in_think { think_count = 1; } else { think_count += 1; }
+            } else {
+                think_count = 0;
+            }
+            prev_in_think = in_think;
+
+            if in_think && think_count >= max_think_tokens {
+                let close_tokens = tokenizer.encode("</think>\n");
+                let budget_left = max_tokens.saturating_sub(generated);
+                let take = close_tokens.len().min(budget_left);
+                for &t in &close_tokens[..take] {
+                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                    m.seq_pos += 1;
+                    if let Some(ref ev) = m.eviction {
+                        if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            m.seq_pos = new_phys;
+                        }
+                    }
+                    m.conversation_tokens.push(t);
+                    streamed_tokens.push(t);
+
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[emitted_bytes..];
+                    let vl = match std::str::from_utf8(new_bytes) {
+                        Ok(_) => new_bytes.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if vl > 0 {
+                        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                        let _ = stdout.flush();
+                        emitted_bytes += vl;
+                    }
+                    generated += 1;
+                }
+                think_count = 0;
+                prev_in_think = false;
+                if generated >= max_tokens { break; }
+                logits = gpu.download_f32(&scratch.logits).unwrap();
+                if let Some((open, close)) = think_pair {
+                    block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+                }
+                next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+            }
+        }
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync
