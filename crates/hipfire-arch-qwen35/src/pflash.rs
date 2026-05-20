@@ -489,8 +489,8 @@ pub fn load_drafter(
     let mut hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
         "pflash: open drafter HFQ at {}: {e}", path.display(),
     )))?;
-    let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).ok_or_else(||
-        hip_bridge::HipError::new(0, "pflash: drafter HFQ has no embedded tokenizer metadata")
+    let drafter_tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e|
+        hip_bridge::HipError::new(0, &format!("pflash: drafter tokenizer load failed: {e}"))
     )?;
 
     // Detect drafter family via the HFQ header's `arch_id` (set at

@@ -1,5 +1,76 @@
 # Changelog
 
+## v0.2.0 — tokenizer interned symbols + loud OOV at construction
+
+`Tokenizer::from_*` constructors now return `Result<Self, TokenizerError>`
+instead of `Option<Self>`. Inconsistent vocab/merges pairs (e.g. truncated
+quantizer output, vocab missing a byte char, merges referencing absent
+symbols) are now rejected loudly at load time with a specific error variant
+instead of silently producing a `Tokenizer` whose `encode_gpt2_bpe` would
+emit id 0 for OOV symbols downstream (#203).
+
+The internal merge representation is now token-id-keyed end-to-end. The GPT-2
+BPE encoder operates on `Vec<u32>` (was `Vec<String>`); merge-pair lookups
+use `HashMap<(u32, u32), u32>` (was `HashMap<(String, String), usize>`).
+Heap-loop String clones are eliminated. For a Qwen3-class vocab this saves
+roughly 13 MB per loaded tokenizer.
+
+### Public API change
+
+```
+Old                                          → New
+Tokenizer::from_gguf(...) -> Option<Self>    → Result<Self, TokenizerError>
+Tokenizer::from_hf_json(...) -> Option<Self>  → Result<Self, TokenizerError>
+Tokenizer::from_hfq_metadata(...)            → Result<Self, TokenizerError>
+Tokenizer::from_gguf_meta_json(...)          → Result<Self, TokenizerError>
+Speculative::load_tokenizer(&self) -> Option<Tokenizer>
+                                             → Result<Tokenizer, TokenizerError>
+```
+
+New public types in `hipfire_runtime::tokenizer`:
+
+- `TokenizerError` — variants: `MetadataMissing { field }`, `MalformedJson`,
+  `MissingByteSymbol { byte, char }`, `MissingMergeOperand { rank, left,
+  right, missing_side }`, `MissingMergeResult { rank, expected }`. Implements
+  `Display`, `std::error::Error`, `From<serde_json::Error>`.
+- `Side` — `Left | Right`, used by `MissingMergeOperand`.
+
+### Migration guide for contributors
+
+```
+Old caller pattern                           → New caller pattern
+.expect("...")                                (unchanged — works on Result)
+.unwrap()                                     (unchanged — works on Result)
+.ok_or(_)?  / .ok_or_else(|| _)?              .map_err(|e| ...: {e})?
+                                              or .map_err(|_| _)?
+if let Some(t) = ...from_*(...)               if let Ok(t) = ...from_*(...)
+.unwrap_or_else(|| ...)                       .unwrap_or_else(|_| ...)
+                                              (closure now receives error)
+```
+
+### Why
+
+Pre-existing `Option`-returning constructors made every failure mode look
+identical from the outside. A user whose model failed to load got `None`
+with no information about why. With many possible failure modes (corrupt
+JSON, missing metadata, vocab/merges drift after re-quantization), this
+made remote debugging painful. The new `Result` variants describe exactly
+what's wrong (which byte, which merge rank, which symbol), so a single log
+line is enough to diagnose.
+
+The OOV consistency check at construction is the structural fix for #203.
+The encoder no longer needs to silently fall back to id 0 in its final walk
+because the constructor guarantees no OOV symbol can survive merges.
+
+### Caveats
+
+- The SentencePiece encoder's single-char fallback at `best_len == 0`
+  still silently drops missing chars. That's a separate failure mode that
+  needs an `encode_strict` variant returning `Result<Vec<u32>, EncodeError>`;
+  deferred to a follow-up PR.
+- The `max_token_chars` cap on the SentencePiece greedy scan (bounding the
+  pre-existing O(N²) tail on unmatchable inputs) is also deferred.
+
 ## v0.1.20 — engine modularization
 
 The `crates/engine/` monolith is split into a runtime crate plus

@@ -1463,7 +1463,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     // DFlash speculative-decode requires the target's lm_head to have a
     // batched-GEMM kernel (used for verify and DDTree top-K). Only
@@ -1811,7 +1811,7 @@ fn load_model_pp(
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     if hfq.arch_id != 5 && hfq.arch_id != 6 {
         return Err(format!(
