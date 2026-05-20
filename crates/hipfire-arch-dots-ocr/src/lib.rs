@@ -13,15 +13,21 @@
 //! preprocessing ([`image`]), and the prompt-frame + EOS overrides
 //! (see [`arch`]).
 //!
-//! # Bring-up status (rev 0 — phase 2 skeleton)
+//! # Bring-up status (rev 1 — phase 2a + 2b landed)
 //!
-//! - Crate scaffold + `Architecture` trait impl with arch_id=8.
+//! - Crate scaffold + `Architecture` trait impl with arch_id=8 (2a).
 //! - Text-side delegation to hipfire-arch-qwen2 (Config, Weights,
 //!   State all wrap Qwen2 equivalents).
+//! - Image preprocessing complete (2b): [`image::smart_resize`],
+//!   [`image::clip_normalise`], [`image::extract_patches`], and
+//!   [`image::preprocess_image`]. The §2.7 silent-failure trap
+//!   (patch reshape+transpose) is gated by
+//!   `image::tests::extract_patches_uses_grid_block_order` which
+//!   verifies the 2×2-grouped-block-major enumeration against a
+//!   synthetic per-pixel-tagged input — catches any drift to raster
+//!   order independently of any GPU code.
 //! - Vision tower types declared but `vision_forward` is a stub —
 //!   forward pass lands in phase 2c.
-//! - Image preprocessing module declared but not yet written —
-//!   lands in phase 2b.
 //!
 //! Not yet wired: daemon load arm for arch_id=8, vision token
 //! splicing, infer_dots_ocr.rs driver. Those follow phase 3 (assembly

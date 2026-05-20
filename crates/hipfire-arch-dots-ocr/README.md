@@ -9,15 +9,15 @@ Pairs a plain Qwen2 text decoder (delegated to
 attention) and a LayerNorm-based PatchMerger. Text decoding produces
 JSON / Markdown / SVG layout output gated by a custom chat template.
 
-## Bring-up status (phase 2 skeleton)
+## Bring-up status (phase 2a + 2b landed)
 
 | component | status |
 |---|---|
 | Crate scaffold + `Architecture` trait | landed (rev 0) |
 | `DotsOcrConfig` parser | landed (text via delegation; vision side parses with defaults fallback) |
 | Text-side weight load | landed (delegates to `Qwen2Weights::load`) |
+| Image preprocessing (smart-resize + CLIP normalise + patch transpose) | **landed** (phase 2b, rev 1) |
 | Vision weight load | **stub** — lands in phase 2c |
-| Image preprocessing (smart-resize + patch transpose) | **stub** — lands in phase 2b |
 | `vision_forward` (42-block ViT + merger) | **stub** — lands in phase 2c |
 | Daemon load arm (arch_id = 8) | not started — phase 3 |
 | `infer_dots_ocr.rs` driver example | not started — phase 3 |

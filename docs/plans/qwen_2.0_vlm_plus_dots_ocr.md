@@ -40,6 +40,11 @@ status per phase in §5.
 | `806680b2` | R3 resolved: daemon arm for `arch_id=7`. Wired `hipfire-arch-qwen2` as a runtime dev-dependency (gated behind new `arch-qwen2` feature, default-on); added `qwen2_config / qwen2_weights / qwen2_state` fields to `LoadedModel` with matching `free_gpu` impls; new load arm constructs the bring-up triple via the `Architecture` trait; new `generate_qwen2` function does encode → prefill → greedy decode → JSON `{type:"token"}` stream → `{type:"done"}`. Verified end-to-end: `hipfire run` (production CLI) against `qwen2-1.5b.arch7.q8.hfq` emits the same continuation as the Q8 precision-sweep run (`"A transformer's attention mechanism is a crucial component of its architecture, which is designed to ..."`) at ~96 tok/s for 137 generated tokens (single-shot, not warmed). Scope-limited bring-up — DFlash / CASK / PFlash / VL / ChatML scaffolding / repeat penalty / top-p / `<think>` budgeting / multi-GPU are all explicitly refused or skipped on this path. |
 | `2226bbcf` | Pre-PR fixes from rev-3 review fold-in (Claude+Gemini+GLM-5): A1 (bench_prefill arch_id=7 panic) + A2 (reset event missed Qwen2State.next_pos) + B1 comment (bias path was option (a) not (c) as claimed) + D1 (dead `let _ = decode_t0`) + MINOR doc refreshes across arch.rs / qwen2.rs / README.md / infer_qwen2.rs. `Qwen2State::reset()` helper added and called from both the daemon's `reset` event AND the `bench_prefill` cold-start path. End-to-end regression run (load + bench_prefill[32] + reset + generate[16] + unload) confirms forward output matches the Q8 reference byte-for-byte. |
 | _PR open_ | [Kaden-Schutt/hipfire#297](https://github.com/Kaden-Schutt/hipfire/pull/297) — phase 1 deliverable. Awaiting maintainer review + merge. |
+| `f6b28a12` | **Phase 2a** — bootstrap `hipfire-arch-dots-ocr` crate (arch_id=8). Mirrors phase 1 sequence from `hipfire-arch-qwen2`: typed Config/Weights/State + Architecture trait impl with dots.ocr-specific EOS overrides. `DotsOcrConfig` wraps Qwen2Config (text) + DotsVisionConfig (vision); `DotsOcrWeights` wraps Qwen2Weights + DotsVisionWeights side-by-side. Vision weight load + `vision_forward` are phase-2c stubs. Tests: 5 passing. |
+| `acd75473` | Merge `upstream/master` into `feat/dots-ocr-qwen2`: 47 commits / 779 files / +23.8k lines (license relicense, HFQ6 family, BF16 loader, MoE grouped-WMMA, gfx94x MFMA, Qwen3.5 MoE norm fix). 1 real conflict resolved: `qwen35.rs` dropped `load_norm_weight_raw` (superseded by upstream PR #228 GemmaRMSNorm convention fix). PR #297 mergeable. |
+| `544822b4` | **R5** — quantiser packs `generation_config.json` into HFQ metadata. Qwen2 parser walks fallback (`config.eos_token_id` → `generation_config.eos_token_id` → default). Fixes dots.ocr's silent EOS-default-to-`<\|im_end\|>` (151645, never fires) by surfacing the real `[151643, 151673]`. Tests: 8 passing (+2 new for the new fallback path). |
+| `1115486a` | **Phase 0 item 2** — read `modeling_dots_ocr.py` + `modeling_dots_vision.py` end-to-end. No plan contradictions. New §2.9 captures: attention scale = plain `1/sqrt(head_dim)`, multi-image batching packs into single flattened sequence (i32 cu_seqlens), bf16 cast at vision forward entry, vision-text integration via `masked_scatter()` with no projection layer, all 42 blocks structurally identical, no dropout/droppath in inference. Gotchas mirrored on `vision_forward` doc. |
+| _wip_ | **Phase 2b** — image preprocessing complete. `smart_resize` (28-divisible, beta scaling, AR>200 guard, zero-dim guard), `clip_normalise` (RGB→CHW f32, CLIP constants), `extract_patches` (the §2.7 silent-failure trap — 2×2-grouped-block-major enumeration), `preprocess_image` top-level wrapper with RGBA→RGB compositing over white. 14 unit tests, no GPU needed. Silent-failure-trap gated by `extract_patches_uses_grid_block_order` against a per-pixel-tagged 28×56 synthetic input. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -804,23 +809,43 @@ than a 28-block dense decoder.
 - **Vision trait impl** owns the custom `DotsVisionTransformer`
   encoder. `type State = ()` (one-shot encoder, no KV cache).
 
-**Image preprocessing:**
-- Port `image.rs` from qwen35-vl as a starting skeleton.
-- Swap resize to the dots.ocr 28-divisible + beta-scaling algorithm
-  exactly (§2.7). Include AR > 200:1 guard.
-- CLIP-style normalisation constants (§2.7).
-- **Apply the patch-extraction reshape+transpose from §2.7 exactly**
-  (`reshape(grid_t, tps, c, gh/sm, sm, ps, gw/sm, sm, ps)` followed by
-  `transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)`). This puts patches in 2×2
-  grid-block order so the merger groups correctly. Silent-failure trap
-  if skipped — see §2.7.
-- Unit tests:
-  - smart-resize clamps within bounds and lands on 28-multiples for a
-    100×3000 input; AR guard rejects 1×500.
-  - patch-order test: synthetic 56×28 RGB input (1×4 patch grid with
-    `merge_size=2`) produces flatten_patches byte-identical to the HF
-    `Qwen2VLImageProcessor` reference for the same input. Catches the
-    transpose bug independently of any GPU code.
+**Image preprocessing:** [DONE in phase 2b commit]
+- ✅ `image.rs` ported from qwen35-vl as skeleton, swapped to
+  dots.ocr's resize policy.
+- ✅ `smart_resize` matches `dots_ocr/utils/image_utils.py` exactly:
+  28-divisible, `[3136, 11_289_600]` pixel clamp, beta scaling for
+  both over-max and under-min cases, AR > 200:1 guard, zero-dim
+  guard.
+- ✅ `clip_normalise` applies the CLIP constants
+  `mean=[0.48145466, 0.4578275, 0.40821073]`,
+  `std=[0.26862954, 0.26130258, 0.27577711]` per-channel, RGB.
+- ✅ `extract_patches` mirrors `transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)`:
+  iteration nesting `outer_y → outer_x → inner_y → inner_x →
+  channel → tps → patch_y → patch_x` produces the 2×2-grouped-block-
+  major patch ordering with channel-major inner element layout.
+  Asserts catch `h`/`w` not multiples of `PATCH_SIZE`, and grid not
+  multiple of `SPATIAL_MERGE_SIZE` — no silent truncation.
+- ✅ Top-level `preprocess_image(path)` / `preprocess_dynamic_image(img)`
+  wrap the full pipeline with RGBA→RGB compositing over white
+  background (matches HF's `PIL.Image.convert("RGB")` on alpha-source).
+- ✅ Unit tests (14 in `image::tests`, no GPU needed):
+  - 5 covering smart_resize: 28-multiples, AR guard rejection,
+    zero-dim rejection, downscale (8000×8000), upscale (20×20).
+  - 1 covering CLIP normalisation with a hand-computed 1×1 RGB
+    reference (3 channels × 1 pixel).
+  - 3 covering extract_patches: 2×2-grouped order verified against
+    a per-patch-tagged synthetic 28×56 input (the canonical §2.7
+    silent-failure test), patch-interior layout, and the two assert
+    panics on misaligned input.
+  - 1 helper test for `PreprocessedImage` helpers.
+  - 3 covering RGBA compositing: alpha=128 mid-blend (hand-computed),
+    alpha=0 yields pure white, alpha=255 preserves source.
+
+The patch-order silent-failure trap is gated by
+`image::tests::extract_patches_uses_grid_block_order`. The test
+explicitly computes both the "raster" and "grid-block" expected
+sequences and asserts on the latter — any drift to raster order
+fails with a diagnostic that names both candidates.
 
 **`vision_forward(gpu, weights, &patches, image_grid_thw) -> Vec<f16>`:**
 
