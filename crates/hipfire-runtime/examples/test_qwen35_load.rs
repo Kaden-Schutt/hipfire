@@ -61,8 +61,8 @@ fn main() {
     // Check tokenizer
     let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json);
     match tok {
-        Some(t) => eprintln!("\nTokenizer: {} tokens", t.vocab_size()),
-        None => eprintln!("\nTokenizer: FAILED to load"),
+        Ok(t) => eprintln!("\nTokenizer: {} tokens", t.vocab_size()),
+        Err(e) => eprintln!("\nTokenizer: FAILED to load: {e}"),
     }
 
     // List some tensors

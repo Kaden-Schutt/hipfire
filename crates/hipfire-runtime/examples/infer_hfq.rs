@@ -59,7 +59,7 @@ fn main() {
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size);
 
     // Load tokenizer from HFQ metadata, fallback to GGUF
-    let tokenizer: hipfire_runtime::tokenizer::Tokenizer = if let Some(t) = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
+    let tokenizer: hipfire_runtime::tokenizer::Tokenizer = if let Ok(t) = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
         eprintln!("Tokenizer: {} tokens (from HFQ)", t.vocab_size());
         t
     } else {

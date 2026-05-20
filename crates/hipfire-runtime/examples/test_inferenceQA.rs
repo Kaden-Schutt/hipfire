@@ -334,7 +334,7 @@ fn classify_qwen35_candidate(hfq: &HfqFile) -> Result<String, CaseOutcome> {
 
 #[cfg(feature = "deltanet")]
 fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
-    if let Some(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
+    if let Ok(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
         return Ok((tokenizer, "hfq-metadata".to_string()));
     }
 
@@ -349,7 +349,7 @@ fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
     let gguf = GgufFile::open(fallback)
         .map_err(|e| CaseOutcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
     let tokenizer = Tokenizer::from_gguf(&gguf)
-        .ok_or_else(|| CaseOutcome::Skip("failed to parse fallback GGUF tokenizer".to_string()))?;
+        .map_err(|e| CaseOutcome::Skip(format!("failed to parse fallback GGUF tokenizer: {e}")))?;
     Ok((tokenizer, format!("gguf:{}", fallback.display())))
 }
 
