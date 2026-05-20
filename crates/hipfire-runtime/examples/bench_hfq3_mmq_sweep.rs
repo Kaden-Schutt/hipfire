@@ -61,6 +61,7 @@ fn run_kernel(
         "mmq16"  => gpu.gemm_hfq3g256_residual_mmq_x16(d_w, d_x, d_y, m, k, n).unwrap(),
         "mmq32"  => gpu.gemm_hfq3g256_residual_mmq_x32(d_w, d_x, d_y, m, k, n).unwrap(),
         "mmq32_y64" => gpu.gemm_hfq3g256_residual_mmq_x32_y64(d_w, d_x, d_y, m, k, n).unwrap(),
+        "mmq32_y32" => gpu.gemm_hfq3g256_residual_mmq_x32_y32(d_w, d_x, d_y, m, k, n).unwrap(),
         _ => unreachable!(),
     };
 }
@@ -100,9 +101,10 @@ fn main() {
     let batches: &[usize] = &[1, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 240, 512, 1024];
 
     println!("# m={m} k={k}  (times in microseconds)");
-    println!("{:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}  {:>10}  {:>10}",
-             "N", "scalar", "dot2", "mmq_x16", "mmq_x32", "mmq_x32_y64", "best", "best/dot2", "y64/y128");
-    println!("{}", "-".repeat(110));
+    println!("{:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>11}  {:>11}  {:>10}  {:>10}  {:>10}",
+             "N", "scalar", "dot2", "mmq_x16", "mmq_x32", "mmq_x32_y64", "mmq_x32_y32",
+             "best", "y64/y128", "y32/y128");
+    println!("{}", "-".repeat(125));
 
     for &n in batches {
         let x = synth_x(n, k, 17);
@@ -116,6 +118,7 @@ fn main() {
         let t_mmq16 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq16",  iters);
         let t_mmq32 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32",  iters);
         let t_mmq32_y64 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32_y64", iters);
+        let t_mmq32_y32 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32_y32", iters);
 
         let methods = [
             ("scalar", t_scal),
@@ -123,23 +126,25 @@ fn main() {
             ("mmq16",  t_mmq16),
             ("mmq32",  t_mmq32),
             ("mmq32_y64", t_mmq32_y64),
+            ("mmq32_y32", t_mmq32_y32),
         ];
-        let (best_name, best_t) = methods.iter()
+        let (best_name, _best_t) = methods.iter()
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .copied().unwrap();
-        let speedup = t_dot2 / best_t;
-        let y_ratio = t_mmq32_y64 / t_mmq32;
+        let r64 = t_mmq32_y64 / t_mmq32;
+        let r32 = t_mmq32_y32 / t_mmq32;
 
-        println!("{:>6}  {:>8.1}  {:>8.1}  {:>8.1}  {:>8.1}  {:>11.1}  {:>10}  {:>9.2}x  {:>9.2}x",
+        println!("{:>6}  {:>8.1}  {:>8.1}  {:>8.1}  {:>8.1}  {:>11.1}  {:>11.1}  {:>10}  {:>9.3}x  {:>9.3}x",
                  n,
                  t_scal * 1e6,
                  t_dot2 * 1e6,
                  t_mmq16 * 1e6,
                  t_mmq32 * 1e6,
                  t_mmq32_y64 * 1e6,
+                 t_mmq32_y32 * 1e6,
                  best_name,
-                 speedup,
-                 y_ratio);
+                 r64,
+                 r32);
 
         gpu.free_tensor(d_x).unwrap();
         gpu.free_tensor(d_y).unwrap();

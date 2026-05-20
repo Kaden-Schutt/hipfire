@@ -7821,6 +7821,24 @@ impl Gpu {
         )
     }
 
+    /// HFQ3 MMQ residual experimental MMQ_Y=32 variant (mmq_x=32).
+    /// Further LDS cut: ~10 KB/WG → 6 WG/CU theoretical (~72% occupancy).
+    /// Risk: per-WG work is 1/4 of y128 → dispatch overhead and reduced
+    /// latency-hiding margin may negate the occupancy win.
+    pub fn gemm_hfq3g256_residual_mmq_x32_y32(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 32,
+            "gemm_hfq3g256_residual_mmq_x32_y32",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y32_SRC,
+        )
+    }
+
     // ── HFQ3 qkv MMQ family — 3-way fused (Q + K + V) ────────────────────
     //
     // Auto-selector picks tile size by batch_size, falling back to dot2 at
