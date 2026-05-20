@@ -6483,6 +6483,12 @@ impl Gpu {
                     return r1.and(r2).and(r3);
                 }
             }
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
+            // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
+            // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
+            if hfq4_mmq_rdna2_enabled(&self.arch) && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+                return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+            }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -8555,6 +8561,137 @@ impl Gpu {
             self.gemm_hfq4g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
         } else {
             self.gemm_hfq4g256_residual_mmq_x32_y64(a_raw, x, y, m, k, batch_size)
+        }
+    }
+
+    // ── HFQ4 qkv MMQ family (3-way fused Q+K+V) — issue #299 Phase 2 ────
+    //
+    // Same launch shape as the residual family but takes 3 weight pointers
+    // and 3 output pointers; routes per-WG based on which of q_m / k_m / v_m
+    // the row tile falls into.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qkv_hfq4_mmq_tile(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_qkv_hfq4g256_mmq_body.cuh\"",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut a_q_p = a_q.buf.as_ptr();
+        let mut a_k_p = a_k.buf.as_ptr();
+        let mut a_v_p = a_v.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut y_q_p = y_q.buf.as_ptr();
+        let mut y_k_p = y_k.buf.as_ptr();
+        let mut y_v_p = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_q_p as *mut _ as *mut c_void,
+            &mut a_k_p as *mut _ as *mut c_void,
+            &mut a_v_p as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut y_q_p as *mut _ as *mut c_void,
+            &mut y_k_p as *mut _ as *mut c_void,
+            &mut y_v_p as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+                  + batch_size * k
+                  + batch_size * (q_m + k_m + v_m) * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 qkv MMQ mmq_x=16. Issue #299 Phase 2.
+    pub fn gemm_qkv_hfq4g256_mmq_x16(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkv_hfq4_mmq_tile(
+            a_q, a_k, a_v, x, y_q, y_k, y_v,
+            q_m, k_m, v_m, k, batch_size,
+            16, "gemm_qkv_hfq4g256_mmq_x16",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 qkv MMQ mmq_x=32. Issue #299 Phase 2.
+    pub fn gemm_qkv_hfq4g256_mmq_x32(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkv_hfq4_mmq_tile(
+            a_q, a_k, a_v, x, y_q, y_k, y_v,
+            q_m, k_m, v_m, k, batch_size,
+            32, "gemm_qkv_hfq4g256_mmq_x32",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 qkv MMQ batch-size auto-selector. Mirrors HFQ3 boundaries.
+    pub fn gemm_qkv_hfq4g256_mmq(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_qkv_hfq4g256_mmq_x16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
+        } else {
+            self.gemm_qkv_hfq4g256_mmq_x32(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
         }
     }
 
