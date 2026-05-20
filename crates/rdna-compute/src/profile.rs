@@ -175,6 +175,13 @@ pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
 }
 
+/// Bytes for a B-way batched HFQ3-G256 GEMM. HFQ3 sibling of
+/// `gemm_hfq4g256_bytes`. Used by the gfx10 MQ3 batched-prefill
+/// dispatchers (qkv / qkvza / gate_up / residual).
+pub fn gemm_hfq3g256_bytes(m: usize, k: usize, batch: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
 /// HFQ6-G256 weight footprint: 200 B/group × K/256 groups per row.
 pub fn hfq6g256_weight_bytes(m: usize, k: usize) -> usize {
     let groups = k / 256;

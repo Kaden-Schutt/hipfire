@@ -4110,13 +4110,26 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
     //   - gfx12 (gfx1200/1201): wave32 WMMA via the `_w32_gfx12` builtin
     //     with K4 unroll + half8_t lane-split, runtime-validated through
     //     the existing HFQ3 dispatch fork (gemm_*_hfq3g256_wmma_gfx12).
-    // gfx10 RDNA1+2 / gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA
-    // kernel; they stay on the per-token forward_scratch fallback
-    // (correct, just slower).
+    // gfx906 GCN5 / gfx94x CDNA3 lack a ported MQ3 WMMA kernel; they
+    // stay on the per-token forward_scratch fallback (correct, just
+    // slower). gfx10 RDNA1/2 gains batched-prefill support via the
+    // scalar HFQ3 GEMM family below (Phase 1 of
+    // docs/plans/gfx10_mq3_prefill.md).
     let mq3_uniform_with_wmma = matches!(dt, DType::MQ3G256)
         && matches!(arch,
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
             | "gfx1200" | "gfx1201"
+        );
+
+    // gfx10 RDNA1/2 scalar HFQ3 batched-prefill family (Phase 1).
+    // Routes the four LA + FA matchers below to the new non-WMMA kernels
+    // (gemm_qkv_hfq3g256, gemm_qkvza_hfq3g256, gemm_gate_up_hfq3g256,
+    // gemm_hfq3g256_residual). Lloyd-MQ3 stays gated on gfx11+ — no
+    // gfx10 Lloyd port (separate larger project).
+    let mq3_uniform_with_gfx10_scalar = matches!(dt, DType::MQ3G256)
+        && matches!(arch,
+            "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013"
+            | "gfx1030" | "gfx1031" | "gfx1032"
         );
 
     // HFP4G32 / MFP4G32 (v2 #2 batched WMMA prefill): same arch gate as
@@ -4154,7 +4167,8 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
-    mq3_uniform_with_wmma || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma || fp4_with_wmma
+    mq3_uniform_with_wmma || mq3_uniform_with_gfx10_scalar
+        || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma || fp4_with_wmma
 }
 
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
@@ -4746,6 +4760,11 @@ fn forward_prefill_chunk(
     // call site below selects the right variant via an `arch.starts_with`
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
     let q8_wmma_arch = rdna_compute::has_wmma_f16(fa_arch) || fa_arch.starts_with("gfx12");
+    // MQ3 dispatch arch gate (same predicate, separate name for clarity at
+    // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
+    // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
+    // !arch_has_wmma archs admitted by `is_batchable_la`.
+    let arch_has_wmma = q8_wmma_arch;
     let fa_batched_ok = (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(l) =>
@@ -4873,13 +4892,23 @@ fn forward_prefill_chunk(
                 } else if is_mq3 {
                     // 104 B/group HFQ3-stride; X is already FWHT-rotated by
                     // fused_rmsnorm_rotate_mq_batched above.
-                    gpu.gemm_qkvza_hfq3g256_wmma(
-                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
-                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
-                        layer.wqkv.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_qkvza_hfq3g256_wmma(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_qkvza_hfq3g256(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k, n,
+                        )?;
+                    }
                 } else if is_fp4 {
                     // HFP4G32: 17-B blocks (vs HFQ4's 136-B groups), per-row 16-B header.
                     // MFP4G32: same storage as HFP4 + offline-FWHT weights; X is already
@@ -5069,10 +5098,17 @@ fn forward_prefill_chunk(
                         layer.wo.m, layer.wo.k, n,
                     )?;
                 } else if wo_is_mq3 {
-                    gpu.gemm_hfq3g256_residual_wmma(
-                        &layer.wo.buf, wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_hfq3g256_residual_wmma(
+                            &layer.wo.buf, wo_input, &pbs.x_batch,
+                            layer.wo.m, layer.wo.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_hfq3g256_residual(
+                            &layer.wo.buf, wo_input, &pbs.x_batch,
+                            layer.wo.m, layer.wo.k, n,
+                        )?;
+                    }
                 } else if wo_is_fp4 {
                     gpu.gemm_hfp4g32_residual(
                         &layer.wo.buf, wo_input, &pbs.x_batch,
@@ -5136,13 +5172,23 @@ fn forward_prefill_chunk(
                         layer.w_gate.k, n,
                     )?;
                 } else if ffn_is_mq3 {
-                    gpu.gemm_gate_up_hfq3g256_wmma(
-                        &layer.w_gate.buf, &layer.w_up.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_gate_up_hfq3g256_wmma(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch, &pbs.up_batch,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_gate_up_hfq3g256(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch, &pbs.up_batch,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k, n,
+                        )?;
+                    }
                 } else if ffn_is_fp4 {
                     gpu.gemm_gate_up_hfp4g32(
                         &layer.w_gate.buf, &layer.w_up.buf,
@@ -5206,10 +5252,17 @@ fn forward_prefill_chunk(
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
                 } else if w_down_is_mq3 {
-                    gpu.gemm_hfq3g256_residual_wmma(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_hfq3g256_residual_wmma(
+                            &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                            layer.w_down.m, layer.w_down.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_hfq3g256_residual(
+                            &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                            layer.w_down.m, layer.w_down.k, n,
+                        )?;
+                    }
                 } else if w_down_is_fp4 {
                     gpu.gemm_hfp4g32_residual(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
@@ -5289,14 +5342,24 @@ fn forward_prefill_chunk(
                     )?;
                 } else if qkv_is_mq3 && qkv_same_dtype {
                     // X is already FWHT-rotated by fused_rmsnorm_rotate_mq_batched
-                    // above; call the bare HFQ3 WMMA (no second rotation).
-                    gpu.gemm_qkv_hfq3g256_wmma(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
-                        layer.wq.k, n,
-                    )?;
+                    // above; call the bare HFQ3 GEMM (no second rotation).
+                    if arch_has_wmma {
+                        gpu.gemm_qkv_hfq3g256_wmma(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                            layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_qkv_hfq3g256(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+                            layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k, n,
+                        )?;
+                    }
                 } else if qkv_is_fp4 && qkv_same_dtype {
                     // HFP4G32 / MFP4G32 FP4 batched WMMA. X is already
                     // rotated above for MFP4 (is_mq path) — same kernel
@@ -5650,10 +5713,17 @@ fn forward_prefill_chunk(
                         layer.wo.m, layer.wo.k, n,
                     )?;
                 } else if fa_wo_is_mq3 {
-                    gpu.gemm_hfq3g256_residual_wmma(
-                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
-                        layer.wo.m, layer.wo.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_hfq3g256_residual_wmma(
+                            &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                            layer.wo.m, layer.wo.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_hfq3g256_residual(
+                            &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                            layer.wo.m, layer.wo.k, n,
+                        )?;
+                    }
                 } else if fa_wo_is_fp4 {
                     gpu.gemm_hfp4g32_residual(
                         &layer.wo.buf, fa_wo_input, &pbs.x_batch,
@@ -5716,13 +5786,23 @@ fn forward_prefill_chunk(
                         layer.w_gate.k, n,
                     )?;
                 } else if fa_ffn_is_mq3 {
-                    gpu.gemm_gate_up_hfq3g256_wmma(
-                        &layer.w_gate.buf, &layer.w_up.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.gate_ffn_batch, &pbs.up_batch,
-                        layer.w_gate.m, layer.w_up.m,
-                        layer.w_gate.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_gate_up_hfq3g256_wmma(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch, &pbs.up_batch,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_gate_up_hfq3g256(
+                            &layer.w_gate.buf, &layer.w_up.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.gate_ffn_batch, &pbs.up_batch,
+                            layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k, n,
+                        )?;
+                    }
                 } else if fa_ffn_is_fp4 {
                     gpu.gemm_gate_up_hfp4g32(
                         &layer.w_gate.buf, &layer.w_up.buf,
@@ -5777,10 +5857,17 @@ fn forward_prefill_chunk(
                         layer.w_down.m, layer.w_down.k, n,
                     )?;
                 } else if fa_w_down_is_mq3 {
-                    gpu.gemm_hfq3g256_residual_wmma(
-                        &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
-                        layer.w_down.m, layer.w_down.k, n,
-                    )?;
+                    if arch_has_wmma {
+                        gpu.gemm_hfq3g256_residual_wmma(
+                            &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                            layer.w_down.m, layer.w_down.k, n,
+                        )?;
+                    } else {
+                        gpu.gemm_hfq3g256_residual(
+                            &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
+                            layer.w_down.m, layer.w_down.k, n,
+                        )?;
+                    }
                 } else if fa_w_down_is_fp4 {
                     gpu.gemm_hfp4g32_residual(
                         &layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch,
@@ -6800,6 +6887,20 @@ fn batched_gemm_single_weight(
             }
             gpu.gemm_hfq6g256_residual(&w.buf, x, y, w.m, w.k, n)
         }
+        DType::MQ3G256 => {
+            // Same pattern as MQ6: no non-residual batched HFQ3 GEMM
+            // exists in the scalar gfx10 family — `gemm_hfq3g256_residual`
+            // is the only single-weight batched dispatch. Zero Y on the
+            // active stream (same race-free contract as the HFQ6 arm)
+            // then accumulate.
+            let bytes = w.m * n * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&y.buf, 0, bytes)?;
+            }
+            gpu.gemm_hfq3g256_residual(&w.buf, x, y, w.m, w.k, n)
+        }
         DType::Q8_0 => {
             // Q8 weights consume the un-rotated rmsnorm output. Callers
             // routing here must pass `pbs.x_rot_batch` containing
@@ -6811,9 +6912,9 @@ fn batched_gemm_single_weight(
         }
         other => Err(hip_bridge::HipError::new(0, &format!(
             "mixed-format batched prefill: weight dtype {other:?} has no \
-             single-weight batched dispatch yet. Currently MQ4/HFQ4, \
-             MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with uniform \
-             format or extend `batched_gemm_single_weight` to cover this format."
+             single-weight batched dispatch yet. Currently MQ3/HFQ3, \
+             MQ4/HFQ4, MQ6/HFQ6, and Q8_0 mixes are wired. Re-quantize with \
+             uniform format or extend `batched_gemm_single_weight` to cover this format."
         ))),
     }
 }
