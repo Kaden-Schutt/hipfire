@@ -652,6 +652,43 @@ pub fn load_weights_hfq(
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
+    // R2 guard: the LLaMA-family loader does NOT read Q/K/V proj bias —
+    // `LayerWeights` has no `wq_bias` / `wk_bias` / `wv_bias` fields and
+    // the per-layer load below only names `*.q_proj.weight`. Qwen2
+    // requires those biases (`attention_bias=true` is the modeling
+    // default). The quantiser used to auto-tag every Qwen2 model as
+    // `arch_id=1`, which the daemon dispatches to this loader; the
+    // result was silently-wrong outputs with no warning. As of the
+    // `--arch-id` flag (see `hipfire-quantize`), Qwen2 models should be
+    // tagged `arch_id=7` and dispatched to `hipfire-arch-qwen2`.
+    //
+    // If we see `q_proj.bias` while loading as the LLaMA family, the
+    // input is a mis-tagged Qwen2 HFQ. Refuse hard with a pointer at
+    // the correct path. (Detection by manifest is robust to either the
+    // model_type tag or the model family — both LLaMA and Qwen3 lack
+    // these bias tensors, so any HFQ with `model.layers.0.self_attn.q_proj.bias`
+    // is by definition a Qwen2-family input.)
+    if hfq.find_tensor_info("model.layers.0.self_attn.q_proj.bias").is_some() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "refusing to load Qwen2 HFQ through the LLaMA family path: \
+                 tensor `model.layers.0.self_attn.q_proj.bias` is present, \
+                 which means this is a Qwen2 (attention_bias=true) model. \
+                 The LLaMA loader drops Q/K/V proj bias and would produce \
+                 wrong outputs. \
+                 Current HFQ arch_id = {}. Re-quantise with \
+                 `hipfire-quantize --arch-id 7 ...` so the daemon \
+                 dispatches arch_id=7 to hipfire-arch-qwen2 (once that \
+                 crate is wired in), or — for inspection only — load \
+                 directly via `cargo run --example inspect_hfq -p \
+                 hipfire-arch-qwen2 -- <path>`. \
+                 See docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §6 R1/R2.",
+                hfq.arch_id
+            ),
+        ));
+    }
+
     eprintln!("  loading token_embd...");
     let embd_info = hfq.tensor_data("model.embed_tokens.weight")
         .expect("embed_tokens not found");

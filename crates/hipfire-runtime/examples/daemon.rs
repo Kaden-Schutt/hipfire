@@ -28,6 +28,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_arch_llama::Llama;
+use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -386,6 +387,12 @@ struct LoadedModel {
     llama_weights: Option<llama::LlamaWeights>,
     llama_scratch: Option<llama::ForwardScratch>,
     llama_kv: Option<llama::KvCache>,
+    // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
+    // KV cache lives inside Qwen2State, so there's no separate
+    // qwen2_kv field. None on every other arch path.
+    qwen2_config: Option<qwen2::Qwen2Config>,
+    qwen2_weights: Option<qwen2::Qwen2Weights>,
+    qwen2_state: Option<qwen2::Qwen2State>,
     // Vision state (VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -734,6 +741,7 @@ fn main() {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
+                            7 => "qwen2",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some();
@@ -741,6 +749,8 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.qwen2_config {
+                            (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else { (0, 0, 0) };
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -1139,6 +1149,12 @@ fn main() {
                     }
                     if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
                     if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                    // arch_id=7: rewind the Qwen2State position cursor so
+                    // the next prefill writes from KV[0]. Without this, a
+                    // reset between turns would leak the prior turn's KV
+                    // entries into attention for the new turn — fluent
+                    // garbage, no panic. See `Qwen2State::reset` doc.
+                    if let Some(ref mut s) = m.qwen2_state { s.reset(); }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1178,6 +1194,7 @@ fn main() {
                 let model_arch = model.as_ref().map(|m| match m.arch_id {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
+                    7 => "qwen2",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1250,6 +1267,10 @@ fn main() {
                     for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                     for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                 }
+                // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
+                // and the per-step scratch share `Qwen2State`. Reset its position
+                // cursor here so bench_prefill measures cold prefill.
+                if let Some(ref mut s) = m.qwen2_state { s.reset(); }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -1264,6 +1285,21 @@ fn main() {
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
                     qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
+                } else if m.arch_id == 7 {
+                    // Qwen2 has no batched prefill kernel yet — per-token loop
+                    // mirroring the LLaMA fallback path. The loop seeds
+                    // position via `state.next_pos` (already reset above to 0).
+                    let config = m.qwen2_config.as_ref().unwrap();
+                    let weights = m.qwen2_weights.as_ref().unwrap();
+                    let state = m.qwen2_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for &tok in &synthetic {
+                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -1588,6 +1624,45 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         max_seq
     };
 
+    if hfq.arch_id == 7 {
+        // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
+        // eviction, no DFlash, no PFlash, no VL. The Architecture
+        // trait surface gives us config + weights + state in three
+        // calls; forward is direct `qwen2::forward_step` below.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        use hipfire_arch_qwen2::Qwen2;
+        let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
     if hfq.arch_id == 5 || hfq.arch_id == 6 {
         // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B). PR 8: dispatch
         // through the `Architecture` trait for the bring-up triple
@@ -1750,6 +1825,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
@@ -1779,6 +1855,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: None, q35_weights: None, q35_scratch: None,
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1908,6 +1985,7 @@ fn load_model_pp(
         kv_cache: Some(kv),
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+        qwen2_config: None, qwen2_weights: None, qwen2_state: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -2009,10 +2087,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
     if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
     if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    // Qwen2 state holds both the per-step scratch AND the KV cache — one
+    // free_gpu call handles both. (Compare LLaMA where ForwardScratch and
+    // KvCache are separate fields.)
+    if let Some(s) = m.qwen2_state { s.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.qwen2_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
@@ -3228,6 +3311,24 @@ fn generate_multi(
 
 #[allow(clippy::too_many_arguments)]
 fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+    // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
+    // generate() body is qwen35/llama-shaped and would panic on
+    // None unwraps for q35_*/llama_* fields when applied to a
+    // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
+    // / ChatML scaffolding since none of those are wired for
+    // arch_id=7 yet (R3 bring-up scope).
+    if m.arch_id == 7 {
+        // Silence the qwen35/llama-only params we deliberately don't
+        // honor on this path. See generate_qwen2 doc for the deferral
+        // list.
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                 assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
+        generate_qwen2(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, repeat_penalty, repeat_window,
+        );
+        return;
+    }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -4164,6 +4265,180 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         );
         let _ = stdout.flush();
     }
+}
+
+/// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
+///
+/// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
+/// → stream `{"type":"token",...}` events → `{"type":"done",...}`.
+///
+/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// no eviction, no ChatML scaffolding, no tool-use, no `<think>` /
+/// `max_think_tokens`, no repeat penalty, no top-p sampling. These
+/// land as the surrounding daemon features mature for the Qwen2 path.
+/// `temp` is currently honored only as a "≤ 1e-6 means greedy"
+/// signal; anything else falls back to greedy too (no sampler wired).
+///
+/// Conversation state on the daemon side advances via
+/// `m.seq_pos` (mirrors the qwen35/llama bookkeeping) plus
+/// `state.next_pos` inside `Qwen2State`. On context overflow we hard
+/// reset (no CASK eviction on arch_id=7) — same fallback the
+/// llama path uses.
+fn generate_qwen2(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    _system_prompt: Option<&str>,
+    _temp: f32,
+    _top_p: f32,
+    max_tokens: usize,
+    _repeat_penalty: f32,
+    _repeat_window: usize,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.qwen2_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2_config missing on arch_id=7 generate"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m.qwen2_weights.as_ref().expect("qwen2_weights missing on arch_id=7 generate");
+    let state = m.qwen2_state.as_mut().expect("qwen2_state missing on arch_id=7 generate");
+
+    let prompt_ids = tokenizer.encode(prompt);
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Capacity guard. No eviction on arch_id=7 yet — reset state when
+    // the requested run would overflow the KV budget.
+    if state.next_pos + prompt_ids.len() + max_tokens > state.max_seq {
+        eprintln!(
+            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
+            state.next_pos, state.max_seq,
+        );
+        state.reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let t0 = Instant::now();
+
+    // Prefill: forward_step per prompt token. The last call leaves
+    // logits in state.logits — these are the predictions for the
+    // first generated token.
+    for &tok in &prompt_ids {
+        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2 prefill failed: {:?}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Decode loop. Greedy argmax for now (see fn doc for sampling
+    // scope). The first generated token is argmax of the prefill's
+    // final logits; each subsequent token requires another
+    // forward_step.
+    let mut generated_count: usize = 0;
+    let eos_set: &[u32] = &cfg.eos_token_ids;
+    let decode_t0 = Instant::now();
+    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"argmax failed: {:?}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        if eos_set.contains(&next_tok) {
+            break;
+        }
+        // Emit text fragment for this token. Tokenizer.decode handles
+        // BPE byte-fragment reassembly; for special tokens that decode
+        // to an empty string we still advance the loop. JSON-escape the
+        // chunk so embedded quotes / control chars don't break the
+        // wire format.
+        let frag = tokenizer.decode(&[next_tok]);
+        let frag_escaped = json_escape(&frag);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":"{}"}}"#,
+            id, frag_escaped,
+        );
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+            Ok(t) => next_tok = t,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_step_greedy failed: {:?}"}}"#, id, e);
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+
+    // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
+    m.seq_pos = state.next_pos;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Minimal JSON string escaper for the daemon's token-stream emit
+/// path. We have full control of the alphabet (BPE-decoded UTF-8)
+/// and only need to escape: backslash, double-quote, and control
+/// chars < 0x20. Non-ASCII bytes pass through as-is (the daemon
+/// client parses with serde_json which accepts UTF-8 verbatim).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {

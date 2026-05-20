@@ -632,6 +632,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen2"
+version = "0.2.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-qwen35"
 version = "0.2.0"
 dependencies = [
@@ -665,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -703,6 +713,7 @@ dependencies = [
  "byteorder",
  "hip-bridge",
  "hipfire-arch-llama",
+ "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
  "hipfire-atlas",
