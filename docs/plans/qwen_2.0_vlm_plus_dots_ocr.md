@@ -407,6 +407,77 @@ Pure text generation. Layout JSON, Markdown, or SVG depending on the
 prompt template (`dots_ocr/utils/prompts.py`). No separate detection
 head — tokens encode bboxes, categories, and content directly.
 
+### 2.9. Phase-0 item-2 findings (modeling_dots_ocr.py + modeling_dots_vision.py)
+
+End-to-end read of the HF source at
+`/data/cache/huggingface/hub/models--rednote-hilab--dots.ocr/snapshots/c0111ce6.../`
+captured these subtleties not already covered by §2.1–§2.8. None
+contradict the rev-2 plan; all are pre-Phase-2c gotchas.
+
+**Vision tower (modeling_dots_vision.py):**
+
+- **Attention scale = standard `1/sqrt(head_dim)`** across every
+  attention impl (eager / eager_v2 / flash_attention_2 / sdpa /
+  ascend_fa — lines 130, 202, 246). No learned scale, no qk-norm.
+  Use plain `1/sqrt(128)` for the dots.ocr vision attention.
+- **Block uniformity**: all 42 blocks are structurally identical
+  (pre-norm RMSNorm → attn → residual → pre-norm RMSNorm → SwiGLU
+  → residual; line 399-400). First block has residual, last block
+  uses the same norm convention. No depth-conditional branches.
+- **`image_grid_thw` batch handling** (line 499): for batch_size > 1
+  the parser **concatenates** image patches into a single flattened
+  sequence (`pos_ids = torch.cat(pos_ids, dim=0)` at line 486;
+  cu_seqlens is image-major: cumsum of `repeat_interleave(grid_thw[:,1] * grid_thw[:,2], grid_thw[:,0])`).
+  Multi-image batching is NOT a 4-D batched tensor — it's a 2-D
+  packed sequence with cu_seqlens marking image boundaries.
+  Rust port: keep the same packing order; image-major, not patch-
+  major. cu_seqlens must be `i32` for FA correctness (line 501).
+- **bf16 cast at vision forward entry** (line 493-494): vision
+  `hidden_states` are unconditionally cast to bf16 at the top of
+  `VisionTransformerPretrainedModel.forward` if `bf16=True` (the
+  default). Don't treat this as training-only — it changes the
+  numerics of every downstream activation in the vision tower.
+  Rust port: compute the vision tower at f32, cast the final
+  merged output to f16 (already in plan).
+- **Dropout / DropPath**: none. `dropout_p=0.0` is hardcoded in
+  every attention call (lines 289, 324, 339). SwiGLU is plain
+  `F.silu()` with no dropout wrapper. Inference and train modes
+  produce identical activations in the vision tower.
+- **PatchMerger init quirk**: `init_merger_std` zero-inits biases
+  and normal-inits weights with stddev `init_merger_std` (lines
+  87-91). Conv2d patch_embed inherits PyTorch's default uniform
+  init. Neither matters at inference — trained weights are what
+  load from disk — but document so a future from-scratch trainer
+  doesn't introduce divergence.
+
+**Text + assembly (modeling_dots_ocr.py):**
+
+- **Vision-token splicing uses `masked_scatter()`** (line 61). The
+  daemon prefill loop in hipfire should follow the same pattern as
+  qwen35-vl: look up text-embed for every `input_id`, then *overwrite*
+  the `<|imgpad|>` (151665) positions with the corresponding merged
+  visual tokens. The `img_mask = input_ids == IMGPAD_ID` shape is
+  `[B, L]` (boolean). NO projection layer between the merger output
+  and the text embed space — the merger already emits `[N_patches/4,
+  text_hidden_size]` directly.
+- **Vision-text dtype mismatch on the integration boundary** (line
+  63): vision embeddings are cast to `inputs_embeds.dtype` before
+  the `masked_scatter`. If the vision tower runs in bf16 (default)
+  but the text decoder runs in f16 or f32, the cast quantises.
+  Rust port: ensure the merged visual tokens are at the same dtype
+  as the text embedding's GPU buffer before splicing.
+- **No projection layer, no KV pre-allocation for image tokens**:
+  the assembly is "lookup text tokens → overwrite image-pad slots →
+  feed straight to Qwen2 decoder". Standard KV cache allocation —
+  no special handling.
+
+**Plan divergences found: none.** §2.1 line 153 (`tie_word_embeddings=false`
+on dots.ocr) is confirmed against `configuration_dots_ocr.py:153` and
+the manifest's separate `lm_head.weight [151936, 1536]`. §2.2 vision
+`use_bias=false` confirmed against `modeling_dots_vision.py:332-333`
+(SwiGLU FFN) and `:392` (VisionAttention qkv/proj). §2.4 LayerNorm-
+based merger confirmed.
+
 ## 3. Reusable hipfire infrastructure
 
 ### 3a. The `Architecture` trait (bring-up contract)
@@ -549,10 +620,15 @@ plan review; this phase makes the artifacts reproducible.
    - dots.ocr text weights stored as `model.*` (no remap needed)
    - arch_id=1 already claimed by LLaMA crate (using 7 instead)
 
-2. **[PENDING]** Read dots_ocr.py end-to-end for subtleties not
-   surfaced in review (e.g. how `image_grid_thw` is constructed for
-   batch sizes > 1, attention scale factor, weight-init quirks).
-   Deferrable until phase 2 (vision tower) starts.
+2. **[DONE]** Read dots_ocr.py + dots_vision.py end-to-end. Findings
+   folded into §2.9. No contradictions with the rev-2 plan; main
+   pre-Phase-2c gotchas captured: attention scale is plain
+   `1/sqrt(head_dim)` (no qk-norm, no learned scale), `image_grid_thw`
+   for batch>1 packs into a single flattened sequence with image-major
+   cu_seqlens (i32), bf16 cast at vision forward entry, vision-text
+   integration via `masked_scatter()` with no projection layer
+   (vision output already at `text_hidden_size`), dtype cast at
+   integration boundary. No dropout/droppath in inference.
 
 3. **[DONE]** dots.ocr safetensors manifest captured at
    `docs/plans/qwen_2.0_vlm_plus_dots_ocr.dots_ocr_manifest.txt` (642 lines, 338

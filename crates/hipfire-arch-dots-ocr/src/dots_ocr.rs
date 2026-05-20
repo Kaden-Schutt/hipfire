@@ -385,6 +385,23 @@ pub fn load_vision_weights(
 /// 4. post_trunk_norm (RMSNorm)
 /// 5. merger: view(-1, 6144) → LayerNorm+bias → linear → GELU →
 ///    linear
+///
+/// # Gotchas (from Phase 0 item 2 — §2.9 of the plan)
+///
+/// - Attention scale is plain `1.0 / (head_dim as f32).sqrt()` —
+///   no qk-norm, no learned scale, no `* -0.5` factor.
+/// - For batch_size > 1, `image_grid_thw` builds a SINGLE flattened
+///   sequence; cu_seqlens is image-major (cumsum of per-image
+///   `t * h * w`) and must be `i32` for FA correctness.
+/// - HF casts vision activations to bf16 at forward entry (line
+///   493-494 in modeling_dots_vision.py). We compute in f32 and
+///   cast the final merged tokens to f16/bf16 to match the text
+///   decoder's embedding dtype before splicing.
+/// - The merger output is already `out_hidden_size = text_hidden_size`.
+///   NO additional projection layer between vision tower and text
+///   embedding space — vision tokens substitute directly into the
+///   `<|imgpad|>` positions via the daemon's `masked_scatter`-style
+///   prefill loop.
 pub fn vision_forward(
     _gpu: &mut Gpu,
     _weights: &DotsVisionWeights,
