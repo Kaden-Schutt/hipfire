@@ -718,9 +718,31 @@ pub(crate) fn linear_f16(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
+    // Intermediate transposed buffer is 1-D `[out_dim * n]` — that's
+    // exactly what `gemm_f16_wmma` writes ("Y[M, N]" with M=out_dim,
+    // N=n stored row-major). 2-D shape would imply batch semantics
+    // that don't apply to transposed-GEMM output.
     let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+    // gfx1100+ (RDNA3 / RDNA3.5) — use the WMMA-accelerated variant.
+    // The naive `gemm_f16` launches grid `[M, N]` which for the dots.ocr
+    // smoke image (M=1536, N=19520) hits ~30M blocks; the WMMA variant
+    // tiles M and N in 16s, dropping the grid to ~117k blocks (and
+    // 2-3× faster on the math itself). The WMMA kernel handles
+    // K % 16 != 0 with bounds-checked padding to 0.0, so K=588
+    // (= 3 * 14 * 14 from `patch_embed`) is safe.
+    //
+    // Note: the upstream `gemm_f16_wmma.hip` shipped with a known
+    // correctness bug (each lane writing 256 elements into a 16-element
+    // half16_t vector → NaN output on dots.ocr's specific shapes). The
+    // 2c-5b investigation traced and fixed it — see the kernel file's
+    // header for the lane-cooperative WMMA layout details.
+    gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    // Output as 2-D `[n, out_dim]`. The 2-D shape is load-bearing for
+    // downstream `rmsnorm_f32`, which infers `batch = shape[0]` and
+    // `n = shape.last()`. With a 1-D shape, rmsnorm interprets the
+    // whole buffer as ONE row of length `n * out_dim` and reads the
+    // norm-weight (length out_dim) out of bounds → sticky HIP fault.
+    let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
     gpu.transpose_f32(&yt, &y, out_dim, n)?;
     gpu.free_tensor(yt)?;
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
@@ -744,8 +766,11 @@ pub(crate) fn linear_f16_no_bias(
     n: usize,
 ) -> HipResult<GpuTensor> {
     let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32)?;
+    // See [`linear_f16`] for the gemm_f16_wmma rationale and the
+    // 2-D output-shape requirement (the latter is load-bearing for
+    // downstream rmsnorm_f32 batch inference).
+    gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
     gpu.transpose_f32(&yt, &y, out_dim, n)?;
     gpu.free_tensor(yt)?;
     Ok(y)
@@ -881,13 +906,36 @@ pub fn vision_forward(
     //
     // patch_embed_w on GPU is the 4-D conv weight flattened to a
     // `[embed_dim, patch_dim]` linear (verified during load).
+    let trace_pre = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    let dump_stats = |gpu: &Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
+        if !trace_pre { return Ok(()); }
+        let data = gpu.download_f32(t)?;
+        let n = data.len();
+        let nan = data.iter().filter(|x| x.is_nan()).count();
+        let inf = data.iter().filter(|x| x.is_infinite()).count();
+        let mean: f64 = data.iter().filter(|x| x.is_finite()).map(|&x| x as f64).sum::<f64>()
+            / (n - nan - inf).max(1) as f64;
+        let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+            if x.is_finite() { (a.min(x), b.max(x)) } else { (a, b) }
+        });
+        eprintln!(
+            "    stats[{label}]: n={n} mean={mean:+.4} range=[{mn:+.3}, {mx:+.3}] nan={nan} inf={inf}"
+        );
+        Ok(())
+    };
+    if trace_pre { eprintln!("  trace: about to patch_embed linear"); gpu.hip.device_synchronize()?; }
+    dump_stats(gpu, patches, "patches_in")?;
     let mut x = linear_f16(
         gpu, &weights.patch_embed_w, patches, &weights.patch_embed_b,
         h, patch_dim, n_patches,
     )?;
+    if trace_pre { eprintln!("  trace: after patch_embed linear"); gpu.hip.device_synchronize()?; }
+    dump_stats(gpu, &x, "patch_embed_linear")?;
     // patch_embed_norm is RMSNorm (the patchifier carries one).
     let normed = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
     gpu.rmsnorm_f32(&x, &weights.patch_embed_norm, &normed, eps)?;
+    if trace_pre { eprintln!("  trace: after patch_embed RMSNorm"); gpu.hip.device_synchronize()?; }
+    dump_stats(gpu, &normed, "patch_embed_norm")?;
     gpu.free_tensor(x)?;
     x = normed;
 
@@ -906,45 +954,124 @@ pub fn vision_forward(
     let qkv_dim = 3 * h;
     let two_interm = 2 * interm;
 
+    // HIPFIRE_DOTS_OCR_TRACE=1: sync after every step + print probe so
+    // the first failing kernel surfaces directly instead of via a sticky
+    // error reported later (HIP errors are async-sticky — the call that
+    // reports them is rarely the launch that caused them).
+    let trace = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
+    macro_rules! probe {
+        ($gpu:expr, $msg:literal) => {
+            if trace {
+                eprintln!("    trace: {}", $msg);
+                $gpu.hip.device_synchronize()?;
+            }
+        };
+    }
+
+    if trace { eprintln!("  trace: entering 42-block loop"); }
     for li in 0..cfg.num_hidden_layers {
         let lw = &weights.blocks[li];
+        let trace_block_li = trace && li == 0;
+        if trace_block_li { eprintln!("  block {li}: start"); }
+
+        // Per-kernel sync timing macro (block 0 only). Returns the elapsed
+        // ms since the previous `tic` (or the loop top if first call).
+        let mut tic = std::time::Instant::now();
+        macro_rules! toc {
+            ($gpu:expr, $label:literal) => {
+                if trace_block_li {
+                    $gpu.hip.device_synchronize()?;
+                    let dt = tic.elapsed().as_secs_f64() * 1000.0;
+                    eprintln!("    timing: {:25} {dt:>8.2} ms", $label);
+                    tic = std::time::Instant::now();
+                }
+            };
+        }
+        if trace_block_li { tic = std::time::Instant::now(); }
 
         // 2a. RMSNorm pre-attn.
         let xn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
         gpu.rmsnorm_f32(&x, &lw.norm1_w, &xn, eps)?;
+        toc!(gpu, "norm1 rmsnorm");
+        if trace_block_li { dump_stats(gpu, &xn, "b0_xn (post-norm1)")?; tic = std::time::Instant::now(); }
 
-        // 2b. Fused QKV GEMM (no bias). yt[3h, n] → transpose → qkv[n, 3h].
+        // 2b. Fused QKV GEMM (no bias). yt[3h, n] → transpose → qkv[n, 3h]
+        // interleaved (Q, K, V stacked along the 3h axis).
         let qkv = linear_f16_no_bias(gpu, &lw.qkv_w, &xn, qkv_dim, h, n_patches)?;
         gpu.free_tensor(xn)?;
+        toc!(gpu, "qkv GEMM");
+        if trace_block_li { dump_stats(gpu, &qkv, "b0_qkv")?; tic = std::time::Instant::now(); }
 
-        // 2c. 2-D RoPE on Q and K (in-place, interleaved layout).
-        gpu.rope_2d_halfsplit_qkv_interleaved_f32(
-            &qkv, &cos_table, &sin_table, n_patches, n_heads, head_dim,
-        )?;
-
-        // 2d. Non-causal attention.
-        let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
-        gpu.vit_attention_opt(&qkv, &attn, n_patches, h, n_heads, head_dim)?;
+        // 2c. Split interleaved QKV into three separate Q, K, V buffers
+        // (`[n_patches, hidden=n_heads*head_dim]` each). `attention_dflash_f32`
+        // expects separate buffers; the in-place interleaved RoPE
+        // variant from 2c-5a is not usable here because the only
+        // large-N-friendly attention kernel (`attention_dflash_f32`)
+        // takes Q/K/V as separate flat tensors. `vit_attention_opt`
+        // would accept the interleaved layout but overflows RDNA3 LDS
+        // at N=19520 (stores `scores[N]` in shared memory = 78 KB,
+        // exceeds the 64 KB cap).
+        let q_buf = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        let k_buf = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        let v_buf = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        gpu.qkv_split_interleaved_f32(&qkv, &q_buf, &k_buf, &v_buf, n_patches, h)?;
         gpu.free_tensor(qkv)?;
+        toc!(gpu, "qkv split");
+        if trace_block_li {
+            dump_stats(gpu, &q_buf, "b0_q (post-split)")?;
+            dump_stats(gpu, &k_buf, "b0_k (post-split)")?;
+            dump_stats(gpu, &v_buf, "b0_v (post-split)")?;
+            tic = std::time::Instant::now();
+        }
 
-        // 2e. Output projection (no bias) + residual.
+        // 2d. 2-D RoPE on Q and K (in-place, separate buffers).
+        gpu.rope_2d_halfsplit_f32(
+            &q_buf, &k_buf, &cos_table, &sin_table,
+            n_patches, n_heads, n_heads, head_dim,
+        )?;
+        toc!(gpu, "rope_2d");
+        if trace_block_li {
+            dump_stats(gpu, &q_buf, "b0_q (post-rope)")?;
+            dump_stats(gpu, &k_buf, "b0_k (post-rope)")?;
+            tic = std::time::Instant::now();
+        }
+
+        // 2e. Non-causal attention via FA-style online softmax. Vision
+        // self-attention is B = L = n_patches, n_heads_kv = n_heads
+        // (no GQA on the vision side per modeling_dots_vision.py:106).
+        let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        gpu.attention_dflash_f32(
+            &q_buf, &k_buf, &v_buf, &attn,
+            n_patches, n_patches, n_heads, n_heads, head_dim,
+        )?;
+        gpu.free_tensor(q_buf)?;
+        gpu.free_tensor(k_buf)?;
+        gpu.free_tensor(v_buf)?;
+        toc!(gpu, "attention_dflash");
+        if trace_block_li { dump_stats(gpu, &attn, "b0_attn")?; tic = std::time::Instant::now(); }
+
+        // 2f. Output projection (no bias) + residual.
         let proj = linear_f16_no_bias(gpu, &lw.proj_w, &attn, h, h, n_patches)?;
         gpu.free_tensor(attn)?;
+        toc!(gpu, "proj GEMM");
         gpu.add_inplace_f32(&x, &proj)?;
         gpu.free_tensor(proj)?;
+        toc!(gpu, "residual1 (add)");
 
-        // 2f. RMSNorm pre-MLP.
+        // 2g. RMSNorm pre-MLP.
         let xn2 = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
         gpu.rmsnorm_f32(&x, &lw.norm2_w, &xn2, eps)?;
+        toc!(gpu, "norm2 rmsnorm");
 
-        // 2g. Fused fc13 GEMM (no bias). Layout: yt[2*interm, n] without
+        // 2h. Fused fc13 GEMM (no bias). Layout: yt[2*interm, n] without
         // transpose — keep head-major so sub_offset can slice cleanly
         // into separate gate/up `[interm, n]` halves.
         let fc13_yt = gpu.alloc_tensor(&[two_interm * n_patches], DType::F32)?;
-        gpu.gemm_f16(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+        gpu.gemm_f16_wmma(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
         gpu.free_tensor(xn2)?;
+        toc!(gpu, "fc13 GEMM");
 
-        // 2h. SwiGLU on head-major sub-views.
+        // 2i. SwiGLU on head-major sub-views.
         //
         // The fc1+fc3 concat at load-time stacked `fc1` (gate) ABOVE
         // `fc3` (up) along the M (output) axis, so without the final
@@ -958,21 +1085,35 @@ pub fn vision_forward(
         let act = gpu.alloc_tensor(&[interm * n_patches], DType::F32)?;
         gpu.silu_mul_f32(&gate, &up, &act)?;
         gpu.free_tensor(fc13_yt)?;
+        toc!(gpu, "silu_mul");
 
-        // 2i. Transpose act from head-major `[interm, n]` to position-
+        // 2j. Transpose act from head-major `[interm, n]` to position-
         // major `[n, interm]` for the fc2 GEMM input.
         let act_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
         gpu.transpose_f32(&act, &act_nm, interm, n_patches)?;
         gpu.free_tensor(act)?;
+        toc!(gpu, "act transpose");
 
-        // 2j. fc2 projection (no bias) + residual.
+        // 2k. fc2 projection (no bias) + residual.
         let fc2_y = linear_f16_no_bias(gpu, &lw.fc2, &act_nm, h, interm, n_patches)?;
         gpu.free_tensor(act_nm)?;
+        toc!(gpu, "fc2 GEMM");
         gpu.add_inplace_f32(&x, &fc2_y)?;
         gpu.free_tensor(fc2_y)?;
+        toc!(gpu, "residual2 (add)");
 
+        if trace {
+            // Force a sync at end of every block in trace mode so the
+            // per-block wall time is real (the loop body is otherwise
+            // fully async — all 42 launches queue in ~100 ms and the
+            // actual GPU work only flushes at the post-loop sync).
+            gpu.hip.device_synchronize()?;
+        }
         if li % 7 == 0 || li == cfg.num_hidden_layers - 1 {
             eprintln!("  vision block {}/{} done ({:.2}s)", li + 1, cfg.num_hidden_layers, t0.elapsed().as_secs_f32());
+        }
+        if trace_pre && (li == 0 || li == 1 || li == 41) {
+            dump_stats(gpu, &x, &format!("block_{li:02}_out"))?;
         }
     }
 

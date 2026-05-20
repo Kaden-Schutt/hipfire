@@ -20056,6 +20056,70 @@ impl Gpu {
         result
     }
 
+    /// Split a fused interleaved `[n_patches, 3 * hidden]` QKV buffer
+    /// into three separate `[n_patches, hidden]` Q, K, V buffers.
+    /// Used by the dots.ocr vision encoder when feeding the
+    /// non-causal `attention_dflash_f32` kernel (which expects Q/K/V
+    /// as separate flat buffers).
+    ///
+    /// `hidden` here is `n_heads * head_dim` — the second axis of each
+    /// of Q, K, V within the fused buffer.
+    pub fn qkv_split_interleaved_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_patches: usize,
+        hidden: usize,
+    ) -> HipResult<()> {
+        assert!(n_patches > 0, "qkv_split_interleaved_f32: n_patches must be > 0");
+        assert!(hidden > 0, "qkv_split_interleaved_f32: hidden must be > 0");
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qkv_split_interleaved",
+            kernels::QKV_SPLIT_INTERLEAVED_SRC,
+            "qkv_split_interleaved_f32",
+        )?;
+
+        let qkvp = qkv.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let np = n_patches as i32;
+        let hd = hidden as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &qkvp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let grid_y = ((hidden as u32) + block_size - 1) / block_size;
+        let grid = [n_patches as u32, grid_y, 1];
+        let block = [block_size, 1, 1];
+        // Bytes-touched estimate: 3 reads + 3 writes per (patch, j) thread.
+        let bytes = n_patches * hidden * 4 * 6;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "qkv_split", "qkv_split_interleaved_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "qkv_split_interleaved_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qkvp); b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_i32(np); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

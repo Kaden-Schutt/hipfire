@@ -1535,10 +1535,22 @@ pub const ROPE_2D_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_
 
 /// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a fused
 /// interleaved `[N, 3*hidden]` QKV buffer. Companion to the separate-
-/// buffer variant above; used by the dots.ocr vision encoder so a
-/// single QKV GEMM can feed directly into `vit_attention_opt` without
-/// split/merge copies. See `kernels/src/rope_2d_halfsplit_qkv_interleaved.hip`.
+/// buffer variant above. Initially intended for the dots.ocr vision
+/// encoder's single-GEMM → attention path, but `vit_attention_opt`
+/// turned out to overflow RDNA3 LDS at the smoke image's N≈19520; the
+/// dots.ocr forward pass therefore splits QKV into separate Q/K/V
+/// buffers (see `QKV_SPLIT_INTERLEAVED_SRC`) and routes through
+/// `attention_dflash_f32` instead. Kernel kept for future fast-path
+/// when a non-overflowing fused vision attention exists.
 pub const ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit_qkv_interleaved.hip");
+
+/// Split a fused interleaved `[N, 3*hidden]` QKV buffer into three
+/// separate `[N, hidden]` Q, K, V buffers. Used by the dots.ocr vision
+/// encoder to feed `attention_dflash_f32` (FlashAttention-style with
+/// online softmax — supports L > 16128 without SLM overflow, unlike
+/// `vit_attention_opt` which materialises a `scores[N]` LDS buffer).
+/// See `kernels/src/qkv_split_interleaved.hip`.
+pub const QKV_SPLIT_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/qkv_split_interleaved.hip");
 
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
