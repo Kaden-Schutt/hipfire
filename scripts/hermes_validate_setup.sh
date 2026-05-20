@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # hermes_validate_setup.sh — Stage A (CPU/net prep, parallel to GPU work):
 # install Bun, build the hipfire daemon binary, install hermes-agent.
 # Safe to run while other GPU workloads are active.

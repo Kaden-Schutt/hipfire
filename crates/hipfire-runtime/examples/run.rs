@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Interactive REPL for hipfire — like `ollama run`.
 //! Usage: hipfire-run <model.hfq> [--system "prompt"] [--kv givens4|givens2]
 

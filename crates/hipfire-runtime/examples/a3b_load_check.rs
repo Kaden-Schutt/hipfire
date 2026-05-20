@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 1 smoke test: load Qwen3.5-35B-A3B (or any qwen3_5_moe HFQ) end-to-end
 //! and report success/failure. No forward pass — just exercises the loader so we
 //! catch tensor-name mismatches, dimension mismatches, and unsupported quant

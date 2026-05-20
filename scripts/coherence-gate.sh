@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Coherence battery — replaces the byte-exact MQ4 quality gate.
 #
 # Rationale: byte-exact comparison blocks legitimate numerical-correctness

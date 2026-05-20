@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Test: can PM4 WRITE_DATA actually write to VRAM through our submit path?
 //! If this fails, the issue is fundamental to our PM4/submit infrastructure.
 //! If it passes, the issue is specifically in the compute dispatch setup.

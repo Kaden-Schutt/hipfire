@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Greedy decode with per-step top-5 logit dump.
 //!
 //! Runs the same forward pass as greedy_dump (same chat wrapping, same

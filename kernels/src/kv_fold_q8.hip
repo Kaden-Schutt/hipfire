@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // CASK m-folding merge kernel for Q8_0 KV cache.
 //
 // Folds `m` source rows into 1 destination row per output slot via

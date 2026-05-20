@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Compact correctness + perf test for the two smaller batched GEMMs:
 //!   * gemm_qkv_hfq4g256     (FA preamble, 3-way)
 //!   * gemm_gate_up_hfq4g256 (FFN preamble, 2-way)

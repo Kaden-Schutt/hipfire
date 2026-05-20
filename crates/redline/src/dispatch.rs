@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! High-level compute dispatch — builds PM4 internally, handles kernarg layout.
 //!
 //! Users load a module, get kernels, and dispatch without touching PM4 packets.

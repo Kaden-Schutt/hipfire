@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Regenerate the quick-reference table check in docs/env-vars.md.
 #
 # Source-of-truth: env::var(), env::var_os(), and process.env.X across tracked

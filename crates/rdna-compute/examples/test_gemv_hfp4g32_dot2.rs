@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness + perf test for the gfx11 v_dot2_f32_f16 HFP4G32 decode GEMV.
 //! Compares `gemv_hfp4g32_dot2_gfx11` (FP16 + fdot2) against the F32 fallback
 //! (`gemv_hfp4g32_fallback`) across production Qwen 9B decode shapes.

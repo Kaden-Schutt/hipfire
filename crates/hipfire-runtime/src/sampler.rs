@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Logit-space sampling: top-p, temperature, repeat_penalty, and
 //! single-token attractor blocking. Wraps GPU-dispatched sampling
 //! kernels. One entry point for any caller (daemon, examples, future

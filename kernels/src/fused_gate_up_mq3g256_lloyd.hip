@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Fused Gate+Up MQ3-Lloyd: two GEMVs in one launch.
 // Baseline (non-RDNA3) variant. Per-row math identical to
 // gemv_mq3g256_lloyd.hip (8-way switch dispatch on per-row codebook).

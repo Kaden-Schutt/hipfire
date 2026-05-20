@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! T3-2 correctness — `gemm_gate_up_q8_0_wmma` vs substrate × 2.
 //! Gate: gated mean_rel < 1e-3 on Y_gate and Y_up.
 

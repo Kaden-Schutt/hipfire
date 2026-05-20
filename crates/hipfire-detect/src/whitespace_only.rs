@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Whitespace-only output detector — hard-fails when visible text
 //! is all whitespace (spaces, tabs, newlines, unicode whitespace).
 

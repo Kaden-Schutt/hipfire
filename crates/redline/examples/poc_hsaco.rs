@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline PoC: parse a real .hsaco kernel binary.
 //! Extracts kernel name, register counts, LDS size — everything
 //! needed to build PM4 dispatch packets.

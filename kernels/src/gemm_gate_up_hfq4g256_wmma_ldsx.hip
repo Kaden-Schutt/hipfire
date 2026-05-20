@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Gate 0 ISA prototype — LDS-staged X variant of gate_up.
 //
 // PURPOSE: ISA inspection only. Not for benchmarking, not for correctness

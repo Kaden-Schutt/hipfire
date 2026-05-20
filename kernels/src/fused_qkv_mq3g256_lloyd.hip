@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Fused QKV MQ3-Lloyd: 3 GEMVs in one launch.
 // Baseline (non-RDNA3) variant. Per-row math identical to
 // gemv_mq3g256_lloyd.hip (8-way ternary lookup). gfx1100/1101/1102

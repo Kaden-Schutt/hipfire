@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Björn Bösel
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Source this file to set LD_LIBRARY_PATH for ROCm/HIP.
 # Tries (in order): existing LD_LIBRARY_PATH, /opt/rocm, Nix store.
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hipfire-arch-toy: reference template for new arch crates.
 //!
 //! This crate is **not a real model**. It implements the

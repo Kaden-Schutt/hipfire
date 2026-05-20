@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! QA mirror for the kernel harness.
 //! Runs each kernel case in an isolated subprocess so hangs, panics, and leaks
 //! do not collapse the rest of the sweep.

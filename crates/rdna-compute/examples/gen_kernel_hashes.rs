@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Generate .hash sidecar files for pre-compiled kernel blobs.
 //! Reads kernel sources from kernels/src/*.hip and hashes them with
 //! the same DefaultHasher(source + arch) algorithm as compiler.rs.

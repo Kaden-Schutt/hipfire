@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # fetch-eval-refs.sh — pull BF16 reference dumps from HF Hub, verify sha256.
 #
 # Reads benchmarks/quality-baselines/harness/manifest.json. For each entry

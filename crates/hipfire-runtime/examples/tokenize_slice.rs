@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Tokenize a slice file using hipfire's tokenizer; emit token IDs as binary.
 //!
 //! Used by `benchmarks/quality-baselines/harness/tokenizer_parity.py` to
