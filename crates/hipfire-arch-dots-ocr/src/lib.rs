@@ -53,5 +53,6 @@
 pub mod arch;
 pub mod dots_ocr;
 pub mod image;
+pub mod rope;
 
 pub use arch::DotsOcr;
