@@ -41,7 +41,8 @@
 use hip_bridge::HipResult;
 use hipfire_arch_qwen2::qwen2::{Qwen2Config, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
-use rdna_compute::{Gpu, GpuTensor};
+use hipfire_runtime::llama::{f16_to_f32, WeightTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -226,13 +227,19 @@ fn parse_vision_config(metadata_json: &str) -> Option<DotsVisionConfig> {
 /// phase 2c.
 pub struct DotsVisionBlockWeights {
     pub norm1_w: GpuTensor,
-    pub qkv_w: GpuTensor,
-    pub proj_w: GpuTensor,
+    /// `[3 * embed_dim, embed_dim]` — fused Q/K/V projection.
+    /// `use_bias=false` so no `qkv_b`.
+    pub qkv_w: WeightTensor,
+    /// `[embed_dim, embed_dim]` — attention output projection.
+    /// `use_bias=false`.
+    pub proj_w: WeightTensor,
     pub norm2_w: GpuTensor,
     /// `[2 * intermediate_size, embed_dim]` — load-time concat of
-    /// `fc1` and `fc3`. `silu(y[:H]) * y[H:]` after this GEMM.
-    pub fc13_proj: GpuTensor,
-    pub fc2: GpuTensor,
+    /// `fc1` and `fc3` along the M axis. `silu(y[:H]) * y[H:]` after
+    /// this GEMM. `use_bias=false`.
+    pub fc13_proj: WeightTensor,
+    /// `[embed_dim, intermediate_size]`. `use_bias=false`.
+    pub fc2: WeightTensor,
 }
 
 /// Full dots.ocr vision tower weights. Owned by [`DotsOcrWeights`].
@@ -253,8 +260,9 @@ pub struct DotsVisionBlockWeights {
 /// ```
 pub struct DotsVisionWeights {
     /// Conv2d-style patch projection. Reshape on load from
-    /// `[embed_dim, 3, 14, 14]` to `[embed_dim, 588]` for the GEMM.
-    pub patch_embed_w: GpuTensor,
+    /// `[embed_dim, 3, 14, 14]` to `[embed_dim, 588]` (= 3 * 14 * 14)
+    /// for the GEMM. Has bias.
+    pub patch_embed_w: WeightTensor,
     pub patch_embed_b: GpuTensor,
     /// RMSNorm applied right after patch_embed projection.
     pub patch_embed_norm: GpuTensor,
@@ -267,31 +275,34 @@ pub struct DotsVisionWeights {
     pub merger_ln_w: GpuTensor,
     pub merger_ln_b: GpuTensor,
     /// `mlp.0`: linear(merge_dim → merge_dim). Bias on disk.
-    pub merger_fc1_w: GpuTensor,
+    pub merger_fc1_w: WeightTensor,
     pub merger_fc1_b: GpuTensor,
     /// `mlp.2`: linear(merge_dim → out_hidden_size). Bias on disk.
     /// `mlp.1` is GELU (no params); slot 2 carries the second linear.
-    pub merger_fc2_w: GpuTensor,
+    pub merger_fc2_w: WeightTensor,
     pub merger_fc2_b: GpuTensor,
 }
 
 impl DotsVisionWeights {
     /// Return all GPU buffers to the pool. Consumes self.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        let _ = gpu.free_tensor(self.patch_embed_w);
+        let _ = gpu.free_tensor(self.patch_embed_w.buf);
         let _ = gpu.free_tensor(self.patch_embed_b);
         let _ = gpu.free_tensor(self.patch_embed_norm);
         for b in self.blocks {
-            for t in [b.norm1_w, b.qkv_w, b.proj_w, b.norm2_w, b.fc13_proj, b.fc2] {
-                let _ = gpu.free_tensor(t);
-            }
+            let _ = gpu.free_tensor(b.norm1_w);
+            let _ = gpu.free_tensor(b.qkv_w.buf);
+            let _ = gpu.free_tensor(b.proj_w.buf);
+            let _ = gpu.free_tensor(b.norm2_w);
+            let _ = gpu.free_tensor(b.fc13_proj.buf);
+            let _ = gpu.free_tensor(b.fc2.buf);
         }
         let _ = gpu.free_tensor(self.post_trunk_norm);
         let _ = gpu.free_tensor(self.merger_ln_w);
         let _ = gpu.free_tensor(self.merger_ln_b);
-        let _ = gpu.free_tensor(self.merger_fc1_w);
+        let _ = gpu.free_tensor(self.merger_fc1_w.buf);
         let _ = gpu.free_tensor(self.merger_fc1_b);
-        let _ = gpu.free_tensor(self.merger_fc2_w);
+        let _ = gpu.free_tensor(self.merger_fc2_w.buf);
         let _ = gpu.free_tensor(self.merger_fc2_b);
     }
 }
@@ -328,24 +339,251 @@ impl DotsOcrWeights {
     }
 }
 
-/// Vision weight loader — phase 2c stub. Returns a "not yet
-/// implemented" error so attempts to load a dots.ocr HFQ surface a
-/// clear message at bring-up rather than silently emitting garbage.
+/// Load all dots.ocr vision-tower weights from an HFQ file.
 ///
-/// Real loader will dequant HFQ4G256 / read F16 / read F32 per the
-/// qwen35-vl pattern, reshape the 4-D `patch_embed.proj.weight` from
-/// `[embed_dim, 3, 14, 14]` to `[embed_dim, 588]`, and concat fc1+fc3
-/// at load time into `fc13_proj`.
+/// Tensor name layout (verified against the safetensors manifest at
+/// `docs/plans/qwen_2.0_vlm_plus_dots_ocr.dots_ocr_manifest.txt`):
+///
+/// - `vision_tower.patch_embed.patchifier.proj.{weight,bias}` — Conv2d
+///   weight is 4-D `[embed_dim, 3, 14, 14]` on disk; we reshape to a
+///   2-D linear `[embed_dim, 3*14*14 = 588]` (free, contiguous memory).
+/// - `vision_tower.patch_embed.patchifier.norm.weight` — RMSNorm scale.
+/// - For each of `num_hidden_layers` blocks:
+///   `vision_tower.blocks.{i}.{norm1,attn.qkv,attn.proj,norm2,mlp.fc1,
+///   mlp.fc2,mlp.fc3}.weight` — all linears `use_bias=false` per §2.2.
+///   `fc1` and `fc3` are concatenated along the output (M) axis at
+///   load time into `fc13_proj` so the SwiGLU MLP runs as one GEMM
+///   instead of two (option (a) of plan §5 phase 2).
+/// - `vision_tower.post_trunk_norm.weight` — RMSNorm scale.
+/// - `vision_tower.merger.ln_q.{weight,bias}` — LayerNorm (NOT
+///   RMSNorm; note divergence from vision blocks).
+/// - `vision_tower.merger.mlp.{0,2}.{weight,bias}` — both linears
+///   carry bias; `mlp.1` is GELU (no params).
 pub fn load_vision_weights(
-    _hfq: &HfqFile,
-    _cfg: &DotsVisionConfig,
-    _gpu: &mut Gpu,
+    hfq: &HfqFile,
+    cfg: &DotsVisionConfig,
+    gpu: &mut Gpu,
 ) -> HipResult<DotsVisionWeights> {
-    panic!(
-        "dots-ocr: vision weight loader is a phase 2c stub. \
-         Text-side load is wired; vision tower lands in the next commit. \
-         Track in docs/plans/qwen_2.0_vlm_plus_dots_ocr.md phase 2c."
+    let h = cfg.embed_dim;
+    let intermediate = cfg.intermediate_size;
+    let patch_dim = cfg.num_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let merge_dim = h * cfg.spatial_merge_size * cfg.spatial_merge_size;
+    eprintln!(
+        "  loading dots-ocr vision tower: embed_dim={h} layers={} intermediate={intermediate} \
+         patch_dim={patch_dim} merge_dim={merge_dim}",
+        cfg.num_hidden_layers,
     );
+
+    // ── patch_embed ───────────────────────────────────────────────
+    //
+    // Conv2d weight on disk is [embed_dim, 3, 14, 14] = [embed_dim,
+    // 588] elements when flattened C-major. `load_weight_tensor` only
+    // sees the data byte length and the m/k we specify; the 4-D shape
+    // on the HFQ side is metadata.
+    let patch_embed_w = load_weight_tensor(
+        hfq, gpu, "vision_tower.patch_embed.patchifier.proj.weight", h, patch_dim,
+    )?;
+    let patch_embed_b = load_bias_f32(
+        hfq, gpu, "vision_tower.patch_embed.patchifier.proj.bias", h,
+    )?;
+    let patch_embed_norm = load_norm_weight_raw(
+        hfq, gpu, "vision_tower.patch_embed.patchifier.norm.weight", h,
+    )?;
+
+    // ── blocks ────────────────────────────────────────────────────
+    let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
+    for i in 0..cfg.num_hidden_layers {
+        if i % 7 == 0 {
+            eprintln!("  loading vision block {i}/{}", cfg.num_hidden_layers);
+        }
+        let p = format!("vision_tower.blocks.{i}");
+        let norm1_w = load_norm_weight_raw(hfq, gpu, &format!("{p}.norm1.weight"), h)?;
+        let qkv_w = load_weight_tensor(hfq, gpu, &format!("{p}.attn.qkv.weight"), 3 * h, h)?;
+        let proj_w = load_weight_tensor(hfq, gpu, &format!("{p}.attn.proj.weight"), h, h)?;
+        let norm2_w = load_norm_weight_raw(hfq, gpu, &format!("{p}.norm2.weight"), h)?;
+        // Load-time concat: fc13_proj = [fc1; fc3] along output axis.
+        // The concat works at byte level for HFQ4/Q8/F16 because each
+        // row is an independent quant block in those layouts. The
+        // resulting tensor has m = 2 * intermediate, k = h.
+        let fc13_proj = load_weight_tensor_concat_rows(
+            hfq, gpu,
+            &format!("{p}.mlp.fc1.weight"),
+            &format!("{p}.mlp.fc3.weight"),
+            intermediate, intermediate, h,
+        )?;
+        let fc2 = load_weight_tensor(hfq, gpu, &format!("{p}.mlp.fc2.weight"), h, intermediate)?;
+        blocks.push(DotsVisionBlockWeights { norm1_w, qkv_w, proj_w, norm2_w, fc13_proj, fc2 });
+    }
+
+    // ── post-trunk norm + merger ──────────────────────────────────
+    let post_trunk_norm = load_norm_weight_raw(
+        hfq, gpu, "vision_tower.post_trunk_norm.weight", h,
+    )?;
+    eprintln!("  loading vision merger");
+    // ln_q is a LayerNorm, NOT an RMSNorm — but `load_norm_weight_raw`
+    // is just "F16/F32 bytes → f32 upload, no offset". Same shape, fine
+    // to reuse. The LayerNorm-ness is in how the FORWARD kernel uses
+    // it (gpu.layernorm_batched, which also takes a bias).
+    let merger_ln_w = load_norm_weight_raw(hfq, gpu, "vision_tower.merger.ln_q.weight", h)?;
+    let merger_ln_b = load_bias_f32(hfq, gpu, "vision_tower.merger.ln_q.bias", h)?;
+    let merger_fc1_w = load_weight_tensor(
+        hfq, gpu, "vision_tower.merger.mlp.0.weight", merge_dim, merge_dim,
+    )?;
+    let merger_fc1_b = load_bias_f32(hfq, gpu, "vision_tower.merger.mlp.0.bias", merge_dim)?;
+    let merger_fc2_w = load_weight_tensor(
+        hfq, gpu, "vision_tower.merger.mlp.2.weight", cfg.out_hidden_size, merge_dim,
+    )?;
+    let merger_fc2_b = load_bias_f32(
+        hfq, gpu, "vision_tower.merger.mlp.2.bias", cfg.out_hidden_size,
+    )?;
+
+    Ok(DotsVisionWeights {
+        patch_embed_w,
+        patch_embed_b,
+        patch_embed_norm,
+        blocks,
+        post_trunk_norm,
+        merger_ln_w,
+        merger_ln_b,
+        merger_fc1_w,
+        merger_fc1_b,
+        merger_fc2_w,
+        merger_fc2_b,
+    })
+}
+
+// ─── Loader helpers (TODO(transformer-extraction): cross-arch dupes) ────
+
+/// Load an F32 norm scale (no `+= 1.0` offset). Mirrors
+/// `hipfire-arch-qwen2::qwen2::load_norm_weight_raw` —
+/// both are the same shape (RMSNorm w/o +1 bake). Dots.ocr also uses
+/// this for the merger's LayerNorm weight (the bias is loaded
+/// separately via `load_bias_f32`).
+///
+/// TODO(transformer-extraction): pull this + the qwen2 + qwen35
+/// variants into `hipfire_runtime::transformer::norm` during the
+/// consolidation PR.
+fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+    let (info, data) = hfq.tensor_data_vec(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        qt => panic!("dots-ocr: expected F16/F32 for norm {name}, got qt={qt}"),
+    };
+    assert_eq!(
+        f32_data.len(), n,
+        "dots-ocr: norm {name} has {} elements, expected {n}", f32_data.len(),
+    );
+    gpu.upload_f32(&f32_data, &[n])
+}
+
+/// Load a bias tensor as F32 on GPU. Mirrors
+/// `hipfire-arch-qwen2::qwen2::load_bias_f32`. Same accepted
+/// quant_types (F16 / F32 only — biases are tiny, never worth
+/// quantising).
+///
+/// TODO(transformer-extraction): see norm helper.
+fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+    let (info, data) = hfq.tensor_data_vec(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        qt => panic!("dots-ocr: expected F16/F32 for bias {name}, got qt={qt}"),
+    };
+    assert_eq!(
+        f32_data.len(), n,
+        "dots-ocr: bias {name} has {} elements, expected {n}", f32_data.len(),
+    );
+    gpu.upload_f32(&f32_data, &[n])
+}
+
+/// Load a quantised linear weight as a `WeightTensor`. Mirrors
+/// `hipfire-arch-qwen2::qwen2::load_weight_tensor`. Same supported
+/// quant_types (F16 / Q8F16 / HFQ4G256 / HFQ4G128) — extend as we ship
+/// more dots.ocr HFQ formats.
+///
+/// TODO(transformer-extraction): pull this + the qwen2 + qwen35
+/// variants into `hipfire_runtime::transformer::weights` during the
+/// consolidation PR.
+fn load_weight_tensor(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let (info, data) = hfq.tensor_data_vec(name)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
+    let gpu_dtype = match info.quant_type {
+        1 => DType::F16,
+        3 => DType::Q8_0,
+        6 => DType::HFQ4G256,
+        7 => DType::HFQ4G128,
+        qt => panic!(
+            "dots-ocr: unsupported weight quant_type {qt} for {name}. \
+             This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
+             Extend load_weight_tensor or wait for the Transformer-extraction PR \
+             to pick up qwen35's full quant_type matrix.",
+        ),
+    };
+    let buf = gpu.upload_raw(&data, &[data.len()])?;
+    Ok(WeightTensor { buf, gpu_dtype, m, k, row_stride: 0, awq_scale: None })
+}
+
+/// Load TWO weight tensors and concatenate them along the output (M)
+/// axis at load time, producing one `WeightTensor` of shape
+/// `[m_a + m_b, k]`. Used for the SwiGLU fc1+fc3 fusion: fc1 and fc3
+/// have identical shape `[intermediate, embed_dim]` and we want a
+/// single `fc13_proj` of `[2*intermediate, embed_dim]` so the SwiGLU
+/// MLP runs as one GEMM (option (a) of plan §5 phase 2).
+///
+/// Works at the byte level because HFQ4G256 / HFQ4G128 / Q8F16 / F16
+/// all use row-independent quantisation — concatenating two row-major
+/// blobs yields a valid row-major blob with the same quant_type.
+///
+/// Both tensors MUST have the same `quant_type` and the same `k`
+/// (input dim).
+fn load_weight_tensor_concat_rows(
+    hfq: &HfqFile,
+    gpu: &Gpu,
+    name_a: &str,
+    name_b: &str,
+    m_a: usize,
+    m_b: usize,
+    k: usize,
+) -> HipResult<WeightTensor> {
+    let (info_a, data_a) = hfq.tensor_data_vec(name_a)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name_a}"));
+    let (info_b, data_b) = hfq.tensor_data_vec(name_b)
+        .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name_b}"));
+    assert_eq!(
+        info_a.quant_type, info_b.quant_type,
+        "dots-ocr: concat row requires matching quant_type ({name_a}={}, {name_b}={})",
+        info_a.quant_type, info_b.quant_type,
+    );
+    let gpu_dtype = match info_a.quant_type {
+        1 => DType::F16,
+        3 => DType::Q8_0,
+        6 => DType::HFQ4G256,
+        7 => DType::HFQ4G128,
+        qt => panic!(
+            "dots-ocr: unsupported weight quant_type {qt} for concat ({name_a}+{name_b})",
+        ),
+    };
+    let mut combined = Vec::with_capacity(data_a.len() + data_b.len());
+    combined.extend_from_slice(&data_a);
+    combined.extend_from_slice(&data_b);
+    let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype,
+        m: m_a + m_b,
+        k,
+        row_stride: 0,
+        awq_scale: None,
+    })
 }
 
 // ─── Forward pass (phase 2c stub) ───────────────────────────────────────
