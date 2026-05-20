@@ -617,6 +617,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-dots-ocr"
+version = "0.1.20"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-qwen2",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.1.20"
 dependencies = [
