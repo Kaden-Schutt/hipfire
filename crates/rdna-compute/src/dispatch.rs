@@ -9645,6 +9645,19 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx94x MFMA-direct opt-in: skips FP16 shadow + rocBLAS launch.
+        // Opt-in via HIPFIRE_GFX942_MFMA_PREFILL=1 while validating; this
+        // fires BEFORE the rocBLAS branch on purpose (rocBLAS goes through
+        // FP16 dequant shadow, which is the cost we want to avoid).
+        if std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").map(|v| v == "1").unwrap_or(false)
+            && matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+            && batch_size >= 16
+            && m % 16 == 0
+            && k % 256 == 0
+            && !self.capture_mode
+        {
+            return self.gemm_hfq4g256_residual_mfma_gfx942(a_raw, x, y, m, k, batch_size);
+        }
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
@@ -9860,6 +9873,63 @@ impl Gpu {
     /// Combines wave64 block structure (2 rows/block, full lane utilization) with
     /// FP16 packed arithmetic (__hfma2). Target: gfx906 (MI50) prefill optimization.
     #[allow(clippy::too_many_arguments)]
+    /// MFMA-direct HFQ4G256 GEMM with residual add for gfx942 (MI300X CDNA3).
+    /// Channel-test verified at max_rel_err = 2e-5 vs FP16 scalar reference.
+    pub fn gemm_hfq4g256_residual_mfma_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mfma_gfx942",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC,
+            "gemm_hfq4g256_residual_mfma_gfx942",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m as u32) + 15) / 16;
+        let grid_y = ((batch_size as u32) + 15) / 16;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mfma_gfx942",
+            bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemm_hfq4g256_residual_mfma_gfx942"],
+                [grid_x, grid_y, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     pub fn gemm_hfq4g256_residual_fp16_wave64(
         &mut self,
         a_raw: &GpuTensor,
