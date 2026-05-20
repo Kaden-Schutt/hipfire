@@ -222,6 +222,10 @@ name = "profile_qwen35_mq4"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "profile_prefill_qwen35"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "test_inference"
 required-features = ["arch-qwen35"]
 
