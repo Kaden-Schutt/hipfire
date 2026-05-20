@@ -1,4 +1,10 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Pre-compile all HIP kernels for target GPU architectures.
 # Usage: ./scripts/compile-kernels.sh [arch1 arch2 ...]
 # Default: gfx906 gfx1010 gfx1030 gfx1100 gfx1200 gfx1201

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline: dispatch hipfire's SiLU activation kernel through bare libdrm.
 //! SiLU(x) = x / (1 + exp(-x)) — used in LLaMA, Qwen, etc.
 

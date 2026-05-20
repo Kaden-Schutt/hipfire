@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Shared helpers for the KLD-eval example binaries (`build_kld_ref`,
 //! `eval_hipfire`, `eval_gguf`). Each of these examples re-verifies the
 //! same three invariants before doing work; centralising the helpers

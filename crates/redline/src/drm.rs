@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! FFI bindings to libdrm_amdgpu.so via dlopen.
 //! Struct layouts match /opt/amdgpu/include/libdrm/amdgpu.h exactly.
 

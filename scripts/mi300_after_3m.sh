@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # After the current after-36 chain finishes (3M extended cals), validate
 # the draft-training POC end-to-end, then start a real multi-hour training
 # run so MI300X stays saturated.

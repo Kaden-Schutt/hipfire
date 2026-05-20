@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! T3-1a microbench — Q8_0 batched GEMM via FP16 WMMA vs the Tier 2 substrate.
 //!
 //! **Status (2026-05-13):** T3-1a recipe pick is LOCKED to FP16-WMMA — the

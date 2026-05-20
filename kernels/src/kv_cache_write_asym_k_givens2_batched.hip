@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched K-only write for asym2: Givens rotation + 2-bit quantize.
 // Same structure as givens4 batched K write but 2-bit packing.
 //

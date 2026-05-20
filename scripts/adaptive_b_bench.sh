@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Adaptive-B scheduler bench — compare fixed-B=16, default adaptive (8..=16),
 # widened adaptive (8..=20). 3 runs each on code + prose + instruct.
 set -u

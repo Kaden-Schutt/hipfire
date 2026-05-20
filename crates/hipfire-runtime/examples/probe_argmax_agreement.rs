@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Double-D feasibility probe — p_outer measurement.
 //!
 //! Loads BOTH a small qwen3.5 model (e.g. 0.8B) and a large target

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # quant_cohort.sh — Phase A Step 0 cohort runner.
 #
 # Orchestrates a per-format quality bench cohort. Per variant emits:

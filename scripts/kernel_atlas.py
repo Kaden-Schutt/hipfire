@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Phase-aware Kernel Atlas collector for hipfire benches.
 
 This intentionally starts as a measurement harness. It does not rewrite kernels

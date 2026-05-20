@@ -1,0 +1,134 @@
+hipfire — RDNA/CDNA inference engine for AMD GPUs
+
+Copyright (c) 2026 Kaden Schutt <kaden@hipfire.dev>
+Portions Copyright (c) 2026 hipfire contributors (see git log,
+CREDITS.md, and per-file SPDX/copyright headers).
+
+hipfire is dual-licensed under either:
+
+    MIT License            (see LICENSE-MIT)
+    Apache License 2.0     (see LICENSE-APACHE)
+
+at your option. This matches the Rust ecosystem norm and respects
+contributor agency: existing contributors who submitted under MIT are
+NOT relicensed in absentia; new contributions default to Apache 2.0
+via the DCO sign-off described in CONTRIBUTING.md, and individual
+contributors may elect MIT-only for their own contributions.
+
+This NOTICE file is provided pursuant to Apache License 2.0 § 4(d)
+because portions of hipfire are distributed under that license.
+Derivative works that include any Apache-2.0-licensed file MUST
+include a readable copy of this NOTICE in the materials provided to
+recipients.
+
+== Per-file SPDX semantics ==
+
+Each first-party source file in hipfire carries an SPDX-License-
+Identifier reflecting the actual authorship of that file:
+
+    Apache-2.0               File's substantive authors (>= 30% of
+                             lines per `git blame`) are all in the
+                             set of authors who have opted into
+                             Apache-2.0 for hipfire going forward,
+                             currently {Kaden Schutt, Kevin Read}.
+
+    MIT                      File's substantive authors are all
+                             outside the Apache-2.0-opt-in set. The
+                             contributor's original MIT grant is
+                             preserved as-is. If they later opt in,
+                             the SPDX tag is refreshed by re-running
+                             scripts/governance/apply_spdx_headers.py
+                             --rewrite-spdx after the opt-in is
+                             recorded.
+
+    MIT OR Apache-2.0        File has substantive authors on both
+                             sides of the opt-in boundary. The dual
+                             tag is the conservative default until
+                             the non-opted-in author elects which
+                             grant applies to their portion.
+
+A small number of license-administration files created in the
+relicense work itself (e.g. scripts/governance/apply_spdx_headers.py)
+are explicitly Apache-2.0.
+
+== Components and primary authors ==
+
+The authoritative, per-contributor record of substantive code
+contributions is maintained in CREDITS.md (regenerated from merged
+PRs by scripts/refresh-credits.sh). The summary below reflects the
+state at the time of dual licensing (2026-05) and is informational;
+CREDITS.md, the per-file SPDX/copyright headers, and PRIOR-ART.md
+together govern attribution.
+
+- crates/{hip-bridge, hsa-bridge, rdna-compute, hipfire-runtime,
+  hipfire-arch-qwen35, hipfire-arch-qwen35-vl, hipfire-arch-llama,
+  hipfire-arch-toy, hipfire-quantize, hipfire-atlas, hipfire-detect,
+  engine}:
+    Primary author: Kaden Schutt (2026).
+    Substantial contributions: Kevin Read (unverbraucht), Björn Bösel
+    (fivetide), alpineq, Robin Van Cauter (RobinVanCauter), beanssec,
+    Daniil Markevich (KotDath), Grégory D (flamme-demon), and others
+    listed in CREDITS.md.
+
+- kernels/src/*.hip, *.cuh:
+    Primary author: Kaden Schutt (2026).
+    Significant per-arch / per-kernel contributions: Kevin Read
+    (gfx906 HFQ family), Robin Van Cauter (gfx12 WMMA family port,
+    issue #54 / PR #56), beanssec (gfx1100 deterministic batched
+    prefill fixes, FP32 dequant HFQ4-G256), Linus Gubenis (gfx908 /
+    MI100 wave64 dispatch + fused_gate_up), Matt Yaple (gfx906
+    bring-up path), nickfinease (vision GEMM family), alpineq
+    (tiled online-softmax in attention_dflash).
+
+- scripts/{mq4_masked_calib.py, gptq_gpu.py, gptq_gpu_pkg/,
+  collect_hessian.py, and adjacent AWQ/GPTQ tooling}:
+    Primary author: Kevin Read (unverbraucht).
+
+- All other files: per git blame and CREDITS.md.
+
+PRIOR-ART.md documents original architectural innovations
+originating in hipfire (with dates and commit hashes) so that
+derivative works can attribute them correctly.
+
+== Attribution requirements (when distributing under Apache 2.0) ==
+
+Any redistribution of Apache-2.0-licensed portions of this Software
+(modified or unmodified) MUST:
+
+(a) Provide a copy of the Apache License 2.0 to recipients.
+(b) Modified files MUST carry prominent notices identifying the
+    modifications.
+(c) Retain (preserve unmodified) all copyright, patent, trademark,
+    and attribution notices present in the Source form, including
+    per-file SPDX/copyright headers and the CREDITS.md inventory.
+(d) Include a readable copy of this NOTICE file in the materials
+    provided to recipients.
+
+Stripping copyright headers, NOTICE entries, or attribution claims
+when redistributing modified or unmodified hipfire code is a license
+violation enforceable as a breach of copyright. See `Jacobsen v.
+Katzer`, 535 F.3d 1373 (Fed. Cir. 2008), which established that
+open-source attribution clauses are conditions of the copyright
+license, not mere contract terms — meaning violations carry
+copyright-infringement remedies, not just contract damages.
+
+== Attribution requirements (when distributing under MIT) ==
+
+For portions distributed under MIT, the MIT license text in
+LICENSE-MIT applies: redistribution must preserve the copyright
+notice and the MIT permission text. The per-file SPDX/copyright
+headers satisfy this when carried through the source.
+
+== Prior license history ==
+
+hipfire's canonical repository was originally MIT-licensed (LICENSE
+added in commit b068a2ac, 2026-04-27). It briefly transitioned to
+Apache 2.0 unilaterally in commit 79167568 (2026-05-19, on branch
+relicense-apache2), then was course-corrected within the same branch
+to the dual MIT/Apache-2.0 posture documented here. Existing
+MIT-licensed copies in the wild remain governed by their MIT grant.
+See docs/governance/relicense-2026-05.md for the full decision
+record including the course-correction reasoning.
+
+Tag `v-mit-final` marks the final commit before the dual-license
+transition; that revision and all prior tags remain MIT-licensed.

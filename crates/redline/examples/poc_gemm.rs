@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline PoC: GEMM (matrix multiply) via bare libdrm_amdgpu.
 //! A real inference-relevant kernel dispatched without HIP/ROCm runtime.
 

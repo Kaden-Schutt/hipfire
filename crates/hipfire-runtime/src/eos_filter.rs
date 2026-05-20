@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Output-stream filtering — applies hold-back, tag-strip, and
 //! end-of-turn suppression to the decoded byte stream as tokens are
 //! emitted. Single source for what reaches stdout / network.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Look up a single tensor in an `.hfq` file by exact name and print its
 //! quant_type + shape. Complement to `compare_hfq` (which diffs two files)
 //! and `dump_norms` (which dumps 1D norm tensor distributions).

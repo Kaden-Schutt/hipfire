@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Daniil Markevich
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! QA mirror for HFQ4-G256 correctness checks.
 
 use std::process::ExitCode;

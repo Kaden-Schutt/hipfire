@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `Architecture` trait implementation for the LLaMA family.
 //!
 //! Mirrors PR 8's qwen35 pattern. Bring-up triple (`config_from_hfq`,

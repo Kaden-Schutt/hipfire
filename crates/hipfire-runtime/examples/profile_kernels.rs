@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Profile Q4_K vs Q4_F16 vs F32 GEMV with different thread configs.
 //! Tests the hypothesis that occupancy (threads/CU) explains the 40% vs 70% gap.
 

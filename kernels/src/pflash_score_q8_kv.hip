@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // PFlash per-block scoring on Q8_0 K cache.
 //
 // One workgroup per output block. Each thread strides through kv_dim,

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention reconstruction-correlation harness (arXiv:2604.04921, §3.3).
 //!
 //! 1. Run forward on a small calibration corpus, collecting pre-RoPE Q at

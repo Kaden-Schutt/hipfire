@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Compile HIP kernels to code objects (.hsaco) via hipcc.
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 

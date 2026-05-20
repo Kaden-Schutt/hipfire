@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! GPU vs CPU correctness test for `gemv_hfp4g32`.
 //!
 //! Builds a deterministic HFP4G32 weight matrix in-process, runs the GPU kernel,

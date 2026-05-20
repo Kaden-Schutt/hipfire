@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Shared test utilities for Q8_0 unit tests and microbenches.
 //
 // `cargo` examples don't share a crate-level test-utils module the way unit

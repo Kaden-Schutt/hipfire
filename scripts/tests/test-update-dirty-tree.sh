@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Regression test for `hipfire update` dirty-working-tree bug.
 #
 # Before the fix, cli/index.ts ran `git pull origin master` which aborts with

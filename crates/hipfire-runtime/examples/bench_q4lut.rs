@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Autokernel benchmark: all Q4 variants + Q8 baseline.
 //! Tests: Q4_K, Q4_LUT, Q4_WAVE, Q4-as-Q8, Q8_0
 

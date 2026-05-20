@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # bench_humaneval_dflash.py — run dflash_spec_demo across a HumanEval sample.
 # HumanEval prompts are code-continuation (signature + docstring) so τ stays
 # in code-token regime. Matches Lucebox methodology.

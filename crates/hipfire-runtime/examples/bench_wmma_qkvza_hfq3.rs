@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Microbench for `gemm_qkvza_hfq3g256_wmma` — measures the new
 //! kernel's throughput on the Qwen3.5-9B DeltaNet LA preamble shape
 //! and compares to the equivalent per-row `gemv_hfq3g256` (the path

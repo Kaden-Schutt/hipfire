@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # DDTree budget/topk sweep — post-kernel-fuse era.
 #
 # Task #71 picked b12-k2 on 2026-04-14, before: #90 gemm_mw16 fix,
