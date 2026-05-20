@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qualitative multi-turn long-context test for MQ4 models.
 //!
 //! Loads a model once, runs N turns against a persistent KV cache

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched K-only write for fwht2: signed-FWHT-128 + 2-bit quantize.
 // Same structure as fwht4_batched K-write but 2-bit packing.
 //

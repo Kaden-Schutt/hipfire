@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Probe WMMA thread-to-output mapping empirically.
 //! A = identity rows, B = columns with unique values.
 //! Determines: which acc[j] in which thread corresponds to which C[m][n].

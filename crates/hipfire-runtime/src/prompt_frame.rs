@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! ChatML prompt framing — single source of truth for assembling
 //! the token sequence that gets fed to the model. Replaces the three
 //! near-copies that lived in daemon.rs (AR, PFlash, DFlash paths).

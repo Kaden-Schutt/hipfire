@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal GGUF file parser. Reads header, metadata, tensor info.
 //! Memory-maps the file for zero-copy access to tensor data.
 

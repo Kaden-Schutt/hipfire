@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Smoke: verify llama::forward_prefill_batch matches forward_scratch per-token.
 //!
 //! Runs the same prompt through both the new batched FA prefill (Phase A)

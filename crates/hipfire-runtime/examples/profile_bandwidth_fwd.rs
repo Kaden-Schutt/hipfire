@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 1 of the bandwidth-ceiling branch: profile where memory bandwidth
 //! goes in one forward pass on gfx1100. Uses hipEvent per-kernel timing and
 //! analytical byte counts, aggregates by category, and prints breakdown tables.

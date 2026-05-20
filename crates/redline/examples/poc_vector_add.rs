@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline PoC: vector_add compute kernel via bare libdrm_amdgpu.
 //! Following ROCT Dispatch.cpp BuildIb() pattern exactly.
 

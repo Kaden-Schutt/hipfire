@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The bring-up contract for a hipfire architecture. Implement this
 //! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
 //! model into the runtime. Generation, sampling, eviction, spec

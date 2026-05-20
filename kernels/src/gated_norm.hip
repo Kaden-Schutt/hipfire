@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 // Grid: [n_heads, batch, 1]. For decode grid.y=1 and the offset below is 0
 // (byte-identical to pre-batching). For prefill grid.y=N; x/z/out are laid

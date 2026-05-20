@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! DFlash draft forward pass — native Rust+HIP.
 //!
 //! Minimal dependency surface: only reads HFQ draft files (arch_id = 20),

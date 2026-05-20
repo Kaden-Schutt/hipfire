@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Quick check: what do <think> / </think> tokenize to in the Qwen3.5 tokenizer?
 //! If they're NOT single special tokens, the infer_qwen35 think-end detection fails
 //! (think_end_token = None) and the thinking block is never terminated by the host.

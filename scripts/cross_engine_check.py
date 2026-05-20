@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Cross-engine sanity check (Step B for engine-drift floor investigation).
 
 Reads the first chunk's tokens from a llama.cpp-produced .kldref, runs

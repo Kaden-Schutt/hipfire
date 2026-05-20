@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for `gemm_gate_up_hfq3g256_wmma` (gfx11 K2 variant).
 //! Compares against a CPU reference dequantizing the same packed HFQ3
 //! bytes via the unpack pattern from gemv_hfq3g256.hip.

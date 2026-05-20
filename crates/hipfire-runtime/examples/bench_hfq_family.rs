@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Benchmark the complete HFQ family: Q2, Q3, Q4, Q6, Q8 at G256.
 
 fn main() {

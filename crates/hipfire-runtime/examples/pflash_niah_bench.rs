@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! NIAH harness with optional PFlash compression (PRD §6 Phase 5 gate).
 //!
 //! Loads a Qwen3.5-family target model (4B/9B/27B; dense or hybrid),

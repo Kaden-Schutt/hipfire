@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Real-data correctness test for the gfx906 dp4a MMQ residual kernel.
 //!
 //! Loads dump files produced by HIPFIRE_MMQ_DUMP=N from a real model run,

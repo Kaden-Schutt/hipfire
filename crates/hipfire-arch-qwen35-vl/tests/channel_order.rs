@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 nickfinease
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Regression test for the vision-encoder channel ordering fix (issue #23).
 //!
 //! Empirical finding: the patch_embed weights in the Qwen3.5-VL HFQ4 export

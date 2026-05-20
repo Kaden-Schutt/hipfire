@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // KV-cache compaction: gather retained positions into a contiguous prefix.
 //
 // Used by TriAttention eviction (arXiv:2604.04921 §4.3): after scoring and

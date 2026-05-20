@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hsa-bridge: thin Rust wrapper around libhsa-runtime64.so.
 //!
 //! Purpose: bypass HIP's ~10 µs launch overhead on gfx1100 by submitting

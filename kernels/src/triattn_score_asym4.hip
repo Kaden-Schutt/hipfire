@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // TriAttention scoring on an asym4 post-RoPE K cache.
 //
 // asym4 stores K as: [4B cnorm][head_dim/2 packed nibbles] with the same

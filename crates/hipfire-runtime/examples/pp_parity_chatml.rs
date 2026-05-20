@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Extended pp parity: ChatML-wrapped prompt + multi-token prefill + top-K
 //! logit dump at the first divergence. Stage 6 pp_parity used a synthetic
 //! `tok=1` repeated input, which exercised decode-only steady state and

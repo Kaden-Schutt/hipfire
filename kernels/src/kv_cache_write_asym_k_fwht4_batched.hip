@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched K-only write for fwht4: signed-FWHT rotation + 4-bit quantize.
 // Processes N positions in one launch. V is written separately via
 // kv_cache_write_q8_0_batched. Handles head_dim ∈ {128, 256} via 2-pass loop.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! MMQ vs WMMA bit-comparison diagnostic for Qwen3.5/3.6 GEMM call sites.
 //!
 //! Compares i8 WMMA + Q8_1 (MMQ) output against f16 WMMA output at each

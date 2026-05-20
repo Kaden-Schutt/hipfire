@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Kernel efficiency profiler for RDNA GPUs.
 //! Measures how close each compiled kernel is to theoretical hardware limits.
 

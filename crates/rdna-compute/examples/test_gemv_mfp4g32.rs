@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! GPU vs CPU correctness test for `gemv_mfp4g32_with_rotate`.
 //!
 //! MFP4G32 = HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement).

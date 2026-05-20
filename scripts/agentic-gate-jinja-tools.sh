@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Agentic gate (Jinja + structured tools) — Phase 1 smoke for the
 # daemon-side `tools` / `messages` JSONL fields.
 #

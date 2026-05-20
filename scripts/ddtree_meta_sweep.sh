@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # DDTree meta-verifier pruner sweep — tests HIPFIRE_DDTREE_LOGW_CUTOFF
 # against the b12-k2 baseline on prose/instruct (where DDTree wins
 # currently). Cutoff stops heap expansion when next candidate's cumulative

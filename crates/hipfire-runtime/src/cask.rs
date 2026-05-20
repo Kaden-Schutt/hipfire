@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! CASK: core-aware selective KV compression (arXiv:2604.10900).
 //!
 //! Sits atop TriAttention. TriAttention scores tokens and keeps the top-B;

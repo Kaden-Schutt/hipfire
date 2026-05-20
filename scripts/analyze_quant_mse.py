@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Corrected analysis: MQ4 vs Q4_K with proper FWHT-256.
 
 The previous version had a buggy vectorized FWHT (reshape misinterpreted pair indices

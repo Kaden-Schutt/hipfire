@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Flash attention tile for asym3: K at 3-bit rotated, V at Q8_0 (normal space).
 //
 // Best-quality rotated K per RotorQuant paper. Tuned for head_dim=256

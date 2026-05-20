@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Smoke test for `Gpus` orchestrator: init_uniform layer split, peer
 //! enable, boundary_copy + wait_boundary round-trip.
 //!

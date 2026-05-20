@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal GGUF reader + dequant copied from `crates/engine/src/{gguf.rs,llama.rs}`.
 //! Self-contained so hipfire-quantize doesn't pull engine's GPU dependency tree.
 //! TODO: factor into a shared `gguf-codec` crate.

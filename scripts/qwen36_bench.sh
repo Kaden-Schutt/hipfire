@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Qwen3.6-27B full-genre bench with its new z-lab DFlash draft.
 # 3 runs each × (code, prose, instruct) × (DFlash linear, DDTree b12-k2).
 set -u

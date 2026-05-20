@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Tree-graph capture A/B — DDTree b12-k2 with/without HIPFIRE_VERIFY_GRAPH_TREE.
 # 3 runs each × (code, prose, instruct).
 set -u

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # amd_quickdeploy.sh — one-shot bring-up for a fresh rented AMD GPU box
 # (MI300X/MI250X/MI210/Radeon VII Pro/V620/etc). Idempotent: safe to re-run.
 #

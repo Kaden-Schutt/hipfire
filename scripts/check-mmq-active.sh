@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Björn Bösel
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Check whether MMQ kernels are actually dispatched during inference.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/rocm-env.sh"

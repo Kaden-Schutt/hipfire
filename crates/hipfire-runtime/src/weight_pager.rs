@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 mad-lab-kbando
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Weight pager — runtime residency management for MoE/dense weights (MAD-93 v0.1).
 //!
 //! Hipfire today loads all weights to VRAM at startup. For models that exceed

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # gpu-lock.sh — GPU mutex for multi-agent coordination
 # Source this in both agent sessions: source gpu-lock.sh
 # Then use: gpu_acquire "model-ingestion" && { run tests; gpu_release; }

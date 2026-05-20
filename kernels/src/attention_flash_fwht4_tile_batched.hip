@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for fwht4: K at FWHT-rotated 4-bit, V at Q8_0.
 // Processes sub_batch_size positions via blockIdx.z.
 // 2-pass K for head_dim=256 (128-dim per pass).

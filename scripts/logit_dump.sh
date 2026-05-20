@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Logit divergence diagnostic: run on each GPU, diff the outputs.
 # Usage: ./scripts/logit_dump.sh <model.hfq> [output_dir]
 #

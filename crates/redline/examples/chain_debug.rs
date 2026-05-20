@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Debug: test RELEASE_MEM in isolation, then chained dispatch.
 use redline::device::Device;
 use redline::dispatch::{CommandBuffer, FastDispatch, Kernel};

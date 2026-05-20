@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness test for HFQ6-G256 quantize → GPU dequant round-trip.
 //! Quantize known F32 values, upload, run GEMV, compare against F32 GEMV.
 
