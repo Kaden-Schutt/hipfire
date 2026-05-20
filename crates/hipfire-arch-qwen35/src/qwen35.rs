@@ -865,9 +865,11 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         };
         // Phase A Stage A — populate awq_scale when the dtype is on
         // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
-        // The pread call invalidates the prior pread_buf borrow, but
-        // the weight bytes have already been uploaded to GPU (owned by
-        // `wt.buf`) so the borrow no longer matters.
+        // `load_awq_scale` reads the sidecar via `tensor_data_vec` (fresh
+        // owned Vec), so it doesn't touch `self.pread_buf` — the prior
+        // pread_buf Ref guard from the weight load above was already
+        // dropped at the end of the `if let` block, and even if it weren't,
+        // the helper wouldn't invalidate it.
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale(hfq, gpu, &full_name, k)
                 .or_else(|| load_awq_scale(hfq, gpu, name, k));
