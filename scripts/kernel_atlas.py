@@ -148,6 +148,38 @@ def annotate_profile_kernels(kernels):
     return annotated
 
 
+def annotate_rocprof_coverage(row):
+    """Add BLINDSPOT tag to rows where rocprof_blindspot_count > 0."""
+    if not isinstance(row, dict):
+        return row
+    metrics = row.get("metrics", {}) or {}
+    count = metrics.get("rocprof_blindspot_count", 0)
+    if count and count > 0:
+        row.setdefault("tags", [])
+        if "BLINDSPOT" not in row["tags"]:
+            row["tags"].append("BLINDSPOT")
+    return row
+
+
+def parse_rocprof_coverage_section(text):
+    """Parse the rocprofv3 coverage block from bench stderr output."""
+    coverage = {}
+    match = re.search(r"=== ROCPROF COVERAGE \(([0-9.]+)%\) ===", text)
+    if match:
+        coverage["coverage_pct"] = float(match.group(1))
+    match = re.search(r"rocprof total:\s+([0-9.]+)ms", text)
+    if match:
+        coverage["rocprof_total_ms"] = float(match.group(1))
+    match = re.search(r"internal total:\s+([0-9.]+)ms", text)
+    if match:
+        coverage["internal_total_ms"] = float(match.group(1))
+    match = re.search(r"blindspot total:\s+([0-9.]+)ms\s+\(([0-9]+) (?:un-tracked )?kernels?\)", text)
+    if match:
+        coverage["blindspot_total_ms"] = float(match.group(1))
+        coverage["blindspot_count"] = int(match.group(2))
+    return coverage
+
+
 def parse_dflash_summary(text):
     """Parse dflash_spec_demo metrics from authoritative lines or fallback text."""
     metrics = {}
@@ -2604,9 +2636,19 @@ def base_metadata(
 
 
 def ar_rows_from_metrics(
-    *, base, metrics, model_size, quant, prefill, gen, run_index, profile_sections=None
+    *,
+    base,
+    metrics,
+    model_size,
+    quant,
+    prefill,
+    gen,
+    run_index,
+    profile_sections=None,
+    rocprof_coverage=None,
 ):
     profile_sections = profile_sections or {}
+    rocprof_coverage = rocprof_coverage or {}
     prefill_row = copy.deepcopy(base)
     prefill_row.update(
         {
@@ -2649,6 +2691,23 @@ def ar_rows_from_metrics(
         decode_row.setdefault("artifacts", {})["profile_kernels"] = annotate_profile_kernels(
             profile_sections["decode_ar"]
         )
+    if rocprof_coverage:
+        coverage_keys = (
+            "coverage_pct",
+            "rocprof_total_ms",
+            "internal_total_ms",
+            "blindspot_total_ms",
+            "blindspot_count",
+        )
+        rc_metrics = {
+            f"rocprof_{k}": rocprof_coverage[k]
+            for k in coverage_keys
+            if k in rocprof_coverage
+        }
+        if rc_metrics:
+            prefill_row.setdefault("metrics", {}).update(rc_metrics)
+    annotate_rocprof_coverage(prefill_row)
+    annotate_rocprof_coverage(decode_row)
     return [prefill_row, decode_row]
 
 
@@ -2789,6 +2848,7 @@ def collect_ar(args):
                 continue
             metrics = parse_bench_summary(output)
             profile_sections = parse_bench_profile_sections(output)
+            rocprof_coverage = parse_rocprof_coverage_section(output)
             rows.extend(
                 ar_rows_from_metrics(
                     base=base,
@@ -2799,6 +2859,7 @@ def collect_ar(args):
                     gen=args.gen,
                     run_index=run_index,
                     profile_sections=profile_sections,
+                    rocprof_coverage=rocprof_coverage,
                 )
             )
 

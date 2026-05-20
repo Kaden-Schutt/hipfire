@@ -151,6 +151,18 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
+/// 4 B zero + 96 B packed 3-bit weights).
+pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 104
+}
+
+/// Bytes for a single-row HFQ3-G256 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq3g256_bytes(m: usize, k: usize) -> usize {
+    hfq3g256_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// MQ3-Lloyd GEMV bytes: weight (112 B / group) + x + y.
 pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
     let groups = k / 256;
@@ -161,6 +173,17 @@ pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
 /// vectors).
 pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + batch * (k + m) * 4
+}
+
+/// HFQ6-G256 weight footprint: 200 B/group × K/256 groups per row.
+pub fn hfq6g256_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 200
+}
+
+/// Bytes for a single-row HFQ6-G256 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq6g256_bytes(m: usize, k: usize) -> usize {
+    hfq6g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
 /// HFP4-G32 weight footprint: 16-B row header + (K/32)*17-B blocks per row.

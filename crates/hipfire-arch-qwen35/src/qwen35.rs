@@ -4161,16 +4161,62 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform.mq4).
 /// Mixed-precision Qwen3.6-A3B (MQ6 in 16/40 layers) still falls back —
 /// needs an MQ6 sibling for `_k8_indexed_batched`, follow-up work.
+/// MoE FFN admit predicate for the batched prefill body
+/// `prefill_moe_ffn_body_batched`. Per-projection MQ4 OR MQ6 admit:
+///
+/// - router, shared_expert_gate: MQ4 or Q8 (small scalars; dispatched
+///   inline below).
+/// - shared_expert.gate AND .up: same dtype, MQ4 or MQ6 (fused gate+up
+///   kernel handles one storage layout per call).
+/// - shared_expert.down: MQ4 or MQ6 (independent dtype).
+/// - experts.gate_up: uniform across all experts in this layer, MQ4 or MQ6.
+/// - experts.down: uniform across all experts in this layer, MQ4 or MQ6.
+///
+/// AWQ A3B dtype dump 2026-05-19 confirms experts are uniform per
+/// projection per layer. The 4 grouped/fused dispatch sites in
+/// `prefill_moe_ffn_body_batched` branch on the actual dtype, so a
+/// layer admitted here is dispatchable end-to-end.
+///
+/// MQ6 admit is gated behind `HIPFIRE_MOE_MQ6_ADMIT=1` because of a
+/// known correctness regression on AWQ A3B (token attractor `!!!!!`)
+/// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
+/// pass synthetic channel tests at FP16 ULP precision but produce
+/// garbage activations in production. Bisection of the offending
+/// dispatch site is pending. Default-off preserves the pre-fan-out
+/// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
 fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
     let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
     let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
-    router_ok
-        && shared_gate_ok
-        && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
-        && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
-        && ffn.experts.iter().all(|e|
-            e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256)
+
+    // MQ6 admit env gate (default off — see comment above)
+    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let admit_mq6 = *MQ6_ADMIT.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() == Ok("1")
+    });
+
+    if admit_mq6 {
+        // Per-projection MQ4 OR MQ6 admit.
+        let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
+        let shared_gu_ok = matches!(shared_gu_dt, DType::MQ4G256 | DType::MQ6G256)
+            && ffn.shared_expert.up.gpu_dtype == shared_gu_dt;
+        let shared_dn_ok = matches!(ffn.shared_expert.down.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
+        let experts_gu = ffn.experts[0].gate_up.gpu_dtype;
+        let experts_dn = ffn.experts[0].down.gpu_dtype;
+        let experts_ok = matches!(experts_gu, DType::MQ4G256 | DType::MQ6G256)
+            && matches!(experts_dn, DType::MQ4G256 | DType::MQ6G256)
+            && ffn.experts.iter().all(|e|
+                e.gate_up.gpu_dtype == experts_gu && e.down.gpu_dtype == experts_dn);
+        router_ok && shared_gate_ok && shared_gu_ok && shared_dn_ok && experts_ok
+    } else {
+        // Strict MQ4 (pre-fan-out behavior).
+        router_ok
+            && shared_gate_ok
+            && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
+            && ffn.shared_expert.down.gpu_dtype == DType::MQ4G256
+            && ffn.experts.iter().all(|e|
+                e.gate_up.gpu_dtype == DType::MQ4G256 && e.down.gpu_dtype == DType::MQ4G256)
+    }
 }
 
 /// Batched MoE FFN for `forward_prefill_chunk`. Takes the post-attention
@@ -4269,14 +4315,26 @@ fn prefill_moe_ffn_body_batched(
                          — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
     }
     // Fused gate+up dispatch for the shared expert — halves the kernel
-    // launch count vs back-to-back gemm_hfq4g256 (~75µs/launch × 40
+    // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
     // MoE layers = ~3ms saved on R9700 A3B prefill at bs=256).
-    gpu.gemm_gate_up_hfq4g256(
-        &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
-        &pbs.x_rot_batch, shared_gate, shared_up,
-        ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
-        ffn.shared_expert.gate.k, n,
-    )?;
+    // Per-projection dispatch: gate AND up share the same dtype (predicate
+    // enforces). MQ4 → HFQ4-layout fused kernel; MQ6 → HFQ6-layout.
+    match ffn.shared_expert.gate.gpu_dtype {
+        DType::MQ4G256 => gpu.gemm_gate_up_hfq4g256(
+            &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch, shared_gate, shared_up,
+            ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k, n,
+        )?,
+        DType::MQ6G256 => gpu.gemm_gate_up_hfq6g256(
+            &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
+            &pbs.x_rot_batch, shared_gate, shared_up,
+            ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
+            ffn.shared_expert.gate.k, n,
+        )?,
+        other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
+                         — admit predicate should have rejected this layer"),
+    }
 
     // ── 3. GPU softmax + top-K + renorm, batched over N tokens ──
     //
@@ -4307,12 +4365,23 @@ fn prefill_moe_ffn_body_batched(
     // ── 5. Shared-expert down with sigmoid-scaled residual, batched ──
     //
     // Reads shared_scalar[token] as the pre-sigmoid logit, applies sigmoid
-    // internally, and atomicAdd's sigmoid(scalar) × (W_down · rot) into
-    // pbs.x_batch[token × dim + row].
-    gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-        &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
-        ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
-    )?;
+    // internally, and += sigmoid(scalar) × (W_down · rot) into
+    // pbs.x_batch[token × dim + row]. (Note: HFQ4 sister uses += not
+    // atomicAdd; each (bid, row) writes a unique cell.)
+    // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
+    // (shipped via feat/hfq6-sigmoid-scaled-batched).
+    match ffn.shared_expert.down.gpu_dtype {
+        DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
+        )?,
+        DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
+        )?,
+        other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
+                         — admit predicate should have rejected this layer"),
+    }
 
     // ── 6. Routed experts: batched gate_up → SwiGLU+FWHT → down ──
     //
@@ -4379,11 +4448,23 @@ fn prefill_moe_ffn_body_batched(
 
         // Stage 2 grouped GEMM (gate_up). Writes Y_grouped[m_total × 2*mi] direct.
         // x_src = x_rot_batch [N × dim], x_row_div = K_TOP.
-        gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
-            &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-            &pbs.x_rot_batch, y_gu_grouped,
-            2 * mi, gate_up_k, k_top, m_total, n,
-        )?;
+        // Per-dtype dispatch: experts uniform per layer (admit predicate
+        // enforces). MQ4 → HFQ4-layout grouped WMMA; MQ6 → HFQ6 sister
+        // (shipped via feat/hfq6-moe-grouped-wmma).
+        match ffn.experts[0].gate_up.gpu_dtype {
+            DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                &pbs.x_rot_batch, y_gu_grouped,
+                2 * mi, gate_up_k, k_top, m_total, n,
+            )?,
+            DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                &pbs.x_rot_batch, y_gu_grouped,
+                2 * mi, gate_up_k, k_top, m_total, n,
+            )?,
+            other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
+                             — admit predicate should have rejected this layer"),
+        }
 
         // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
         gpu.moe_gate_up_unscatter_k8(
@@ -4427,11 +4508,22 @@ fn prefill_moe_ffn_body_batched(
 
         // Grouped GEMM on down: x_src = rot_batch [N*K_TOP × mi], x_row_div = 1
         // (sorted_slot_index[slot] directly indexes the source row).
-        gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
-            &ffn.expert_down_ptrs, tile_ids, sorted,
-            rot_batch, y_down_grouped,
-            down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-        )?;
+        // Per-dtype dispatch: experts uniform per layer. MQ4 → HFQ4-layout;
+        // MQ6 → HFQ6 sister (shipped via feat/hfq6-moe-grouped-wmma).
+        match ffn.experts[0].down.gpu_dtype {
+            DType::MQ4G256 => gpu.gemm_hfq4g256_moe_grouped_wmma_k2(
+                &ffn.expert_down_ptrs, tile_ids, sorted,
+                rot_batch, y_down_grouped,
+                down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+            )?,
+            DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
+                &ffn.expert_down_ptrs, tile_ids, sorted,
+                rot_batch, y_down_grouped,
+                down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+            )?,
+            other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
+                             — admit predicate should have rejected this layer"),
+        }
         // Non-atomic combine via inverse_perm + topk_weights.
         gpu.moe_down_combine_grouped_k8(
             y_down_grouped, inverse_perm, topk_weights, &pbs.x_batch,
@@ -5872,10 +5964,15 @@ fn forward_prefill_chunk(
                     n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
                 )?;
                 // wo + residual. Q8 wo lands un-rotated (Q8 weights were
-                // quantized against un-rotated activations); MQ4 wo requires
-                // FWHT(awq_scale-adjusted) rotation. Mirrors the dense FA
-                // wo dispatch (qwen35.rs:5388-5411).
+                // quantized against un-rotated activations); MQ4/MQ6 wo
+                // require FWHT(awq_scale-adjusted) rotation. Mirrors the
+                // dense LA wo dispatch (qwen35.rs:5000-5043) — the MQ6
+                // branch is required for AWQ A3B where 4/40 LA layers
+                // ship MQ6 wo and would otherwise corrupt the residual
+                // stream when dispatched through the HFQ4 kernel against
+                // 200 B/group MQ6-layout bytes.
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_input = if dn_wo_is_q8 {
                     &pbs.dn_normed_batch
                 } else {
@@ -5886,7 +5983,12 @@ fn forward_prefill_chunk(
                     )?;
                     &pbs.dn_normed_rot_batch
                 };
-                if dn_wo_is_q8 && q8_wmma_arch {
+                if dn_wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, dn_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if dn_wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_residual_wmma(
                         &layer.wo.buf, dn_wo_input, &x_n,
@@ -6228,9 +6330,15 @@ fn forward_prefill_chunk(
                 }
                 gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
                 // wo + residual. Mirrors the dense FA wo dispatch at
-                // qwen35.rs:5388-5411 — Q8 wo skips rotation (un-rotated
-                // input expected); MQ4 wo applies FWHT(awq_scale-adjusted).
+                // qwen35.rs:5591-5623 — Q8 wo skips rotation (un-rotated
+                // input expected); MQ4/MQ6 wo apply FWHT(awq_scale-adjusted).
+                // MQ6 branch added alongside MQ6_ADMIT (without it, MQ6 wo
+                // bytes get fed to gemm_hfq4g256_residual which reads them
+                // as 136 B/group HFQ4 layout vs the actual 200 B/group MQ6
+                // — catastrophic stride mismatch produces a single-token
+                // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let fa_wo_input = if fa_wo_is_q8 {
                     &pbs.fa_attn_out_batch
                 } else {
@@ -6241,7 +6349,12 @@ fn forward_prefill_chunk(
                     )?;
                     &pbs.fa_attn_out_rot_batch
                 };
-                if fa_wo_is_q8 && q8_wmma_arch {
+                if fa_wo_is_6bit {
+                    gpu.gemm_hfq6g256_residual(
+                        &layer.wo.buf, fa_wo_input, &pbs.x_batch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                } else if fa_wo_is_q8 && q8_wmma_arch {
                     let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_residual_wmma(
                         &layer.wo.buf, fa_wo_input, &x_n,
