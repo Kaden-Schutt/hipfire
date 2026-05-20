@@ -19,12 +19,20 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
+// MMQ_Y is the row tile (output rows per workgroup). Default 128.
+// Per-WG LDS budget scales with MMQ_Y; lowering it to 64 trades
+// per-WG compute for higher CU occupancy (experiment in #300 follow-up).
+#ifndef MMQ_Y
 #define MMQ_Y 128
+#endif
 #define MMQ_NWARPS 4
 #define WAVE_SIZE 32
 #define QK8_1 32
 #define X_STRIDE 40
 #define Y_STRIDE 36
+// X-tile loader task count: each thread loops `(MMQ_Y * 16) / 128` times.
+// At MMQ_Y=128 → 16 loops/thread (the original); at MMQ_Y=64 → 8 loops.
+#define X_LOADER_TASKS_PER_THREAD ((MMQ_Y * 16) / 128)
 
 #ifndef MMQ_X
 #error "MMQ_X must be defined before #including this body"
@@ -86,9 +94,12 @@ extern "C" __global__ void KERNEL_NAME(
                 x_dm[i] = make_float2(sc, zp + 4.0f * sc);
             }
 
+            // X-tile loader: each thread loops X_LOADER_TASKS_PER_THREAD
+            // times to cover MMQ_Y rows × 16 chunks/row. At MMQ_Y=128 this is
+            // 16 loops/thread (the original); MMQ_Y=64 → 8 loops/thread.
             #pragma unroll
-            for (int loop = 0; loop < 16; ++loop) {
-                const int task_id = tid * 16 + loop;
+            for (int loop = 0; loop < X_LOADER_TASKS_PER_THREAD; ++loop) {
+                const int task_id = tid * X_LOADER_TASKS_PER_THREAD + loop;
                 const int i = task_id / 16;
                 const int chunk = task_id % 16;
 

@@ -7658,12 +7658,20 @@ impl Gpu {
             }
             return self.gemm_hfq3g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
+        // Gate boundaries from `examples/bench_hfq3_mmq_sweep.rs`:
+        //   batch ≤ 12:  dot2 (MMQ tile granularity wastes compute)
+        //   13..=63:     mmq_x=16 (wins moderate-N regime)
+        //   batch ≥ 64:  mmq_x=32 with MMQ_Y=64 (higher-occupancy variant
+        //                — wins at long N where the LDS budget reduction
+        //                from y128→y64 lets 4 WG/CU instead of 2 → ~48%
+        //                occupancy. Beats both mmq_x32_y128 and mmq_x16
+        //                at N≥64 by 5-14%).
         if batch_size <= 12 {
             self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size)
-        } else if batch_size <= 127 {
+        } else if batch_size <= 63 {
             self.gemm_hfq3g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
         } else {
-            self.gemm_hfq3g256_residual_mmq_x32(a_raw, x, y, m, k, batch_size)
+            self.gemm_hfq3g256_residual_mmq_x32_y64(a_raw, x, y, m, k, batch_size)
         }
     }
 
@@ -7676,6 +7684,27 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        self.launch_hfq3_mmq_tile_with_y(a_raw, x, y, m, k, batch_size, mmq_x, 128, kernel_name, src)
+    }
+
+    /// MMQ_Y-parameterized variant of `launch_hfq3_mmq_tile`. The body.cuh
+    /// uses `#ifndef MMQ_Y / #define MMQ_Y 128 / #endif`, so each wrapper
+    /// can override the row-tile size. The y=64 variant trades per-WG
+    /// compute for higher occupancy (issue #300 follow-up).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hfq3_mmq_tile_with_y(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
         kernel_name: &'static str,
         src: &'static str,
     ) -> HipResult<()> {
@@ -7705,14 +7734,13 @@ impl Gpu {
         ];
 
         // LDS layout — must match the body.cuh constants:
-        //   x_qs: 128 × X_STRIDE(40) ints + x_dm: 128 × float2
+        //   x_qs: mmq_y × X_STRIDE(40) ints + x_dm: mmq_y × float2
         //   tile_y: mmq_x × Y_STRIDE(36) ints
-        const MMQ_Y: usize = 128;
         const X_STRIDE: usize = 40;
         const Y_STRIDE: usize = 36;
-        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
 
-        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let row_tiles = (m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size)
@@ -7772,6 +7800,24 @@ impl Gpu {
             a_raw, x, y, m, k, batch_size,
             32, "gemm_hfq3g256_residual_mmq_x32",
             kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ3 MMQ residual experimental MMQ_Y=64 variant (mmq_x=32).
+    /// Halves the row tile to cut LDS budget (~26 KB → ~15 KB per WG),
+    /// targeting 4 WGs/CU instead of 2 → ~48% occupancy vs ~24%.
+    /// Issue #300 follow-up; for A/B vs the default `_mmq_x32` (MMQ_Y=128).
+    pub fn gemm_hfq3g256_residual_mmq_x32_y64(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 64,
+            "gemm_hfq3g256_residual_mmq_x32_y64",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y64_SRC,
         )
     }
 
