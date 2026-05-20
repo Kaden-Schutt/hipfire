@@ -9,12 +9,14 @@ members = [
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-toy",
+    "crates/hipfire-arch-qwen2",
     "crates/hipfire-quantize",
     "crates/hipfire-detect",
+    "crates/hipfire-atlas",
     "crates/redline",
 ]
 
 [workspace.package]
-version = "0.1.20"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"

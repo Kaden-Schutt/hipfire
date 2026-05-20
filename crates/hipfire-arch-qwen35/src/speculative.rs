@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Speculative decoding infrastructure for hipfire.
 //!
 //! Phase 1: holds target + draft model slots side-by-side on a single shared
@@ -16,7 +20,7 @@ use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hipfire_runtime::tokenizer::Tokenizer;
+use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hip_bridge::{DeviceBuffer, HipResult};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
@@ -145,6 +149,23 @@ pub enum KvMode {
     Asym3,
     /// Asym2: rotated 2-bit K + Q8 V. Smallest but most lossy.
     Asym2,
+    /// Fwht4: signed-FWHT-rotated 4-bit K + Q8 V. Byte-identical storage to
+    /// Asym4 but with a Hadamard rotation (matches MQ4's weight-quant trick).
+    /// Centroid LUTs were always Lloyd-Max-fit for post-FWHT N(0, 1/128) per
+    /// turbo_common.h:13 — Fwht4 finally uses them on the distribution they
+    /// were calibrated for. Opt-in via `--kv-mode fwht4`.
+    Fwht4,
+    /// Fwht3: signed-FWHT-256 rotated 3-bit K + Q8 V. Byte-identical storage to
+    /// Asym3 (the canonical default). Single-pass 256-element FWHT — the
+    /// natural fit for asym3's existing layout (8 dims/thread). Empirical
+    /// prose-τ win on 3.5-27b at the 4-bit tier suggests the 3-bit tier
+    /// should benefit even more from rotation. Opt-in via `--kv-mode fwht3`.
+    Fwht3,
+    /// Fwht2: signed-FWHT-128 rotated 2-bit K + Q8 V. Byte-identical storage
+    /// to Asym2. 2-pass-over-128 structure matches fwht4. Highest theoretical
+    /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
+    /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
+    Fwht2,
 }
 
 impl Default for KvMode {
@@ -205,40 +226,71 @@ impl ModelSlot {
         })?;
         let weights = qwen35::load_weights(&mut hfq, &config, gpu)?;
 
-        let n_kv_layers = config
+        // For hybrid arches (Qwen 3.5 = 48 DeltaNet LinearAttention + 16
+        // FullAttention out of 64 total), only the FullAttention layers need
+        // a KV cache slot. The LinearAttention layers carry their own state
+        // via DeltaNetState (`new_with_quant` below) and never write to
+        // kv_cache.k_gpu / .v_gpu. Pre-2026-05-15 the KV constructor
+        // allocated full K/V slots for ALL layers regardless of type — at
+        // ctx=64K that's ~5 GB of dead allocation on 27B. The `_filtered`
+        // constructors take a `is_kv_layer` slice and substitute a
+        // 1-element placeholder for non-KV layers. Indexing by absolute
+        // layer_idx is preserved.
+        let is_kv_layer: Vec<bool> = config
             .layer_types
             .iter()
-            .filter(|t| **t == qwen35::LayerType::FullAttention)
-            .count();
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
 
         // Honor the caller's requested KV cache mode. Default is Q8 for
         // backwards-compat, but DFlash verify is KV-bandwidth sensitive at
         // longer contexts — asym3/asym4 cut the verify attention cost.
         let kv_cache = match slot_config.kv_mode {
-            KvMode::Q8 => KvCache::new_gpu_q8(
+            KvMode::Q8 => KvCache::new_gpu_q8_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym4 => KvCache::new_gpu_asym4(
+            KvMode::Asym4 => KvCache::new_gpu_asym4_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym3 => KvCache::new_gpu_asym3(
+            KvMode::Asym3 => KvCache::new_gpu_asym3_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Asym2 => KvCache::new_gpu_asym2(
+            KvMode::Asym2 => KvCache::new_gpu_asym2_filtered(
                 gpu,
-                config.n_layers,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
+                gpu,
+                &is_kv_layer,
                 config.n_kv_heads,
                 config.head_dim,
                 slot_config.max_seq,
@@ -263,8 +315,11 @@ impl ModelSlot {
     /// Load the tokenizer from this slot's HFQ metadata. Each slot technically
     /// carries its own tokenizer; callers should validate that two slots'
     /// tokenizers are compatible via `Tokenizer::is_compatible_with` before
-    /// sharing.
-    pub fn load_tokenizer(&self) -> Option<Tokenizer> {
+    /// sharing. Returns the underlying `TokenizerError` on failure so callers
+    /// can surface specific diagnostics (e.g. `MissingMergeResult` from a
+    /// truncated quantizer output) rather than a generic "no tokenizer"
+    /// message — see #203.
+    pub fn load_tokenizer(&self) -> Result<Tokenizer, TokenizerError> {
         Tokenizer::from_hfq_metadata(&self.hfq.metadata_json)
     }
 
@@ -339,11 +394,11 @@ impl SpecPair {
         let target = ModelSlot::load(gpu, target_path, "target", target_cfg)?;
         let draft = ModelSlot::load(gpu, draft_path, "draft", draft_cfg)?;
 
-        let target_tok = target.load_tokenizer().ok_or_else(|| {
-            hip_bridge::HipError::new(0, "target model has no tokenizer in HFQ metadata")
+        let target_tok = target.load_tokenizer().map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("target tokenizer load failed: {e}"))
         })?;
-        let draft_tok = draft.load_tokenizer().ok_or_else(|| {
-            hip_bridge::HipError::new(0, "draft model has no tokenizer in HFQ metadata")
+        let draft_tok = draft.load_tokenizer().map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("draft tokenizer load failed: {e}"))
         })?;
 
         if target_tok.vocab_size() != draft_tok.vocab_size() {
@@ -2092,18 +2147,28 @@ fn verify_dflash_block_inner(
 
     if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=16 in the kernel, so
-        // tree-verify blocks exceeding 16 (budget + 1 > 16) need chunking.
+        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=64 in the kernel, so
+        // tree-verify blocks exceeding 64 (budget + 1 > 64) need chunking.
         // MQ4/HFQ4/HFQ6/MQ6 kernels have no such cap — they take the single-shot path.
+        //
+        // INVARIANT: this path MUST stay on `gemm_q8_0_batched` (the substrate),
+        // NOT the Tier 3 `gemm_qkv_q8_0_wmma` family. The substrate matches
+        // `gemv_q8_0`'s single-accumulator reduction order, preserving byte-exact
+        // greedy parity with decode — required for DFlash+Q8 spec-verify to ever
+        // be a valid eval target (see docs/plans/q8-fused-prefill-kernels.md
+        // §Constraints — "greedy-parity invariant"). The WMMA family uses a
+        // hardware-determined reduction order and will not match.
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                const Q8_LM_MAX: usize = 16;
+                const Q8_LM_MAX: usize = 64;
                 let mut chunk_start = 0usize;
                 while chunk_start < b {
                     let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
                     let chunk_n = chunk_end - chunk_start;
                     let x_chunk = final_hidden.sub_offset(chunk_start * dim, chunk_n * dim);
                     let y_chunk = logits_batch.sub_offset(chunk_start * vocab, chunk_n * vocab);
+                    // DO NOT route this through the Q8 WMMA dispatcher — see
+                    // greedy-parity invariant above.
                     gpu.gemm_q8_0_batched(
                         &w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n,
                     )?;
@@ -2120,7 +2185,11 @@ fn verify_dflash_block_inner(
                     "verify_scratch.rot undersized: b*k={} > max_n*hidden_k={}",
                     b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
                 let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                // AWQ-aware rotation: when `w_out.awq_scale.is_some()` (lm_head
+                // has an AWQ sidecar attached), `_for` dispatches the AWQ
+                // variant that divides x by s before FWHT. Numerically
+                // identical to `rotate_x_mq_batched` when no sidecar exists.
+                llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
@@ -2130,7 +2199,8 @@ fn verify_dflash_block_inner(
                     "verify_scratch.rot undersized for MQ3 lm_head: b*k={} > max_n*hidden_k={}",
                     b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
                 let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                // AWQ-aware rotation; see the MQ4 arm above for rationale.
+                llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
@@ -2468,7 +2538,10 @@ pub fn spec_step_dflash(
     // ACTUAL GPU completion (not CPU enqueue of async work). Perf-heavy —
     // use only for diagnostics. When disabled, zero cost beyond a handful
     // of Instant::now() calls.
-    let phase_on = std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1");
+    static PHASE_ON_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let phase_on = *PHASE_ON_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_SPEC_PHASES").ok().as_deref() == Some("1")
+    });
     if phase_on {
         gpu.hip.device_synchronize()?;
     }
@@ -2496,8 +2569,11 @@ pub fn spec_step_dflash(
     // production-path defense in daemon/run/infer for the AR sampler.
     // Forces the per-row host download even when RP is off (extra D2H per
     // cycle); off-by-default for that reason.
-    let ngram_block_active = !use_temp_sampling
-        && std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1");
+    static NGRAM_BLOCK_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ngram_block_env = *NGRAM_BLOCK_ENV.get_or_init(|| {
+        std::env::var("HIPFIRE_DFLASH_NGRAM_BLOCK").ok().as_deref() == Some("1")
+    });
+    let ngram_block_active = !use_temp_sampling && ngram_block_env;
     let host_path_active = rp_active || ngram_block_active;
 
     if let Some(pld) = pld_spine {
@@ -2658,6 +2734,9 @@ pub fn spec_step_dflash(
 
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
+                // INVARIANT: substrate-only (greedy-parity with decode); see the
+                // earlier Q8_0 spec-verify path in this file for the full rationale.
+                // Do not route through the Q8 WMMA dispatcher.
                 gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             rdna_compute::DType::HFQ4G256 => {
@@ -2669,7 +2748,9 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                // AWQ-aware rotation; same rationale as the target-verify
+                // arms above.
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
@@ -2678,7 +2759,7 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for MQ3 draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
@@ -3296,7 +3377,9 @@ fn run_dflash_draft_for_logits(
         }
         rdna_compute::DType::MQ4G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            // AWQ-aware rotation; see the target-verify dispatch above for the
+            // rationale (numerically identical when `w_out.awq_scale` is None).
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);
@@ -3310,7 +3393,7 @@ fn run_dflash_draft_for_logits(
         }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);
@@ -3459,7 +3542,9 @@ fn run_dflash_draft_for_topk_gpu(
         }
         rdna_compute::DType::MQ4G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            // AWQ-aware rotation for the target lm_head when an AWQ
+            // sidecar is attached. Sister of the spec-verify dispatch above.
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);
@@ -3473,7 +3558,7 @@ fn run_dflash_draft_for_topk_gpu(
         }
         rdna_compute::DType::MQ3G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);

@@ -6,7 +6,7 @@ in the hot path. Ollama-style UX.
 ```bash
 hipfire pull qwen3.5:9b
 hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve -d        # background daemon, OpenAI-compatible API on :11435
+hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
 ```
 
 Current release: **v0.1.20** — engine modularization. See [CHANGELOG.md](CHANGELOG.md).
@@ -134,7 +134,23 @@ the prefill MMQ redesign log is at
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+hipfire is dual-licensed under MIT or Apache-2.0 at your option. See
+[LICENSE](LICENSE) (dual-license pointer), [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) for details.
+
+New contributions default to Apache-2.0 via DCO sign-off; existing
+contributors' MIT-licensed contributions remain MIT unless they opt
+in. Each source file carries an `SPDX-License-Identifier` reflecting
+actual authorship (MIT, Apache-2.0, or `MIT OR Apache-2.0`). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor side and
+[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
+for the decision record (including the 2026-05-19 course correction
+from a unilateral Apache-2.0 relicense to dual licensing).
+
+Original architectural innovations originating in hipfire are
+catalogued in [PRIOR-ART.md](PRIOR-ART.md); derivative works
+(including reimplementations informed by hipfire's design) should
+attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 

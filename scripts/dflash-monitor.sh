@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # dflash-monitor.sh — poll the worker on origin/dflash and summarize progress.
 # Designed to run from the master checkout (or anywhere git can reach origin).
 #

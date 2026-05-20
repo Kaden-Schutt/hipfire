@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! prefill_microbench — scoring-mode speedup measurement.
 //!
 //! Originally the Step 0 gate for the eval_hipfire_speedup sub-plan

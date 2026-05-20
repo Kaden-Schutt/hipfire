@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 alpineq
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Non-causal cross-attention kernel for DFlash draft forward.
 //
 // Each query position attends to ALL key/value positions (non-causal,

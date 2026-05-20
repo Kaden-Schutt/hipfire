@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Parity test for the HFQ3 (uniform-MQ3) WMMA family — covers all 4
 //! kernels (residual + qkvza + qkv + gate_up) with both `_wmma` and `_mb4`
 //! variants. Verifies `_mb4` output is bit-exact against `_wmma` for the

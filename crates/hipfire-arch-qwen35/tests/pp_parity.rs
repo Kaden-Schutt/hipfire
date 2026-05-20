@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stage 9 multi-GPU parity test (env-gated).
 //!
 //! Runs only when `HIPFIRE_HAVE_2_GPU=1` is set — single-GPU dev boxes

@@ -1,0 +1,15 @@
+[package]
+name = "hipfire-atlas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Kernel Atlas: typed measurement schema + JSONL writer for hipfire bench corpus"
+
+[dependencies]
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "hipfire-atlas"
+path = "src/main.rs"

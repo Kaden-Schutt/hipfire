@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Unified Qwen3.5 inference — text-only or vision-language.
 //! Usage:
 //!   infer <model.hfq> [prompt...]                          # text-only

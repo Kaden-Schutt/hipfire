@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # A/B eval: baseline MQ4 vs approximate-MQ3 (sim_mq3.py).
 # Runs the same prompts through both copies and prints decoded text side-by-side.
 #

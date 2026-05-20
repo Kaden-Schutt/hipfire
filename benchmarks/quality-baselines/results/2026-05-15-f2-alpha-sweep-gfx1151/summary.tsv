@@ -1,0 +1,4 @@
+alpha	quantize_sec	eval_sec	kldseq_path
+0.50	194	1058	benchmarks/quality-baselines/results/2026-05-15-f2-alpha-sweep-gfx1151/per-variant/a0_50/awq-a0_50.kldseq
+0.55	113	1069	benchmarks/quality-baselines/results/2026-05-15-f2-alpha-sweep-gfx1151/per-variant/a0_55/awq-a0_55.kldseq
+0.60	122	1077	benchmarks/quality-baselines/results/2026-05-15-f2-alpha-sweep-gfx1151/per-variant/a0_60/awq-a0_60.kldseq

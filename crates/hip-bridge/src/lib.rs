@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hip-bridge: Safe Rust FFI to AMD HIP runtime via dlopen.
 //! Modeled after rustane's ane-bridge — no link-time dependency on libamdhip64.
 

@@ -193,6 +193,38 @@ negative-result log of attempts that looked like wins in one-shell A/B
 but measured as no-op or regression on fresh probe — check it before
 starting a new kernel experiment.
 
+**Δ ≥ 5% investigation rule (mandatory).** Any perf delta whose
+magnitude crosses ±5% warrants investigation. Do NOT shrug it off as
+"within the ±10–15 % session noise band" — that band describes
+worst-case spread, not the expected center, and a ±5% point estimate
+is most likely real signal partly masked by noise. Walk the rule
+cheapest-step first:
+
+1. **Warming first (always cheapest, always required).** Re-run 3–5
+   times with the established protocol — one `--max 16` warmup per
+   cell, gpu-tcas-coordinated, fresh process per measure, byte-identical
+   prompt (md5 recorded). Take the median of the 3–5 measures.
+   - Median snaps back to baseline → thermal/DPM/cache noise. Record
+     and close.
+   - Median holds (still ≥5%) → the delta is real. Continue.
+2. **If real LOSS: investigation rule activated.** Walk in order
+   (cheapest diagnostic first): kernel occupancy (use the
+   `gfx-kernel-metadata` skill — VGPR/SGPR/LDS/spill from `.hsaco`),
+   rocprof attribution, env state (ROCm version, kernel cache,
+   sccache, mold, DPM governor), flag state (`HIPFIRE_*` env vars,
+   `--kv-mode`, `--no-chatml`, `prompt_normalize`, prompt md5), then
+   code-change bisect via `scripts/probe_commits.sh`.
+3. **If real GAIN: coherence MUST be established before ANY claim.**
+   Run `./scripts/coherence-gate.sh` and (if spec-decode touched)
+   `./scripts/coherence-gate-dflash.sh`. A win that ships an
+   attractor / token loop / special-token leak / structural repetition
+   is not a win — it's a regression on the output axis hiding behind a
+   tok/s number. See the multiple "synth-win → prod-falsify" entries
+   in memory (`feedback_v2_sgpr_lut_falsified_2026_05_10`,
+   `project_gfx11_dot2_trickle_down_falsified_2026_05_11`,
+   `project_fp8_wmma_hfp4g32_2026_05_10`) — every one of them passed a
+   synthetic microbench, then failed coherence or fresh-probe perf.
+
 **Diagnosing memset pressure:** run with `HIPFIRE_MEMSET_DUMP=1` — the
 gpu layer's memset helper is `#[track_caller]` and prints `file:line`
 per call. Grep the dump by source location, not by byte size. Note:

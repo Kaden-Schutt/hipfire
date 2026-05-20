@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! KFD (Kernel Fusion Driver) interface for user-mode AQL compute queues.
 //!
 //! This bypasses the amdgpu_cs_submit ioctl path entirely.

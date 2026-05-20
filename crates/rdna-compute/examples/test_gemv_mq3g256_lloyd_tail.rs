@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Tail K-sweep parity test for gemv_mq3g256_lloyd.
 //!
 //! Sweeps groups_per_row ∈ {4, 5, 6, 7, 8} (K ∈ {1024, 1280, 1536, 1792, 2048})

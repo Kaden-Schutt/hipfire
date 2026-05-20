@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! coherence_probe — user-facing model behavior debugger.
 //!
 //! Spawns the daemon as a child process, drives a prompt through it,

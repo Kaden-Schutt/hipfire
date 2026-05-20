@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Real-measurement VRAM probe for the multi-GPU PP=2 path. Loads the
 //! given model with `load_weights_multi`, builds `Qwen35ScratchSet` +
 //! `KvCache::new_gpu_asym3_capped_multi` + `DeltaNetState` (Q8), and

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness test for gemm_hfq4g256_wave64_dp4a vs the FP wave64
 //! reference. Both produce y[b, m] = sum_k A[m, k] * x[b, k]; they
 //! differ by Q8_1 quantization noise on x (~1 % per-element relative).

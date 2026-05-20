@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness + perf test for the gfx12 FP8-dot4 HFP4G32 decode GEMV.
 //!
 //! Compares `gemv_hfp4g32_fp8_gfx12` against the fallback `gemv_hfp4g32`

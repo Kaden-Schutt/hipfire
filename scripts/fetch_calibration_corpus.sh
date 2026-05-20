@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # fetch_calibration_corpus.sh — build a corpus by concatenating one or
 # more HuggingFace datasets, flattened to a ChatML-wrapped plain-text
 # stream. **Used by two distinct flows; do not confuse them:**

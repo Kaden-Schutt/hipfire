@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! DFlash draft forward pass — native Rust+HIP.
 //!
 //! Minimal dependency surface: only reads HFQ draft files (arch_id = 20),
@@ -26,6 +30,20 @@ use crate::hfq::HfqFile;
 use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)
+/// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
+/// sized to this many rows × `max(inter, q_dim, num_extract * hidden)`,
+/// regardless of context length. Calls with `batch > MQ_X_ROT_CHUNK_ROWS`
+/// are chunked transparently inside `gemm_dispatch`.
+///
+/// Sizing rationale: at chunk=1024 and 27B (ne*h = 25600 floats per row),
+/// the scratch is `1024 × 25600 × 4 ≈ 100 MB`. The pre-2026-05-15
+/// allocator sized this buffer to `max_seq × ne × h`, which at ctx=17K
+/// reached 1.74 GB on 27B — a multi-GB waste that scaled with `max_seq`.
+/// Chunking adds `ceil(batch / 1024)` extra kernel launches on the
+/// first-call `fc` rotation (one-shot per prompt, negligible vs prefill).
+const MQ_X_ROT_CHUNK_ROWS: usize = 1024;
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -181,7 +199,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
     let (info, data) = hfq
         .tensor_data(name)
         .unwrap_or_else(|| panic!("dflash tensor missing: {name}"));
-    match info.quant_type {
+    let mut wt = match info.quant_type {
         1 => {
             // F16 on disk. Default: upload as F16 (no lift) and dispatch through
             // the mw16 WMMA kernel — 3-5× faster draft at B=16 on gfx1100 than
@@ -194,7 +212,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             if use_f16 {
                 assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
                 let buf = gpu.upload_raw(data, &[m * k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
             } else {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
@@ -202,7 +220,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
                     .collect();
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
                 let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
         }
         2 => {
@@ -212,23 +230,55 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
                 .collect();
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
             let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         13 => {
             // MQ4-G256: 136 bytes per 256 weights. The buffer is opaque to
             // the engine; the gemm_hfq4g256 kernel reads it directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         17 => {
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4. Dispatch path (`gemm_dispatch`) routes through
             // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, paro: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
+    }?;
+    // AWQ sidecar attachment — same pattern as hfq.rs::load_weight_tensor
+    // and qwen35.rs::load_weight_tensor. Routed through the centralized
+    // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
+    // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
+    // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
+    //
+    // Logic is inlined rather than calling out to hfq.rs's closure or
+    // qwen35.rs's `load_awq_scale_for` to avoid pulling in a cross-crate
+    // dependency for what is structurally a third copy of the same load.
+    // Factor-out (one shared `pub fn load_awq_scale_for` in this crate)
+    // is tracked as a follow-up.
+    if wt.gpu_dtype.supports_awq_sidecar() {
+        let sidecar_name = match name.strip_suffix(".weight") {
+            Some(stem) => format!("{stem}.awq_scale.weight"),
+            None => format!("{name}.awq_scale.weight"),
+        };
+        if let Some((sc_info, sc_data)) = hfq.tensor_data(&sidecar_name) {
+            if sc_info.quant_type != 1 {
+                eprintln!("warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping", sc_info.quant_type);
+            } else if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+                eprintln!("warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping", sc_info.shape, k);
+            } else {
+                let f32_data: Vec<f32> = sc_data
+                    .chunks_exact(2)
+                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                wt.awq_scale = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok();
+            }
+        }
     }
+    Ok(wt)
 }
 
 impl DflashWeights {
@@ -422,11 +472,26 @@ impl DflashScratch {
         let kvd = cfg.kv_dim();
 
         let mq_x_rot = if with_mq {
-            // The widest single rotation: max(max_ctx × ne*h, max_block × max(intermediate, q_dim)).
-            // ne*h on ctx is the `fc` rotation (target_hidden). intermediate is the `w_down`
-            // rotation. q_dim is the `wo` rotation. Take the max so a single
-            // buffer covers them all.
-            let widest = std::cmp::max(l * ne * h, b * std::cmp::max(inter, qd));
+            // Sized for a CHUNK of the worst-case MQ rotation, not the whole
+            // first-call prefix. The rotations called through `gemm_dispatch`
+            // are:
+            //   - first-call `fc` (target_hidden):  batch up to `l`, w.k = ne*h
+            //   - per-cycle wq/wk/wv/gate/up:       batch = b,         w.k = h
+            //   - per-cycle wo:                     batch = b,         w.k = q_dim
+            //   - per-cycle w_down:                 batch = b,         w.k = intermediate
+            //   - first-call wk/wv on prefix:       batch up to `l`,   w.k = h
+            //
+            // Steady-state cycles only need `b × max(inter, qd, ne*h)`. The
+            // first-call rotations against the full prefix used to pin the
+            // buffer to `l × ne × h` (1.7 GB at ctx=17K on 27B). That sizing
+            // forced VRAM bloat that scales with max_seq.
+            //
+            // Fix: cap the scratch at `MQ_X_ROT_CHUNK_ROWS × max(inter, qd, ne*h)`
+            // floats and chunk any call where `batch × w.k > scratch.size()`
+            // inside `gemm_dispatch`. The first-call rotations are split into
+            // `ceil(batch / chunk_rows)` smaller GEMMs — adds ~1-2 launches per
+            // 1K prefix tokens (negligible vs seconds-scale prefill).
+            let widest = MQ_X_ROT_CHUNK_ROWS * std::cmp::max(inter, std::cmp::max(qd, ne * h));
             Some(gpu.alloc_tensor(&[widest], DType::F32)?)
         } else {
             None
@@ -577,23 +642,76 @@ fn gemm_dispatch(
         DType::F16 => gpu.gemm_f16_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::HFQ4G256 => gpu.gemm_hfq4g256_batched_lmhead(&w.buf, x, y, w.m, w.k, batch),
         DType::MQ4G256 => {
+            // Chunk on `batch` when the request exceeds the scratch capacity
+            // for this w.k. `mq_x_rot` is sized to MQ_X_ROT_CHUNK_ROWS × max(...)
+            // — first-call rotations against the full prefix split into
+            // `ceil(batch / max_chunk)` GEMMs.
             let scratch = mq_x_rot.expect("MQ4 dispatch requires mq_x_rot scratch");
-            // Use the prefix [0, batch * k) of the rotation scratch.
-            let rot_view = scratch.sub_offset(0, batch * w.k);
-            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
-            gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                // AWQ-aware FWHT rotation. When the drafter weight ships an
+                // AWQ sidecar (`w.awq_scale.is_some()`), `_for` dispatches
+                // the `x /= awq_scale` + FWHT kernel; otherwise falls
+                // through to the plain `rotate_x_mq_batched` and is
+                // numerically identical to the prior dispatch.
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                if let Err(e) = gpu.gemm_hfq4g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
         }
         DType::MQ3G256 => {
             // Mirrors the MQ4 path: pre-rotate x via FWHT (same shared signs
             // as MQ4 — rotate_x_mq_batched is dtype-agnostic for the activation
             // side), invalidate the FP16 x cache because the rotated bytes
             // share the same source pointer, then dispatch the HFQ3 batched
-            // lm_head WMMA kernel.
+            // lm_head WMMA kernel. Chunked symmetrically with MQ4.
+            //
+            // `fp16_x_source_ptr` is invalidated ONCE before the chunk loop —
+            // not per-iteration. The MQ3 dispatch always overwrites the
+            // shared rotation scratch from scratch each call (no chunk can
+            // re-read FP16 from the previous chunk's output), so the
+            // invalidation only needs to fire once per gemm_dispatch entry.
+            // Previously the assignment was inside the loop, firing
+            // `ceil(batch / max_chunk)` times for no extra correctness.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
-            let rot_view = scratch.sub_offset(0, batch * w.k);
-            gpu.rotate_x_mq_batched(x, &rot_view, w.k, batch)?;
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
             gpu.fp16_x_source_ptr = std::ptr::null_mut();
-            gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, y, w.m, w.k, batch)
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                // Same AWQ-aware FWHT rotation as the MQ4 arm. Drafters
+                // that ship MQ3 AWQ sidecars (via the loader fix in
+                // `hfq_weight`) now actually receive the `x /= s` divide
+                // before the HFQ3 GEMM; pre-fix this silently produced
+                // wrong drafts on AWQ-calibrated drafters.
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                if let Err(e) = gpu.gemm_hfq3g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
         }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };

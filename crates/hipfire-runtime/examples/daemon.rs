@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hipfire engine daemon — JSON lines over stdin/stdout.
 //! The Bun CLI spawns this process and communicates via IPC.
 //! Usage: daemon (reads JSON from stdin, writes JSON to stdout)
@@ -24,6 +28,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_arch_llama::Llama;
+use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -32,6 +37,8 @@ use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
+use hipfire_arch_qwen35_vl::image;
+use base64::Engine;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -121,6 +128,31 @@ struct CaskConfig {
 /// helper below is the simpler fallback for unpaired tokens — trips on
 /// `count >= threshold` regardless of structure — kept here as
 /// reference for a future per-token attractor block.
+/// CPU-side counterpart that applies the same depth-tracking attractor
+/// block directly to a freshly-downloaded logits vector. Avoids the
+/// htod-memcpy + redownload roundtrip the GPU variant required per token.
+fn block_attractor_unclosed_cpu(
+    logits: &mut [f32],
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 || open_id == close_id { return; }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id { depth += 1; }
+        else if t == close_id && depth > 0 { depth -= 1; }
+    }
+    if depth >= threshold as i32 {
+        if let Some(slot) = logits.get_mut(open_id as usize) {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
 //
 // ─── Probe-mode `committed` event emitter ────────────────────────────────
 //
@@ -236,10 +268,41 @@ fn acquire_daemon_lock() -> std::fs::File {
     f
 }
 
-const IMAGE_SIZE: usize = 448;
-const IMAGE_PAD_ID: u32 = 248056;
-const VISION_START_ID: u32 = 248053;
-const VISION_END_ID: u32 = 248054;
+/// Cap on the *encoded* base64 string length the daemon will accept on the
+/// IPC. ~40 MB encoded → ~30 MB raw image bytes (4/3 expansion).
+const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+
+/// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
+/// line on the IPC stream. Uses `serde_json` so user-controlled error
+/// strings (image decoder messages, base64 errors) can't desync the
+/// protocol by injecting embedded `"`, `\`, or newline bytes.
+fn write_error(stdout: &mut std::io::Stdout, id: &str, message: &str) {
+    let line = serde_json::json!({
+        "type": "error",
+        "id": id,
+        "message": message,
+    });
+    let _ = writeln!(stdout, "{line}");
+    let _ = stdout.flush();
+}
+
+enum ImageSource<'a> {
+    Path(&'a str),
+    Base64(&'a str),
+}
+
+struct GenerateVLParams<'a> {
+    id: &'a str,
+    prompt: &'a str,
+    system_prompt: Option<&'a str>,
+    image_source: ImageSource<'a>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    max_think_tokens: usize,
+}
 
 /// Optional DFlash speculative-decoding state. Populated when `load` supplies
 /// a matching draft (.hfq arch=20) via `params.draft`. Used by the daemon's
@@ -324,6 +387,12 @@ struct LoadedModel {
     llama_weights: Option<llama::LlamaWeights>,
     llama_scratch: Option<llama::ForwardScratch>,
     llama_kv: Option<llama::KvCache>,
+    // Qwen2 state (arch_id=7 — hipfire-arch-qwen2 standalone). The
+    // KV cache lives inside Qwen2State, so there's no separate
+    // qwen2_kv field. None on every other arch path.
+    qwen2_config: Option<qwen2::Qwen2Config>,
+    qwen2_weights: Option<qwen2::Qwen2Weights>,
+    qwen2_state: Option<qwen2::Qwen2State>,
     // Vision state (VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -584,7 +653,8 @@ fn main() {
 
                 // MMQ per-weight screening (#87): detect outlier rows that
                 // cause Q8_1 precision loss and fall back to WMMA for those
-                // weights. Enabled by default; disable with mmq_screen=false.
+                // weights. Disabled by default; enable with mmq_screen=true
+                // (or HIPFIRE_MMQ_SCREEN=1) when adding new quant formats.
                 if let Some(v) = msg.get("params").and_then(|p| p.get("mmq_screen")).and_then(|v| v.as_bool()) {
                     gpu.mmq_screen = v;
                 }
@@ -663,11 +733,15 @@ fn main() {
                     }
                 }
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), &cask, pp, &mut gpu) {
+                let state_quant_override = msg.get("params").and_then(|p| p.get("state_quant")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
+
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
+                            7 => "qwen2",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some();
@@ -675,6 +749,8 @@ fn main() {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.qwen2_config {
+                            (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else { (0, 0, 0) };
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -808,10 +884,67 @@ fn main() {
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
                 let image = msg.get("image").and_then(|v| v.as_str());
+                let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+
+                // Structured-tools + structured-messages support (Phase 1 of
+                // Jinja-everywhere migration). When present, both fields are
+                // routed through `JinjaChatFrame::render_messages` so the
+                // model sees the upstream template's `{% if tools %}` and
+                // multi-turn branches (XML/JSON tool-call format per arch,
+                // tool-response role mapping, etc.).
+                //
+                // Backward compat: when neither is present, legacy
+                // `prompt`+`system` continues to drive a synthesized
+                // [system?, user] slice — byte-identical to today's
+                // `JinjaChatFrame::render()` single-turn path.
+                //
+                // Parse errors emit a structured error event and skip the
+                // request (rather than silently dropping the fields).
+                let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
+                    Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
+                        Ok(t) => Some(t),
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","id":"{}","message":"invalid tools field: {}"}}"#,
+                                id, e.to_string().replace('"', "'"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
+                let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> = match msg.get("messages") {
+                    Some(v) => match serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone()) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            let _ = writeln!(
+                                stdout,
+                                r#"{{"type":"error","id":"{}","message":"invalid messages field: {}"}}"#,
+                                id, e.to_string().replace('"', "'"),
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    },
+                    None => None,
+                };
                 let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
                 let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
-                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.3) as f32;
+                // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
+                // and HF transformers `generate(repetition_penalty=1.0)`
+                // defaults. The prior 1.3 default suppressed legitimately
+                // repeated formatting tokens (e.g. `' **'` for bullets,
+                // indentation patterns) on multi-step reasoning prompts,
+                // pushing structured chain-of-thought trajectories off the
+                // model's well-trained path into a self-doubt / number-
+                // hallucination attractor on 9B Qwen3.5 at greedy decode.
+                // Root cause writeup: issue #258 comment "Bug B root cause"
+                // and docs/investigations/2026-05-15-9b-reasoning-loop/.
+                // Clients can still opt in to a non-1.0 value per request.
+                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -854,6 +987,8 @@ fn main() {
 
                 // assistant_prefix: "plain", "open_think", or "closed_think"
                 // Controls the ChatML framing after the assistant role header.
+                // Consumed by the text path; VL path does not yet propagate
+                // it (tracked as a follow-up to the post-#169 rebase).
                 let assistant_prefix = match msg.get("assistant_prefix")
                     .and_then(|v| v.as_str()).unwrap_or("plain")
                 {
@@ -862,8 +997,40 @@ fn main() {
                     _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
                 };
 
-                if image.is_some() && m.vision_config.is_some() {
-                    generate_vl(m, &mut gpu, &mut stdout, id, prompt, system, image.unwrap(), temp, top_p, max_tokens, repeat_penalty, repeat_window);
+                let has_image = image_base64.is_some() || image.is_some();
+                let has_vl = m.vision_config.is_some();
+
+                if has_image && !has_vl {
+                    write_error(&mut stdout, id, "model has no vision encoder");
+                } else if has_image && has_vl {
+                    if image_base64.is_some() && image.is_some() {
+                        eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+                    }
+                    let source = if let Some(b64) = image_base64 {
+                        if b64.len() > MAX_BASE64_ENCODED_LEN {
+                            write_error(&mut stdout, id, &format!(
+                                "image payload exceeds maximum encoded size ({} bytes)",
+                                MAX_BASE64_ENCODED_LEN,
+                            ));
+                            continue;
+                        }
+                        ImageSource::Base64(b64)
+                    } else {
+                        ImageSource::Path(image.unwrap())
+                    };
+                    // Plan-mandated Phase-1 stopgap (docs/plans/completions_vision.md §2.1):
+                    // VL dispatch defaults `max_think_tokens` to 256 when the
+                    // client doesn't specify one. Caps runaway thinking
+                    // without needing the full `ThinkState` extraction. Text
+                    // path keeps unwrap_or(0) — it has different defaults
+                    // controlled per-model on the CLI side.
+                    let vl_max_think_tokens = if max_think_tokens == 0 { 256 } else { max_think_tokens };
+                    let params = GenerateVLParams {
+                        id, prompt, system_prompt: system, image_source: source,
+                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
+                        max_think_tokens: vl_max_think_tokens,
+                    };
+                    generate_vl(m, &mut gpu, &mut stdout, &params);
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
                     // and apply any per-request overrides from `params`.
@@ -928,6 +1095,8 @@ fn main() {
                         assistant_prefix,
                         pflash_state.as_mut(),
                         pf_cfg_owned.as_ref(),
+                        tools_json.as_deref(),
+                        messages_history.as_deref(),
                     );
                 }
             }
@@ -980,6 +1149,12 @@ fn main() {
                     }
                     if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
                     if let Some(kv) = m.llama_kv.as_mut() { kv.compact_offset = 0; }
+                    // arch_id=7: rewind the Qwen2State position cursor so
+                    // the next prefill writes from KV[0]. Without this, a
+                    // reset between turns would leak the prior turn's KV
+                    // entries into attention for the new turn — fluent
+                    // garbage, no panic. See `Qwen2State::reset` doc.
+                    if let Some(ref mut s) = m.qwen2_state { s.reset(); }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1019,6 +1194,7 @@ fn main() {
                 let model_arch = model.as_ref().map(|m| match m.arch_id {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
+                    7 => "qwen2",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1091,6 +1267,10 @@ fn main() {
                     for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                     for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
                 }
+                // Qwen2 (arch_id=7) doesn't have a separate KV buffer — the cache
+                // and the per-step scratch share `Qwen2State`. Reset its position
+                // cursor here so bench_prefill measures cold prefill.
+                if let Some(ref mut s) = m.qwen2_state { s.reset(); }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -1105,6 +1285,21 @@ fn main() {
                     let kv = m.kv_cache.as_mut().unwrap();
                     let dn = m.dn_state.as_mut().unwrap();
                     qwen35::forward_prefill_batch(&mut gpu, weights, config, &synthetic, 0, kv, dn, scratch, None, None, None, None).is_ok()
+                } else if m.arch_id == 7 {
+                    // Qwen2 has no batched prefill kernel yet — per-token loop
+                    // mirroring the LLaMA fallback path. The loop seeds
+                    // position via `state.next_pos` (already reset above to 0).
+                    let config = m.qwen2_config.as_ref().unwrap();
+                    let weights = m.qwen2_weights.as_ref().unwrap();
+                    let state = m.qwen2_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for &tok in &synthetic {
+                        if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
                 } else {
                     let config = m.llama_config.as_ref().unwrap();
                     let weights = m.llama_weights.as_ref().unwrap();
@@ -1242,14 +1437,57 @@ fn resolve_chat_template(
     hfq.chat_template()
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn parse_state_quant(mode: Option<&str>) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    match mode.unwrap_or("q8").to_ascii_lowercase().as_str() {
+        "" | "auto" | "q8" | "int8" => Ok(StateQuant::Q8),
+        "fp32" | "f32" => Ok(StateQuant::FP32),
+        "q4" | "int4" => Ok(StateQuant::Q4),
+        other => Err(format!("unsupported DeltaNet state_quant '{other}' (expected q8|fp32|q4)")),
+    }
+}
+
+fn state_quant_label(q: hipfire_arch_qwen35::qwen35::StateQuant) -> &'static str {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    match q {
+        StateQuant::FP32 => "FP32",
+        StateQuant::Q8 => "Q8",
+        StateQuant::Q4 => "Q4",
+    }
+}
+
+fn hfq_parameter_count(hfq: &HfqFile) -> u128 {
+    hfq.tensors()
+        .iter()
+        .map(|t| {
+            t.shape
+                .iter()
+                .fold(1u128, |acc, &dim| acc.saturating_mul(dim as u128))
+        })
+        .sum()
+}
+
+fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQuant) {
+    use hipfire_arch_qwen35::qwen35::StateQuant;
+    const TINY_MODEL_PARAMS: u128 = 2_000_000_000;
+    let params = hfq_parameter_count(hfq);
+    if params < TINY_MODEL_PARAMS && q != StateQuant::FP32 {
+        eprintln!(
+            "  warning: model has ~{:.2}B params; FP32 DeltaNet state is recommended below 2B for long-generation coherence (current: {})",
+            params as f64 / 1.0e9,
+            state_quant_label(q)
+        );
+    }
+}
+
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
         let _ = (draft_path, cask);
-        return load_model_pp(path, max_seq, kv_mode_override, pp, gpu);
+        return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -1268,7 +1506,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
 
     let mut hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     // DFlash speculative-decode requires the target's lm_head to have a
     // batched-GEMM kernel (used for verify and DDTree top-K). Only
@@ -1393,6 +1631,45 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         max_seq
     };
 
+    if hfq.arch_id == 7 {
+        // Qwen2 dense (hipfire-arch-qwen2). Standalone bring-up — no
+        // eviction, no DFlash, no PFlash, no VL. The Architecture
+        // trait surface gives us config + weights + state in three
+        // calls; forward is direct `qwen2::forward_step` below.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=7 (hipfire-arch-qwen2 bring-up). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        use hipfire_arch_qwen2::Qwen2;
+        let config = <Qwen2 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <Qwen2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("qwen2: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
     if hfq.arch_id == 5 || hfq.arch_id == 6 {
         // Qwen3.5 DeltaNet (arch=5 dense, arch=6 MoE/A3B). PR 8: dispatch
         // through the `Architecture` trait for the bring-up triple
@@ -1430,7 +1707,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // MMQ per-weight screening (#87): pre-screen all weight matrices at
         // load time so the first prefill doesn't pay the screening overhead.
         // Results are cached by device pointer in gpu.mmq_screen_cache.
-        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
+        // Disabled by default on all arches; opt-in via mmq_screen=true or
+        // HIPFIRE_MMQ_SCREEN=1. gfx906 is included for the opt-in case so
+        // its ~700 µs/weight screening-reference dispatch doesn't surprise
+        // first prefill if a user enables it.
+        if gpu.mmq_screen && matches!(gpu.arch.as_str(), "gfx906" | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103" | "gfx1150" | "gfx1151" | "gfx1152") {
             let t0 = std::time::Instant::now();
             let (n_safe, n_unsafe) = screen_weights_qwen35(&weights, gpu);
             let elapsed = t0.elapsed();
@@ -1471,16 +1752,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
-        // MoE models (num_experts > 0) have ~10x smaller hidden-state
-        // magnitudes than dense models, making Q8 DeltaNet state quantization
-        // error proportionally larger. Use FP32 state to avoid cumulative
-        // drift that degenerates output after ~200 tokens.
-        let dn_quant = if config.num_experts > 0 {
-            eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-            hipfire_arch_qwen35::qwen35::StateQuant::FP32
-        } else {
-            hipfire_arch_qwen35::qwen35::StateQuant::Q8
-        };
+        // Q8 DeltaNet state can accumulate quality drift on long generation.
+        // The load-time override exists for coherence A/B probes.
+        let dn_quant = parse_state_quant(state_quant_override)?;
+        eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+        warn_tiny_model_state(&hfq, dn_quant);
         let dn = DeltaNetState::new_with_quant(gpu, &config, dn_quant).map_err(|e| format!("{e}"))?;
         // Flash partials size with physical_cap (bounds the max_tiles the
         // flash kernel must address). When physical_cap == max_seq this is
@@ -1556,6 +1832,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
@@ -1585,6 +1862,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             q35_config: None, q35_weights: None, q35_scratch: None,
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1614,6 +1892,7 @@ fn load_model_safetensors(
     // Tokenizer from tokenizer.json
     let tokenizer = if let Some(tok_path) = source.tokenizer_json_path() {
         hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+            .map_err(|e| format!("failed to parse tokenizer at {}: {e}", tok_path.display()))?
             .ok_or_else(|| format!("failed to load tokenizer from {}", tok_path.display()))?
     } else {
         return Err("no tokenizer.json found in model directory".into());
@@ -1739,6 +2018,7 @@ fn load_model_pp(
     path: &str,
     max_seq: usize,
     kv_mode_override: Option<&str>,
+    state_quant_override: Option<&str>,
     pp: usize,
     _gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
@@ -1748,7 +2028,7 @@ fn load_model_pp(
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .ok_or("tokenizer not found")?;
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
 
     if hfq.arch_id != 5 && hfq.arch_id != 6 {
         return Err(format!(
@@ -1797,28 +2077,27 @@ fn load_model_pp(
 
     let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).map_err(|e| format!("{e}"))?;
 
-    // KV cache (asym3 default, q8/asym4/asym2 selectable). physical_cap ==
-    // max_seq on this path — eviction is refused at load.
+    // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
+    // physical_cap == max_seq on this path — eviction is refused at load.
     let kv = match kv_mode.as_str() {
         "q8" => llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
             llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
         }
     };
 
-    // MoE state-quant rule mirrors the pp=1 path (Q8 drift on small hidden
-    // states); apply at the multi entry point so bit-equivalence with pp=1
-    // forward output holds when both run on the same model.
-    let dn_quant = if config.num_experts > 0 {
-        eprintln!("  DeltaNet state: FP32 (MoE model — Q8 drift mitigation)");
-        qwen35::StateQuant::FP32
-    } else {
-        qwen35::StateQuant::Q8
-    };
+    // Mirror the pp=1 state-mode parser so pp parity probes can force the
+    // same DeltaNet state representation.
+    let dn_quant = parse_state_quant(state_quant_override)?;
+    eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
+    warn_tiny_model_state(&hfq, dn_quant);
     let (dn, la_to_device) =
         DeltaNetState::new_with_quant_multi(&mut gpus, &config, dn_quant).map_err(|e| format!("{e}"))?;
 
@@ -1846,6 +2125,7 @@ fn load_model_pp(
         kv_cache: Some(kv),
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+        qwen2_config: None, qwen2_weights: None, qwen2_state: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1947,10 +2227,15 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(s) = m.q35_scratch { s.free_gpu(gpu); }
     if let Some(kv) = m.llama_kv { kv.free_gpu(gpu); }
     if let Some(s) = m.llama_scratch { s.free_gpu(gpu); }
+    // Qwen2 state holds both the per-step scratch AND the KV cache — one
+    // free_gpu call handles both. (Compare LLaMA where ForwardScratch and
+    // KvCache are separate fields.)
+    if let Some(s) = m.qwen2_state { s.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.qwen2_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
@@ -2186,23 +2471,89 @@ fn generate_dflash(
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pflash_bypass_reason: Option<&str>,
     pflash_alpha: Option<f32>,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
     };
 
-    // Tokenize with ChatML wrapping (identical to the AR path). System prompt
-    // is always prepended because this fast path is single-turn.
+    // Prompt build: same two-path branch as the AR-path generate() — when
+    // `HIPFIRE_JINJA_CHAT=1` AND the model carries a chat_template, render
+    // via `JinjaChatFrame` so structured `tools` / `messages` can reach
+    // the upstream template's `{% if tools %}` / multi-turn branches.
+    // Otherwise fall back to the hand-rolled `ChatFrame::Plain` scaffold
+    // (byte-identical to the prior DFlash-path build).
+    //
+    // DFlash is single-turn by construction — `seq_pos` is reset to 0
+    // below before seed_target_hidden_from_prompt runs — so we never
+    // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: system_prompt,
-        user: prompt,
-        assistant_prefix,
-        raw: false,
-    }
-    .build();
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let prompt_tokens: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in dflash path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: prompt,
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build()
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build()
+    };
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -2629,6 +2980,8 @@ fn generate_multi(
     budget_alert_text: &str,
     max_think_tokens: usize,
     assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
@@ -2727,17 +3080,82 @@ fn generate_multi(
         raw_q_tokens
     };
 
-    // ChatML framing via the canonical hipfire_runtime::prompt_frame module.
-    // Identical to the pp=1 path so multi-turn behavior matches byte-for-byte
-    // when both paths run the same model on the same prompt history.
-    let new_tokens = hipfire_runtime::prompt_frame::ChatFrame {
-        tokenizer,
-        system: if m.seq_pos == 0 { system_prompt } else { None },
-        user: "",
-        assistant_prefix,
-        raw: false,
-    }
-    .build_with_user_tokens(&q_tokens);
+    // ChatML framing — two paths, same shape as the single-GPU AR
+    // generate() (line 3147+):
+    //
+    //   1) HIPFIRE_JINJA_CHAT=1 + model has chat_template + seq_pos==0
+    //      → render via JinjaChatFrame so structured tools/messages
+    //      reach the upstream template. PFlash compression is bypassed
+    //      under Jinja (q_tokens is unused; the rendered prompt string
+    //      is re-tokenized straight through).
+    //
+    //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
+    //      identical to the pp=1 default path so multi-turn behavior
+    //      matches between pp=1 and pp>1 when both run the same prompt.
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let new_tokens = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: if m.seq_pos == 0 { system_prompt } else { None },
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "",
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&q_tokens)
+    };
 
     let trailer = nl.len();
     if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
@@ -3032,7 +3450,25 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+    // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
+    // generate() body is qwen35/llama-shaped and would panic on
+    // None unwraps for q35_*/llama_* fields when applied to a
+    // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
+    // / ChatML scaffolding since none of those are wired for
+    // arch_id=7 yet (R3 bring-up scope).
+    if m.arch_id == 7 {
+        // Silence the qwen35/llama-only params we deliberately don't
+        // honor on this path. See generate_qwen2 doc for the deferral
+        // list.
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                 assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
+        generate_qwen2(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, repeat_penalty, repeat_window,
+        );
+        return;
+    }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -3042,6 +3478,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
             budget_alert_at_tok, budget_alert_text, max_think_tokens,
             assistant_prefix,
+            tools, messages_history,
         );
         return;
     }
@@ -3081,8 +3518,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha);
-        // Silence unused-variable warnings for the params we didn't need.
+        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha, tools, messages_history);
+        // Silence unused-variable warnings for the params DFlash doesn't
+        // consume (top_p / repeat penalties are AR-only sampling knobs;
+        // pflash_state is bypassed on the DFlash decode path).
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
@@ -3295,7 +3734,45 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
-        match frame.render() {
+        // Phase 1 of Jinja-everywhere migration: when the caller supplies
+        // either a `tools` array or a `messages` history (or both), route
+        // through `render_messages` so the upstream template's
+        // `{% if tools %}` / multi-turn branches fire. With neither
+        // supplied, fall through to the single-turn `render()` convenience,
+        // which is byte-identical to the synthesized [system?, user]
+        // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            // Synthesize [system?, user] when no explicit history was
+            // provided. Tools-with-legacy-prompt is the natural OpenAI
+            // function-calling shape (one turn + tool definitions).
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(m) => m,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
             Ok(rendered) => tokenizer.encode(&rendered),
             Err(e) => {
                 eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
@@ -3930,18 +4407,266 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
 }
 
-fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, image_path: &str, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize) {
-    // Capacity guard — VL prompts include vision tokens + text + ChatML framing
+/// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
+///
+/// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
+/// → stream `{"type":"token",...}` events → `{"type":"done",...}`.
+///
+/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// no eviction, no ChatML scaffolding, no tool-use, no `<think>` /
+/// `max_think_tokens`, no repeat penalty, no top-p sampling. These
+/// land as the surrounding daemon features mature for the Qwen2 path.
+/// `temp` is currently honored only as a "≤ 1e-6 means greedy"
+/// signal; anything else falls back to greedy too (no sampler wired).
+///
+/// Conversation state on the daemon side advances via
+/// `m.seq_pos` (mirrors the qwen35/llama bookkeeping) plus
+/// `state.next_pos` inside `Qwen2State`. On context overflow we hard
+/// reset (no CASK eviction on arch_id=7) — same fallback the
+/// llama path uses.
+fn generate_qwen2(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    _system_prompt: Option<&str>,
+    _temp: f32,
+    _top_p: f32,
+    max_tokens: usize,
+    _repeat_penalty: f32,
+    _repeat_window: usize,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.qwen2_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2_config missing on arch_id=7 generate"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m.qwen2_weights.as_ref().expect("qwen2_weights missing on arch_id=7 generate");
+    let state = m.qwen2_state.as_mut().expect("qwen2_state missing on arch_id=7 generate");
+
+    let prompt_ids = tokenizer.encode(prompt);
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Capacity guard. No eviction on arch_id=7 yet — reset state when
+    // the requested run would overflow the KV budget.
+    if state.next_pos + prompt_ids.len() + max_tokens > state.max_seq {
+        eprintln!(
+            "[daemon] arch_id=7 context full ({}/{}) — resetting Qwen2State.next_pos",
+            state.next_pos, state.max_seq,
+        );
+        state.reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let t0 = Instant::now();
+
+    // Prefill: forward_step per prompt token. The last call leaves
+    // logits in state.logits — these are the predictions for the
+    // first generated token.
+    for &tok in &prompt_ids {
+        if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2 prefill failed: {:?}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // Decode loop. Greedy argmax for now (see fn doc for sampling
+    // scope). The first generated token is argmax of the prefill's
+    // final logits; each subsequent token requires another
+    // forward_step.
+    let mut generated_count: usize = 0;
+    let eos_set: &[u32] = &cfg.eos_token_ids;
+    let decode_t0 = Instant::now();
+    let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"argmax failed: {:?}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        if eos_set.contains(&next_tok) {
+            break;
+        }
+        // Emit text fragment for this token. Tokenizer.decode handles
+        // BPE byte-fragment reassembly; for special tokens that decode
+        // to an empty string we still advance the loop. JSON-escape the
+        // chunk so embedded quotes / control chars don't break the
+        // wire format.
+        let frag = tokenizer.decode(&[next_tok]);
+        let frag_escaped = json_escape(&frag);
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"token","id":"{}","text":"{}"}}"#,
+            id, frag_escaped,
+        );
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
+            Ok(t) => next_tok = t,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_step_greedy failed: {:?}"}}"#, id, e);
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+
+    // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
+    m.seq_pos = state.next_pos;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// Minimal JSON string escaper for the daemon's token-stream emit
+/// path. We have full control of the alphabet (BPE-decoded UTF-8)
+/// and only need to escape: backslash, double-quote, and control
+/// chars < 0x20. Non-ASCII bytes pass through as-is (the daemon
+/// client parses with serde_json which accepts UTF-8 verbatim).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
+    let GenerateVLParams { id, prompt, system_prompt, ref image_source, temp, top_p, max_tokens, repeat_penalty, repeat_window, max_think_tokens } = *params;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let vision_config = m.vision_config.as_ref().unwrap();
-    let n_patches = (IMAGE_SIZE / vision_config.patch_size) * (IMAGE_SIZE / vision_config.patch_size);
+
+    // Vision special-token IDs resolved from the tokenizer rather than
+    // hardcoded constants. Different VL-capable Qwen variants ship with
+    // different IDs for these tokens; a hardcoded mismatch silently
+    // splices the wrong tokens into the prompt. Required at load time —
+    // panic loudly here so the failure is at first-VL-request, not after
+    // a successful but wrong forward pass.
+    let image_pad_id = tokenizer.special_token_id("<|image_pad|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|image_pad|> special token"));
+    let vision_start_id = tokenizer.special_token_id("<|vision_start|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_start|> special token"));
+    let vision_end_id = tokenizer.special_token_id("<|vision_end|>")
+        .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_end|> special token"));
+
+    // Image preprocessing (CPU decode + smart resize). Cheap relative to
+    // the GPU vision encoder, so we run it before the capacity check —
+    // we need img_h/img_w to estimate visual tokens, and rejecting an
+    // over-budget request before vision_forward saves expensive GPU work.
+    let (pixels, img_h, img_w) = match image_source {
+        ImageSource::Path(path) => {
+            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+            image::load_and_preprocess(
+                Path::new(path),
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            )
+        }
+        ImageSource::Base64(b64) => {
+            // Strip optional `data:...;base64,` prefix. A `data:` URL
+            // missing the comma separator is malformed — surface that
+            // explicitly rather than letting it fall through to a
+            // misleading "invalid byte 'd' at index 0" base64 error.
+            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+                match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => {
+                        write_error(stdout, id, "malformed data URL: missing ',' separator");
+                        return;
+                    }
+                }
+            } else {
+                b64
+            };
+            eprintln!("[VL-DEBUG] preprocessing image: <{}-byte buffer>", raw_b64.len());
+            let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(b) => b,
+                Err(e) => {
+                    write_error(stdout, id, &format!("failed to decode base64 image data: {e}"));
+                    return;
+                }
+            };
+            match image::load_and_preprocess_from_bytes(
+                &bytes,
+                vision_config.patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    write_error(stdout, id, &e);
+                    return;
+                }
+            }
+        }
+    };
+    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+
+    let grid_h = img_h / vision_config.patch_size;
+    let grid_w = img_w / vision_config.patch_size;
+    let n_patches = grid_h * grid_w;
     let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-    let prompt_est = tokenizer.encode(prompt).len() + n_visual_tokens + 20; // text + vision + ChatML overhead
+
+    // Capacity estimate including system prompt — a long system prompt
+    // on first turn would otherwise let an over-budget request through
+    // the soft check, only to fail the hard check after the expensive
+    // vision encoder runs.
+    let system_est = system_prompt.map(|s| tokenizer.encode(s).len()).unwrap_or(0);
+    let prompt_est = tokenizer.encode(prompt).len() + system_est + n_visual_tokens + 20;
+
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon/vl] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
         m.conversation_tokens.clear();
-        // Zero DeltaNet state on reset
         if let Some(ref dn) = m.dn_state {
             for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
             for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
@@ -3949,51 +4674,36 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         if let Some(kv) = m.kv_cache.as_mut() { kv.compact_offset = 0; }
     }
+
+    if m.eviction.is_none() && prompt_est + max_tokens > m.max_seq {
+        write_error(stdout, id, &format!(
+            "request size ({} tokens) exceeds loaded KV budget ({})",
+            prompt_est + max_tokens, m.max_seq,
+        ));
+        return;
+    }
+
     let config = m.q35_config.as_ref().unwrap();
-    let vision_config = m.vision_config.as_ref().unwrap();
     let vision_weights = m.vision_weights.as_ref().unwrap();
     let weights = m.q35_weights.as_ref().unwrap();
     let scratch = m.q35_scratch.as_ref().unwrap();
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
 
-    // Load and preprocess image (smart resize matching HuggingFace)
-    eprintln!("[VL-DEBUG] preprocessing image: {}", image_path);
-    let (pixels, img_h, img_w) = hipfire_arch_qwen35_vl::image::load_and_preprocess(
-        Path::new(image_path),
-        vision_config.patch_size,
-        vision_config.spatial_merge_size,
-    );
-    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
-    let grid_h = img_h / vision_config.patch_size;
-    let grid_w = img_w / vision_config.patch_size;
-    let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-
-    // Extract patches and run vision encoder
-    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels, 3, img_h, img_w,
-        vision_config.patch_size, vision_config.temporal_patch_size,
-    );
-    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
-        .expect("vision forward failed");
-
-    // Build VL prompt via hipfire_runtime::prompt_frame. The VL user body splices
-    // vision tokens (`<|vision_start|>` + N × `<|image_pad|>` +
-    // `<|vision_end|>`) BEFORE the textual prompt, separated by a newline.
-    // We pre-assemble that as the user-body token sequence and pass it
-    // through `build_with_user_tokens` so the role/newline/im_end
-    // scaffolding stays canonical.
+    // Build the actual prompt token sequence BEFORE running the GPU vision
+    // encoder so the hard capacity check uses the real prefill length, not
+    // the estimate. The vision tower is the most expensive part of a VL
+    // prefill — failing earlier saves the round-trip on over-budget requests.
     let nl = tokenizer.encode("\n");
     let im_end = tokenizer.encode("<|im_end|>");
     let q_tokens = tokenizer.encode(prompt);
 
     let mut user_body: Vec<u32> = Vec::with_capacity(n_visual_tokens + q_tokens.len() + 4);
-    user_body.push(VISION_START_ID);
+    user_body.push(vision_start_id);
     for _ in 0..n_visual_tokens {
-        user_body.push(IMAGE_PAD_ID);
+        user_body.push(image_pad_id);
     }
-    user_body.push(VISION_END_ID);
+    user_body.push(vision_end_id);
     user_body.extend_from_slice(&nl);
     user_body.extend_from_slice(&q_tokens);
 
@@ -4017,26 +4727,45 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         absolute_pos_vl + prompt_tokens.len() + max_tokens + trailer > m.max_seq
     };
     if over_budget {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"error","id":"{}","message":"request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq"}}"#,
-            id, m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
+        write_error(stdout, id, &format!(
+            "request exceeds loaded KV budget: seq_pos={} + prefill={} + max_tokens={} + trailer={} > cap={} — reload model with a larger max_seq",
+            m.seq_pos, prompt_tokens.len(), max_tokens, trailer,
             if m.eviction.is_none() { m.physical_cap } else { m.max_seq },
-        );
-        let _ = stdout.flush();
+        ));
         return;
     }
+
+    // Now safe to run the expensive GPU vision encoder.
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+        &pixels, 3, img_h, img_w,
+        vision_config.patch_size, vision_config.temporal_patch_size,
+    );
+    let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
+        .expect("vision forward failed");
 
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
 
-    // Prefill with vision token embedding for IMAGE_PAD positions.
-    // VL prefill is already per-token (forward_scratch_embed isn't batched),
-    // so we advance m.seq_pos in-loop and call maybe_evict after every write.
+    // Mirror the text path: <think>/</think> as paired open/close. The
+    // previous implementation queried "💭" twice (open == close) which
+    // collapsed depth tracking and made `in_think` always-false; the
+    // force-close splice also encoded the open emoji, doubling the
+    // unclosed depth instead of closing it.
+    let think_pair = match (
+        tokenizer.special_token_id("<think>"),
+        tokenizer.special_token_id("</think>"),
+    ) {
+        (Some(o), Some(c)) => Some((o, c)),
+        _ => None,
+    };
+
+    // Prefill with vision token embedding for image_pad positions. VL
+    // prefill is per-token (forward_scratch_embed isn't batched), so we
+    // advance m.seq_pos in-loop and call maybe_evict after every write.
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
-        if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
+        if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
             qwen35::forward_scratch_embed(gpu, weights, config, emb, m.seq_pos, kv, dn, scratch)
                 .expect("forward_scratch_embed failed");
@@ -4052,6 +4781,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
             }
         }
     }
+
     m.conversation_tokens.extend_from_slice(&prompt_tokens);
 
     // Generate. CPU-side sampling — VL path predates the GPU sampler
@@ -4061,12 +4791,13 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     //   - subsequent samples: positional ngram-block, then
     //     repeat_penalty, then top-p sample.
     //
-    // The positional ngram block writes -INF to the
-    // *next-token-after-an-earlier-ngram-match* position — a
-    // per-history-pattern decision rather than the identity-only
-    // contract of SamplerConfig::blocked_tokens — so it stays inline
-    // rather than going through the SamplerConfig path.
+    // Attractor-block uses CPU-side mutation of the downloaded logits
+    // vector (`block_attractor_unclosed_cpu`) instead of the previous
+    // GPU memcpy + redownload — saves a full vocab-sized DMA per token.
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
+    if let Some((open, close)) = think_pair {
+        block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+    }
     let vl_cfg_first = SamplerConfig {
         temperature: temp,
         top_p,
@@ -4084,18 +4815,50 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
     let t_prefill = Instant::now();
     let mut generated = 0;
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut think_count: usize = 0;
+    let mut prev_in_think: bool = false;
 
-    for _ in 0..max_tokens {
+    // N-gram loop detector — mirrors the text path. Catches answer-phase
+    // attractor loops that the think cap and repeat penalty miss.
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+
+    while generated < max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
         emit_committed_event(stdout, id, next_token, generated - 1, t0.elapsed().as_millis() as u64);
-        let text = tokenizer.decode(&[next_token]);
-        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-        let _ = stdout.flush();
+        streamed_tokens.push(next_token);
+
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let valid_len = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len > 0 {
+            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += valid_len;
+        }
 
         if next_token == config.eos_token { break; }
         if im_end_token == Some(next_token) { break; }
         if tokenizer.is_terminator(next_token) { break; }
+
+        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
+            loop_guard.check(&streamed_tokens)
+        {
+            let window_len = loop_guard.window_len(streamed_tokens.len());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+                id, count, window_len,
+            );
+            let _ = stdout.flush();
+            break;
+        }
 
         qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
         m.seq_pos += 1;
@@ -4106,7 +4869,68 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
         }
         logits = gpu.download_f32(&scratch.logits).unwrap();
         llama::apply_ngram_block(&mut logits, &m.conversation_tokens);
+        if let Some((open, close)) = think_pair {
+            block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+        }
+
         next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+
+        if max_think_tokens > 0 {
+            let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let open_idx = raw_str.rfind("<think>");
+            let close_idx = raw_str.rfind("</think>");
+            let in_think = match (open_idx, close_idx) {
+                (Some(o), Some(c)) => o > c,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if in_think {
+                if !prev_in_think { think_count = 1; } else { think_count += 1; }
+            } else {
+                think_count = 0;
+            }
+            prev_in_think = in_think;
+
+            if in_think && think_count >= max_think_tokens {
+                let close_tokens = tokenizer.encode("</think>\n");
+                let budget_left = max_tokens.saturating_sub(generated);
+                let take = close_tokens.len().min(budget_left);
+                for &t in &close_tokens[..take] {
+                    qwen35::forward_scratch(gpu, weights, config, t, m.seq_pos, kv, dn, scratch).unwrap();
+                    m.seq_pos += 1;
+                    if let Some(ref ev) = m.eviction {
+                        if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
+                            m.seq_pos = new_phys;
+                        }
+                    }
+                    m.conversation_tokens.push(t);
+                    streamed_tokens.push(t);
+
+                    let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                    let new_bytes = &all_bytes[emitted_bytes..];
+                    let vl = match std::str::from_utf8(new_bytes) {
+                        Ok(_) => new_bytes.len(),
+                        Err(e) => e.valid_up_to(),
+                    };
+                    if vl > 0 {
+                        let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
+                        let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                        let _ = stdout.flush();
+                        emitted_bytes += vl;
+                    }
+                    generated += 1;
+                }
+                think_count = 0;
+                prev_in_think = false;
+                if generated >= max_tokens { break; }
+                logits = gpu.download_f32(&scratch.logits).unwrap();
+                if let Some((open, close)) = think_pair {
+                    block_attractor_unclosed_cpu(&mut logits, &m.conversation_tokens, open, close, 20, 2);
+                }
+                next_token = sampler::sample_cpu(&mut logits, &m.conversation_tokens, &vl_cfg);
+            }
+        }
     }
 
     // ChatML \n boundary — run through forward to keep KV cache + DeltaNet in sync

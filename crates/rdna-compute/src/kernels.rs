@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Built-in HIP kernel sources for inference operations.
 
 /// GEMV F32: y = alpha * A * x + beta * y
@@ -284,6 +288,15 @@ pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../ke
 /// per-layer wo + w_down at B>1.
 pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
 
+/// HFQ4 sibling of `GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC` (issue #276,
+/// Gap 2 from the HFQ4/HFQ6 dp4a parity audit). Same structural pattern
+/// as the HFQ4 lm-head `gemm_hfq4g256_wave64_dp4a` with `+=` residual
+/// write semantic. Closes the dispatch gap where MQ4 at gfx906 B>1 below
+/// the MMQ cutover (B ∈ [2, 7]) falls to FP16 wave64; the dp4a path wins
+/// on per-call ALU and reuses the Q8_1 scratch. Ships BATCH_TILE=16 from
+/// the start per the HFQ6 Phase B.1.1 measurement (commit ff9e2105).
+pub const GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wave64_dp4a.hip");
+
 /// Phase A.3 (plan v3.2.3 §5.1 item 3): wave64+dp4a batched fused
 /// GEMMs for HFQ6/MQ6 prefill. Sibling of A.2 with multi-output row
 /// routing (qkvza 4-way, qkv 3-way, gate_up 2-way). Overwrite output
@@ -292,6 +305,19 @@ pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../
 pub const GEMM_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wave64_dp4a.hip");
 pub const GEMM_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wave64_dp4a.hip");
 pub const GEMM_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wave64_dp4a.hip");
+
+/// HFQ4 siblings of the HFQ6 Phase A.3 fused dp4a kernels (issue #276
+/// Gap 2 part 2 of 4). Wave64+dp4a batched fused GEMMs at gfx906 for
+/// MQ4 prefill at B>1. Close the dispatch fallthroughs where MQ4 today
+/// drops to `gemm_*_hfq4g256_fp16_wave64` for the multi-output paths.
+/// Ship `BATCH_TILE=16` from the start per HFQ6 Phase B.1.1 (commits
+/// 2bee6e6b / ff9e2105). Math identity: signed 4-bit nibble unpack +
+/// `zp_eff = zp + 8*sc` matching the HFQ4 lm-head dp4a sibling
+/// `gemm_hfq4g256_wave64_dp4a.hip` and the HFQ4 residual dp4a
+/// `gemm_hfq4g256_residual_wave64_dp4a.hip`.
+pub const GEMM_QKVZA_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_QKV_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wave64_dp4a.hip");
+pub const GEMM_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wave64_dp4a.hip");
 
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.
@@ -307,7 +333,24 @@ pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g2
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
+pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
+pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v2.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v3.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
+/// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
+/// when the upcoming linear carries an `awq_scale` sidecar. Math:
+/// (W·s) · (x/s) = W·x — divide before FWHT mirrors the offline pre-scaling.
+pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_x_mq_awq.hip");
+/// Phase A Stage A — F2: AWQ-aware variant of `fused_silu_mul_mq_rotate`
+/// for the down_proj / w_down input stage. Dispatched when down_proj
+/// carries an `awq_scale`. Divide happens AFTER silu*up reduction, BEFORE
+/// signs1 gather and FWHT.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
 
 /// HFP4-G32 GEMV — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale).
 /// v1 correctness anchor: no WMMA, no FP8, no rotation. See docs/quant-formats/hfp4.md.
@@ -360,6 +403,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v2.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v3.gfx942.hip");
+pub const FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKV_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_v2.gfx942.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
@@ -367,6 +416,15 @@ pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../..
 /// routed-expert variant scales by a CPU top-K weight, and the shared-expert
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
+
+/// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
+///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
+/// HFQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` —
+/// unlocks the batched MoE-FFN shared-expert `down` projection for the
+/// AWQ-style mixed-precision path where shared.down is MQ6 (storage-
+/// compatible with HFQ6G256, 200 B / group of 256).
+pub const GEMV_HFQ6G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_residual_sigmoid_scaled.hip");
 
 /// MoE fused gate_up GEMV: runs 8 top-K experts' HFQ4-G256 GEMV in one
 /// launch. Grid.y is the expert rank (0..7); each block selects its
@@ -454,12 +512,253 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip");
 
+/// Atomic-free batched indexed MoE down — writes per-(token, krank) row into
+/// an expanded [N × K_TOP × M] output buffer instead of atomicAdd'ing into
+/// a shared residual row. Pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`.
+/// Observed lift: 387 → ~900 GiB/s on R9700/gfx1201 (no K_TOP-way atomic
+/// contention per output cell).
+pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
+
+/// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
+/// slots per (token, m) with topk_weights applied; accumulates into the
+/// per-token residual row. No cross-token contention.
+pub const MOE_DOWN_COMBINE_K8_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_k8_batched.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 1: per-expert histogram
+/// over flattened topk_indices. Single workgroup, LDS atomics.
+pub const MOE_SCATTER_HISTOGRAM_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_histogram_k8.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 2: pad raw histogram up to
+/// BLOCK_M and exclusive prefix-sum into expert_offsets[E+1]. Rewrites
+/// expert_token_counts in place from raw → padded. expert_offsets[E] is
+/// M_total (total padded slot count).
+pub const MOE_SCATTER_OFFSETS_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_offsets_k8.hip");
+
+/// SGLang-style MoE scatter pipeline — Phase 3: scatter each flat slot
+/// (n*K_TOP + k) into sorted_slot_index at offsets[e] + bucket[e]. Pads
+/// with -1 sentinel. Emits expert_tile_ids[M_total/BLOCK_M] for the
+/// grouped-GEMM dispatch loop (Stage 2).
+pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_permute_k8.hip");
+
+/// Path 2 grouped-GEMM kernel for MoE prefill gate_up (and reusable
+/// for moe down). WMMA 16×16×16 F16, 2× K-tile pipeline. Per-tile
+/// expert lookup + sorted_slot_index X gather; -1 padding lanes
+/// substitute zero. Writes Y_grouped[m_total × M] directly (no
+/// residual; combine kernel handles the fanout into per-token
+/// gate_batch/up_batch). **gfx11 (RDNA3) only** — the gfx12 sister
+/// kernel below uses the _gfx12 WMMA intrinsic.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
+
+/// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
+/// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
+/// width (half8_t vs half16_t), and K-lane split (K split across 2
+/// lane groups). K4 unroll like the gfx12 residual variant.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma.gfx12.hip");
+
+/// 2×1 M-direction reg-blocked sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Each warp covers a 32-row × 16-slot output tile; B-load shared across both
+/// M-blocks halves X-gather BW per output. Same kernarg layout. Lever from
+/// glovepost/wmma_ops (`wmma_kernels_optimized.hpp`). Gated on
+/// `HIPFIRE_MOE_GROUPED_M2=1`.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_M2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip");
+
+/// gfx1151 (Strix Halo iGPU) i8 MMQ variant of MOE_GROUPED_WMMA_K2. Uses
+/// i8 WMMA (`wmma_i32_16x16x16_iu8_w32`) at 2× the FLOP rate of FP16 WMMA
+/// on gfx11. X must be pre-quantized to Q8_1 via `ensure_q8_1_mmq_x`
+/// before dispatch. Same 16×16 output tile + grouped scatter contract as
+/// the FP16 sister, but the kernel reads Q8_1 packed activations and
+/// applies HFQ4 scale/zero through the Q8_1 (d, sum) correction at the
+/// FMA step. Lifts the grouped-MoE-GEMM compute ceiling from ~71 to
+/// ~140 TFLOPS on Strix Halo, matching the analog "MMQ for attention
+/// beats FP16 WMMA at batch≥256" empirical win seen on gfx1100.
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx1151.hip");
+
+/// k4 (deeper K-tile pipeline) sibling of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC.
+/// Pairs adjacent Q8_1 sub-blocks (sb=0,1 then sb=2,3) so each inner
+/// iteration issues 4 WMMAs into 2 independent int32 accumulators before
+/// the per-sub-block scale FMA resolves. Same kernarg signature + grid +
+/// block geometry as the k2 sibling; the only difference is unroll depth.
+/// Rationale: i8 WMMA has ~2× FP16 WMMA throughput on gfx11 so per-tile
+/// latency is shorter — a deeper pipeline hides more dequant + (d, sum)
+/// load latency than the k2 baseline could. Opt-IN via
+/// `HIPFIRE_MOE_GROUPED_I8_K4=1` (default off pending bench validation).
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx1151.hip");
+
+/// k8 (deepest K-tile pipeline) sibling of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC.
+/// Processes all 4 sub-blocks of one Q8_1 block per inner iteration —
+/// 8 WMMAs into 4 independent int32 accumulators before the per-sub-block
+/// scale FMA resolves. Same kernarg signature + grid + block geometry as
+/// the k2/k4 siblings; the only difference is unroll depth. Natural next
+/// experiment after k4 hit +4.6% on gfx1151 with zero register spills;
+/// expected diminishing return (+1-3% upside, possible 0% or regression
+/// if registers spill). Opt-IN via `HIPFIRE_MOE_GROUPED_I8_K8=1` (default
+/// OFF pending bench validation).
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq_k8.gfx1151.hip");
+
+/// gfx12 (RDNA4 — R9700/gfx1201, gfx1200) i8 MMQ variant of MOE_GROUPED_WMMA.
+/// Uses the gfx12-specific i8 WMMA intrinsic
+/// (`wmma_i32_16x16x16_iu8_w32_gfx12`). X pre-quantized to Q8_1 via
+/// `ensure_q8_1_mmq_x` before dispatch. Same 16×16 output tile + grouped
+/// scatter contract as the FP16 sister; kernel reads Q8_1 packed activations
+/// and applies HFQ4 scale/zero through the Q8_1 (d, sum) correction post-WMMA.
+///
+/// Key gfx12 differences vs gfx11/gfx1151:
+///   - Intrinsic has `_gfx12` suffix.
+///   - Per-lane operand width is int32x2 (8 int8) instead of int32x4 (16 int8).
+///   - K=16 per WMMA is split across 2 lane groups (lanes 0-15 carry K[0..7],
+///     lanes 16-31 carry K[8..15]).
+///   - C-output mapping: `acc[j] = C[8*k_grp + j][m_lane]` (8 contiguous M-rows
+///     per lane half), unlike gfx11/gfx1151's `acc[j] = C[2*j + k_grp][m_lane]`.
+///   - Per-row HFQ4 sc/zp shuffle uses `src_lane = 8*k_grp + j`.
+///
+/// **EMPIRICAL RESULT (2026-05-19, R9700/gfx1201, A3B uniform.mq4, prefill=256):
+/// 2960 → 2607 tok/s = -11.6% REGRESSION** vs FP16 grouped WMMA. Kernel-level:
+/// 279µs/call (FP16) → 408µs/call (i8) = +46% slowdown despite correctness
+/// PASS (NRMSE ~0.4% on a3b-slice shape). Root cause: i8 WMMA's theoretical
+/// 2× FLOP rate is offset by per-sub-block scale FMA serial dependency chain
+/// (each Q8_1 sub-block: 2 WMMAs → 8 INT32→F32 conversions → 16 FMAs). Same
+/// synth-win → prod-falsify pattern as docs/memory items
+/// `project_fp8_wmma_hfp4g32_2026_05_10` and
+/// `project_gfx11_dot2_trickle_down_falsified_2026_05_11`. Shipped as opt-in
+/// research artifact; default OFF for gfx12. Opt-in via
+/// HIPFIRE_MOE_GROUPED_I8=1.
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx12.hip");
+
+/// k4 (deeper K-tile pipeline) variant of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX12_SRC.
+/// Processes all 4 sub-blocks of one Q8_1 block per inner iteration —
+/// 8 WMMAs into 4 independent int32 accumulators before the per-sub-block
+/// scale FMA chain resolves. Same kernarg layout + grid + block geometry as
+/// the k2 sibling; the only difference is unroll depth.
+///
+/// Rationale: the k2 gfx12 path runs at +46% kernel time vs FP16 (R9700/
+/// gfx1201 A3B prefill, 2026-05-19). Structural diagnosis was that the
+/// per-sub-block scale FMA serial dependency chain dominates the 16×16
+/// output tile. k4 amortizes that chain over more WMMA dispatches per
+/// scale-FMA boundary — same lever that gave +4.6% on gfx1151 and +2.8%
+/// on gfx11_dgpu. R9700's fewer CUs (~40-48 vs 96 on 7900 XTX) should
+/// make this proportionally more effective IF the diagnosis is right.
+///
+/// Opt-IN via `HIPFIRE_MOE_GROUPED_I8=1 HIPFIRE_MOE_GROUPED_I8_K4_GFX12=1`
+/// (both default OFF — this is an experiment).
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx12.hip");
+
+/// HFQ6/MQ6 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC for AWQ MoE
+/// experts. Same WMMA tile geometry + grouped dispatch contract; differs
+/// only in the 200 B/group HFQ6 dequant inner loop (4 B scale + 4 B zero
+/// + 192 B packed 6-bit). The kernel is dtype-agnostic between HFQ6 and
+/// MQ6 — MQ6G256 uses the identical 200 B layout and the caller applies
+/// the FWHT rotation to X before dispatch, same convention as MQ4/HFQ4.
+/// **gfx12 (RDNA4) only.** Unblocks AWQ A3B prefill (~50% of experts MQ6).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
+
+/// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
+/// K-substep 2 A-dequants + 1 B-load → 2 WMMAs (vs 1+1+1 in v1). Halves X-gather
+/// BW per output element. Same kernarg layout + BLOCK_M=16 slot stride
+/// (expert-boundary contract unchanged). Lever from `wmma_kernels_optimized.hpp`
+/// extending the HFQ4 m2 trick to BW-bound HFQ6 (where the dequant
+/// serialization that falsified HFQ4-m2 is hidden behind memory waits).
+/// Gated on `HIPFIRE_MOE_HFQ6_V2=1` (default off).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip");
+
+/// gfx12 (RDNA4) HFQ3/MQ3 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_GFX12_SRC.
+/// Same WMMA tile geometry + expert_tile_ids sentinel pattern + kernarg
+/// layout; differs in dequant (HFQ3-G256 = 104 B/group, 8 × 3-bit chunks
+/// packed across 24 bits per 3-byte slice). Same FWHT-rotated 3-bit
+/// storage applies to MQ3G256 — the kernel handles both buffers (rotation
+/// is applied by the caller, matching the MQ4/HFQ4 dispatch convention).
+pub const GEMM_HFQ3G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip");
+
+/// i8 MMQ sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC for gfx11 dGPUs
+/// (gfx1100/1101/1102/1103 — 7900 XTX, 7800/7700, 7600, Phoenix mobile).
+/// Same 9-tuple kernarg layout + 16×16 output tile + expert_tile_ids /
+/// sorted_slot_index dispatch contract; differs in that X is pre-quantized
+/// to `block_q8_1_mmq` (via `ensure_q8_1_mmq_x`) and the per-K-tile WMMA
+/// uses the int8 `iu8` builtin instead of the FP16 `f16` builtin. Roughly
+/// 2× the FLOP rate on gfx11 dGPUs (compute-bound on this path); BW
+/// reduced via i8 X (vs FP16 X). HFQ4 sc/zp correction applied in float
+/// at the 32-K Q8_1 sub-block boundary. Gated on
+/// `HIPFIRE_MOE_GROUPED_I8` (default on for gfx1100/1101/1102/1103).
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX11_DGPU_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx11_dgpu.hip");
+
+/// k4 (deeper K-tile pipeline) variant of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX11_DGPU_SRC.
+/// Same kernarg layout; processes 4 K-tiles per inner iteration instead of 2.
+/// Matches the gfx1151 k4 design (validated +4.6% over k2 there with zero spills).
+/// Opt-in on gfx11 dGPUs via `HIPFIRE_MOE_GROUPED_I8_K4=1` (default off pending
+/// A/B confirmation).
+pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX11_DGPU_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx11_dgpu.hip");
+
+/// Non-residual WMMA Q8_0 GEMM (gfx12). Direct write to Y[N, M] without
+/// reading prior values (= rather than +=). Drop-in replacement for the
+/// scalar `gemm_q8_0_batched` kernel; rocprof 2026-05-19 showed that
+/// scalar version was 65% of A3B prefill GPU time (invisible to
+/// HIPFIRE_PROFILE, no begin_timer wired).
+pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx12.hip");
+
+/// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
+/// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
+/// × mi] via the inverse permutation in sorted_slot_index.
+pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
+
+/// Path 2 combine for down: per (token, m) iterates K_TOP slots via
+/// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
+/// x_residual. No atomic contention (each token's m column is owned by
+/// a unique thread).
+pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_combine_grouped_k8.hip");
+
+/// Fused single-CTA SGLang-style MoE scatter pipeline: combines
+/// histogram + padded prefix-sum + permutation in one launch. Saves
+/// 2 kernel launches per MoE layer (~75µs each).
+pub const MOE_SCATTER_FUSED_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
+
+/// LA-layer fusion: fused L2-norm(Q) + scale(Q) + L2-norm(K) +
+/// repeat-interleave(Q,K). Replaces fused_qk_l2_norm_scale_f32_batched
+/// + repeat_interleave_qk_f32_batched. Saves 1 launch per LA layer.
+pub const FUSED_QK_L2_NORM_SCALE_INTERLEAVE_F32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/fused_qk_l2_norm_scale_interleave_f32_batched.hip");
+
 // Batched HFQ4-G256 GEMM with fused residual add. Processes N batch elements
 // per launch with the same 4-accumulator interleave as the single-row GEMV, so
 // output is bitwise identical to calling gemv_hfq4g256_residual N times. Used
 // for batched prefill (FFN down + wo projection) where N prompt tokens share
 // the same weight matrix.
 pub const GEMM_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual.hip");
+
+// Batched HFQ3-G256 GEMM with fused residual add. HFQ3 sibling of
+// GEMM_HFQ4G256_RESIDUAL_SRC — same dispatch shape and batching tile,
+// 104 B group stride and 3-bit unpack instead of 136 B / 4-bit. Used
+// for batched prefill of MQ3-quantized down + wo projections when
+// `is_batchable_la(MQ3G256, arch)` returns true (non-WMMA archs only;
+// gfx11+ uses the WMMA family).
+pub const GEMM_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual.hip");
+// v_dot2_f32_f16 variant — HFQ3 sibling of GEMM_HFQ4G256_RESIDUAL_FP16_SRC, upgraded
+// from v_pk_fma_f16 to v_dot2_f32_f16 (4 amd_mixed_dot calls per group, FP32 accum).
+pub const GEMM_HFQ3G256_RESIDUAL_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_dot2.hip");
+// FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013. Same inner loop
+// as gemm_hfq4g256_residual_fp16 (1 __hmul2 + 3 __hfma2 + extract + add).
+pub const GEMM_HFQ3G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_fp16.hip");
 
 // CDNA3 wave64-native batched HFQ4-G256 residual GEMM. 2 rows per block
 // (one per warp), halves grid.x. Byte-exact with the wave32 kernel.
@@ -597,6 +896,13 @@ pub const GEMM_GATE_UP_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../ker
 pub const GEMM_QKVZA_HFP4G32_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.hip");
 pub const GEMM_QKVZA_HFP4G32_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfp4g32_wmma.gfx12.hip");
 
+// HFP4-G32 grouped-WMMA-GEMM for MoE prefill on gfx12. Sister of the
+// HFQ4 grouped variant — same tile geometry / expert_tile_ids sentinel
+// pattern, with HFP4G32's 18 B/group dequant (1 B UE8M0 + 16 B packed
+// FP4 + LUT) and the G32 inner loop. MFP4G32 shares storage with HFP4G32.
+pub const GEMM_HFP4G32_MOE_GROUPED_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfp4g32_moe_grouped_wmma.gfx12.hip");
+
 // Batched 4-way fused HFQ4-G256 GEMM (LA preamble: wqkv + wz + w_beta + w_alpha).
 // Batched counterpart of fused_qkvza_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the LA layer projection.
@@ -614,6 +920,16 @@ pub const GEMM_QKVZA_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/sr
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
 pub const GEMM_QKVZA_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_dot2.hip");
 
+// Batched 4-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_QKVZA_HFQ4G256_SRC;
+// same dispatch shape, 104 B group stride, 3-bit unpack. Wired in alongside
+// GEMM_QKV_HFQ3G256_SRC / GEMM_GATE_UP_HFQ3G256_SRC for the gfx10 MQ3
+// prefill path on dense Qwen3.5 LA layers.
+pub const GEMM_QKVZA_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256.hip");
+// v_dot2_f32_f16 variant — HFQ3 sibling of GEMM_QKVZA_HFQ4G256_DOT2_SRC.
+pub const GEMM_QKVZA_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_dot2.hip");
+// FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013.
+pub const GEMM_QKVZA_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_fp16.hip");
+
 // Batched 3-way fused HFQ4-G256 GEMM (FA preamble: wq + wk + wv).
 // Batched counterpart of fused_qkv_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FA layer projection.
@@ -629,6 +945,58 @@ pub const GEMM_QKV_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/src/
 // v_dot2_f32_f16 variant — emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12.
 pub const GEMM_QKV_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_dot2.hip");
 
+// Batched 3-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_QKV_HFQ4G256_SRC
+// with 104 B group stride and 3-bit unpack via uint24 byte-combine.
+// Wired into the gfx10 MQ3 prefill path when `is_batchable_la(MQ3G256, arch)`
+// admits the format (non-WMMA archs only).
+pub const GEMM_QKV_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256.hip");
+// v_dot2_f32_f16 variant — HFQ3 sibling of GEMM_QKV_HFQ4G256_DOT2_SRC.
+// Emits v_dot2_f32_f16 on gfx1011/1012/1030-1032 and gfx11/12 — NOT on gfx1010
+// (5700 XT, Navi 10) or gfx1013 (BC-250 APU), which lack the dot extension.
+pub const GEMM_QKV_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dot2.hip");
+// FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013 which lack dot2.
+pub const GEMM_QKV_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_fp16.hip");
+// Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
+// Port of gemm_qkv_hfq4g256_wave64_dp4a from gfx906 to wave32 + HFQ3 unpack.
+pub const GEMM_QKV_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_dp4a.gfx1030.hip");
+// Wave32 MMQ residual family — gfx1030+ Phase 3 probe. Tile-size templates
+// over the shared body in `gemm_hfq3g256_residual_mmq_body.cuh`. The body
+// defines MMQ_Y=128 rows × MMQ_X cols per workgroup with LDS-tiled X reuse;
+// each instantiation specializes MMQ_X for a batch-size regime.
+//   x8  → batch ≤ ~12 (short prefill, tile granularity dominates)
+//   x16 → batch 12-24 (mid-prefill)
+//   x32 → batch ≥ 24  (long prefill, b128 LDS path is profitable)
+//
+// The body is included via the shared `_BODY_CUH` const at dispatch time
+// (string-replace into each tile wrapper) — the runtime hipcc compile
+// happens in cache_dir which doesn't have kernels/src on its -I path.
+// Same pattern as the gfx906 MMQ family.
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_body.cuh");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x8.gfx1030.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x16.gfx1030.hip");
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x32.gfx1030.hip");
+
+// HFQ3 qkv (3-way fused: Q + K + V) MMQ family. Same body template,
+// different output routing.
+pub const GEMM_QKV_HFQ3G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_mmq_body.cuh");
+pub const GEMM_QKV_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_mmq_x8.gfx1030.hip");
+pub const GEMM_QKV_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_mmq_x16.gfx1030.hip");
+pub const GEMM_QKV_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq3g256_mmq_x32.gfx1030.hip");
+
+// HFQ3 gate_up (2-way fused: gate + up) MMQ family.
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_body.cuh");
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x8.gfx1030.hip");
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x16.gfx1030.hip");
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32.gfx1030.hip");
+
+// HFQ3 qkvza (4-way fused: wqkv + wz + w_beta + w_alpha — LinearAttention
+// preamble) MMQ family.
+pub const GEMM_QKVZA_HFQ3G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_body.cuh");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x8.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x16.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x32.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
+
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
@@ -643,10 +1011,26 @@ pub const GEMM_GATE_UP_HFQ4G256_FP16_SRC: &str = include_str!("../../../kernels/
 // Does NOT work on gfx1010 (5700 XT) or gfx1013 (BC-250 APU) — lack dot instructions.
 pub const GEMM_GATE_UP_HFQ4G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_dot2.hip");
 
+// Batched 2-way fused HFQ3-G256 GEMM. HFQ3 sibling of GEMM_GATE_UP_HFQ4G256_SRC;
+// same dispatch shape, 104 B group stride, 3-bit unpack. Wired in alongside
+// GEMM_QKV_HFQ3G256_SRC for the gfx10 MQ3 prefill path.
+pub const GEMM_GATE_UP_HFQ3G256_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256.hip");
+// v_dot2_f32_f16 variant — HFQ3 sibling of GEMM_GATE_UP_HFQ4G256_DOT2_SRC.
+pub const GEMM_GATE_UP_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dot2.hip");
+// FP16-packed (v_pk_fma_f16) variant — fallback for gfx1010/1013.
+pub const GEMM_GATE_UP_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_fp16.hip");
+// Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
+pub const GEMM_GATE_UP_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dp4a.gfx1030.hip");
+
 // ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_fp16.hip");
 pub const GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma_k2.hip");
+// gfx12 (RDNA4) sister of GEMM_HFQ6G256_RESIDUAL_WMMA_K2_SRC. Pure composition
+// of validated patterns — hfq6 dequant (gemm_qkv_hfq6g256_wmma.gfx12.hip) +
+// fused residual `+=` (gemm_q8_0_residual_wmma.gfx12.hip).
+pub const GEMM_HFQ6G256_RESIDUAL_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKVZA_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256.hip");
 pub const GEMM_QKVZA_HFQ6G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_fp16.hip");
 pub const GEMM_QKVZA_HFQ6G256_DOT2_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_dot2.hip");
@@ -858,6 +1242,41 @@ pub const GEMV_Q8_0_SRC: &str = include_str!("../../../kernels/src/gemv_q8_0.hip
 /// serial-GEMV loop for DFlash lm_heads.
 pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_batched.hip");
 
+/// WMMA-accelerated 3-way fused QKV GEMM for Q8_0 weights. gfx1100+ wave32.
+/// Recipe-selected per docs/plans/q8-fused-prefill-kernels.md T3-1a microbench
+/// (FP16-WMMA, register-redundant dequant, no LDS).
+pub const GEMM_QKV_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.hip");
+
+/// WMMA 4-way fused qkv+z+beta+alpha GEMM for Q8_0 (DeltaNet LA preamble).
+pub const GEMM_QKVZA_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.hip");
+
+/// WMMA 2-way fused gate+up GEMM for Q8_0 (FFN preamble).
+pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_q8_0_wmma.hip");
+
+/// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
+pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
+
+// gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
+// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
+// and half8_t operands (vs half16_t). Lane-grp K split (tid>>4 selects
+// K-half) and `acc[j] = C[8*(tid>>4) + j][tid & 15]` C-output mapping —
+// pattern mirrors gemm_qkv_hfq4g256_wmma.gfx12 and is silicon-validated
+// on R9700 (test_gemm_q8_qkv_wmma 22/22 PASS, 2026-05-14).
+pub const GEMM_QKV_Q8_0_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.gfx12.hip");
+
+/// gfx12 sister of GEMM_QKVZA_Q8_0_WMMA_SRC. Same lane-grp + half8_t
+/// pattern as the QKV gfx12 sibling.
+pub const GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.gfx12.hip");
+
+/// gfx12 sister of GEMM_GATE_UP_Q8_0_WMMA_SRC. Same lane-grp + half8_t
+/// pattern as the QKV gfx12 sibling.
+pub const GEMM_GATE_UP_Q8_0_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_q8_0_wmma.gfx12.hip");
+
+/// gfx12 sister of GEMM_Q8_0_RESIDUAL_WMMA_SRC. Same lane-grp + half8_t
+/// pattern; preserves the non-overlapping-write invariant under the new
+/// lane-group row partition (lane group 0 → rows 0..7, group 1 → rows 8..15).
+pub const GEMM_Q8_0_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.gfx12.hip");
+
 
 /// GEMV Q6_K: matrix-vector multiply with on-the-fly Q6_K dequantization.
 /// Q6_K block: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes per 256 elements.
@@ -1062,6 +1481,23 @@ pub const ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC: &str = include_str!("../../../
 pub const ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym3_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym2_tile_batched.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
+
+// Signed-FWHT K-write + FA tile variants — same byte layout as asym family,
+// rotation primitive swapped from Givens (per-quad cos/sin) to signed-FWHT
+// (128-wide butterfly via ds_swizzle_b32). Q is forward-rotated by the same
+// signed-FWHT in the FA path; K cache is byte-identical to asym4.
+pub const KV_CACHE_WRITE_ASYM_K_FWHT4_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht4_batched.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht4_tile.hip");
+pub const ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht4_tile_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT3_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht3.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT3_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht3_batched.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile.hip");
+pub const ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht3_tile_batched.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT2_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht2.hip");
+pub const KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_asym_k_fwht2_batched.hip");
+pub const ATTENTION_FLASH_FWHT2_TILE_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht2_tile.hip");
+pub const ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_fwht2_tile_batched.hip");
 
 /// TriAttention scoring on Q8 post-RoPE K cache (arXiv:2604.04921).
 pub const TRIATTN_SCORE_Q8_SRC: &str = include_str!("../../../kernels/src/triattn_score_q8.hip");

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for `gemm_qkvza_hfq3g256_wmma` (gfx11 K2 variant).
 //!
 //! 4-output sister of test_wmma_qkvza_gfx12 — exercises qkv/z/beta/alpha

@@ -137,6 +137,49 @@ The expected residual gap between probe `gen tok/s` and bench
 further is a separate workstream; it is uniform across quant formats
 so does not interfere with format ranking.
 
+## eval_hipfire wall-clock is NOT a kernel-speed meter
+
+`eval_hipfire`'s reported `tok/s` (the trailing `(N tok/s)` line) is
+**scored-tokens-per-wall-second across the entire eval loop**, not
+forward-pass throughput. The eval loop runs, per chunk:
+
+1. `forward_prefill_batch` (prefix, no logit capture)
+2. `forward_prefill_batch` (scored region, with hidden-state capture)
+3. **`weight_gemv` × `scored_per_chunk` (≈1023) for the lm_head fan-out**
+4. `score_position` × scored_per_chunk (CPU-side KLD compute, F32→F16
+   block I/O against the ref file)
+
+For non-F16 lm_head dtypes (Q8_0, MQ4G256, …), step 3 issues one GEMV
+call per scored position against the full lm_head matrix (vocab=248K
+on Qwen3.5). On Q8 that's ~1 GB read per call × 1023 calls = ~1 TB/chunk
+of HBM traffic just for lm_head. That dominates the wall-clock and
+masks any projection-kernel win. Concrete numbers from `feat/q8-prefill-tier2`
+validation on gfx1100 / RX 7900 XT:
+
+| Path | eval_hipfire tok/s | daemon `prefill_tok_s` |
+|---|---:|---:|
+| q8f16 (Q8 lm_head, T3 WMMA projections) | 27 | 1069 |
+| q8f16-f16lm (F16 lm_head batched, T3 WMMA) | 187 | 1069 |
+| mq4 (MQ4 lm_head, MQ4 batched projections) | 248 | ~1100+ |
+
+**Rules:**
+
+- **For kernel-speed perf claims**, read `daemon prefill_tok_s` from
+  the daemon's `done` event (`coherence_probe`, `coherence-gate.sh`
+  matrix rows all expose it), or use `scripts/probe_commits.sh`
+  which also uses the daemon. Do NOT cite eval_hipfire `tok/s`.
+- **For KLD validation and silent-corruption checks**, eval_hipfire
+  is the right tool — its wall-clock is incidental, only the slice-mean
+  KLD and PPL matter.
+- **For end-to-end "user-visible" throughput** (TTFT + decode), use
+  the daemon. eval_hipfire's scoring loop is not representative of
+  any production workload.
+
+The lm_head fan-out itself is fixable — see PR #242 (F16 batched
+fan-out via `gemm_f16_batched_lmhead`) for the pattern; a parallel
+batched Q8 lm_head kernel is currently out of scope per
+`docs/plans/q8-fused-prefill-kernels.md §Out of scope`.
+
 ## Speed-gate baselines
 
 `tests/speed-baselines/<arch>.txt` records the "ground floor" decode
