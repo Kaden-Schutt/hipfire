@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-18 (canonical 9B 4-bit headline landed §1.1j: mq4-awq-gptq-f2-q8head KLD 0.1727 PPL 8.42 on gfx1100 KV=q8 n=256, superseding §1.1f's 0.1842 by 6% KLD / 12% PPL. AWQ+GPTQ Δ vs plain-q8head at clean A/B = −20% KLD / −3.8% PPL, CIs essentially non-overlapping. Cross-engine gap to llama.cpp UD-Q3_K_XL holds at +24% Δ at matched bpw. Earlier today: cleanup pass — removed self-flagged rows (§1.1 q8f16 Tier-2, §1.1d FWHT n=20, §1.1f n=20 smokes, §2.2 q8f16 0.0806, §2.4.1 FLIPPED). 27B first-light cohort §3.2 — AWQ+GPTQ −38% KLD. 9B MQ3 cohort §1.4 — AWQ+GPTQ 2.77× KLD at 3-bit. Prior: 2026-05-15 PM — 4B Stage B GPTQ §3.1 KLD 0.0662; F2 AWQ whitelist; §1.1h K-map AWQ; §1.1i F2 α=0.55.)
+**Last updated:** 2026-05-20 (27B mixed-bits row landed in §3.2: `mq3-body-mq4-lmhead-kvq8-c256` KLD 0.3082 PPL 9.86 on gfx1100 KV=q8 n=256, file 11.943 GB at 3.55 bpw — first true mixed-format Stage D build via per-tensor n_bits dispatch (commit 7915ed6f). +136% KLD vs all-MQ4 A100 row (0.1307) for −1.0 bpw saving; the body's 3-bit precision floor dominates the size win. Coherence eyeball clean. Prior: 2026-05-18 — canonical 9B 4-bit headline landed §1.1j: mq4-awq-gptq-f2-q8head KLD 0.1727 PPL 8.42 on gfx1100 KV=q8 n=256, superseding §1.1f's 0.1842 by 6% KLD / 12% PPL. AWQ+GPTQ Δ vs plain-q8head at clean A/B = −20% KLD / −3.8% PPL, CIs essentially non-overlapping. Cross-engine gap to llama.cpp UD-Q3_K_XL holds at +24% Δ at matched bpw. Earlier today: cleanup pass — removed self-flagged rows (§1.1 q8f16 Tier-2, §1.1d FWHT n=20, §1.1f n=20 smokes, §2.2 q8f16 0.0806, §2.4.1 FLIPPED). 27B first-light cohort §3.2 — AWQ+GPTQ −38% KLD. 9B MQ3 cohort §1.4 — AWQ+GPTQ 2.77× KLD at 3-bit. Prior: 2026-05-15 PM — 4B Stage B GPTQ §3.1 KLD 0.0662; F2 AWQ whitelist; §1.1h K-map AWQ; §1.1i F2 α=0.55.)
 
 **Provenance note (2026-05-18 import):** rows §1.1 through §4A were carried over from `feat/mq-v2-quant-format` (which was split into multiple PRs, not merged whole). Some of those measurements pre-date subsequent code fixes on master (e.g. May-16 Q8 attention NaN #264, F16 lm_head shim #265, hipGraph H2D capture fix #7790ac6a). Heuristic: better KLD numbers are more likely to be representative of current code. Re-measurement on master is welcome for any specific row; if the new number is materially lower, replace and note the SHA delta.
 **Owner:** hipfire eval
@@ -610,6 +610,7 @@ Source: 2026-05-18 + 2026-05-19 sessions. 27B KLD measurements against `qwen3.6-
 | mq4-plain-q8head-kvq8-c256 | ~4.5 | 0.2034 (CI 0.1841–0.2237) | 19.009 | 8.584 | **no AWQ, no GPTQ**; `--kmap-dense` only (Q8 lm_head + default Promote6 on alt down_proj) |
 | mq4-awq-gptq-f2-q8head-v100-kvq8-c256 | ~4.5 | **0.1257** (CI 0.1126–0.1398) | **16.666** | 8.697 | AWQ stage-A F2 + GPTQ body + Q8 lm_head — V100-calibrated |
 | **mq4-awq-gptq-f2-lmhead-a100-kvq8-c256** | **4.458** | **0.1307** (CI 0.1181–0.1442) | **15.946** | **8.663** | **same recipe family, A100-calibrated**; 2026-05-19, file 14.987 GB |
+| **mq3-body-mq4-lmhead-kvq8-c256** | **3.552** | **0.3082** (CI 0.2857–0.3316) | **19.096** | **9.856** | **mixed-bits**: MQ3-AWQ-GPTQ body (α=0.55, refit_iters=1) + MQ4-AWQ lm_head; 2026-05-20, file 11.943 GB; Stage C on A100, Stage D on gfx1100 (commit 7915ed6f added per-tensor n_bits dispatch). Coherent eyeball output ("Paris is the capital and largest city of France…" at 43 tok/s on gfx1100). HF: `hipfire-models/qwen3.6-27b-dev` (deleted 2026-05-20 — see analysis below). |
 
 **AWQ+GPTQ Δ on 27B MQ4 (identical kv-q8 + Q8 lm_head + body kmap):**
 mean KLD **−38%** (0.2034 → 0.1257), CIs non-overlapping. p99 KLD −12%
@@ -654,6 +655,52 @@ table because re-measuring on the fixed quant supersedes it.
 - Same variants at full slice (1175 chunks) — current row is the
   c256 smoke (CI half-width ≈11% of mean, acceptable for cohort
   comparison; full slice expected to tighten ≈2×).
+
+**Mixed-bits MQ3-body + MQ4-AWQ-lmhead (2026-05-20).** First true
+mixed-format Stage D build — `--format mq3 --lm-head-format mq4
+--precomputed-gptq-path …` with per-tensor `n_bits` in the manifest
+dispatched correctly (commit 7915ed6f). Bytes verified: 496 MQ3G256
+body tensors, 1 MQ4G256 lm_head, 497 AWQ sidecars; body codes use the
+full `[0..7]` range as expected. File is **3.86 GB smaller** than the
+all-MQ4 A100 row (11.943 vs 14.987 GB).
+
+Quality trade-off:
+- **KLD 0.3082 vs 0.1307 all-MQ4** → +136% (CIs non-overlapping, so
+  the regression is real, not noise). p99 19.1 vs 15.9 (+20% tail).
+- **PPL 9.856 vs 8.663 all-MQ4** → +14% next-token-loss.
+- **−1.0 bpw saving** (3.55 vs 4.46) for that quality cost.
+
+The body's 3-bit precision floor dominates the size win. Compare to §1.4
+9B MQ3 cohort: `mq3-awq-gptq` reached KLD 0.1967 (9B at 3.8 bpw) — about
+1.5× the 4-bit equivalent's KLD. The 27B mixed-bits sits at a similar
+ratio above its 4-bit reference (0.308 / 0.131 ≈ 2.4×), consistent with
+the "3-bit imposes a structural KLD floor that AWQ+GPTQ can mitigate
+but not eliminate" finding.
+
+**Coherence eyeball:** fluent on prose ("Paris is the capital and largest
+city of France, serving as the country's political and economic center.
+It is globally renowned for its rich history, iconic landmarks like the
+Eiffel Tower, and world-class museums such as the Louvre…" 1188 tokens
+at 43.6 tok/s on gfx1100). No attractor / repetition / token-level
+pathology observed in the eyeball window.
+
+**Recommendation:** the mixed-bits build is COHERENT but the +136% KLD
+makes it a niche Pareto point — best for VRAM-constrained gfx1100
+deployments where the 14.99 GB all-MQ4 file leaves no headroom for KV
+cache + activations. Default 27B distribution should remain
+`mq4-awq-gptq-f2-lmhead-a100` (KLD 0.1307). The artifact was uploaded
+to `hipfire-models/qwen3.6-27b-dev` on 2026-05-20 then deleted after the
+n=32 smoke (KLD 0.218) misleadingly suggested better quality than the
+n=256 measurement revealed.
+
+**Open α sweep — H1 from §3.2 followups still applies here.** AWQ
+α=0.55 was tuned at the 9B MQ4 U-curve minimum. The 27B mixed-bits row
+inherits that α with no re-tuning at the body's 3-bit width. Lower α
+(0.3 / 0.4) is the next thing to try — less aggressive AWQ pre-scaling
+may stay within MQ3's narrower precision envelope and recover some of
+the KLD gap to the 4-bit baseline. Expected shape: PPL benefit shrinks
+gracefully, KLD regression flips back toward parity with the 4-bit
+row. ~3 hours GPTQ wall-time per α point on A100.
 
 ---
 
