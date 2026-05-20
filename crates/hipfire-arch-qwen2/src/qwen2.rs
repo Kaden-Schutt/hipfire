@@ -446,6 +446,15 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         qt => panic!("qwen2: expected F16/F32 for norm {name}, got qt={qt}"),
     };
+    // Harmonised with `hipfire-arch-dots-ocr::dots_ocr::load_norm_weight_raw`.
+    // Catches a manifest-shape vs caller-arg mismatch (e.g. norm tensor on
+    // disk is `[hidden_size]` but caller passed `head_dim`) at upload
+    // time rather than letting a wrong-shape GpuTensor cascade through
+    // the forward pass.
+    assert_eq!(
+        f32_data.len(), n,
+        "qwen2: norm {name} has {} elements, expected {n}", f32_data.len(),
+    );
     gpu.upload_f32(&f32_data, &[n])
 }
 

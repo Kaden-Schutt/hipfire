@@ -175,9 +175,21 @@ fn parse_vision_config(metadata_json: &str) -> Option<DotsVisionConfig> {
     let rms_norm_eps = vc.get("rms_norm_eps").and_then(|v| v.as_f64())
         .map(|v| v as f32)
         .unwrap_or(defaults.rms_norm_eps);
-    // Text-hidden-size for out_hidden_size fallback (matches the
-    // post-merger output dim — must match text decoder).
+    // Post-merger output dim — must match the text decoder's embedding
+    // dimension so the merger output can splice directly into the text
+    // embed stream. Fallback chain:
+    //   1. `vision_config.out_hidden_size` — explicit override
+    //   2. `vision_config.hidden_size` — HF's PatchMerger uses this
+    //      (modeling_dots_vision.py:62-83 `PatchMerger(dim=config.hidden_size, ...)`).
+    //      dots.ocr's config.json sets both `embed_dim` and `hidden_size`
+    //      to 1536 (verified against the snapshot's config.json). On a
+    //      future Qwen2-VL sibling where embed_dim != hidden_size,
+    //      this is the load-bearing one for the merger output dim.
+    //   3. `config.text_config.hidden_size` — last resort for
+    //      hypothetical nested-config layouts.
+    //   4. defaults.out_hidden_size (1536).
     let out_hidden_size = vc.get("out_hidden_size").and_then(|v| v.as_u64())
+        .or_else(|| vc.get("hidden_size").and_then(|v| v.as_u64()))
         .or_else(|| {
             meta.get("config")?
                 .get("text_config")
@@ -561,7 +573,11 @@ fn load_f16_or_dequant(
         }
         qt => panic!(
             "dots-ocr: unsupported weight quant_type {qt} for {name}. \
-             load_f16_or_dequant handles qt ∈ {{1 (F16), 2 (F32), 6 (HFQ4G256), 7 (HFQ4G128)}}.",
+             load_f16_or_dequant handles qt ∈ {{1 (F16), 2 (F32), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
+             Other formats known to the HFQ writer (3 = Q8F16, 13 = MQ4G256, etc.) \
+             would need an additional dequant arm here; mirrors the qwen35-vl \
+             load_f16_gpu gap and is deferred until phase 5 (quantisation) makes \
+             one of them load-bearing on the vision side.",
         ),
     }
 }
@@ -587,6 +603,21 @@ fn load_f16_or_dequant_concat_rows(
     // Dequantise + cast to F16 bytes for each side, then concatenate.
     let bytes_a = dequant_to_f16_bytes(hfq, name_a, n_elements_a);
     let bytes_b = dequant_to_f16_bytes(hfq, name_b, n_elements_b);
+    // Defensive: dequant_hfq4 truncates to n_elements on a successful
+    // dequant, but a partial last-group truncate inside the loop could
+    // produce fewer elements without panicking. Catch that here so the
+    // GPU upload doesn't silently produce a shape-mismatched fc13_proj
+    // and either crash or, worse, read into the next tensor's allocation.
+    assert_eq!(
+        bytes_a.len(), 2 * n_elements_a,
+        "dots-ocr: {name_a} dequant produced {} f16 bytes, expected {}",
+        bytes_a.len(), 2 * n_elements_a,
+    );
+    assert_eq!(
+        bytes_b.len(), 2 * n_elements_b,
+        "dots-ocr: {name_b} dequant produced {} f16 bytes, expected {}",
+        bytes_b.len(), 2 * n_elements_b,
+    );
     let mut combined = Vec::with_capacity(bytes_a.len() + bytes_b.len());
     combined.extend_from_slice(&bytes_a);
     combined.extend_from_slice(&bytes_b);
@@ -776,19 +807,35 @@ pub(crate) fn linear_f16_no_bias(
 ///   embedding space — vision tokens substitute directly into the
 ///   `<|imgpad|>` positions via the daemon's `masked_scatter`-style
 ///   prefill loop.
+///
+/// # Batch limitation (single image per call)
+///
+/// This function processes ONE image at a time. The HF `cu_seqlens`
+/// block-diagonal masking that allows multi-image concatenation in
+/// `flash_attn_varlen_func` (see `modeling_dots_vision.py:160-167`)
+/// is NOT supported by `vit_attention_opt`, which is a standard dense
+/// attention kernel. Multi-image batching at this layer would let
+/// patches from image A attend to patches from image B, corrupting
+/// the merged tokens.
+///
+/// Multi-image prompts should call `vision_forward` once per image
+/// at the daemon prefill layer and concatenate the resulting merged
+/// tokens after the vision pass. Until that wiring lands (Phase 3),
+/// the function panics on inputs whose `patches.numel()` is not
+/// consistent with a single image's `[grid_h * grid_w, 588]` shape.
 pub fn vision_forward(
     _gpu: &mut Gpu,
     _weights: &DotsVisionWeights,
     _cfg: &DotsVisionConfig,
-    _patches: &[f32],
+    _patches: &GpuTensor,
     _grid_h: usize,
     _grid_w: usize,
-) -> Result<Vec<f32>, String> {
-    Err(
+) -> HipResult<GpuTensor> {
+    Err(hip_bridge::HipError::new(
+        0,
         "dots-ocr: vision_forward is a phase 2c stub. Implementation \
-         pending — see docs/plans/qwen_2.0_vlm_plus_dots_ocr.md phase 2c."
-            .to_string(),
-    )
+         pending — see docs/plans/qwen_2.0_vlm_plus_dots_ocr.md phase 2c.",
+    ))
 }
 
 // ─── Token-id constants ─────────────────────────────────────────────────

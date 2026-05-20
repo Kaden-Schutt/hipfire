@@ -53,6 +53,7 @@ status per phase in §5.
 | `7051d6e9` | **Phase 2c-2** — vision weight loader. Wires all 17 vision-tensor names: patch_embed (Conv2d → linear reshape [embed_dim,3,14,14] → [1536, 588], bias, RMSNorm), 42× DotsVisionBlock (norm1, attn.qkv, attn.proj, norm2, fc13_proj load-time concat, fc2), post_trunk_norm, merger (ln_q + bias, mlp.{0,2} + biases). Load-time SwiGLU fusion via fc1+fc3 → fc13_proj concat (initially byte-level on raw quant; refactored to F16 byte-level in 2c-4). 4 helpers (`load_norm_weight_raw`, `load_bias_f32`, `load_weight_tensor`, `load_weight_tensor_concat_rows`) all carry `TODO(transformer-extraction)` markers. Tests: 19 still passing. |
 | `22d47330` | **Phase 2c-3** — 2-D RoPE prep helper (`rope::build_rope_2d_tables`). Ports `get_pos_ids_by_grid` + `VisionRotaryEmbedding` + `apply_rotary_pos_emb_vision` quarter-repeat layout from `modeling_dots_vision.py` into a single CPU function emitting per-patch [N_patches, head_dim] cos/sin tables in dots.ocr's exact `[hc, wc, hc, wc]` layout. Patch enumeration in 2×2-block-major order matches `image::extract_patches`. 7 new tests including a hand-computed 2×2/head_dim=8 case and a reshape-permute-flatten equivalence check on a 4×6 grid. 26 tests total. |
 | `9f738911` | **Phase 2c-4** — vision GPU primitives. (1) New kernel `rope_2d_halfsplit_f32` (`kernels/src/rope_2d_halfsplit.hip` + dispatch fn) — applies the 2c-3 precomputed cos/sin tables to Q/K in-place; halfsplit pairs `(d, d+head_dim/2)`. (2) Loader refactor: vision linear weights now stored as F16 GpuTensor on GPU (HFQ4 / Q8 / F32 source quant types dequantise to F16 at load time per the qwen35-vl pattern — N=~20k patches makes batched HFQ4 GEMM the bottleneck; dequant-on-load + gemm_f16 sidesteps it). DotsVisionBlockWeights + DotsVisionWeights field types changed from WeightTensor → GpuTensor; load_f16_or_dequant + load_f16_or_dequant_concat_rows + dequant_hfq4 helpers added. (3) `linear_f16` + `linear_f16_no_bias` private helpers in dots_ocr.rs (the latter for the use_bias=false vision-block linears). Vision-shape primitive audit confirmed: `rmsnorm_f32`, `silu_mul_f32`, `vit_attention_f32` (non-causal), `bias_add_f32`, `gelu_tanh_f32`, `layernorm_batched`, `gemm_f16`, `add_inplace_f32`, `transpose_f32` all accept [N_patches, hidden] strides — CAVEAT: large-N attention needs `vit_attention_opt` instead of `vit_attention_f32` (the latter materialises N² scores in shared mem, ~77 KB at N≈19520 exceeds RDNA per-CU SLM cap). 26 tests still passing. |
+| _wip_ | **Phase 2 review fold-in (rev-claude + rev-glm5 + rev-gemini)** — three-reviewer pass on `f6b28a12..9f738911`. Adjudication: rev-claude A1 (out_hidden_size fallback) VALIDATED → fixed; rev-claude B1 (smart_resize upscale re-clamp) VALIDATED → fixed; rev-claude B2/B3 (rope_2d dispatch missing launch_maybe_blob + profile + guards) VALIDATED → fixed (now wired through `launch_maybe_blob` + `begin_timer` like neighbouring kernels, `head_dim % 4` assert matches table builder); rev-claude B4 (qwen2 `load_norm_weight_raw` missing length assert) VALIDATED → harmonised; rev-claude C2 (concat_rows missing length asserts) VALIDATED → added; rev-claude C5 (TPS>1 doc) VALIDATED → added; rev-glm5 A1 (rope kernel head bounds) REJECTED (body work IS inside guards — no OOB; GLM-5 misread); rev-glm5 A2 (vision_forward GPU signature) VALIDATED, merged with rev-claude C3 → stub now takes `&GpuTensor` patches and returns `HipResult<GpuTensor>`; rev-glm5 A3 (load_f16_or_dequant qt=3) PARTIAL → panic message improved (matches qwen35-vl gap; defer qt=3 arm to phase 5); rev-gemini 3.1 (multi-image attention leakage in vit_attention_opt) DOCUMENTED → vision_forward now has explicit single-image-only doc + plan §5 phase 3 spec calls for per-image loop in daemon; rev-gemini 3.2 (IMGPAD count assertion) DOCUMENTED in plan §5 phase 3 as a hard splice-site assert; rev-gemini 3.3 (R5 still listed in §6.1 deferred) FIXED → §6.1 R5 marked resolved with reference to §6. 34 tests passing (26 dots-ocr + 8 qwen2). Review scaffolding files dropped per `feedback_drop_review_files_after_fold_in`. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -1039,6 +1040,36 @@ triple.
   `forward_scratch_embed` with the next merged visual embedding.
 - Plumb `image_grid_thw` through the daemon's generate request
   payload (currently no path for this in non-Qwen3.5 VL).
+- **IMGPAD count assertion (Gemini review).** The merger emits exactly
+  `(grid_h / sm) * (grid_w / sm)` visual tokens per image. The prompt
+  framer MUST insert exactly that count of `<|imgpad|>` (151665)
+  tokens between `<|img|>` and `<|endofimg|>` for each image. Add a
+  hard assert at the splice site:
+  ```rust
+  assert_eq!(
+      img_mask.count_ones(),
+      merged_vision_tokens.len(),
+      "dots-ocr: prompt has {} <|imgpad|> slots but vision_forward \
+       produced {} merged tokens — prompt framer mismatch",
+      img_mask.count_ones(), merged_vision_tokens.len(),
+  );
+  ```
+  Mismatched counts either truncate vision tokens silently or leave
+  unresolved IMGPAD positions in the text context — both are
+  silent-failure traps.
+- **Multi-image attention leakage (Gemini review, HIGH RISK).**
+  `vit_attention_opt` is a standard dense ViT attention kernel; it
+  does NOT support FlashAttention's `cu_seqlens` block-diagonal
+  masking that HF's `flash_attn_varlen_func` uses for multi-image
+  concatenation. Two paths:
+  1. Per-image loop in the daemon: call `vision_forward` once per
+     image (batch=1), concatenate merged tokens AFTER the vision
+     pass but BEFORE the text-side `masked_scatter`. Safer, no
+     kernel changes.
+  2. Add `cu_seqlens` masking to `vit_attention_opt`. More work,
+     better throughput at multi-image scale.
+  Phase 3 implements (1) — `vision_forward` itself already documents
+  single-image-only semantics. Phase 6+ (perf) may revisit (2).
 
 **Example binary:**
 - `crates/hipfire-runtime/examples/infer_dots_ocr.rs`: takes
@@ -1130,23 +1161,20 @@ OCR-specific gate. Fluent ≠ correct.
   Latent (didn't fire) because the current `qwen2-1.5b.hfq4` uses
   HFQ4G256 for the embedding, not F16. Tagged here so the test
   matrix doesn't regress.
-- **[NEW — R5] dots.ocr `eos_token_id` is in `generation_config.json`,
-  not `config.json`.** The quantiser doesn't load
-  `generation_config.json`; the config parser then defaults
-  `eos_token_id` to 151645 (ChatML `<|im_end|>`), which is wrong for
-  dots.ocr (correct primary is 151673 `<|endofassistant|>`). Two
-  resolution paths (pick one before phase 3):
-  - Extend `hipfire-quantize` to also pack `generation_config.json`
-    into metadata when present.
-  - Special-case dots.ocr's EOS in `eos_filter_overrides` (already
-    planned per §2.5) and accept that the `cfg.eos_token_id` scalar
-    is for sampler-level termination only, not for streaming EOS.
-  Parser side of this is **partially mitigated** — the parser now
-  keeps the *full* `eos_token_id` array (Qwen2Config.eos_token_ids,
-  added in `45913eb0`) so the daemon's stop-set has the multi-element
-  semantics it needs. What's still missing is the quantiser-side
-  packing of `generation_config.json` — without it, dots.ocr's EOS
-  doesn't reach Qwen2Config at all. Resolve before phase 2 starts.
+- **[RESOLVED — R5] dots.ocr EOS via generation_config.json.**
+  Shipped in `544822b4`: `hipfire-quantize` now reads
+  `generation_config.json` alongside `tokenizer_config.json` (if the
+  file exists in the input directory) and packs it into HFQ metadata
+  under a top-level `generation_config` key. Parser side
+  (`Qwen2Config::from_hfq`) walks the three-layer fallback
+  `text_config.eos_token_id` / `config.eos_token_id` →
+  `generation_config.eos_token_id` → default `[151645]`. Tests: 8
+  passing including `eos_falls_back_to_generation_config_when_absent_from_config`
+  (dots.ocr's real shape) and
+  `eos_in_config_takes_precedence_over_generation_config` (guards
+  against ordering ambiguity). Field docs in
+  `crates/hipfire-arch-qwen2/src/qwen2.rs:46-57` describe the
+  lookup order explicitly.
 - **[RESOLVED — R6] Daemon arch_id=7 event-handler gaps.**
   The R3 commit (`806680b2`) added the `load_model` / `generate`
   arms for arch_id=7 but missed two other daemon event handlers:
@@ -1273,13 +1301,12 @@ ought to absorb them. None blocks the rev-3 PR.
 - **§2.5 `<|endofsystem|>` token-string handling.** Not in
   `added_tokens_decoder` — must be emitted as raw bytes that the BPE
   tokenizer fragments. rev-1 BUG-2 deferred. (GLM-5 §4)
-- **R5 dots.ocr EOS in `generation_config.json`.** Quantiser still
-  doesn't pack `generation_config.json`, so the parser falls back to
-  `eos_token_id = 151645` for any model that doesn't carry it in
-  `config.json` (which is most models including dots.ocr). Land the
-  quantiser-side fix OR special-case via `eos_filter_overrides`
-  before phase 2 starts. (Claude rev-3 B4, partly "MITIGATED" by
-  Gemini §4 but the metadata-side gap is real.)
+- **[RESOLVED] R5 dots.ocr EOS in `generation_config.json`.** Landed
+  in `544822b4` — quantiser packs `generation_config.json` into HFQ
+  metadata; Qwen2 parser walks fallback chain
+  `text_config.eos_token_id` / `config.eos_token_id` →
+  `generation_config.eos_token_id` → default `[151645]`. See §6 R5
+  for the full resolution narrative.
 
 **Cleanup / nice-to-have (any future PR):**
 

@@ -19913,28 +19913,38 @@ impl Gpu {
         n_heads_k: usize,
         head_dim: usize,
     ) -> HipResult<()> {
-        assert_eq!(head_dim % 2, 0, "rope_2d_halfsplit_f32: head_dim must be even");
+        // The dots.ocr 2-D RoPE layout (`[hc, wc, hc, wc]` quarter-
+        // repeat) requires head_dim to split into four equal quarters;
+        // `head_dim % 4 == 0` is the load-bearing constraint, not just
+        // evenness. Match the `rope::build_rope_2d_tables` panic.
+        assert!(
+            head_dim % 4 == 0,
+            "rope_2d_halfsplit_f32: head_dim={head_dim} must be a multiple of 4 \
+             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
+        );
+        assert!(n_patches > 0, "rope_2d_halfsplit_f32: n_patches must be > 0");
+        assert!(n_heads_q > 0 || n_heads_k > 0, "rope_2d_halfsplit_f32: must rotate at least one of Q/K");
         self.bind_thread()?;
         self.ensure_kernel("rope_2d_halfsplit", kernels::ROPE_2D_HALFSPLIT_SRC, "rope_2d_halfsplit_f32")?;
 
-        let mut qp = q.buf.as_ptr();
-        let mut kp = k.buf.as_ptr();
-        let mut cp = cos_table.buf.as_ptr();
-        let mut sp = sin_table.buf.as_ptr();
-        let mut np = n_patches as i32;
-        let mut nhq = n_heads_q as i32;
-        let mut nhk = n_heads_k as i32;
-        let mut hd = head_dim as i32;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let cp = cos_table.buf.as_ptr();
+        let sp = sin_table.buf.as_ptr();
+        let np = n_patches as i32;
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut qp as *mut _ as *mut c_void,
-            &mut kp as *mut _ as *mut c_void,
-            &mut cp as *mut _ as *mut c_void,
-            &mut sp as *mut _ as *mut c_void,
-            &mut np as *mut _ as *mut c_void,
-            &mut nhq as *mut _ as *mut c_void,
-            &mut nhk as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
         ];
 
         let half = (head_dim / 2) as u32;
@@ -19945,13 +19955,24 @@ impl Gpu {
         // on RDNA.
         let grid = [n_patches as u32, max_heads, 1];
         let block = [half, 1, 1];
-
-        let func = &self.functions["rope_2d_halfsplit_f32"];
-        unsafe {
-            self.hip.launch_kernel(
-                func, grid, block, 0, self.stream_ref(), &mut params,
-            )
-        }
+        // Bytes-touched estimate for the profile timer: Q+K reads/writes
+        // + cos/sin reads. Each thread touches 2 q/k entries and 2
+        // cos/sin entries (cd, ce, sd, se).
+        let max_heads_us = n_heads_q.max(n_heads_k);
+        let bytes = (n_patches * max_heads_us * head_dim * 4 * 2)  // Q+K RMW
+                  + (n_patches * head_dim * 4 * 2);                // cos+sin reads
+        let timer = crate::profile::begin_timer(&self.hip, "rope_2d", "rope_2d_halfsplit_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "rope_2d_halfsplit_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(cp); b.push_ptr(sp);
+                b.push_i32(np); b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// Sigmoid activation, in-place.

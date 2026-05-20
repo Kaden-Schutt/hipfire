@@ -148,7 +148,22 @@ fn smart_resize_inner(
         let beta = (min_pixels as f64 / (h * w)).sqrt();
         let h_scaled = factor.max(((h * beta / factor_f).ceil() as usize) * factor);
         let w_scaled = factor.max(((w * beta / factor_f).ceil() as usize) * factor);
-        (h_scaled, w_scaled)
+        // Edge case from `dots_ocr/utils/image_utils.py:56-61`: the
+        // upscale ceil-rounding can overshoot `max_pixels` on a very
+        // skinny input (e.g. 1×100 input → upscale to cross min_pixels
+        // → ceil pushes both dims to factor-multiples → product > max).
+        // The Python source re-clamps with the downscale formula. For
+        // dots.ocr's MIN=3136 / MAX=11_289_600 the ratio (~3600×) makes
+        // this branch effectively unreachable, but we mirror the source
+        // exactly to keep the byte-identity claim with HF.
+        if h_scaled * w_scaled > max_pixels {
+            let beta = ((h_scaled * w_scaled) as f64 / max_pixels as f64).sqrt();
+            let h_re = factor.max(((h_scaled as f64 / beta / factor_f).floor() as usize) * factor);
+            let w_re = factor.max(((w_scaled as f64 / beta / factor_f).floor() as usize) * factor);
+            (h_re, w_re)
+        } else {
+            (h_scaled, w_scaled)
+        }
     } else {
         (h_round, w_round)
     };
@@ -238,6 +253,18 @@ pub fn clip_normalise(rgb: &[u8], h: usize, w: usize) -> Vec<f32> {
 /// - `h % PATCH_SIZE != 0` or `w % PATCH_SIZE != 0`
 /// - `(h / PATCH_SIZE) % SPATIAL_MERGE_SIZE != 0` or
 ///   `(w / PATCH_SIZE) % SPATIAL_MERGE_SIZE != 0`
+///
+/// # TEMPORAL_PATCH_SIZE > 1 (future)
+///
+/// Input contract is `[3, h, w]` (single frame). For
+/// `TEMPORAL_PATCH_SIZE > 1` the inner `_t` loop reads
+/// `chw[c * h * w + y * w + x]` independent of `_t`, which
+/// duplicates the single frame across the temporal axis. This
+/// matches HF behaviour — they upstream-duplicate one frame into a
+/// `[TPS, C, H, W]` tensor before the transpose at
+/// `image_processing_qwen2_vl.py:267-275`. dots.ocr ships with
+/// `TEMPORAL_PATCH_SIZE = 1` so the duplication path is dead code;
+/// kept explicit so a future TPS>1 fork compiles unchanged.
 pub fn extract_patches(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
     assert_eq!(
         chw.len(),
