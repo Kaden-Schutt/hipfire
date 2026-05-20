@@ -97,76 +97,123 @@ fn compute_n_tiles(l: usize, head_dim: usize) -> usize {
     (l + tile_size - 1) / tile_size.max(1)
 }
 
+fn run_case(
+    gpu: &mut Gpu,
+    kernel: &str,
+    b: usize, l: usize, n_heads: usize, n_kv_heads: usize, hd: usize,
+    out_ref: &[f32],
+) -> f32 {
+    let q = lcg_data(0xa5a5_a5a5 ^ ((l as u32).wrapping_mul(31)), b * n_heads * hd);
+    let k = lcg_data(0xc3c3_c3c3 ^ ((l as u32).wrapping_mul(17)), l * n_kv_heads * hd);
+    let v = lcg_data(0x9696_9696 ^ ((l as u32).wrapping_mul(13)), l * n_kv_heads * hd);
+
+    let d_q = gpu.upload_f32(&q, &[b * n_heads * hd]).unwrap();
+    let d_k = gpu.upload_f32(&k, &[l * n_kv_heads * hd]).unwrap();
+    let d_v = gpu.upload_f32(&v, &[l * n_kv_heads * hd]).unwrap();
+    let d_out = gpu.zeros(&[b * n_heads * hd], DType::F32).unwrap();
+
+    match kernel {
+        "scalar" => gpu
+            .attention_dflash_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
+            .unwrap(),
+        "wmma" => gpu
+            .attention_dflash_wmma_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
+            .unwrap(),
+        _ => unreachable!(),
+    }
+
+    let out_gpu = gpu.download_f32(&d_out).unwrap();
+    let max_abs_diff = out_ref
+        .iter()
+        .zip(out_gpu.iter())
+        .map(|(r, g)| (g - r).abs())
+        .fold(0.0f32, f32::max);
+
+    gpu.free_tensor(d_q).unwrap();
+    gpu.free_tensor(d_k).unwrap();
+    gpu.free_tensor(d_v).unwrap();
+    gpu.free_tensor(d_out).unwrap();
+    max_abs_diff
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init failed");
     println!("GPU initialized: {}", gpu.arch);
 
-    let b = 1usize;
-    let n_heads = 2usize;
-    let n_kv_heads = 1usize;
-
+    // Existing scalar coverage: B=1 sweep across small + large L.
+    // New WMMA coverage: same plus B=16, 17, 32 to exercise B-tiling
+    // (single tile, partial second tile, exact two tiles).
     let l_values = [1usize, 127, 128, 13_951, 13_952, 13_953, 16_384];
     let hd_values = [64usize, 128, 256, 512];
+    let b_values: &[(usize, &str)] = &[
+        (1,  "scalar+wmma"),
+        (16, "wmma_only"),
+        (17, "wmma_only"),
+        (32, "wmma_only"),
+    ];
+    let n_heads = 2usize;
+    let n_kv_heads = 1usize;
     let tol = 1.0e-3f32;
 
     let mut total = 0;
     let mut failed = 0;
     let mut max_err_seen = 0.0f32;
 
+    println!("tolerance: max-abs-diff < {tol:.0e}");
+    println!("kernels:   scalar = attention_dflash_f32   wmma = attention_dflash_wmma_f32");
+    println!();
     println!(
-        "matrix: B={b} n_heads={n_heads} n_kv_heads={n_kv_heads} (rep={})",
-        n_heads / n_kv_heads
+        "{:>3}  {:>5}  {:>3}  {:>6}  {:>11}  {:>11}  {:>4}",
+        "B", "L", "hd", "kernel", "max_diff", "vs_scalar", "stat"
     );
-    println!("tolerance: max-abs-diff < {tol:.0e}\n");
-    println!("{:>5}  {:>3}  {:>7}  {:>11}  {:>4}", "L", "hd", "n_tiles", "max_diff", "stat");
-    println!("{}", "-".repeat(40));
+    println!("{}", "-".repeat(70));
 
-    for &l in &l_values {
-        for &hd in &hd_values {
-            total += 1;
-            let n_tiles = compute_n_tiles(l, hd);
+    for &(b, mode) in b_values {
+        for &l in &l_values {
+            for &hd in &hd_values {
+                let q = lcg_data(0xa5a5_a5a5 ^ ((l as u32).wrapping_mul(31)), b * n_heads * hd);
+                let k = lcg_data(0xc3c3_c3c3 ^ ((l as u32).wrapping_mul(17)), l * n_kv_heads * hd);
+                let v = lcg_data(0x9696_9696 ^ ((l as u32).wrapping_mul(13)), l * n_kv_heads * hd);
+                let out_ref = cpu_attention_ref(&q, &k, &v, b, l, n_heads, n_kv_heads, hd);
 
-            let q = lcg_data(0xa5a5_a5a5 ^ ((l as u32).wrapping_mul(31)), b * n_heads * hd);
-            let k = lcg_data(0xc3c3_c3c3 ^ ((l as u32).wrapping_mul(17)), l * n_kv_heads * hd);
-            let v = lcg_data(0x9696_9696 ^ ((l as u32).wrapping_mul(13)), l * n_kv_heads * hd);
+                let run_scalar = mode.contains("scalar");
+                let scalar_diff = if run_scalar {
+                    let d = run_case(&mut gpu, "scalar", b, l, n_heads, n_kv_heads, hd, &out_ref);
+                    total += 1;
+                    max_err_seen = max_err_seen.max(d);
+                    if d >= tol { failed += 1; }
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>6}  {:>11.3e}  {:>11}  {}",
+                        b, l, hd, "scalar", d, "—",
+                        if d < tol { "PASS" } else { "FAIL" }
+                    );
+                    Some(d)
+                } else { None };
 
-            let out_ref = cpu_attention_ref(&q, &k, &v, b, l, n_heads, n_kv_heads, hd);
-
-            let d_q = gpu.upload_f32(&q, &[b * n_heads * hd]).unwrap();
-            let d_k = gpu.upload_f32(&k, &[l * n_kv_heads * hd]).unwrap();
-            let d_v = gpu.upload_f32(&v, &[l * n_kv_heads * hd]).unwrap();
-            let d_out = gpu.zeros(&[b * n_heads * hd], DType::F32).unwrap();
-
-            gpu.attention_dflash_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
-                .unwrap();
-
-            let out_gpu = gpu.download_f32(&d_out).unwrap();
-
-            let mut max_abs_diff = 0.0f32;
-            for i in 0..out_ref.len() {
-                let diff = (out_gpu[i] - out_ref[i]).abs();
-                if diff > max_abs_diff {
-                    max_abs_diff = diff;
+                // WMMA kernel caps at head_dim <= 256 (LDS budget). Skip
+                // larger head_dim — those stay on the scalar path.
+                if hd <= 256 {
+                    let wmma_diff = run_case(&mut gpu, "wmma", b, l, n_heads, n_kv_heads, hd, &out_ref);
+                    total += 1;
+                    max_err_seen = max_err_seen.max(wmma_diff);
+                    if wmma_diff >= tol { failed += 1; }
+                    let vs = match scalar_diff {
+                        Some(_) => format!("{:.2e}", wmma_diff),
+                        None => "—".into(),
+                    };
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>6}  {:>11.3e}  {:>11}  {}",
+                        b, l, hd, "wmma", wmma_diff, vs,
+                        if wmma_diff < tol { "PASS" } else { "FAIL" }
+                    );
+                } else if !run_scalar {
+                    // hd>256, wmma_only mode — nothing to test.
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>6}  {:>11}  {:>11}  {}",
+                        b, l, hd, "wmma", "—", "—", "SKIP (hd>256)"
+                    );
                 }
             }
-            max_err_seen = max_err_seen.max(max_abs_diff);
-            let pass = max_abs_diff < tol;
-            if !pass {
-                failed += 1;
-            }
-            println!(
-                "{:>5}  {:>3}  {:>7}  {:>11.3e}  {}",
-                l,
-                hd,
-                n_tiles,
-                max_abs_diff,
-                if pass { "PASS" } else { "FAIL" }
-            );
-
-            gpu.free_tensor(d_q).unwrap();
-            gpu.free_tensor(d_k).unwrap();
-            gpu.free_tensor(d_v).unwrap();
-            gpu.free_tensor(d_out).unwrap();
         }
     }
 

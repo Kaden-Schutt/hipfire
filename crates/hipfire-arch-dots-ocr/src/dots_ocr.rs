@@ -1040,10 +1040,27 @@ pub fn vision_forward(
         // self-attention is B = L = n_patches, n_heads_kv = n_heads
         // (no GQA on the vision side per modeling_dots_vision.py:106).
         let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
-        gpu.attention_dflash_f32(
-            &q_buf, &k_buf, &v_buf, &attn,
-            n_patches, n_patches, n_heads, n_heads, head_dim,
-        )?;
+        // For large-B vision attention (B = L = n_patches ≈ 20k on the
+        // smoke image), use the WMMA-accelerated FlashAttention kernel —
+        // grid `[n_heads, B/16]` with one block tiling 16 queries via
+        // wave-cooperative WMMA. The scalar `attention_dflash_f32` is
+        // ~10× slower at this scale; benchmarks on the smoke image
+        // show ~50s/block → ~5-10s/block after the switch.
+        //
+        // Falls back to the scalar variant if head_dim isn't a multiple
+        // of 16 (the WMMA tile-K size) — for dots.ocr (head_dim=128)
+        // we always take the WMMA path.
+        if head_dim % 16 == 0 {
+            gpu.attention_dflash_wmma_f32(
+                &q_buf, &k_buf, &v_buf, &attn,
+                n_patches, n_patches, n_heads, n_heads, head_dim,
+            )?;
+        } else {
+            gpu.attention_dflash_f32(
+                &q_buf, &k_buf, &v_buf, &attn,
+                n_patches, n_patches, n_heads, n_heads, head_dim,
+            )?;
+        }
         gpu.free_tensor(q_buf)?;
         gpu.free_tensor(k_buf)?;
         gpu.free_tensor(v_buf)?;

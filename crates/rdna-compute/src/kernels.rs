@@ -1552,6 +1552,12 @@ pub const ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC: &str = include_str!("../../../k
 /// See `kernels/src/qkv_split_interleaved.hip`.
 pub const QKV_SPLIT_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/qkv_split_interleaved.hip");
 
+/// WMMA-accelerated FlashAttention-style non-causal attention (gfx1100+).
+/// Companion to `ATTENTION_DFLASH_SRC` for the large-B / large-L case
+/// where one block tiles 16 queries via WMMA. Grid `[n_heads, ceil(B/16)]`,
+/// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
+pub const ATTENTION_DFLASH_WMMA_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
