@@ -2355,8 +2355,17 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    // Vision encoder weights stay FP16 (only 456M params, run once per image)
-    if name.starts_with("model.visual.") || name.starts_with("visual.") {
+    // Vision encoder weights stay FP16 (only ~500M params, run once per image).
+    // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
+    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
+    // per-stage diff against the HF reference activations
+    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
+    // both forward-pass implementation noise AND quant noise — clean
+    // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
+    if name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+        || name.starts_with("vision_tower.")
+    {
         return false;
     }
     if name.contains("norm") || name.contains("bias") {
@@ -3905,6 +3914,11 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
+        // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
+        // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
+        // qwen_2.0_vlm_plus_dots_ocr.md.
+        "dots_ocr" => 8,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -4226,8 +4240,14 @@ fn main() {
         .unwrap_or_default();
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip MTP head; optionally include vision encoder for VL inference
-        let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
+        // Skip MTP head; optionally include vision encoder for VL inference.
+        // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
+        // dots.ocr names them `vision_tower.*`. Both fall through to the
+        // F16 fallback path (see should_quantize: vision_tower.* is
+        // skipped from quantization) when --include-vision is set.
+        let is_vision = name.starts_with("model.visual.")
+            || name.starts_with("visual.")
+            || name.starts_with("vision_tower.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
