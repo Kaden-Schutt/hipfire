@@ -8427,6 +8427,137 @@ impl Gpu {
         )
     }
 
+    /// MMQ_Y-parameterized tile launcher for HFQ4 residual kernels.
+    /// Mirrors `launch_hfq3_mmq_tile_with_y`; body.cuh uses `#ifndef MMQ_Y`
+    /// so each wrapper can override the row tile. Issue #299.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hfq4_mmq_tile_with_y(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_hfq4g256_residual_mmq_body.cuh\"",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let row_tiles = (m + mmq_y - 1) / mmq_y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                  + batch_size * k
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 MMQ residual mmq_x=16. Mid-batch tile (best in HFQ3 sweep for
+    /// 13 ≤ N ≤ 63). Issue #299.
+    pub fn gemm_hfq4g256_residual_mmq_x16(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            16, 128,
+            "gemm_hfq4g256_residual_mmq_x16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 MMQ residual mmq_x=32. Long-prefill tile (N ≥ 64 in HFQ3 sweep).
+    pub fn gemm_hfq4g256_residual_mmq_x32(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 128,
+            "gemm_hfq4g256_residual_mmq_x32",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 MMQ residual mmq_x=32, MMQ_Y=64. Halves the row tile to
+    /// double theoretical CU occupancy. MQ3 phase-2 finding transferred.
+    pub fn gemm_hfq4g256_residual_mmq_x32_y64(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 64,
+            "gemm_hfq4g256_residual_mmq_x32_y64",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X32_Y64_SRC,
+        )
+    }
+
+    /// HFQ4 RDNA2 MMQ residual auto-selector — batch-size gated tile picker.
+    /// Mirrors `gemm_hfq3g256_residual_mmq` boundaries pending HFQ4 sweep.
+    /// Distinct from `gemm_hfq4g256_residual_mmq` (RDNA3+ llama.cpp-style
+    /// path gated by `HIPFIRE_WO_MMQ=1`) which lives at a different LDS
+    /// layout and was not part of the gfx10 MQ3 prefill work.
+    pub fn gemm_hfq4g256_residual_mmq_rdna2_auto(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_hfq4g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
+        } else {
+            self.gemm_hfq4g256_residual_mmq_x32_y64(a_raw, x, y, m, k, batch_size)
+        }
+    }
+
     /// Wave32 MMQ residual kernel for HFQ4 on RDNA2+ — Phase 3 side-win probe.
     /// Same topology as the HFQ3 sibling; differs only in 4-bit nibble unpack
     /// (vs 3-bit trit). Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
@@ -13168,8 +13299,13 @@ impl Gpu {
         // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
         // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
         // gate is OnceLock-cached. Default off.
+        //
+        // Issue #299 follow-up: route through the tile-size auto-selector
+        // so narrow-batch calls pick mmq_x=16 and long-prefill picks
+        // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
+        // internally, so no alignment check needed.
         if batch_size > 1 && hfq4_mmq_rdna2_enabled(&self.arch) {
-            return self.gemm_hfq4g256_residual_mmq_rdna2(a_raw, x, y, m, k, batch_size);
+            return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
 
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.

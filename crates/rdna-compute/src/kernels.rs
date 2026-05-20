@@ -1002,6 +1002,14 @@ pub const GEMM_QKVZA_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels
 pub const GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x32.gfx1030.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
 
+// HFQ4 RDNA2 MMQ residual family (issue #299). Templated body + thin
+// tile wrappers. Mirrors the HFQ3 Phase 3 layout (mmq_x ∈ {16, 32},
+// MMQ_Y default 128; y64 variant applies the MQ3 phase-2 finding).
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_body.cuh");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x16.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x32.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x32_y64.gfx1030.hip");
+
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
 // N times on the same x[b]. Used for batched prefill of the FFN gate/up projections.
