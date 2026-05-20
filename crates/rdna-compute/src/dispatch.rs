@@ -492,6 +492,40 @@ fn fp16_disabled() -> bool {
     })
 }
 
+/// Whether FP16 fast paths are disabled FOR THE CURRENT LAYER, considering
+/// both the global `HIPFIRE_FP16=0` flag and the per-layer
+/// `HIPFIRE_FP16_LAYER_MIN..=HIPFIRE_FP16_LAYER_MAX` range. Used by the
+/// HFQ3 dispatcher chain to support per-layer FP16-vs-scalar KLD
+/// attribution sweeps (issue #302).
+///
+/// Returns `true` (= disable FP16, force scalar) when either:
+///   - the global `HIPFIRE_FP16=0` is set, OR
+///   - the current layer (`MMQ_CURRENT_LAYER`) falls within the
+///     `HIPFIRE_FP16_LAYER_MIN..=HIPFIRE_FP16_LAYER_MAX` range
+///
+/// When neither env var is set the per-layer range is inactive — the
+/// function reduces to `fp16_disabled()` and routing is unchanged.
+fn fp16_disabled_for_current_layer() -> bool {
+    if fp16_disabled() { return true; }
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    let lo = *MIN.get_or_init(|| {
+        std::env::var("HIPFIRE_FP16_LAYER_MIN").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    let hi = *MAX.get_or_init(|| {
+        std::env::var("HIPFIRE_FP16_LAYER_MAX").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    if lo.is_none() && hi.is_none() {
+        return false;  // per-layer gate not active
+    }
+    let layer = MMQ_CURRENT_LAYER.load(Ordering::Relaxed);
+    let above_min = lo.map(|m| layer >= m).unwrap_or(true);
+    let below_max = hi.map(|m| layer <= m).unwrap_or(true);
+    above_min && below_max  // in-range → disable FP16 for this layer
+}
+
 /// Cached env-var read for `HIPFIRE_WO_MMQ=1` (opt-in MMQ for the wo path
 /// on RDNA3+/RDNA3.5 while the tiled path is validated).
 fn wo_mmq_enabled() -> bool {
@@ -5847,7 +5881,10 @@ impl Gpu {
             );
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302): falls through to scalar when the
+        // current layer falls in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when
+        // those env vars are unset.
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_qkvza_hfq3g256_dot2(
                     a_qkv, a_z, a_beta, a_alpha, x,
@@ -6537,7 +6574,9 @@ impl Gpu {
         }
         // FP16 fast paths — gfx10xx admits MQ3 via is_batchable_la, all of
         // these archs support FP16 ISA. Phase 2b (dot2) + Phase 2c (fp16).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302) falls through to scalar when layer
+        // in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when those vars are unset.
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             // v_dot2_f32_f16 on archs with the dot extension
             // (gfx1011/1012/1030-1032, gfx11/12).
             if has_dot2_f32_f16(&self.arch) {
@@ -7301,7 +7340,8 @@ impl Gpu {
             );
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -13136,7 +13176,8 @@ impl Gpu {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
             }
