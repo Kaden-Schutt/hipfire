@@ -131,8 +131,70 @@ extern "C" __global__ void attention_dflash_f32(
         // Update running denominator.
         l_run = alpha * l_run + tile_sum;
 
-        // Update running output: each thread updates the head_dim slots it owns.
-        for (int d = tid; d < head_dim; d += nthreads) {
+        // Phase C: update running output. Mathematically:
+        //   out_run[d] = alpha * out_run[d] + sum_j tile_scores[j] * V[j, d]
+        //
+        // The naive layout — `for (d = tid; d < head_dim; d += nthreads)` with
+        // a serial inner j-loop — only parallelises across head_dim. For
+        // typical DFlash configs (small L, small head_dim) that's fine.
+        // For large L (vision tower at L≈20k), each active thread serially
+        // loops `tile_len` (up to ~14k) j-positions per tile, and half the
+        // 256 threads idle when head_dim=128 — the V-accumulation becomes
+        // the kernel's hot spot.
+        //
+        // Cooperative layout: when `nthreads > head_dim` we have spare
+        // threads. Map `tid -> (j_chunk_id, d_lane)`:
+        //   d_lane     = tid % head_dim
+        //   j_chunk_id = tid / head_dim
+        //   j_chunks   = nthreads / head_dim    (≥ 1)
+        // Each (j_chunk_id, d_lane) thread accumulates its slice of j into
+        // a per-thread `partial` register, all threads write to ws[], then
+        // the `j_chunk_id == 0` lanes reduce across j_chunks for their d.
+        //
+        // FP-equivalence: same multiply-add set as the naive layout, just
+        // reordered into j_chunk groups. Numerical drift vs the naive form
+        // is bounded by FP non-associativity (~1e-8 on the parity test).
+        //
+        // When nthreads <= head_dim (small DFlash configs), j_chunks=1 and
+        // the cooperative layout collapses exactly to the naive layout —
+        // identical work, identical order.
+        int j_chunks = nthreads / head_dim;
+        if (j_chunks < 1) j_chunks = 1;
+        int d_lane = tid % head_dim;
+        int j_chunk_id = tid / head_dim;
+
+        float partial = 0.0f;
+        if (j_chunk_id < j_chunks && d_lane < head_dim) {
+            int j_per_chunk = (tile_len + j_chunks - 1) / j_chunks;
+            int j_start_local = j_chunk_id * j_per_chunk;
+            int j_end_local = j_start_local + j_per_chunk;
+            if (j_end_local > tile_len) j_end_local = tile_len;
+            for (int j = j_start_local; j < j_end_local; ++j) {
+                int abs_j = tile_start + j;
+                partial += tile_scores[j] * v[abs_j * kv_stride + kv_head * head_dim + d_lane];
+            }
+        }
+        // Threads with tid >= j_chunks * head_dim are idle (when
+        // `nthreads % head_dim != 0`); their partial stays 0.
+        ws[tid] = partial;
+        __syncthreads();
+
+        // The j_chunk_id == 0 lane (i.e. tid in [0, head_dim)) reduces
+        // across j_chunks for its d and updates out_run[d].
+        if (j_chunk_id == 0 && d_lane < head_dim) {
+            float total = ws[d_lane];
+            for (int jc = 1; jc < j_chunks; ++jc) {
+                total += ws[jc * head_dim + d_lane];
+            }
+            out_run[d_lane] = alpha * out_run[d_lane] + total;
+        }
+        // Handle nthreads < head_dim: the cooperative layout above only
+        // assigned d_lane = tid % head_dim values; tids that wrap past
+        // head_dim never happen (j_chunks would be 1 and tid < nthreads
+        // < head_dim, so d_lane = tid). But head_dim may still exceed
+        // nthreads (e.g. head_dim=256 with nthreads=128). Cover the
+        // remaining slots with the original per-d serial-j loop.
+        for (int d = nthreads + tid; d < head_dim; d += nthreads) {
             float scaled_old = alpha * out_run[d];
             float contrib = 0.0f;
             for (int j = 0; j < tile_len; ++j) {
