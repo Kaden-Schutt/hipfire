@@ -40,6 +40,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -610,7 +616,7 @@ checksum = "fc0fef456e4baa96da950455cd02c081ca953b141298e41db3fc7e36b1da849c"
 
 [[package]]
 name = "hip-bridge"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "thiserror 2.0.18",
@@ -630,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-llama"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -639,7 +645,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen2"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -649,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -660,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-qwen35-vl"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -672,7 +678,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-arch-toy"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "hipfire-runtime",
@@ -681,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-atlas"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "regex",
  "serde",
@@ -690,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-detect"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "md5",
  "regex",
@@ -700,7 +706,7 @@ dependencies = [
 
 [[package]]
 name = "hipfire-quantize"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "faer",
@@ -713,8 +719,9 @@ dependencies = [
 
 [[package]]
 name = "hipfire-runtime"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
+ "base64",
  "byteorder",
  "hip-bridge",
  "hipfire-arch-llama",
@@ -735,7 +742,7 @@ dependencies = [
 
 [[package]]
 name = "hsa-bridge"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
  "libloading",
@@ -1346,7 +1353,7 @@ dependencies = [
 
 [[package]]
 name = "rdna-compute"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "hip-bridge",
 ]
@@ -1359,7 +1366,7 @@ checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
 name = "redline"
-version = "0.1.20"
+version = "0.2.0"
 dependencies = [
  "libc",
  "libloading",

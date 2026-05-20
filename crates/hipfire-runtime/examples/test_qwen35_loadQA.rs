@@ -147,7 +147,7 @@ fn is_qwen35_candidate(model_type: &str, hfq: &HfqFile) -> bool {
 }
 
 fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), Outcome> {
-    if let Some(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
+    if let Ok(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
         return Ok((tokenizer, "hfq-metadata".to_string()));
     }
 
@@ -162,7 +162,7 @@ fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), Outcome> {
     let gguf = GgufFile::open(fallback)
         .map_err(|e| Outcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
     let tokenizer = Tokenizer::from_gguf(&gguf)
-        .ok_or_else(|| Outcome::Skip("failed to parse fallback GGUF tokenizer".to_string()))?;
+        .map_err(|e| Outcome::Skip(format!("failed to parse fallback GGUF tokenizer: {e}")))?;
     Ok((tokenizer, format!("gguf:{}", fallback.display())))
 }
 

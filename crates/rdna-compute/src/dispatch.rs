@@ -2564,6 +2564,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // mb4 path selector — same gate as MQ4-Lloyd's mb4 family.
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2575,7 +2576,6 @@ impl Gpu {
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        self.bind_thread()?;
         let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
@@ -2690,6 +2690,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2705,7 +2706,6 @@ impl Gpu {
                 qkv_m, z_m, beta_m, alpha_m, k, n,
             );
         }
-        self.bind_thread()?;
         let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
@@ -2857,6 +2857,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -2871,7 +2872,6 @@ impl Gpu {
                 q_m, k_m, v_m, k, n,
             );
         }
-        self.bind_thread()?;
         let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
@@ -3011,6 +3011,7 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -3024,7 +3025,6 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n,
             );
         }
-        self.bind_thread()?;
         let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch);
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
@@ -3384,8 +3384,8 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        assert!(k % 256 == 0, "gemv_hfp4g32 requires K%256==0 in v1, got K={}", k);
         self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_hfp4g32 requires K%256==0 in v1, got K={}", k);
         // Shape-gated: FP8 dot4 only when M is large enough that it
         // actually wins (FFN shapes). At M < 4096 the fallback wins or
         // ties; uniform-FP8 was net-negative in 9B Qwen 3.5 decode.
@@ -3449,8 +3449,8 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        assert!(k % 256 == 0, "gemv_hfp4g32_fp8 requires K%256==0, got K={}", k);
         self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_hfp4g32_fp8 requires K%256==0, got K={}", k);
         self.ensure_kernel(
             "gemv_hfp4g32_fp8_gfx12",
             kernels::GEMV_HFP4G32_FP8_GFX12_SRC,
@@ -4450,8 +4450,8 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        assert!(k % 256 == 0, "gemv_hfp4g32_dot2 requires K%256==0, got K={}", k);
         self.bind_thread()?;
+        assert!(k % 256 == 0, "gemv_hfp4g32_dot2 requires K%256==0, got K={}", k);
         self.ensure_kernel(
             "gemv_hfp4g32_dot2_gfx11",
             kernels::GEMV_HFP4G32_DOT2_GFX11_SRC,
@@ -5010,6 +5010,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -5068,6 +5069,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -5134,6 +5136,7 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -6968,6 +6971,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // HFQ3 mb4 path selector. Only triggers on gfx11; gfx12 keeps its
         // existing fast path (line below) since mb4 sibling not ported.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
@@ -6984,7 +6988,6 @@ impl Gpu {
                 y_qkv, y_z, y_beta, y_alpha,
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkvza_hfq3g256_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -7424,6 +7427,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -7436,7 +7440,6 @@ impl Gpu {
             return self.gemm_qkv_hfq3g256_wmma_mb4(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_qkv_hfq3g256_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
@@ -8361,6 +8364,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
@@ -8373,7 +8377,6 @@ impl Gpu {
             return self.gemm_gate_up_hfq3g256_wmma_mb4(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
-        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_gate_up_hfq3g256_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
@@ -12325,6 +12328,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
         let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
@@ -12335,7 +12339,6 @@ impl Gpu {
         if use_mb4 {
             return self.gemm_hfq3g256_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        self.bind_thread()?;
         if has_wmma_f16_gfx12(&self.arch) {
             return self.gemm_hfq3g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
         }
@@ -12799,6 +12802,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_hfq4g256_residual_wave64_dp4a",
             kernels::GEMM_HFQ4G256_RESIDUAL_WAVE64_DP4A_SRC,
@@ -12888,6 +12892,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_hfq4g256_wave64_dp4a",
             kernels::GEMM_QKVZA_HFQ4G256_WAVE64_DP4A_SRC,
@@ -12996,6 +13001,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_hfq4g256_wave64_dp4a",
             kernels::GEMM_QKV_HFQ4G256_WAVE64_DP4A_SRC,
@@ -13092,6 +13098,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_hfq4g256_wave64_dp4a",
             kernels::GEMM_GATE_UP_HFQ4G256_WAVE64_DP4A_SRC,
@@ -13389,6 +13396,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -13871,6 +13879,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -14338,6 +14347,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -14763,6 +14773,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
 
         self.ensure_kernel(
@@ -15231,6 +15242,7 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         static USE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_legacy = *USE_LEGACY.get_or_init(|| {
             std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1")
@@ -15326,6 +15338,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_qkvza_q8_0_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
@@ -15337,7 +15350,6 @@ impl Gpu {
         // multiple of 32. All current production shapes satisfy this; guard
         // here to catch future shape regressions before they corrupt output.
         debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})");
-        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkvza_q8_0_wmma",
             kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
@@ -15418,13 +15430,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_gate_up_q8_0_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
         debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma: K must be a multiple of 32 (got K={k})");
-        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_gate_up_q8_0_wmma",
             kernels::GEMM_GATE_UP_Q8_0_WMMA_SRC,
@@ -15494,11 +15506,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_q8_0_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
-        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_q8_0_residual_wmma",
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
@@ -15558,13 +15570,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         if self.arch.starts_with("gfx12") {
             return self.gemm_qkv_q8_0_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
         }
         debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})");
-        self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qkv_q8_0_wmma",
             kernels::GEMM_QKV_Q8_0_WMMA_SRC,
@@ -15644,8 +15656,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.ensure_kernel(
             "gemm_qkv_q8_0_wmma_gfx12",
             kernels::GEMM_QKV_Q8_0_WMMA_GFX12_SRC,
@@ -15720,8 +15732,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.ensure_kernel(
             "gemm_qkvza_q8_0_wmma_gfx12",
             kernels::GEMM_QKVZA_Q8_0_WMMA_GFX12_SRC,
@@ -15801,8 +15813,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_gate_up_q8_0_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.ensure_kernel(
             "gemm_gate_up_q8_0_wmma_gfx12",
             kernels::GEMM_GATE_UP_Q8_0_WMMA_GFX12_SRC,
@@ -15871,8 +15883,8 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma_gfx12: K must be a multiple of 32 (got K={k})");
         self.ensure_kernel(
             "gemm_q8_0_residual_wmma_gfx12",
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_GFX12_SRC,
