@@ -8018,6 +8018,11 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
+        // y64 variant TESTED but REGRESSED on gate_up (LRU 240: 668 → 641
+        // tok/s, -4%). Gate_up has different characteristics from residual —
+        // per-WG work is 2× (gate + up weights) so halving rows hurts more
+        // than the occupancy improvement gains. Keep y128 for gate_up.
+        // Dedicated gate_up sweep would let us re-tune (#300 follow-up).
         if batch_size <= 12 {
             self.gemm_gate_up_hfq3g256_dot2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -8043,6 +8048,28 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            mmq_x, 128, kernel_name, src,
+        )
+    }
+
+    /// MMQ_Y-parameterized variant of the gate_up MMQ launch helper.
+    /// Mirrors `launch_hfq3_mmq_tile_with_y` for the 2-way fused path.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_hfq3_mmq_tile_with_y(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
         kernel_name: &'static str,
         src: &'static str,
     ) -> HipResult<()> {
@@ -8076,13 +8103,12 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_Y: usize = 128;
         const X_STRIDE: usize = 40;
         const Y_STRIDE: usize = 36;
-        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
 
         let total_m = gate_m + up_m;
-        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let row_tiles = (total_m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let bytes = crate::profile::gemm_hfq3g256_bytes(gate_m, k, batch_size)
@@ -8149,6 +8175,25 @@ impl Gpu {
             a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             32, "gemm_gate_up_hfq3g256_mmq_x32",
             kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ3 gate_up MMQ mmq_x=32, MMQ_Y=64 — higher-occupancy variant.
+    /// Halves the row tile to drop LDS to ~15 KB/WG (4 WG/CU instead of 2).
+    /// Issue #300 follow-up. Used by the auto-selector at batch ≥ 64.
+    pub fn gemm_gate_up_hfq3g256_mmq_x32_y64(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            32, 64,
+            "gemm_gate_up_hfq3g256_mmq_x32_y64",
+            kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y64_SRC,
         )
     }
 
