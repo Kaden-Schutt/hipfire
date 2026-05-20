@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA QKV scaffold.
 //!
 //! Compiles `gemm_qkv_hfq4g256_wmma.gfx12.hip` and compares its output

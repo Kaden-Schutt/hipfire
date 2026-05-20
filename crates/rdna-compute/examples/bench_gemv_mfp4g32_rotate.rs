@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Production-realistic bench for the MFP4G32 decode GEMV path
 //! (`gemv_mfp4g32_with_rotate`). Compares env=0 fallback (rotate +
 //! gemv_hfp4g32 fallback) vs env=1 A3 (fused rotate+pack + FP8 GEMV).

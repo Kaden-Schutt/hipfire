@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 alpineq
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Verify that every pub fn in `impl Gpu` of dispatch.rs either calls
 # `self.bind_thread()?;` (or `let _ = self.bind_thread();`) as the first
 # statement, or carries a `// bind_thread: skip — <reason>` whitelist marker.

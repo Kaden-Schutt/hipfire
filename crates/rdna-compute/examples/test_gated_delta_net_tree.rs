@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Tree-aware gated_delta_net_q8 correctness test.
 //!
 //! Verifies: for spine topology (parent_indices = [-1, 0, 1, 2, ...]),

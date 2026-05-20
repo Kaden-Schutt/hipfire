@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Profile: measure time breakdown within a single forward pass.
 
 use hipfire_runtime::gguf::GgufFile;

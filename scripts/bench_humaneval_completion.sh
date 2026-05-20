@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # bench_humaneval_completion.sh — completion-capture harness for HumanEval prompts.
 #
 # Phase A Step 0 deliverable: per-format completion capture on a small

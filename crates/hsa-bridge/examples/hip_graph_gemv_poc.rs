@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Validates hipGraph replay savings on a real hipfire kernel (not a toy
 //! vector_add). Uses gemv_hfq4g256 at Qwen3.5 0.8B-realistic sizes to
 //! measure whether hipGraph forward-pass integration is worth the

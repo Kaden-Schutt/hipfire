@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Tool-call shape detector — port of `scripts/agentic-gate.sh:487-509`.
 //!
 //! Runs four sub-checks against every `<tool_call>...</tool_call>`

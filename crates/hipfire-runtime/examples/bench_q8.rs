@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Benchmark Q8_0 vs Q4_K vs F32 — testing the occupancy hypothesis.
 //! Q8 = byte loads, no nibble extraction → fewer VGPRs → more waves → higher bandwidth.
 fn main() {

@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Run z-lab's unmodified reference spec_generate on our prompt.
 
 If this gives τ=1, the issue is NOT in our tau_probe reproduction —

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase-level breakdown of attention_q8_0_kv at long context.
 //!
 //! The normal profile_qwen35_mq4 only reports per-kernel totals — it shows

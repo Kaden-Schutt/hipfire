@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen3.5 (DeltaNet) inference — matches ollama quality settings.
 //! Usage: infer_qwen35 <model.hfq> [--guards on|off] [prompt text...]
 //!

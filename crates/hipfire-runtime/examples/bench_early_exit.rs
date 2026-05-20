@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Benchmark: early-exit forward pass vs baseline.
 //! Measures exit rate, speed, and quality impact.
 //! Usage: bench_early_exit <model.hfq>

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for `gemm_hfq3g256_residual_wmma` (gfx11 K1 variant).
 //! Note: residual kernel does Y += W*X (fused residual add) and uses a
 //! TRANSPOSED C-output convention vs qkvza/gate_up (lane covers 1 row,

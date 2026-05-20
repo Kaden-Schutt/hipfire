@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # rebase-onto-modular.sh — port a pre-modular branch to post-modular master.
 #
 # As of 0.1.20, hipfire's monolithic `engine` crate split into

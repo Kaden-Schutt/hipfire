@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stage 0/2-partial smoke harness — render via JinjaChatFrame and
 //! run end-to-end inference on Qwen3.5/3.6 (dense or A3B). Validates
 //! that the multi-turn JinjaChatFrame produces prompts that lead to

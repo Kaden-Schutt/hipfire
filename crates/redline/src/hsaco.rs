@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Parse .hsaco (AMD GPU code object) ELF files.
 //!
 //! .hsaco files are Clang offload bundles containing ELF64 binaries with:

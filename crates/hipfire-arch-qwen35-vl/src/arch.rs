@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `Architecture` trait implementation for the Qwen3.5-VL vision tower.
 //!
 //! Mirrors PR 8's pattern (`hipfire-arch-qwen35::arch`): trait-routed

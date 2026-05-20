@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! PM4 command buffer builder for GFX10 (RDNA1) compute dispatch.
 //!
 //! PM4 (Packet Manager 4) is AMD's GPU command protocol. We build a

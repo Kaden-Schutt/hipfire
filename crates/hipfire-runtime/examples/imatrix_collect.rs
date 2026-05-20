@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! imatrix_collect — calibration-corpus activation-magnitude collector.
 //!
 //! Phase A Step 4 (Tier 2 — subprocess wrapper per

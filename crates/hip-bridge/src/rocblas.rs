@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal FFI wrapper around librocblas.so for MI300X MFMA-accelerated GEMMs.
 //!
 //! Why rocBLAS and not hipBLASLt: rocBLAS has a single entry point

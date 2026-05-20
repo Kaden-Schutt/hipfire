@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hipfire-arch-qwen35-vl: Qwen3.5-VL vision-language architecture.
 //!
 //! Wraps the Qwen3.5 text decoder (in `hipfire-arch-qwen35`) with a SigLIP-2

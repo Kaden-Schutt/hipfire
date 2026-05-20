@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Logit divergence diagnostic for Qwen3.5 DeltaNet models.
 //! Dumps per-token greedy sequence for cross-GPU comparison.
 //! Usage: logit_dump <model.hfq> <output_dir>

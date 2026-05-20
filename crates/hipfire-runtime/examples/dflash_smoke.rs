@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! dflash_smoke: load a converted DFlash draft .hfq file and run a single
 //! forward pass with random inputs. Verifies weights load, all kernels
 //! compile + launch, and the output contains finite values.

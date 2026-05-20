@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase B JSONL replay — runs detector banks against captured daemon
 //! output streams. Catches the failure mode synthetic-payload self-check
 //! misses: a detector regex matches a synthetic string but no longer

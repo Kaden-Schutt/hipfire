@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Focused perf benchmark for Qwen3.5 MQ4 forward pass.
 //!
 //! Separates prefill from generation, strips first-run kernel JIT overhead

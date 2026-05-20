@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal roundtrip test for Q8_0 KV cache quantization.
 fn main() {
     let mut gpu = rdna_compute::Gpu::init().unwrap();

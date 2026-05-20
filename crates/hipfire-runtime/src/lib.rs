@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hipfire-runtime: GGUF model loading and LLaMA inference on RDNA GPUs.
 //!
 //! This crate is arch-agnostic. Architecture implementations live in
