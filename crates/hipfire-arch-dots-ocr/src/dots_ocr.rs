@@ -893,6 +893,31 @@ pub fn vision_forward(
         cfg.num_hidden_layers,
     );
 
+    // HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
+    // outputs to that directory for offline HF-reference diffing. Stage
+    // names match `benchmarks/references/dots_ocr_smoke_001_activations/`:
+    // patch_embed, block_00, block_21, block_41, post_trunk_norm, merger.
+    // Each is written as a NumPy `.npy` file in native row-major F32.
+    let dump_dir: Option<std::path::PathBuf> = std::env::var("HIPFIRE_DOTS_OCR_DUMP_DIR")
+        .ok()
+        .map(std::path::PathBuf::from);
+    if let Some(ref d) = dump_dir {
+        std::fs::create_dir_all(d).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("dump_dir mkdir {}: {e}", d.display()))
+        })?;
+        eprintln!("  HIPFIRE_DOTS_OCR_DUMP_DIR={} — will dump per-stage tensors", d.display());
+    }
+    let dump_stage = |gpu: &Gpu, t: &GpuTensor, name: &str, shape: &[usize]| -> HipResult<()> {
+        if let Some(d) = dump_dir.as_ref() {
+            let data = gpu.download_f32(t)?;
+            write_npy_f32(&d.join(format!("{name}.npy")), &data, shape).map_err(|e| {
+                hip_bridge::HipError::new(0, &format!("npy write {name}: {e}"))
+            })?;
+            eprintln!("    dump: {name}.npy ({}×{} f32)", shape[0], shape[1]);
+        }
+        Ok(())
+    };
+
     // ── Build + upload 2-D RoPE tables (CPU build per plan §2.6) ─────
     //
     // Tables persist for the whole vision pass (all 42 blocks share
@@ -938,6 +963,9 @@ pub fn vision_forward(
     dump_stats(gpu, &normed, "patch_embed_norm")?;
     gpu.free_tensor(x)?;
     x = normed;
+    // Dump matches HF capture point — `patch_embed` hook is on the
+    // full `vt.patch_embed` module = Conv2d + bias + RMSNorm output.
+    dump_stage(gpu, &x, "patch_embed", &[n_patches, h])?;
 
     // ── 2. 42-block encoder stack ────────────────────────────────────
     //
@@ -1132,6 +1160,11 @@ pub fn vision_forward(
         if trace_pre && (li == 0 || li == 1 || li == 41) {
             dump_stats(gpu, &x, &format!("block_{li:02}_out"))?;
         }
+        // Dump matches HF capture: blocks 0, 21, 41 (output of full block,
+        // i.e. after the residual add at the end).
+        if li == 0 || li == 21 || li == 41 {
+            dump_stage(gpu, &x, &format!("block_{li:02}"), &[n_patches, h])?;
+        }
     }
 
     // Drop RoPE tables now that all blocks are done.
@@ -1146,6 +1179,7 @@ pub fn vision_forward(
     let post = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
     gpu.rmsnorm_f32(&x, &weights.post_trunk_norm, &post, eps)?;
     gpu.free_tensor(x)?;
+    dump_stage(gpu, &post, "post_trunk_norm", &[n_patches, h])?;
 
     // ── 4. Merger: LayerNorm + 2×2 reshape (free) + MLP ──────────────
     //
@@ -1192,7 +1226,45 @@ pub fn vision_forward(
         "  vision merger done: {n_merged} merged tokens × {} dims ({:.2}s)",
         cfg.out_hidden_size, t0.elapsed().as_secs_f32(),
     );
+    dump_stage(gpu, &m2, "merger", &[n_merged, cfg.out_hidden_size])?;
     Ok(m2)
+}
+
+/// Minimal NumPy `.npy` writer for F32 row-major tensors. Used by the
+/// `HIPFIRE_DOTS_OCR_DUMP_DIR` per-stage dump for offline HF-reference
+/// diffing. Format reference: github.com/numpy/numpy/blob/main/numpy/lib/format.py
+fn write_npy_f32(path: &std::path::Path, data: &[f32], shape: &[usize]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    // Build the header dict (ASCII), then pad with spaces to 16-byte align
+    // including the 10-byte preamble (magic + version + header_len).
+    let mut shape_str = String::from("(");
+    for (i, &s) in shape.iter().enumerate() {
+        if i > 0 { shape_str.push_str(", "); }
+        shape_str.push_str(&s.to_string());
+    }
+    if shape.len() == 1 { shape_str.push(','); }
+    shape_str.push(')');
+    let header = format!(
+        "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
+    );
+    // Pre-pad so (10 + header.len()) is a multiple of 16, then add `\n`.
+    let preamble = 10;
+    let mut padded = header;
+    while (preamble + padded.len() + 1) % 16 != 0 { padded.push(' '); }
+    padded.push('\n');
+    let header_len = padded.len() as u16;
+
+    f.write_all(b"\x93NUMPY")?;
+    f.write_all(&[1u8, 0u8])?;                       // version 1.0
+    f.write_all(&header_len.to_le_bytes())?;
+    f.write_all(padded.as_bytes())?;
+    // Cast &[f32] to &[u8] for the data section.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
+    };
+    f.write_all(bytes)?;
+    Ok(())
 }
 
 // ─── Token-id constants ─────────────────────────────────────────────────

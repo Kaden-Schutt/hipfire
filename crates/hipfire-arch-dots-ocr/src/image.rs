@@ -400,7 +400,11 @@ pub fn preprocess_dynamic_image(img: &image::DynamicImage) -> Result<Preprocesse
         &rgb_image,
         resized_w as u32,
         resized_h as u32,
-        image::imageops::FilterType::Triangle,
+        // HF's Qwen2VLImageProcessor uses PIL BICUBIC for the resize step.
+        // image::imageops::FilterType::CatmullRom is the closest bicubic
+        // variant available in the `image` crate (cubic B-spline / Catmull-
+        // Rom — small per-pixel differences vs PIL BICUBIC are expected).
+        image::imageops::FilterType::CatmullRom,
     );
 
     let chw = clip_normalise(resized.as_raw(), resized_h, resized_w);
