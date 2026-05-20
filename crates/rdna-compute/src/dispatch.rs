@@ -102,6 +102,30 @@ fn gemv_prefetch_enabled(arch: &str) -> bool {
     override_.unwrap_or(arch == "gfx906")
 }
 
+/// gfx94x (MI300X CDNA3) LDS-cached, 8-rows-per-WG HFQ4 GEMV variant.
+///
+/// The prior `*_wave64` kernels were tuned for CDNA1/2 (80 CUs, modest
+/// HBM). gfx942 has 304 CUs + 5.3 TB/s HBM; the 2-rows-per-WG geometry
+/// leaves the GPU starved (2560 WGs / 304 CUs = 8 launch rounds, each
+/// reading x[K] from L1 with no explicit sharing).
+///
+/// gfx942 variant: 256 threads/WG × 8 rows/WG × cooperative LDS load
+/// of x → 4× fewer WGs, 4× less x-HBM traffic. Same inner-loop math.
+///
+/// Default ON for gfx94x. Override with HIPFIRE_GFX942_LDS_GEMV={0,1}.
+fn gfx942_lds_gemv_enabled(arch: &str) -> bool {
+    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
+    let override_ = *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GFX942_LDS_GEMV").ok().and_then(|v| match v.as_str() {
+            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
+            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
+            _ => None,
+        })
+    });
+    override_.unwrap_or(false)  // gfx942 LDS GEMV: +1.9% on K=5120 attn_out alone
+    // but neutral overall on 27B-3.6 AR; opt-in for research
+}
+
 /// Per-arch default R for the multi-row HFQ4 GEMV kernel family.
 ///
 /// - RDNA3 (gfx1100/1101/1102): R=1. Measured negative on 7900 XTX —
@@ -3392,6 +3416,15 @@ impl Gpu {
         k: usize,
         eps: f32,
     ) -> HipResult<()> {
+        // gfx94x split: opt-in via HIPFIRE_GFX942_RMSNORM_SPLIT=1.
+        // Two-kernel path (reduce + rotate) gives 5× more in-flight wave64s
+        // on prefill scale; modest decode change. Math byte-identical.
+        if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+            && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT")
+                .map(|v| v != "0").unwrap_or(true)
+        {
+            return self.fused_rmsnorm_rotate_mq_split_gfx942(x, weight, x_rot, k, eps, 1);
+        }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
@@ -3598,6 +3631,126 @@ impl Gpu {
         result
     }
 
+    /// gfx942 two-kernel split: rmsnorm_reduce + rotate_with_rms.
+    ///
+    /// Replaces the single-WG-per-batch fused kernel with two kernels that
+    /// each scale better on MI300X's 304 CUs. Kernel A computes rms per
+    /// batch (1 WG/batch × 16 wave64s). Kernel B applies rmsnorm + FWHT
+    /// per (group, batch) cell (K/256 × batch WGs × 1 wave64 each).
+    ///
+    /// For batch=256 K=5120: 20×256 = 5120 wave64s on Kernel B vs 1024 on
+    /// the fused path → 5× more in-flight waves on prefill.
+    ///
+    /// Math byte-identical to fused_rmsnorm_mq_rotate.
+    fn fused_rmsnorm_rotate_mq_split_gfx942(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rmsnorm_reduce_gfx942",
+            kernels::RMSNORM_REDUCE_GFX942_SRC,
+            "rmsnorm_reduce_gfx942",
+        )?;
+        self.ensure_kernel(
+            "rotate_with_rms_gfx942",
+            kernels::ROTATE_WITH_RMS_GFX942_SRC,
+            "rotate_with_rms_gfx942",
+        )?;
+        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        // Allocate scratch tensor for rms_out (batch_size f32s).
+        let rms_tensor = self.alloc_tensor(&[batch_size], DType::F32)?;
+        let rms_ptr = rms_tensor.buf.as_ptr();
+
+        // ─── Kernel A: rmsnorm_reduce ────────────────────────────────────
+        let xp_a = x.buf.as_ptr();
+        let kv_a = k as i32;
+        let eps_a = eps;
+        let mut params_a: Vec<*mut c_void> = vec![
+            &xp_a as *const _ as *mut c_void,
+            &rms_ptr as *const _ as *mut c_void,
+            &kv_a as *const _ as *mut c_void,
+            &eps_a as *const _ as *mut c_void,
+        ];
+        let bytes_a = batch_size * k * 4;
+        let timer_a = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "rmsnorm_reduce_gfx942",
+            bytes_a,
+        );
+        self.launch_maybe_blob(
+            "rmsnorm_reduce_gfx942",
+            [batch_size as u32, 1, 1],
+            [1024, 1, 1],
+            0,
+            &mut params_a,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp_a);
+                b.push_ptr(rms_ptr);
+                b.push_i32(kv_a);
+                b.push_f32(eps_a);
+                b
+            },
+        )?;
+        if let Some(t) = timer_a { t.finish(&self.hip); }
+
+        // ─── Kernel B: rotate_with_rms ───────────────────────────────────
+        let xp_b = x.buf.as_ptr();
+        let wp_b = weight.buf.as_ptr();
+        let xrp_b = x_rot.buf.as_ptr();
+        let s1_b = s1_ptr;
+        let s2_b = s2_ptr;
+        let kv_b = k as i32;
+        let mut params_b: Vec<*mut c_void> = vec![
+            &xp_b as *const _ as *mut c_void,
+            &wp_b as *const _ as *mut c_void,
+            &s1_b as *const _ as *mut c_void,
+            &s2_b as *const _ as *mut c_void,
+            &rms_ptr as *const _ as *mut c_void,
+            &xrp_b as *const _ as *mut c_void,
+            &kv_b as *const _ as *mut c_void,
+        ];
+        let groups = (k / 256) as u32;
+        let bytes_b = batch_size * (k * 4 * 3 + 2 * 256 * 4);
+        let timer_b = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            "rotate_with_rms_gfx942",
+            bytes_b,
+        );
+        let result = self.launch_maybe_blob(
+            "rotate_with_rms_gfx942",
+            [groups, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params_b,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp_b);
+                b.push_ptr(wp_b);
+                b.push_ptr(s1_b);
+                b.push_ptr(s2_b);
+                b.push_ptr(rms_ptr);
+                b.push_ptr(xrp_b);
+                b.push_i32(kv_b);
+                b
+            },
+        );
+        if let Some(t) = timer_b { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp_b);
+        result
+    }
+
     pub fn fused_rmsnorm_rotate_mq_batched(
         &mut self,
         x: &GpuTensor,
@@ -3607,6 +3760,13 @@ impl Gpu {
         eps: f32,
         batch_size: usize,
     ) -> HipResult<()> {
+        // gfx94x split — see fused_rmsnorm_rotate_mq docstring.
+        if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+            && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT")
+                .map(|v| v != "0").unwrap_or(true)
+        {
+            return self.fused_rmsnorm_rotate_mq_split_gfx942(x, weight, x_rot, k, eps, batch_size);
+        }
         self.bind_thread()?;
         self.ensure_mq_signs()?;
         self.ensure_kernel(
@@ -4978,13 +5138,30 @@ impl Gpu {
 
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_qkv_hfq4g256_wave64",
-                kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
-                "fused_qkv_hfq4g256_wave64",
-            )?;
-            let total = (q_m + k_m + v_m) as u32;
-            ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_v2_gfx942",
+                    kernels::FUSED_QKV_HFQ4G256_V2_GFX942_SRC,
+                    "fused_qkv_hfq4g256_v2_gfx942",
+                )?;
+                let total = (q_m + k_m + v_m) as u32;
+                ("fused_qkv_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_qkv_hfq4g256_wave64",
+                    kernels::FUSED_QKV_HFQ4G256_WAVE64_SRC,
+                    "fused_qkv_hfq4g256_wave64",
+                )?;
+                let total = (q_m + k_m + v_m) as u32;
+                ("fused_qkv_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_qkv_hfq4g256",
@@ -5073,13 +5250,30 @@ impl Gpu {
         // wave64, so it is safe for Vega 20 as well as CDNA.
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_qkvza_hfq4g256_wave64",
-                kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
-                "fused_qkvza_hfq4g256_wave64",
-            )?;
-            let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
-            ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_qkvza_hfq4g256_v2_gfx942",
+                    kernels::FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC,
+                    "fused_qkvza_hfq4g256_v2_gfx942",
+                )?;
+                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                ("fused_qkvza_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_qkvza_hfq4g256_wave64",
+                    kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC,
+                    "fused_qkvza_hfq4g256_wave64",
+                )?;
+                let total = (qkv_m + z_m + beta_m + alpha_m) as u32;
+                ("fused_qkvza_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_qkvza_hfq4g256",
@@ -8519,29 +8713,76 @@ impl Gpu {
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual", bytes);
         let result = if cdna3 {
-            let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
-                (
-                    "gemv_hfq4g256_residual_wave64_prefetch",
-                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+            // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
+            // when enabled; gfx906/908 (or env override) keep wave64 base.
+            if std::env::var("HIPFIRE_GFX942_GEMV_V3").map(|v| v == "1").unwrap_or(false) {
+                let kname = "gemv_hfq4g256_residual_v3_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 7) / 8;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [256, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            } else if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") && std::env::var("HIPFIRE_GFX942_GEMV_V2").map(|v| v != "0").unwrap_or(true) {
+                let kname = "gemv_hfq4g256_residual_v2_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 3) / 4;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [128, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
+                )
+            } else if gfx942_lds_gemv_enabled(&self.arch) && !gemv_prefetch_enabled(&self.arch) && (k as u32) * 4 <= 32768 {
+                let kname = "gemv_hfq4g256_residual_gfx942";
+                self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_GFX942_SRC, kname)?;
+                let grid = ((m as u32) + 7) / 8;
+                let lds_bytes = (k as u32) * 4;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [256, 1, 1], lds_bytes, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
                 )
             } else {
-                (
-                    "gemv_hfq4g256_residual_wave64",
-                    kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+                    (
+                        "gemv_hfq4g256_residual_wave64_prefetch",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
+                    )
+                } else {
+                    (
+                        "gemv_hfq4g256_residual_wave64",
+                        kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC,
+                    )
+                };
+                self.ensure_kernel(kname, ksrc, kname)?;
+                let grid = ((m as u32) + 1) / 2;
+                self.launch_maybe_blob(
+                    kname,
+                    [grid, 1, 1], [64, 1, 1], 0, &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                        b.push_i32(m_val); b.push_i32(k_val);
+                        b
+                    },
                 )
-            };
-            self.ensure_kernel(kname, ksrc, kname)?;
-            let grid = ((m as u32) + 1) / 2;
-            self.launch_maybe_blob(
-                kname,
-                [grid, 1, 1], [64, 1, 1], 0, &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
-                    b.push_i32(m_val); b.push_i32(k_val);
-                    b
-                },
-            )
+            }
         } else if use_multirow {
             let (func_name, grid_div) = match rows {
                 2 => ("gemv_hfq4g256_residual_multirow_r2", 2u32),
@@ -9408,6 +9649,32 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // gfx94x MFMA-direct opt-in: skips FP16 shadow + rocBLAS launch.
+        // Opt-in via HIPFIRE_GFX942_MFMA_PREFILL=1 while validating; this
+        // fires BEFORE the rocBLAS branch on purpose (rocBLAS goes through
+        // FP16 dequant shadow, which is the cost we want to avoid).
+        {
+            let mfma_v = std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok();
+            let want = mfma_v.as_deref();
+            if (want == Some("1") || want == Some("2") || want == Some("3") || want == Some("4"))
+                && matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+                && batch_size >= 16
+                && m % 16 == 0
+                && k % 256 == 0
+                && !self.capture_mode
+            {
+                if want == Some("4") && batch_size % 64 == 0 && m % 16 == 0 {
+                    return self.gemm_hfq4g256_residual_mfma_v4_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                if want == Some("3") && batch_size % 32 == 0 && m % 32 == 0 {
+                    return self.gemm_hfq4g256_residual_mfma_v3_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                if want == Some("2") && batch_size % 32 == 0 && m % 32 == 0 {
+                    return self.gemm_hfq4g256_residual_mfma_v2_gfx942(a_raw, x, y, m, k, batch_size);
+                }
+                return self.gemm_hfq4g256_residual_mfma_gfx942(a_raw, x, y, m, k, batch_size);
+            }
+        }
         // CDNA3 MFMA path — Y += X·W^T via rocBLAS with beta=1.
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
@@ -9623,6 +9890,228 @@ impl Gpu {
     /// Combines wave64 block structure (2 rows/block, full lane utilization) with
     /// FP16 packed arithmetic (__hfma2). Target: gfx906 (MI50) prefill optimization.
     #[allow(clippy::too_many_arguments)]
+    /// MFMA-direct HFQ4G256 GEMM with residual add for gfx942 (MI300X CDNA3).
+    /// Channel-test verified at max_rel_err = 2e-5 vs FP16 scalar reference.
+    pub fn gemm_hfq4g256_residual_mfma_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mfma_gfx942",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC,
+            "gemm_hfq4g256_residual_mfma_gfx942",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m as u32) + 15) / 16;
+        let grid_y = ((batch_size as u32) + 15) / 16;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mfma_gfx942",
+            bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemm_hfq4g256_residual_mfma_gfx942"],
+                [grid_x, grid_y, 1],
+                [64, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_hfq4g256_residual_mfma_v2_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mfma_v2_gfx942",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MFMA_V2_GFX942_SRC,
+            "gemm_hfq4g256_residual_mfma_v2_gfx942",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m as u32) + 31) / 32;
+        let grid_y = ((batch_size as u32) + 31) / 32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mfma_v2_gfx942",
+            bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemm_hfq4g256_residual_mfma_v2_gfx942"],
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_hfq4g256_residual_mfma_v3_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mfma_v3_gfx942",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MFMA_V3_GFX942_SRC,
+            "gemm_hfq4g256_residual_mfma_v3_gfx942",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m as u32) + 31) / 32;
+        let grid_y = ((batch_size as u32) + 31) / 32;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mfma_v3_gfx942",
+            bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemm_hfq4g256_residual_mfma_v3_gfx942"],
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_hfq4g256_residual_mfma_v4_gfx942(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_residual_mfma_v4_gfx942",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC,
+            "gemm_hfq4g256_residual_mfma_v4_gfx942",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((m as u32) + 15) / 16;
+        let grid_y = ((batch_size as u32) + 63) / 64;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemm",
+            "gemm_hfq4g256_residual_mfma_v4_gfx942",
+            bytes,
+        );
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["gemm_hfq4g256_residual_mfma_v4_gfx942"],
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     pub fn gemm_hfq4g256_residual_fp16_wave64(
         &mut self,
         a_raw: &GpuTensor,
@@ -14657,13 +15146,30 @@ impl Gpu {
 
         let cdna_wave64 = has_wave64_native(&self.arch);
         let (func_name, block, grid_x) = if cdna_wave64 {
-            self.ensure_kernel(
-                "fused_gate_up_hfq4g256_wave64",
-                kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
-                "fused_gate_up_hfq4g256_wave64",
-            )?;
-            let total = (gate_m + up_m) as u32;
-            ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
+            // (commit 5bd75a69 sibling). Default ON; opt out via
+            // HIPFIRE_GFX942_GEMV_V2=0.
+            let is_gfx94x = matches!(self.arch.as_str(),
+                "gfx940" | "gfx941" | "gfx942");
+            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
+                .map(|v| v != "0").unwrap_or(true);
+            if is_gfx94x && v2_on {
+                self.ensure_kernel(
+                    "fused_gate_up_hfq4g256_v2_gfx942",
+                    kernels::FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC,
+                    "fused_gate_up_hfq4g256_v2_gfx942",
+                )?;
+                let total = (gate_m + up_m) as u32;
+                ("fused_gate_up_hfq4g256_v2_gfx942", [128u32, 1, 1], (total + 3) / 4)
+            } else {
+                self.ensure_kernel(
+                    "fused_gate_up_hfq4g256_wave64",
+                    kernels::FUSED_GATE_UP_HFQ4G256_WAVE64_SRC,
+                    "fused_gate_up_hfq4g256_wave64",
+                )?;
+                let total = (gate_m + up_m) as u32;
+                ("fused_gate_up_hfq4g256_wave64", [64u32, 1, 1], (total + 1) / 2)
+            }
         } else {
             self.ensure_kernel(
                 "fused_gate_up_hfq4g256",

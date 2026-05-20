@@ -334,6 +334,12 @@ pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g2
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
+pub const RMSNORM_REDUCE_GFX942_SRC: &str = include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
+pub const ROTATE_WITH_RMS_GFX942_SRC: &str = include_str!("../../../kernels/src/rotate_with_rms.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v2.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v3.gfx942.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str = include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
@@ -397,6 +403,12 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_wave64_prefetch.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v2.gfx942.hip");
+pub const GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_v3.gfx942.hip");
+pub const FUSED_GATE_UP_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKV_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq4g256_v2.gfx942.hip");
+pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq4g256_v2.gfx942.hip");
 
 /// HFQ4-G256 GEMV with fused SCALED residual: y[row] += scale * (A[row] · x).
 /// Two flavors in one file: `_cpu` takes `scale` by kernarg, `_gpu` reads it
