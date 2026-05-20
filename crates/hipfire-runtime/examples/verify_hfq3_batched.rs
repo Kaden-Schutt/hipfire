@@ -270,12 +270,14 @@ fn main() {
     }
     gpu.free_tensor(d_w).unwrap();
 
-    // ── MMQ-direct qkv + gate_up tests at MMQ_Y-aligned m ────────────────
+    // -- MMQ selector/fallback qkv + gate_up tests at MMQ_Y-aligned m ----
     // The MMQ qkv/gate_up bodies REQUIRE q_m/k_m/v_m and gate_m/up_m to
     // each be multiples of MMQ_Y=128. Allocate a separate weight matrix
-    // at m=256 to test these paths properly.
+    // at m=256 to test these selectors properly. On non-gfx10-sdot4 archs,
+    // the public MMQ selectors fall back to dot2/fp16 rather than compiling
+    // a gfx10-only sdot4 kernel.
     {
-        eprintln!("\n-- MMQ-direct (qkv + gate_up at m=256) --");
+        eprintln!("\n-- MMQ selector/fallback (qkv + gate_up at m=256) --");
         let m_mmq = 256usize;
         let weight_bytes_mmq = synth_hfq3_bytes(m_mmq, k, 42);
         let d_w_mmq = gpu.upload_raw(&weight_bytes_mmq, &[weight_bytes_mmq.len()]).unwrap();
@@ -342,6 +344,6 @@ fn main() {
         eprintln!("\n[FAIL] At least one batched HFQ3 kernel diverged from per-row gemv_hfq3g256.");
         std::process::exit(1);
     } else {
-        eprintln!("\n[PASS] All HFQ3 batched kernels (scalar + dot2 + fp16 + mmq) within tolerance.");
+        eprintln!("\n[PASS] All HFQ3 batched kernels/selectors within tolerance.");
     }
 }

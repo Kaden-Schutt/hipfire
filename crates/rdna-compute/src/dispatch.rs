@@ -169,15 +169,24 @@ fn has_dot2_f32_f16(arch: &str) -> bool {
         | "gfx1200" | "gfx1201")
 }
 
+/// Whether this architecture can compile the gfx10 HFQ3 sdot4 kernels.
+///
+/// These sources use `__builtin_amdgcn_sdot4`, which ROCm rejects on gfx11
+/// targets without the `dot1-insts` feature even though they have the dot2
+/// FP16 path.
+fn hfq3_sdot4_gfx10_enabled(arch: &str) -> bool {
+    matches!(arch, "gfx1011" | "gfx1012" | "gfx1030" | "gfx1031" | "gfx1032")
+}
+
 /// Whether to route HFQ3 batched-prefill through the experimental
 /// wave32 dp4a path (`gemm_qkv_hfq3g256_dp4a` / `gemm_gate_up_hfq3g256_dp4a`)
-/// instead of the default dot2 family on RDNA2+.
+/// instead of the default dot2 family on gfx10.
 ///
 /// Phase 2 of `docs/plans/gfx10_mq3_prefill.md` — an experiment to see
 /// whether the sdot4 4×-ALU lift that helped gfx906 transfers to wave32.
 /// Default off (dot2 ships); flip on with `HIPFIRE_HFQ3_DP4A=1` to bench.
-/// Available on archs with `v_dot4_i32_i8` (gfx1011/1012/1030-1032,
-/// gfx11/12) — NOT gfx1010 / gfx1013.
+/// Available only on the gfx10 sdot4 subset (gfx1011/1012/1030-1032) —
+/// NOT gfx1010/gfx1013/gfx11/gfx12.
 fn hfq3_dp4a_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -190,17 +199,13 @@ fn hfq3_dp4a_enabled(arch: &str) -> bool {
     if !override_.unwrap_or(false) {
         return false;
     }
-    matches!(arch,
-        "gfx1011" | "gfx1012"
-        | "gfx1030" | "gfx1031" | "gfx1032"
-        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151" | "gfx1152"
-        | "gfx1200" | "gfx1201")
+    hfq3_sdot4_gfx10_enabled(arch)
 }
 
 /// Whether to route HFQ3 residual through the experimental wave32 MMQ
 /// kernel (`gemm_hfq3g256_residual_mmq`). Phase 3 minimal probe. Same
-/// arch set as `hfq3_dp4a_enabled`. Gated by `HIPFIRE_HFQ3_MMQ=1`.
+/// gfx10 sdot4 arch set as `hfq3_dp4a_enabled`. Gated by
+/// `HIPFIRE_HFQ3_MMQ=1`.
 fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -213,12 +218,7 @@ fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
     if !override_.unwrap_or(false) {
         return false;
     }
-    matches!(arch,
-        "gfx1011" | "gfx1012"
-        | "gfx1030" | "gfx1031" | "gfx1032"
-        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151" | "gfx1152"
-        | "gfx1200" | "gfx1201")
+    hfq3_sdot4_gfx10_enabled(arch)
 }
 
 /// Whether to route HFQ4 residual through the experimental wave32 MMQ
@@ -6719,8 +6719,8 @@ impl Gpu {
 
     /// Wave32+dp4a batched 3-way fused HFQ3-G256 GEMM (Q + K + V).
     /// Phase 2 experimental — port of `gemm_qkv_hfq4g256_wave64_dp4a` from
-    /// gfx906 wave64 to wave32 + HFQ3 unpack. Available on RDNA2+ archs
-    /// with `v_dot4_i32_i8`. Gated by `HIPFIRE_HFQ3_DP4A=1`.
+    /// gfx906 wave64 to wave32 + HFQ3 unpack. Available on the gfx10 sdot4
+    /// subset. Gated by `HIPFIRE_HFQ3_DP4A=1`.
     pub fn gemm_qkv_hfq3g256_dp4a(
         &mut self,
         a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
@@ -6731,6 +6731,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_qkv_hfq3g256_dot2(
+                    a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
+            return self.gemm_qkv_hfq3g256_fp16(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_qkv_hfq3g256_dp4a",
             kernels::GEMM_QKV_HFQ3G256_DP4A_SRC,
@@ -7450,6 +7460,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_gate_up_hfq3g256_dot2(
+                    a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
+            return self.gemm_gate_up_hfq3g256_fp16(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_gate_up_hfq3g256_dp4a",
             kernels::GEMM_GATE_UP_HFQ3G256_DP4A_SRC,
@@ -7528,6 +7548,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_hfq3g256_residual_{dot2,mmq_xN} which bind.
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
+            }
+            return self.gemm_hfq3g256_residual_fp16(a_raw, x, y, m, k, batch_size);
+        }
         if batch_size <= 12 {
             self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size)
         } else if batch_size <= 127 {
@@ -7664,6 +7690,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkv_hfq3g256_{dot2,mmq_xN} which bind.
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_qkv_hfq3g256_dot2(
+                    a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+                );
+            }
+            return self.gemm_qkv_hfq3g256_fp16(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         if batch_size <= 12 {
             self.gemm_qkv_hfq3g256_dot2(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -7822,6 +7858,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_gate_up_hfq3g256_{dot2,mmq_xN} which bind.
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_gate_up_hfq3g256_dot2(
+                    a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                );
+            }
+            return self.gemm_gate_up_hfq3g256_fp16(
+                a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         if batch_size <= 12 {
             self.gemm_gate_up_hfq3g256_dot2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -7972,6 +8018,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkvza_hfq3g256_{dot2,mmq_xN} which bind.
+        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
+            if has_dot2_f32_f16(&self.arch) {
+                return self.gemm_qkvza_hfq3g256_dot2(
+                    a_qkv, a_z, a_beta, a_alpha, x,
+                    y_qkv, y_z, y_beta, y_alpha,
+                    qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
+            return self.gemm_qkvza_hfq3g256_fp16(
+                a_qkv, a_z, a_beta, a_alpha, x,
+                y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            );
+        }
         if batch_size <= 12 {
             self.gemm_qkvza_hfq3g256_dot2(
                 a_qkv, a_z, a_beta, a_alpha, x,
