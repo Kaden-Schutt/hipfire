@@ -13,7 +13,7 @@
 //! preprocessing ([`image`]), and the prompt-frame + EOS overrides
 //! (see [`arch`]).
 //!
-//! # Bring-up status (rev 2 — phase 2a + 2b + 2c-2 landed)
+//! # Bring-up status (rev 3 — phase 2a + 2b + 2c-1..4 landed)
 //!
 //! - Crate scaffold + `Architecture` trait impl with arch_id=8 (2a).
 //! - Text-side delegation to hipfire-arch-qwen2 (Config, Weights,
@@ -26,18 +26,26 @@
 //!   verifies the 2×2-grouped-block-major enumeration against a
 //!   synthetic per-pixel-tagged input — catches any drift to raster
 //!   order independently of any GPU code.
-//! - Vision weight loader complete (2c-2):
+//! - Vision weight loader complete (2c-2 → refactored 2c-4):
 //!   [`dots_ocr::load_vision_weights`] reads patch_embed + 42 blocks
-//!   + post-trunk norm + merger from an HFQ file. The fc1+fc3 →
-//!   `fc13_proj` byte-level row concatenation (load-time SwiGLU
-//!   fusion per plan §5 phase 2 option (a)) lands here. Helpers:
-//!   `load_norm_weight_raw`, `load_bias_f32`, `load_weight_tensor`,
-//!   `load_weight_tensor_concat_rows` — all carry
-//!   `TODO(transformer-extraction)` markers next to their qwen2 dupes
-//!   for the future consolidation PR.
-//! - `vision_forward` still a stub — assembly lands in phase 2c-5
-//!   after the 2-D RoPE prep helper (2c-3) and vision-shape primitive
-//!   variants (2c-4).
+//!   + post-trunk norm + merger from an HFQ file. Linear weights are
+//!   loaded as F16 on GPU (HFQ4 / Q8 / F32 sources dequantise at load
+//!   time per the qwen35-vl pattern — vision is one-shot per image,
+//!   so dequant-on-load is cheaper than wiring batched HFQ4 GEMM for
+//!   every per-block linear). The fc1+fc3 → `fc13_proj` row
+//!   concatenation (load-time SwiGLU fusion per plan §5 phase 2
+//!   option (a)) lands here via `load_f16_or_dequant_concat_rows`.
+//! - 2-D RoPE prep complete (2c-3): [`rope::build_rope_2d_tables`]
+//!   builds per-patch cos/sin tables in the
+//!   `[h-quarter, w-quarter, repeat]` layout dots.ocr expects.
+//! - Vision GPU primitives complete (2c-4):
+//!   * `rdna_compute::Gpu::rope_2d_halfsplit_f32` — applies the
+//!     precomputed tables to Q/K (kernel:
+//!     `kernels/src/rope_2d_halfsplit.hip`).
+//!   * `dots_ocr::linear_f16` / `linear_f16_no_bias` — F16 GEMM +
+//!     optional bias + transpose, matching the qwen35-vl pattern.
+//! - `vision_forward` still a stub — assembly + per-stage validation
+//!   land in phase 2c-5.
 //!
 //! Not yet wired: daemon load arm for arch_id=8, vision token
 //! splicing, infer_dots_ocr.rs driver. Those follow phase 3 (assembly

@@ -19872,6 +19872,88 @@ impl Gpu {
         result
     }
 
+    /// 2-D spatial RoPE with precomputed per-patch cos/sin tables.
+    ///
+    /// Used by the dots.ocr (Qwen2-VL family) vision tower. Applies a
+    /// halfsplit rotation in-place to Q and K — pairs `(d, d + head_dim/2)`
+    /// of each head are rotated by `cos[patch, d] / sin[patch, d]` from
+    /// the precomputed tables.
+    ///
+    /// # Arguments
+    ///
+    /// - `q`: `[n_patches, n_heads_q, head_dim]` row-major, f32.
+    /// - `k`: `[n_patches, n_heads_k, head_dim]` row-major, f32. For
+    ///   vision attention `n_heads_q == n_heads_k` (no GQA in
+    ///   `DotsVisionTransformer`).
+    /// - `cos_table` / `sin_table`: `[n_patches, head_dim]` f32 each.
+    ///   Built by `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`
+    ///   on the host and uploaded once per image. The second half of
+    ///   each row is a copy of the first half (the quarter-repeat
+    ///   invariant from `apply_rotary_pos_emb_vision`), but the kernel
+    ///   reads `cos[patch, e]` / `sin[patch, e]` independently so the
+    ///   same kernel works for any "halfsplit + per-position tables"
+    ///   case.
+    /// - `head_dim`: must be even (halfsplit requires `head_dim/2`
+    ///   pairs).
+    ///
+    /// # See also
+    ///
+    /// - `kernels/src/rope_2d_halfsplit.hip` — kernel source.
+    /// - `crates/hipfire-arch-dots-ocr/src/rope.rs::build_rope_2d_tables`
+    ///   — host-side cos/sin builder.
+    /// - docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §2.6 — algorithm spec.
+    pub fn rope_2d_halfsplit_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        cos_table: &GpuTensor,
+        sin_table: &GpuTensor,
+        n_patches: usize,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        assert_eq!(head_dim % 2, 0, "rope_2d_halfsplit_f32: head_dim must be even");
+        self.bind_thread()?;
+        self.ensure_kernel("rope_2d_halfsplit", kernels::ROPE_2D_HALFSPLIT_SRC, "rope_2d_halfsplit_f32")?;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut cp = cos_table.buf.as_ptr();
+        let mut sp = sin_table.buf.as_ptr();
+        let mut np = n_patches as i32;
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+
+        let half = (head_dim / 2) as u32;
+        let max_heads = n_heads_q.max(n_heads_k) as u32;
+        // Grid: (n_patches, max_heads, 1), block: (head_dim/2, 1, 1).
+        // For dots.ocr's 19520 patches × 12 heads × 64 threads per
+        // block this is ~234k blocks of 64 threads — large but fine
+        // on RDNA.
+        let grid = [n_patches as u32, max_heads, 1];
+        let block = [half, 1, 1];
+
+        let func = &self.functions["rope_2d_halfsplit_f32"];
+        unsafe {
+            self.hip.launch_kernel(
+                func, grid, block, 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

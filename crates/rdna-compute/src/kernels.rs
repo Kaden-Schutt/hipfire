@@ -1526,6 +1526,13 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/sr
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
+/// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
+/// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
+/// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout
+/// + algorithm and `crates/hipfire-arch-dots-ocr/src/rope.rs` for the
+/// host-side cos/sin table builder.
+pub const ROPE_2D_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
