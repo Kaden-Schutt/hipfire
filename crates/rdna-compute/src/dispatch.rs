@@ -19975,6 +19975,87 @@ impl Gpu {
         result
     }
 
+    /// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a
+    /// fused interleaved `[n_patches, 3 * hidden]` QKV buffer. V is
+    /// left untouched. Companion to [`Self::rope_2d_halfsplit_f32`].
+    ///
+    /// The fused-QKV variant matches the natural output layout of a
+    /// single QKV GEMM (one row per patch, `[Q-all-heads, K-all-heads,
+    /// V-all-heads]` along the second axis) — same layout
+    /// `vit_attention_opt` expects — so the encoder block becomes:
+    ///
+    /// ```text
+    /// single QKV GEMM  →  rope_2d_halfsplit_qkv_interleaved_f32  →  vit_attention_opt
+    /// ```
+    ///
+    /// without intermediate split/merge copies.
+    ///
+    /// `cos_table` and `sin_table` are the precomputed per-patch tables
+    /// of shape `[n_patches, head_dim]` produced by
+    /// `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`.
+    pub fn rope_2d_halfsplit_qkv_interleaved_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        cos_table: &GpuTensor,
+        sin_table: &GpuTensor,
+        n_patches: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        assert!(
+            head_dim % 4 == 0,
+            "rope_2d_halfsplit_qkv_interleaved_f32: head_dim={head_dim} must be a multiple of 4 \
+             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
+        );
+        assert!(n_patches > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_patches must be > 0");
+        assert!(n_heads > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_heads must be > 0");
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_2d_halfsplit_qkv_interleaved",
+            kernels::ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC,
+            "rope_2d_halfsplit_qkv_interleaved_f32",
+        )?;
+
+        let qkvp = qkv.buf.as_ptr();
+        let cp = cos_table.buf.as_ptr();
+        let sp = sin_table.buf.as_ptr();
+        let np = n_patches as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &qkvp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+
+        let half = (head_dim / 2) as u32;
+        let grid = [n_patches as u32, n_heads as u32, 1];
+        let block = [half, 1, 1];
+        // Bytes-touched estimate: per thread we RMW two Q entries + two
+        // K entries (= 4 × 2 × 4 = 32 bytes) plus 4 cos/sin reads (= 16
+        // bytes). Threads per kernel = n_patches * n_heads * head_dim/2.
+        let bytes = (n_patches * n_heads * head_dim * 4 * 4)             // Q+K RMW (read+write each)
+                  + (n_patches * head_dim * 4 * 2);                       // cos+sin reads
+        let timer = crate::profile::begin_timer(
+            &self.hip, "rope_2d", "rope_2d_halfsplit_qkv_interleaved_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "rope_2d_halfsplit_qkv_interleaved_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qkvp); b.push_ptr(cp); b.push_ptr(sp);
+                b.push_i32(np); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

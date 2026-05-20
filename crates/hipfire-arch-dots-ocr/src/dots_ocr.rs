@@ -709,7 +709,6 @@ fn dequant_hfq4(data: &[u8], n_elements: usize, group_size: usize) -> Vec<f32> {
 /// TODO(transformer-extraction): qwen35-vl has the same helper; pull
 /// both into `hipfire_runtime::transformer::vision_linear` during the
 /// consolidation PR.
-#[allow(dead_code)]
 pub(crate) fn linear_f16(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -736,7 +735,6 @@ pub(crate) fn linear_f16(
 ///
 /// Saves one kernel launch per linear vs. calling `linear_f16` with
 /// a zero-filled bias buffer.
-#[allow(dead_code)]
 pub(crate) fn linear_f16_no_bias(
     gpu: &mut Gpu,
     w: &GpuTensor,
@@ -824,18 +822,219 @@ pub(crate) fn linear_f16_no_bias(
 /// the function panics on inputs whose `patches.numel()` is not
 /// consistent with a single image's `[grid_h * grid_w, 588]` shape.
 pub fn vision_forward(
-    _gpu: &mut Gpu,
-    _weights: &DotsVisionWeights,
-    _cfg: &DotsVisionConfig,
-    _patches: &GpuTensor,
-    _grid_h: usize,
-    _grid_w: usize,
+    gpu: &mut Gpu,
+    weights: &DotsVisionWeights,
+    cfg: &DotsVisionConfig,
+    patches: &GpuTensor,
+    grid_h: usize,
+    grid_w: usize,
 ) -> HipResult<GpuTensor> {
-    Err(hip_bridge::HipError::new(
-        0,
-        "dots-ocr: vision_forward is a phase 2c stub. Implementation \
-         pending — see docs/plans/qwen_2.0_vlm_plus_dots_ocr.md phase 2c.",
-    ))
+    let h = cfg.embed_dim;
+    let n_heads = cfg.num_attention_heads;
+    let head_dim = cfg.head_dim;
+    let interm = cfg.intermediate_size;
+    let n_patches = grid_h * grid_w;
+    let patch_dim = cfg.num_channels * cfg.temporal_patch_size * cfg.patch_size * cfg.patch_size;
+    let sms = cfg.spatial_merge_size;
+    let eps = cfg.rms_norm_eps;
+
+    // Patch tensor shape check — `[N, patch_dim]` flat. Per the
+    // "single image per call" invariant documented in this function's
+    // doc-comment, the daemon prefill loop must call us once per image;
+    // multi-image batching at this layer would let patches from image A
+    // attend to patches from image B (vit_attention_opt is dense, not
+    // cu_seqlens-aware).
+    assert_eq!(
+        patches.numel(), n_patches * patch_dim,
+        "dots-ocr: vision_forward expects patches.numel() == n_patches * patch_dim \
+         ({n_patches} * {patch_dim} = {}), got {}. \
+         If you're batching multiple images, call vision_forward once per image; \
+         see the multi-image-attention-leakage note on the function header.",
+        n_patches * patch_dim, patches.numel(),
+    );
+    assert_eq!(
+        grid_h % sms, 0,
+        "dots-ocr: grid_h={grid_h} must be a multiple of spatial_merge_size={sms}",
+    );
+    assert_eq!(
+        grid_w % sms, 0,
+        "dots-ocr: grid_w={grid_w} must be a multiple of spatial_merge_size={sms}",
+    );
+    assert_eq!(n_heads * head_dim, h, "dots-ocr: n_heads * head_dim must equal embed_dim");
+
+    let t0 = std::time::Instant::now();
+    eprintln!(
+        "  vision forward (dots-ocr GPU): {n_patches} patches, {grid_h}×{grid_w} grid, {} blocks",
+        cfg.num_hidden_layers,
+    );
+
+    // ── Build + upload 2-D RoPE tables (CPU build per plan §2.6) ─────
+    //
+    // Tables persist for the whole vision pass (all 42 blocks share
+    // them). Theta = 10000 per `VisionRotaryEmbedding` default in
+    // modeling_dots_vision.py.
+    let (cos_h, sin_h) = crate::rope::build_rope_2d_tables(grid_h, grid_w, head_dim, sms, 10_000.0);
+    let cos_table = gpu.upload_f32(&cos_h, &[n_patches, head_dim])?;
+    let sin_table = gpu.upload_f32(&sin_h, &[n_patches, head_dim])?;
+
+    // ── 1. Patch embed: linear(F16 weight + bias) + RMSNorm ──────────
+    //
+    // patch_embed_w on GPU is the 4-D conv weight flattened to a
+    // `[embed_dim, patch_dim]` linear (verified during load).
+    let mut x = linear_f16(
+        gpu, &weights.patch_embed_w, patches, &weights.patch_embed_b,
+        h, patch_dim, n_patches,
+    )?;
+    // patch_embed_norm is RMSNorm (the patchifier carries one).
+    let normed = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+    gpu.rmsnorm_f32(&x, &weights.patch_embed_norm, &normed, eps)?;
+    gpu.free_tensor(x)?;
+    x = normed;
+
+    // ── 2. 42-block encoder stack ────────────────────────────────────
+    //
+    // Per-block:
+    //   x_norm = rmsnorm(x, norm1)
+    //   qkv    = linear_no_bias(qkv_w, x_norm)                 # [n, 3h]
+    //   rope_2d_halfsplit_qkv_interleaved(qkv, cos, sin)        # in-place on Q+K
+    //   attn   = vit_attention_opt(qkv)                         # non-causal
+    //   x     += linear_no_bias(proj_w, attn)
+    //   x_norm = rmsnorm(x, norm2)
+    //   fc13   = linear_no_bias(fc13_proj, x_norm)              # [n, 2*interm]
+    //   act    = silu(fc13[:, :interm]) * fc13[:, interm:]      # SwiGLU
+    //   x     += linear_no_bias(fc2_w, act)
+    let qkv_dim = 3 * h;
+    let two_interm = 2 * interm;
+
+    for li in 0..cfg.num_hidden_layers {
+        let lw = &weights.blocks[li];
+
+        // 2a. RMSNorm pre-attn.
+        let xn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        gpu.rmsnorm_f32(&x, &lw.norm1_w, &xn, eps)?;
+
+        // 2b. Fused QKV GEMM (no bias). yt[3h, n] → transpose → qkv[n, 3h].
+        let qkv = linear_f16_no_bias(gpu, &lw.qkv_w, &xn, qkv_dim, h, n_patches)?;
+        gpu.free_tensor(xn)?;
+
+        // 2c. 2-D RoPE on Q and K (in-place, interleaved layout).
+        gpu.rope_2d_halfsplit_qkv_interleaved_f32(
+            &qkv, &cos_table, &sin_table, n_patches, n_heads, head_dim,
+        )?;
+
+        // 2d. Non-causal attention.
+        let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        gpu.vit_attention_opt(&qkv, &attn, n_patches, h, n_heads, head_dim)?;
+        gpu.free_tensor(qkv)?;
+
+        // 2e. Output projection (no bias) + residual.
+        let proj = linear_f16_no_bias(gpu, &lw.proj_w, &attn, h, h, n_patches)?;
+        gpu.free_tensor(attn)?;
+        gpu.add_inplace_f32(&x, &proj)?;
+        gpu.free_tensor(proj)?;
+
+        // 2f. RMSNorm pre-MLP.
+        let xn2 = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+        gpu.rmsnorm_f32(&x, &lw.norm2_w, &xn2, eps)?;
+
+        // 2g. Fused fc13 GEMM (no bias). Layout: yt[2*interm, n] without
+        // transpose — keep head-major so sub_offset can slice cleanly
+        // into separate gate/up `[interm, n]` halves.
+        let fc13_yt = gpu.alloc_tensor(&[two_interm * n_patches], DType::F32)?;
+        gpu.gemm_f16(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+        gpu.free_tensor(xn2)?;
+
+        // 2h. SwiGLU on head-major sub-views.
+        //
+        // The fc1+fc3 concat at load-time stacked `fc1` (gate) ABOVE
+        // `fc3` (up) along the M (output) axis, so without the final
+        // transpose yt[0..interm*n] is exactly the gate buffer and
+        // yt[interm*n..2*interm*n] is exactly the up buffer (each in
+        // `[interm, n]` head-major layout). silu_mul_f32 operates
+        // element-wise, so it doesn't care about the (interm, n)
+        // ordering — only that gate[i] and up[i] correspond.
+        let gate = fc13_yt.sub_offset(0, interm * n_patches);
+        let up = fc13_yt.sub_offset(interm * n_patches, interm * n_patches);
+        let act = gpu.alloc_tensor(&[interm * n_patches], DType::F32)?;
+        gpu.silu_mul_f32(&gate, &up, &act)?;
+        gpu.free_tensor(fc13_yt)?;
+
+        // 2i. Transpose act from head-major `[interm, n]` to position-
+        // major `[n, interm]` for the fc2 GEMM input.
+        let act_nm = gpu.alloc_tensor(&[n_patches, interm], DType::F32)?;
+        gpu.transpose_f32(&act, &act_nm, interm, n_patches)?;
+        gpu.free_tensor(act)?;
+
+        // 2j. fc2 projection (no bias) + residual.
+        let fc2_y = linear_f16_no_bias(gpu, &lw.fc2, &act_nm, h, interm, n_patches)?;
+        gpu.free_tensor(act_nm)?;
+        gpu.add_inplace_f32(&x, &fc2_y)?;
+        gpu.free_tensor(fc2_y)?;
+
+        if li % 7 == 0 || li == cfg.num_hidden_layers - 1 {
+            eprintln!("  vision block {}/{} done ({:.2}s)", li + 1, cfg.num_hidden_layers, t0.elapsed().as_secs_f32());
+        }
+    }
+
+    // Drop RoPE tables now that all blocks are done.
+    gpu.free_tensor(cos_table)?;
+    gpu.free_tensor(sin_table)?;
+
+    // Single sync at end of the encoder stack (matches qwen35-vl).
+    gpu.hip.device_synchronize()?;
+    eprintln!("  vision encoder done ({:.2}s)", t0.elapsed().as_secs_f32());
+
+    // ── 3. Post-trunk RMSNorm (post_norm=true for dots.ocr) ──────────
+    let post = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+    gpu.rmsnorm_f32(&x, &weights.post_trunk_norm, &post, eps)?;
+    gpu.free_tensor(x)?;
+
+    // ── 4. Merger: LayerNorm + 2×2 reshape (free) + MLP ──────────────
+    //
+    // ln_q is a LayerNorm (NOT RMSNorm — note divergence; see §2.4 of
+    // the plan). eps=1e-6 from modeling_dots_vision.py:75.
+    let merger_eps = 1e-6f32;
+    let normed_merger = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
+    gpu.layernorm_batched(
+        &post, &weights.merger_ln_w, &weights.merger_ln_b, &normed_merger,
+        n_patches, h, merger_eps,
+    )?;
+    gpu.free_tensor(post)?;
+
+    // The 2×2 group concat is a pure shape change — no rearrange — because
+    // [`crate::image::extract_patches`] + [`crate::rope::build_rope_2d_tables`]
+    // already emit patches in 2×2-block-major order. `linear_f16` only
+    // uses the dimension parameters, not the tensor shape vector, so we
+    // can reinterpret `[n_patches, h]` as `[n_merged, merge_dim]` for the
+    // merger MLP without an explicit reshape.
+    let n_merged = n_patches / (sms * sms);
+    let merge_dim = h * sms * sms;
+
+    // 4a. mlp.0: linear(merge_dim → merge_dim) + bias, then GELU.
+    let m1 = linear_f16(
+        gpu, &weights.merger_fc1_w, &normed_merger, &weights.merger_fc1_b,
+        merge_dim, merge_dim, n_merged,
+    )?;
+    gpu.free_tensor(normed_merger)?;
+    // dots.ocr uses exact GELU (PyTorch nn.GELU default). We currently
+    // only have the tanh approximation — numerical difference is ~1e-3
+    // peak, well inside the bf16→f16 cast slack. TODO(vision-gelu):
+    // add gelu_exact_f32 when validation flags a regression.
+    gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
+
+    // 4b. mlp.2: linear(merge_dim → out_hidden_size) + bias.
+    let m2 = linear_f16(
+        gpu, &weights.merger_fc2_w, &m1, &weights.merger_fc2_b,
+        cfg.out_hidden_size, merge_dim, n_merged,
+    )?;
+    gpu.free_tensor(m1)?;
+
+    gpu.hip.device_synchronize()?;
+    eprintln!(
+        "  vision merger done: {n_merged} merged tokens × {} dims ({:.2}s)",
+        cfg.out_hidden_size, t0.elapsed().as_secs_f32(),
+    );
+    Ok(m2)
 }
 
 // ─── Token-id constants ─────────────────────────────────────────────────

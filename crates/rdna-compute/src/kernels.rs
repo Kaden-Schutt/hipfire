@@ -1533,6 +1533,13 @@ pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/
 /// host-side cos/sin table builder.
 pub const ROPE_2D_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit.hip");
 
+/// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a fused
+/// interleaved `[N, 3*hidden]` QKV buffer. Companion to the separate-
+/// buffer variant above; used by the dots.ocr vision encoder so a
+/// single QKV GEMM can feed directly into `vit_attention_opt` without
+/// split/merge copies. See `kernels/src/rope_2d_halfsplit_qkv_interleaved.hip`.
+pub const ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit_qkv_interleaved.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]

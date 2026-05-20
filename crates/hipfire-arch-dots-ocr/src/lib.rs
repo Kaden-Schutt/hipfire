@@ -13,7 +13,7 @@
 //! preprocessing ([`image`]), and the prompt-frame + EOS overrides
 //! (see [`arch`]).
 //!
-//! # Bring-up status (rev 3 — phase 2a + 2b + 2c-1..4 landed)
+//! # Bring-up status (rev 4 — phase 2a + 2b + 2c-1..5a landed)
 //!
 //! - Crate scaffold + `Architecture` trait impl with arch_id=8 (2a).
 //! - Text-side delegation to hipfire-arch-qwen2 (Config, Weights,
@@ -44,8 +44,18 @@
 //!     `kernels/src/rope_2d_halfsplit.hip`).
 //!   * `dots_ocr::linear_f16` / `linear_f16_no_bias` — F16 GEMM +
 //!     optional bias + transpose, matching the qwen35-vl pattern.
-//! - `vision_forward` still a stub — assembly + per-stage validation
-//!   land in phase 2c-5.
+//! - `vision_forward` assembly complete (2c-5a):
+//!   [`dots_ocr::vision_forward`] runs the full encoder + merger
+//!   end-to-end on GPU — patch_embed + RMSNorm, 42 blocks (RMSNorm +
+//!   fused QKV GEMM + 2-D RoPE via the new
+//!   `rope_2d_halfsplit_qkv_interleaved_f32` kernel + non-causal
+//!   `vit_attention_opt` + SwiGLU with load-time fc13 fusion), post-
+//!   trunk RMSNorm, and the LayerNorm-based PatchMerger (free 2×2
+//!   reshape thanks to the patch-order permutation in 2b+2c-3, MLP
+//!   with GELU between layers). Per-stage byte-level validation
+//!   against `benchmarks/references/dots_ocr_smoke_001_activations/`
+//!   pends 2c-5b — requires a quantised dots.ocr HFQ and an
+//!   `infer_dots_ocr` driver binary.
 //!
 //! Not yet wired: daemon load arm for arch_id=8, vision token
 //! splicing, infer_dots_ocr.rs driver. Those follow phase 3 (assembly
