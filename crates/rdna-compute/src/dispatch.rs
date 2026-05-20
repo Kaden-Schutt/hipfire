@@ -5865,20 +5865,48 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
-        // AND all four output strides are MMQ_Y-aligned. Auto-selector falls
-        // back to dot2 at small batch. Layer-gate (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX})
-        // is a no-op when unset; supports per-layer KLD attribution sweeps (#302).
+        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1.
+        // Auto-selector falls back to dot2 at small batch. Layer-gate
+        // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
+        // per-layer KLD attribution sweeps (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
             && hfq3_mmq_layer_gate_pass()
-            && qkv_m % 128 == 0 && z_m % 128 == 0
-            && beta_m % 128 == 0 && alpha_m % 128 == 0
         {
-            return self.gemm_qkvza_hfq3g256_mmq(
-                a_qkv, a_z, a_beta, a_alpha, x,
-                y_qkv, y_z, y_beta, y_alpha,
-                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
-            );
+            // Best case: all four output strides MMQ_Y-aligned → 4-way fused MMQ.
+            // Hits on Qwen3.5-VL ViT and any model where beta/alpha aren't
+            // per-head scalars.
+            if qkv_m % 128 == 0 && z_m % 128 == 0
+                && beta_m % 128 == 0 && alpha_m % 128 == 0
+            {
+                return self.gemm_qkvza_hfq3g256_mmq(
+                    a_qkv, a_z, a_beta, a_alpha, x,
+                    y_qkv, y_z, y_beta, y_alpha,
+                    qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
+            // Common case: qkv + z are aligned but beta/alpha are small
+            // (per-head scalars — Qwen3.5/A3B DeltaNet LA layers have
+            // beta_m = alpha_m = num_value_heads, often 16 or 32). Split
+            // routing: MMQ on the qkv+z 2-way, dot2 on the beta+alpha 2-way.
+            // Reuses the existing `gemm_gate_up_*` 2-way kernels which are
+            // semantically agnostic (any 2 weights, any 2 outputs).
+            //
+            // Cost: 1 extra kernel launch per LA layer per chunk vs the
+            // ideal fused path (~5μs × num_LA_layers ≈ 100-150μs across
+            // a full forward — well under 0.1% of prefill wall).
+            //
+            // Win: the qkv+z chunk is the dominant compute (qkv_m + z_m
+            // is typically 100-200× larger than beta_m + alpha_m); MMQ-ing
+            // it gives ~the full MMQ speedup on the qkvza preamble.
+            if qkv_m % 128 == 0 && z_m % 128 == 0 {
+                self.gemm_gate_up_hfq3g256_mmq(
+                    a_qkv, a_z, x, y_qkv, y_z, qkv_m, z_m, k, batch_size,
+                )?;
+                return self.gemm_gate_up_hfq3g256_dot2(
+                    a_beta, a_alpha, x, y_beta, y_alpha, beta_m, alpha_m, k, batch_size,
+                );
+            }
+            // No MMQ-able split possible — fall through to dot2/fp16.
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
         // Layer-aware FP16 gate (#302): falls through to scalar when the
