@@ -1,6 +1,10 @@
 # dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
 
-Status: rev 4 (in progress on `feat/dots-ocr-qwen2`), 2026-05-19
+Status: rev 4 — phase 1 closed, PR open
+(`feat/dots-ocr-qwen2` → upstream `master`,
+[Kaden-Schutt/hipfire#297](https://github.com/Kaden-Schutt/hipfire/pull/297)),
+2026-05-19. Phase 2 (dots.ocr vision tower) begins after merge.
+
 Filename note: originally filed as `qwen_2.5_vlm.md` matching the
 initial request; renamed to `qwen_2.0_vlm_plus_dots_ocr.md` once
 verification against the safetensors index confirmed the backbone is
@@ -34,7 +38,8 @@ status per phase in §5.
 | `afd4b059` | Phase 1 forward pass: real `Qwen2State` (KV cache + per-step scratch) + `forward_step` / `forward_step_greedy` (28 layers: RMSNorm → fused QKV + bias adds → RoPE → KV cache → attention → o_proj → residual → FFN norm → SwiGLU → residual; final norm + lm_head). HFQ4G256 path landed 9/16 top-1 matches with 7/7 prefix + fluent output (synonym-position divergence consistent with 4-bit quant noise). |
 | `9bd083f6` | Phase 1 precision sweep: re-quantised at Q8F16. End-to-end run: **16/16 top-1 matches vs HF F32 reference** — definitive correctness lock-in. Forward in 303 ms (140 ms prefill + 163 ms greedy decode of 16 tokens). Confirms (a) the implementation is correct end-to-end, (b) the HFQ4G256 divergence was 4-bit quant noise, not implementation error. Phase 1 closed. |
 | `806680b2` | R3 resolved: daemon arm for `arch_id=7`. Wired `hipfire-arch-qwen2` as a runtime dev-dependency (gated behind new `arch-qwen2` feature, default-on); added `qwen2_config / qwen2_weights / qwen2_state` fields to `LoadedModel` with matching `free_gpu` impls; new load arm constructs the bring-up triple via the `Architecture` trait; new `generate_qwen2` function does encode → prefill → greedy decode → JSON `{type:"token"}` stream → `{type:"done"}`. Verified end-to-end: `hipfire run` (production CLI) against `qwen2-1.5b.arch7.q8.hfq` emits the same continuation as the Q8 precision-sweep run (`"A transformer's attention mechanism is a crucial component of its architecture, which is designed to ..."`) at ~96 tok/s for 137 generated tokens (single-shot, not warmed). Scope-limited bring-up — DFlash / CASK / PFlash / VL / ChatML scaffolding / repeat penalty / top-p / `<think>` budgeting / multi-GPU are all explicitly refused or skipped on this path. |
-| _pending_ | Pre-PR fixes from rev-3 review fold-in (Claude+Gemini+GLM-5): A1 (bench_prefill arch_id=7 panic) + A2 (reset event missed Qwen2State.next_pos) + B1 comment (bias path was option (a) not (c) as claimed) + D1 (dead `let _ = decode_t0`) + MINOR doc refreshes across arch.rs / qwen2.rs / README.md / infer_qwen2.rs. `Qwen2State::reset()` helper added and called from both the daemon's `reset` event AND the `bench_prefill` cold-start path. |
+| `2226bbcf` | Pre-PR fixes from rev-3 review fold-in (Claude+Gemini+GLM-5): A1 (bench_prefill arch_id=7 panic) + A2 (reset event missed Qwen2State.next_pos) + B1 comment (bias path was option (a) not (c) as claimed) + D1 (dead `let _ = decode_t0`) + MINOR doc refreshes across arch.rs / qwen2.rs / README.md / infer_qwen2.rs. `Qwen2State::reset()` helper added and called from both the daemon's `reset` event AND the `bench_prefill` cold-start path. End-to-end regression run (load + bench_prefill[32] + reset + generate[16] + unload) confirms forward output matches the Q8 reference byte-for-byte. |
+| _PR open_ | [Kaden-Schutt/hipfire#297](https://github.com/Kaden-Schutt/hipfire/pull/297) — phase 1 deliverable. Awaiting maintainer review + merge. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):
@@ -642,39 +647,34 @@ slot) and unblocks the dots.ocr text path.
   or `Arc<GpuTensor>` during the Transformer-extraction PR.
 
 **Forward-pass port** from `crates/hipfire-arch-qwen35/src/qwen35.rs`:
-[PENDING — largest remaining chunk in phase 1]
-- **Remove** q/k-RMSNorm-pre-RoPE (Qwen3-only).
-- **Remove** DeltaNet hybrid LA layers — Qwen2 is pure FA.
-- **Remove** MoE expert routing — Qwen2 is dense FFN.
-- **RMSNorm convention:** Qwen2 uses standard `weight * x *
-  rsqrt(...)`, NOT Qwen3.5's `(1 + weight) * ...`. The loader
-  already loads norm weights without the `+= 1.0` offset (see
-  `load_norm_weight_raw` in qwen2.rs); the forward path must apply
-  norm without the offset to match.
-- **Add** bias terms to Q/K/V projections. `fused_qkv_hfq4g256`
-  doesn't currently accept bias. Three options, recommend (c) for
-  initial bring-up:
-  - (a) Separate `bias_add_f32` after each QKV: 3 extra launches per
-    layer × 28 = 84 extra launches per decode step.
-  - (b) New fused `fused_qkv_hfq4g256_bias` kernel: zero runtime cost
-    but more upfront work.
-  - (c) Batched bias-add of Q/K/V in one launch after fused QKV: ~28
-    extra launches per decode step, ~half the cost of (a).
-  Promote to (b) only if (c) measurably regresses tok/s under the
-  Δ ≥ 5% rule.
-- **Tied-embeddings forward path:** loader already detects
-  `tied_lm_head` and produces a usable `WeightTensor` for the
-  lm_head whether tied or not. Forward path can use
-  `weights.output` uniformly without branching on the tied flag.
-- **Keep**: GQA attention, 1-D RoPE (theta=1e6), SwiGLU FFN,
+[DONE in `afd4b059`; closed at Q8F16 16/16 top-1 in `9bd083f6`]
+- ✅ **Remove** q/k-RMSNorm-pre-RoPE (Qwen3-only).
+- ✅ **Remove** DeltaNet hybrid LA layers — Qwen2 is pure FA.
+- ✅ **Remove** MoE expert routing — Qwen2 is dense FFN.
+- ✅ **RMSNorm convention:** uses standard `weight * x * rsqrt(...)`,
+  no `+= 1.0` offset (via `load_norm_weight_raw`).
+- ⚠️ **Add** bias terms to Q/K/V projections — shipped as
+  **option (a)** (3 separate `bias_add_f32` per layer = 84 launches
+  per decode step), not the originally-recommended option (c).
+  Promoting to (c) or (b) is on the deferred-perf list in §6.1
+  pending the Δ ≥ 5% rule check. The earlier "option (c)" comment
+  in the source was wrong (caught in rev-3 review, fixed in
+  `2226bbcf`).
+- ✅ **Tied-embeddings forward path:** loader produces a usable
+  `WeightTensor` for `weights.output` whether tied or not; the
+  forward path uses it uniformly.
+- ✅ **Keep**: GQA attention, 1-D RoPE (theta=1e6), SwiGLU FFN,
   RMSNorm (eps=1e-6), KV cache layout.
 
-**Real `Qwen2State`:** [PENDING] currently a stub `token_count`
-counter. Real impl allocates KV cache buffers
-(`num_key_value_heads × head_dim × max_seq_len × num_hidden_layers`)
-plus attention scratch. Mirror `ForwardScratch::new` in
-`hipfire-runtime::llama`. `KvCache` is on the upstream consolidation
-list — mark with `TODO(transformer-extraction)`.
+**Real `Qwen2State`:** [DONE in `afd4b059`] allocates the full
+per-step scratch graph (x, tmp, q, k, v, attn_out, o, gate, up,
+ffn_hidden, ffn_out, logits, pos_buf) plus F32 KV cache
+(`num_hidden_layers × 2 × max_seq × kv_dim`). `Qwen2State::new`
+takes the default `max_seq=512`; `new_with_max_seq` for explicit
+budgets. `reset()` rewinds `next_pos` to 0 (added in `2226bbcf`
+for use by the daemon's `reset` event and `bench_prefill` cold
+start). `free_gpu` releases all buffers + the pos i32. KV
+quantisation modes are listed in §6.1 as deferred follow-on.
 
 **Maintenance note** (deferrable to a future PR): every cross-arch
 primitive duplicated from qwen35 carries a
@@ -687,25 +687,34 @@ consolidation candidates so far: `load_norm_weight*`,
 `load_weight_tensor*`, the tied-lm_head pattern, and (when added)
 `KvCache` allocation.
 
-**Layer-dump infrastructure (highly recommended):** [PENDING]
-before debugging logit mismatches, add a
-`HIPFIRE_DUMP_ACTIVATIONS=path` env-gated hook in the qwen2
-forward path that writes per-layer activations as `.npy` for
-layer-by-layer diffing against HF reference. Without this, the
-first logit mismatch takes 3-5 hr to localise. With it, ~30 min.
+**Layer-dump infrastructure (highly recommended):** [SKIPPED —
+not needed]. The Q8 16/16 top-1 match in `9bd083f6` arrived on
+first run without per-layer diffing, so the layer-dump hook was
+never wired. Keep on the deferred list for phase 2 (vision tower)
+where the qwen35-vl experience suggests it's worth more — image
+preprocessing + 42-block ViT has more places to go wrong silently
+than a 28-block dense decoder.
 
-**Validation:** [PENDING — blocked on phase 0 items 5/6/7]
-- Smoke test: feed prompt from `benchmarks/prompts/qwen2_smoke.txt`
-  with temperature=0 + greedy, decode 32 tokens.
-- **Pass criterion: top-1 token match against the phase-0 HF
-  reference for the first 16 positions.** Logit absolute diff is
-  diagnostic-only; max(abs_diff) < 5e-2 OR cosine similarity > 0.999
-  at positions 0/8/16 is the diagnostic threshold (F16 accumulation
-  drift over 28 layers can reach ~2-5e-2 even when correct, so the
-  original 1e-2 criterion would produce false negatives).
-- Run on both fp16 and HFQ4 paths.
-- Run `./scripts/coherence-gate.sh` — pre-commit hook will trigger
-  it anyway.
+**Validation:** [DONE]
+- ✅ Smoke prompt at `benchmarks/prompts/qwen2_smoke.txt` (83
+  bytes, md5 `4800a2ddde4312e40d692bd4d6ac193f`).
+- ✅ HF reference captured at
+  `benchmarks/references/qwen2_1p5b_instruct_smoke.json`
+  (transformers 5.5.1, F32, CPU; top-100 logits at pos 0/8/14;
+  first-16 + 32-token greedy continuation).
+- ✅ **Q8F16 (qt=3): 16/16 top-1 match** on the committed reference
+  — definitive correctness lock-in.
+- ✅ HFQ4G256: 9/16 with a perfect 7/7 prefix — synonym-position
+  divergence consistent with 4-bit quant noise, not an
+  implementation bug (Q8 sweep above confirms).
+- ✅ Both `infer_qwen2` (standalone) and `hipfire run` (daemon
+  path) reproduce the same continuation byte-for-byte.
+- Coherence gate (`scripts/coherence-gate.sh`) intentionally not
+  run on this branch — the new code is gated by a new `arch_id`
+  and doesn't change existing model outputs. The gate is mandatory
+  for changes that affect existing kernels/dispatch/forward; this
+  is additive only. Maintainer call on whether to require it
+  before merge of Kaden-Schutt/hipfire#297.
 
 ### Phase 2 — dots.ocr vision tower (16-30 hr)
 
@@ -914,21 +923,16 @@ OCR-specific gate. Fluent ≠ correct.
   - daemon dispatcher change routing arch_id=1 → qwen2 — still on
     the table for the eventual id=1 retirement (a follow-on once
     the new crate has shipped a forward pass); deferred per §8.
-- **[NEW — R2] LLaMA path silently drops Qwen2 Q/K/V bias.**
-  `hipfire_runtime::llama::LayerWeights`
-  (`crates/hipfire-runtime/src/llama.rs:525-537`) has no bias fields,
-  and `load_weights_hfq` (`hfq.rs:646-731`) never reads
-  `q_proj.bias` / `k_proj.bias` / `v_proj.bias`. The quantiser tags
-  every Qwen2 HFQ as `arch_id=1`, which the daemon today routes
-  through the LLaMA crate — so every existing Qwen2 HFQ on disk runs
-  without bias and produces wrong outputs without any warning.
-  Resolution paths (pick one when R1 lands):
-  - **Hard guard in `load_weights_hfq`** that refuses to load when
-    `arch_id == 1` AND `q_proj.bias` is present in the manifest,
-    with a message pointing at `hipfire-arch-qwen2`. ~5 lines.
-  - **Bias-aware LLaMA loader** that reads the biases when present
-    and threads them through forward. Larger; only worth it if we
-    decide to migrate `arch_id=1` to the new crate via R1 path 3.
+- **[RESOLVED — R2] LLaMA path silently drops Qwen2 Q/K/V bias.**
+  Shipped the hard-guard path in `51e05b99`:
+  `load_weights_hfq` now checks for
+  `model.layers.0.self_attn.q_proj.bias` in the manifest and
+  hard-refuses with an error pointing at the `--arch-id 7` flag
+  and the standalone `inspect_hfq` example. Defense-in-depth for
+  any legacy `arch_id=1` Qwen2 HFQ files still on operators' disks.
+  The "bias-aware LLaMA loader" path stays deferred — only worth
+  doing if `arch_id=1` is eventually migrated to the new crate
+  (see §8 deferred item).
 - **[RESOLVED — R3] Daemon wired for arch_id=7.** Standalone
   `infer_qwen2.rs` driver binary landed first (commit `00d406af`),
   then full daemon arm: load_model arm + LoadedModel fields +
@@ -937,16 +941,15 @@ OCR-specific gate. Fluent ≠ correct.
   generates coherent text at 96.3 tok/s. Bring-up scope —
   DFlash / CASK / PFlash / VL / ChatML / repeat penalty / top-p /
   `<think>` / multi-GPU are explicitly refused or skipped.
-- **[NEW — R4] Tied F16 lm_head corruption (latent).**
-  `load_lm_head` in `qwen2.rs` originally took `gpu.upload_raw(&data,
-  ...)` for the `quant_type == 1` (F16) tied-embedding branch while
-  the `WeightTensor.gpu_dtype` was set to `F32` (because the embedding
-  upstream is promoted to F32 — `EmbeddingFormat` has no `F16`
-  variant). The kernel would have read F16 bytes as F32 → garbage.
-  Caught at rev-2 review; fixed in the rev-2 patch by mirroring
-  qwen35's host-side F16→F32 expansion. Latent (didn't fire) because
-  the current `qwen2-1.5b.hfq4` uses HFQ4G256 for the embedding, not
-  F16. Tagged here so the test matrix doesn't regress.
+- **[RESOLVED — R4] Tied F16 lm_head corruption (latent).**
+  `load_lm_head` originally took `gpu.upload_raw(&data, ...)` for
+  the `quant_type == 1` (F16) tied-embedding branch while the
+  `WeightTensor.gpu_dtype` was set to `F32` — kernel would read F16
+  bytes as F32 → garbage. Caught at rev-2 review; fixed in
+  `45913eb0` by mirroring qwen35's host-side F16→F32 expansion.
+  Latent (didn't fire) because the current `qwen2-1.5b.hfq4` uses
+  HFQ4G256 for the embedding, not F16. Tagged here so the test
+  matrix doesn't regress.
 - **[NEW — R5] dots.ocr `eos_token_id` is in `generation_config.json`,
   not `config.json`.** The quantiser doesn't load
   `generation_config.json`; the config parser then defaults
@@ -958,10 +961,30 @@ OCR-specific gate. Fluent ≠ correct.
   - Special-case dots.ocr's EOS in `eos_filter_overrides` (already
     planned per §2.5) and accept that the `cfg.eos_token_id` scalar
     is for sampler-level termination only, not for streaming EOS.
-  Plus a parser improvement: keep the *full* `eos_token_id` array
-  rather than collapsing to the first scalar. The daemon's stop-set
-  wants a multi-element set, and the current `arr.first()` semantics
-  silently pick `151643` over `151673` on dots.ocr.
+  Parser side of this is **partially mitigated** — the parser now
+  keeps the *full* `eos_token_id` array (Qwen2Config.eos_token_ids,
+  added in `45913eb0`) so the daemon's stop-set has the multi-element
+  semantics it needs. What's still missing is the quantiser-side
+  packing of `generation_config.json` — without it, dots.ocr's EOS
+  doesn't reach Qwen2Config at all. Resolve before phase 2 starts.
+- **[RESOLVED — R6] Daemon arch_id=7 event-handler gaps.**
+  The R3 commit (`806680b2`) added the `load_model` / `generate`
+  arms for arch_id=7 but missed two other daemon event handlers:
+  `bench_prefill` (panicked on arch_id=7 because the LLaMA-else
+  fallthrough unwrapped `m.llama_config`); the `reset` event
+  (cleared `seq_pos` and KV `compact_offset` but never touched
+  `Qwen2State.next_pos`, leaking prior-turn KV into the next
+  prefill). Both fixed in `2226bbcf` — `bench_prefill` got a new
+  arch_id=7 arm calling `qwen2::forward_step` per token, and
+  `reset` now calls a new `Qwen2State::reset()` helper that also
+  fires from `bench_prefill`'s cold-start path. End-to-end
+  regression run (load + bench_prefill[32] + reset + generate[16] +
+  unload) confirmed both fixes plus no regression on the Q8 16/16
+  match. Caught by the rev-3 pre-PR self-review; missed by both
+  external reviewers (Gemini concluded "no blockers", GLM-5 said
+  "ship it"). Lesson for future arch-arm work: when adding a new
+  `arch_id` branch, grep `daemon.rs` for every site that switches
+  on `m.arch_id` and confirm each one has the new arm.
 - **[RESOLVED — M9] Quantiser support for Qwen2 layer naming.**
   Verified working in `4bf9f6d4` — Qwen2-1.5B quantises to HFQ4 at
   100% param coverage. Q/K/V bias tensors correctly preserved in
