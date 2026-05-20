@@ -2526,9 +2526,15 @@ impl Gpu {
     }
 
     /// Device-to-device copy (same-size tensors).
+    ///
+    /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
+    /// the active (capturing) stream when one is set, falling back to the sync
+    /// legacy-stream path otherwise. The raw `hip.memcpy_dtod` call would
+    /// deadlock hipGraph capture with "operation would make the legacy stream
+    /// depend on a capturing blocking stream" (matches the H2D fix in 7790ac6a).
     pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
         let size = src.buf.size().min(dst.buf.size());
-        self.hip.memcpy_dtod(&dst.buf, &src.buf, size)
+        self.memcpy_dtod_auto(&dst.buf, &src.buf, size)
     }
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
