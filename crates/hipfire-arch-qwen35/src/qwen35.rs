@@ -717,6 +717,13 @@ impl DeltaNetState {
 // ─── Weight loading ─────────────────────────────────────────────────────
 
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
+///
+/// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
+/// in `hipfire-arch-qwen2::qwen2::load_norm_weight_raw` is the same
+/// shape minus the `+= 1.0` offset (Qwen2 uses standard RMSNorm) and
+/// without the `model.language_model.` name prefix (Qwen2 stores norms
+/// flat). Pull both into `hipfire_runtime::transformer::norm` during the
+/// Transformer-extraction PR with the offset and prefix as parameters.
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
     let full_name = format!("model.language_model.{name}");
     let (info, data) = hfq.tensor_data_vec(&full_name)
@@ -734,6 +741,14 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
 }
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
+///
+/// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
+/// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
+/// of this match (only HFQ4G256, HFQ4G128, F16 — the formats Qwen2 HFQ
+/// files actually use). Pull this full quant-type matcher into
+/// `hipfire_runtime::transformer::weights` so every arch crate shares
+/// one implementation. Will also resolve the AWQ-sidecar attachment
+/// hand-off cleanly.
 fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: usize) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
@@ -873,6 +888,13 @@ fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
+/// TODO(transformer-extraction): cross-arch duplicate of
+/// `hipfire-arch-qwen2::qwen2::load_weight_tensor` — same name-lookup +
+/// pread + AWQ-sidecar pattern, but qwen35 uses the
+/// `model.language_model.` prefix (its HFQ files put text weights under
+/// the VL-friendly nested name) where qwen2 uses flat `model.{...}`.
+/// Pull into `hipfire_runtime::transformer::weights` with the prefix
+/// as a parameter during consolidation.
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let full_name = format!("model.language_model.{name}");
     // Use pread path to avoid page cache buildup on unified-memory APUs.
@@ -1317,6 +1339,15 @@ fn load_raw_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     load_any_as_f32(hfq, gpu, name, n)
 }
 
+// TODO(transformer-extraction): the overall `load_weights` orchestration
+// here (drop_mmap → embedding+tied-lm_head → norm → per-layer loop) is
+// the model the Qwen2 loader at
+// `hipfire-arch-qwen2::qwen2::load_weights` follows. The tied-embedding
+// re-upload pattern (re-reading `embed_tokens.weight` to construct a
+// second GpuTensor for the lm_head) is duplicated in both crates
+// because GpuTensor is not Clone. Consolidation PR should either add
+// `GpuTensor::shallow_clone()` or switch to `Arc<GpuTensor>` so tied
+// embeddings stop costing 2× the embedding VRAM.
 pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
     // Drop the mmap on unix to avoid double-buffering on UMA systems.
     // All tensor data reads go through pread + fadvise_dontneed, which

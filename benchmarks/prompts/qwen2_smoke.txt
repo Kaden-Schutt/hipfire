@@ -1,0 +1,1 @@
+Write a one-paragraph explanation of how a transformer's attention mechanism works.
