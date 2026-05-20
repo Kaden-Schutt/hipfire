@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -200,6 +201,37 @@ fn hfq3_dp4a_enabled(arch: &str) -> bool {
         return false;
     }
     hfq3_sdot4_gfx10_enabled(arch)
+}
+
+/// Current layer index, set by the qwen35 forward_prefill_chunk at the
+/// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
+/// support per-layer MMQ-on/off experiments (see issue #302 — KLD
+/// attribution sweep). Default 0; no semantic meaning outside an
+/// instrumented sweep.
+pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the current layer index falls within the
+/// `HIPFIRE_HFQ3_MMQ_LAYER_MIN..=HIPFIRE_HFQ3_MMQ_LAYER_MAX` range, if
+/// either is set. Both env vars are OnceLock-cached. Default open
+/// (always pass) when neither var is set — preserves current routing.
+fn hfq3_mmq_layer_gate_pass() -> bool {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    let lo = *MIN.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_MMQ_LAYER_MIN").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    let hi = *MAX.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_MMQ_LAYER_MAX").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    if lo.is_none() && hi.is_none() {
+        return true;  // gate open
+    }
+    let layer = MMQ_CURRENT_LAYER.load(Ordering::Relaxed);
+    if let Some(lo) = lo { if layer < lo { return false; } }
+    if let Some(hi) = hi { if layer > hi { return false; } }
+    true
 }
 
 /// Whether to route HFQ3 residual through the experimental wave32 MMQ
@@ -5801,8 +5833,10 @@ impl Gpu {
         self.bind_thread()?;
         // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
         // AND all four output strides are MMQ_Y-aligned. Auto-selector falls
-        // back to dot2 at small batch.
+        // back to dot2 at small batch. Layer-gate (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX})
+        // is a no-op when unset; supports per-layer KLD attribution sweeps (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && hfq3_mmq_layer_gate_pass()
             && qkv_m % 128 == 0 && z_m % 128 == 0
             && beta_m % 128 == 0 && alpha_m % 128 == 0
         {
@@ -6486,8 +6520,9 @@ impl Gpu {
         // Phase 3 experimental: MMQ family (auto-tile-selecting). Fires only
         // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
-        // safe at any batch_size.
+        // safe at any batch_size. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && hfq3_mmq_layer_gate_pass()
             && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0
         {
             return self.gemm_qkv_hfq3g256_mmq(
@@ -7250,8 +7285,9 @@ impl Gpu {
         self.bind_thread()?;
         // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
         // AND gate_m/up_m are MMQ_Y-aligned. Auto-selector falls back to dot2
-        // at small batch.
+        // at small batch. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && hfq3_mmq_layer_gate_pass()
             && gate_m % 128 == 0 && up_m % 128 == 0
         {
             return self.gemm_gate_up_hfq3g256_mmq(
@@ -13095,8 +13131,8 @@ impl Gpu {
         // Phase 3 experimental: wave32 MMQ if HIPFIRE_HFQ3_MMQ=1. Env gate is
         // OnceLock-cached so the env read is one-shot per process; the arch
         // match is a handful of cycles per dispatch call (not in any inner
-        // loop). Default off.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) {
+        // loop). Default off. Layer-gate is a no-op when unset (#302).
+        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) && hfq3_mmq_layer_gate_pass() {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
