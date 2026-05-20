@@ -7,7 +7,7 @@ use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -504,6 +504,55 @@ impl DType {
     }
 }
 
+/// Activation-capture hook for the Tier 1 hipfire-native calibration path.
+///
+/// Foundation scaffold (2026-05-19) — the field on `Gpu` is set by
+/// `collect_imatrix` / `collect_hessian` (see
+/// `crates/hipfire-runtime/src/bin/`) and called from each linear-layer
+/// dispatch site to feed activations into an on-GPU reduction
+/// (per-channel `Σ act²` for imatrix, K×K outer-product for the GPTQ
+/// Hessian).
+///
+/// Phase 1 ships only the trait, the `Gpu::capture_handler` field, and
+/// a default of `None` — so existing call sites are unaffected. Phase 2
+/// threads the `if let Some(h) = &gpu.capture_handler { h.capture(...) }`
+/// call into every fused/unfused GEMM dispatch arm.
+///
+/// `tensor_name` is the canonical hipfire tensor identifier (the same
+/// string the .hfq loader uses, e.g. `model.layers.0.self_attn.q_proj`)
+/// so the reduction kernel can key its on-GPU accumulator dictionary
+/// by name without ambiguity across MoE expert indices.
+///
+/// `input_ptr` / `numel` / `dtype` describe the activation tensor in
+/// HBM at the moment of the linear-layer dispatch. The capture
+/// implementation is responsible for launching its own reduction
+/// kernel on the same stream as the producing GEMM (so ordering is
+/// preserved without an extra `hipDeviceSynchronize`). The hook MUST
+/// NOT free or reallocate the input tensor.
+///
+/// `Send + Sync` lets the same handler be shared across multi-GPU
+/// dispatch threads (one `Gpu` instance per device, all pointing at
+/// the same Arc'd handler that funnels into a per-tensor accumulator).
+pub trait ActivationCapture: Send + Sync {
+    /// Called by linear-layer dispatch arms when calibration is active.
+    ///
+    /// `tensor_name` — canonical .hfq / GGUF tensor name.
+    /// `input_ptr`   — device pointer to the input activation tensor.
+    /// `numel`       — number of elements at `input_ptr` (NOT bytes).
+    /// `dtype`       — element type of the captured activation.
+    /// `shape`       — full activation shape (e.g. `[batch, K]` for the
+    ///                 input of a `[K, M]` linear). Borrowed; do NOT
+    ///                 retain past the call.
+    fn capture(
+        &self,
+        tensor_name: &str,
+        input_ptr: *const c_void,
+        numel: usize,
+        dtype: DType,
+        shape: &[usize],
+    );
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 pub struct Gpu {
     pub hip: HipRuntime,
@@ -668,6 +717,17 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
+
+    /// Activation-capture hook for the Tier 1 hipfire-native calibration
+    /// path (foundation scaffold 2026-05-19). `None` by default — set by
+    /// `collect_imatrix` / `collect_hessian` binaries when calibration is
+    /// active. Phase 2 threads the `Some(h).capture(...)` call into each
+    /// linear-layer dispatch arm. See `ActivationCapture` trait doc above.
+    ///
+    /// `Arc<dyn>` so the same handler can be shared across multi-GPU
+    /// dispatch threads (one `Gpu` per device, all routing into a single
+    /// per-tensor accumulator).
+    pub capture_handler: Option<Arc<dyn ActivationCapture>>,
 }
 
 impl Gpu {
@@ -887,6 +947,7 @@ impl Gpu {
             replay_capturing_n: None,
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
+            capture_handler: None,
         }).map(|mut gpu| {
             if gpu.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
