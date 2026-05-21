@@ -1,9 +1,11 @@
 # MTP+DFlash composition bench — Phase 0 empirical 2026-05-21
 
-**Hardware**: hiptrx, 4× R9700 / gfx1201 RDNA4, single GPU
-(`HIP_VISIBLE_DEVICES=0`). ~640 GB/s GDDR6 per card.
+**Hardware tested:**
+- hiptrx: 4× R9700 / gfx1201 RDNA4, single GPU (`HIP_VISIBLE_DEVICES=0`)
+- k9lin: 7900 XTX / gfx1100 RDNA3 single GPU
+- BW ratio (R9700/7900 XTX): 640/960 = 0.667
 
-**Branch**: `mtp-hiptrx-rocprof` (HEAD `5340a974` + composition bench).
+**Branch**: `mtp-hiptrx-rocprof` (HEAD `7a5a4f8f` + bench).
 
 **Code state**: `spec_step_dflash_mtp` (linear) and
 `spec_step_dflash_mtp_tree` (per-slot tree) are **already implemented**
@@ -13,10 +15,11 @@ wire them up. This bench just exercises the existing artifacts.
 
 **Bench config**:
 ```
-HIP_VISIBLE_DEVICES=0 ./target/release/examples/dflash_mtp_demo \
+HIPFIRE_DPM_WARMUP_SECS=10 (or 1 throwaway run) \
+./target/release/examples/dflash_mtp_demo \
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
   --drafter ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --mtp-head ~/.hipfire/models/qwen3.5-27b-cvs16384.mtp \
+  --mtp-head <path-to-cvs16384.mtp-or-q8.mtp> \
   --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt \
   --max 120 --temp 0 --no-chatml --kv-mode q8 \
   --dflash-b <B> --mtp-k <K>
@@ -25,22 +28,38 @@ HIP_VISIBLE_DEVICES=0 ./target/release/examples/dflash_mtp_demo \
 
 ---
 
-## Headline results (canonical 27B-3.5, K=5 implicit for MTP head)
+## Headline results (canonical 27B-3.5, K=5 internal for MTP head)
 
-| Variant | dflash-b | mtp-k | tok/s | commits/cycle | cycles | decode_secs | notes |
-|---|---|---|---|---|---|---|---|
-| **DFlash solo** | 16 | — | **126.06** | 10.46 | 13 | 0.98 | reference baseline |
-| **MTP solo** (mtp_only_demo) | — | — | 39.12 | 9.46 / 3.4 | 35 | 3.07 | from prior bench |
-| Composition linear B=14 K=2 | 14 | 2 | **123.79** | 9.46 | 13 | 0.99 | tile-aligned M=16 |
-| Composition linear B=16 K=1 | 16 | 1 | 94.64 | 9.46 | 13 | 1.30 | M=17 → 2 tiles |
-| Composition linear B=16 K=2 | 16 | 2 | 93.05 | 9.46 | 13 | 1.32 | M=18 → 2 tiles |
-| Composition linear B=16 K=3 | 16 | 3 | 91.62 | 9.46 | 13 | 1.34 | M=19 → 2 tiles |
-| Composition linear B=12 K=4 | 12 | 4 | 115.15 | 8.79 | 14 | 1.07 | M=16 tile-aligned |
-| Composition linear B=8  K=8 | 8 | 8 | 86.49 | 6.47 | 19 | 1.42 | M=16 but DFlash truncated |
-| Composition tree B=16 K=1 | 16 | 1 | 37.18 | 6.32 | 19 | 3.23 | tree overhead kills it |
-| Composition tree B=8  K=2 | 8 | 2 | 16.11 | 1.88 | 64 | 7.45 | tree variant degenerate |
+### hiptrx (single R9700 gfx1201)
 
-### Full-vocab MTP head (qwen3.5-27b-q8.mtp) vs compressed (cvs16384)
+| Variant | dflash-b | mtp-k | tok/s | commits/cycle | cycles |
+|---|---|---|---|---|---|
+| **DFlash solo** (dflash_spec_demo) | 16 | — | **126.06** | 10.46 | 13 |
+| **MTP solo** (mtp_only_demo) | — | — | 39.12 | 3.40 | 35 |
+| Composition linear B=14 K=2 | 14 | 2 | **123.79** | 9.46 | 13 |
+| Composition linear B=15 K=1 | 15 | 1 | not run | | |
+| Composition linear B=16 K=1 | 16 | 1 | 94.64 | 9.46 | 13 |
+| Composition linear B=16 K=2 | 16 | 2 | 93.05 | 9.46 | 13 |
+| Composition linear B=12 K=4 | 12 | 4 | 115.15 | 8.79 | 14 |
+| Composition linear B=8 K=8 | 8 | 8 | 86.49 | 6.47 | 19 |
+| Composition tree B=16 K=1 | 16 | 1 | 37.18 | 6.32 | 19 |
+| Composition tree B=8 K=2 | 8 | 2 | 16.11 | 1.88 | 64 |
+
+### k9lin (7900 XTX gfx1100)
+
+| Variant | dflash-b | mtp-k | tok/s | commits/cycle | cycles |
+|---|---|---|---|---|---|
+| **DFlash solo** (dflash_spec_demo) | 16 | — | **181** | 11.25 | 12 |
+| **MTP solo** (mtp_only_demo) | — | — | 44 | 3.4 | 35 |
+| Composition linear B=15 K=1 | 15 | 1 | 159.9 | 9.46 | 13 |
+| Composition linear B=14 K=2 | 14 | 2 | **159.3** | 9.46 | 13 |
+| Composition linear B=13 K=3 | 13 | 3 | 145.4 | 8.79 | 14 |
+| Composition linear B=12 K=4 | 12 | 4 | 144.4 | 8.79 | 14 |
+| Composition linear B=10 K=6 | 10 | 6 | 133.0 | 8.2 | 15 |
+| Composition linear B=8 K=8 | 8 | 8 | 109.5 | 6.83 | 18 |
+| Composition tree B=12 K=1 | 12 | 1 | 22.6 | 2.18 | 55 |
+
+### Full-vocab MTP head (qwen3.5-27b-q8.mtp) vs compressed (cvs16384) on hiptrx
 
 | Variant | compressed tok/s | full-vocab tok/s |
 |---|---|---|
@@ -49,119 +68,133 @@ HIP_VISIBLE_DEVICES=0 ./target/release/examples/dflash_mtp_demo \
 | B=16 K=2 | 93.05 | 92.56 |
 
 **Vocab compression doesn't matter** — both produce identical
-committed_total (123) at every (B,K). MTP head's argmax positions on
+committed_total at every (B,K). MTP head's argmax positions on
 canonical bench are all in top-16K.
 
 ---
 
 ## Conclusion: composition does NOT exceed DFlash solo with weak MTP head
 
-Empirically confirms master plan's honest math (see
-`docs/plans/mtp-dflash-composition-master-plan.md`):
-
-> "Composition is at-best-flat over DFlash solo if MTP adds 2-3 commits
-> per cycle. To CLEARLY EXCEED DFlash solo, we need either:
-> 1. MTP contribution ≥4-5 commits per cycle (requires good MTP solo
->    acceptance — needs the trained sidecar)
-> ..."
-
-Best composition (B=14 K=2 tile-aligned M=16) hits **123.8 tok/s** vs
-DFlash solo 126.1 tok/s — 1.8% under DFlash. MTP candidates contribute
-0 extra commits in observed cycles (committed_total identical at
-B=16 K=0 vs B=14 K=2).
-
 ### Why composition contributes 0 net commits
 
-DFlash full-accept rate at B=16: 1/13 = **7.7%** (per spec_step_dflash
-seed-oracle output). MTP K=2 candidates only "fire usefully" on full-
-accept cycles. Conditional contribution per full-accept:
-- MTP step 0 accept p ≈ 0.68 (matches MTP solo per-position acceptance)
-- MTP step 1 accept p ≈ 0.68 × 0.68 = 0.46
-- E(commits per full-accept) = 1.14
+Both devices show the same pattern:
+- committed_total invariant across (B,K) variants at fixed max=120
+- cycles vary only with B (DFlash provides the commits)
+- MTP candidates only "fire usefully" on DFlash full-accept cycles
 
-Expected lift: 7.7% × 1.14 = **0.088 commits/cycle**. In 13 cycles =
-~1.1 extra commits — within noise of 123 vs 124 measurements.
+DFlash full-accept rate at B=16: ~7-8% (per spec_step_dflash seed-oracle).
+Conditional MTP contribution: ~0.1 commits per cycle on average.
+This is within measurement noise of "0".
 
 ### Why tree variant is much worse
 
 Tree allocates B × K MTP slots; verify becomes M = B + B×K. At B=16
-K=1, M = 32 → 2 WMMA tiles + per-cycle tree-construction overhead.
-The non-WMMA per-cycle costs (tree node construction, attention bias
-building, KV writes for B*K slots) dominate the cycle. Drops to 37
-tok/s vs linear 94 tok/s at same (B,K).
+K=1, M = 32. Per-cycle tree-construction overhead + 2-3 WMMA tiles
+dominates. Drops 3-7× vs linear at same (B,K).
+
+### Master plan honest math, vindicated
+
+Per `docs/plans/mtp-dflash-composition-master-plan.md`:
+> "Composition is at-best-flat over DFlash solo if MTP adds 2-3 commits
+> per cycle. To CLEARLY EXCEED DFlash solo, we need either:
+> 1. MTP contribution ≥4-5 commits per cycle (requires good MTP solo
+>    acceptance — needs the trained sidecar)
+> 2. Eliminate the extra verify+overhead (replay elim + fused-verify
+>    kernels — multi-week)
+> 3. Reuse DFlash's verify completely — MTP just steals from DFlash's
+>    bonus slot, not chaining off DFlash's last draft."
+
+Phase 0 empirics show Option 1 is the gating lever. With current MTP head
+(~68% per-position acceptance), MTP candidates can't reliably extend
+beyond DFlash's full-accept chain. Need ~85%+ per-position to consistently
+add commits in the 7-8% of full-accept cycles, OR need composition design
+that fires MTP at interior positions where DFlash is uncertain (out of scope
+for Phase 0).
+
+---
+
+## Today's baseline drift vs prior memory
+
+Today (2026-05-21, master `97747374` tokenizer fix rebased):
+
+| Metric | Memory baseline | Today | Drift |
+|---|---|---|---|
+| MTP solo k9lin (mtp_only_demo) | 53 tok/s | 44 tok/s | -17% |
+| DFlash solo k9lin (dflash_spec_demo) | 199 tok/s (CLAUDE.md) | 181 tok/s | -9% |
+| DFlash τ k9lin | 10.36 | 9.25 | -11% |
+
+Possible causes:
+- Tokenizer fix (`97747374`) changed prompt tokenization → different argmax
+  → different τ → different tok/s
+- Recent merges from master may have shifted kernel selection
+- DPM/cache state different across days
+
+Not investigated tonight (orthogonal to composition findings). Worth a
+git bisect against `cf449fcd` (pre-rebase HEAD) on a future session.
 
 ---
 
 ## What this proves
 
-1. ✅ Composition architecture **works correctly** — verify accepts
-   MTP candidates as expected on full-accept cycles, no regression in
-   committed_total quality
-2. ✅ Tile-alignment is real: M=18 → 2-tile WMMA costs 34% more wall
-   for batched gate_up/residual/qkvza, killing throughput
+1. ✅ Composition architecture **works correctly** — `spec_step_dflash_mtp`
+   linear is byte-exact correct; verify accepts MTP candidates as
+   expected on full-accept cycles, no regression in committed_total
+2. ✅ Tile-alignment is real and significant: M=18 → 2-tile WMMA costs
+   34% more wall for batched gate_up/residual/qkvza, killing throughput
 3. ❌ Current MTP head (sidecar cvs16384 or full-vocab Q8) does NOT
-   produce enough extra commits to offset composition overhead
+   produce enough extra commits to offset composition overhead — Goal B
+   blocked on stronger MTP head
+4. ⚠ Today's MTP solo and DFlash solo baselines are below prior memory
+   numbers (~10-17% lower) — possible regression worth bisecting
 
 ## What's needed for Goal B 230+ tok/s
 
-Per master plan and these empirics:
-
-### Tract A: Trained MTP sidecar (Phase 1, multi-hour to multi-day)
+### Track A: Trained MTP sidecar (Phase 1, multi-hour to multi-day)
 - Run `scripts/distill/run_distill_parallel.sh` on hiptrx 4× R9700
-- Wide-corpus trunk-argmax distillation (needs ~100s of prompts;
-  HF datasets `Roman1111111-claude-opus-10000x`,
+- Wide-corpus trunk-argmax distillation
+- Need HF prompt datasets (`Roman1111111-claude-opus-10000x`,
   `Jackrong-Qwen3.5-reasoning-700x`, `nohurry-Opus-Reasoning-3000x`)
-- Need `--kv-mode q8` flag added to run_distill_parallel.sh
-  (currently defaults to asym3)
-- Projected MTP solo τ: 3.4 → 4.5+ → tok/s 39 → 50-60
-- In composition: enables MTP to contribute ~1.5-2 commits/cycle
-  consistently (not just on full-accept) → tok/s 124 → 150+
+  cached locally on hiptrx — currently absent
+- Need `--kv-mode q8` flag in run_distill_parallel.sh — script
+  already supports it (default asym3, override via `--kv-mode q8`)
+- Projected MTP solo τ: 3.4 → 4.5+ → tok/s 44 → 55-60 (k9lin)
+- In composition: MTP per-position acceptance 68% → 85%+ → enables
+  consistent MTP commits → composition lift +20-30% over DFlash solo
 
 ### Track B: Replay elimination via per-position GDN checkpoint
 - Multi-week kernel work (per master plan)
 - Saves ~30-50% of cycle wall by skipping replay forward
 - Pure perf lever, independent of MTP head quality
+- Lifts MTP solo + composition + DFlash solo together
 
-### Hardware: TP across 4 R9700s
+### Hardware: TP across 4 R9700s on hiptrx
 - Multi-week TP infrastructure work
-- 3-4× lift theoretical → composition 124 → 350-450 tok/s
-- Clears Goal B comfortably
+- 3-4× lift theoretical → composition 159 → 450-600 tok/s on hiptrx
 - Out of overnight scope
 
 ---
 
-## Recommendations for next session
+## Code state (no changes this session)
 
-1. **Distillation prep**: download HF prompt corpus on hiptrx,
-   add `--kv-mode q8` flag to run_distill_parallel.sh, kick off
-   distillation. ~2-6 hours runtime on 4× R9700.
-2. **Aggregate + sidecar**: run aggregate_argmax.py + merge_sidecars.py
-   to produce trained `qwen3.5-27b-distilled.mtp`.
-3. **Re-bench composition**: replace cvs16384.mtp with distilled.mtp,
-   re-run B=14 K=2 sweep. Expected: 140-160 tok/s on hiptrx single GPU.
-4. **k9lin re-bench**: same composition on k9lin 7900 XTX. Per BW
-   ratio, expected: 124 × (960/640) = 186 tok/s (no trained sidecar) →
-   220-240 tok/s (with trained sidecar) → likely **clears Goal B 230**.
+- `crates/hipfire-arch-qwen35/src/mtp_compose.rs` (1223 LOC) — pre-existing
+- `crates/hipfire-runtime/examples/dflash_mtp_demo.rs` (405 LOC) — pre-existing
+- `crates/hipfire-runtime/examples/dflash_mtp_tree_demo.rs` (394 LOC) — pre-existing
 
-Goal B 230+ on **k9lin** is feasible with Phase 1 trained sidecar.
-On **hiptrx single R9700**, probably blocked by BW until TP work.
-
-## Code state
-
-- `crates/hipfire-arch-qwen35/src/mtp_compose.rs` (1223 LOC):
-  - `MtpComposeState`, `spec_step_dflash_mtp` (linear)
-  - `MtpComposeTreeState`, `spec_step_dflash_mtp_tree` (tree)
-- `crates/hipfire-runtime/examples/dflash_mtp_demo.rs` (405 LOC)
-- `crates/hipfire-runtime/examples/dflash_mtp_tree_demo.rs` (394 LOC)
-
-All shipped before this session. No code changes required for Phase 0.
+Phase 0 prototype was built and shipped weeks ago (the
+`mtp_compose.rs` module date back to Task 11 in earlier session per
+its header comment); tonight's contribution is the **empirical
+characterization** documenting what works, what doesn't, and why.
 
 ## Bench reproducibility
 
-Models on hiptrx (canonical):
-- `~/.hipfire/models/qwen3.5-27b.mq4` — trunk
-- `~/.hipfire/models/qwen35-27b-dflash-mq4.hfq` — DFlash drafter
-- `~/.hipfire/models/qwen3.5-27b-cvs16384.mtp` — MTP head (vocab=16K)
-- `~/.hipfire/models/qwen3.5-27b-q8.mtp` — MTP head (full vocab)
+Models on hiptrx + k9lin (canonical):
+- `~/.hipfire/models/qwen3.5-27b.mq4` — trunk (14.0 GiB)
+- `~/.hipfire/models/qwen35-27b-dflash-mq4.hfq` — DFlash drafter (876 MiB)
+- `~/.hipfire/models/qwen3.5-27b-cvs16384.mtp` (or `/tmp/...` on k9lin) — MTP head vocab=16K (258 MiB)
+- `~/.hipfire/models/qwen3.5-27b-q8.mtp` — MTP head full vocab (451 MiB)
 
-prompt_md5: `1e74f17934fe759468dbe1471b732067`
+prompt_md5: `1e74f17934fe759468dbe1471b732067` (canonical LRU PEP-8 prompt)
+
+Variance: 5-run deterministic on warm runs ±0.5%. Cold first run typically
+3-7× slower (DPM/kernel-cache warming). Use HIPFIRE_DPM_WARMUP_SECS=10 or
+1-2 throwaway runs before measurement.
