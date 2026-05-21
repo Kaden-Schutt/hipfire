@@ -5489,7 +5489,15 @@ fn prefill_moe_ffn_body_batched(
                 )?;
                 let use_paro_i8 = gpu.arch.starts_with("gfx1151")
                     && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
-                if use_paro_i8 {
+                let use_paro_i8_k8 = use_paro_i8
+                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() == Ok("1");
+                if use_paro_i8_k8 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
+                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                        &pbs.x_rot_batch, y_gu_grouped,
+                        2 * mi, gate_up_k, k_top, m_total, n,
+                    )?;
+                } else if use_paro_i8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
                         &ffn.expert_gate_up_ptrs, tile_ids, sorted,
                         &pbs.x_rot_batch, y_gu_grouped,
@@ -5615,7 +5623,15 @@ fn prefill_moe_ffn_body_batched(
             DType::ParoQ4G128 => {
                 let use_paro_i8 = gpu.arch.starts_with("gfx1151")
                     && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
-                if use_paro_i8 {
+                let use_paro_i8_k8 = use_paro_i8
+                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() == Ok("1");
+                if use_paro_i8_k8 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
+                        &ffn.expert_down_ptrs, tile_ids, sorted,
+                        rot_batch, y_down_grouped,
+                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                    )?;
+                } else if use_paro_i8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
                         &ffn.expert_down_ptrs, tile_ids, sorted,
                         rot_batch, y_down_grouped,
