@@ -9988,6 +9988,10 @@ impl Gpu {
         let (kernel_name, kernel_src) = match variant_override.as_deref() {
             Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
                              kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
+            // k4 = 4-tile pipeline (more in-flight B loads for better BW
+            // utilization). Opt-in default-off; bench-measured 2026-05-21.
+            Some("k4")   => ("gemm_gate_up_hfq4g256_wmma_k4",
+                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC),
             _            => ("gemm_gate_up_hfq4g256_wmma",
                              kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
         };

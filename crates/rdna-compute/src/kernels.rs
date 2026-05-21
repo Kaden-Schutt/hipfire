@@ -814,6 +814,11 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/
 // Gate 1 microbench measurement. See
 // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip");
+// K4 4-tile pipeline variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=k4 to
+// test deeper memory-load pipelining (3-4 in-flight B loads vs k2's 2).
+// Target: lift gate_up_wmma from 305 GB/s (32% peak on gfx1100) toward
+// 60-70% peak. See feedback_v3_gate_up_k4_2026_05_21.md.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_k4.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
