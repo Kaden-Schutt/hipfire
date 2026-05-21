@@ -561,6 +561,16 @@ pub const GEMV_PARO_Q4G128_MOE_DOWN_K8_INDEXED_BATCHED_SRC: &str =
 pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_k2.hip");
 
+/// i8 WMMA MMQ MoE grouped GEMM for HFQ4G128 (ParoQuant) on gfx1151
+/// (Strix Halo iGPU). Port of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC
+/// with the 72 B/group HFQ4G128 stride. Targets the same +2× FP16 WMMA
+/// throughput lift on routed-expert grouped GEMM. Compute-bound regime
+/// per Phase 4 rocprof attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
+/// = 68.5% of GPU time, 25.8 GiB/s effective — far from the ~256 GB/s BW
+/// roof, so compute-throughput doubling has full upside).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx1151.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down

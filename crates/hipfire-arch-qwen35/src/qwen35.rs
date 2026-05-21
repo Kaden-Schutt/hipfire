@@ -5472,6 +5472,12 @@ fn prefill_moe_ffn_body_batched(
             // x_rot ONCE, then dispatch the HFQ4G128 grouped WMMA. The
             // kernel auto-converts the F32 x_rot to F16 internally via
             // ensure_fp16_x, same as the G256 sister.
+            //
+            // gfx1151 i8 MMQ opt-in (HIPFIRE_MOE_PARO_I8=1): routes to the
+            // HFQ4G128 i8 MMQ kernel which doubles compute throughput on
+            // Strix Halo (~140 vs ~71 TFLOPS). Compute-bound regime per
+            // Phase 4 attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
+            // = 68.5% GPU time, 25.8 GiB/s — far from BW roof).
             DType::ParoQ4G128 => {
                 let paro = ffn.paro_shared.as_ref().expect(
                     "ParoQ4G128 routed experts require paro_shared sidecars",
@@ -5481,11 +5487,21 @@ fn prefill_moe_ffn_body_batched(
                     &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
                     n, dim, paro.krot as usize,
                 )?;
-                gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                    &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-                    &pbs.x_rot_batch, y_gu_grouped,
-                    2 * mi, gate_up_k, k_top, m_total, n,
-                )?;
+                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
+                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
+                if use_paro_i8 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                        &pbs.x_rot_batch, y_gu_grouped,
+                        2 * mi, gate_up_k, k_top, m_total, n,
+                    )?;
+                } else {
+                    gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                        &pbs.x_rot_batch, y_gu_grouped,
+                        2 * mi, gate_up_k, k_top, m_total, n,
+                    )?;
+                }
             },
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
                              — admit predicate should have rejected this layer"),
@@ -5590,19 +5606,29 @@ fn prefill_moe_ffn_body_batched(
                 rot_batch, y_down_grouped,
                 down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
             )?,
-            // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA. rot_batch was
+            // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
+            // opt-in for gfx1151 — see gate_up arm above). rot_batch was
             // already Givens-rotated by paro_shared.down_* via the PARO
-            // fused_silu_mul_givens_rotate_f32 step above, so the kernel
-            // is rotation-agnostic (same as the MQ4 path: rot_batch is
-            // FWHT-rotated upstream there too). Same HFQ4G128 grouped
-            // WMMA kernel as gate_up — x_src layout differs (per-slot
-            // routed-expert intermediate vs per-token gate_up input)
-            // but the kernel is shape-parametric.
-            DType::ParoQ4G128 => gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                &ffn.expert_down_ptrs, tile_ids, sorted,
-                rot_batch, y_down_grouped,
-                down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-            )?,
+            // fused_silu_mul_givens_rotate_f32 step above; the kernel is
+            // rotation-agnostic. Same kernel for gate_up + down — only
+            // shape parameters and x_row_div differ.
+            DType::ParoQ4G128 => {
+                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
+                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
+                if use_paro_i8 {
+                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
+                        &ffn.expert_down_ptrs, tile_ids, sorted,
+                        rot_batch, y_down_grouped,
+                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                    )?;
+                } else {
+                    gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                        &ffn.expert_down_ptrs, tile_ids, sorted,
+                        rot_batch, y_down_grouped,
+                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+                    )?;
+                }
+            },
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
