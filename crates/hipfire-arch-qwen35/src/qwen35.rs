@@ -4808,7 +4808,7 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_all_mq4(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
@@ -4816,7 +4816,7 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.wk.gpu_dtype, arch)
                     && is_batchable_la(l.wv.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_all_mq4(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn),
         });
 
     if !eligible {
@@ -4932,7 +4932,7 @@ pub fn forward_prefill_batch_with_pbs(
 #[inline]
 // IMPORTANT: This allowlist is paired with the `is_mq*` matchers in
 // forward_prefill_chunk (lines 4063+, 4360+, 4768, 4919) and with the
-// MoE FFN gate `moe_ffn_all_mq4`. They MUST be updated together when
+// MoE FFN gate `moe_ffn_batched_admissible`. They MUST be updated together when
 // adding a new batchable dtype. Updating one without the others either
 // produces dead code (safe but useless) or silent prefill corruption
 // (HFQ4-stride GEMM reading a different-stride weight block). See
@@ -5078,9 +5078,38 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// garbage activations in production. Bisection of the offending
 /// dispatch site is pending. Default-off preserves the pre-fan-out
 /// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
-fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
-    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
-    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
+fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
+    // F32 router/shared_gate admit (PARO checkpoints — router is FP16-dense,
+    // expanded to F32 on GPU; shared_expert_gate likewise. See
+    // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
+    // prefill_moe_ffn_body_batched route F32 through gemm_f32_batched.
+    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
+    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
+
+    // PARO env-gated admit (HIPFIRE_PARO_BATCHED=1). Unlocks the batched body
+    // for shisa-Qwen3.6-A3B-PARO and similar ParoQuant checkpoints where the
+    // routed-expert + shared-expert weights are ParoQ4G128 (HFQ4G128 +
+    // per-weight Givens rotation metadata). The downstream dispatch arms for
+    // ParoQ4G128 are panic-stubs in Phase 1; Phase 2 fills shared_expert and
+    // Phase 3 fills routed-expert. The env gate ensures the panic-stubs only
+    // fire when the user explicitly opts in. See roadmap at
+    // .claude/plans/magical-marinating-hippo.md.
+    static PARO_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let admit_paro = *PARO_ADMIT.get_or_init(|| {
+        std::env::var("HIPFIRE_PARO_BATCHED").as_deref() == Ok("1")
+    });
+    if admit_paro {
+        let paro_ok = router_ok
+            && shared_gate_ok
+            && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
+            && matches!(ffn.shared_expert.up.gpu_dtype, DType::ParoQ4G128)
+            && matches!(ffn.shared_expert.down.gpu_dtype, DType::ParoQ4G128)
+            && ffn.experts.iter().all(|e|
+                e.gate_up.gpu_dtype == DType::ParoQ4G128 && e.down.gpu_dtype == DType::ParoQ4G128);
+        if paro_ok {
+            return true;
+        }
+    }
 
     // MQ6 admit env gate (default off — see comment above)
     static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5118,7 +5147,7 @@ fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
 /// residual back into the same buffer in-place.
 ///
 /// Preconditions (caller must guarantee):
-/// - `moe_ffn_all_mq4(ffn)` returns true: router + shared_expert_gate may
+/// - `moe_ffn_batched_admissible(ffn)` returns true: router + shared_expert_gate may
 ///   be MQ4G256 *or* Q8_0; all other MoE weights must be MQ4G256
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
@@ -5165,7 +5194,7 @@ fn prefill_moe_ffn_body_batched(
     // expect FWHT(rmsnorm(x) / awq_scale). Populate both:
     //   x_norm_batch ← rmsnorm(x_batch)
     //   x_rot_batch  ← FWHT(x_norm_batch / awq_scale)  (only if any
-    //                  downstream MQ weight is present, which moe_ffn_all_mq4
+    //                  downstream MQ weight is present, which moe_ffn_batched_admissible
     //                  guarantees — shared_expert.gate is always MQ4 here)
     //
     // Pick `shared_expert.gate` as the AWQ representative (instead of
@@ -5193,8 +5222,12 @@ fn prefill_moe_ffn_body_batched(
             &ffn.router.buf, &pbs.x_rot_batch, router_logits,
             ffn.router.m, ffn.router.k, n,
         )?,
+        DType::F32 => gpu.gemm_f32_batched(
+            &ffn.router.buf, &pbs.x_norm_batch, router_logits,
+            ffn.router.m, ffn.router.k, n,
+        )?,
         other => panic!("prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
+                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"),
     }
     match ffn.shared_expert_gate.gpu_dtype {
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
@@ -5205,8 +5238,12 @@ fn prefill_moe_ffn_body_batched(
             &ffn.shared_expert_gate.buf, &pbs.x_rot_batch, shared_scalar,
             ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
         )?,
+        DType::F32 => gpu.gemm_f32_batched(
+            &ffn.shared_expert_gate.buf, &pbs.x_norm_batch, shared_scalar,
+            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
+        )?,
         other => panic!("prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
+                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"),
     }
     // Fused gate+up dispatch for the shared expert — halves the kernel
     // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
@@ -5226,6 +5263,12 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
             ffn.shared_expert.gate.k, n,
         )?,
+        // Phase 1 panic-stub: admitted by moe_ffn_batched_admissible only
+        // when HIPFIRE_PARO_BATCHED=1. Phase 2 (the shared-expert PARO
+        // kernels, gemm_gate_up_paro_q4g128_batched) replaces this stub.
+        DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 shared_expert.gate \
+                                     not yet implemented — Phase 2 deliverable. Unset \
+                                     HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
@@ -5273,6 +5316,11 @@ fn prefill_moe_ffn_body_batched(
             &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
+        // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 2 fills in
+        // gemv_hfq4g128_residual_sigmoid_scaled_paro_batched.
+        DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 shared_expert.down \
+                                     not yet implemented — Phase 2 deliverable. Unset \
+                                     HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
@@ -5356,6 +5404,13 @@ fn prefill_moe_ffn_body_batched(
                 &pbs.x_rot_batch, y_gu_grouped,
                 2 * mi, gate_up_k, k_top, m_total, n,
             )?,
+            // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
+            // ship the routed-expert ParoQuant kernels
+            // (gemv_hfq4g128_moe_gate_up_k8_indexed_batched_paro for Path 1,
+            // gemm_hfq4g128_moe_grouped_wmma_k2_paro for Path 2).
+            DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].gate_up \
+                                         not yet implemented — Phase 3/4 deliverable. Unset \
+                                         HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
@@ -5415,6 +5470,13 @@ fn prefill_moe_ffn_body_batched(
                 rot_batch, y_down_grouped,
                 down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
             )?,
+            // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
+            // ship the routed-expert down kernels
+            // (gemv_hfq4g128_moe_down_k8_indexed_batched_expanded_paro,
+            // gemm_hfq4g128_moe_grouped_wmma_k2_paro).
+            DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].down \
+                                         not yet implemented — Phase 3/4 deliverable. Unset \
+                                         HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
@@ -5639,7 +5701,7 @@ fn forward_prefill_chunk(
                 is_batchable_la(l.w_up.gpu_dtype, fa_arch) &&
                 is_batchable_la(l.w_down.gpu_dtype, fa_arch),
             // MoE variant: attention weights must be MQ4-class (FFN is
-            // checked separately by moe_ffn_all_mq4 in the eligibility gate).
+            // checked separately by moe_ffn_batched_admissible in the eligibility gate).
             LayerWeights::FullAttnMoe(l) =>
                 is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
                 is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
@@ -6830,7 +6892,7 @@ fn forward_prefill_chunk(
                 } else if is_q8 && q8_wmma_arch {
                     // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
                     // stride; mixed Q8/other layers within DNMoe are rejected
-                    // upstream by `moe_ffn_all_mq4` (router/gate Q8 OK, but
+                    // upstream by `moe_ffn_batched_admissible` (router/gate Q8 OK, but
                     // shared_expert + experts must be MQ4) and would otherwise
                     // re-introduce Tier-1 stride corruption.
                     debug_assert!(
