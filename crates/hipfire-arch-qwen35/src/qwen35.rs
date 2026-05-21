@@ -1922,6 +1922,12 @@ struct MoeScratchRef<'a> {
     rot_batch:     &'a GpuTensor,
     topk_indices:  &'a GpuTensor,
     topk_weights:  &'a GpuTensor,
+    // [k_top × dim] f32 — per-(expert-rank) MoE down output buffer for
+    // the atomic-free expand+combine decode path. Mirrors the prefill
+    // `pbs.moe_down_expanded_batch` layout with batch=1. Required so
+    // the MoE FFN is byte-deterministic under hipGraph replay; see
+    // task #100 root-cause notes in `forward_scratch`.
+    down_expanded: &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -1942,6 +1948,7 @@ impl<'a> MoeScratchRef<'a> {
             rot_batch:     s.moe_rot_batch.as_ref().expect("MoE scratch"),
             topk_indices:  s.moe_topk_indices.as_ref().expect("MoE scratch"),
             topk_weights:  s.moe_topk_weights.as_ref().expect("MoE scratch"),
+            down_expanded: s.moe_down_expanded.as_ref().expect("MoE scratch"),
         }
     }
 }
@@ -1977,6 +1984,7 @@ fn moe_ffn_decode(
     let rot_batch     = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let topk_indices  = gpu.alloc_tensor(&[k], DType::F32)?;
     let topk_weights  = gpu.alloc_tensor(&[k], DType::F32)?;
+    let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
@@ -1992,12 +2000,13 @@ fn moe_ffn_decode(
         rot_batch:     &rot_batch,
         topk_indices:  &topk_indices,
         topk_weights:  &topk_weights,
+        down_expanded: &down_expanded,
     };
     let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
 
     for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
               up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
-              topk_indices, topk_weights] {
+              topk_indices, topk_weights, down_expanded] {
         gpu.free_tensor(t)?;
     }
     result
@@ -2235,8 +2244,21 @@ fn moe_ffn_decode_impl(
 
     if use_gpu_topk {
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
-        // IDs and weights from device buffers. 3 launches for routed
-        // compute, zero D2H sync — hipGraph-capturable.
+        // IDs and weights from device buffers, zero D2H sync.
+        //
+        // Task #100 fix (2026-05-21): atomic-free expand+combine, mirroring
+        // the prefill path (forward_prefill_batch_with_pbs L5217-5232). The
+        // earlier single-launch `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
+        // used `atomicAdd` across K_TOP=8 blocks per row, which gives FP32
+        // sums whose final bits depend on wavefront-scheduling order
+        // (see gemv_hfq4g256_moe_down.hip:14-19 — the kernel's own comment
+        // admits non-determinism). Under hipGraph capture the ordering
+        // diverges from direct mode, so each forward step accumulates a
+        // ~1-ULP delta that compounds through the KV cache + GDN state,
+        // crossing the top-1 margin at step ~7 (q8 KV) or ~114 (asym3 KV).
+        // Expanding into `s.down_expanded` (no atomics) then summing via
+        // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
+        // output byte-deterministic, eliminating the cumulative drift.
         let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
@@ -2250,10 +2272,18 @@ fn moe_ffn_decode_impl(
         // share the same input residual basis → same imatrix → byte-
         // identical AWQ scales; experts[0].down is representative.
         fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
-        gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
-            &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
-            s.rot_batch, x_residual,
-            down_m, down_k,
+        // Atomic-free expanded write: [k_top × down_m] f32, one block per
+        // (m, krank) pair, no cross-block contention.
+        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs, s.topk_indices,
+            s.rot_batch, s.down_expanded,
+            down_m, down_k, k, 1,
+        )?;
+        // Deterministic combine: sums K_TOP slots into x_residual in a
+        // fixed iteration order with `topk_weights` applied.
+        gpu.moe_down_combine_k8_batched(
+            s.down_expanded, s.topk_weights, x_residual,
+            down_m, k, 1,
         )?;
     } else {
         // CPU-top-K fallback path. Two sub-paths from here:
@@ -2880,6 +2910,13 @@ pub struct Qwen35Scratch {
     /// can stay in a graph-capturable stream).
     pub moe_topk_indices:  Option<GpuTensor>,   // [k] i32 stored as f32 alias
     pub moe_topk_weights:  Option<GpuTensor>,   // [k] f32
+    // Atomic-free MoE down expansion buffer for decode — [k × dim] f32.
+    // Paired with `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
+    // `moe_down_combine_k8_batched` (batch_size=1) in `moe_ffn_decode_impl`'s
+    // use_gpu_topk path. Replaces the K_TOP-way atomicAdd that introduced
+    // non-deterministic wavefront-order-dependent FP rounding under hipGraph
+    // replay (task #100).
+    pub moe_down_expanded: Option<GpuTensor>,
 
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
@@ -2993,6 +3030,7 @@ impl Qwen35Scratch {
             moe_rot_batch:     None,
             moe_topk_indices:  None,
             moe_topk_weights:  None,
+            moe_down_expanded: None,
             prefill_batch:     None,
         })
         .and_then(|mut s| {
@@ -3022,6 +3060,8 @@ impl Qwen35Scratch {
                 // indexed MoE GEMV kernels read it as int*.
                 s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                // Atomic-free decode MoE down output: [k × dim].
+                s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -3064,7 +3104,8 @@ impl Qwen35Scratch {
                    self.moe_gate_up_buf, self.moe_gate_buf, self.moe_up_buf,
                    self.moe_ffn_hidden, self.moe_ffn_out,
                    self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
-                   self.moe_topk_indices, self.moe_topk_weights] {
+                   self.moe_topk_indices, self.moe_topk_weights,
+                   self.moe_down_expanded] {
             if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
         }
         if let Some(pbs) = self.prefill_batch {
@@ -3118,39 +3159,58 @@ pub fn forward_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
-    // hipGraph capture is currently DISABLED for MoE configs. Single-shot
-    // replay looks fine for short sequences, but state diverges from the
-    // direct-dispatch path after ~30–50 decoded tokens — the model drops
-    // a number in a count (skips "8" → "9"), loops on a single token, etc.
-    // The divergence is consistent under HIPFIRE_GRAPH=1 with the same
-    // prompt that succeeds with HIPFIRE_GRAPH=0. Investigated without
-    // finding the root cause: all kernels used by the MoE forward path
-    // appear individually graph-safe (pos-dependent ones read pos_buf
-    // dynamically; size-dependent ones use max_tiles/max_seq; the indexed
-    // MoE kernels have only static pointer kernargs). Suspect a numerical
-    // reordering between capture and replay in one of the flash-attn or
-    // GDN state-update kernels that compounds over many replays.
-    // Until that's isolated, MoE always takes the direct path.
-    // HIPFIRE_GRAPH_MOE=1 (diagnostic-only): bypass the MoE guard. Required
-    // to reproduce task #100. Under-graph A3B does NOT corrupt at step 1 —
-    // it accumulates numerical drift and diverges from direct at step ~6
-    // with q8 KV or step ~114 with asym3 KV on the Count-from-1-to-20
-    // prompt. Migrating `kv_cache_write_q8_0` to the blob launch path (it
-    // was the only remaining non-blob kernel in the MoE hot path) did not
-    // resolve the drift — the root cause is elsewhere, likely DeltaNet
-    // state accumulating tiny bit-level differences across replays via a
-    // numerical-reordering path (atomics or wavefront-scheduling dependent
-    // reductions inside gated_delta_net_*). Reproducer for next dig:
+    // hipGraph capture for MoE was previously gated off-by-default behind
+    // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
+    // capture, A3B accumulated a per-step ~1-ULP delta that compounded
+    // through the KV cache + GDN state and crossed the top-1 margin at
+    // step ~7 (q8 KV) or ~114 (asym3 KV), producing visible token-loop
+    // attractors by step 30-50 ("- **One**\n- **One**\n…").
+    //
+    // Root cause (fixed 2026-05-21): `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
+    // used K_TOP=8 concurrent `atomicAdd` writes per output row. FP32
+    // addition is non-associative, so the final bits depend on wavefront
+    // scheduling order. Under hipGraph replay that order differs from
+    // direct execution (graph scheduling pipelines kernels differently),
+    // introducing the systematic per-step delta. The kernel's own header
+    // (`kernels/src/gemv_hfq4g256_moe_down.hip:14-19`) had already flagged
+    // this non-determinism but rated it negligible based on the
+    // direct-only smoke test — capture amplifies the effect.
+    //
+    // Fix: the MoE FFN decode path now uses the atomic-free expand+combine
+    // pattern already used in prefill (`forward_prefill_batch_with_pbs`
+    // L5217-5232): `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
+    // writes one row per (expert-rank, m), then `moe_down_combine_k8_batched`
+    // sums K_TOP slots into x_residual in a fixed iteration order. The
+    // resulting MoE FFN output is byte-deterministic under both direct
+    // execution and hipGraph replay.
+    //
+    // HIPFIRE_GRAPH_MOE remains opt-in (set to "1" to enable). The atomic
+    // fix is necessary but not sufficient — the CPU-topK fallback path
+    // (when not all gate-side MoE weights are MQ4G256, e.g. router=Q8 per
+    // the post-2026-04 router-attractor fix) calls `download_f32(router_logits)`,
+    // a sync D2H that fails under graph capture with hipError 906. Until
+    // that D2H is migrated to a capture-safe equivalent, opting in only
+    // works for models where the runtime takes the use_gpu_topk path.
+    //
+    // Reproducer used to characterize the fix:
     //   HIPFIRE_GRAPH=1 HIPFIRE_GRAPH_MOE=1 HIPFIRE_SMOKE_KV=q8 \
     //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
     //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
-    //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
+    //   ./target/release/examples/a3b_smoke_forward <uniform-mq4-a3b>
+    //
     // Per-forward env var lookups cached via OnceLock — these used to fire
     // ~16-46 std::env::var() syscalls per cycle on 27B decode, allocating a
     // String and walking the env table each time. Process env can't legitimately
     // change between forward calls; cache once and read atomically.
     static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for the MoE
+    // forward path. Default-off until a follow-up makes the CPU-topK
+    // fallback's `download_f32(router_logits)` D2H sync capture-safe —
+    // mixed-kmap A3B (post-PR #199) routes through that fallback and crashes
+    // with hipError 906 under graph capture. The atomicAdd-determinism fix in
+    // this commit removes the use_gpu_topk path's drift, which is the necessary
+    // first step, but is not sufficient to enable MoE+graph by default.
     let allow_moe = *ALLOW_MOE_ENV.get_or_init(|| {
         std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1")
     });
@@ -3164,9 +3224,14 @@ pub fn forward_scratch(
     //     and consistent across model sizes.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     HIPFIRE_GRAPH=1) since not yet A/B'd on those.
-    //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
-    //     graph path numerically drifts after ~30-50 tokens on MoE
-    //     (see surrounding comment block for repro).
+    //   - MoE configs: opt-in via HIPFIRE_GRAPH_MOE=1. The ~30-50-token
+    //     attractor drift in the use_gpu_topk MoE down step was fixed
+    //     2026-05-21 (task #100 — atomicAdd → expand+combine), but the
+    //     CPU-topK fallback's `download_f32(router_logits)` D2H sync
+    //     remains capture-incompatible, so mixed-kmap A3B (post-PR #199)
+    //     can crash under graph capture even with the fix. Once that
+    //     D2H is migrated to a capture-safe path, the MoE default can
+    //     be flipped to follow the arch defaults.
     // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
     let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
         match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {
