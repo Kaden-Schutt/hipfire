@@ -759,13 +759,13 @@ fn weight_tensor_from_raw(
                 ".mtp tensor '{name}' is MQ4G256 with K={k} not divisible by 256"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, awq_scale: None })
         }
         3 => {
             // Q8_F16 (group_size=32, 34 bytes/group) — same byte layout as
             // GGML Q8_0; existing gemv_q8_0 dispatch works directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
         }
         1 => {
             // F16 → dequantize on host, upload as F32 (no GPU-native F16
@@ -780,12 +780,12 @@ fn weight_tensor_from_raw(
                 )
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
         }
         2 => {
             // F32 raw.
             let buf = gpu.upload_raw(data, &[m, k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0 })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
