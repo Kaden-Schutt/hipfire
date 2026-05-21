@@ -211,6 +211,30 @@ lm_head; tonight's changes only touched gfx12 dispatch + the K-default.
    impact but completes the family
 5. awq_scale rebase fix (commit 1f714ed1) — build correctness
 
+### Decode-length sensitivity finding (k9lin MTP solo)
+
+| max tokens | k9lin tok/s |
+|---|---|
+| 120 (canonical) | 47.83 mean (5 runs) |
+| 240 | 55.55 mean (4 warm runs) |
+| 360 | 56.03 mean (3 runs) |
+| 480 | **57.0 mean / 58.39 peak** |
+| 720 | 54.49 mean (3 runs) |
+
+MTP solo on k9lin lifts ~+19% from max=120 → max=480 due to per-cycle
+amortization of prefill + DPM stabilization overhead. Peak 58.39 tok/s
+is ~2% short of Goal A 60+ target. Confirms structural ceiling on
+k9lin single-GPU MTP solo without weight training.
+
+Composition behavior is OPPOSITE: max=240 = 152-160 (vs max=120 159) —
+slightly lower with longer decode. Likely thermal/clock effect at
+higher kernel intensity. Composition perf doesn't benefit from longer
+max.
+
+Q8 distilled MTP head + K=4 + max=480: 51-55 tok/s (worse than MQ4
+cvs16384 at same config). Q8 quant's higher per-call BW outweighs τ
+lift (3.55 vs 3.40).
+
 ### Falsified (saved future-session time)
 
 1. **Track A sidecar swap (commit 4e1ac103)** — full pipeline executed on
