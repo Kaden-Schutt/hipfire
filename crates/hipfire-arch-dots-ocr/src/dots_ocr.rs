@@ -1112,6 +1112,11 @@ pub fn vision_forward(
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
         }
+        // Dump pre-proj attention output so we can compare to numpy
+        // F32 reference (which doesn't include proj).
+        if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
+            dump_stage(gpu, &attn, &format!("block_{li:02}_attn_pre_proj"), &[n_patches, h])?;
+        }
         gpu.free_tensor(q_buf)?;
         gpu.free_tensor(k_buf)?;
         gpu.free_tensor(v_buf)?;
