@@ -9985,22 +9985,35 @@ impl Gpu {
         // (Gate 1 microbench, opt-in only, default off). See
         // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
         let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
-        let (kernel_name, kernel_src) = match variant_override.as_deref() {
-            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
-            // k4 = 4-tile pipeline (more in-flight B loads for better BW
-            // utilization). Opt-in default-off; bench-measured 2026-05-21.
-            Some("k4")   => ("gemm_gate_up_hfq4g256_wmma_k4",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC),
-            // ldscoop = cooperative LDS weight staging for coalesced DRAM
-            // loads. All 32 threads load one row's weights at a time
-            // (128-byte coalesced cache lines), staged in LDS for the
-            // WMMA loop. Targets the 32% peak BW seen in base kernel.
-            Some("ldscoop") => ("gemm_gate_up_hfq4g256_wmma_ldscoop",
-                                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC),
-            _            => ("gemm_gate_up_hfq4g256_wmma",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
-        };
+        // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
+        // per-block row count; block_threads is the wave/block size.
+        let (kernel_name, kernel_src, m_tile, block_threads) =
+            match variant_override.as_deref() {
+                Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
+                                 16, 32),
+                // k4 = 4-tile pipeline (more in-flight B loads for better BW
+                // utilization). Opt-in default-off; bench-measured 2026-05-21.
+                Some("k4")   => ("gemm_gate_up_hfq4g256_wmma_k4",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
+                                 16, 32),
+                // ldscoop = cooperative LDS weight staging for coalesced DRAM
+                // loads. All 32 threads load one row's weights at a time
+                // (128-byte coalesced cache lines), staged in LDS for the
+                // WMMA loop. Targets the 32% peak BW seen in base kernel.
+                Some("ldscoop") => ("gemm_gate_up_hfq4g256_wmma_ldscoop",
+                                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                                    16, 32),
+                // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
+                // Halves grid in M; both waves share the same X tile so
+                // L0/L1 cache absorbs the second wave's loads cheaply.
+                Some("2tile") => ("gemm_gate_up_hfq4g256_wmma_2tile",
+                                  kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                                  32, 64),
+                _            => ("gemm_gate_up_hfq4g256_wmma",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                                 16, 32),
+            };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -10027,7 +10040,7 @@ impl Gpu {
         ];
 
         let total_m = gate_m + up_m;
-        let row_tiles = (total_m + 15) / 16;
+        let row_tiles = (total_m + m_tile - 1) / m_tile;
         let batch_tiles = (batch_size + 15) / 16;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
@@ -10038,7 +10051,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block_threads as u32, 1, 1],
             0,
             &mut params,
             || {

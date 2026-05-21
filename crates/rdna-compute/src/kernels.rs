@@ -826,6 +826,12 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str = include_str!("../../../kerne
 // observed in the base kernel — coalesced DRAM loads should get
 // closer to 60-70%. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldscoop.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop.hip");
+// 2tile variant: 32 rows × 16 cols output tile per block, 64 threads
+// (2 wave32). Halves grid in M-dim (1728 → 864 blocks at M=27648),
+// amortizing per-block X-tile (FP16 batch matrix) loads across both
+// waves via L0/L1 cache. Targets the 32% peak BW seen in base kernel.
+// Opt-in via HIPFIRE_GATE_UP_VARIANT=2tile.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_2tile.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
