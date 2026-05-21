@@ -15218,8 +15218,16 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Gate covers gfx11 (RDNA3) AND gfx12 (RDNA4). The gfx12 family
+        // ships its own residual_wmma kernel sibling
+        // (gemm_hfq4g256_residual_wmma_gfx12); without this dispatch,
+        // gfx12 falls through to the scalar `gemm_hfq4g256` and pays the
+        // 8-10× per-call penalty (rocprof on R9700 / gfx1201 measured
+        // ~26.68% of composition cycle wall in this scalar path).
+        let arch = self.arch.as_str();
+        let arch_eligible = arch.starts_with("gfx11") || arch.starts_with("gfx12");
         let wmma_eligible = batch_size > 1
-            && self.arch.starts_with("gfx11")
+            && arch_eligible
             && !fp16_disabled()
             && !lm_head_wmma_disabled();
         if wmma_eligible {
@@ -15228,7 +15236,11 @@ impl Gpu {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+            return if arch.starts_with("gfx12") {
+                self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            } else {
+                self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+            };
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
