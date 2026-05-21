@@ -15273,9 +15273,14 @@ impl Gpu {
             }
             return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
         }
-        // gfx11+: WMMA residual + zero-init.
+        // gfx11+ AND gfx12: WMMA residual + zero-init. Symmetric to the
+        // HFQ4 fix (commit 48dd8ba4) — gfx12 sibling kernel already ships
+        // (gemm_hfq6g256_residual_wmma_gfx12, see line ~15431 dispatch);
+        // this wrapper just needed the gate widened.
+        let arch_str = self.arch.as_str();
+        let arch_eligible = arch_str.starts_with("gfx11") || arch_str.starts_with("gfx12");
         let wmma_eligible = batch_size > 1
-            && self.arch.starts_with("gfx11")
+            && arch_eligible
             && !fp16_disabled()
             && !lm_head_wmma_disabled();
         if wmma_eligible {
@@ -15284,7 +15289,11 @@ impl Gpu {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+            return if arch_str.starts_with("gfx12") {
+                self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            } else {
+                self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+            };
         }
         // Fallback: use the residual dispatcher with zero-init Y. This
         // routes to fp16-packed or scalar depending on arch.
