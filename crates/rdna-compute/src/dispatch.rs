@@ -2525,16 +2525,21 @@ impl Gpu {
         Ok(())
     }
 
-    /// Device-to-device copy (same-size tensors).
+    /// Device-to-device copy.
     ///
     /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
     /// the active (capturing) stream when one is set, falling back to the sync
     /// legacy-stream path otherwise. The raw `hip.memcpy_dtod` call would
     /// deadlock hipGraph capture with "operation would make the legacy stream
     /// depend on a capturing blocking stream" (matches the H2D fix in 7790ac6a).
-    pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
-        let size = src.buf.size().min(dst.buf.size());
-        self.memcpy_dtod_auto(&dst.buf, &src.buf, size)
+    ///
+    /// Callers must pass `n_bytes` explicitly to state intent — the prior
+    /// implicit `min(src.size(), dst.size())` silently truncated mismatched
+    /// copies, which was a footgun.
+    pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor, n_bytes: usize) -> HipResult<()> {
+        debug_assert!(n_bytes <= src.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds src.buf.size ({})", src.buf.size());
+        debug_assert!(n_bytes <= dst.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds dst.buf.size ({})", dst.buf.size());
+        self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.

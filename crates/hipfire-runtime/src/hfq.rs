@@ -7,7 +7,7 @@
 use crate::llama::{
     f16_to_f32, EmbeddingFormat, LayerWeights, LlamaConfig, LlamaWeights, ModelArch, WeightTensor,
 };
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use memmap2::Mmap;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::collections::HashMap;
@@ -870,7 +870,11 @@ pub fn config_from_safetensors_llama(source: &dyn crate::model_source::ModelSour
 }
 
 /// Repack AWQ-format INT4 weights into HFQ4G128 layout (ParoQuant uses AWQ packing).
-/// Duplicated from hipfire-arch-qwen35 to avoid cross-crate dependency cycle.
+///
+/// SYNC: must match `repack_awq_to_hfq4g128` in
+/// `crates/hipfire-arch-qwen35/src/qwen35.rs`. Duplicated to avoid a
+/// cross-crate dependency cycle (the qwen35 crate already depends on this
+/// one); keep the two bodies byte-identical when editing.
 fn repack_awq_to_hfq4g128(
     qweight: &[u8],    // I32 raw bytes
     qzeros: &[u8],     // I32 raw bytes
@@ -883,16 +887,19 @@ fn repack_awq_to_hfq4g128(
     let bytes_per_row = groups_per_row * 72;
     let mut out = vec![0u8; out_dim * bytes_per_row];
 
+    debug_assert_eq!(qweight.as_ptr() as usize % 4, 0, "AWQ qweight not 4-byte aligned");
     let qw: &[u32] = unsafe {
         std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4)
     };
     let qw_cols = out_dim / 8;
 
+    debug_assert_eq!(qzeros.as_ptr() as usize % 4, 0, "AWQ qzeros not 4-byte aligned");
     let qz: &[u32] = unsafe {
         std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4)
     };
     let qz_cols = out_dim / 8;
 
+    debug_assert_eq!(scales.as_ptr() as usize % 2, 0, "AWQ scales not 2-byte aligned");
     let sc: &[u16] = unsafe {
         std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2)
     };
@@ -950,21 +957,21 @@ fn load_paroquant_weight_from_source(
     let cs_name = format!("{tensor_prefix}.channel_scales");
 
     let (_, qw_data) = source.tensor_data(&qw_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qw_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
     let (_, qz_data) = source.tensor_data(&qz_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qz_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
     let (_, sc_data) = source.tensor_data(&sc_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {sc_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
 
     let hfq_data = repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size as usize);
     let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
 
     let (_, pairs_data) = source.tensor_data(&pairs_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {pairs_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
     let (_, theta_data) = source.tensor_data(&theta_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {theta_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
     let (_, cs_data) = source.tensor_data(&cs_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {cs_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
 
     let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
     let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
@@ -982,6 +989,7 @@ fn load_paroquant_weight_from_source(
             channel_scales,
             krot: krot as u32,
             group_size,
+            is_alias: false,
         }),
         awq_scale: None,
     })
@@ -996,7 +1004,7 @@ fn load_fp16_weight_tensor_from_source(
     k: usize,
 ) -> HipResult<WeightTensor> {
     let (_, data) = source.tensor_data(name)
-        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
     let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
@@ -1034,7 +1042,7 @@ fn paro_load_llama_norm_raw(
 ) -> HipResult<GpuTensor> {
     let full = format!("model.{name}");
     let (info, data) = source.tensor_data(&full)
-        .unwrap_or_else(|| panic!("not found: {full}"));
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
     let v: Vec<f32> = if info.dtype == "F16" {
         data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
     } else {
@@ -1052,14 +1060,16 @@ pub fn load_weights_paroquant_llama(
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
-    let qc = source.quant_config().expect("ParoQuant model must have quantization_config");
+    let qc = source.quant_config()
+        .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
     let gs = qc.group_size;
     let kr = qc.krot;
 
     // Embedding
     eprintln!("  loading token_embd (ParoQuant LLaMA/Qwen3)...");
     let embd_name = "model.embed_tokens.weight";
-    let (_, embd_data) = source.tensor_data(embd_name).expect("embed_tokens not found");
+    let (_, embd_data) = source.tensor_data(embd_name)
+        .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
     let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
     let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
@@ -1080,7 +1090,8 @@ pub fn load_weights_paroquant_llama(
         }
     } else {
         eprintln!("  loading output (tied embeddings)...");
-        let (_, td) = source.tensor_data(embd_name).expect("embed_tokens for lm_head");
+        let (_, td) = source.tensor_data(embd_name)
+            .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens for lm_head"))?;
         let f: Vec<f32> = td.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
         let bytes: &[u8] = unsafe {

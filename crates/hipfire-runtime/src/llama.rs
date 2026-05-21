@@ -495,6 +495,12 @@ pub struct ParoRotation {
     pub channel_scales: GpuTensor,  // F16 [in_dim] — per-channel scaling factor alpha
     pub krot: u32,                  // number of rotation layers (typically 8)
     pub group_size: u32,            // quantization group size (typically 128)
+    /// True if `pairs`/`theta`/`channel_scales` are non-owning aliases into
+    /// shared per-layer sidecars (e.g. MoE routed experts that share one
+    /// rotation tuple across all experts in a layer). Owning ParoRotations
+    /// set this to false; `WeightTensor::free_all` skips tensor frees when
+    /// is_alias is true so the shared sidecars aren't double-freed.
+    pub is_alias: bool,
 }
 
 pub struct WeightTensor {
@@ -524,9 +530,13 @@ impl WeightTensor {
     /// AWQ sidecar) from GPU.
     pub fn free_all(self, gpu: &mut Gpu) {
         if let Some(paro) = self.paro {
-            let _ = gpu.free_tensor(paro.pairs);
-            let _ = gpu.free_tensor(paro.theta);
-            let _ = gpu.free_tensor(paro.channel_scales);
+            // Aliased rotations point into shared per-layer sidecars; the owner
+            // (e.g. MoeFfnWeights.paro_shared) frees them. Skip here.
+            if !paro.is_alias {
+                let _ = gpu.free_tensor(paro.pairs);
+                let _ = gpu.free_tensor(paro.theta);
+                let _ = gpu.free_tensor(paro.channel_scales);
+            }
         }
         if let Some(awq) = self.awq_scale {
             let _ = gpu.free_tensor(awq);
@@ -722,8 +732,6 @@ pub fn weight_gemv(
             // weight_gemv calls in a layer (wqkv, wz, w_alpha, w_beta, etc.),
             // each with different rotation metadata.
             let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| eprintln!("  [ParoQ4G128] Givens rotation + HFQ4G128 GEMV path active"));
             // Lazily allocate the scratch buffer on first use
             gpu.ensure_paro_scratch(w.k)?;
             // Alias the scratch buffer to avoid borrow conflicts with gpu methods
@@ -733,7 +741,7 @@ pub fn weight_gemv(
                 dtype: DType::F32,
             };
             // Copy x → scratch, rotate scratch, GEMV from scratch
-            gpu.copy_d2d(x, &scratch_alias)?;
+            gpu.copy_d2d(x, &scratch_alias, w.k * 4)?;
             gpu.givens_rotate(
                 &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
                 1, w.k, paro.krot as usize,

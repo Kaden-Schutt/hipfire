@@ -16,7 +16,7 @@ use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, We
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::multi_gpu::Gpus;
 use crate::speculative::HiddenStateRingBuffer;
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::sync::OnceLock;
 
@@ -1038,6 +1038,11 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
 ///     [f32 scale (4B)][f32 zero (4B)][64B packed nibbles] = 72 bytes
 ///
 /// Returns: Vec<u8> in HFQ4G128 format, ready for gpu.upload_raw.
+///
+/// SYNC: must match `repack_awq_to_hfq4g128` in
+/// `crates/hipfire-runtime/src/hfq.rs`. Duplicated to avoid a cross-crate
+/// dependency cycle (hipfire-arch-qwen35 -> hipfire-runtime); keep the two
+/// bodies byte-identical when editing.
 fn repack_awq_to_hfq4g128(
     qweight: &[u8],  // I32 raw bytes
     qzeros: &[u8],   // I32 raw bytes
@@ -1051,6 +1056,7 @@ fn repack_awq_to_hfq4g128(
     let mut out = vec![0u8; out_dim * bytes_per_row];
 
     // Parse qweight as &[u32] (LE)
+    debug_assert_eq!(qweight.as_ptr() as usize % 4, 0, "AWQ qweight not 4-byte aligned");
     let qw: &[u32] = unsafe {
         std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4)
     };
@@ -1058,6 +1064,7 @@ fn repack_awq_to_hfq4g128(
     let qw_cols = out_dim / 8;
 
     // Parse qzeros as &[u32]
+    debug_assert_eq!(qzeros.as_ptr() as usize % 4, 0, "AWQ qzeros not 4-byte aligned");
     let qz: &[u32] = unsafe {
         std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4)
     };
@@ -1065,6 +1072,7 @@ fn repack_awq_to_hfq4g128(
     let qz_cols = out_dim / 8;
 
     // Parse scales as &[u16] (F16)
+    debug_assert_eq!(scales.as_ptr() as usize % 2, 0, "AWQ scales not 2-byte aligned");
     let sc: &[u16] = unsafe {
         std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2)
     };
@@ -1125,11 +1133,11 @@ fn load_paroquant_weight(
     let cs_name = format!("{tensor_prefix}.channel_scales");
 
     let (_, qw_data) = source.tensor_data(&qw_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qw_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
     let (_, qz_data) = source.tensor_data(&qz_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {qz_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
     let (_, sc_data) = source.tensor_data(&sc_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {sc_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
 
     // Repack AWQ → HFQ4G128
     let hfq_data = repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size as usize);
@@ -1137,11 +1145,11 @@ fn load_paroquant_weight(
 
     // Load rotation metadata
     let (_, pairs_data) = source.tensor_data(&pairs_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {pairs_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
     let (_, theta_data) = source.tensor_data(&theta_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {theta_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
     let (_, cs_data) = source.tensor_data(&cs_name)
-        .unwrap_or_else(|| panic!("ParoQuant tensor not found: {cs_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
 
     let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
     let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
@@ -1159,6 +1167,7 @@ fn load_paroquant_weight(
             channel_scales,
             krot: krot as u32,
             group_size,
+            is_alias: false,
         }),
         awq_scale: None,
     })
@@ -1173,7 +1182,7 @@ fn load_fp16_weight_from_source(
     k: usize,
 ) -> HipResult<WeightTensor> {
     let (_, data) = source.tensor_data(name)
-        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
     let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
@@ -1197,17 +1206,17 @@ fn paro_repack_moe_projection(
     out_dim: usize,
     in_dim: usize,
     group_size: usize,
-) -> Vec<u8> {
+) -> HipResult<Vec<u8>> {
     let qw_name = format!("{full_prefix}.qweight");
     let qz_name = format!("{full_prefix}.qzeros");
     let sc_name = format!("{full_prefix}.scales");
     let (_, qw_data) = source.tensor_data(&qw_name)
-        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {qw_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qw_name}")))?;
     let (_, qz_data) = source.tensor_data(&qz_name)
-        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {qz_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {qz_name}")))?;
     let (_, sc_data) = source.tensor_data(&sc_name)
-        .unwrap_or_else(|| panic!("ParoQuant MoE tensor not found: {sc_name}"));
-    repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size)
+        .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE tensor not found: {sc_name}")))?;
+    Ok(repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size))
 }
 
 /// Upload the per-layer shared PARO rotation sidecars (one tuple for gate||up,
@@ -1221,15 +1230,16 @@ fn paro_load_moe_shared_sidecars(
     gpu: &Gpu,
     p: &str, // e.g. "layers.0"
 ) -> HipResult<MoeParoSidecars> {
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
     let base = format!("{mp}.{p}.mlp.experts");
     let load = |name: &str| -> HipResult<GpuTensor> {
         let full = format!("{base}.{name}");
         let (_, data) = source.tensor_data(&full)
-            .unwrap_or_else(|| panic!("ParoQuant MoE shared sidecar not found: {full}"));
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant MoE shared sidecar not found: {full}")))?;
         gpu.upload_raw(data, &[data.len()])
     };
-    let qc = source.quant_config().expect("ParoQuant config required");
+    let qc = source.quant_config()
+        .ok_or_else(|| HipError::new(0, "ParoQuant: quant_config required"))?;
     Ok(MoeParoSidecars {
         gate_up_pairs: load("gate_up_weight_pairs")?,
         gate_up_theta: load("gate_up_weight_theta")?,
@@ -1263,6 +1273,7 @@ fn alias_paro_rotation(
         channel_scales: alias(cs_src),
         krot,
         group_size,
+        is_alias: true,
     }
 }
 
@@ -1283,11 +1294,12 @@ fn paro_load_moe_ffn(
     let mi    = config.moe_intermediate_size;
     let smi   = config.shared_expert_intermediate_size;
     let dim   = config.dim;
-    let qc = source.quant_config().expect("ParoQuant MoE requires quant_config");
+    let qc = source.quant_config()
+        .ok_or_else(|| HipError::new(0, "ParoQuant MoE requires quant_config"))?;
     let gs = qc.group_size;
     let kr = qc.krot;
 
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
 
     // ── Router (FP16 dense in shisa-ai's PARO checkpoint) ──
     // mlp.gate.weight is NOT PARO-quantized — only the expert FFN matmuls are.
@@ -1329,8 +1341,8 @@ fn paro_load_moe_ffn(
         // Fuse gate || up at HFQ4G128 row level: each row is independent
         // (`bytes_per_row` bytes, no cross-row state), so concat works.
         // Final shape: [2*mi, dim], rows [0..mi] = gate, rows [mi..2*mi] = up.
-        let gate_bytes = paro_repack_moe_projection(source, &gate_prefix, mi, dim, gs as usize);
-        let up_bytes   = paro_repack_moe_projection(source, &up_prefix,   mi, dim, gs as usize);
+        let gate_bytes = paro_repack_moe_projection(source, &gate_prefix, mi, dim, gs as usize)?;
+        let up_bytes   = paro_repack_moe_projection(source, &up_prefix,   mi, dim, gs as usize)?;
         debug_assert_eq!(gate_bytes.len(), mi * bytes_per_row_hidden);
         debug_assert_eq!(up_bytes.len(),   mi * bytes_per_row_hidden);
         let mut gate_up_bytes = Vec::with_capacity(gate_bytes.len() + up_bytes.len());
@@ -1338,7 +1350,7 @@ fn paro_load_moe_ffn(
         gate_up_bytes.extend_from_slice(&up_bytes);
         let gate_up_buf = gpu.upload_raw(&gate_up_bytes, &[gate_up_bytes.len()])?;
 
-        let down_bytes = paro_repack_moe_projection(source, &down_prefix, dim, mi, gs as usize);
+        let down_bytes = paro_repack_moe_projection(source, &down_prefix, dim, mi, gs as usize)?;
         debug_assert_eq!(down_bytes.len(), dim * bytes_per_row_mi);
         let down_buf = gpu.upload_raw(&down_bytes, &[down_bytes.len()])?;
 
@@ -2034,20 +2046,20 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
 ///     the text-only A3B inherits the prefix from the multimodal config).
 ///   - `"model"` for Qwen3 v1 / pure-text-LLM PARO checkpoints (e.g.
 ///     z-lab/Qwen3-0.6B-PARO).
-/// Probed via `embed_tokens.weight` which exists in both layouts. Panics if
-/// neither form is present — caller is exercising a non-Qwen3 family.
-fn paro_text_prefix(source: &dyn ModelSource) -> &'static str {
+/// Probed via `embed_tokens.weight` which exists in both layouts. Returns an
+/// `Err` if neither form is present — caller is exercising a non-Qwen3 family.
+fn paro_text_prefix(source: &dyn ModelSource) -> HipResult<&'static str> {
     if source.tensor_info("model.language_model.embed_tokens.weight").is_some() {
-        "model.language_model"
+        Ok("model.language_model")
     } else if source.tensor_info("model.embed_tokens.weight").is_some() {
-        "model"
+        Ok("model")
     } else {
-        panic!("ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout");
+        Err(HipError::new(0, "ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout"))
     }
 }
 
 fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: usize, gs: u32, kr: u8) -> HipResult<WeightTensor> {
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
     let fp = format!("{mp}.{prefix}");
     if source.tensor_info(&format!("{fp}.qweight")).is_some() {
         load_paroquant_weight(source, gpu, &fp, m, k, gs, kr)
@@ -2057,9 +2069,10 @@ fn paro_load_wt(source: &dyn ModelSource, gpu: &Gpu, prefix: &str, m: usize, k: 
 }
 
 fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
     let full = format!("{mp}.{name}");
-    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
+    let (info, data) = source.tensor_data(&full)
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
     let mut v: Vec<f32> = if info.dtype == "F16" {
         data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
     } else {
@@ -2070,9 +2083,10 @@ fn paro_load_norm(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, shape: &[
 }
 
 fn paro_load_f32(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
     let full = format!("{mp}.{name}");
-    let (info, data) = source.tensor_data(&full).unwrap_or_else(|| panic!("not found: {full}"));
+    let (info, data) = source.tensor_data(&full)
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
     let v: Vec<f32> = if info.dtype == "F16" {
         data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
     } else {
@@ -2082,26 +2096,23 @@ fn paro_load_f32(source: &dyn ModelSource, gpu: &mut Gpu, name: &str, n: usize) 
 }
 
 pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, gpu: &mut Gpu) -> HipResult<Qwen35Weights> {
-    let qc = source.quant_config().expect("ParoQuant model must have quantization_config");
+    let qc = source.quant_config()
+        .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
     let gs = qc.group_size;
     let kr = qc.krot;
 
-    let mp = paro_text_prefix(source);
+    let mp = paro_text_prefix(source)?;
     eprintln!("  loading token_embd (ParoQuant)...");
     let embd_name = format!("{mp}.embed_tokens.weight");
     let (_, embd_data) = source.tensor_data(&embd_name)
-        .unwrap_or_else(|| panic!("embed_tokens not found at {embd_name}"));
+        .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: embed_tokens not found at {embd_name}")))?;
     let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
     let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
     let embd_fmt = EmbeddingFormat::F32;
 
     eprintln!("  loading output_norm...");
-    let output_norm = if config.num_experts > 0 {
-        paro_load_norm(source, gpu, "norm.weight", &[config.dim])?
-    } else {
-        paro_load_norm(source, gpu, "norm.weight", &[config.dim])?
-    };
+    let output_norm = paro_load_norm(source, gpu, "norm.weight", &[config.dim])?;
 
     // Prefer separate lm_head when checkpoint provides one (tie_word_embeddings:false);
     // fall back to embed_tokens for tied checkpoints. shisa-ai/Qwen3.6-35B-A3B-PARO
@@ -2116,7 +2127,8 @@ pub fn load_weights_paroquant(source: &dyn ModelSource, config: &Qwen35Config, g
     };
     eprintln!("  loading output ({})...", if output_tied { "tied embeddings" } else { "separate lm_head" });
     let output = {
-        let (_, td) = source.tensor_data(&output_src_name).expect("output projection tensor");
+        let (_, td) = source.tensor_data(&output_src_name)
+            .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: output projection tensor {output_src_name}")))?;
         let f: Vec<f32> = td.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
         let bytes: &[u8] = unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
@@ -7598,8 +7610,6 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                if layer_idx == 0 {
-                }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
                 // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
@@ -7663,16 +7673,12 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
-                if layer_idx == 0 {
-                }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
                 // n_v_heads — merging into one launch shaves one dispatch per LA.
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
-                if layer_idx == 0 {
-                }
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
@@ -7683,8 +7689,6 @@ fn forward_scratch_layers(
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
-                if layer_idx == 0 {
-                }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
@@ -8090,13 +8094,9 @@ fn forward_scratch_layers(
             // does its own internal MQ rotation once per call. Re-rotation
             // overhead is one of the items targeted by Phase 2/3 speedups.
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                if layer_idx == 0 {
-                }
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
-                if layer_idx == 0 {
-                }
                 let dt = layer.wqkv.gpu_dtype;
                 let la4_same_dtype = layer.wz.gpu_dtype == dt
                     && layer.w_beta.gpu_dtype == dt
@@ -8133,21 +8133,15 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 }
-                if layer_idx == 0 {
-                }
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
-                if layer_idx == 0 {
-                }
                 gpu.conv1d_silu_split_f32(
                     &s.dn_q_raw, &s.dn_k_raw, &s.dn_v,
                     &s.dn_qkv, &layer.conv_weight,
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
-                if layer_idx == 0 {
-                }
                 gpu.fused_qk_l2_norm_scale_f32(
                     &s.dn_q_raw, &s.dn_k_raw,
                     config.linear_num_key_heads, hd,
@@ -8184,15 +8178,9 @@ fn forward_scratch_layers(
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                 }
-                if layer_idx == 0 {
-                }
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
-                if layer_idx == 0 {
-                }
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
-                if layer_idx == 0 {
-                }
 
                 // ── MoE FFN ──
                 // Fuse rmsnorm + FWHT-rotate when all MoE weights are MQ4:
@@ -8210,11 +8198,7 @@ fn forward_scratch_layers(
                     moe_ffn_decode_with_scratch_prerotated(gpu, &layer.ffn, &s.x, &s.x, config, s)?;
                 } else {
                     gpu.rmsnorm_f32(&s.x, &layer.ffn_norm, &s.tmp, config.norm_eps)?;
-                    if layer_idx == 0 {
-                    }
                     moe_ffn_decode_with_scratch(gpu, &layer.ffn, &s.tmp, &s.x, config, s)?;
-                    if layer_idx == 0 {
-                    }
                 }
 
                 if let Some(ref rb) = hidden_rb {
