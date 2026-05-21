@@ -5466,13 +5466,27 @@ fn prefill_moe_ffn_body_batched(
                 &pbs.x_rot_batch, y_gu_grouped,
                 2 * mi, gate_up_k, k_top, m_total, n,
             )?,
-            // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
-            // ship the routed-expert ParoQuant kernels
-            // (gemv_paro_q4g128_moe_gate_up_k8_indexed_batched_paro for Path 1,
-            // gemm_hfq4g128_moe_grouped_wmma_k2_paro for Path 2).
-            DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].gate_up \
-                                         not yet implemented — Phase 3/4 deliverable. Unset \
-                                         HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
+            // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
+            // experts at this layer share one gate_up Givens rotation
+            // sidecar (ffn.paro_shared.gate_up_*); rotate x_norm into
+            // x_rot ONCE, then dispatch the HFQ4G128 grouped WMMA. The
+            // kernel auto-converts the F32 x_rot to F16 internally via
+            // ensure_fp16_x, same as the G256 sister.
+            DType::ParoQ4G128 => {
+                let paro = ffn.paro_shared.as_ref().expect(
+                    "ParoQ4G128 routed experts require paro_shared sidecars",
+                );
+                gpu.givens_rotate_to(
+                    &pbs.x_norm_batch, &pbs.x_rot_batch,
+                    &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
+                    n, dim, paro.krot as usize,
+                )?;
+                gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                    &ffn.expert_gate_up_ptrs, tile_ids, sorted,
+                    &pbs.x_rot_batch, y_gu_grouped,
+                    2 * mi, gate_up_k, k_top, m_total, n,
+                )?;
+            },
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
@@ -5576,13 +5590,19 @@ fn prefill_moe_ffn_body_batched(
                 rot_batch, y_down_grouped,
                 down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
             )?,
-            // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
-            // ship the routed-expert down kernels
-            // (gemv_paro_q4g128_moe_down_k8_indexed_batched_paro,
-            // gemm_hfq4g128_moe_grouped_wmma_k2_paro).
-            DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].down \
-                                         not yet implemented — Phase 3/4 deliverable. Unset \
-                                         HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
+            // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA. rot_batch was
+            // already Givens-rotated by paro_shared.down_* via the PARO
+            // fused_silu_mul_givens_rotate_f32 step above, so the kernel
+            // is rotation-agnostic (same as the MQ4 path: rot_batch is
+            // FWHT-rotated upstream there too). Same HFQ4G128 grouped
+            // WMMA kernel as gate_up — x_src layout differs (per-slot
+            // routed-expert intermediate vs per-token gate_up input)
+            // but the kernel is shape-parametric.
+            DType::ParoQ4G128 => gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
+                &ffn.expert_down_ptrs, tile_ids, sorted,
+                rot_batch, y_down_grouped,
+                down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
+            )?,
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }

@@ -550,6 +550,17 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMV_PARO_Q4G128_MOE_DOWN_K8_INDEXED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/gemv_paro_q4g128_moe_down_k8_indexed_batched.hip");
 
+/// SGLang-style grouped-WMMA-GEMM for HFQ4G128 (ParoQuant) routed-expert
+/// gate_up + down dispatch on RDNA3/4. Port of
+/// `GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC` with 72 B/group stride and 128
+/// elements per group. Same scatter-pipeline contract (expert_tile_ids +
+/// sorted_slot_index) and same WMMA 16×16×16 F16 layout. Caller pre-
+/// rotates X by the layer's shared Givens sidecar (gate_up or down) and
+/// the kernel reads HFQ4G128 nibbles; F32→F16 X conversion is handled by
+/// the Rust dispatch wrapper via `ensure_fp16_x`.
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_k2.hip");
+
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
 /// composition the ParoQuant MoE decode path used for the gate→down
