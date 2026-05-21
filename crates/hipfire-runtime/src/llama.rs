@@ -903,6 +903,26 @@ pub fn rotate_x_mq_for(
     }
 }
 
+/// ParoQuant single-token rotation: copy x → x_rot, then apply the layer's
+/// shared Givens rotation (pairs / theta / channel_scales) into x_rot.
+/// Mirrors the in-`weight_gemv(ParoQ4G128)` rotation step but writes to a
+/// caller-provided buffer so the same rotated activation can feed multiple
+/// downstream GEMVs (e.g. the indexed MoE gate_up kernel that reuses
+/// `paro_shared.gate_up_*` across all routed experts).
+pub fn rotate_x_paro_for(
+    gpu: &mut Gpu,
+    paro: &ParoRotation,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    gpu.copy_d2d(x, x_rot, k * 4)?;
+    gpu.givens_rotate(
+        x_rot, &paro.pairs, &paro.theta, &paro.channel_scales,
+        1, k, paro.krot as usize,
+    )
+}
+
 /// Phase A Stage A — F2: batched AWQ-aware variant of `rotate_x_mq`.
 /// Grid.y is the batch dim. See `rotate_x_mq_for` for routing logic.
 pub fn rotate_x_mq_batched_for(
