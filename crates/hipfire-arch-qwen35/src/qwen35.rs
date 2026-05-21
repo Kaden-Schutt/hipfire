@@ -2103,41 +2103,62 @@ fn moe_ffn_decode_impl(
     let ffn_out       = s.ffn_out;
 
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
-    // buffer across every gate-side GEMV. Only MQ4 GEMVs benefit; mixed
-    // configs fall back to weight_gemv which rotates internally.
+    // buffer across every MQ4 GEMV that consumes it. Two independent users:
+    //   1. The 4-way fused gate-side GEMV (gate_side_mq4) — requires router,
+    //      shared_expert_gate, shared_expert.{gate,up} all MQ4G256.
+    //   2. The indexed routed-expert gate_up GEMV (routed_gate_up_mq4) — fires
+    //      whenever the routed gate_up family is MQ4G256, independent of the
+    //      gate-side family's dtype.
+    // We compute x_rot_local if EITHER user will fire. Models with a Q8
+    // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
+    // the device-side top-K + indexed expert GEMV path — only the 4-way
+    // fused GEMV falls back to four individual `weight_gemv` calls.
     let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-    let x_rot_local = if gate_side_mq4 {
-        gpu.ensure_mq_signs()?;
-        if !x_rot_prerotated {
-            // F2 / F1: AWQ-aware rotate. All gate-side downstream linears
-            // (router, shared_expert_gate, shared_expert.{gate,up}, all
-            // experts.gate_up) share the same input basis → identical
-            // imatrix → byte-identical AWQ scales. Pick `ffn.router` as a
-            // representative (it's on the F1 whitelist for AWQ scales).
-            // When AWQ is disabled (no sidecar), routes to the non-AWQ
-            // kernel — byte-identical to pre-F2.
-            rotate_x_mq_for(gpu, &ffn.router, x_norm, s.x_rot_local, config.dim)?;
-        }
-        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
-        Some(s.x_rot_local)
-    } else {
-        None
-    };
-
-    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
-    // device and the indexed MoE kernels consume topk_indices /
-    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
     let routed_mq4 = ffn.experts.first()
         .map(|e| e.down.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
     let routed_gate_up_mq4 = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
-    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
+    // device and the indexed MoE kernels consume topk_indices /
+    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
+    // Note: this no longer requires `gate_side_mq4`. The device-side
+    // `moe_topk_renorm_k8` kernel and the indexed gate_up/down GEMVs
+    // consume router_logits/topk_indices/topk_weights/x_rot from device
+    // buffers regardless of how router_logits was produced (fused-4 or
+    // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
+    // are now first-class for graph capture.
+    let use_gpu_topk = k == 8 && routed_mq4 && routed_gate_up_mq4;
+    let x_rot_local = if gate_side_mq4 || routed_gate_up_mq4 {
+        gpu.ensure_mq_signs()?;
+        if !x_rot_prerotated {
+            // F2 / F1: AWQ-aware rotate. All MQ4 weights in this layer
+            // consume the same post-rmsnorm x, so they share the same
+            // input basis → identical imatrix → byte-identical AWQ
+            // scales. When gate_side_mq4 is true the 4-way fused GEMV
+            // expects rotation aligned with `ffn.router`'s AWQ scale;
+            // otherwise pick `ffn.experts[0].gate_up` as the routed-
+            // expert representative for the indexed kernel path. When
+            // AWQ is disabled (no sidecar), `rotate_x_mq_for` routes
+            // to the non-AWQ kernel — byte-identical to pre-F2 either
+            // way.
+            let next_lin = if gate_side_mq4 {
+                &ffn.router
+            } else {
+                &ffn.experts[0].gate_up
+            };
+            rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
+        }
+        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
+        Some(s.x_rot_local)
+    } else {
+        None
+    };
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
@@ -2147,12 +2168,13 @@ fn moe_ffn_decode_impl(
     // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
     let shared_gate = slice_f32_view(gate_buf, 0, smi);
     let shared_up   = slice_f32_view(up_buf,   0, smi);
-    if let Some(xr) = x_rot_local {
-        // All MQ4: use the 4-way fused prerotated GEMV. Router weight, shared
-        // sigmoid-gate weight, shared gate weight, shared up weight — all
+    if gate_side_mq4 {
+        // All-MQ4 gate-side: use the 4-way fused prerotated GEMV. Router,
+        // shared_expert_gate, shared_expert.gate, shared_expert.up — all
         // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
         // rotated at quant time, so `gemv_hfq4g256` inner loop with the
         // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local is Some");
         gpu.fused_qkvza_hfq4g256(
             &ffn.router.buf, &ffn.shared_expert_gate.buf,
             &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
@@ -2164,7 +2186,10 @@ fn moe_ffn_decode_impl(
         )?;
     } else {
         // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
-        // weight_gemv handles its own rotation for MQ4 weights internally.
+        // weight_gemv handles its own rotation for MQ4 weights internally
+        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
+        // so the externally-computed `x_rot_local` is preserved for the
+        // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
         weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
         weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
@@ -2259,7 +2284,7 @@ fn moe_ffn_decode_impl(
         // Expanding into `s.down_expanded` (no atomics) then summing via
         // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
         // output byte-deterministic, eliminating the cumulative drift.
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_mq4 implies x_rot_local is Some");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
@@ -2293,7 +2318,15 @@ fn moe_ffn_decode_impl(
         //   (b) Mixed-dtype or k != 8: per-expert loop.
         let topk_indices = topk_indices_cpu.expect("CPU-fallback path implies CPU top-K");
         let topk_weights = topk_weights_cpu.expect("CPU-fallback path implies CPU top-K");
-        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
+        // `use_kernarg_fused` dispatches both gate_up and down through
+        // HFQ4G256-layout kernels, so it needs routed.down MQ4 as well as
+        // routed.gate_up. Previously this constraint was carried implicitly
+        // by `x_rot_local.is_some()` (which required gate_side_mq4, which in
+        // shipped configs implied routed_mq4); now that x_rot_local fires
+        // for `routed_gate_up_mq4` alone, check `routed_mq4` explicitly.
+        // With both checks the condition equals `use_gpu_topk`, so this
+        // branch is effectively dead — kept for clarity until the cleanup.
+        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && routed_mq4 && x_rot_local.is_some();
         if use_kernarg_fused {
             let xr = x_rot_local.unwrap();
             let e0 = &ffn.experts[topk_indices[0]];
