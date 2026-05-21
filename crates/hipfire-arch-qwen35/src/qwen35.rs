@@ -2124,6 +2124,25 @@ fn moe_ffn_decode_impl(
     let routed_gate_up_mq4 = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
+    // MQ6-routed eligibility: layers promoted by the alternating kmap
+    // (post-PR-199) carry MQ6G256 experts. The HFQ6 indexed kernels mirror
+    // the HFQ4 ones — same compute shape, different per-group byte layout
+    // (200 vs 136). All routed experts within a layer share the same
+    // promotion decision, so checking experts[0] is sufficient.
+    let routed_mq6 = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ6G256)
+        .unwrap_or(false);
+    let routed_gate_up_mq6 = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
+        .unwrap_or(false);
+    // The indexed gate_up and down kernels live in separate dtype families;
+    // we require the routed gate_up and down dtypes to match (i.e., both
+    // MQ4 or both MQ6) so the FWHT-rotated x_rot_local feeds both
+    // consistently. Mixed gate_up/down within a layer is not produced by
+    // the quantizer.
+    let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
+    let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
+    let routed_dtype_indexable = routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -2132,9 +2151,12 @@ fn moe_ffn_decode_impl(
     // consume router_logits/topk_indices/topk_weights/x_rot from device
     // buffers regardless of how router_logits was produced (fused-4 or
     // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
-    // are now first-class for graph capture.
-    let use_gpu_topk = k == 8 && routed_mq4 && routed_gate_up_mq4;
-    let x_rot_local = if gate_side_mq4 || routed_gate_up_mq4 {
+    // are now first-class for graph capture. Mixed-kmap A3B layers
+    // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
+    // of the HFQ4 ones — same control flow, different kernel binary.
+    let use_gpu_topk = k == 8 && routed_dtype_indexable;
+    let needs_x_rot_local = gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6;
+    let x_rot_local = if needs_x_rot_local {
         gpu.ensure_mq_signs()?;
         if !x_rot_prerotated {
             // F2 / F1: AWQ-aware rotate. All MQ4 weights in this layer
@@ -2284,28 +2306,53 @@ fn moe_ffn_decode_impl(
         // Expanding into `s.down_expanded` (no atomics) then summing via
         // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
         // output byte-deterministic, eliminating the cumulative drift.
-        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_mq4 implies x_rot_local is Some");
+        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_mq{4,6} implies x_rot_local is Some");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs, s.topk_indices,
-            xr, s.gate_batch, s.up_batch,
-            2 * mi, gate_up_k,
-        )?;
+        // Dispatch the right indexed-GEMV layout for this layer's routed
+        // dtype. Within a layer, gate_up and down share the same dtype
+        // (kmap promotes whole expert tensor groups together); the
+        // `routed_dtype_indexable_mq{4,6}` checks above enforce this.
+        if routed_dtype_indexable_mq4 {
+            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
+        } else {
+            // routed_dtype_indexable_mq6 — HFQ6 (200 B/group) indexed kernel.
+            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
+        }
         // F2: AWQ-aware silu_mul+rotate. All experts in this MoE layer
         // share the same input residual basis → same imatrix → byte-
-        // identical AWQ scales; experts[0].down is representative.
+        // identical AWQ scales; experts[0].down is representative. The
+        // helper is dtype-agnostic — it dispatches on awq_scale presence,
+        // not on weight bytes layout — so MQ6 down's AWQ scale (if any)
+        // routes through the same _awq_batched variant as MQ4.
         fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
         // Atomic-free expanded write: [k_top × down_m] f32, one block per
         // (m, krank) pair, no cross-block contention.
-        gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-            &ffn.expert_down_ptrs, s.topk_indices,
-            s.rot_batch, s.down_expanded,
-            down_m, down_k, k, 1,
-        )?;
+        if routed_dtype_indexable_mq4 {
+            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, s.topk_indices,
+                s.rot_batch, s.down_expanded,
+                down_m, down_k, k, 1,
+            )?;
+        } else {
+            gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, s.topk_indices,
+                s.rot_batch, s.down_expanded,
+                down_m, down_k, k, 1,
+            )?;
+        }
         // Deterministic combine: sums K_TOP slots into x_residual in a
-        // fixed iteration order with `topk_weights` applied.
+        // fixed iteration order with `topk_weights` applied. This kernel
+        // is dtype-independent — it operates on the f32 expanded buffer.
         gpu.moe_down_combine_k8_batched(
             s.down_expanded, s.topk_weights, x_residual,
             down_m, k, 1,

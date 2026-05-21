@@ -520,6 +520,19 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts. Used
+/// by mixed-kmap MoE models where some layers are promoted from MQ4 → MQ6
+/// (post-PR-199 alternating-kmap default). Without this kernel, those
+/// layers fall to the CPU-topK D2H path which crashes under hipGraph capture.
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
+
+/// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
+/// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
+/// (combine is dtype-independent — operates on the f32 expanded buffer).
+pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
+
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the
 /// per-token residual row. No cross-token contention.
