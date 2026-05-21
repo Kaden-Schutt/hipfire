@@ -1902,3 +1902,12 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+/// PFlash per-block scoring kernel — fwht3 K-cache variant.
+/// Drop-in replacement for `pflash_score_q8_kv` when the drafter runs
+/// with fwht3 KV (the LDS-cliff-free long-context path). Reads fwht3 K
+/// cache (4 B cnorm + packed 3-bit TURBO_C3_256 codes), dequantizes
+/// inline, and computes cosine in FWHT-rotated space — orthonormal
+/// FWHT makes that exactly equal to the original-space cosine, with no
+/// inverse FWHT needed in the scoring kernel.
+pub const PFLASH_SCORE_FWHT3_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht3_kv.hip");

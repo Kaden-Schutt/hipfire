@@ -23921,6 +23921,78 @@ impl Gpu {
         }
     }
 
+    /// PFlash per-block scoring — fwht3 K-cache variant.
+    ///
+    /// Same input/output contract as `pflash_score_q8_kv`: takes a K
+    /// cache buffer and emits one f32 cosine score per block. Only the
+    /// K dequant path differs (fwht3 vs Q8). Used by
+    /// `pflash::compute_scores_batched_gpu` when the drafter runs with
+    /// fwht3 KV — that path's no-LDS-cap batched flash unblocks the >15K
+    /// ctx regime that Q8 batched flash falls out of.
+    ///
+    /// Header prepend: the kernel uses `TURBO_C3_256` from
+    /// `turbo_common.h`. Reusing `ensure_givens4_kernel` since it already
+    /// prepends `turbo_common.h` + `givens_common.h`. The unused
+    /// givens_common include is harmless (no symbols are referenced from
+    /// it), and avoids adding another `ensure_*` variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_fwht3_kv(
+        &mut self,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // fwht3 packs 8 dims per thread-group (3 bits each = 24 bits =
+        // 3 bytes), so head_dim must be a multiple of 8 for the
+        // per-thread-group byte addressing to align.
+        assert!(head_dim % 8 == 0, "head_dim must be a multiple of 8 for fwht3 K cache");
+        assert!(n_blocks > 0 && block_size > 0 && n_pos > 0);
+        assert!(last_pos < n_pos, "last_pos {last_pos} >= n_pos {n_pos}");
+        self.ensure_givens4_kernel(
+            "pflash_score_fwht3_kv",
+            kernels::PFLASH_SCORE_FWHT3_KV_SRC,
+            "pflash_score_fwht3_kv_blocks",
+        )?;
+        let func = &self.functions["pflash_score_fwht3_kv_blocks"];
+
+        let k_ptr = k_cache.buf.as_ptr();
+        let s_ptr = scores_out.buf.as_ptr();
+        let mut np = n_pos as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = block_size as i32;
+        let mut nb = n_blocks as i32;
+        let mut lp = last_pos as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &k_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Kernel profiler
     // ═══════════════════════════════════════════════════════════════════════════

@@ -45,12 +45,17 @@ The score kernel (`pflash_score_q8_kv`, ~3 ms on niah_4k) reads K cache twice in
 **Effort:** Medium — extend `kv_cache_write_q8_0_batched` to also maintain `[n_blocks × kv_dim]` running f32 sums, plus a tiny finalize kernel for `sum / count` → cosine.
 **Stacks on:** A, B (independent).
 
-### D. Asym3 KV on the drafter — pending (handoff Lever 1)
+### D. Fwht3/4/2 KV on the drafter — pending (revised from handoff Lever 1)
 
-Drafter is currently locked to Q8 KV by `assert!(kv.quant_q8)` at `pflash.rs:608`. At ctx > 15000 tokens, `attention_q8_0_kv_batched_masked` overflows the 56 KB usable LDS on gfx1100 and falls back to per-position single-token kernel calls. asym3 KV uses tiled partials-buffer reduction with no LDS cap.
+Drafter is currently locked to Q8 KV by `assert!(kv.quant_q8)` at `pflash.rs:608`. At ctx > 15000 tokens, `attention_q8_0_kv_batched_masked` overflows the 56 KB usable LDS on gfx1100 and falls back to per-position single-token kernel calls. The original handoff doc proposed asym3 as the LDS-cliff escape, but **fwht3/4/2 are the correct target instead** — they have the same no-LDS-cap tiled-partials-buffer path (`attention_flash_fwht3_tile_batched.hip` etc., already wired in qwen35.rs) AND better K reconstruction accuracy than asym3 at equivalent byte footprint (FWHT rotation distributes quantization noise across the head dim; asym3's per-pair Givens rotation localizes it). Memory entry `project_fwht3_replaces_asym3_planned_2026_05_19` corroborates fwht3 as the production default replacement for asym3.
 
-**Win:** ~12× compress at 128K source (217 s → ~18 s). Irrelevant below 15K.
-**Effort:** Medium — new `pflash_score_asym3_kv.hip` kernel (~120 LOC port of the Q8 score kernel with asym3 K dequant) + drop the Q8 assert + dispatch wiring. Spec in `docs/plans/pflash-drafter-asym3-handoff.md`.
+**Why fwht over asym3 for pflash specifically:** the scorer integrates over head_dim (`cos_sim(K_block_mean, K_last)`), so error patterns that are *unbiased across the head dim* hurt scoring less than locally-biased patterns. FWHT's distributed-error spectrum is precisely the property the scorer wants.
+
+**Win:** ~12× compress at 128K source (217 s → ~18 s on gfx1100; gfx1151 ratio TBD). Irrelevant below 15K.
+**Effort:** Medium — new `kernels/src/pflash/score_fwht3_kv.hip` (~120 LOC port of the Q8 score kernel with fwht3 K dequant via inverse FWHT + cnorm) + drop the Q8 assert + dispatch wiring. Same shape as the original handoff spec but with fwht3 dequant pattern instead of asym3.
+
+**Variants to try (per "try all anyway"):** fwht4 (more bits, higher precision, larger K cache), fwht2 (fewer bits, more aggressive compression, faster but lower precision). Same kernel template, different dequant width. Acceptance gate is needle recovery + cosine-score parity vs Q8 reference within ~1% MSE.
+
 **Stacks on:** A (early-exit composes with any KV mode).
 
 ### E. Tiled Q8 batched flash — pending (handoff Lever 2)
@@ -94,11 +99,26 @@ At long ctx (>15K): A + (D or E) is the headline; B + C still apply on top.
 
 ## Open questions
 
-1. Should pflash get its own subdirectory `kernels/src/pflash/` with isolated kernel files, or should pflash-specific variants live as flags on existing kernels? Subdir is cleaner if 3+ pflash-specific kernels land (B + C + D minimum); flags work if it stays to 1-2.
+1. ~~Subdir vs flag layout?~~ **Resolved 2026-05-21:** new pflash kernels go in `kernels/src/pflash/`. Existing `pflash_score_q8_kv.hip` stays at its current path for now; relocate in a separate cleanup commit after the family is stable.
 
-2. Should `pflash::drafter_prefill` route through `forward_prefill_batch_with_pbs` with a max_layer flag (current design, A) or through a brand-new `forward_drafter_for_pflash` function with no MoE / no logit branches at all? Current design preserves shared code with chat at the cost of one branch; new function would isolate concerns at the cost of ~200 LOC duplication.
+2. Should `pflash::drafter_prefill` route through `forward_prefill_batch_with_pbs` with a max_layer flag (current design, A) or through a brand-new `forward_drafter_for_pflash` function with no MoE / no logit branches at all? Current design preserves shared code with chat at the cost of one branch; new function would isolate concerns at the cost of ~200 LOC duplication. Reconsider once B + D have landed and the pflash-specific surface area is clearer.
 
-3. Plain drafter path (`llama::forward_prefill_batch`): worth wiring max_layer? Score_layer_idx is 0 for Plain, which would skip even more compute (1 layer instead of all). But Plain drafters are uncommon — the hybrid path (Qwen3.5/3.6 family) covers most production usage.
+3. Plain drafter path (`llama::forward_prefill_batch`): worth wiring max_layer? Score_layer_idx is 0 for Plain, which would skip even more compute (1 layer instead of all). But Plain drafters are uncommon — the hybrid path (Qwen3.5/3.6 family) covers most production usage. Lucebox PR #225 uses plain qwen3-0.6B as drafter, which is structurally slower than our qwen3.5-hybrid choice (Plain has FullAttn at every layer; hybrid is 3 LinearAttn + 1 FullAttn per group). This is an architectural advantage we already have over lucebox's drafter choice.
+
+## Competitive picture (lucebox-hub PR #225, "rocWMMA+all")
+
+End-to-end compress, keep_ratio=0.05, hipx-class hardware (Strix Halo gfx1151, 128 GB UMA), drafter = qwen3-0.6B (Plain), median of 3 warmed runs:
+
+| Tokens | Lucebox baseline (q8-FA) | Lucebox PR #225 (rocWMMA+all) | Ours, post-A (extrapolated where noted) |
+|---:|---:|---:|---:|
+| 4K | 1.280 s | 0.800 s | ~0.135 s ✓ |
+| 8K | 3.220 s | 1.590 s | ~0.270 s ✓ (extrapolated) |
+| 16K | 9.760 s | 3.380 s | ~0.55 s ✓ (extrapolated, still pre-LDS-cliff) |
+| 32K | 33.070 s | 7.390 s | ~13.9 s ✗ (LDS-cliff fallback) |
+| 64K | 120.700 s | 16.800 s | ~54.7 s ✗ (LDS-cliff fallback) |
+| 128K | 471.580 s | 39.260 s | ~217 s ✗ (LDS-cliff fallback) |
+
+Short-ctx we already win (~6× ahead at 4K). Long-ctx we lose because our Q8 batched-flash path hits the 15K LDS cliff and our q8-FA fallback isn't tile-cap-free yet. **Lever D (fwht3 drafter) is exactly the cliff escape — should bring 32K-128K from "behind lucebox" to "ahead of lucebox" in one kernel.**
 
 ## Empirical anchors
 

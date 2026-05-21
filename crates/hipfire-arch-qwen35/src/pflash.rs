@@ -479,6 +479,37 @@ pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
 ///   - weights load,
 ///   - tokenizer_compat passes (otherwise loaded=true but compat=false; the
 ///     caller sees BypassReason::TokenizerMismatch downstream).
+/// PFlash drafter KV mode. Q8 is the historical default. Fwht3 unlocks
+/// the >15K LDS-cliff regime: `attention_q8_0_kv_batched_masked`
+/// overflows the 56 KB usable LDS on gfx1100 at ctx > 15000 and the
+/// chunk path degenerates to per-position single-token kernel launches;
+/// fwht3 uses tiled partials-buffer reduction with no LDS cap, so the
+/// drafter holds its batched-prefill throughput across the full source
+/// length. Asym3 storage layout (100 B/head) is shared between the two
+/// modes; fwht3 differs in the rotation type (FWHT-256 instead of
+/// per-pair Givens) which gives an unbiased noise spectrum across the
+/// head dim — exactly what the cosine-over-head_dim scorer prefers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DrafterKvMode {
+    Q8,
+    Fwht3,
+}
+
+impl DrafterKvMode {
+    /// Read `HIPFIRE_PFLASH_DRAFTER_KV` env var; defaults to Q8 (current
+    /// production behaviour). Unknown values panic loudly rather than
+    /// silently downgrading.
+    pub fn from_env() -> Self {
+        match std::env::var("HIPFIRE_PFLASH_DRAFTER_KV").ok().as_deref() {
+            None | Some("") | Some("q8") | Some("Q8") => DrafterKvMode::Q8,
+            Some("fwht3") | Some("FWHT3") => DrafterKvMode::Fwht3,
+            Some(other) => panic!(
+                "HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht3}}"
+            ),
+        }
+    }
+}
+
 pub fn load_drafter(
     state: &mut PflashState,
     gpu: &mut Gpu,
@@ -486,6 +517,7 @@ pub fn load_drafter(
     target_tokenizer: &Tokenizer,
     max_kv_seq: usize,
 ) -> HipResult<()> {
+    let kv_mode = DrafterKvMode::from_env();
     let mut hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
         "pflash: open drafter HFQ at {}: {e}", path.display(),
     )))?;
@@ -513,7 +545,26 @@ pub fn load_drafter(
             let weights = qwen35::load_weights(&mut hfq, &q35_cfg, gpu)?;
             let scratch = qwen35::Qwen35Scratch::new_with_kv_max(gpu, &q35_cfg, 128, max_kv_seq)?;
             let dn_state = qwen35::DeltaNetState::new(gpu, &q35_cfg)?;
-            let kv = KvCache::new_gpu_q8(gpu, q35_cfg.n_layers, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq)?;
+            // Hybrid drafter only stores K (and V for chat-path) at
+            // FullAttention layers; LinearAttention layers' recurrent
+            // state is in dn_state and they don't touch the Q8/asym3 KV
+            // buffer. Use the filtered constructor so the cache slots
+            // for LA layers are placeholders, not real allocations —
+            // saves ~75% of KV memory on a Qwen3.5 hybrid (1 FA every
+            // 4 layers).
+            let is_kv_layer: Vec<bool> = q35_cfg
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
+            let kv = match kv_mode {
+                DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
+                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                )?,
+                DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                )?,
+            };
             let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
             state.drafter_path = Some(path.display().to_string());
             state.drafter_model = Some(DrafterModel::Hybrid {
@@ -532,7 +583,19 @@ pub fn load_drafter(
     ))?;
     let weights = hfq::load_weights_hfq(&hfq, &config, gpu)?;
     let scratch = ForwardScratch::new(gpu, &config)?;
-    let kv = KvCache::new_gpu_q8(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_kv_seq)?;
+    // Plain (non-hybrid) drafters have FullAttn at every layer, so every
+    // layer carries real K (no LA placeholders). Filtered constructor
+    // with an all-true mask matches the non-filtered behaviour but lets
+    // us share one match arm across the two KV modes.
+    let is_kv_layer: Vec<bool> = vec![true; config.n_layers];
+    let kv = match kv_mode {
+        DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
+            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+        )?,
+        DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+        )?,
+    };
     let compat = tokenizers_compatible(target_tokenizer, &drafter_tokenizer);
     state.drafter_path = Some(path.display().to_string());
     state.drafter_model = Some(DrafterModel::Plain { config, weights, scratch });
@@ -623,7 +686,18 @@ fn drafter_prefill(
         .map(|l| l + 1);
     let model = state.drafter_model.as_mut().expect("loaded -> drafter_model");
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
-    assert!(kv.quant_q8, "drafter_prefill: drafter KV must be Q8_0");
+    // Drafter KV must be one of the modes we know how to score against:
+    // Q8 (the historical default) or fwht3 (the LDS-cliff-free path).
+    // The forward-pass layer dispatch in qwen35::forward_prefill_chunk
+    // already handles fwht3 K writes via `kv_cache_write_asym_k_fwht3`
+    // (line 5516 etc.); the choice here is just which downstream score
+    // kernel `compute_scores_batched_gpu` will dispatch.
+    assert!(
+        kv.quant_q8 || (kv.quant_asym3 && kv.quant_fwht),
+        "drafter_prefill: drafter KV must be Q8 or fwht3 \
+         (quant_q8={}, quant_asym3={}, quant_fwht={})",
+        kv.quant_q8, kv.quant_asym3, kv.quant_fwht,
+    );
     assert!(n <= kv.physical_cap, "drafter_prefill: source {n} > physical_cap {}", kv.physical_cap);
 
     match model {
@@ -808,16 +882,31 @@ pub fn compute_scores_batched_gpu(
     let n_blocks = (n + block_size - 1) / block_size;
 
     let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-    gpu.pflash_score_q8_kv(
-        &kv.k_gpu[layer_idx],
-        &scores_buf,
-        n,
-        n_kv_heads,
-        head_dim,
-        block_size,
-        n_blocks,
-        n - 1, // last_pos
-    )?;
+    // Dispatch on the drafter's KV cache mode. Both kernels emit the
+    // same f32 cosine-per-block scores; they only differ in K dequant
+    // (Q8: 2B fp16 scale + 32 i8 / block; fwht3: 4B cnorm + packed 3-bit
+    // codes via TURBO_C3_256). Cosine is rotation-invariant under FWHT
+    // so the fwht3 score kernel can compute in rotated space directly —
+    // see kernel-level comment in score_fwht3_kv.hip.
+    if kv.quant_q8 {
+        gpu.pflash_score_q8_kv(
+            &kv.k_gpu[layer_idx], &scores_buf,
+            n, n_kv_heads, head_dim, block_size, n_blocks,
+            n - 1, // last_pos
+        )?;
+    } else if kv.quant_asym3 && kv.quant_fwht {
+        gpu.pflash_score_fwht3_kv(
+            &kv.k_gpu[layer_idx], &scores_buf,
+            n, n_kv_heads, head_dim, block_size, n_blocks,
+            n - 1,
+        )?;
+    } else {
+        panic!(
+            "compute_scores_batched_gpu: unsupported drafter KV mode \
+             (quant_q8={}, quant_asym3={}, quant_fwht={})",
+            kv.quant_q8, kv.quant_asym3, kv.quant_fwht,
+        );
+    }
     let scores = gpu.download_f32(&scores_buf)?;
     let _ = gpu.free_tensor(scores_buf);
 
