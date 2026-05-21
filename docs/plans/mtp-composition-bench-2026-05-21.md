@@ -186,6 +186,74 @@ Lifting this requires:
 - The mtp_extract tool only quantizes from upstream BF16; it doesn't
   train
 
+## 2026-05-21 LATE UPDATE: gfx12 lm_head WMMA dispatch fix — HUGE LIFT
+
+Rocprof on the composition cycle (hiptrx) revealed `gemm_hfq4g256`
+(scalar lm_head GEMM) consumed **26.68% of cycle wall**. Root cause:
+`gemm_hfq4g256_batched_lmhead` gated WMMA on `arch.starts_with("gfx11")`
+only — gfx12 (RDNA4) fell through to the scalar path despite
+`gemm_hfq4g256_residual_wmma_gfx12` already shipping in dispatch.rs.
+
+One-line dispatch fix (commit 48dd8ba4):
+```rust
+let arch_eligible = arch.starts_with("gfx11") || arch.starts_with("gfx12");
+// ...
+return if arch.starts_with("gfx12") {
+    self.gemm_hfq4g256_residual_wmma_gfx12(...)
+} else {
+    self.gemm_hfq4g256_residual_wmma(...)
+};
+```
+
+### Empirical lift on hiptrx (R9700/gfx1201)
+
+| Variant | Pre-fix | Post-fix | Lift | Notes |
+|---|---|---|---|---|
+| MTP solo K=4 | 45.4 | 45.85 | +1.0% | small (verify M=K+1=5, lm_head tiny fraction) |
+| **DFlash solo** | **126.06** | **182.04** | **+44.4%** | lm_head was 25%+ of cycle |
+| **Composition B=14 K=2** | **123.79** | **170.05** | **+37.4%** | dominant gain |
+
+k9lin (7900 XTX gfx1100) UNCHANGED: post-fix DFlash solo 181, composition
+159 — gfx11 already used WMMA path, no regression. Verified via 3-run
+bench post-fix.
+
+### Goal B sub-criterion 1 (composition exceeds DFlash solo)
+
+Both pre-fix and post-fix, composition is BELOW DFlash solo on hiptrx
+single R9700:
+- Pre-fix: comp 124 vs DFlash 126 → -1.7%
+- Post-fix: comp 170 vs DFlash 182 → -6.6%
+
+The WMMA fix lifted DFlash solo MORE than composition (because lm_head
+is a bigger fraction of DFlash solo's smaller cycle, vs composition's
+larger cycle which is dominated more by verify+replay forwards). Net
+result: composition still doesn't exceed DFlash solo with current MTP
+head; both are now faster but the gap widened.
+
+### Coherence — re-validated post-fix
+
+- coherence-gate.sh: PASSED (6/6 cells fluent)
+- coherence-gate-dflash.sh: PASSED (4/4 cells fluent, status OK)
+- pflash-gate: 11/12 clean, 1 soft regression at +2.5% drift on
+  longcode_baseline (same pre-existing issue, not from this fix; within
+  ±5% tolerance)
+- Composition output (preview_200) byte-identical to pre-fix output
+
+### Composition sweep post-fix — B=14 K=2 still optimal
+
+| B | K | M | tok/s |
+|---|---|---|---|
+| 16 | 1 | 17 | 121 (2 tiles) |
+| **14** | **2** | **16** | **170** ← BEST |
+| 16 | 2 | 18 | 120 (2 tiles) |
+| 15 | 1 | 16 | 162 |
+| 13 | 3 | 16 | 156 |
+| 12 | 4 | 16 | 155 |
+| 16 | 3 | 19 | 119 (2 tiles) |
+
+Tile alignment (M=16) remains the sweet-spot constraint. The 8 cells
+at M=16 cluster at 155-170 tok/s; M>16 drops to ~120 (2-tile penalty).
+
 ### Methodology validation (added per stop-hook feedback)
 
 **Fresh-process bench**: All K-sweep and composition measurements above
