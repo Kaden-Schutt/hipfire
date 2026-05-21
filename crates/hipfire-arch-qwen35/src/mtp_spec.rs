@@ -776,6 +776,7 @@ pub fn spec_step_mtp(
         None, // tree_verify
         Some(&state.trunk_pbs),
         None, // mask_override
+        None, // max_layer
     )?;
 
     // ── 5. Per-position lm_head + batched argmax ─────────────────────────
@@ -1126,7 +1127,8 @@ pub fn spec_step_mtp_compressed(
         None,
         None,
         Some(&state.trunk_pbs),
-        None,
+        None, // mask_override
+        None, // max_layer
     )?;
 
     // ── 3. Trunk batched lm_head over verify positions ─────────────────────
@@ -1587,7 +1589,8 @@ pub fn spec_step_mtp_compressed_serial(
         gpu, trunk_weights, &target.config, &verify_tokens, cur_pos,
         &mut target.kv_cache, &mut target.dn_state, &target.scratch,
         None, Some(&state.verify_hidden), None, None,
-        Some(&state.trunk_pbs), None,
+        Some(&state.trunk_pbs), None, // mask_override
+        None, // max_layer
     )?;
 
     let w_out = &trunk_weights.output;

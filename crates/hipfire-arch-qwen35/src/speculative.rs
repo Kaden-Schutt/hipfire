@@ -2101,6 +2101,7 @@ fn verify_dflash_block_inner(
             tree_verify,
             verify_scratch.prefill_batch.as_ref(),
             None, // mask_override: speculative verify path doesn't use the MTP probe hook
+            None, // max_layer: DFlash verify always runs the full stack
         )
     };
 

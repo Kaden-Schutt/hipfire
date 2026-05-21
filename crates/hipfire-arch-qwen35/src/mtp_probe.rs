@@ -265,6 +265,7 @@ pub fn mtp_probe_step(
             slot: mask_slot,
             embed: &state.mask_embed,
         }),
+        None, // max_layer: MTP probe runs full stack
     )?;
 
     // ── Per-position lm_head GEMM ───────────────────────────────────────

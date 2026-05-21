@@ -3787,6 +3787,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
+        None, // max_layer: single-chunk captured path always runs the full stack
     )
 }
 
@@ -3808,6 +3809,7 @@ pub fn forward_prefill_batch(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
         None, // mask_override: MTP probe is the only consumer; default callers don't override
+        None, // max_layer: pflash uses this; non-pflash default is full stack
     )
 }
 
@@ -3835,6 +3837,7 @@ pub fn forward_prefill_batch_with_pbs(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -4106,6 +4109,7 @@ pub fn forward_prefill_batch_with_pbs(
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
                 mo_for_chunk,
+                max_layer,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -4693,6 +4697,7 @@ fn forward_prefill_chunk(
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
     mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -4707,9 +4712,22 @@ fn forward_prefill_chunk(
     let dim_row_bytes = dim * 4;
 
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
-    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
-    let layer_end = band.map(|b| b.layer_end).unwrap_or(config.n_layers);
+    // `max_layer = Some(N)` early-exits at layer N (exclusive). pflash uses
+    // this with N = score_layer_idx + 1: the drafter forward only needs to
+    // populate the K cache through the scoring layer (the shallowest
+    // FullAttention layer, typically layer 3 of 24 in Qwen3.5 hybrid),
+    // since `pflash_score_q8_kv` reads exactly that layer's K. Layers
+    // beyond it and the final norm + lm_head are wasted compute for
+    // pflash. Saves ~80% of drafter forward time on hybrid drafters.
+    let layer_end = band
+        .map(|b| b.layer_end)
+        .unwrap_or(config.n_layers)
+        .min(max_layer.unwrap_or(usize::MAX));
+    // Skip final norm + lm_head when the caller early-exits — they produce
+    // logits the caller doesn't read, and require running through the full
+    // layer stack anyway.
+    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true) && max_layer.is_none();
     // Per-call-site `givens_cos_view` / `givens_sin_view` macros below
     // resolve to either the band-supplied per-device replica (multi-GPU
     // mode where `kv_cache.givens_*` is `None` by design) or the
@@ -8750,6 +8768,7 @@ pub fn forward_prefill_batch_multi(
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
+                        None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }
 
