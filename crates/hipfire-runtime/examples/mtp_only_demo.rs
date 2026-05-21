@@ -288,22 +288,33 @@ fn main() {
 
     let eos_token = target.config.eos_token;
 
-    // ── Prefill prompt one token at a time ─────────────────────────────
+    // ── Prefill prompt via batched WMMA path ───────────────────────────
     //
-    // Per-token AR prefill. After the LAST token, target.scratch.tmp holds
-    // the post-output-norm hidden at position prompt_len - 1, which IS the
-    // hidden whose argmax produces the seed_token (= cycle 0's last_committed).
+    // forward_prefill_batch handles all prompt tokens through batched WMMA
+    // GEMMs (M up to PREFILL_MAX_BATCH per chunk). Leaves target.scratch.tmp
+    // with the post-output-norm hidden at the LAST prefill position — same
+    // contract as the per-token loop, just much faster.
     //
-    // Note: we use forward_scratch (not the batched prefill path) because we
-    // need the per-token-final post-output-norm hidden snapshot at the END,
-    // and forward_scratch leaves it in target.scratch.tmp. The batched path
-    // does too (only-last-token path, line 5800-5802), but per-token gives
-    // us a coherent baseline first.
-    eprintln!("prefilling {} tokens...", prompt_tokens.len());
+    // Previously this was a per-token forward_scratch loop (~6.4s prefill
+    // on 232-token canonical prompt at 36 tok/s). Batched path runs the
+    // same 232 tokens at ~540 tok/s (~0.43s), reclaiming ~6s of bench
+    // wall time per run.
+    eprintln!("prefilling {} tokens (batched)...", prompt_tokens.len());
     let t_prefill = Instant::now();
-    for (pos, &token) in prompt_tokens.iter().enumerate() {
-        target.forward(&mut gpu, token, pos).expect("prefill forward");
-    }
+    hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+        &mut gpu,
+        &target.weights,
+        &target.config,
+        &prompt_tokens,
+        0,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        None,  // hidden_rb (not needed — MTP demo doesn't use ring buffer)
+        None,  // per_token_hidden_out (not needed for MTP seed)
+        None,  // gdn_tape
+        None,  // tree_verify
+    ).expect("prefill forward_prefill_batch");
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
     eprintln!("prefill: {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
