@@ -1784,6 +1784,14 @@ pub fn spec_step_mtp_compressed_serial(
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
+    // h_idx contract (audited 2026-05-21 vs AtomicBot atomic-llama-cpp-
+    // turboquant feature/turboquant-kv-cache): prev_hidden_row = advance - 1
+    // = accept_count IS the right index. It points to verify_hidden of the
+    // last position trunk evaluated whose argmax IS the committed bonus
+    // token. AtomicBot's common_speculative_set_h_idx is called with
+    // `ids.size() - 1 == n_accepted_drafts` which is the same index.
+    // Empirical sensitivity (canonical K=2 p=0.65 max=480): offset 0 = 60.7
+    // tok/s tau=2.74; offset ±1 collapses to 17-45 tok/s. Default is sharp.
     let prev_hidden_row = advance - 1;
     state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
 
