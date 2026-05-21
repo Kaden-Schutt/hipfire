@@ -19,7 +19,7 @@
 // Grid: (M, K_TOP, N). Each block computes one output row for one expert
 // for one token. Block = 32 threads, one warp per output cell.
 //
-// Per HFQ4G128 layout (see gemv_hfq4g128.hip + gemv_hfq4g128_moe_gate_up_indexed.hip):
+// Per HFQ4G128 layout (see gemv_hfq4g128.hip + gemv_paro_q4g128_moe_gate_up_indexed.hip):
 //   - 128 elements per group
 //   - 8-byte header: scale F32 + zero F32
 //   - 64-byte payload: 64 packed 4-bit nibbles
@@ -30,7 +30,7 @@
 // rotation-agnostic — it just reads HFQ4G128 nibbles + the rotated x_row.
 
 __launch_bounds__(32, 20)
-extern "C" __global__ void gemv_hfq4g128_moe_gate_up_k8_indexed_batched(
+extern "C" __global__ void gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
     const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
     const int* __restrict__ topk_indices,                // [N × K_TOP]
     const float* __restrict__ x,                         // [N × K]

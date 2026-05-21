@@ -2976,7 +2976,7 @@ fn moe_ffn_decode_impl(
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
             // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
-            gpu.gemv_hfq4g128_moe_gate_up_k8_indexed(
+            gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, gate_up_k,
@@ -3021,7 +3021,7 @@ fn moe_ffn_decode_impl(
             )?;
         } else {
             // routed_dtype_indexable_paro
-            gpu.gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
+            gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
                 &ffn.expert_down_ptrs, s.topk_indices,
                 s.rot_batch, s.down_expanded,
                 down_m, down_k, k, 1,
@@ -5459,7 +5459,7 @@ fn prefill_moe_ffn_body_batched(
             )?,
             // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
             // ship the routed-expert ParoQuant kernels
-            // (gemv_hfq4g128_moe_gate_up_k8_indexed_batched_paro for Path 1,
+            // (gemv_paro_q4g128_moe_gate_up_k8_indexed_batched_paro for Path 1,
             // gemm_hfq4g128_moe_grouped_wmma_k2_paro for Path 2).
             DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].gate_up \
                                          not yet implemented — Phase 3/4 deliverable. Unset \
@@ -5498,7 +5498,7 @@ fn prefill_moe_ffn_body_batched(
                     &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
                     n, dim, paro.krot as usize,
                 )?;
-                gpu.gemv_hfq4g128_moe_gate_up_k8_indexed_batched(
+                gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
                     &ffn.expert_gate_up_ptrs, topk_indices,
                     &pbs.x_rot_batch, gate_batch, up_batch,
                     2 * mi, gate_up_k, k_top, n,
@@ -5569,7 +5569,7 @@ fn prefill_moe_ffn_body_batched(
             )?,
             // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 3 / Phase 4
             // ship the routed-expert down kernels
-            // (gemv_hfq4g128_moe_down_k8_indexed_batched_expanded_paro,
+            // (gemv_paro_q4g128_moe_down_k8_indexed_batched_paro,
             // gemm_hfq4g128_moe_grouped_wmma_k2_paro).
             DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 experts[0].down \
                                          not yet implemented — Phase 3/4 deliverable. Unset \
@@ -5600,7 +5600,7 @@ fn prefill_moe_ffn_body_batched(
                 // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
                 // indexed kernel (existing, shipped in 7c00970d) is
                 // rotation-agnostic; same dispatch shape as G256 sister.
-                DType::ParoQ4G128 => gpu.gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
+                DType::ParoQ4G128 => gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
                     &ffn.expert_down_ptrs, topk_indices,
                     rot_batch, down_expanded,
                     down_m, down_k, k_top, n,
