@@ -171,8 +171,15 @@ def main() -> int:
 
     hook_handles.append(vt.patch_embed.register_forward_hook(make_hook("patch_embed")))
     for idx in BLOCK_INDICES_TO_CAPTURE:
+        # `vt.blocks[idx]` returns `x + attn(norm1(x)) + mlp(norm2(...))`.
+        # `vt.blocks[idx].attn` returns the FULL attention output including the
+        # `self.proj` projection — i.e. what gets added to the residual on the
+        # attention side of the block.
         hook_handles.append(
             vt.blocks[idx].register_forward_hook(make_hook(f"block_{idx:02d}"))
+        )
+        hook_handles.append(
+            vt.blocks[idx].attn.register_forward_hook(make_hook(f"block_{idx:02d}_attn_out"))
         )
     hook_handles.append(vt.post_trunk_norm.register_forward_hook(make_hook("post_trunk_norm")))
     hook_handles.append(vt.merger.register_forward_hook(make_hook("merger")))

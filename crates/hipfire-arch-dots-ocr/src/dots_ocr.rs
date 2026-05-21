@@ -1099,6 +1099,12 @@ pub fn vision_forward(
         let proj = linear_f16_no_bias(gpu, &lw.proj_w, &attn, h, h, n_patches)?;
         gpu.free_tensor(attn)?;
         toc!(gpu, "proj GEMM");
+        // Matches HF capture point `block_NN_attn_out` (= output of
+        // VisionAttention.forward — includes the self.proj projection,
+        // before the residual is added).
+        if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
+            dump_stage(gpu, &proj, &format!("block_{li:02}_attn_out"), &[n_patches, h])?;
+        }
         gpu.add_inplace_f32(&x, &proj)?;
         gpu.free_tensor(proj)?;
         toc!(gpu, "residual1 (add)");
