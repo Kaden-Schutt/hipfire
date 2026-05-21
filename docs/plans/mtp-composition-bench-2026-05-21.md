@@ -186,11 +186,20 @@ Lifting this requires:
 - The mtp_extract tool only quantizes from upstream BF16; it doesn't
   train
 
-### Track B: Replay elimination via per-position GDN checkpoint
-- Multi-week kernel work (per master plan)
-- Saves ~30-50% of cycle wall by skipping replay forward
-- Pure perf lever, independent of MTP head quality
-- Lifts MTP solo + composition + DFlash solo together
+### K=4 beats K=5: new MTP solo optimum (supersedes prior memory)
+
+Memory's hard-falsified list said "K=5 peak"; that was on prior config.
+With batched prefill + distilled sidecar on this branch:
+
+| K | hiptrx tok/s | k9lin tok/s | τ |
+|---|---|---|---|
+| 3 | 41.5 | 47.0 mean (3 runs) | 2.98 |
+| **4** | **45.4 deterministic** | **49.0 mean (3 runs)** | **3.40** |
+| 5 | 39.6 deterministic | 46.3 mean (3 runs) | 3.40 |
+| 6 | 39.7 | 40.8 mean | 3.40 |
+
+K=4 lifts MTP solo +14.6% on hiptrx, +2.4% on k9lin. Same τ as K=5
+means K=5 just wastes one extra MTP block forward per cycle.
 
 ### Track B: Replay elimination via per-position GDN checkpoint
 - Multi-week kernel work (per master plan)
