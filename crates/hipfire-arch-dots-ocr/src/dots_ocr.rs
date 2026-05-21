@@ -1160,9 +1160,9 @@ pub fn vision_forward(
         if trace_pre && (li == 0 || li == 1 || li == 41) {
             dump_stats(gpu, &x, &format!("block_{li:02}_out"))?;
         }
-        // Dump matches HF capture: blocks 0, 21, 41 (output of full block,
-        // i.e. after the residual add at the end).
-        if li == 0 || li == 21 || li == 41 {
+        // Dump matches HF capture: blocks 0, 1, 2, 4, 8, 12, 16, 21, 41
+        // (output of full block, i.e. after the residual add at the end).
+        if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
             dump_stage(gpu, &x, &format!("block_{li:02}"), &[n_patches, h])?;
         }
     }

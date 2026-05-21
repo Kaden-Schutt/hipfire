@@ -99,7 +99,7 @@ PROMPT_LAYOUT_ALL_EN = """Please output the layout information from the PDF imag
 # Indices of blocks to capture (out of 42 total). Block 0 establishes
 # the first-block-output reference; mid-stack catches drift accumulation;
 # final block is the pre-merger reference.
-BLOCK_INDICES_TO_CAPTURE = [0, 21, 41]
+BLOCK_INDICES_TO_CAPTURE = [0, 1, 2, 4, 8, 12, 16, 21, 41]   # bisection of 1..21 to locate per-block divergence
 
 # Patch-row sampling. The full activation tensors are [N_patches, 1536]
 # (this image: 19520 patches → 120 MB per stage × 5 stages = 600 MB).

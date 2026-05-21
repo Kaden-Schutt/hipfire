@@ -29,7 +29,8 @@ import sys
 import numpy as np
 
 
-STAGES = ["patch_embed", "block_00", "block_21", "block_41", "post_trunk_norm", "merger"]
+STAGES = ["patch_embed", "block_00", "block_01", "block_02", "block_04", "block_08",
+          "block_12", "block_16", "block_21", "block_41", "post_trunk_norm", "merger"]
 
 
 def cosine(a: np.ndarray, b: np.ndarray) -> float:
