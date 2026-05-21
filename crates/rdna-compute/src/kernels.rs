@@ -480,6 +480,15 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_HFQ4G128_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_moe_gate_up_indexed.hip");
 
+/// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
+/// experts). Sister of `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` with
+/// 72 B/group stride. Used by Path 1 fallback in
+/// `prefill_moe_ffn_body_batched` when ParoQ4G128 expert weights are admitted
+/// (HIPFIRE_PARO_BATCHED=1) on non-WMMA archs (CDNA/gfx10). gfx11/gfx12 takes
+/// Path 2's grouped-WMMA kernel instead (Phase 4).
+pub const GEMV_HFQ4G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq4g128_moe_gate_up_k8_indexed_batched.hip");
+
 /// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
 /// gate_up GEMV. Block=[64,1,1] with 2 rows per block (one per warp) —
 /// halves the grid count vs the wave32 variant, which otherwise wastes

@@ -5474,18 +5474,62 @@ fn prefill_moe_ffn_body_batched(
             mi, k_top, m_total,
         )?;
     } else {
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-            &ffn.expert_gate_up_ptrs, topk_indices,
-            &pbs.x_rot_batch, gate_batch, up_batch,
-            2 * mi, gate_up_k, k_top, n,
-        )?;
+        // Path 1 fallback (CDNA/gfx10): per-token indexed GEMV, batched
+        // over the N tokens via grid.z. The dispatch is dtype-keyed because
+        // the kernel reads the weight nibble layout directly (HFQ4G256:
+        // 136 B/group; HFQ4G128/PARO: 72 B/group).
+        match ffn.experts[0].gate_up.gpu_dtype {
+            DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                &ffn.expert_gate_up_ptrs, topk_indices,
+                &pbs.x_rot_batch, gate_batch, up_batch,
+                2 * mi, gate_up_k, k_top, n,
+            )?,
+            // Phase 3 PARO routed-expert: apply the layer's shared gate_up
+            // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
+            // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
+            // at this layer share the same gate_up rotation sidecar
+            // (ffn.paro_shared, populated by paro_load_moe_shared_sidecars).
+            DType::ParoQ4G128 => {
+                let paro = ffn.paro_shared.as_ref().expect(
+                    "ParoQ4G128 routed experts require paro_shared sidecars",
+                );
+                gpu.givens_rotate_to(
+                    &pbs.x_norm_batch, &pbs.x_rot_batch,
+                    &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
+                    n, dim, paro.krot as usize,
+                )?;
+                gpu.gemv_hfq4g128_moe_gate_up_k8_indexed_batched(
+                    &ffn.expert_gate_up_ptrs, topk_indices,
+                    &pbs.x_rot_batch, gate_batch, up_batch,
+                    2 * mi, gate_up_k, k_top, n,
+                )?;
+            },
+            other => panic!("prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
+                             experts[0].gate_up dtype {other:?} — admit predicate should \
+                             have rejected this layer"),
+        }
     }
 
     // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
     // expert ranks, k=mi is per-row width.
     // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative (all
     // experts at this layer share imatrix at the same residual basis).
-    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+    // PARO branch (Phase 3): the layer-shared `down` rotation sidecar lives
+    // on ffn.paro_shared (not per-expert; all 256 experts alias the same
+    // tuple). Apply via fused_silu_mul_givens_rotate_f32 over the flattened
+    // [n*k_top × mi] grid.
+    if paro_mode {
+        let paro = ffn.paro_shared.as_ref().expect(
+            "ParoQ4G128 routed experts require paro_shared sidecars",
+        );
+        gpu.fused_silu_mul_givens_rotate_f32(
+            gate_batch, up_batch, rot_batch,
+            &paro.down_pairs, &paro.down_theta, &paro.down_channel_scales,
+            n * k_top, mi, paro.krot as usize,
+        )?;
+    } else {
+        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
+    }
 
     // Down projection. Three paths:
     //   Path 2 (HIPFIRE_MOE_GROUPED_GEMM=1, RDNA): grouped-WMMA-GEMM
@@ -5541,11 +5585,30 @@ fn prefill_moe_ffn_body_batched(
     } else {
         let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
         if use_atomic_free_down {
-            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                &ffn.expert_down_ptrs, topk_indices,
-                rot_batch, down_expanded,
-                down_m, down_k, k_top, n,
-            )?;
+            // Path 1 expanded-down: per-token-per-rank GEMV writes to a
+            // [N × K_TOP × M] scratch, then a separate combine kernel folds
+            // it back into pbs.x_batch with topk weights. The expanded
+            // kernel is dtype-keyed; the combine kernel is dtype-agnostic.
+            match ffn.experts[0].down.gpu_dtype {
+                DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs, topk_indices,
+                    rot_batch, down_expanded,
+                    down_m, down_k, k_top, n,
+                )?,
+                // Phase 3 PARO down: the layer-shared `down` Givens rotation
+                // has already been applied to rot_batch by the
+                // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
+                // indexed kernel (existing, shipped in 7c00970d) is
+                // rotation-agnostic; same dispatch shape as G256 sister.
+                DType::ParoQ4G128 => gpu.gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs, topk_indices,
+                    rot_batch, down_expanded,
+                    down_m, down_k, k_top, n,
+                )?,
+                other => panic!("prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
+                                 experts[0].down dtype {other:?} — admit predicate should \
+                                 have rejected this layer"),
+            }
             gpu.moe_down_combine_k8_batched(
                 down_expanded, topk_weights, &pbs.x_batch,
                 down_m, k_top, n,

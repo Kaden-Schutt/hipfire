@@ -12749,6 +12749,65 @@ impl Gpu {
     /// caller must follow with `moe_down_combine_k8_batched` to fold the
     /// K_TOP slots into x_residual with topk_weights applied. wave32-only.
     #[allow(clippy::too_many_arguments)]
+    /// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
+    /// experts). Sister of `gemv_hfq4g256_moe_gate_up_k8_indexed_batched`
+    /// with 72 B/group stride. The caller MUST pre-rotate x using the
+    /// layer's shared `gate_up` Givens sidecar (givens_rotate_to into
+    /// x_rot_batch) before calling — this kernel is rotation-agnostic and
+    /// just reads HFQ4G128 nibbles. Grid: (M, K_TOP, N) wave32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq4g128_moe_gate_up_k8_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_gate_up_k8_indexed_batched",
+            kernels::GEMV_HFQ4G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC,
+            "gemv_hfq4g128_moe_gate_up_k8_indexed_batched",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = batch_size * k_top * (crate::profile::gemv_hfq4g128_bytes(m, k) + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq4g128_moe_gate_up_k8_indexed_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq4g128_moe_gate_up_k8_indexed_batched",
+            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
+                b.push_ptr(ygp); b.push_ptr(yup);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     pub fn gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
         &mut self,
         expert_ptrs: &GpuTensor,
