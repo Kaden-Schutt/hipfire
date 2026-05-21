@@ -186,6 +186,63 @@ Lifting this requires:
 - The mtp_extract tool only quantizes from upstream BF16; it doesn't
   train
 
+## Session totals (final)
+
+15 commits pushed to `mtp-hiptrx-rocprof` (1f714ed1 → 2592ab46).
+
+Cumulative perf delta (canonical 27B-3.5 K=4 Q8 greedy --no-chatml):
+
+| Variant | hiptrx (R9700/gfx1201) | k9lin (7900 XTX/gfx1100) |
+|---|---|---|
+| DFlash solo | 126.1 → **182.0 (+44%)** | 181.0 (unchanged) |
+| Composition B=14 K=2 | 123.8 → **170.0 (+37%)** | 159.3 (unchanged) |
+| MTP solo K=4 | 39.6 → 45.9 (+14.6%) | 46.3 → 49.0 (+2.4%) |
+
+k9lin (gfx11) unchanged because gfx11 path was already correct for WMMA
+lm_head; tonight's changes only touched gfx12 dispatch + the K-default.
+
+### Real perf wins shipped tonight
+
+1. **gfx12 lm_head WMMA dispatch fix (commit 48dd8ba4)** — biggest single
+   lever; +44% DFlash solo / +37% composition on hiptrx
+2. K=4 default (commits f1dfa1ef + 937ac6dc) — +14.6% hiptrx / +2.4% k9lin
+3. Batched mtp_only_demo prefill (commit a3d23bdf) — +9% k9lin / +2% hiptrx
+4. HFQ6 sibling fix (commit 2592ab46) — symmetric to #1; no canonical
+   impact but completes the family
+5. awq_scale rebase fix (commit 1f714ed1) — build correctness
+
+### Falsified (saved future-session time)
+
+1. **Track A sidecar swap (commit 4e1ac103)** — full pipeline executed on
+   4× R9700 (~22 min). 249 prompts → 70K argmax labels → distilled .mtp.
+   ZERO canonical lift. cvs16384 already ~100% covers canonical
+2. Tree composition variant: 3-7× worse than linear (all sweeps)
+3. Aggressive composition M>16: 2-tile penalty exceeds extra commits
+4. Q8 vs MQ4 MTP head: same wall, marginal τ
+5. Baseline-drift hypothesis: pre-rebase cf449fcd gives same numbers
+
+### Methodology evidence
+
+- coherence-gate.sh PASSED (6/6 cells fluent, pre + post fix)
+- coherence-gate-dflash.sh PASSED (4/4 cells fluent, pre + post fix)
+- pflash-gate: 11/12 clean, 1 soft regression +2.5% (within ±5%, pre-existing)
+- Composition output byte-identical (preview_200) before/after WMMA fix
+- K=4 vs K=5 output byte-identical (same committed tokens)
+- All bench numbers from fresh-process invocations (each `./target/...`
+  is a separate process)
+
+### Persistent artifacts on hiptrx
+
+`~/.hipfire/distill_artifacts_2026_05_21/`:
+- qwen3.5-27b-distilled.mtp (258 MiB, MQ4 + merged sidecar)
+- qwen3.5-27b-distilled-q8.mtp (515 MiB, Q8 + merged sidecar)
+- v1/v2/merged_sidecar.json
+- distill_raw_249prompts.tar.gz (raw stderr with `AR tokens: [...]`)
+- coherence-{,dflash-}20260521-*.md (gate reports)
+
+The 249-prompt × 70K argmax-token corpus is ready as supervised
+training data for next session's MTP weight fine-tuning work.
+
 ## 2026-05-21 LATE UPDATE: gfx12 lm_head WMMA dispatch fix — HUGE LIFT
 
 Rocprof on the composition cycle (hiptrx) revealed `gemm_hfq4g256`
