@@ -8,7 +8,7 @@
 //! Usage:
 //!   mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \
 //!                 (--prompt "Hello" | --prompt-file <path>) \
-//!                 [--max 64] [--ctx 4096] [--temp 0.0] [--max-n 3]
+//!                 [--max 64] [--ctx 4096] [--temp 0.0] [--max-n 4]
 //!                 [--no-chatml]
 
 #[cfg(not(feature = "deltanet"))]
@@ -35,7 +35,11 @@ fn main() {
     let mut max_tokens: usize = 64;
     let mut ctx_capacity: usize = 4096;
     let mut temp: f32 = 0.0;
-    let mut max_n: usize = 3;
+    // K=4 default (2026-05-21 bench): K=4 vs K=5 on canonical 27B-3.5
+    // gives +14.6% hiptrx / +2.4% k9lin tok/s with byte-identical output.
+    // Higher K just wastes one extra MTP block forward per cycle that
+    // trunk's verify rejects.
+    let mut max_n: usize = 4;
     let mut chatml: bool = true;
     let mut compressed: bool = false;
     let mut compressed_serial: bool = false;
@@ -75,7 +79,7 @@ fn main() {
                 eprintln!(
                     "Usage: mtp_only_demo --target <trunk.hfq> --mtp-head <head.mtp> \\\n\
                      \t(--prompt \"Hello\" | --prompt-file <path>) \\\n\
-                     \t[--max 64] [--ctx 4096] [--temp 0.0] [--max-n 3] \\\n\
+                     \t[--max 64] [--ctx 4096] [--temp 0.0] [--max-n 4] \\\n\
                      \t[--no-chatml] [--compressed]\n\
                      \n\
                      --compressed: use FastMTP-style compressed lm_head_draft (K=1 path).\n\
