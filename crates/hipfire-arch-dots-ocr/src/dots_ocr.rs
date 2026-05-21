@@ -1037,8 +1037,21 @@ pub fn vision_forward(
         // interleaved (Q, K, V stacked along the 3h axis).
         let qkv = linear_f16_no_bias(gpu, &lw.qkv_w, &xn, qkv_dim, h, n_patches)?;
         gpu.free_tensor(xn)?;
+        // EXPERIMENTAL bf16-trunc the QKV linear output to match HF's
+        // bf16 storage of Q/K/V. QKV linear cos is 0.999 (essentially
+        // exact) but the small remaining drift may flip softmax winners
+        // — bf16-trunc collapses our F32 output to the exact bf16 bits
+        // HF would have at this point.
+        if bf16_residual { gpu.bf16_round_trip_f32(&qkv)?; }
         toc!(gpu, "qkv GEMM");
         if trace_block_li { dump_stats(gpu, &qkv, "b0_qkv")?; tic = std::time::Instant::now(); }
+        // Dump QKV linear output for direct HF diff. Shape is
+        // [n_patches, 3 * hidden] interleaved (Q | K | V along the
+        // 3h axis). Lets us isolate whether the bug is in the QKV
+        // linear or downstream (RoPE / attention compute).
+        if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
+            dump_stage(gpu, &qkv, &format!("block_{li:02}_qkv"), &[n_patches, qkv_dim])?;
+        }
 
         // 2c. Split interleaved QKV into three separate Q, K, V buffers
         // (`[n_patches, hidden=n_heads*head_dim]` each). `attention_dflash_f32`

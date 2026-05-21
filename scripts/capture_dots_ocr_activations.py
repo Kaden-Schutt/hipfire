@@ -181,6 +181,13 @@ def main() -> int:
         hook_handles.append(
             vt.blocks[idx].attn.register_forward_hook(make_hook(f"block_{idx:02d}_attn_out"))
         )
+        # Hook the qkv linear's OUTPUT (= pre-reshape, pre-permute, pre-RoPE,
+        # pre-attention). Shape is [seq, 3*num_heads*head_dim]. Lets us
+        # diff our QKV linear output directly vs HF, isolating whether
+        # the bug is in QKV linear or downstream (RoPE / attention compute).
+        hook_handles.append(
+            vt.blocks[idx].attn.qkv.register_forward_hook(make_hook(f"block_{idx:02d}_qkv"))
+        )
     hook_handles.append(vt.post_trunk_norm.register_forward_hook(make_hook("post_trunk_norm")))
     hook_handles.append(vt.merger.register_forward_hook(make_hook("merger")))
     print(f"  registered {len(hook_handles)} hooks")
