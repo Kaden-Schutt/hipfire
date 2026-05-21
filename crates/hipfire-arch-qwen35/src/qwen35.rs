@@ -3810,12 +3810,35 @@ impl Qwen35Scratch {
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
             //   HIPFIRE_ATTN_FLASH=never|0|off    → non-flash at all contexts
-            //   HIPFIRE_ATTN_FLASH=auto|1|on      → (default) flash at ctx >= 2048
+            //   HIPFIRE_ATTN_FLASH=auto|1|on      → flash at ctx >= 2048
             //   HIPFIRE_ATTN_FLASH=always|2|force → flash at all contexts
+            //
+            // Default on gfx11/gfx12 (graph-capable archs): `2` (always
+            // flash). On other archs: `1` (auto). The capture path at
+            // qwen35.rs:8199 hard-wires `use_flash = capture_mode || ...`
+            // because attention_q8_0_kv has variable block_size + variable
+            // shared-mem (not capture-safe). Without an always-flash default
+            // on capture-capable archs, direct mode at small ctx silently
+            // uses attention_q8_0_kv while a captured-and-replayed forward
+            // uses attention_flash_q8_0 — same math, different fp32
+            // reduction order, observed as ~0.44 logit delta direct-vs-graph
+            // on shisa-Qwen3.6-A3B-PARO (see
+            // .scratch/hipgraph-moe-drift-audit.md Part A). Aligning the
+            // default flips both paths to `attention_flash_q8_0` and makes
+            // direct vs graph byte-identical at the cost of moving small-
+            // context decode off the non-flash kernel (~few % attention
+            // perf hit, small contribution to total MoE decode time).
+            // Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
+            // for users who prefer the non-flash kernel and don't intend
+            // to use graph capture.
             flash_mode: match std::env::var("HIPFIRE_ATTN_FLASH").as_deref() {
                 Ok("never") | Ok("0") | Ok("off") => 0,
                 Ok("always") | Ok("2") | Ok("force") => 2,
-                _ => 1, // auto / unset / any other value
+                _ => {
+                    let graph_capable_arch =
+                        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
+                    if graph_capable_arch { 2 } else { 1 }
+                }
             },
 
             moe_router_logits: None,
