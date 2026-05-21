@@ -603,6 +603,24 @@ fn drafter_prefill(
     source_tokens: &[u32],
 ) -> HipResult<(usize, usize, usize)> {
     let n = source_tokens.len();
+    // Early-exit budget for the drafter forward. pflash only reads
+    // `kv.k_gpu[score_layer_idx]` for cosine scoring (see
+    // `compute_scores_batched_gpu`), so layers strictly beyond
+    // score_layer_idx, plus the final norm + lm_head, are wasted compute.
+    // For Qwen3.5 hybrid drafters with full_attention_interval=4 this
+    // skips ~80% of the layer stack (score_layer_idx=3 of 24 layers).
+    // For Plain drafters score_layer_idx=0 but the Plain path goes
+    // through `llama::forward_prefill_batch` which doesn't yet honor
+    // max_layer — wiring deferred to a follow-up.
+    //
+    // The `+ 1` converts an inclusive layer index ("populate K through
+    // layer N") to the exclusive `layer_end` semantics the forward path
+    // uses internally.
+    let max_layer: Option<usize> = state
+        .drafter_model
+        .as_ref()
+        .and_then(|m| m.score_layer_idx())
+        .map(|l| l + 1);
     let model = state.drafter_model.as_mut().expect("loaded -> drafter_model");
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
     assert!(kv.quant_q8, "drafter_prefill: drafter KV must be Q8_0");
@@ -611,6 +629,12 @@ fn drafter_prefill(
     match model {
         DrafterModel::Plain { config, weights, scratch } => {
             assert!(config.head_dim % 32 == 0, "drafter_prefill: head_dim must be multiple of 32");
+            // Plain path: max_layer not yet plumbed through
+            // llama::forward_prefill_batch; full stack runs. Wiring it is
+            // a follow-up — Plain drafters are uncommon (Qwen3, no hybrid)
+            // and their score_layer_idx is 0, so the win there is even
+            // larger but the call surface change is larger too.
+            let _ = max_layer; // suppress unused warning until follow-up lands
             llama::forward_prefill_batch(gpu, weights, config, source_tokens, 0, kv, scratch, None)?;
             Ok((config.n_layers, config.n_kv_heads, config.head_dim))
         }
@@ -630,10 +654,14 @@ fn drafter_prefill(
             // qwen35 batched prefill writes the same Q8_0 K cache layout
             // as llama::forward_prefill_batch. None on hidden_rb /
             // per_token_hidden_out / gdn_tape / tree_verify -- pflash
-            // doesn't need DFlash hidden capture or DDTree state.
-            qwen35::forward_prefill_batch(
+            // doesn't need DFlash hidden capture or DDTree state. The
+            // trailing `max_layer` truncates the layer loop at the
+            // scoring layer + 1 and skips the final norm + lm_head.
+            qwen35::forward_prefill_batch_with_pbs(
                 gpu, weights, config, source_tokens, 0, kv, dn_state, scratch,
                 None, None, None, None,
+                scratch.prefill_batch.as_ref(),
+                max_layer,
             )?;
             Ok((config.n_layers, config.n_kv_heads, config.head_dim))
         }
