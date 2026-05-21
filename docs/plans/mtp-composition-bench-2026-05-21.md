@@ -149,17 +149,48 @@ git bisect against `cf449fcd` (pre-rebase HEAD) on a future session.
 
 ## What's needed for Goal B 230+ tok/s
 
-### Track A: Trained MTP sidecar (Phase 1, multi-hour to multi-day)
-- Run `scripts/distill/run_distill_parallel.sh` on hiptrx 4× R9700
-- Wide-corpus trunk-argmax distillation
-- Need HF prompt datasets (`Roman1111111-claude-opus-10000x`,
-  `Jackrong-Qwen3.5-reasoning-700x`, `nohurry-Opus-Reasoning-3000x`)
-  cached locally on hiptrx — currently absent
-- Need `--kv-mode q8` flag in run_distill_parallel.sh — script
-  already supports it (default asym3, override via `--kv-mode q8`)
-- Projected MTP solo τ: 3.4 → 4.5+ → tok/s 44 → 55-60 (k9lin)
-- In composition: MTP per-position acceptance 68% → 85%+ → enables
-  consistent MTP commits → composition lift +20-30% over DFlash solo
+### Track A: Trained MTP sidecar — FALSIFIED tonight as goal-clearing lever
+
+**Pipeline executed end-to-end on 4× R9700:**
+1. Synthesized 249 diverse prompts (Python stdlib + hipfire Rust source +
+   English/code/dialogue/QA), ~726 chars mean
+2. Ran `scripts/distill/run_distill_parallel.sh ... --kv-mode q8` —
+   249/249 prompts complete in ~22 min wall, 70,313 tokens emitted,
+   5,422 unique trunk-argmax tokens
+3. `aggregate_argmax.py` → v2 sidecar JSON (top-16384 covers 100% of
+   trunk's actual emit distribution on the corpus)
+4. `merge_sidecars.py` rank-weighted combined v1 (canonical-corpus
+   frequency) + v2 (trunk-argmax distill) → merged sidecar
+5. `mtp_extract --vocab-sidecar /tmp/merged_sidecar.json` → new
+   `qwen3.5-27b-distilled.mtp` (258 MiB MQ4)
+
+**Result: distilled sidecar gives 0.0% lift on canonical bench:**
+
+| Variant | Baseline (cvs16384) | Distilled (merged v1+v2) | Lift |
+|---|---|---|---|
+| MTP solo (hiptrx single R9700) | 39.91 tok/s τ=3.40 | 39.95 tok/s τ=3.40 | +0.1% noise |
+| Composition B=14 K=2 (hiptrx) | 123.79 tok/s τ=9.46 | 123.86 tok/s τ=9.46 | +0.06% noise |
+
+**Why sidecar doesn't help on canonical**: cvs16384 was BUILT FROM the
+canonical bench corpus (build_mtp_vocab_sidecar.py reads
+benchmarks/prompts/lru_cache_pep8_strict.txt as its first input). Top-16K
+already covers ~100% of trunk's argmax distribution on this prompt.
+A new sidecar can only help on OUT-OF-DISTRIBUTION prompts where
+cvs16384 has gaps.
+
+**The real bottleneck is MTP HEAD WEIGHT QUALITY, not vocab compression.**
+MTP head's per-position acceptance is ~68% (giving τ=3.4 over K=5 chain).
+Lifting this requires:
+- Training the MTP block attn/FFN weights (multi-day PyTorch pipeline)
+- Or imatrix-calibrated re-quantization (mild lift, +5-15% typical)
+- The mtp_extract tool only quantizes from upstream BF16; it doesn't
+  train
+
+### Track B: Replay elimination via per-position GDN checkpoint
+- Multi-week kernel work (per master plan)
+- Saves ~30-50% of cycle wall by skipping replay forward
+- Pure perf lever, independent of MTP head quality
+- Lifts MTP solo + composition + DFlash solo together
 
 ### Track B: Replay elimination via per-position GDN checkpoint
 - Multi-week kernel work (per master plan)
