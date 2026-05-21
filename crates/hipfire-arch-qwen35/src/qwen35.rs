@@ -7300,6 +7300,12 @@ fn forward_prefill_chunk(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+                // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
+                // (each with its own Givens rotation tables). The fused-QKV
+                // kernels can't handle this — they assume one shared
+                // rotation. Unfused 3-way dispatch (rotate + gemm_hfq4g128
+                // per projection) matches the LA QKVZA Phase 1.5 pattern.
+                let qkv_is_paro = matches!(layer.wq.gpu_dtype, DType::ParoQ4G128);
                 let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
                     || gpu.arch.starts_with("gfx12");
                 // Fused QKV requires uniform dtype — see issue #249 for
@@ -7312,13 +7318,60 @@ fn forward_prefill_chunk(
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
+                } else if qkv_is_paro {
+                    // PARO: rmsnorm into x_norm_batch (un-rotated). x_rot_batch
+                    // is reused as the per-weight rotation scratch.
+                    gpu.rmsnorm_batched(
+                        &pbs.x_batch, &layer.attn_norm, &pbs.x_norm_batch,
+                        n, dim, config.norm_eps,
+                    )?;
                 } else {
                     gpu.rmsnorm_batched(
                         &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
                         n, dim, config.norm_eps,
                     )?;
                 }
-                if qkv_is_6bit && qkv_same_dtype {
+                if qkv_is_paro {
+                    // PARO 3-way unfused dispatch (wq, wk, wv each with own
+                    // Givens rotation). Same shape outputs as the fused
+                    // paths: fa_q_full_batch, fa_k_batch, fa_v_batch.
+                    let paro_wq = layer.wq.paro.as_ref()
+                        .expect("ParoQ4G128 wq missing paro metadata");
+                    let paro_wk = layer.wk.paro.as_ref()
+                        .expect("ParoQ4G128 wk missing paro metadata");
+                    let paro_wv = layer.wv.paro.as_ref()
+                        .expect("ParoQ4G128 wv missing paro metadata");
+                    // wq
+                    gpu.givens_rotate_to(
+                        &pbs.x_norm_batch, &pbs.x_rot_batch,
+                        &paro_wq.pairs, &paro_wq.theta, &paro_wq.channel_scales,
+                        n, dim, paro_wq.krot as usize,
+                    )?;
+                    gpu.gemm_hfq4g128(
+                        &layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch,
+                        layer.wq.m, layer.wq.k, n,
+                    )?;
+                    // wk
+                    gpu.givens_rotate_to(
+                        &pbs.x_norm_batch, &pbs.x_rot_batch,
+                        &paro_wk.pairs, &paro_wk.theta, &paro_wk.channel_scales,
+                        n, dim, paro_wk.krot as usize,
+                    )?;
+                    gpu.gemm_hfq4g128(
+                        &layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch,
+                        layer.wk.m, layer.wk.k, n,
+                    )?;
+                    // wv
+                    gpu.givens_rotate_to(
+                        &pbs.x_norm_batch, &pbs.x_rot_batch,
+                        &paro_wv.pairs, &paro_wv.theta, &paro_wv.channel_scales,
+                        n, dim, paro_wv.krot as usize,
+                    )?;
+                    gpu.gemm_hfq4g128(
+                        &layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch,
+                        layer.wv.m, layer.wv.k, n,
+                    )?;
+                } else if qkv_is_6bit && qkv_same_dtype {
                     gpu.gemm_qkv_hfq6g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -7590,8 +7643,22 @@ fn forward_prefill_chunk(
                 // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+                // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
+                // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
+                // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
+                // scratch, then add into x_batch.
+                let fa_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
                 let fa_wo_input = if fa_wo_is_q8 {
                     &pbs.fa_attn_out_batch
+                } else if fa_wo_is_paro {
+                    let paro_wo = layer.wo.paro.as_ref()
+                        .expect("ParoQ4G128 wo missing paro metadata");
+                    gpu.givens_rotate_to(
+                        &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch,
+                        &paro_wo.pairs, &paro_wo.theta, &paro_wo.channel_scales,
+                        n, layer.wo.k, paro_wo.krot as usize,
+                    )?;
+                    &pbs.fa_attn_out_rot_batch
                 } else {
                     // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
                     rotate_x_mq_batched_for(
@@ -7617,6 +7684,18 @@ fn forward_prefill_chunk(
                     // didn't run here) as scratch.
                     let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_batched_chunked(
+                        &layer.wo.buf, fa_wo_input, &scratch,
+                        layer.wo.m, layer.wo.k, n,
+                    )?;
+                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.add_inplace_f32(&x_n, &scratch)?;
+                } else if fa_wo_is_paro {
+                    // PARO wo residual: HFQ4G128 batched GEMM into scratch,
+                    // then add into x_batch. Reuse x_norm_batch (free since
+                    // QKVZA is done — the MoE FFN body below rewrites it
+                    // as its first action) as the gemm output scratch.
+                    let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
+                    gpu.gemm_hfq4g128(
                         &layer.wo.buf, fa_wo_input, &scratch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
