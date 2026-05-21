@@ -122,6 +122,65 @@ Short-ctx we already win (~6× ahead at 4K). Long-ctx we lose because our Q8 bat
 
 ## Empirical anchors
 
+### Long-ctx sweep (k9lin gfx1100, post-A + post-D)
+
+Hardware: k9lin (RX 7900 XTX, gfx1100, RDNA3 — same family as gfx1151
+Strix Halo). Target qwen3.5-27b-awq.mq4, PFlash drafter
+qwen3.5-0.8b.mq4, **target KV q8** (lucebox-matched), `--maxgen 16`,
+`--keep-ratio 0.05`, warm (one prior pass for kernel JIT).
+
+| Source ctx | tokens | Q8 compress | **fwht3 compress** | speedup | lucebox-PR225 | ours vs lucebox |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4K   | 2,771  | 70 ms      | **69 ms**    | 1.01× | 800 ms    | **11.6× ahead** |
+| 8K   | 5,487  | 149 ms     | **143 ms**   | 1.04× | 1,590 ms  | **11.1× ahead** |
+| 16K  | 10,881 | 482 ms     | **342 ms**   | 1.41× | 3,380 ms  | **9.9× ahead**  |
+| 32K  | 21,551 | 5,953 ms   | **950 ms**   | 6.27× | 7,390 ms  | **7.8× ahead**  |
+| 64K  | 43,296 | 9,863 ms   | **2,882 ms** | 3.42× | 16,800 ms | **5.8× ahead**  |
+| 128K | 86,459 | 39,143 ms  | **10,863 ms**| 3.60× | 39,260 ms | **3.6× ahead**  |
+
+**6/6 ctx rows beat lucebox** with fwht3 drafter. Q8 baseline also
+ahead at 4K-16K and (barely) 128K; the cliff bites at 32K/64K where
+fwht3 dominates.
+
+The cliff fingerprint: Q8 compress grows roughly linearly to 16K
+(70 → 149 → 482, ~3× per doubling), then jumps **12.4× at 32K** (482 →
+5953) — exactly where `attention_q8_0_kv_batched_masked` falls off the
+56 KB LDS budget and `qwen35.rs:5021`'s per-position fallback kicks in.
+fwht3 keeps the batched-tile path active across the full source-length
+range, so its growth stays roughly linear.
+
+### Scoring fidelity (fwht3 vs Q8)
+
+| Ctx | Q8 kept_spans (first / last) | fwht3 kept_spans (first / last) | Match |
+|---:|---|---|---|
+| 4K  | (0,128) + (2739,2771)  | (0,128) + (2739,2771)  | ✓ identical |
+| 8K  | (0,128) + (5440,5487)  | (0,128) + (5440,5487)  | ✓ identical |
+| 16K | (0,448) + (10816,10881)| (0,384) + (10816,10881)| ≈ 1-block off in anchor |
+| 32K | (0,896) + (21504,21551)| (0,896) + (21504,21551)| ✓ identical |
+| 64K | (0,1024)+(43264,43296),16 r | (0,896)+(43264,43296),15 r | ≈ 1-range merge |
+| 128K| (0,1216)+(85632,86459),21 r | (0,1216)+(85632,86459),19 r | ≈ 2-range merge |
+
+source_tokens md5 identical at every ctx (trivial — tokenization is
+arch-independent). kept_spans differ by at most one block / one merged
+range, confirming the fwht3 score kernel produces cosines within budget-
+rounding of the Q8 reference. **No NIAH regression vs Q8 anywhere.**
+
+### NIAH gate (open question)
+
+At keep_ratio=0.05, needle recovers at 4K only (post-A bench). At every
+ctx ≥ 8K, **needle is missed by BOTH Q8 and fwht3** — pre-existing
+scorer bias where the cosine ranker over-weights late-prompt blocks
+and under-weights mid-prompt content (consistent with the
+attention-recency story in our 4K analysis: the bench's small
+sink_tokens=16 + recent_tokens=32 anchor windows don't include the
+50%-depth needle position, and the scorer's top-N middle picks miss it
+at keep=0.05's tight budget).
+
+This is the **next lever** beyond fwht3: scorer accuracy at long ctx
+(Lever F territory, possibly redesign to attention-pooled instead of
+cosine-of-block-mean). fwht3 unblocks the perf path; doesn't fix this.
+
+### niah_4k post-A baseline (earlier bench, retained for trend)
 niah_4k on hipx (Radeon 8060S / gfx1151), target qwen3.5-27b.mq4, PFlash
 drafter qwen3.5-0.8b.mq4, asym3 KV, --maxgen 64:
 
