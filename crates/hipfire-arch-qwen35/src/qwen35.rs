@@ -5204,7 +5204,15 @@ fn prefill_moe_ffn_body_batched(
     // Reading awq_scale from router would silently drop AWQ rotation in
     // v3 AWQ runs — latent until this predicate widened.
     gpu.rmsnorm_batched(&pbs.x_batch, ffn_norm, &pbs.x_norm_batch, n, dim, config.norm_eps)?;
-    rotate_x_mq_batched_for(gpu, &ffn.shared_expert.gate, &pbs.x_norm_batch, &pbs.x_rot_batch, dim, n)?;
+    // PARO mode (shared_expert.gate is ParoQ4G128): each weight carries its
+    // own Givens rotation table (paro.pairs / theta / channel_scales). The
+    // shared MQ4-style FWHT pre-rotation here would be wrong — skip it. The
+    // ParoQ4G128 dispatch arms below run per-weight Givens rotation in-place
+    // before each GEMM, using pbs.x_rot_batch as the rotation destination.
+    let paro_mode = matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128);
+    if !paro_mode {
+        rotate_x_mq_batched_for(gpu, &ffn.shared_expert.gate, &pbs.x_norm_batch, &pbs.x_rot_batch, dim, n)?;
+    }
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
     //
@@ -5263,12 +5271,39 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
             ffn.shared_expert.gate.k, n,
         )?,
-        // Phase 1 panic-stub: admitted by moe_ffn_batched_admissible only
-        // when HIPFIRE_PARO_BATCHED=1. Phase 2 (the shared-expert PARO
-        // kernels, gemm_gate_up_paro_q4g128_batched) replaces this stub.
-        DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 shared_expert.gate \
-                                     not yet implemented — Phase 2 deliverable. Unset \
-                                     HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
+        // Phase 2: PARO shared_expert.gate + up. Each weight has its own
+        // Givens rotation table — rotate x_norm_batch into x_rot_batch using
+        // gate's tables, GEMM, then re-rotate using up's tables, GEMM. Total
+        // 4 dispatches vs the MQ4 path's 1 fused gemm_gate_up — acceptable
+        // overhead for the per-token-loop elimination win. Phase 4 could
+        // collapse this into a single fused kernel
+        // (gemm_gate_up_paro_q4g128_batched) if measurement shows it matters.
+        DType::ParoQ4G128 => {
+            let paro_gate = ffn.shared_expert.gate.paro.as_ref()
+                .expect("ParoQ4G128 shared_expert.gate missing paro metadata");
+            let paro_up = ffn.shared_expert.up.paro.as_ref()
+                .expect("ParoQ4G128 shared_expert.up missing paro metadata");
+            // Gate: rotate x_norm by gate's Givens → x_rot, then HFQ4G128 GEMM
+            gpu.givens_rotate_to(
+                &pbs.x_norm_batch, &pbs.x_rot_batch,
+                &paro_gate.pairs, &paro_gate.theta, &paro_gate.channel_scales,
+                n, dim, paro_gate.krot as usize,
+            )?;
+            gpu.gemm_hfq4g128(
+                &ffn.shared_expert.gate.buf, &pbs.x_rot_batch, shared_gate,
+                ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
+            )?;
+            // Up: re-rotate x_norm by up's Givens → x_rot (overwrite), GEMM
+            gpu.givens_rotate_to(
+                &pbs.x_norm_batch, &pbs.x_rot_batch,
+                &paro_up.pairs, &paro_up.theta, &paro_up.channel_scales,
+                n, dim, paro_up.krot as usize,
+            )?;
+            gpu.gemm_hfq4g128(
+                &ffn.shared_expert.up.buf, &pbs.x_rot_batch, shared_up,
+                ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
+            )?;
+        },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
@@ -5297,7 +5332,21 @@ fn prefill_moe_ffn_body_batched(
     // batch on grid.y and writes FWHT(silu(gate) * up) into x_rot. Here
     // batch=N, k=smi; the shared-rot output buffer is [N × smi].
     // F2: AWQ-aware silu_mul+rotate for the batched shared-expert down input.
-    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
+    // PARO: shared_expert.down has its own Givens rotation tables (paro.*);
+    // use the dedicated fused kernel (commit 50198daa). It takes a per-weight
+    // (pairs, theta, channel_scales, krot) tuple instead of the MQ4 FWHT
+    // convention. Same shape: gate/up [N × smi] → shared_rot [N × smi].
+    if paro_mode {
+        let paro_down = ffn.shared_expert.down.paro.as_ref()
+            .expect("ParoQ4G128 shared_expert.down missing paro metadata");
+        gpu.fused_silu_mul_givens_rotate_f32(
+            shared_gate, shared_up, shared_rot,
+            &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
+            n, smi, paro_down.krot as usize,
+        )?;
+    } else {
+        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
+    }
 
     // ── 5. Shared-expert down with sigmoid-scaled residual, batched ──
     //
@@ -5316,11 +5365,15 @@ fn prefill_moe_ffn_body_batched(
             &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
-        // Phase 1 panic-stub: HIPFIRE_PARO_BATCHED=1 only. Phase 2 fills in
-        // gemv_hfq4g128_residual_sigmoid_scaled_paro_batched.
-        DType::ParoQ4G128 => panic!("prefill_moe_ffn_body_batched: ParoQ4G128 shared_expert.down \
-                                     not yet implemented — Phase 2 deliverable. Unset \
-                                     HIPFIRE_PARO_BATCHED to fall back to the per-token PARO path."),
+        // Phase 2: HFQ4G128 batched residual+sigmoid-scaled kernel. Single
+        // launch, same semantics as the HFQ4G256 sister — reads shared_rot
+        // (already silu-mul-rotated by the PARO fused kernel above), GEMVs
+        // against W_down, applies sigmoid(shared_scalar[token]) × output,
+        // accumulates into pbs.x_batch.
+        DType::ParoQ4G128 => gpu.gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
+            ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
+        )?,
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
