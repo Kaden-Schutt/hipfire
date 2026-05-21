@@ -492,19 +492,35 @@ pub fn tokenizers_compatible(target: &Tokenizer, draft: &Tokenizer) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrafterKvMode {
     Q8,
+    /// fwht4: 4-bit codes, 132 B/head, TURBO_C4 LUT — ablation variant.
+    Fwht4,
+    /// fwht3: 3-bit codes, 100 B/head, TURBO_C3_256 LUT — the
+    /// production default replacement for asym3 in long-ctx pflash.
     Fwht3,
+    /// fwht2: 2-bit codes, 68 B/head, TURBO_C2 LUT — ablation /
+    /// lower-bound variant.
+    Fwht2,
 }
 
 impl DrafterKvMode {
     /// Read `HIPFIRE_PFLASH_DRAFTER_KV` env var; defaults to Q8 (current
     /// production behaviour). Unknown values panic loudly rather than
-    /// silently downgrading.
+    /// silently downgrading. asym3 is intentionally NOT accepted —
+    /// banned from drafter scoring per project policy (per-pair Givens
+    /// noise localizes error, biasing the head_dim-averaged cosine;
+    /// fwht's distributed-noise spectrum is the right shape).
     pub fn from_env() -> Self {
         match std::env::var("HIPFIRE_PFLASH_DRAFTER_KV").ok().as_deref() {
             None | Some("") | Some("q8") | Some("Q8") => DrafterKvMode::Q8,
+            Some("fwht4") | Some("FWHT4") => DrafterKvMode::Fwht4,
             Some("fwht3") | Some("FWHT3") => DrafterKvMode::Fwht3,
+            Some("fwht2") | Some("FWHT2") => DrafterKvMode::Fwht2,
+            Some("asym3") | Some("ASYM3") => panic!(
+                "HIPFIRE_PFLASH_DRAFTER_KV=asym3 is banned for drafter scoring — \
+                 use fwht3 (similar throughput, better scorer accuracy)"
+            ),
             Some(other) => panic!(
-                "HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht3}}"
+                "HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht4, fwht3, fwht2}}"
             ),
         }
     }
@@ -561,7 +577,13 @@ pub fn load_drafter(
                 DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
                     gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
                 )?,
+                DrafterKvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
+                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                )?,
                 DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+                    gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
+                )?,
+                DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
                     gpu, &is_kv_layer, q35_cfg.n_kv_heads, q35_cfg.head_dim, max_kv_seq,
                 )?,
             };
@@ -592,7 +614,13 @@ pub fn load_drafter(
         DrafterKvMode::Q8 => KvCache::new_gpu_q8_filtered(
             gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
         )?,
+        DrafterKvMode::Fwht4 => KvCache::new_gpu_fwht4_filtered(
+            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+        )?,
         DrafterKvMode::Fwht3 => KvCache::new_gpu_fwht3_filtered(
+            gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
+        )?,
+        DrafterKvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
             gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_kv_seq,
         )?,
     };
@@ -686,17 +714,21 @@ fn drafter_prefill(
         .map(|l| l + 1);
     let model = state.drafter_model.as_mut().expect("loaded -> drafter_model");
     let kv = state.drafter_kv.as_mut().expect("loaded -> kv");
-    // Drafter KV must be one of the modes we know how to score against:
-    // Q8 (the historical default) or fwht3 (the LDS-cliff-free path).
-    // The forward-pass layer dispatch in qwen35::forward_prefill_chunk
-    // already handles fwht3 K writes via `kv_cache_write_asym_k_fwht3`
-    // (line 5516 etc.); the choice here is just which downstream score
-    // kernel `compute_scores_batched_gpu` will dispatch.
+    // Drafter KV must be one of the four modes we know how to score
+    // against: Q8 (the historical default) or fwht{4,3,2} (the
+    // LDS-cliff-free FWHT family). The asym{4,3,2} storage layouts with
+    // `quant_fwht=true` are how llama::KvCache encodes the fwht
+    // variants (storage layout from asym*, rotation type from the
+    // quant_fwht flag). asym* WITHOUT quant_fwht (Givens-rotated) is
+    // intentionally rejected here — banned from drafter scoring per
+    // project policy.
+    let fwht_storage_ok =
+        (kv.quant_asym4 || kv.quant_asym3 || kv.quant_asym2) && kv.quant_fwht;
     assert!(
-        kv.quant_q8 || (kv.quant_asym3 && kv.quant_fwht),
-        "drafter_prefill: drafter KV must be Q8 or fwht3 \
-         (quant_q8={}, quant_asym3={}, quant_fwht={})",
-        kv.quant_q8, kv.quant_asym3, kv.quant_fwht,
+        kv.quant_q8 || fwht_storage_ok,
+        "drafter_prefill: drafter KV must be Q8 or fwht{{4,3,2}} \
+         (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, quant_fwht={})",
+        kv.quant_q8, kv.quant_asym4, kv.quant_asym3, kv.quant_asym2, kv.quant_fwht,
     );
     assert!(n <= kv.physical_cap, "drafter_prefill: source {n} > physical_cap {}", kv.physical_cap);
 
@@ -882,20 +914,36 @@ pub fn compute_scores_batched_gpu(
     let n_blocks = (n + block_size - 1) / block_size;
 
     let scores_buf = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-    // Dispatch on the drafter's KV cache mode. Both kernels emit the
-    // same f32 cosine-per-block scores; they only differ in K dequant
-    // (Q8: 2B fp16 scale + 32 i8 / block; fwht3: 4B cnorm + packed 3-bit
-    // codes via TURBO_C3_256). Cosine is rotation-invariant under FWHT
-    // so the fwht3 score kernel can compute in rotated space directly —
-    // see kernel-level comment in score_fwht3_kv.hip.
+    // Dispatch on the drafter's KV cache mode. All four kernels emit
+    // the same f32 cosine-per-block scores; they only differ in K
+    // dequant. Cosine is rotation-invariant under any orthonormal
+    // transform, so the fwht{4,3,2} score kernels compute in rotated
+    // space directly — see kernel-level comments in
+    // `kernels/src/pflash/score_fwht{4,3,2}_kv.hip`. The fwht storage
+    // variants are tagged by which `quant_asym*` flag is set AND
+    // `quant_fwht == true`; asym* without fwht (Givens-rotated) is
+    // disallowed here (drafter scoring policy bans asym3 — see
+    // assert in drafter_prefill).
     if kv.quant_q8 {
         gpu.pflash_score_q8_kv(
             &kv.k_gpu[layer_idx], &scores_buf,
             n, n_kv_heads, head_dim, block_size, n_blocks,
             n - 1, // last_pos
         )?;
-    } else if kv.quant_asym3 && kv.quant_fwht {
+    } else if kv.quant_fwht && kv.quant_asym4 {
+        gpu.pflash_score_fwht4_kv(
+            &kv.k_gpu[layer_idx], &scores_buf,
+            n, n_kv_heads, head_dim, block_size, n_blocks,
+            n - 1,
+        )?;
+    } else if kv.quant_fwht && kv.quant_asym3 {
         gpu.pflash_score_fwht3_kv(
+            &kv.k_gpu[layer_idx], &scores_buf,
+            n, n_kv_heads, head_dim, block_size, n_blocks,
+            n - 1,
+        )?;
+    } else if kv.quant_fwht && kv.quant_asym2 {
+        gpu.pflash_score_fwht2_kv(
             &kv.k_gpu[layer_idx], &scores_buf,
             n, n_kv_heads, head_dim, block_size, n_blocks,
             n - 1,
@@ -903,8 +951,10 @@ pub fn compute_scores_batched_gpu(
     } else {
         panic!(
             "compute_scores_batched_gpu: unsupported drafter KV mode \
-             (quant_q8={}, quant_asym3={}, quant_fwht={})",
-            kv.quant_q8, kv.quant_asym3, kv.quant_fwht,
+             (quant_q8={}, quant_asym4={}, quant_asym3={}, quant_asym2={}, \
+              quant_fwht={})",
+            kv.quant_q8, kv.quant_asym4, kv.quant_asym3, kv.quant_asym2,
+            kv.quant_fwht,
         );
     }
     let scores = gpu.download_f32(&scores_buf)?;
