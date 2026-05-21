@@ -122,36 +122,43 @@ Short-ctx we already win (~6× ahead at 4K). Long-ctx we lose because our Q8 bat
 
 ## Empirical anchors
 
-### Canonical sweep (k9lin gfx1100, levers A+D, bs=16, maxgen=96)
+### Canonical sweep (hipx Strix Halo gfx1151, levers A+D, bs=16, maxgen=96)
 
-Hardware: k9lin (RX 7900 XTX, gfx1100, RDNA3 — same family as gfx1151
-Strix Halo, ratios expected to transfer). Target
-qwen3.5-27b-awq.mq4, PFlash drafter qwen3.5-0.8b.mq4, **target KV q8**
+Hardware: hipx Strix Halo (Radeon 8060S, gfx1151, RDNA3.5, UMA 128 GB)
+— **the goal's target hardware**, lucebox-comparable. Target
+qwen3.5-27b.mq4, PFlash drafter qwen3.5-0.8b.mq4, **target KV q8**
 (lucebox-matched), `--keep-ratio 0.05 --block-size 16 --maxgen 96`,
-warm (one prior pass for kernel JIT).
+warm.
 
 | Source | tokens | Q8 ms | **fwht3 ms** | speedup | NIAH Q8/fwht3 | lucebox-PR225 | ours/lucebox |
 |---:|---:|---:|---:|---:|:---:|---:|---:|
-| 4K   | 2,771  | 70     | **69**     | 1.01× | ✓ / ✓ | 800       | **11.6× ahead** |
-| 8K   | 5,487  | 149    | **143**    | 1.04× | ✓ / ✓ | 1,590     | **11.1× ahead** |
-| 16K  | 10,881 | 485    | **343**    | 1.41× | ✓ / ✓ | 3,380     | **9.9× ahead**  |
-| 32K  | 21,551 | 3,053  | **956**    | 3.19× | ✓ / ✓ | 7,390     | **7.7× ahead**  |
-| 64K  | 43,296 | 9,974  | **3,021**  | 3.30× | ✓ / ✓ | 16,800    | **5.6× ahead**  |
-| 128K | 86,459 | 39,110 | **10,950** | 3.57× | ✓ / ✓ | 39,260    | **3.6× ahead**  |
+| 4K   | 2,771  | 95     | **91**     | 1.04× | ✓ / ✓ | 800       | **8.8× ahead**  |
+| 8K   | 5,487  | 222    | **204**    | 1.09× | ✓ / ✓ | 1,590     | **7.8× ahead**  |
+| 16K  | 10,881 | 727    | **529**    | 1.37× | ✓ / ✓ | 3,380     | **6.4× ahead**  |
+| 32K  | 21,551 | 3,349  | **1,596**  | 2.10× | ✓ / ✓ | 7,390     | **4.6× ahead**  |
+| 64K  | 43,296 | 14,986 | **5,866**  | 2.55× | ✓ / ✓ | 16,800    | **2.86× ahead** |
+| 128K | 86,459 | 65,657 | **27,342** | 2.40× | ✓ / ✓ | 39,260    | **1.44× ahead** |
 
 **6/6 ctx rows beat lucebox-hub PR #225 (rocWMMA+all)** with fwht3
-drafter. All 12 cells (6 ctx × {Q8, fwht3}) PASS NIAH needle recovery at
-keep_ratio=0.05.
+drafter, **on the target hardware (Strix Halo)**. All 12 cells
+(6 ctx × {Q8, fwht3}) PASS NIAH needle recovery at keep_ratio=0.05.
 
 The cliff fingerprint: Q8 compress grows roughly linearly to 16K
-(70 → 149 → 485, ~3× per doubling), then jumps **6.3× at 32K** (485 →
-3053) — `attention_q8_0_kv_batched_masked` falls off the 56 KB LDS
+(95 → 222 → 727, ~3× per doubling), then jumps **4.6× at 32K** (727 →
+3349) — `attention_q8_0_kv_batched_masked` falls off the 56 KB LDS
 budget and `qwen35.rs:5021`'s per-position fallback kicks in. fwht3
 keeps the batched-tile path active across the full source-length
-range, so its growth stays roughly linear (343 → 956 → 3021 → 10950).
+range, so its growth stays roughly linear (529 → 1596 → 5866 → 27342).
 Lever A (early-exit drafter forward) makes the Q8 fallback ~6× cheaper
 than it would be without A — visible in the 32K+ Q8 numbers being
-several × lower than pre-A historical estimates.
+several × lower than pre-A historical estimates (the original handoff
+projected Q8 at 217 s for 128K; post-A + lucebox-matched config gets
+65 s).
+
+For reference / sanity, the same sweep on k9lin (gfx1100 7900 XTX,
+desktop dedicated VRAM, higher BW than Strix Halo's UMA) ran ~2× faster
+at every cell — same cliff structure, same fwht3 ratio. Strix is the
+canonical bench since it matches lucebox's hardware.
 
 ### NIAH gate: block_size matters
 
