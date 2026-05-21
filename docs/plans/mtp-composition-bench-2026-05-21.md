@@ -211,6 +211,22 @@ lm_head; tonight's changes only touched gfx12 dispatch + the K-default.
    impact but completes the family
 5. awq_scale rebase fix (commit 1f714ed1) — build correctness
 
+### 10-run consolidated k9lin MTP solo bench (final ceiling)
+
+Canonical config + K=4 + max=480 (best discovered combo), 10 fresh-process runs:
+
+```
+56.51, 55.22, 54.10, 53.47, 56.71, 56.33, 56.62, 52.92, 53.49, 55.44
+median: 55.33  mean: 55.08  peak: 56.71  range: 52.92-56.71  σ ≈ 1.4
+```
+
+vs Goal A reference baseline (CLAUDE.md "~53 tok/s K=5 Q8 cvs16384
+greedy --no-chatml on 7900 XTX"): **+4.4% (mean) to +7.0% (peak)**.
+At the ±5% threshold of CLAUDE.md's "MEANINGFUL lift" rule.
+
+Literal Goal A target floor (60 tok/s) NOT achieved — peak 56.71 is
+5.5% short.
+
 ### Decode-length sensitivity finding (k9lin MTP solo)
 
 | max tokens | k9lin tok/s |
