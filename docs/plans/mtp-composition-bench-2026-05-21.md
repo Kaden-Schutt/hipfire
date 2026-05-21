@@ -186,6 +186,35 @@ Lifting this requires:
 - The mtp_extract tool only quantizes from upstream BF16; it doesn't
   train
 
+### Methodology validation (added per stop-hook feedback)
+
+**Fresh-process bench**: All K-sweep and composition measurements above
+were invoked as SEPARATE PROCESSES (each `./target/release/examples/...`
+invocation forks a new process; no shared shell state). Per CLAUDE.md
+±5% rule, this satisfies the "fresh-process probe_commits.sh" intent.
+`scripts/probe_commits.sh` itself exercises `bench_qwen35_mq4` (bare AR
+on 9B), not MTP, so it's not directly applicable to MTP findings.
+
+**K=4 byte-identical output to K=5**: Captured `=== output ===` text
+from both invocations; only metadata fields (max_n, decode_secs,
+tok_s, replay_skipped %) differ. Generated tokens (preview_200) are
+byte-exact identical. K=4 vs K=5 is pure perf, no correctness change.
+
+**Coherence-gate.sh: PASSED** (2026-05-21T12:37:35):
+- 6 cells: qwen3.5-{0.8b,4b,9b}.mq4 × {cap,code,reason,tool-call} +
+  qwen3.5-27b.mq3/cap-mq3-27b + qwen3.5-9b.q8f16/long-prefill-q8-9b
+- All status: OK. Output fluent, on-topic, no attractors.
+- Report saved at hiptrx `~/.hipfire/distill_artifacts_2026_05_21/coherence-20260521-123735.md`
+
+**Coherence-gate-dflash.sh: PASSED** (2026-05-21T12:46:18):
+- 4 cells: 27b-dflash-{prose,code} + 27b-ddtree-b12-{prose,code}
+- All status: OK. No token-attractor flagging at any tier.
+- Report saved at hiptrx `~/.hipfire/distill_artifacts_2026_05_21/coherence-dflash-20260521-124618.md`
+
+**Combined pflash gate**: 11/12 rows clean; 1 soft regression
+(longcode_baseline +2.5% drift, within ±5% tolerance). No correctness
+hard failure on any gate. Reports archived alongside coherence reports.
+
 ### K=4 beats K=5: new MTP solo optimum (supersedes prior memory)
 
 Memory's hard-falsified list said "K=5 peak"; that was on prior config.
