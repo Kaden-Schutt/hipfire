@@ -819,6 +819,13 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC: &str = include_str!("../../../ker
 // Target: lift gate_up_wmma from 305 GB/s (32% peak on gfx1100) toward
 // 60-70% peak. See feedback_v3_gate_up_k4_2026_05_21.md.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_k4.hip");
+// LDSCOOP variant: cooperative LDS weight staging. 32 threads load
+// each row's 136 bytes in 1-2 coalesced cache lines (128B per warp
+// instruction), vs the base k2 kernel's scattered 16-thread loads
+// (16 different cache lines per warp). Targets the 32% peak BW
+// observed in the base kernel — coalesced DRAM loads should get
+// closer to 60-70%. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldscoop.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
