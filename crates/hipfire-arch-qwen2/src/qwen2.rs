@@ -698,6 +698,57 @@ pub fn forward_step(
     state: &mut Qwen2State,
     token: u32,
 ) -> HipResult<()> {
+    let pos = forward_step_prelude(gpu, state)?;
+
+    // Embedding lookup → state.x.
+    let dim = cfg.hidden_size;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+    }
+
+    forward_step_after_x(gpu, weights, cfg, state, pos)
+}
+
+/// Variant of [`forward_step`] that consumes a pre-built F32 embedding row
+/// instead of looking one up from `weights.token_embd`. Used by VLM splice
+/// paths (dots-ocr, qwen2-vl) to insert vision-tower merger outputs at
+/// `<|imgpad|>` positions during prefill.
+///
+/// `embedding` is a host-side slice of exactly `cfg.hidden_size` F32 values
+/// (one row of the merger output). It is uploaded directly into `state.x.buf`,
+/// after which the layer loop runs identically to [`forward_step`].
+pub fn forward_step_with_embed(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    embedding: &[f32],
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    if embedding.len() != dim {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: forward_step_with_embed expects {dim} F32s (hidden_size); \
+                 got {} — caller probably sliced the wrong row of merger output",
+                embedding.len(),
+            ),
+        ));
+    }
+    let pos = forward_step_prelude(gpu, state)?;
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
+    forward_step_after_x(gpu, weights, cfg, state, pos)
+}
+
+/// Common prefix: bounds-check, upload pos. Returns the position used.
+fn forward_step_prelude(gpu: &mut Gpu, state: &Qwen2State) -> HipResult<usize> {
     let pos = state.next_pos;
     if pos >= state.max_seq {
         return Err(hip_bridge::HipError::new(
@@ -710,21 +761,21 @@ pub fn forward_step(
             ),
         ));
     }
-
-    // Upload pos to GPU buffer (single i32, used by rope/kv_write/attention).
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
+    Ok(pos)
+}
 
-    // Embedding lookup → x.
-    let dim = cfg.hidden_size;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-    }
-
+/// Common tail: 28-layer decoder + final RMSNorm + lm_head + bump next_pos.
+/// Assumes `state.x` already holds the embedding for `pos` and `state.pos_buf`
+/// has been uploaded.
+fn forward_step_after_x(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    pos: usize,
+) -> HipResult<()> {
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
     let head_dim = cfg.head_dim;
