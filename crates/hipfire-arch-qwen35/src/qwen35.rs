@@ -3027,19 +3027,17 @@ fn moe_ffn_decode_impl(
             )?;
         }
         // Gate→down hop. MQ paths use a single fused silu+mul+FWHT kernel;
-        // ParoQuant decomposes into batched silu_mul + batched Givens (no
-        // fused kernel yet — the silu_mul is dtype-agnostic and the
-        // givens_rotate kernel already supports seq_len > 1).
+        // ParoQuant uses the structural mirror `fused_silu_mul_givens_rotate`
+        // (silu+mul+per-channel-scale+krot Givens rounds in one launch).
+        // The earlier 2-launch decomposition (silu_mul_f32 + givens_rotate)
+        // produced a small but reproducible direct-vs-graph numerical
+        // delta on gfx1151/HIP 7.13; fusing matches the MQ4 pattern that
+        // hipGraph captures byte-identically.
         if routed_dtype_indexable_paro {
-            // Element-wise silu(gate) * up over the full [k × mi] batch.
-            gpu.silu_mul_f32(s.gate_batch, s.up_batch, s.rot_batch)?;
-            // Batched Givens rotation: seq_len = k_top rows of width mi.
-            // Same shared sidecars for all routed experts at this layer;
-            // experts[0].down.paro is the canonical handle.
             let paro_down = ffn.experts[0].down.paro.as_ref()
                 .expect("routed_paro implies experts[0].down.paro.is_some()");
-            gpu.givens_rotate(
-                s.rot_batch,
+            gpu.fused_silu_mul_givens_rotate_f32(
+                s.gate_batch, s.up_batch, s.rot_batch,
                 &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
                 k, mi, paro_down.krot as usize,
             )?;

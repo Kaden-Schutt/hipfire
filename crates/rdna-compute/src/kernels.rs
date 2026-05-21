@@ -535,6 +535,23 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 pub const GEMV_HFQ4G128_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
+/// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
+/// composition the ParoQuant MoE decode path used for the gate→down
+/// hop. Structural mirror of MQ4's `fused_silu_mul_rotate_mq` — fuses
+/// the gate→down activations to eliminate inter-launch state and
+/// match the single-kernel reduction pattern that holds up under
+/// hipGraph capture.
+pub const FUSED_SILU_MUL_GIVENS_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/fused_silu_mul_givens_rotate.hip");
+
+/// Out-of-place variant of `givens_rotate_f32`. Reads `x_in`, writes
+/// rotated activations to `x_out`. Used by `rotate_x_paro_for` to
+/// eliminate the preceding `copy_d2d` (one fewer graph node + one
+/// fewer inter-node dependency for the hipGraph dependency analyzer).
+pub const GIVENS_ROTATE_TO_SRC: &str =
+    include_str!("../../../kernels/src/givens_rotate_to.hip");
+
 /// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts. Used
 /// by mixed-kmap MoE models where some layers are promoted from MQ4 → MQ6
 /// (post-PR-199 alternating-kmap default). Without this kernel, those

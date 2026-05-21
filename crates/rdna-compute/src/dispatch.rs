@@ -2517,6 +2517,143 @@ impl Gpu {
         )
     }
 
+    /// Out-of-place Givens rotation. Reads `x_in`, writes rotated
+    /// activations to `x_out`. Replaces the
+    /// `copy_d2d + givens_rotate` pair used by `rotate_x_paro_for` —
+    /// one graph node + one inter-node dependency removed.
+    #[allow(clippy::too_many_arguments)]
+    pub fn givens_rotate_to(
+        &mut self,
+        x_in: &GpuTensor,
+        x_out: &GpuTensor,
+        pairs: &GpuTensor,
+        theta: &GpuTensor,
+        channel_scales: &GpuTensor,
+        seq_len: usize,
+        hidden_dim: usize,
+        krot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "givens_rotate_to_f32",
+            kernels::GIVENS_ROTATE_TO_SRC,
+            "givens_rotate_to_f32",
+        )?;
+
+        let cta_m: u32 = 4;
+        let group_size: u32 = 128;
+        let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
+        let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
+
+        let in_ptr = x_in.buf.as_ptr();
+        let out_ptr = x_out.buf.as_ptr();
+        let pairs_ptr = pairs.buf.as_ptr();
+        let theta_ptr = theta.buf.as_ptr();
+        let cs_ptr = channel_scales.buf.as_ptr();
+        let seq_val = seq_len as i32;
+        let dim_val = hidden_dim as i32;
+        let krot_val = krot as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &in_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &pairs_ptr as *const _ as *mut c_void,
+            &theta_ptr as *const _ as *mut c_void,
+            &cs_ptr as *const _ as *mut c_void,
+            &seq_val as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &krot_val as *const _ as *mut c_void,
+        ];
+
+        let smem = (cta_m * group_size * 4) as u32;
+
+        self.launch_maybe_blob(
+            "givens_rotate_to_f32",
+            [grid_x, groups_per_row, 1],
+            [group_size / 2, 1, 1],
+            smem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr); b.push_ptr(out_ptr);
+                b.push_ptr(pairs_ptr); b.push_ptr(theta_ptr); b.push_ptr(cs_ptr);
+                b.push_i32(seq_val); b.push_i32(dim_val); b.push_i32(krot_val);
+                b
+            },
+        )
+    }
+
+    /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
+    /// rotation. Single-launch replacement for the
+    /// `silu_mul_f32 + givens_rotate` pair used by the ParoQuant routed
+    /// gate→down hop. Same shared-memory + grid contract as
+    /// `givens_rotate`, plus two additional input pointers (gate, up)
+    /// and a separate output pointer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused_silu_mul_givens_rotate_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        pairs: &GpuTensor,
+        theta: &GpuTensor,
+        channel_scales: &GpuTensor,
+        seq_len: usize,
+        hidden_dim: usize,
+        krot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_silu_mul_givens_rotate_f32",
+            kernels::FUSED_SILU_MUL_GIVENS_ROTATE_SRC,
+            "fused_silu_mul_givens_rotate_f32",
+        )?;
+
+        let cta_m: u32 = 4;
+        let group_size: u32 = 128;
+        let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
+        let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
+
+        let gate_ptr = gate.buf.as_ptr();
+        let up_ptr = up.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let pairs_ptr = pairs.buf.as_ptr();
+        let theta_ptr = theta.buf.as_ptr();
+        let cs_ptr = channel_scales.buf.as_ptr();
+        let seq_val = seq_len as i32;
+        let dim_val = hidden_dim as i32;
+        let krot_val = krot as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &gate_ptr as *const _ as *mut c_void,
+            &up_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &pairs_ptr as *const _ as *mut c_void,
+            &theta_ptr as *const _ as *mut c_void,
+            &cs_ptr as *const _ as *mut c_void,
+            &seq_val as *const _ as *mut c_void,
+            &dim_val as *const _ as *mut c_void,
+            &krot_val as *const _ as *mut c_void,
+        ];
+
+        let smem = (cta_m * group_size * 4) as u32;
+
+        self.launch_maybe_blob(
+            "fused_silu_mul_givens_rotate_f32",
+            [grid_x, groups_per_row, 1],
+            [group_size / 2, 1, 1],
+            smem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_ptr(pairs_ptr); b.push_ptr(theta_ptr); b.push_ptr(cs_ptr);
+                b.push_i32(seq_val); b.push_i32(dim_val); b.push_i32(krot_val);
+                b
+            },
+        )
+    }
+
     /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
     pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
         if let Some(ref s) = self.paro_x_scratch {

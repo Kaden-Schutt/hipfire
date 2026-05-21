@@ -903,12 +903,12 @@ pub fn rotate_x_mq_for(
     }
 }
 
-/// ParoQuant single-token rotation: copy x → x_rot, then apply the layer's
-/// shared Givens rotation (pairs / theta / channel_scales) into x_rot.
-/// Mirrors the in-`weight_gemv(ParoQ4G128)` rotation step but writes to a
-/// caller-provided buffer so the same rotated activation can feed multiple
-/// downstream GEMVs (e.g. the indexed MoE gate_up kernel that reuses
-/// `paro_shared.gate_up_*` across all routed experts).
+/// ParoQuant single-token rotation: read x, write Givens-rotated
+/// activation to x_rot via a single out-of-place kernel. Earlier
+/// versions did `copy_d2d(x → x_rot)` then `givens_rotate(x_rot)`;
+/// fusing into one launch eliminates an inter-node dependency that
+/// the hipGraph dependency analyzer can fail to enforce (observed
+/// numerical delta direct-vs-graph on gfx1151 / HIP 7.13).
 pub fn rotate_x_paro_for(
     gpu: &mut Gpu,
     paro: &ParoRotation,
@@ -916,9 +916,9 @@ pub fn rotate_x_paro_for(
     x_rot: &GpuTensor,
     k: usize,
 ) -> HipResult<()> {
-    gpu.copy_d2d(x, x_rot, k * 4)?;
-    gpu.givens_rotate(
-        x_rot, &paro.pairs, &paro.theta, &paro.channel_scales,
+    gpu.givens_rotate_to(
+        x, x_rot,
+        &paro.pairs, &paro.theta, &paro.channel_scales,
         1, k, paro.krot as usize,
     )
 }
