@@ -5487,10 +5487,14 @@ fn prefill_moe_ffn_body_batched(
                     &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
                     n, dim, paro.krot as usize,
                 )?;
+                // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
+                // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
+                // (clean decode, finite logits) + coherence-gate (MQ4 paths
+                // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
                 let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
+                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
                 let use_paro_i8_k8 = use_paro_i8
-                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() == Ok("1");
+                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
                         &ffn.expert_gate_up_ptrs, tile_ids, sorted,
@@ -5621,10 +5625,14 @@ fn prefill_moe_ffn_body_batched(
             // rotation-agnostic. Same kernel for gate_up + down — only
             // shape parameters and x_row_div differ.
             DType::ParoQ4G128 => {
+                // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
+                // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
+                // (clean decode, finite logits) + coherence-gate (MQ4 paths
+                // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
                 let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() == Ok("1");
+                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
                 let use_paro_i8_k8 = use_paro_i8
-                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() == Ok("1");
+                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
                 if use_paro_i8_k8 {
                     gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
                         &ffn.expert_down_ptrs, tile_ids, sorted,
@@ -7090,9 +7098,12 @@ fn forward_prefill_chunk(
                     // ParoQ4G128 with their own Givens rotation tables;
                     // w_alpha and w_beta are F32 with no rotation.
                     let paro_wqkv = layer.wqkv.paro.as_ref()
-                        .expect("ParoQ4G128 wqkv missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wqkv missing paro metadata at LA layer {layer_idx} \
+                             — paro_load_wt() loader regression?"));
                     let paro_wz = layer.wz.paro.as_ref()
-                        .expect("ParoQ4G128 wz missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wz missing paro metadata at LA layer {layer_idx}"));
                     // wqkv: rotate x_norm → x_rot, then HFQ4G128 GEMM.
                     gpu.givens_rotate_to(
                         &pbs.x_norm_batch, &pbs.x_rot_batch,
@@ -7269,7 +7280,8 @@ fn forward_prefill_chunk(
                     // into dn_normed_rot_batch. Same scratch layout as MQ4
                     // (since dn_normed_rot_batch is unused on the Q8 path).
                     let paro_wo = layer.wo.paro.as_ref()
-                        .expect("ParoQ4G128 wo missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wo missing paro metadata at LA layer {layer_idx}"));
                     gpu.givens_rotate_to(
                         &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch,
                         &paro_wo.pairs, &paro_wo.theta, &paro_wo.channel_scales,
@@ -7398,11 +7410,14 @@ fn forward_prefill_chunk(
                     // Givens rotation). Same shape outputs as the fused
                     // paths: fa_q_full_batch, fa_k_batch, fa_v_batch.
                     let paro_wq = layer.wq.paro.as_ref()
-                        .expect("ParoQ4G128 wq missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wq missing paro metadata at FA layer {layer_idx}"));
                     let paro_wk = layer.wk.paro.as_ref()
-                        .expect("ParoQ4G128 wk missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wk missing paro metadata at FA layer {layer_idx}"));
                     let paro_wv = layer.wv.paro.as_ref()
-                        .expect("ParoQ4G128 wv missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wv missing paro metadata at FA layer {layer_idx}"));
                     // wq
                     gpu.givens_rotate_to(
                         &pbs.x_norm_batch, &pbs.x_rot_batch,
@@ -7714,7 +7729,8 @@ fn forward_prefill_chunk(
                     &pbs.fa_attn_out_batch
                 } else if fa_wo_is_paro {
                     let paro_wo = layer.wo.paro.as_ref()
-                        .expect("ParoQ4G128 wo missing paro metadata");
+                        .unwrap_or_else(|| panic!(
+                            "ParoQ4G128 wo missing paro metadata at FA layer {layer_idx}"));
                     gpu.givens_rotate_to(
                         &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch,
                         &paro_wo.pairs, &paro_wo.theta, &paro_wo.channel_scales,
