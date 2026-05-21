@@ -963,6 +963,16 @@ pub fn vision_forward(
     dump_stats(gpu, &normed, "patch_embed_norm")?;
     gpu.free_tensor(x)?;
     x = normed;
+    // HF cast x to bf16 at vision forward entry (modeling_dots_vision.py
+    // line 484-485 `hidden_states = hidden_states.bfloat16()`), so the
+    // residual stream is bf16-precision throughout. Emulate that by
+    // bf16-truncating at every block boundary (after each residual add).
+    // Optional via env var so it can be A/B tested.
+    let bf16_residual = std::env::var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
+        .ok().as_deref() == Some("1");
+    if bf16_residual {
+        gpu.bf16_round_trip_f32(&x)?;
+    }
     // Dump matches HF capture point — `patch_embed` hook is on the
     // full `vt.patch_embed` module = Conv2d + bias + RMSNorm output.
     dump_stage(gpu, &x, "patch_embed", &[n_patches, h])?;
@@ -1107,6 +1117,7 @@ pub fn vision_forward(
         }
         gpu.add_inplace_f32(&x, &proj)?;
         gpu.free_tensor(proj)?;
+        if bf16_residual { gpu.bf16_round_trip_f32(&x)?; }
         toc!(gpu, "residual1 (add)");
 
         // 2g. RMSNorm pre-MLP.
@@ -1151,6 +1162,7 @@ pub fn vision_forward(
         toc!(gpu, "fc2 GEMM");
         gpu.add_inplace_f32(&x, &fc2_y)?;
         gpu.free_tensor(fc2_y)?;
+        if bf16_residual { gpu.bf16_round_trip_f32(&x)?; }
         toc!(gpu, "residual2 (add)");
 
         if trace {

@@ -20120,6 +20120,40 @@ impl Gpu {
         result
     }
 
+    /// In-place F32 → bf16 → F32 round-trip on `x`. Used by the
+    /// dots.ocr vision encoder for HF-bf16-precision emulation
+    /// (see `kernels/src/bf16_round_trip.hip`).
+    pub fn bf16_round_trip_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "bf16_round_trip",
+            kernels::BF16_ROUND_TRIP_SRC,
+            "bf16_round_trip_f32",
+        )?;
+        let xp = x.buf.as_ptr();
+        let n = x.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let grid = (((n as u32) + block_size - 1) / block_size).max(1);
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "bf16_round_trip", "bf16_round_trip_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "bf16_round_trip_f32", [grid, 1, 1], [block_size, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.

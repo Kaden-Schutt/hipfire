@@ -1558,6 +1558,12 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/q
 /// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
 pub const ATTENTION_DFLASH_WMMA_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma.hip");
 
+/// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
+/// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
+/// vision encoder to match HF's bf16 forward path at residual-stream
+/// points. See `kernels/src/bf16_round_trip.hip`.
+pub const BF16_ROUND_TRIP_SRC: &str = include_str!("../../../kernels/src/bf16_round_trip.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
