@@ -1,8 +1,8 @@
 # MTP + DFlash composition master plan
 
-**Date:** 2026-05-18
-**Branch:** `feat/mtp` (HEAD `d10c0906`)
-**Status:** Architecture proposed; prototype not yet built
+**Date:** 2026-05-18 (original) — **2026-05-21 EMPIRICAL UPDATE BELOW**
+**Branch:** `mtp-hiptrx-rocprof` (HEAD `f1dfa1ef`+, was `feat/mtp` `d10c0906`)
+**Status:** **Phase 0 EXECUTED + EMPIRICALLY VALIDATED — STRUCTURALLY BLOCKED on current MTP head quality**
 **Goal:** Match Unsloth/Atlas-class solo MTP (60-80 tok/s on 27B-3.5), then
 STACK DFlash composition on top for **250-350+ tok/s** — exceeding DFlash
 solo (199 tok/s on canonical).
@@ -11,19 +11,79 @@ This document is the load-bearing handoff for the multi-phase MTP+DFlash
 composition work. Read this before re-investigating already-falsified
 levers (see "Negative results" section).
 
-## Headline ambition
+## 2026-05-21 EMPIRICAL UPDATE — Phase 0 + Phase 1 Track A results
+
+**TL;DR**: Composition architecture works correctly but does NOT exceed
+DFlash solo with current MTP head. Phase 1 Track A (sidecar swap) gives
+ZERO lift on canonical. The structural bottleneck is MTP head WEIGHT
+QUALITY (not vocab compression, not composition design). Clearing
+either Goal A (60-80+ tok/s solo) or Goal B (230+ composition) requires:
+- (1) MTP block weight fine-tuning — multi-day PyTorch pipeline, OR
+- (2) Replay elimination kernel work — multi-week, OR
+- (3) TP across 4× R9700s on hiptrx — multi-week infrastructure
+
+Empirical bench numbers (canonical 27B-3.5 K=4 Q8 greedy --no-chatml):
+
+| Variant | hiptrx 1× R9700 | k9lin 7900 XTX | Goal A target | Goal B target |
+|---|---|---|---|---|
+| MTP solo | 45.4 tok/s | 49.0 tok/s (mean) | 60-80+ | — |
+| DFlash solo | 126.1 | 181 | — | — (baseline) |
+| Composition B=14 K=2 (best) | 123.8 | 159.3 | — | 230+ |
+
+Composition is 1.7% under DFlash solo on hiptrx, 12% under on k9lin.
+MTP solo is 18-27% under Goal A target.
+
+See `docs/plans/mtp-composition-bench-2026-05-21.md` and
+`docs/plans/mtp-hiptrx-rocprof-2026-05-21.md` for full data + reproducibility.
+
+### What was tested and falsified tonight
+
+| Lever | Result | Why |
+|---|---|---|
+| Composition linear B+K sweep across 5 configs | Best 159 k9lin / 124 hiptrx | MTP candidates only fire on DFlash full-accept (~7%) |
+| Composition tree variant | 3-7× worse than linear | B×K MTP overhead dominates |
+| Track A sidecar swap (v1 + v2 + merged) | 0.0% canonical lift | cvs16384 already ~100% coverage |
+| MQ4 vs Q8 distilled head | Same tok/s, Q8 has τ=3.50 vs 3.40 | Both at similar wall, Q8 quant lifts accept marginally |
+| K-sweep K=3,4,5,6,7 | K=4 +14.6% hiptrx, +2.4% k9lin | K=5 wastes one MTP block forward |
+| Aggressive M (B=16 K=8, B=24 K=8) | Much worse | 2-tile overhead > extra commits |
+| rocprof on cycle | No hidden kernels | Decode already batched, 50-55% peak BW |
+
+### What's still NOT tested (out of overnight scope)
+
+1. **MTP block weight fine-tuning** (multi-day): use the 249-prompt /
+   70K trunk-argmax corpus captured tonight as supervised labels. Train
+   block.attn + block.ffn weights with PyTorch + Transformers.
+   Distilled head + bench at end. Could plausibly lift τ 3.40 → 5.0+.
+2. **Imatrix-aware quantization**: requires `mtp_extract` extension to
+   weight error minimization by activation magnitude. Multi-hour code
+   work. Mild lift (+5-15% typical).
+3. **Replay elimination via per-position GDN checkpoint kernel**:
+   multi-week kernel + plumbing work. -30-50% cycle wall. Direct lift
+   for both Goal A and Goal B.
+4. **Pipelined MTP-DFlash overlap**: run MTP K-chain ON ANOTHER STREAM
+   concurrently with DFlash drafter. Saves ~5-10 ms/cycle if streams
+   actually overlap on R9700. Speculative.
+5. **TP across 4× R9700 on hiptrx**: multi-week TP infrastructure.
+   3-4× lift theoretical, ~350-500 tok/s on hiptrx (clears all goals).
+
+## Headline ambition (ORIGINAL — kept for context)
 
 | Layer | Current tok/s (27B-3.5 canonical) | Target |
 |---|---|---|
-| DFlash solo | 199 | (baseline) |
-| MTP solo | 53 (1.17× AR) | 60-80 (1.3-1.8× AR, Unsloth/Atlas class) |
-| **DFlash + MTP composition** | **untried with current MTP arch** | **250-350+** (1.25-1.75× DFlash solo) |
+| DFlash solo | 199 (CLAUDE.md) / 181 (today's measurement) | (baseline) |
+| MTP solo | 53 (1.17× AR) → 49 today w/ K=4 | 60-80 (1.3-1.8× AR, Unsloth/Atlas class) |
+| **DFlash + MTP composition** | **159 today (k9lin) / 124 (hiptrx)** | **250-350+** (1.25-1.75× DFlash solo) |
 
 Sneaky-smart sequencing: **probe composition FIRST** with current weak MTP
 to validate the architecture in days, not weeks. Composition gains are
 ADDITIVE — if composition gives +2 commits/cycle on top of DFlash, that's
 already 230-250 tok/s. Investing in solo MTP improvements then MULTIPLIES
 the base.
+
+> **Validation outcome (2026-05-21)**: composition contributes
+> ~0 net commits with current MTP head. Master plan's honest math
+> ("Composition is at-best-flat over DFlash solo if MTP adds 2-3
+> commits per cycle") proven correct empirically.
 
 ## Proposed architecture: "MTP-extended verify"
 
