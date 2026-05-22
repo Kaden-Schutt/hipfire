@@ -7828,6 +7828,18 @@ fn run_fa_layer_body(
     let x_rot = fused_rmsnorm_rotate_for_mq(
         gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
     )?;
+    // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
+    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+        && layer.w_gate.gpu_dtype == DType::PARO4G128T
+        && layer.w_gate.k % 128 == 0
+        && layer.w_gate.m % 8 == 0
+    {
+        fused_rmsnorm_rotate_for_paro(
+            gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+        )?
+    } else {
+        None
+    };
     let dt_g = layer.w_gate.gpu_dtype;
     let same_dtype = layer.w_up.gpu_dtype == dt_g;
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
@@ -7836,6 +7848,7 @@ fn run_fa_layer_body(
         && dt_g == DType::PARO4G128T
         && layer.w_gate.m == layer.w_up.m
         && layer.w_gate.k == layer.w_up.k
+        && x_rot_paro.is_none()
         && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
@@ -7880,7 +7893,11 @@ fn run_fa_layer_body(
             layer.w_gate.k,
         )?;
     } else {
-        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+        if let Some(xr_first) = x_rot_paro {
+            gpu.gemv_paro4g128t_prerotated(&layer.w_gate.buf, xr_first, &s.gate_ffn, layer.w_gate.m, layer.w_gate.k)?;
+        } else {
+            weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+        }
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
     weight_gemv_swiglu_residual(
@@ -8052,6 +8069,18 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.wqkv.gpu_dtype == DType::PARO4G128T
+                    && layer.wqkv.k % 128 == 0
+                    && layer.wqkv.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 LA attn_norm", &s.tmp)?;
                 }
@@ -8072,9 +8101,11 @@ fn forward_scratch_layers(
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_la4_paro4t = la4_same_dtype
                     && dt == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
                 let fused_la2_paro4t = dt == DType::PARO4G128T
                     && layer.wz.gpu_dtype == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_la4_hfq6 = la4_same_dtype
@@ -8139,7 +8170,11 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.wqkv.buf, xr_first, &s.dn_qkv, layer.wqkv.m, layer.wqkv.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
@@ -8249,6 +8284,18 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.w_gate.gpu_dtype == DType::PARO4G128T
+                    && layer.w_gate.k % 128 == 0
+                    && layer.w_gate.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 if layer_idx == 0 {
                     trace_finite_if_enabled(gpu, "layer 0 FFN norm", &s.tmp)?;
                 }
@@ -8262,6 +8309,7 @@ fn forward_scratch_layers(
                     && dt_g == DType::PARO4G128T
                     && layer.w_gate.m == layer.w_up.m
                     && layer.w_gate.k == layer.w_up.k
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
@@ -8312,7 +8360,11 @@ fn forward_scratch_layers(
                         layer.w_gate.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.w_gate.buf, xr_first, &s.gate_ffn, layer.w_gate.m, layer.w_gate.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 }
                 if layer_idx == 0 {
@@ -8344,6 +8396,18 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for wq.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.wq.gpu_dtype == DType::PARO4G128T
+                    && layer.wq.k % 128 == 0
+                    && layer.wq.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
                 // Works for MQ4 and HF4 — same kernel math as the LA 4-way.
                 let dt = layer.wq.gpu_dtype;
@@ -8352,6 +8416,7 @@ fn forward_scratch_layers(
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_fa3_paro4t = fa3_same_dtype
                     && dt == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
@@ -8400,7 +8465,11 @@ fn forward_scratch_layers(
                         layer.wq.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.wq.buf, xr_first, &s.fa_q_full, layer.wq.m, layer.wq.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
                     weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 }
@@ -8561,6 +8630,18 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.w_gate.gpu_dtype == DType::PARO4G128T
+                    && layer.w_gate.k % 128 == 0
+                    && layer.w_gate.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
                 let dt_g = layer.w_gate.gpu_dtype;
@@ -8571,6 +8652,7 @@ fn forward_scratch_layers(
                     && dt_g == DType::PARO4G128T
                     && layer.w_gate.m == layer.w_up.m
                     && layer.w_gate.k == layer.w_up.k
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
@@ -8621,7 +8703,11 @@ fn forward_scratch_layers(
                         layer.w_gate.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.w_gate.buf, xr_first, &s.gate_ffn, layer.w_gate.m, layer.w_gate.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                 }
                 // Fused SwiGLU + w_down residual GEMV:
@@ -8652,6 +8738,18 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.wqkv.gpu_dtype == DType::PARO4G128T
+                    && layer.wqkv.k % 128 == 0
+                    && layer.wqkv.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 let dt = layer.wqkv.gpu_dtype;
                 let la4_same_dtype = layer.wz.gpu_dtype == dt
                     && layer.w_beta.gpu_dtype == dt
@@ -8660,9 +8758,11 @@ fn forward_scratch_layers(
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_la4_paro4t = la4_same_dtype
                     && dt == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
                 let fused_la2_paro4t = dt == DType::PARO4G128T
                     && layer.wz.gpu_dtype == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                 if fused_la4_mq4 {
                     let eff_x = match x_rot {
@@ -8709,7 +8809,11 @@ fn forward_scratch_layers(
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.wqkv.buf, xr_first, &s.dn_qkv, layer.wqkv.m, layer.wqkv.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
@@ -8794,12 +8898,25 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                // Lever 1 — Fused rmsnorm + PARO per-group rotation for wq.
+                let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                    && layer.wq.gpu_dtype == DType::PARO4G128T
+                    && layer.wq.k % 128 == 0
+                    && layer.wq.m % 8 == 0
+                {
+                    fused_rmsnorm_rotate_for_paro(
+                        gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                    )?
+                } else {
+                    None
+                };
                 let dt = layer.wq.gpu_dtype;
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                 let fused_fa3_paro4t = fa3_same_dtype
                     && dt == DType::PARO4G128T
+                    && x_rot_paro.is_none()
                     && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
@@ -8848,7 +8965,11 @@ fn forward_scratch_layers(
                         layer.wq.k,
                     )?;
                 } else {
-                    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    if let Some(xr_first) = x_rot_paro {
+                        gpu.gemv_paro4g128t_prerotated(&layer.wq.buf, xr_first, &s.fa_q_full, layer.wq.m, layer.wq.k)?;
+                    } else {
+                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                    }
                     weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
                     weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                 }
@@ -9100,6 +9221,18 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.wqkv.gpu_dtype == DType::PARO4G128T
+                        && layer.wqkv.k % 128 == 0
+                        && layer.wqkv.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt = layer.wqkv.gpu_dtype;
                     let la4_same_dtype = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
@@ -9108,9 +9241,11 @@ fn forward_scratch_layers_multi(
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_paro4t = la4_same_dtype
                         && dt == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
                     let fused_la2_paro4t = dt == DType::PARO4G128T
                         && layer.wz.gpu_dtype == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                     if fused_la4_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9151,7 +9286,11 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.wqkv.buf, xr_first, &s.dn_qkv, layer.wqkv.m, layer.wqkv.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
@@ -9207,6 +9346,18 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.w_gate.gpu_dtype == DType::PARO4G128T
+                        && layer.w_gate.k % 128 == 0
+                        && layer.w_gate.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
@@ -9215,6 +9366,7 @@ fn forward_scratch_layers_multi(
                         && dt_g == DType::PARO4G128T
                         && layer.w_gate.m == layer.w_up.m
                         && layer.w_gate.k == layer.w_up.k
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9246,7 +9398,11 @@ fn forward_scratch_layers_multi(
                             layer.w_gate.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.w_gate.buf, xr_first, &s.gate_ffn, layer.w_gate.m, layer.w_gate.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                     }
                     weight_gemv_swiglu_residual(
@@ -9259,12 +9415,25 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for wq.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.wq.gpu_dtype == DType::PARO4G128T
+                        && layer.wq.k % 128 == 0
+                        && layer.wq.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_paro4t = fa3_same_dtype
                         && dt == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9294,7 +9463,11 @@ fn forward_scratch_layers_multi(
                             layer.wq.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.wq.buf, xr_first, &s.fa_q_full, layer.wq.m, layer.wq.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
                         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                     }
@@ -9421,6 +9594,18 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for w_gate.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.w_gate.gpu_dtype == DType::PARO4G128T
+                        && layer.w_gate.k % 128 == 0
+                        && layer.w_gate.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt_g = layer.w_gate.gpu_dtype;
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
@@ -9429,6 +9614,7 @@ fn forward_scratch_layers_multi(
                         && dt_g == DType::PARO4G128T
                         && layer.w_gate.m == layer.w_up.m
                         && layer.w_gate.k == layer.w_up.k
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9460,7 +9646,11 @@ fn forward_scratch_layers_multi(
                             layer.w_gate.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.w_gate.buf, xr_first, &s.gate_ffn, layer.w_gate.m, layer.w_gate.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
                     }
                     weight_gemv_swiglu_residual(
@@ -9472,6 +9662,18 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for wqkv.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.wqkv.gpu_dtype == DType::PARO4G128T
+                        && layer.wqkv.k % 128 == 0
+                        && layer.wqkv.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt = layer.wqkv.gpu_dtype;
                     let la4_same_dtype = layer.wz.gpu_dtype == dt
                         && layer.w_beta.gpu_dtype == dt
@@ -9480,9 +9682,11 @@ fn forward_scratch_layers_multi(
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_la4_paro4t = la4_same_dtype
                         && dt == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
                     let fused_la2_paro4t = dt == DType::PARO4G128T
                         && layer.wz.gpu_dtype == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                     if fused_la4_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9523,7 +9727,11 @@ fn forward_scratch_layers_multi(
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.wqkv.buf, xr_first, &s.dn_qkv, layer.wqkv.m, layer.wqkv.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                         weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                         weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
@@ -9594,12 +9802,25 @@ fn forward_scratch_layers_multi(
                     let x_rot = fused_rmsnorm_rotate_for_mq(
                         gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                     )?;
+                    // Lever 1 — Fused rmsnorm + PARO per-group rotation for wq.
+                    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+                        && layer.wq.gpu_dtype == DType::PARO4G128T
+                        && layer.wq.k % 128 == 0
+                        && layer.wq.m % 8 == 0
+                    {
+                        fused_rmsnorm_rotate_for_paro(
+                            gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+                        )?
+                    } else {
+                        None
+                    };
                     let dt = layer.wq.gpu_dtype;
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
                     let fused_fa3_paro4t = fa3_same_dtype
                         && dt == DType::PARO4G128T
+                        && x_rot_paro.is_none()
                         && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
@@ -9629,7 +9850,11 @@ fn forward_scratch_layers_multi(
                             layer.wq.k,
                         )?;
                     } else {
-                        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                        if let Some(xr_first) = x_rot_paro {
+                            gpu.gemv_paro4g128t_prerotated(&layer.wq.buf, xr_first, &s.fa_q_full, layer.wq.m, layer.wq.k)?;
+                        } else {
+                            weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+                        }
                         weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
                         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
                     }
