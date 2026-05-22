@@ -767,6 +767,9 @@ pub struct Gpu {
     /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
+    /// MagnumQuant FWHT signs for G128 (128 floats each, seeds 43 and 1043).
+    pub mq_signs1_128: Option<GpuTensor>,
+    pub mq_signs2_128: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
     pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
@@ -921,6 +924,17 @@ pub struct Gpu {
     /// dispatch threads (one `Gpu` per device, all routing into a single
     /// per-tensor accumulator).
     pub capture_handler: Option<Arc<dyn ActivationCapture>>,
+}
+
+/// Generate `n` FWHT sign values (+1.0 / -1.0) from a simple LCG seeded with `seed`.
+/// Deterministic and portable; used by both host-side codec (weight encoding) and
+/// device-side init (`ensure_mq_signs` / `ensure_mq_signs_128`).
+pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+    let mut state = seed;
+    (0..n).map(|_| {
+        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+    }).collect()
 }
 
 impl Gpu {
@@ -1084,6 +1098,8 @@ impl Gpu {
             verify_stream: None,
             mq_signs1: None,
             mq_signs2: None,
+            mq_signs1_128: None,
+            mq_signs2_128: None,
             mq_x_rot: None,
             paro_x_scratch: None,
             mq_x_q8: None,
@@ -5261,15 +5277,8 @@ impl Gpu {
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         if self.mq_signs1.is_some() { return Ok(()); }
-        fn gen_signs(seed: u32) -> Vec<f32> {
-            let mut state = seed;
-            (0..256).map(|_| {
-                state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-                if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-            }).collect()
-        }
-        let s1 = gen_signs(42);
-        let s2 = gen_signs(1042);
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
         let s1b: Vec<u8> = s1.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s1t = self.alloc_tensor(&[256], DType::F32)?;
@@ -5285,6 +5294,23 @@ impl Gpu {
         self.mq_x_rot = Some(x_rot);
         self.mq_x_q8 = Some(x_q8);
         self.mq_x_scales = Some(x_scales);
+        Ok(())
+    }
+
+    /// Lazily initialize MagnumQuant FWHT sign tables for G128 (128 floats each, seeds 43 and 1043).
+    pub fn ensure_mq_signs_128(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.mq_signs1_128.is_some() { return Ok(()); }
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
+        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1t = self.alloc_tensor(&[128], DType::F32)?;
+        let s2t = self.alloc_tensor(&[128], DType::F32)?;
+        self.hip.memcpy_htod(&s1t.buf, &s1b)?;
+        self.hip.memcpy_htod(&s2t.buf, &s2b)?;
+        self.mq_signs1_128 = Some(s1t);
+        self.mq_signs2_128 = Some(s2t);
         Ok(())
     }
 
@@ -27718,5 +27744,25 @@ impl Drop for Gpu {
             return;
         }
         self.bind_thread_or_warn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gen_fwht_signs;
+
+    #[test]
+    fn mq_signs_128_deterministic() {
+        let s1 = gen_fwht_signs(43, 128);
+        let s2 = gen_fwht_signs(1043, 128);
+        assert_eq!(s1.len(), 128);
+        assert_eq!(s2.len(), 128);
+        for x in &s1 { assert!(*x == 1.0 || *x == -1.0, "signs1 contains {x}"); }
+        for x in &s2 { assert!(*x == 1.0 || *x == -1.0, "signs2 contains {x}"); }
+        // Reproducibility
+        assert_eq!(gen_fwht_signs(43, 128), s1);
+        assert_eq!(gen_fwht_signs(1043, 128), s2);
+        // Distinct from G256 seeds
+        assert_ne!(gen_fwht_signs(42, 128), s1, "seed 43 should differ from seed 42");
     }
 }
