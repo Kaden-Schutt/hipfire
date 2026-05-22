@@ -2795,19 +2795,19 @@ impl Gpu {
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
     ///
-    /// gfx1151 i8 MMQ fast-path (opt-in via HIPFIRE_HFQ4G128_MMQ=1): when
-    /// batch_size and M are 16-tile aligned, pre-quantize X to Q8_1 and
-    /// route to `gemm_hfq4g128_mmq_gfx1151`. Closes the rocprof finding
-    /// that this kernel was 66% of pp256 prefill on A3B-PARO. Default OFF
-    /// until channel-tested + perf-gated; mirror of the routed-MoE MMQ k8
-    /// rollout precedent.
+    /// gfx1151 i8 MMQ fast-path (default ON; opt out via HIPFIRE_HFQ4G128_MMQ=0):
+    /// when batch_size and M are 16-tile aligned, pre-quantize X to Q8_1 and
+    /// route to `gemm_hfq4g128_mmq_gfx1151`. Closes the rocprof finding that
+    /// this kernel was 66% of pp256 prefill on A3B-PARO; A/B median +129.5%
+    /// (427 → 980 tok/s pp256) on shisa-Qwen3.6-35B-A3B-PARO. Mirror of the
+    /// routed-MoE MMQ k8 default-on flip at 949f51db.
     pub fn gemm_hfq4g128(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let use_mmq = self.arch.starts_with("gfx1151")
-            && std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() == Ok("1")
+            && std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0")
             && batch_size >= 16
             && batch_size % 16 == 0
             && m % 16 == 0
