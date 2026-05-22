@@ -855,17 +855,30 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
     x_rot_scratch: &'a GpuTensor,
     eps: f32,
 ) -> HipResult<Option<&'a GpuTensor>> {
-    let opt_out = std::env::var("HIPFIRE_PARO_FUSE_RMSNORM")
-        .map(|v| v == "0")
+    // IMPORTANT: callers chain this AFTER `fused_rmsnorm_rotate_for_mq`,
+    // which already runs rmsnorm_f32 in its non-MQ fallthrough. So when we
+    // return None (opt-out or wrong dtype), `tmp` already contains the
+    // rmsnorm output from the prior call — DO NOT run rmsnorm_f32 again.
+    //
+    // STATUS: Lever 1 falsified at -2.4% on 0.8B PARO4G128T (gfx1201, 2026-05-22).
+    // The single-workgroup fused kernel runs ~K-rotation serially within one block,
+    // losing the M/8 cross-CU parallelism that the split rotate kernel (grid=[K/128])
+    // gets for free. Saves ~10µs launch overhead but adds ~30-70µs serial rotate
+    // time per call. Net loss on every site. Default OFF; explicit opt-in for
+    // research / future-redesign comparison.
+    let opt_in = std::env::var("HIPFIRE_PARO_FUSE_RMSNORM")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if opt_out {
-        gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+    if !opt_in {
         return Ok(None);
     }
     match next_linear.gpu_dtype {
         DType::PARO4G128T => {
             // Fast path: fused kernel emits x_rot (for next_linear's
             // prerotated GEMV) + tmp (post-rmsnorm x for subsequent linears).
+            // Math identity: the kernel computes the same rmsnorm into tmp
+            // that fused_rmsnorm_rotate_for_mq's fallthrough would have, so
+            // overwriting tmp here is fine.
             gpu.fused_rmsnorm_paro4g128t_rotate(
                 &next_linear.buf,
                 x,
@@ -879,8 +892,7 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
             Ok(Some(x_rot_scratch))
         }
         _ => {
-            // Non-PARO dtype: plain rmsnorm into tmp, caller uses standard path.
-            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+            // Non-PARO dtype: tmp already has rmsnorm output from prior call.
             Ok(None)
         }
     }
