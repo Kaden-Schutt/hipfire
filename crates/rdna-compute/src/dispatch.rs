@@ -6183,6 +6183,47 @@ impl Gpu {
         result
     }
 
+    /// FWHT-128 standalone rotation for MQ4G128 activations.
+    ///
+    /// Mirrors `rotate_x_mq` but targets G128 groups (32 threads × 4 elems).
+    /// Grid: [k/128, 1, 1]. Block: [32, 1, 1].
+    ///
+    /// NOTE: This is a T5-preview — the full T5 will expand it with batched
+    /// and AWQ variants. For now it's the minimal path needed by the
+    /// test_fwht_128_gpu_vs_cpu correctness gate (T3).
+    pub fn rotate_x_mq_128(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs_128()?;
+        self.ensure_kernel("gemv_mq4g128", kernels::GEMV_MQ4G128_SRC, "mq_rotate_x_128")?;
+        let s1_ptr = self.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 128) as u32;
+        let xp = x.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void, &xrp as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void, &s2_ptr as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::mq_rotate_bytes(k);
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_128", bytes);
+        let result = self.launch_maybe_blob(
+            "mq_rotate_x_128",
+            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(xrp);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
+                b.push_i32(kv);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(xrp);
+        result
+    }
+
     /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
     ///
     /// Divides each input element by `awq_scale[i]` BEFORE the FWHT,
