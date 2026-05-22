@@ -2517,6 +2517,7 @@ impl Gpu {
 
     /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
     pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
         if let Some(ref s) = self.paro_x_scratch {
             if s.buf.size() >= dim * 4 { return Ok(()); }
         }
@@ -2537,6 +2538,7 @@ impl Gpu {
     /// implicit `min(src.size(), dst.size())` silently truncated mismatched
     /// copies, which was a footgun.
     pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor, n_bytes: usize) -> HipResult<()> {
+        // bind_thread: skip — delegates to memcpy_dtod_auto which binds
         debug_assert!(n_bytes <= src.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds src.buf.size ({})", src.buf.size());
         debug_assert!(n_bytes <= dst.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds dst.buf.size ({})", dst.buf.size());
         self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
@@ -23980,6 +23982,160 @@ impl Gpu {
             "pflash_score_q8_kv_blocks",
         )?;
         let func = &self.functions["pflash_score_q8_kv_blocks"];
+
+        let k_ptr = k_cache.buf.as_ptr();
+        let s_ptr = scores_out.buf.as_ptr();
+        let mut np = n_pos as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = block_size as i32;
+        let mut nb = n_blocks as i32;
+        let mut lp = last_pos as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &k_ptr as *const _ as *mut c_void,
+            &s_ptr as *const _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut nb as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+        ];
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_blocks as u32, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// PFlash per-block scoring — fwht3 K-cache variant.
+    ///
+    /// Same input/output contract as `pflash_score_q8_kv`: takes a K
+    /// cache buffer and emits one f32 cosine score per block. Only the
+    /// K dequant path differs (fwht3 vs Q8). Used by
+    /// `pflash::compute_scores_batched_gpu` when the drafter runs with
+    /// fwht3 KV — that path's no-LDS-cap batched flash unblocks the >15K
+    /// ctx regime that Q8 batched flash falls out of.
+    ///
+    /// Header prepend: the kernel uses `TURBO_C3_256` from
+    /// `turbo_common.h`. Reusing `ensure_givens4_kernel` since it already
+    /// prepends `turbo_common.h` + `givens_common.h`. The unused
+    /// givens_common include is harmless (no symbols are referenced from
+    /// it), and avoids adding another `ensure_*` variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_fwht3_kv(
+        &mut self,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
+        self.pflash_score_fwht_kv_impl(
+            "pflash_score_fwht3_kv",
+            kernels::PFLASH_SCORE_FWHT3_KV_SRC,
+            "pflash_score_fwht3_kv_blocks",
+            8, // alignment: 8 dims per thread group (3-bit codes × 8 = 24 bits = 3 bytes)
+            k_cache, scores_out, n_pos, n_kv_heads, head_dim,
+            block_size, n_blocks, last_pos,
+        )
+    }
+
+    /// PFlash per-block scoring — fwht4 K-cache variant.
+    /// 4-bit codes packed into nibbles, two FWHT-128 halves per head at
+    /// head_dim=256. Higher precision than fwht3 / larger K storage
+    /// (132 B/head vs 100 B). Ablation variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_fwht4_kv(
+        &mut self,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
+        self.pflash_score_fwht_kv_impl(
+            "pflash_score_fwht4_kv",
+            kernels::PFLASH_SCORE_FWHT4_KV_SRC,
+            "pflash_score_fwht4_kv_blocks",
+            // fwht4 thread-group = 4 dims (4-bit × 4 = 16 bits = 2 bytes)
+            // plus head_dim must accommodate two FWHT-128 halves.
+            4,
+            k_cache, scores_out, n_pos, n_kv_heads, head_dim,
+            block_size, n_blocks, last_pos,
+        )
+    }
+
+    /// PFlash per-block scoring — fwht2 K-cache variant.
+    /// 2-bit codes packed 4 per byte, two FWHT-128 halves per head at
+    /// head_dim=256. Smallest K storage in the family (68 B/head).
+    /// Ablation / lower-bound variant — likely NIAH-marginal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn pflash_score_fwht2_kv(
+        &mut self,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
+        self.pflash_score_fwht_kv_impl(
+            "pflash_score_fwht2_kv",
+            kernels::PFLASH_SCORE_FWHT2_KV_SRC,
+            "pflash_score_fwht2_kv_blocks",
+            4, // fwht2 thread-group = 4 dims (2-bit × 4 = 8 bits = 1 byte)
+            k_cache, scores_out, n_pos, n_kv_heads, head_dim,
+            block_size, n_blocks, last_pos,
+        )
+    }
+
+    /// Shared launch body for fwht{2,3,4} scoring — same grid +
+    /// argument shape, only the kernel binary + per-thread-group
+    /// alignment vary.
+    #[allow(clippy::too_many_arguments)]
+    fn pflash_score_fwht_kv_impl(
+        &mut self,
+        cache_key: &str,
+        src: &str,
+        func_name: &str,
+        tg_align: i32,
+        k_cache: &GpuTensor,
+        scores_out: &GpuTensor,
+        n_pos: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim as i32 % tg_align == 0,
+            "head_dim must be a multiple of {tg_align} for this fwht K cache layout",
+        );
+        assert!(n_blocks > 0 && block_size > 0 && n_pos > 0);
+        assert!(last_pos < n_pos, "last_pos {last_pos} >= n_pos {n_pos}");
+        self.ensure_givens4_kernel(cache_key, src, func_name)?;
+        let func = &self.functions[func_name];
 
         let k_ptr = k_cache.buf.as_ptr();
         let s_ptr = scores_out.buf.as_ptr();
