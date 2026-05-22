@@ -2794,11 +2794,27 @@ impl Gpu {
     }
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.
+    ///
+    /// gfx1151 i8 MMQ fast-path (opt-in via HIPFIRE_HFQ4G128_MMQ=1): when
+    /// batch_size and M are 16-tile aligned, pre-quantize X to Q8_1 and
+    /// route to `gemm_hfq4g128_mmq_gfx1151`. Closes the rocprof finding
+    /// that this kernel was 66% of pp256 prefill on A3B-PARO. Default OFF
+    /// until channel-tested + perf-gated; mirror of the routed-MoE MMQ k8
+    /// rollout precedent.
     pub fn gemm_hfq4g128(
         &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let use_mmq = self.arch.starts_with("gfx1151")
+            && std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() == Ok("1")
+            && batch_size >= 16
+            && batch_size % 16 == 0
+            && m % 16 == 0
+            && k % 128 == 0;
+        if use_mmq {
+            return self.gemm_hfq4g128_mmq_gfx1151(a_raw, x, y, m, k, batch_size);
+        }
         self.ensure_kernel("gemm_hfq4g128", kernels::GEMM_HFQ4G128_SRC, "gemm_hfq4g128")?;
         let func = &self.functions["gemm_hfq4g128"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -2819,6 +2835,57 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(func, [m as u32, batch_tiles, 1], [32, 1, 1], 0, self.stream_ref(), &mut params)
         }
+    }
+
+    /// gfx1151 i8 MMQ dispatch helper for HFQ4-G128. Pre-quantizes X to
+    /// Q8_1 mmq DS4 then launches `gemm_hfq4g128_mmq_gfx1151`. Caller must
+    /// have already verified the alignment constraints.
+    fn gemm_hfq4g128_mmq_gfx1151(
+        &mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        let x_q8_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        self.ensure_kernel(
+            "gemm_hfq4g128_mmq_gfx1151",
+            kernels::GEMM_HFQ4G128_MMQ_GFX1151_SRC,
+            "gemm_hfq4g128_mmq_gfx1151",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_q8_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let bytes = (m * k / 2)               // HFQ4 weight (4 bits / elem)
+                  + (batch_size * k * 4 / 3)  // Q8_1 activation (approx, includes ds4 headers)
+                  + (batch_size * m * 4);     // F32 output
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g128_mmq_gfx1151", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g128_mmq_gfx1151",
+            [(m / 16) as u32, (batch_size / 16) as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_q8_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
     }
 
     /// HFQ2-G256 GEMV. K must be multiple of 256.

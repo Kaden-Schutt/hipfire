@@ -41,6 +41,17 @@ pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str = include_str!("../../
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
 
+/// HFQ4-G128 i8 WMMA MMQ (non-grouped) for gfx1151. Mirror of the routed
+/// grouped k8 kernel minus expert scatter — same i8 WMMA pattern, same
+/// 16×16 tile, same 8-WMMA-per-group K-pipeline. Activation must be
+/// pre-quantized to block_q8_1_mmq via `quantize_q8_1_mmq_ds4` (handled
+/// transparently by the dispatcher). Closes the perf gap left when only
+/// the routed-expert path got the MMQ port — see the
+/// `paroquant-real-bottleneck-gemm-hfq4g128` rocprof finding (66% of
+/// pp256 prefill time was the non-grouped baseline).
+pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g128_mmq.gfx1151.hip");
+
 
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][64B data] = 72 bytes per 256 weights (0.28 B/w).
