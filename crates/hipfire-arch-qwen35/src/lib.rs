@@ -33,8 +33,6 @@ pub mod speculative;
 pub mod pflash;
 #[cfg(feature = "deltanet")]
 pub mod arch;
-#[cfg(feature = "deltanet")]
-pub mod paro_la_gates_codec;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
