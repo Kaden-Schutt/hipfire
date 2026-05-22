@@ -21811,6 +21811,7 @@ impl Gpu {
         n_heads_k: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // The dots.ocr 2-D RoPE layout (`[hc, wc, hc, wc]` quarter-
         // repeat) requires head_dim to split into four equal quarters;
         // `head_dim % 4 == 0` is the load-bearing constraint, not just
@@ -21822,7 +21823,6 @@ impl Gpu {
         );
         assert!(n_patches > 0, "rope_2d_halfsplit_f32: n_patches must be > 0");
         assert!(n_heads_q > 0 || n_heads_k > 0, "rope_2d_halfsplit_f32: must rotate at least one of Q/K");
-        self.bind_thread()?;
         self.ensure_kernel("rope_2d_halfsplit", kernels::ROPE_2D_HALFSPLIT_SRC, "rope_2d_halfsplit_f32")?;
 
         let qp = q.buf.as_ptr();
@@ -21900,6 +21900,7 @@ impl Gpu {
         n_heads: usize,
         head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(
             head_dim % 4 == 0,
             "rope_2d_halfsplit_qkv_interleaved_f32: head_dim={head_dim} must be a multiple of 4 \
@@ -21907,7 +21908,6 @@ impl Gpu {
         );
         assert!(n_patches > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_patches must be > 0");
         assert!(n_heads > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_heads must be > 0");
-        self.bind_thread()?;
         self.ensure_kernel(
             "rope_2d_halfsplit_qkv_interleaved",
             kernels::ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC,
@@ -21971,9 +21971,9 @@ impl Gpu {
         n_patches: usize,
         hidden: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(n_patches > 0, "qkv_split_interleaved_f32: n_patches must be > 0");
         assert!(hidden > 0, "qkv_split_interleaved_f32: hidden must be > 0");
-        self.bind_thread()?;
         self.ensure_kernel(
             "qkv_split_interleaved",
             kernels::QKV_SPLIT_INTERLEAVED_SRC,
@@ -23799,6 +23799,7 @@ impl Gpu {
         q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
         b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         assert!(
             head_dim % 16 == 0,
             "attention_dflash_wmma_f32: head_dim={head_dim} must be a multiple of 16 \
@@ -23817,7 +23818,6 @@ impl Gpu {
             n_heads % n_kv_heads == 0,
             "attention_dflash_wmma_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
-        self.bind_thread()?;
         self.ensure_kernel(
             "attention_dflash_wmma_f32",
             kernels::ATTENTION_DFLASH_WMMA_SRC,
@@ -24316,6 +24316,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht3_kv",
             kernels::PFLASH_SCORE_FWHT3_KV_SRC,
@@ -24342,6 +24343,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht4_kv",
             kernels::PFLASH_SCORE_FWHT4_KV_SRC,
@@ -24370,6 +24372,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht2_kv",
             kernels::PFLASH_SCORE_FWHT2_KV_SRC,
