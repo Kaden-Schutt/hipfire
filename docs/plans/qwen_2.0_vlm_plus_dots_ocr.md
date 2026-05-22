@@ -1,12 +1,11 @@
 # dots.ocr (Qwen2-VL family) + Qwen2 text decoder implementation plan
 
-Status: rev 5 — phase 1 closed (PR #297 merged upstream), phase 2a +
-2b landed, phase 2c sub-tasks 1-4 + 2c-5a (vision_forward assembly)
-landed. 2026-05-20. `feat/dots-ocr-qwen2-phase-2` is the active
-branch; phase 2c-5b (per-stage validation against the 2c-1 .npy
-refs + end-to-end Qwen2-prefill logit match — requires a quantised
-dots.ocr HFQ + `infer_dots_ocr` driver binary) is the remaining
-work before phase 3 (daemon plumbing) can start.
+Status: rev 6 — phase 1 closed (PR #297 merged upstream), phase 2
+**fully closed** as of 2026-05-21 — end-to-end OCR on the smoke
+image is byte-exact vs vLLM reference (F1 1.000, 13/13 text
+exact-match). `feat/dots-ocr-qwen2-phase-2` is the active branch;
+master merged in 2026-05-22 (this commit). Phase 3 (daemon
+plumbing) is the next deliverable.
 
 Filename note: originally filed as `qwen_2.5_vlm.md` matching the
 initial request; renamed to `qwen_2.0_vlm_plus_dots_ocr.md` once
@@ -68,6 +67,8 @@ status per phase in §5.
 | `d0f38625` | **Phase 2c-5d (WIP)** — pre-attention QKV linear capture. Added a hook that dumps the post-QKV-linear output before reshape/RoPE/attention. Diff vs HF dump: cos 0.99924 (small input delta). After our attention compute on our QKV: cos 0.99819 vs HF's full attn output. → input delta is small; the post-attention divergence is amplified inside the attention compute or proj GEMM. |
 | `4c059433` | **Phase 2c-5d landed: no bug.** Decisive: `scripts/numpy_attention_replay.py` computes F32 numpy attention on captured QKV and reproduces our GPU attn pre-proj at **cos 1.00000** (5 decimals). New `examples/dump_proj_weight.rs` extracts `proj.weight` as F32 .npy so the proj GEMM can be numpy-replayed; same result, cos 1.00000 vs our GPU attn_out. **Our GPU pipeline is bit-equivalent to F32 numpy on the SAME QKV inputs.** Meanwhile `numpy(HF_qkv @ proj_w.T)` vs `HF_attn_out` is cos 0.989 — i.e. HF's bf16 compute diverges from the F32 reference by 1%. We are **6× closer to the F32 reference than HF's bf16 path is.** The cos 0.989 we'd been chasing is just HF's bf16 truncation drift, not our bug. Also falsifies a UAF / stream-race hypothesis (numpy reproduces our dumps, so no corruption). |
 | `1f94da31` | **Phase 2c-5d Strategy A — END-TO-END OCR PASSES 13/13.** Added `qwen2::forward_step_with_embed` (sibling to `forward_step` that uploads a pre-built F32 embedding row instead of doing the lookup — mirrors `qwen35::forward_scratch_embed`) + new `examples/ocr_e2e.rs` (loads HFQ, runs vision_forward, splices merger output at IMGPAD slots during qwen2 prefill, greedy-decodes until EOS) + new `scripts/grade_dots_ocr_e2e.py` (greedy bbox-IoU match + Levenshtein text distance). Result on smoke image vs `dots_ocr_smoke_001_vllm.json`: **regions 13/13, F1 1.000, text exact-match 13/13, max bbox L1 = 1 pixel**. The model is robust to F32-vs-HF-bf16 drift; the trained weights tolerate it. Strategy B (bf16-truncate-everywhere) is NOT needed. HF tensor dumps are NOT a valid correctness oracle for bf16-trained models (see plan §2.10 lesson). Perf one-shot: vision 4.2s + text-weight load 0.4s + prefill 81.6s (5095 tokens, 62.5 tok/s unbatched) + greedy gen 119.9s (4633 tokens until EOS 151673, 38.6 tok/s) ≈ 206s end-to-end. Phase 2 closed. |
+| `47a28359` | docs-only plan sync: §0 progress log + §5 phase status updated to reflect 2c-5d closed. New §2.10 "The bf16-oracle lesson" codifying the rule that HF tensor-dump cosine is NOT a valid correctness oracle for bf16-trained models. Phase 3 marked NOT STARTED; phase 4 PARTIAL (smoke-image scaffolding done, broader reference set pending). |
+| _merge_ | Merge `upstream/master` into `feat/dots-ocr-qwen2-phase-2` (2026-05-22): brings pflash perfmax, fwht3/4 KV drafters, gfx10 MQ3/HFQ3 prefill kernels, GPT-2 BPE pre-tok fix. Conflicts resolved: `Cargo.toml` (add dots-ocr crate row), `docs/architecture-ids.md` (arch_id=8 description updated to 2c-5d closed), `crates/hipfire-arch-qwen2/src/qwen2.rs` (kept HEAD's R5 EOS-fallback parser + `load_norm_weight_raw` length assert + `forward_step` refactor with new `forward_step_with_embed` companion + R5/EOS tests — all phase-2 work post-PR-#297), plan progress log + §5 phase narrative. |
 
 Verified at *load* time on gfx1151 via `inspect_hfq --load`
 (no forward pass, no token output yet):

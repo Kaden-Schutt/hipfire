@@ -2100,6 +2100,7 @@ fn verify_dflash_block_inner(
             gdn_tape,
             tree_verify,
             verify_scratch.prefill_batch.as_ref(),
+            None, // max_layer: DFlash verify always runs the full stack
         )
     };
 

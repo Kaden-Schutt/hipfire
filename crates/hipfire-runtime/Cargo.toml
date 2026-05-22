@@ -57,6 +57,14 @@ serde_json = "1"
 base64 = "0.22"
 libc = "0.2"
 rayon = "1"
+# GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
+# (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
+# then BPE each chunk independently; without that step the merge PQ runs
+# on the whole prompt as one problem and goes O(N log N) with a huge
+# constant from cross-word merges + stale-entry churn. PR #230 fixed
+# per-iteration costs but not the algorithmic shape — this regex restores
+# the canonical chunking.
+regex = "1"
 # Renders the upstream HF chat_template (Jinja) when present in
 # .hfq metadata, so prompt framing matches what the model was
 # trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`
