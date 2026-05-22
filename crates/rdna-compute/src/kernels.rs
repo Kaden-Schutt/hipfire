@@ -1915,3 +1915,27 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+/// PFlash per-block scoring kernel — fwht3 K-cache variant.
+/// Drop-in replacement for `pflash_score_q8_kv` when the drafter runs
+/// with fwht3 KV (the LDS-cliff-free long-context path). Reads fwht3 K
+/// cache (4 B cnorm + packed 3-bit TURBO_C3_256 codes), dequantizes
+/// inline, and computes cosine in FWHT-rotated space — orthonormal
+/// FWHT makes that exactly equal to the original-space cosine, with no
+/// inverse FWHT needed in the scoring kernel.
+pub const PFLASH_SCORE_FWHT3_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht3_kv.hip");
+
+/// PFlash per-block scoring — fwht4 variant. 4-bit codes / TURBO_C4 LUT.
+/// 132 B/head at head_dim=256, two FWHT-128 halves per head. Higher
+/// per-element precision than fwht3 (16 centroids vs 8) at the cost of
+/// larger K storage. Shipped as a research / ablation variant — fwht3
+/// is expected to dominate on the cosine-scorer's throughput/quality
+/// curve.
+pub const PFLASH_SCORE_FWHT4_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht4_kv.hip");
+
+/// PFlash per-block scoring — fwht2 variant. 2-bit codes / TURBO_C2 LUT.
+/// 68 B/head at head_dim=256, two FWHT-128 halves per head. Most
+/// aggressive K compression in the family; lowest precision (4
+/// centroids). May regress NIAH needle recovery at long ctx — shipped
+/// for ablation / lower-bound study.
+pub const PFLASH_SCORE_FWHT2_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");
