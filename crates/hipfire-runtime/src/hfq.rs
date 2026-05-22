@@ -612,6 +612,16 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        28 => { // PARO4-G128 — ParoQuant rotated-activation W4 probe format
+            assert!(k % 128 == 0, "PARO4G128 weight {st_name} has K={k} but kernel requires K%128==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        29 => { // PARO4-G128T — same metadata, qweight retiled as [M/8, K] for GEMV
+            assert!(k % 128 == 0, "PARO4G128T weight {st_name} has K={k} but kernel requires K%128==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128T, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         8 => { // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0, paro: None, awq_scale: None })

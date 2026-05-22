@@ -5,7 +5,7 @@
 //! Qwen3.5 model: hybrid DeltaNet (linear attention) + standard attention.
 //! Feature-gated behind `deltanet`.
 
-use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
+use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, WeightTensor,
                               weight_gemv, weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               fused_rmsnorm_rotate_mq_batched_for,
@@ -114,6 +114,11 @@ pub struct Qwen35Config {
     pub head_dim: usize,       // 256
     pub rope_theta: f32,
     pub partial_rotary_factor: f32, // 0.25 — only 64/256 dims get RoPE
+    /// True when a composite Qwen3.5-VL checkpoint is being used as a
+    /// text-only model through its nested `text_config`.
+    pub is_vl_text: bool,
+    pub mrope_interleaved: bool,
+    pub mrope_section: [usize; 3],
 
     // DeltaNet params
     pub linear_num_key_heads: usize,   // 16
@@ -160,6 +165,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config")?;
     let tc = config.get("text_config").unwrap_or(config);
+    let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
 
     let dim = tc.get("hidden_size")?.as_u64()? as usize;
     let n_layers = tc.get("num_hidden_layers")?.as_u64()? as usize;
@@ -179,6 +185,21 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     let partial_rotary_factor = tc.get("partial_rotary_factor")
         .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
         .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+    let mrope_interleaved = rope_params
+        .and_then(|r| r.get("mrope_interleaved"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut mrope_section = [11usize, 11usize, 10usize];
+    if let Some(arr) = rope_params
+        .and_then(|r| r.get("mrope_section"))
+        .and_then(|v| v.as_array())
+    {
+        for (dst, src) in mrope_section.iter_mut().zip(arr.iter().take(3)) {
+            if let Some(v) = src.as_u64() {
+                *dst = v as usize;
+            }
+        }
+    }
 
     let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
 
@@ -212,6 +233,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
     Some(Qwen35Config {
         dim, n_layers, vocab_size, norm_eps, eos_token,
         n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
+        is_vl_text, mrope_interleaved, mrope_section,
         linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
@@ -244,6 +266,22 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config>
     let partial_rotary_factor = tc.get("partial_rotary_factor")
         .or_else(|| rope_params.and_then(|r| r.get("partial_rotary_factor")))
         .and_then(|v| v.as_f64()).unwrap_or(0.25) as f32;
+    let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
+    let mrope_interleaved = rope_params
+        .and_then(|r| r.get("mrope_interleaved"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut mrope_section = [11usize, 11usize, 10usize];
+    if let Some(arr) = rope_params
+        .and_then(|r| r.get("mrope_section"))
+        .and_then(|v| v.as_array())
+    {
+        for (dst, src) in mrope_section.iter_mut().zip(arr.iter().take(3)) {
+            if let Some(v) = src.as_u64() {
+                *dst = v as usize;
+            }
+        }
+    }
     let eos_token = tc.get("eos_token_id").and_then(|v| v.as_u64()).unwrap_or(248044) as u32;
     let linear_num_key_heads = tc.get("linear_num_key_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
     let linear_num_value_heads = tc.get("linear_num_value_heads").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
@@ -265,6 +303,7 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config>
     Some(Qwen35Config {
         dim, n_layers, vocab_size, norm_eps, eos_token,
         n_heads, n_kv_heads, head_dim, rope_theta, partial_rotary_factor,
+        is_vl_text, mrope_interleaved, mrope_section,
         linear_num_key_heads, linear_num_value_heads, linear_key_head_dim, linear_value_head_dim, conv_kernel_dim,
         hidden_dim, layer_types,
         num_experts, num_experts_per_tok, moe_intermediate_size, shared_expert_intermediate_size, has_shared_expert,
@@ -806,6 +845,49 @@ impl DeltaNetState {
 
 // ─── Weight loading ─────────────────────────────────────────────────────
 
+fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(4);
+    let mut push = |s: String| {
+        if !out.iter().any(|x| x == &s) {
+            out.push(s);
+        }
+    };
+
+    if name == "lm_head.weight" {
+        push(name.to_string());
+        push("model.language_model.lm_head.weight".to_string());
+        push("model.lm_head.weight".to_string());
+        return out;
+    }
+
+    if name.starts_with("model.") {
+        push(name.to_string());
+    } else {
+        push(format!("model.language_model.{name}"));
+        push(format!("model.{name}"));
+        push(name.to_string());
+    }
+    out
+}
+
+fn qwen35_tensor_data_vec<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensorInfo, Vec<u8>)> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some(found) = hfq.tensor_data_vec(&candidate) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn qwen35_tensor_data<'a>(hfq: &'a HfqFile, name: &str) -> Option<(&'a HfqTensorInfo, &'a [u8])> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some(found) = hfq.tensor_data(&candidate) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 /// Load norm weight for Qwen3.5: stored as offset from 1.0 (output = x * (1 + weight))
 ///
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
@@ -815,10 +897,8 @@ impl DeltaNetState {
 /// flat). Pull both into `hipfire_runtime::transformer::norm` during the
 /// Transformer-extraction PR with the offset and prefix as parameters.
 fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
-    let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data_vec(&full_name)
-        .or_else(|| hfq.tensor_data_vec(name))
-        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+    let (info, data) = qwen35_tensor_data_vec(hfq, name)
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
 
     let mut f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
@@ -829,6 +909,21 @@ fn load_norm_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -
     for v in &mut f32_data { *v += 1.0; }
     gpu.upload_f32(&f32_data, shape)
 }
+
+/// Load norm weight without the +1.0 offset — for standard RMSNorm tensors
+/// (e.g., the final `model.language_model.norm.weight` stored as raw scale,
+/// mean ~1.6 on Qwen3.5-MoE A3B). Applying +1.0 would over-amplify by ~60%.
+fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let (info, data) = qwen35_tensor_data_vec(hfq, name)
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let f32_data: Vec<f32> = match info.quant_type {
+        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        _ => panic!("expected F16/F32 for {name}, got qt={}", info.quant_type),
+    };
+    gpu.upload_f32(&f32_data, shape)
+}
+
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 ///
@@ -848,6 +943,16 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
         7 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        28 => { // PARO4-G128 — ParoQuant rotated-activation W4 probe format
+            assert!(k % 128 == 0, "PARO4G128 weight has K={k} but kernel requires K%128==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        29 => { // PARO4-G128T — ParoQuant engine-tiled W4 probe format
+            assert!(k % 128 == 0, "PARO4G128T weight has K={k} but kernel requires K%128==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128T, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         8 => {
             let buf = gpu.upload_raw(data, &[data.len()])?;
@@ -932,6 +1037,52 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
     }
 }
 
+/// Phase A Stage A — AWQ sidecar loader for the Qwen3.5 forward path.
+///
+/// The .hfq quantizer emits `<weight>.awq_scale.weight` (1D F16, length K)
+/// alongside MQ4G256 weights that were AWQ pre-scaled. The dispatcher in
+/// `fused_rmsnorm_rotate_for_mq` / `fused_rmsnorm_rotate_mq_batched_for`
+/// looks at `WeightTensor.awq_scale.is_some()` to pick the AWQ-aware
+/// kernel variant. WITHOUT this loader populating the field, every MQ4
+/// weight ends up with `awq_scale: None`, the dispatcher falls through
+/// to the non-AWQ kernel, and the math `(W·s) · (x/s) = W·x` breaks
+/// because the runtime never divides by `s` — observed KLD blowup
+/// 0.6721 → 13.4893 on 0.8B Qwen3.5 before this landed.
+///
+/// Lookup pattern matches `hipfire_runtime::hfq::load_awq_scale`:
+/// strip trailing `.weight`, append `.awq_scale.weight`. Try both the
+/// `model.language_model.`-prefixed name and the bare name (the qwen35
+/// crate uses prefixed names; older sidecars or tests may use either).
+fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let sidecar_name = match name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{name}.awq_scale.weight"),
+    };
+    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
+    // Must be 1D F16, length K. quant_type 1 = F16.
+    if sc_info.quant_type != 1 {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+            sc_info.quant_type
+        );
+        return None;
+    }
+    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape, k
+        );
+        return None;
+    }
+    // F16 → F32 on host so the kernel takes a plain `const float*`.
+    let f32_data: Vec<f32> = sc_data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+}
+
 /// TODO(transformer-extraction): cross-arch duplicate of
 /// `hipfire-arch-qwen2::qwen2::load_weight_tensor` — same name-lookup +
 /// pread + AWQ-sidecar pattern, but qwen35 uses the
@@ -940,41 +1091,51 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
 /// Pull into `hipfire_runtime::transformer::weights` with the prefix
 /// as a parameter during consolidation.
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
-    let full_name = format!("model.language_model.{name}");
     // Use pread path to avoid page cache buildup on unified-memory APUs.
     #[cfg(unix)]
     {
-        let mut wt = if let Some((info, buf)) = hfq.tensor_data_pread(&full_name) {
-            let qt = info.quant_type;
-            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
-        } else if let Some((info, buf)) = hfq.tensor_data_pread(name) {
-            let qt = info.quant_type;
-            load_weight_tensor_raw(gpu, qt, &buf, m, k)?
-        } else {
-            panic!("tensor not found: {name} or {full_name}");
-        };
+        let mut wt: Option<WeightTensor> = None;
+        let mut matched: Option<String> = None;
+        for candidate in qwen35_tensor_name_candidates(name) {
+            if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
+                let qt = info.quant_type;
+                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
+        }
+        let mut wt = wt.unwrap_or_else(|| panic!("tensor not found: {name}"));
         // Phase A Stage A — populate awq_scale when the dtype is on
         // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
-        // `load_awq_scale` reads the sidecar via `tensor_data_vec` (fresh
-        // owned Vec), so it doesn't touch `self.pread_buf` — the prior
-        // pread_buf Ref guard from the weight load above was already
-        // dropped at the end of the `if let` block, and even if it weren't,
-        // the helper wouldn't invalidate it.
+        // The pread call invalidates the prior pread_buf borrow, but
+        // the weight bytes have already been uploaded to GPU (owned by
+        // `wt.buf`) so the borrow no longer matters.
         if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale(hfq, gpu, &full_name, k)
-                .or_else(|| load_awq_scale(hfq, gpu, name, k));
+            if let Some(matched_name) = matched.as_deref() {
+                wt.awq_scale = load_awq_scale_for(hfq, gpu, matched_name, k)
+                    .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+            } else {
+                wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
+            }
         }
         return Ok(wt);
     }
     #[cfg(not(unix))]
     {
-        let (info, data) = hfq.tensor_data(&full_name)
-            .or_else(|| hfq.tensor_data(name))
-            .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+        let (info, data, matched_name) = {
+            let mut found = None;
+            for candidate in qwen35_tensor_name_candidates(name) {
+                if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                    found = Some((info, data, candidate));
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| panic!("tensor not found: {name}"))
+        };
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
         if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale(hfq, gpu, &full_name, k)
-                .or_else(|| load_awq_scale(hfq, gpu, name, k));
+            wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
+                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
         Ok(wt)
     }
@@ -1364,10 +1525,8 @@ fn paro_load_moe_ffn(
 
 /// Load a tensor as F32 on GPU, handling any quant type by dequanting on CPU.
 fn load_any_as_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let full_name = format!("model.language_model.{name}");
-    let (info, data) = hfq.tensor_data_vec(&full_name)
-        .or_else(|| hfq.tensor_data_vec(name))
-        .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
+    let (info, data) = qwen35_tensor_data_vec(hfq, name)
+        .unwrap_or_else(|| panic!("tensor not found: {name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
@@ -1785,7 +1944,13 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     hfq.drop_mmap();
 
     eprintln!("  loading token_embd...");
-    let (embd_meta, embd_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight")
+    if config.is_vl_text {
+        eprintln!(
+            "  qwen3.5-vl text wrapper: mrope_interleaved={} mrope_section={:?}",
+            config.mrope_interleaved, config.mrope_section
+        );
+    }
+    let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
         .expect("embed_tokens not found");
     let embd_qt = embd_meta.quant_type;
     let (token_embd, embd_fmt) = if embd_qt == 6 {
@@ -1832,14 +1997,13 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
     // Try separate lm_head first (untied embeddings, e.g. 9B), fall back to tied embed_tokens.
-    let lm_head_info = hfq.tensor_data_vec("lm_head.weight")
-        .or_else(|| hfq.tensor_data_vec("model.language_model.lm_head.weight"));
+    let lm_head_info = qwen35_tensor_data_vec(hfq, "lm_head.weight");
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, config.vocab_size, config.dim)?
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
-        let (_, tied_data) = hfq.tensor_data_vec("model.language_model.embed_tokens.weight").unwrap();
+        let (_, tied_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight").unwrap();
         if embd_qt == 6 || embd_qt == 7 || embd_qt == 8 {
             let buf = gpu.upload_raw(&tied_data, &[tied_data.len()])?;
             let dtype = match embd_qt {
@@ -1873,13 +2037,13 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     // attaching a sidecar here would have driven the 0.67 → 13.5 KLD
     // corruption documented at `docs/plans/awq_fix_claude.md` because
     // the spec-verify path used the non-AWQ `rotate_x_mq_batched`.
-    // Try each plausible tensor name; `load_awq_scale` returns
+    // Try each plausible tensor name; `load_awq_scale_for` returns
     // None when no sidecar exists, so this is a no-op for current
     // pre-CUDA-pipeline files.
     if output.gpu_dtype.supports_awq_sidecar() {
-        output.awq_scale = load_awq_scale(hfq, gpu, "lm_head.weight", config.dim)
-            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
-            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
         eprintln!("  lm_head AWQ sidecar: {}",
             if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
@@ -2223,8 +2387,13 @@ fn load_token_embd_into(
     gpu: &mut Gpu,
 ) -> HipResult<(GpuTensor, EmbeddingFormat)> {
     eprintln!("  loading token_embd...");
-    let embd_info = hfq
-        .tensor_data("model.language_model.embed_tokens.weight")
+    if config.is_vl_text {
+        eprintln!(
+            "  qwen3.5-vl text wrapper: mrope_interleaved={} mrope_section={:?}",
+            config.mrope_interleaved, config.mrope_section
+        );
+    }
+    let embd_info = qwen35_tensor_data(hfq, "embed_tokens.weight")
         .expect("embed_tokens not found");
     Ok(if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
@@ -2258,15 +2427,12 @@ fn load_output_into(
     // GemmaRMSNorm `+= 1.0` bake applies uniformly for dense and MoE.
     let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[config.dim])?;
 
-    let lm_head_info = hfq
-        .tensor_data("lm_head.weight")
-        .or_else(|| hfq.tensor_data("model.language_model.lm_head.weight"));
+    let lm_head_info = qwen35_tensor_data(hfq, "lm_head.weight");
     let mut output = if let Some((lm_info, lm_data)) = lm_head_info {
         eprintln!("  loading output (separate lm_head, qt={})...", lm_info.quant_type);
         load_weight_tensor_raw(gpu, lm_info.quant_type, lm_data, config.vocab_size, config.dim)?
     } else {
-        let embd_info = hfq
-            .tensor_data("model.language_model.embed_tokens.weight")
+        let embd_info = qwen35_tensor_data(hfq, "embed_tokens.weight")
             .expect("embed_tokens not found");
         eprintln!("  loading output (tied embeddings, qt={})...", embd_info.0.quant_type);
         let embd_data = embd_info.1;
@@ -2305,9 +2471,9 @@ fn load_output_into(
     // (spec-verify) route through AWQ-aware rotations on
     // `output.awq_scale.is_some()`. No-op on current files.
     if output.gpu_dtype.supports_awq_sidecar() {
-        output.awq_scale = load_awq_scale(hfq, gpu, "lm_head.weight", config.dim)
-            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
-            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
         eprintln!("  lm_head AWQ sidecar: {}",
             if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
@@ -2976,7 +3142,7 @@ fn moe_ffn_decode_impl(
         } else {
             // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
             // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
-            gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed(
+            gpu.gemv_hfq4g128_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, gate_up_k,
@@ -3021,7 +3187,7 @@ fn moe_ffn_decode_impl(
             )?;
         } else {
             // routed_dtype_indexable_paro
-            gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
+            gpu.gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
                 &ffn.expert_down_ptrs, s.topk_indices,
                 s.rot_batch, s.down_expanded,
                 down_m, down_k, k, 1,
@@ -4621,7 +4787,6 @@ pub fn forward_prefill_batch_single_chunk_captured(
         gdn_tape, 0, tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
-        None, // max_layer: single-chunk captured path always runs the full stack
     )
 }
 
@@ -4642,7 +4807,6 @@ pub fn forward_prefill_batch(
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
-        None,
     )
 }
 
@@ -4669,7 +4833,6 @@ pub fn forward_prefill_batch_with_pbs(
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
-    max_layer: Option<usize>,
 ) -> HipResult<()> {
     // Threshold below which the batching overhead isn't worth the alloc +
     // per-layer dispatch. Single-token prefill obviously should not take
@@ -4808,7 +4971,7 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_all_mq4(&l.ffn),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
@@ -4816,7 +4979,7 @@ pub fn forward_prefill_batch_with_pbs(
                     && is_batchable_la(l.wk.gpu_dtype, arch)
                     && is_batchable_la(l.wv.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_all_mq4(&l.ffn),
         });
 
     if !eligible {
@@ -4905,7 +5068,6 @@ pub fn forward_prefill_batch_with_pbs(
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
-                max_layer,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -4932,7 +5094,7 @@ pub fn forward_prefill_batch_with_pbs(
 #[inline]
 // IMPORTANT: This allowlist is paired with the `is_mq*` matchers in
 // forward_prefill_chunk (lines 4063+, 4360+, 4768, 4919) and with the
-// MoE FFN gate `moe_ffn_batched_admissible`. They MUST be updated together when
+// MoE FFN gate `moe_ffn_all_mq4`. They MUST be updated together when
 // adding a new batchable dtype. Updating one without the others either
 // produces dead code (safe but useless) or silent prefill corruption
 // (HFQ4-stride GEMM reading a different-stride weight block). See
@@ -4948,15 +5110,6 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         DType::MQ4G256 | DType::HFQ4G256
         | DType::MQ6G256 | DType::HFQ6G256
         | DType::Q8_0
-        // Phase 1.5 (PARO): wqkv/wz/wo are ParoQ4G128, w_alpha/w_beta are F32
-        // on shisa-Qwen3.6-A3B-PARO. Dispatch in the DeltaNetMoe LA matcher
-        // routes these through gemm_hfq4g128 (with per-weight Givens
-        // rotation pre-pass) and gemm_f32_batched respectively. Eligibility
-        // is gated downstream by the env-keyed moe_ffn_batched_admissible
-        // (HIPFIRE_PARO_BATCHED=1) — admitting them here keeps non-PARO
-        // models unaffected because no production checkpoint sets
-        // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
-        | DType::ParoQ4G128 | DType::F32
     );
     if always_ok {
         return true;
@@ -5029,6 +5182,34 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma || fp4_with_wmma
 }
 
+fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
+    if std::env::var_os("HIPFIRE_QWEN35_FINITE_TRACE").is_none() {
+        return Ok(());
+    }
+    let vals = gpu.download_f32(tensor)?;
+    let mut n_nan = 0usize;
+    let mut n_inf = 0usize;
+    let mut n_finite = 0usize;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &v in &vals {
+        if v.is_nan() {
+            n_nan += 1;
+        } else if v.is_infinite() {
+            n_inf += 1;
+        } else {
+            n_finite += 1;
+            min_v = min_v.min(v);
+            max_v = max_v.max(v);
+        }
+    }
+    eprintln!(
+        "[qwen35 finite] {label}: finite={n_finite}/{} nan={n_nan} inf={n_inf} range=[{min_v:.6e}, {max_v:.6e}]",
+        vals.len(),
+    );
+    Ok(())
+}
+
 /// Process one chunk of up to `pbs.max_batch` tokens through the batched
 /// prefill path. All LA layers go through batched kernels; all FA layers
 /// go through a per-token gather/scatter loop with the inline FA body.
@@ -5087,38 +5268,9 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// garbage activations in production. Bisection of the offending
 /// dispatch site is pending. Default-off preserves the pre-fan-out
 /// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
-fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
-    // F32 router/shared_gate admit (PARO checkpoints — router is FP16-dense,
-    // expanded to F32 on GPU; shared_expert_gate likewise. See
-    // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
-    // prefill_moe_ffn_body_batched route F32 through gemm_f32_batched.
-    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
-    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0 | DType::F32);
-
-    // PARO env-gated admit (HIPFIRE_PARO_BATCHED=1). Unlocks the batched body
-    // for shisa-Qwen3.6-A3B-PARO and similar ParoQuant checkpoints where the
-    // routed-expert + shared-expert weights are ParoQ4G128 (HFQ4G128 +
-    // per-weight Givens rotation metadata). The downstream dispatch arms for
-    // ParoQ4G128 are panic-stubs in Phase 1; Phase 2 fills shared_expert and
-    // Phase 3 fills routed-expert. The env gate ensures the panic-stubs only
-    // fire when the user explicitly opts in. See roadmap at
-    // .claude/plans/magical-marinating-hippo.md.
-    static PARO_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let admit_paro = *PARO_ADMIT.get_or_init(|| {
-        std::env::var("HIPFIRE_PARO_BATCHED").as_deref() == Ok("1")
-    });
-    if admit_paro {
-        let paro_ok = router_ok
-            && shared_gate_ok
-            && matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.up.gpu_dtype, DType::ParoQ4G128)
-            && matches!(ffn.shared_expert.down.gpu_dtype, DType::ParoQ4G128)
-            && ffn.experts.iter().all(|e|
-                e.gate_up.gpu_dtype == DType::ParoQ4G128 && e.down.gpu_dtype == DType::ParoQ4G128);
-        if paro_ok {
-            return true;
-        }
-    }
+fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {
+    let router_ok = matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
+    let shared_gate_ok = matches!(ffn.shared_expert_gate.gpu_dtype, DType::MQ4G256 | DType::Q8_0);
 
     // MQ6 admit env gate (default off — see comment above)
     static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -5156,7 +5308,7 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
 /// residual back into the same buffer in-place.
 ///
 /// Preconditions (caller must guarantee):
-/// - `moe_ffn_batched_admissible(ffn)` returns true: router + shared_expert_gate may
+/// - `moe_ffn_all_mq4(ffn)` returns true: router + shared_expert_gate may
 ///   be MQ4G256 *or* Q8_0; all other MoE weights must be MQ4G256
 /// - `pbs.moe_*_batch` tensors are allocated (num_experts > 0 at scratch
 ///   construction time) and sized to max_batch ≥ N
@@ -5203,7 +5355,7 @@ fn prefill_moe_ffn_body_batched(
     // expect FWHT(rmsnorm(x) / awq_scale). Populate both:
     //   x_norm_batch ← rmsnorm(x_batch)
     //   x_rot_batch  ← FWHT(x_norm_batch / awq_scale)  (only if any
-    //                  downstream MQ weight is present, which moe_ffn_batched_admissible
+    //                  downstream MQ weight is present, which moe_ffn_all_mq4
     //                  guarantees — shared_expert.gate is always MQ4 here)
     //
     // Pick `shared_expert.gate` as the AWQ representative (instead of
@@ -5213,15 +5365,7 @@ fn prefill_moe_ffn_body_batched(
     // Reading awq_scale from router would silently drop AWQ rotation in
     // v3 AWQ runs — latent until this predicate widened.
     gpu.rmsnorm_batched(&pbs.x_batch, ffn_norm, &pbs.x_norm_batch, n, dim, config.norm_eps)?;
-    // PARO mode (shared_expert.gate is ParoQ4G128): each weight carries its
-    // own Givens rotation table (paro.pairs / theta / channel_scales). The
-    // shared MQ4-style FWHT pre-rotation here would be wrong — skip it. The
-    // ParoQ4G128 dispatch arms below run per-weight Givens rotation in-place
-    // before each GEMM, using pbs.x_rot_batch as the rotation destination.
-    let paro_mode = matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128);
-    if !paro_mode {
-        rotate_x_mq_batched_for(gpu, &ffn.shared_expert.gate, &pbs.x_norm_batch, &pbs.x_rot_batch, dim, n)?;
-    }
+    rotate_x_mq_batched_for(gpu, &ffn.shared_expert.gate, &pbs.x_norm_batch, &pbs.x_rot_batch, dim, n)?;
 
     // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
     //
@@ -5239,12 +5383,8 @@ fn prefill_moe_ffn_body_batched(
             &ffn.router.buf, &pbs.x_rot_batch, router_logits,
             ffn.router.m, ffn.router.k, n,
         )?,
-        DType::F32 => gpu.gemm_f32_batched(
-            &ffn.router.buf, &pbs.x_norm_batch, router_logits,
-            ffn.router.m, ffn.router.k, n,
-        )?,
         other => panic!("prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"),
+                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
     }
     match ffn.shared_expert_gate.gpu_dtype {
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
@@ -5255,12 +5395,8 @@ fn prefill_moe_ffn_body_batched(
             &ffn.shared_expert_gate.buf, &pbs.x_rot_batch, shared_scalar,
             ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
         )?,
-        DType::F32 => gpu.gemm_f32_batched(
-            &ffn.shared_expert_gate.buf, &pbs.x_norm_batch, shared_scalar,
-            ffn.shared_expert_gate.m, ffn.shared_expert_gate.k, n,
-        )?,
         other => panic!("prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"),
+                         — moe_ffn_all_mq4 admits only MQ4G256 and Q8_0"),
     }
     // Fused gate+up dispatch for the shared expert — halves the kernel
     // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
@@ -5280,39 +5416,6 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.gate.m, ffn.shared_expert.up.m,
             ffn.shared_expert.gate.k, n,
         )?,
-        // Phase 2: PARO shared_expert.gate + up. Each weight has its own
-        // Givens rotation table — rotate x_norm_batch into x_rot_batch using
-        // gate's tables, GEMM, then re-rotate using up's tables, GEMM. Total
-        // 4 dispatches vs the MQ4 path's 1 fused gemm_gate_up — acceptable
-        // overhead for the per-token-loop elimination win. Phase 4 could
-        // collapse this into a single fused kernel
-        // (gemm_gate_up_paro_q4g128_batched) if measurement shows it matters.
-        DType::ParoQ4G128 => {
-            let paro_gate = ffn.shared_expert.gate.paro.as_ref()
-                .expect("ParoQ4G128 shared_expert.gate missing paro metadata");
-            let paro_up = ffn.shared_expert.up.paro.as_ref()
-                .expect("ParoQ4G128 shared_expert.up missing paro metadata");
-            // Gate: rotate x_norm by gate's Givens → x_rot, then HFQ4G128 GEMM
-            gpu.givens_rotate_to(
-                &pbs.x_norm_batch, &pbs.x_rot_batch,
-                &paro_gate.pairs, &paro_gate.theta, &paro_gate.channel_scales,
-                n, dim, paro_gate.krot as usize,
-            )?;
-            gpu.gemm_hfq4g128(
-                &ffn.shared_expert.gate.buf, &pbs.x_rot_batch, shared_gate,
-                ffn.shared_expert.gate.m, ffn.shared_expert.gate.k, n,
-            )?;
-            // Up: re-rotate x_norm by up's Givens → x_rot (overwrite), GEMM
-            gpu.givens_rotate_to(
-                &pbs.x_norm_batch, &pbs.x_rot_batch,
-                &paro_up.pairs, &paro_up.theta, &paro_up.channel_scales,
-                n, dim, paro_up.krot as usize,
-            )?;
-            gpu.gemm_hfq4g128(
-                &ffn.shared_expert.up.buf, &pbs.x_rot_batch, shared_up,
-                ffn.shared_expert.up.m, ffn.shared_expert.up.k, n,
-            )?;
-        },
         other => panic!("prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
                          — admit predicate should have rejected this layer"),
     }
@@ -5341,21 +5444,7 @@ fn prefill_moe_ffn_body_batched(
     // batch on grid.y and writes FWHT(silu(gate) * up) into x_rot. Here
     // batch=N, k=smi; the shared-rot output buffer is [N × smi].
     // F2: AWQ-aware silu_mul+rotate for the batched shared-expert down input.
-    // PARO: shared_expert.down has its own Givens rotation tables (paro.*);
-    // use the dedicated fused kernel (commit 50198daa). It takes a per-weight
-    // (pairs, theta, channel_scales, krot) tuple instead of the MQ4 FWHT
-    // convention. Same shape: gate/up [N × smi] → shared_rot [N × smi].
-    if paro_mode {
-        let paro_down = ffn.shared_expert.down.paro.as_ref()
-            .expect("ParoQ4G128 shared_expert.down missing paro metadata");
-        gpu.fused_silu_mul_givens_rotate_f32(
-            shared_gate, shared_up, shared_rot,
-            &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
-            n, smi, paro_down.krot as usize,
-        )?;
-    } else {
-        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
-    }
+    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.shared_expert.down, shared_gate, shared_up, shared_rot, smi, n)?;
 
     // ── 5. Shared-expert down with sigmoid-scaled residual, batched ──
     //
@@ -5371,15 +5460,6 @@ fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
         DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
-            &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
-            ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
-        )?,
-        // Phase 2: HFQ4G128 batched residual+sigmoid-scaled kernel. Single
-        // launch, same semantics as the HFQ4G256 sister — reads shared_rot
-        // (already silu-mul-rotated by the PARO fused kernel above), GEMVs
-        // against W_down, applies sigmoid(shared_scalar[token]) × output,
-        // accumulates into pbs.x_batch.
-        DType::ParoQ4G128 => gpu.gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf, shared_rot, &pbs.x_batch, shared_scalar,
             ffn.shared_expert.down.m, ffn.shared_expert.down.k, n,
         )?,
@@ -5466,55 +5546,6 @@ fn prefill_moe_ffn_body_batched(
                 &pbs.x_rot_batch, y_gu_grouped,
                 2 * mi, gate_up_k, k_top, m_total, n,
             )?,
-            // Phase 4: Path 2 ParoQ4G128 grouped-WMMA. All 256 routed
-            // experts at this layer share one gate_up Givens rotation
-            // sidecar (ffn.paro_shared.gate_up_*); rotate x_norm into
-            // x_rot ONCE, then dispatch the HFQ4G128 grouped WMMA. The
-            // kernel auto-converts the F32 x_rot to F16 internally via
-            // ensure_fp16_x, same as the G256 sister.
-            //
-            // gfx1151 i8 MMQ opt-in (HIPFIRE_MOE_PARO_I8=1): routes to the
-            // HFQ4G128 i8 MMQ kernel which doubles compute throughput on
-            // Strix Halo (~140 vs ~71 TFLOPS). Compute-bound regime per
-            // Phase 4 attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
-            // = 68.5% GPU time, 25.8 GiB/s — far from BW roof).
-            DType::ParoQ4G128 => {
-                let paro = ffn.paro_shared.as_ref().expect(
-                    "ParoQ4G128 routed experts require paro_shared sidecars",
-                );
-                gpu.givens_rotate_to(
-                    &pbs.x_norm_batch, &pbs.x_rot_batch,
-                    &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
-                    n, dim, paro.krot as usize,
-                )?;
-                // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
-                // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
-                // (clean decode, finite logits) + coherence-gate (MQ4 paths
-                // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 = use_paro_i8
-                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
-                if use_paro_i8_k8 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-                        &pbs.x_rot_batch, y_gu_grouped,
-                        2 * mi, gate_up_k, k_top, m_total, n,
-                    )?;
-                } else if use_paro_i8 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-                        &pbs.x_rot_batch, y_gu_grouped,
-                        2 * mi, gate_up_k, k_top, m_total, n,
-                    )?;
-                } else {
-                    gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                        &ffn.expert_gate_up_ptrs, tile_ids, sorted,
-                        &pbs.x_rot_batch, y_gu_grouped,
-                        2 * mi, gate_up_k, k_top, m_total, n,
-                    )?;
-                }
-            },
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].gate_up dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
@@ -5525,62 +5556,18 @@ fn prefill_moe_ffn_body_batched(
             mi, k_top, m_total,
         )?;
     } else {
-        // Path 1 fallback (CDNA/gfx10): per-token indexed GEMV, batched
-        // over the N tokens via grid.z. The dispatch is dtype-keyed because
-        // the kernel reads the weight nibble layout directly (HFQ4G256:
-        // 136 B/group; HFQ4G128/PARO: 72 B/group).
-        match ffn.experts[0].gate_up.gpu_dtype {
-            DType::MQ4G256 => gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                &ffn.expert_gate_up_ptrs, topk_indices,
-                &pbs.x_rot_batch, gate_batch, up_batch,
-                2 * mi, gate_up_k, k_top, n,
-            )?,
-            // Phase 3 PARO routed-expert: apply the layer's shared gate_up
-            // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
-            // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
-            // at this layer share the same gate_up rotation sidecar
-            // (ffn.paro_shared, populated by paro_load_moe_shared_sidecars).
-            DType::ParoQ4G128 => {
-                let paro = ffn.paro_shared.as_ref().expect(
-                    "ParoQ4G128 routed experts require paro_shared sidecars",
-                );
-                gpu.givens_rotate_to(
-                    &pbs.x_norm_batch, &pbs.x_rot_batch,
-                    &paro.gate_up_pairs, &paro.gate_up_theta, &paro.gate_up_channel_scales,
-                    n, dim, paro.krot as usize,
-                )?;
-                gpu.gemv_paro_q4g128_moe_gate_up_k8_indexed_batched(
-                    &ffn.expert_gate_up_ptrs, topk_indices,
-                    &pbs.x_rot_batch, gate_batch, up_batch,
-                    2 * mi, gate_up_k, k_top, n,
-                )?;
-            },
-            other => panic!("prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
-                             experts[0].gate_up dtype {other:?} — admit predicate should \
-                             have rejected this layer"),
-        }
+        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+            &ffn.expert_gate_up_ptrs, topk_indices,
+            &pbs.x_rot_batch, gate_batch, up_batch,
+            2 * mi, gate_up_k, k_top, n,
+        )?;
     }
 
     // SwiGLU + FWHT over [N*K_TOP × mi] — batch flatten across tokens and
     // expert ranks, k=mi is per-row width.
     // F2: AWQ-aware silu_mul+rotate; experts[0].down is representative (all
     // experts at this layer share imatrix at the same residual basis).
-    // PARO branch (Phase 3): the layer-shared `down` rotation sidecar lives
-    // on ffn.paro_shared (not per-expert; all 256 experts alias the same
-    // tuple). Apply via fused_silu_mul_givens_rotate_f32 over the flattened
-    // [n*k_top × mi] grid.
-    if paro_mode {
-        let paro = ffn.paro_shared.as_ref().expect(
-            "ParoQ4G128 routed experts require paro_shared sidecars",
-        );
-        gpu.fused_silu_mul_givens_rotate_f32(
-            gate_batch, up_batch, rot_batch,
-            &paro.down_pairs, &paro.down_theta, &paro.down_channel_scales,
-            n * k_top, mi, paro.krot as usize,
-        )?;
-    } else {
-        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
-    }
+    fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, gate_batch, up_batch, rot_batch, mi, n * k_top)?;
 
     // Down projection. Three paths:
     //   Path 2 (HIPFIRE_MOE_GROUPED_GEMM=1, RDNA): grouped-WMMA-GEMM
@@ -5618,41 +5605,6 @@ fn prefill_moe_ffn_body_batched(
                 rot_batch, y_down_grouped,
                 down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
             )?,
-            // Phase 4: Path 2 ParoQ4G128 down grouped-WMMA (with i8 MMQ
-            // opt-in for gfx1151 — see gate_up arm above). rot_batch was
-            // already Givens-rotated by paro_shared.down_* via the PARO
-            // fused_silu_mul_givens_rotate_f32 step above; the kernel is
-            // rotation-agnostic. Same kernel for gate_up + down — only
-            // shape parameters and x_row_div differ.
-            DType::ParoQ4G128 => {
-                // Default-on for gfx1151 since 2026-05-21: i8 MMQ +6.3% over
-                // FP16 WMMA, k8 +2.5% over k2, both validated via PARO gen 100
-                // (clean decode, finite logits) + coherence-gate (MQ4 paths
-                // unchanged). Opt-out via HIPFIRE_MOE_PARO_I8=0 or _K8=0.
-                let use_paro_i8 = gpu.arch.starts_with("gfx1151")
-                    && std::env::var("HIPFIRE_MOE_PARO_I8").as_deref() != Ok("0");
-                let use_paro_i8_k8 = use_paro_i8
-                    && std::env::var("HIPFIRE_MOE_PARO_I8_K8").as_deref() != Ok("0");
-                if use_paro_i8_k8 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_k8_gfx1151(
-                        &ffn.expert_down_ptrs, tile_ids, sorted,
-                        rot_batch, y_down_grouped,
-                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-                    )?;
-                } else if use_paro_i8 {
-                    gpu.gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
-                        &ffn.expert_down_ptrs, tile_ids, sorted,
-                        rot_batch, y_down_grouped,
-                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-                    )?;
-                } else {
-                    gpu.gemm_paro_q4g128_moe_grouped_wmma_k2(
-                        &ffn.expert_down_ptrs, tile_ids, sorted,
-                        rot_batch, y_down_grouped,
-                        down_m, down_k, 1 /* x_row_div */, m_total, n * k_top,
-                    )?;
-                }
-            },
             other => panic!("prefill_moe_ffn_body_batched: unsupported experts[0].down dtype {other:?} \
                              — admit predicate should have rejected this layer"),
         }
@@ -5664,30 +5616,11 @@ fn prefill_moe_ffn_body_batched(
     } else {
         let use_atomic_free_down = !gpu.arch.starts_with("gfx9");
         if use_atomic_free_down {
-            // Path 1 expanded-down: per-token-per-rank GEMV writes to a
-            // [N × K_TOP × M] scratch, then a separate combine kernel folds
-            // it back into pbs.x_batch with topk weights. The expanded
-            // kernel is dtype-keyed; the combine kernel is dtype-agnostic.
-            match ffn.experts[0].down.gpu_dtype {
-                DType::MQ4G256 => gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &ffn.expert_down_ptrs, topk_indices,
-                    rot_batch, down_expanded,
-                    down_m, down_k, k_top, n,
-                )?,
-                // Phase 3 PARO down: the layer-shared `down` Givens rotation
-                // has already been applied to rot_batch by the
-                // fused_silu_mul_givens_rotate_f32 call above. The HFQ4G128
-                // indexed kernel (existing, shipped in 7c00970d) is
-                // rotation-agnostic; same dispatch shape as G256 sister.
-                DType::ParoQ4G128 => gpu.gemv_paro_q4g128_moe_down_k8_indexed_batched(
-                    &ffn.expert_down_ptrs, topk_indices,
-                    rot_batch, down_expanded,
-                    down_m, down_k, k_top, n,
-                )?,
-                other => panic!("prefill_moe_ffn_body_batched: Path 1 fallback unsupported \
-                                 experts[0].down dtype {other:?} — admit predicate should \
-                                 have rejected this layer"),
-            }
+            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, topk_indices,
+                rot_batch, down_expanded,
+                down_m, down_k, k_top, n,
+            )?;
             gpu.moe_down_combine_k8_batched(
                 down_expanded, topk_weights, &pbs.x_batch,
                 down_m, k_top, n,
@@ -5749,7 +5682,6 @@ fn forward_prefill_chunk(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
-    max_layer: Option<usize>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -5764,22 +5696,9 @@ fn forward_prefill_chunk(
     let dim_row_bytes = dim * 4;
 
     let do_embed = band.map(|b| b.is_first_band).unwrap_or(true);
+    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true);
     let layer_start = band.map(|b| b.layer_start).unwrap_or(0);
-    // `max_layer = Some(N)` early-exits at layer N (exclusive). pflash uses
-    // this with N = score_layer_idx + 1: the drafter forward only needs to
-    // populate the K cache through the scoring layer (the shallowest
-    // FullAttention layer, typically layer 3 of 24 in Qwen3.5 hybrid),
-    // since `pflash_score_q8_kv` reads exactly that layer's K. Layers
-    // beyond it and the final norm + lm_head are wasted compute for
-    // pflash. Saves ~80% of drafter forward time on hybrid drafters.
-    let layer_end = band
-        .map(|b| b.layer_end)
-        .unwrap_or(config.n_layers)
-        .min(max_layer.unwrap_or(usize::MAX));
-    // Skip final norm + lm_head when the caller early-exits — they produce
-    // logits the caller doesn't read, and require running through the full
-    // layer stack anyway.
-    let do_lm_head = band.map(|b| b.is_last_band).unwrap_or(true) && max_layer.is_none();
+    let layer_end = band.map(|b| b.layer_end).unwrap_or(config.n_layers);
     // Per-call-site `givens_cos_view` / `givens_sin_view` macros below
     // resolve to either the band-supplied per-device replica (multi-GPU
     // mode where `kv_cache.givens_*` is `None` by design) or the
@@ -5896,7 +5815,7 @@ fn forward_prefill_chunk(
                 is_batchable_la(l.w_up.gpu_dtype, fa_arch) &&
                 is_batchable_la(l.w_down.gpu_dtype, fa_arch),
             // MoE variant: attention weights must be MQ4-class (FFN is
-            // checked separately by moe_ffn_batched_admissible in the eligibility gate).
+            // checked separately by moe_ffn_all_mq4 in the eligibility gate).
             LayerWeights::FullAttnMoe(l) =>
                 is_batchable_la(l.wq.gpu_dtype, fa_arch) &&
                 is_batchable_la(l.wk.gpu_dtype, fa_arch) &&
@@ -5930,10 +5849,6 @@ fn forward_prefill_chunk(
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
 
     for layer_idx in layer_start..layer_end {
-        // Set the MMQ layer counter for per-layer KLD attribution sweeps
-        // (issue #302). No-op outside the sweep — the layer gate is open
-        // by default. Cheap atomic store, runs once per layer.
-        rdna_compute::MMQ_CURRENT_LAYER.store(layer_idx, std::sync::atomic::Ordering::Relaxed);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
@@ -7062,14 +6977,6 @@ fn forward_prefill_chunk(
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
-                // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
-                // ParoQ4G128 (each with its own Givens rotation tables);
-                // w_alpha/w_beta are F32 (no rotation, no quantization).
-                // Dispatch is unfused: rotate+gemm_hfq4g128 for wqkv and wz,
-                // direct gemm_f32_batched for w_alpha and w_beta. Same shape
-                // outputs as the Q8/MQ4 paths (dn_qkv_batch, dn_z_batch,
-                // dn_alpha_batch, dn_beta_batch).
-                let is_paro = matches!(layer.wqkv.gpu_dtype, DType::ParoQ4G128);
                 let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
                     || gpu.arch.starts_with("gfx12");
 
@@ -7078,62 +6985,13 @@ fn forward_prefill_chunk(
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
-                } else if is_paro {
-                    // PARO: need un-rotated x_norm available for per-weight
-                    // Givens rotation. Write rmsnorm into x_norm_batch (the
-                    // dedicated normalized buffer); x_rot_batch becomes the
-                    // per-weight rotation scratch (overwritten per GEMM).
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_norm_batch,
-                        n, dim, config.norm_eps,
-                    )?;
                 } else {
                     gpu.rmsnorm_batched(
                         &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
                         n, dim, config.norm_eps,
                     )?;
                 }
-                if is_paro {
-                    // PARO 4-way unfused dispatch. wqkv and wz are
-                    // ParoQ4G128 with their own Givens rotation tables;
-                    // w_alpha and w_beta are F32 with no rotation.
-                    let paro_wqkv = layer.wqkv.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wqkv missing paro metadata at LA layer {layer_idx} \
-                             — paro_load_wt() loader regression?"));
-                    let paro_wz = layer.wz.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wz missing paro metadata at LA layer {layer_idx}"));
-                    // wqkv: rotate x_norm → x_rot, then HFQ4G128 GEMM.
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch, &pbs.x_rot_batch,
-                        &paro_wqkv.pairs, &paro_wqkv.theta, &paro_wqkv.channel_scales,
-                        n, dim, paro_wqkv.krot as usize,
-                    )?;
-                    gpu.gemm_hfq4g128(
-                        &layer.wqkv.buf, &pbs.x_rot_batch, &pbs.dn_qkv_batch,
-                        layer.wqkv.m, layer.wqkv.k, n,
-                    )?;
-                    // wz: re-rotate x_norm → x_rot (overwrite), then GEMM.
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch, &pbs.x_rot_batch,
-                        &paro_wz.pairs, &paro_wz.theta, &paro_wz.channel_scales,
-                        n, dim, paro_wz.krot as usize,
-                    )?;
-                    gpu.gemm_hfq4g128(
-                        &layer.wz.buf, &pbs.x_rot_batch, &pbs.dn_z_batch,
-                        layer.wz.m, layer.wz.k, n,
-                    )?;
-                    // w_alpha / w_beta: F32, no rotation, direct batched GEMM.
-                    gpu.gemm_f32_batched(
-                        &layer.w_alpha.buf, &pbs.x_norm_batch, &pbs.dn_alpha_batch,
-                        layer.w_alpha.m, layer.w_alpha.k, n,
-                    )?;
-                    gpu.gemm_f32_batched(
-                        &layer.w_beta.buf, &pbs.x_norm_batch, &pbs.dn_beta_batch,
-                        layer.w_beta.m, layer.w_beta.k, n,
-                    )?;
-                } else if is_6bit {
+                if is_6bit {
                     gpu.gemm_qkvza_hfq6g256(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         &pbs.x_rot_batch,
@@ -7144,7 +7002,7 @@ fn forward_prefill_chunk(
                 } else if is_q8 && q8_wmma_arch {
                     // Fused Q8 QKVZA WMMA — assumes all 4 weights share Q8_0
                     // stride; mixed Q8/other layers within DNMoe are rejected
-                    // upstream by `moe_ffn_batched_admissible` (router/gate Q8 OK, but
+                    // upstream by `moe_ffn_all_mq4` (router/gate Q8 OK, but
                     // shared_expert + experts must be MQ4) and would otherwise
                     // re-introduce Tier-1 stride corruption.
                     debug_assert!(
@@ -7272,22 +7130,8 @@ fn forward_prefill_chunk(
                 // 200 B/group MQ6-layout bytes.
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-                let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
                 let dn_wo_input = if dn_wo_is_q8 {
                     &pbs.dn_normed_batch
-                } else if dn_wo_is_paro {
-                    // PARO wo: rotate dn_normed by wo's own Givens tables
-                    // into dn_normed_rot_batch. Same scratch layout as MQ4
-                    // (since dn_normed_rot_batch is unused on the Q8 path).
-                    let paro_wo = layer.wo.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wo missing paro metadata at LA layer {layer_idx}"));
-                    gpu.givens_rotate_to(
-                        &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch,
-                        &paro_wo.pairs, &paro_wo.theta, &paro_wo.channel_scales,
-                        n, layer.wo.k, paro_wo.krot as usize,
-                    )?;
-                    &pbs.dn_normed_rot_batch
                 } else {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
                     rotate_x_mq_batched_for(
@@ -7313,18 +7157,6 @@ fn forward_prefill_chunk(
                     // path didn't run here) as the GEMM scratch.
                     let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_batched_chunked(
-                        &layer.wo.buf, dn_wo_input, &scratch,
-                        layer.wo.m, layer.wo.k, n,
-                    )?;
-                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.add_inplace_f32(&x_n, &scratch)?;
-                } else if dn_wo_is_paro {
-                    // PARO wo residual: HFQ4G128 batched GEMM into scratch,
-                    // then add into x_batch. Reuse x_norm_batch (free at
-                    // this point — used earlier for the QKVZA stage; not
-                    // needed for the rest of this layer) as the scratch.
-                    let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_hfq4g128(
                         &layer.wo.buf, dn_wo_input, &scratch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
@@ -7374,12 +7206,6 @@ fn forward_prefill_chunk(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
-                // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
-                // (each with its own Givens rotation tables). The fused-QKV
-                // kernels can't handle this — they assume one shared
-                // rotation. Unfused 3-way dispatch (rotate + gemm_hfq4g128
-                // per projection) matches the LA QKVZA Phase 1.5 pattern.
-                let qkv_is_paro = matches!(layer.wq.gpu_dtype, DType::ParoQ4G128);
                 let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
                     || gpu.arch.starts_with("gfx12");
                 // Fused QKV requires uniform dtype — see issue #249 for
@@ -7392,63 +7218,13 @@ fn forward_prefill_chunk(
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
                     )?;
-                } else if qkv_is_paro {
-                    // PARO: rmsnorm into x_norm_batch (un-rotated). x_rot_batch
-                    // is reused as the per-weight rotation scratch.
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch, &layer.attn_norm, &pbs.x_norm_batch,
-                        n, dim, config.norm_eps,
-                    )?;
                 } else {
                     gpu.rmsnorm_batched(
                         &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch,
                         n, dim, config.norm_eps,
                     )?;
                 }
-                if qkv_is_paro {
-                    // PARO 3-way unfused dispatch (wq, wk, wv each with own
-                    // Givens rotation). Same shape outputs as the fused
-                    // paths: fa_q_full_batch, fa_k_batch, fa_v_batch.
-                    let paro_wq = layer.wq.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wq missing paro metadata at FA layer {layer_idx}"));
-                    let paro_wk = layer.wk.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wk missing paro metadata at FA layer {layer_idx}"));
-                    let paro_wv = layer.wv.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wv missing paro metadata at FA layer {layer_idx}"));
-                    // wq
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch, &pbs.x_rot_batch,
-                        &paro_wq.pairs, &paro_wq.theta, &paro_wq.channel_scales,
-                        n, dim, paro_wq.krot as usize,
-                    )?;
-                    gpu.gemm_hfq4g128(
-                        &layer.wq.buf, &pbs.x_rot_batch, &pbs.fa_q_full_batch,
-                        layer.wq.m, layer.wq.k, n,
-                    )?;
-                    // wk
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch, &pbs.x_rot_batch,
-                        &paro_wk.pairs, &paro_wk.theta, &paro_wk.channel_scales,
-                        n, dim, paro_wk.krot as usize,
-                    )?;
-                    gpu.gemm_hfq4g128(
-                        &layer.wk.buf, &pbs.x_rot_batch, &pbs.fa_k_batch,
-                        layer.wk.m, layer.wk.k, n,
-                    )?;
-                    // wv
-                    gpu.givens_rotate_to(
-                        &pbs.x_norm_batch, &pbs.x_rot_batch,
-                        &paro_wv.pairs, &paro_wv.theta, &paro_wv.channel_scales,
-                        n, dim, paro_wv.krot as usize,
-                    )?;
-                    gpu.gemm_hfq4g128(
-                        &layer.wv.buf, &pbs.x_rot_batch, &pbs.fa_v_batch,
-                        layer.wv.m, layer.wv.k, n,
-                    )?;
-                } else if qkv_is_6bit && qkv_same_dtype {
+                if qkv_is_6bit && qkv_same_dtype {
                     gpu.gemm_qkv_hfq6g256(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         &pbs.x_rot_batch,
@@ -7720,23 +7496,8 @@ fn forward_prefill_chunk(
                 // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-                // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
-                // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
-                // paro into fa_attn_out_rot_batch, then HFQ4G128 GEMM into a
-                // scratch, then add into x_batch.
-                let fa_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
                 let fa_wo_input = if fa_wo_is_q8 {
                     &pbs.fa_attn_out_batch
-                } else if fa_wo_is_paro {
-                    let paro_wo = layer.wo.paro.as_ref()
-                        .unwrap_or_else(|| panic!(
-                            "ParoQ4G128 wo missing paro metadata at FA layer {layer_idx}"));
-                    gpu.givens_rotate_to(
-                        &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch,
-                        &paro_wo.pairs, &paro_wo.theta, &paro_wo.channel_scales,
-                        n, layer.wo.k, paro_wo.krot as usize,
-                    )?;
-                    &pbs.fa_attn_out_rot_batch
                 } else {
                     // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
                     rotate_x_mq_batched_for(
@@ -7762,18 +7523,6 @@ fn forward_prefill_chunk(
                     // didn't run here) as scratch.
                     let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
                     gpu.gemm_q8_0_batched_chunked(
-                        &layer.wo.buf, fa_wo_input, &scratch,
-                        layer.wo.m, layer.wo.k, n,
-                    )?;
-                    let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.add_inplace_f32(&x_n, &scratch)?;
-                } else if fa_wo_is_paro {
-                    // PARO wo residual: HFQ4G128 batched GEMM into scratch,
-                    // then add into x_batch. Reuse x_norm_batch (free since
-                    // QKVZA is done — the MoE FFN body below rewrites it
-                    // as its first action) as the gemm output scratch.
-                    let scratch = pbs.x_norm_batch.sub_offset(0, n * layer.wo.m);
-                    gpu.gemm_hfq4g128(
                         &layer.wo.buf, fa_wo_input, &scratch,
                         layer.wo.m, layer.wo.k, n,
                     )?;
@@ -7870,6 +7619,9 @@ fn run_fa_layer_body(
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+    let fused_fa3_paro4t = fa3_same_dtype
+        && dt == DType::PARO4G128T
+        && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = fa3_same_dtype
         && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -7899,6 +7651,15 @@ fn run_fa_layer_body(
             eff_x,
             &s.fa_q_full, &s.fa_k, &s.fa_v,
             layer.wq.m, layer.wk.m, layer.wv.m,
+            layer.wq.k,
+        )?;
+    } else if fused_fa3_paro4t {
+        gpu.fused_qkvza_paro4g128t(
+            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+            &s.tmp,
+            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+            layer.wq.m, layer.wk.m, layer.wv.m, 0,
             layer.wq.k,
         )?;
     } else {
@@ -8040,6 +7801,11 @@ fn run_fa_layer_body(
     let same_dtype = layer.w_up.gpu_dtype == dt_g;
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+    let fused_gu_paro4t = same_dtype
+        && dt_g == DType::PARO4G128T
+        && layer.w_gate.m == layer.w_up.m
+        && layer.w_gate.k == layer.w_up.k
+        && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
         && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -8069,6 +7835,17 @@ fn run_fa_layer_body(
             eff_x,
             &s.gate_ffn, &s.up,
             layer.w_gate.m, layer.w_up.m,
+            layer.w_gate.k,
+        )?;
+    } else if fused_gu_paro4t {
+        gpu.fused_gate_up_paro4g128t(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            &s.tmp,
+            &s.gate_ffn,
+            &s.up,
+            &s.x_rot,
+            layer.w_gate.m,
             layer.w_gate.k,
         )?;
     } else {
@@ -8244,6 +8021,9 @@ fn forward_scratch_layers(
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA attn_norm", &s.tmp)?;
+                }
                 // Cross-arch fast path: one fused 4-way projection kernel
                 // (wqkv + wz + w_beta + w_alpha) in a single launch. Works
                 // for BOTH MQ4 (weights FWHT-rotated, input x_rot FWHT-rotated)
@@ -8259,6 +8039,12 @@ fn forward_scratch_layers(
                     && layer.w_alpha.gpu_dtype == dt;
                 let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_la4_paro4t = la4_same_dtype
+                    && dt == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
+                let fused_la2_paro4t = dt == DType::PARO4G128T
+                    && layer.wz.gpu_dtype == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_la4_hfq6 = la4_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -8301,11 +8087,37 @@ fn forward_scratch_layers(
                         layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                         layer.wqkv.k,
                     )?;
+                } else if fused_la4_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &s.tmp,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                } else if fused_la2_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.wqkv.buf, &layer.wqkv.buf,
+                        &s.tmp,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wqkv.m, layer.wz.m, 0, 0,
+                        layer.wqkv.k,
+                    )?;
+                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 } else {
                     weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
                     weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
                     weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+                }
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA wqkv", &s.dn_qkv)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA wz", &s.dn_z)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA w_beta", &s.dn_beta)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA w_alpha", &s.dn_alpha)?;
                 }
                 // Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are
                 // elementwise scalar transforms on independent buffers of size
@@ -8313,6 +8125,10 @@ fn forward_scratch_layers(
                 gpu.fused_sigmoid_alpha_gate_f32(
                     &s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA beta", &s.dn_beta)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA alpha", &s.dn_alpha)?;
+                }
 
                 // Fused conv1d+SiLU+split: writes directly to q_raw/k_raw/v,
                 // eliminating the 3 DtoD copies that used to follow a
@@ -8323,6 +8139,11 @@ fn forward_scratch_layers(
                     &dn_state.conv_states[delta_layer_idx],
                     k_dim, v_dim,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA conv q", &s.dn_q_raw)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA conv k", &s.dn_k_raw)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA conv v", &s.dn_v)?;
+                }
 
                 // Fused: l2_norm(q_raw) + l2_norm(k_raw) + scale(q_raw).
                 // Three launches collapsed to one — saves ~2 dispatches per
@@ -8335,6 +8156,10 @@ fn forward_scratch_layers(
                     1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA q norm", &s.dn_q_raw)?;
+                    trace_finite_if_enabled(gpu, "layer 0 LA k norm", &s.dn_k_raw)?;
+                }
 
                 // Repeat-interleave Q/K if needed.
                 // Phase 3a-A fix: replace per-head memcpy loop with one fused kernel.
@@ -8374,22 +8199,39 @@ fn forward_scratch_layers(
                         1, n_v_heads, config.linear_value_head_dim,
                     )?,
                 }
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA gdn out", &s.dn_attn_out)?;
+                }
 
                 gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
                     n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA gated norm", &s.dn_normed)?;
+                }
                 // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
                 weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 LA wo residual", &s.x)?;
+                }
 
                 // FFN: fused rmsnorm + rotate for w_gate/w_up.
                 let x_rot = fused_rmsnorm_rotate_for_mq(
                     gpu, &layer.w_gate, &s.x, &layer.ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 FFN norm", &s.tmp)?;
+                }
                 // Cross-arch fast path: fused gate+up in one launch. Works
                 // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
                 let dt_g = layer.w_gate.gpu_dtype;
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                let fused_gu_paro4t = same_dtype
+                    && dt_g == DType::PARO4G128T
+                    && layer.w_gate.m == layer.w_up.m
+                    && layer.w_gate.k == layer.w_up.k
+                    && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -8427,9 +8269,24 @@ fn forward_scratch_layers(
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k,
                     )?;
+                } else if fused_gu_paro4t {
+                    gpu.fused_gate_up_paro4g128t(
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &s.tmp,
+                        &s.gate_ffn,
+                        &s.up,
+                        &s.x_rot,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                    )?;
                 } else {
                     weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+                }
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 FFN gate", &s.gate_ffn)?;
+                    trace_finite_if_enabled(gpu, "layer 0 FFN up", &s.up)?;
                 }
                 // Fused SwiGLU + w_down residual GEMV:
                 //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
@@ -8437,6 +8294,9 @@ fn forward_scratch_layers(
                 weight_gemv_swiglu_residual(
                     gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
                 )?;
+                if layer_idx == 0 {
+                    trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
+                }
 
                 if let Some(ref rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -8444,6 +8304,7 @@ fn forward_scratch_layers(
                     }
                 }
 
+                trace_finite_if_enabled(gpu, &format!("layer {layer_idx} LinearAttention residual"), &s.x)?;
                 delta_layer_idx += 1;
             }
 
@@ -8458,6 +8319,9 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_fa3_paro4t = fa3_same_dtype
+                    && dt == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -8493,6 +8357,15 @@ fn forward_scratch_layers(
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
                         layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else if fused_fa3_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                        &s.tmp,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
                     )?;
                 } else {
@@ -8663,6 +8536,11 @@ fn forward_scratch_layers(
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                let fused_gu_paro4t = same_dtype
+                    && dt_g == DType::PARO4G128T
+                    && layer.w_gate.m == layer.w_up.m
+                    && layer.w_gate.k == layer.w_up.k
+                    && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
@@ -8700,6 +8578,17 @@ fn forward_scratch_layers(
                         layer.w_gate.m, layer.w_up.m,
                         layer.w_gate.k,
                     )?;
+                } else if fused_gu_paro4t {
+                    gpu.fused_gate_up_paro4g128t(
+                        &layer.w_gate.buf,
+                        &layer.w_up.buf,
+                        &s.tmp,
+                        &s.gate_ffn,
+                        &s.up,
+                        &s.x_rot,
+                        layer.w_gate.m,
+                        layer.w_gate.k,
+                    )?;
                 } else {
                     weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
                     weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
@@ -8717,6 +8606,7 @@ fn forward_scratch_layers(
                     }
                 }
 
+                trace_finite_if_enabled(gpu, &format!("layer {layer_idx} FullAttention residual"), &s.x)?;
                 kv_layer_idx += 1;
             }
 
@@ -8737,6 +8627,12 @@ fn forward_scratch_layers(
                     && layer.w_alpha.gpu_dtype == dt;
                 let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_la4_paro4t = la4_same_dtype
+                    && dt == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
+                let fused_la2_paro4t = dt == DType::PARO4G128T
+                    && layer.wz.gpu_dtype == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                 if fused_la4_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -8761,6 +8657,26 @@ fn forward_scratch_layers(
                         layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                         layer.wqkv.k,
                     )?;
+                } else if fused_la4_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        &s.tmp,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;
+                } else if fused_la2_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.wqkv.buf, &layer.wqkv.buf,
+                        &s.tmp,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wqkv.m, layer.wz.m, 0, 0,
+                        layer.wqkv.k,
+                    )?;
+                    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                 } else {
                     weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                     weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
@@ -8851,6 +8767,9 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_fa3_paro4t = fa3_same_dtype
+                    && dt == DType::PARO4G128T
+                    && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
@@ -8886,6 +8805,15 @@ fn forward_scratch_layers(
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
                         layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;
+                } else if fused_fa3_paro4t {
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                        &s.tmp,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
                     )?;
                 } else {
@@ -9147,6 +9075,12 @@ fn forward_scratch_layers_multi(
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_la4_paro4t = la4_same_dtype
+                        && dt == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
+                    let fused_la2_paro4t = dt == DType::PARO4G128T
+                        && layer.wz.gpu_dtype == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                     if fused_la4_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkvza_hfq4g256(
@@ -9165,6 +9099,26 @@ fn forward_scratch_layers_multi(
                             layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                             layer.wqkv.k,
                         )?;
+                    } else if fused_la4_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k,
+                        )?;
+                    } else if fused_la2_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.wqkv.buf, &layer.wqkv.buf,
+                            &s.tmp,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wqkv.m, layer.wz.m, 0, 0,
+                            layer.wqkv.k,
+                        )?;
+                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     } else {
                         weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                         weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
@@ -9226,6 +9180,11 @@ fn forward_scratch_layers_multi(
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                    let fused_gu_paro4t = same_dtype
+                        && dt_g == DType::PARO4G128T
+                        && layer.w_gate.m == layer.w_up.m
+                        && layer.w_gate.k == layer.w_up.k
+                        && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
@@ -9242,6 +9201,17 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.gate_ffn, &s.up,
                             layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k,
+                        )?;
+                    } else if fused_gu_paro4t {
+                        gpu.fused_gate_up_paro4g128t(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &s.tmp,
+                            &s.gate_ffn,
+                            &s.up,
+                            &s.x_rot,
+                            layer.w_gate.m,
                             layer.w_gate.k,
                         )?;
                     } else {
@@ -9262,6 +9232,9 @@ fn forward_scratch_layers_multi(
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_fa3_paro4t = fa3_same_dtype
+                        && dt == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
@@ -9278,6 +9251,15 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,
                             layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k,
+                        )?;
+                    } else if fused_fa3_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                            &s.tmp,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
                         )?;
                     } else {
@@ -9412,6 +9394,11 @@ fn forward_scratch_layers_multi(
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                    let fused_gu_paro4t = same_dtype
+                        && dt_g == DType::PARO4G128T
+                        && layer.w_gate.m == layer.w_up.m
+                        && layer.w_gate.k == layer.w_up.k
+                        && std::env::var_os("HIPFIRE_PARO_GATE_UP_FUSED").is_some();
                     if fused_gu_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_gate_up_hfq4g256(
@@ -9428,6 +9415,17 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.gate_ffn, &s.up,
                             layer.w_gate.m, layer.w_up.m,
+                            layer.w_gate.k,
+                        )?;
+                    } else if fused_gu_paro4t {
+                        gpu.fused_gate_up_paro4g128t(
+                            &layer.w_gate.buf,
+                            &layer.w_up.buf,
+                            &s.tmp,
+                            &s.gate_ffn,
+                            &s.up,
+                            &s.x_rot,
+                            layer.w_gate.m,
                             layer.w_gate.k,
                         )?;
                     } else {
@@ -9449,6 +9447,12 @@ fn forward_scratch_layers_multi(
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_la4_paro4t = la4_same_dtype
+                        && dt == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_LA4_FUSED").is_some();
+                    let fused_la2_paro4t = dt == DType::PARO4G128T
+                        && layer.wz.gpu_dtype == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_LA2_FUSED").is_some();
                     if fused_la4_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkvza_hfq4g256(
@@ -9467,6 +9471,26 @@ fn forward_scratch_layers_multi(
                             layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
                             layer.wqkv.k,
                         )?;
+                    } else if fused_la4_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                            &s.tmp,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                            layer.wqkv.k,
+                        )?;
+                    } else if fused_la2_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wqkv.buf, &layer.wz.buf, &layer.wqkv.buf, &layer.wqkv.buf,
+                            &s.tmp,
+                            &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wqkv.m, layer.wz.m, 0, 0,
+                            layer.wqkv.k,
+                        )?;
+                        weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+                        weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
                     } else {
                         weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
                         weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
@@ -9543,6 +9567,9 @@ fn forward_scratch_layers_multi(
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_fa3_paro4t = fa3_same_dtype
+                        && dt == DType::PARO4G128T
+                        && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
                     if fused_fa3_mq4 {
                         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
                         gpu.fused_qkv_hfq4g256(
@@ -9559,6 +9586,15 @@ fn forward_scratch_layers_multi(
                             eff_x,
                             &s.fa_q_full, &s.fa_k, &s.fa_v,
                             layer.wq.m, layer.wk.m, layer.wv.m,
+                            layer.wq.k,
+                        )?;
+                    } else if fused_fa3_paro4t {
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                            &s.tmp,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
                         )?;
                     } else {
@@ -9956,7 +9992,6 @@ pub fn forward_prefill_batch_multi(
                         None, // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
-                        None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }
 

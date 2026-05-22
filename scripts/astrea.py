@@ -48,6 +48,8 @@ GGUF_SUMMARY_SCHEMA = "hipfire.astrea.gguf_summary.v0"
 HFQ_SUMMARY_SCHEMA = "hipfire.astrea.hfq_summary.v0"
 IMATRIX_HFQ_JOIN_SCHEMA = "hipfire.astrea.imatrix_hfq_join.v0"
 SAFETENSORS_SUMMARY_SCHEMA = "hipfire.astrea.safetensors_summary.v0"
+PARO_PROBE_SCHEMA = "hipfire.astrea.paro_probe.v0"
+PARO_IMPORT_SCHEMA = "hipfire.astrea.paro_import.v0"
 
 SUPPORTED_FORMATS = {
     "mq3",
@@ -57,6 +59,7 @@ SUPPORTED_FORMATS = {
     "hfq6",
     "hfp4",
     "mfp4",
+    "paro4",
     "q8",
     "f16",
 }
@@ -204,6 +207,8 @@ HFQ_QUANT_TYPE_NAMES = {
     20: "MQ3G256_LLOYD",
     21: "HFP4G32",
     24: "MFP4G32",
+    28: "PARO4G128",
+    29: "PARO4G128T",
 }
 
 HFQ_QUANT_TYPE_FORMATS = {
@@ -219,6 +224,8 @@ HFQ_QUANT_TYPE_FORMATS = {
     "MQ3G256_LLOYD": "mq3",
     "HFP4G32": "hfp4",
     "MFP4G32": "mfp4",
+    "PARO4G128": "paro4",
+    "PARO4G128T": "paro4",
 }
 
 
@@ -3480,6 +3487,63 @@ def build_report(paths):
     }
 
 
+def load_paroquant_import_module():
+    import importlib.util
+
+    script_path = Path(__file__).with_name("paroquant_import.py")
+    spec = importlib.util.spec_from_file_location("hipfire_paroquant_import", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_paroquant_oracle_module():
+    import importlib.util
+
+    script_path = Path(__file__).with_name("paroquant_oracle.py")
+    spec = importlib.util.spec_from_file_location("hipfire_paroquant_oracle", script_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load {script_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def paro_probe_model(model, *, local_only=False, max_modules=None):
+    module = load_paroquant_import_module()
+    return module.probe_model(model, local_only=local_only, max_modules=max_modules)
+
+
+def paro_import_model(model, output, *, local_only=False, max_modules=None, layout="native", copy_floats="f16"):
+    module = load_paroquant_import_module()
+    return module.import_model(
+        model,
+        output,
+        local_only=local_only,
+        max_modules=max_modules,
+        layout=layout,
+        copy_floats=copy_floats,
+    )
+
+
+def paro_oracle_model(source, hfq, *, module_name=None, local_only=False, samples=2, seed=1234, input_scale=0.125, atol=0.0):
+    module = load_paroquant_oracle_module()
+    args = argparse.Namespace(
+        source=source,
+        hfq=hfq,
+        module=module_name,
+        local_only=local_only,
+        samples=samples,
+        seed=seed,
+        input_scale=input_scale,
+        atol=atol,
+        pretty=False,
+    )
+    return module.run_oracle(args)
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="astrea",
@@ -3598,6 +3662,35 @@ def build_parser():
     bundle_plan.add_argument("--bundle-id")
     bundle_plan.add_argument("--pretty", action="store_true")
     bundle_plan.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    paro_probe = sub.add_parser("paro-probe", help="Inspect a ParoQuant checkpoint and runtime contract.")
+    paro_probe.add_argument("--model", required=True)
+    paro_probe.add_argument("--local-only", action="store_true")
+    paro_probe.add_argument("--max-modules", type=int)
+    paro_probe.add_argument("--pretty", action="store_true")
+    paro_probe.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    paro_import = sub.add_parser("paro-import", help="Write a runtime-loadable PARO4G128 HFQ model.")
+    paro_import.add_argument("--model", required=True)
+    paro_import.add_argument("--output", required=True)
+    paro_import.add_argument("--local-only", action="store_true")
+    paro_import.add_argument("--max-modules", type=int)
+    paro_import.add_argument("--layout", choices=("native", "engine"), default="native")
+    paro_import.add_argument("--copy-floats", choices=("f16", "q8"), default="f16")
+    paro_import.add_argument("--pretty", action="store_true")
+    paro_import.add_argument("--out", help="Write JSON to this path instead of stdout.")
+
+    paro_oracle = sub.add_parser("paro-oracle", help="Compare PARO4G128 HFQ bytes against a PyTorch Paro decode oracle.")
+    paro_oracle.add_argument("--source", required=True, help="ParoQuant safetensors directory or HuggingFace repo id.")
+    paro_oracle.add_argument("--hfq", required=True, help="HFQ file produced by astrea paro-import.")
+    paro_oracle.add_argument("--module", dest="module_name", help="Paro module base name; defaults to the first complete module.")
+    paro_oracle.add_argument("--local-only", action="store_true")
+    paro_oracle.add_argument("--samples", type=int, default=2)
+    paro_oracle.add_argument("--seed", type=int, default=1234)
+    paro_oracle.add_argument("--input-scale", type=float, default=0.125)
+    paro_oracle.add_argument("--atol", type=float, default=0.0)
+    paro_oracle.add_argument("--pretty", action="store_true")
+    paro_oracle.add_argument("--out", help="Write JSON to this path instead of stdout.")
 
     report = sub.add_parser("report", help="Summarize Astrea JSON artifacts.")
     report.add_argument("artifacts", nargs="+")
@@ -3732,6 +3825,44 @@ def run(argv=None):
                 triattn=args.triattn,
                 policy_id=args.policy_id,
                 bundle_id=args.bundle_id,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "paro-probe":
+        write_json(
+            paro_probe_model(
+                args.model,
+                local_only=args.local_only,
+                max_modules=args.max_modules,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "paro-import":
+        write_json(
+            paro_import_model(
+                args.model,
+                args.output,
+                local_only=args.local_only,
+                max_modules=args.max_modules,
+                layout=args.layout,
+                copy_floats=args.copy_floats,
+            ),
+            pretty=args.pretty,
+            out=args.out,
+        )
+    elif args.command == "paro-oracle":
+        write_json(
+            paro_oracle_model(
+                args.source,
+                args.hfq,
+                module_name=args.module_name,
+                local_only=args.local_only,
+                samples=args.samples,
+                seed=args.seed,
+                input_scale=args.input_scale,
+                atol=args.atol,
             ),
             pretty=args.pretty,
             out=args.out,

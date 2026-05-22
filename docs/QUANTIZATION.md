@@ -187,7 +187,7 @@ breakthroughs. But they add up.
     for each tensor:
       name_len: u16 LE
       name: utf-8
-      quant_type: u8     (0=Q4F16G64, 1=F16, ..., 6=HFQ4G256, 13=MQ4G256, ...)
+      quant_type: u8     (0=Q4F16G64, 1=F16, ..., 6=HFQ4G256, 13=MQ4G256, 28=PARO4G128, ...)
       n_dims: u8
       shape: u32 LE × n_dims
       group_size: u32 LE
@@ -200,3 +200,29 @@ breakthroughs. But they add up.
 `HfqFile::open` mmaps the file; `tensor_data(name)` returns a slice
 into the mapping. The daemon never copies tensor bytes — they go
 straight from mmap to a HIP `hipMalloc` + `hipMemcpy` upload.
+
+### PARO4G128 probe payload
+
+`quant_type=28` is a native ParoQuant/AWQ runtime-probe format. It is not the
+row-major HFQ4/MQ4 block layout. Each tensor stores the ParoQuant buffers in
+this exact order:
+
+```
+qweight        int32 [K, M/8]
+qzeros         int32 [K/128, M/8]
+scales         f16   [K/128, M]
+pairs          int16 [8, K]
+theta          f16   [8, K/2]
+channel_scales f16   [K]
+```
+
+The runtime contract is:
+
+```
+x_rot = rotate(x, pairs, theta, channel_scales)
+y     = awq_w4_gemv(x_rot, qweight, qzeros, scales)
+```
+
+Use `python3 scripts/astrea.py paro-oracle --source PARO_SAFE_DIR --hfq MODEL.hfq
+--module MODULE --pretty` to verify an imported HFQ record against the source
+Paro safetensors before making quality or perf claims.
