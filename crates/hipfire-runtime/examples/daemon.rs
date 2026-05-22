@@ -1913,10 +1913,16 @@ fn load_model_safetensors(
         let weights = hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, gpu)
             .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
 
+        // asym3 K-cache asserts head_dim==256 (Qwen 3.5/3.6 family). Qwen3
+        // dense checkpoints (e.g. shisa-Qwen3-0.6B-PARO, head_dim=128) need
+        // q8 for auto/default selection; explicit "asym3" still routes to
+        // the panicking constructor so caller-misconfigured runs surface.
+        let asym3_auto = matches!(kv_mode, "turbo3" | "turbo" | "auto" | "");
         let kv = match kv_mode {
             "q8" => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
             "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-            "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+            "asym3" => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+            _ if asym3_auto && config.head_dim == 256 => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
             _ => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
         }.map_err(|e| format!("KvCache: {e}"))?;
 
