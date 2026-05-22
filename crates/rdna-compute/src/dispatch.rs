@@ -5299,19 +5299,30 @@ impl Gpu {
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables for G128 (128 floats each, seeds 43 and 1043).
+    /// Also allocates the shared `mq_x_rot` scratch if not already present — the G256 path
+    /// (`ensure_mq_signs`) normally owns that allocation, but the G128 path must be
+    /// self-sufficient so models that carry only MQ4G128 weights still get the scratch buffer.
     pub fn ensure_mq_signs_128(&mut self) -> HipResult<()> {
         self.bind_thread()?;
-        if self.mq_signs1_128.is_some() { return Ok(()); }
-        let signs1 = gen_fwht_signs(43, 128);
-        let signs2 = gen_fwht_signs(1043, 128);
-        let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1t = self.alloc_tensor(&[128], DType::F32)?;
-        let s2t = self.alloc_tensor(&[128], DType::F32)?;
-        self.hip.memcpy_htod(&s1t.buf, &s1b)?;
-        self.hip.memcpy_htod(&s2t.buf, &s2b)?;
-        self.mq_signs1_128 = Some(s1t);
-        self.mq_signs2_128 = Some(s2t);
+        if self.mq_signs1_128.is_some() && self.mq_x_rot.is_some() { return Ok(()); }
+        if self.mq_signs1_128.is_none() {
+            let signs1 = gen_fwht_signs(43, 128);
+            let signs2 = gen_fwht_signs(1043, 128);
+            let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s1t = self.alloc_tensor(&[128], DType::F32)?;
+            let s2t = self.alloc_tensor(&[128], DType::F32)?;
+            self.hip.memcpy_htod(&s1t.buf, &s1b)?;
+            self.hip.memcpy_htod(&s2t.buf, &s2b)?;
+            self.mq_signs1_128 = Some(s1t);
+            self.mq_signs2_128 = Some(s2t);
+        }
+        // Allocate shared rotation scratch if ensure_mq_signs (G256 path) has not run yet.
+        // 32K elements covers K up to 32768, matching ensure_mq_signs's allocation.
+        if self.mq_x_rot.is_none() {
+            let x_rot = self.alloc_tensor(&[32768], DType::F32)?;
+            self.mq_x_rot = Some(x_rot);
+        }
         Ok(())
     }
 

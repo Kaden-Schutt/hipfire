@@ -696,6 +696,16 @@ pub fn weight_gemv(
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq4g256_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ4G128 => {
+            gpu.ensure_mq_signs_128()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_128_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g128_prerotated(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         DType::MQ6G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
@@ -1000,6 +1010,22 @@ pub fn rotate_x_mq_for(
     } else {
         gpu.rotate_x_mq(x, x_rot, k)
     }
+}
+
+/// MQ4G128 activation rotate helper. Always takes the non-AWQ path —
+/// no AWQ sidecar is supported for G128 weights in this PR.
+/// The `_next_linear` argument is reserved for a future AWQ branch;
+/// pass the upcoming weight tensor but its `awq_scale` is ignored here.
+pub fn rotate_x_mq_128_for(
+    gpu: &mut Gpu,
+    _next_linear: &WeightTensor,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    // NOTE: no AWQ branch for G128. If AWQ support for MQ4G128 is added
+    // in a follow-up, mirror the AWQ branch from `rotate_x_mq_for` here.
+    gpu.rotate_x_mq_128(x, x_rot, k)
 }
 
 /// ParoQuant single-token rotation: read x, write Givens-rotated
