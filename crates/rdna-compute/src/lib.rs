@@ -7,6 +7,7 @@
 mod compiler;
 mod dispatch;
 mod kernels;
+pub mod arch_caps;
 pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
