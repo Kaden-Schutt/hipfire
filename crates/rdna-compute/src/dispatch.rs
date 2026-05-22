@@ -6188,10 +6188,6 @@ impl Gpu {
     ///
     /// Mirrors `rotate_x_mq` but targets G128 groups (32 threads × 4 elems).
     /// Grid: [k/128, 1, 1]. Block: [32, 1, 1].
-    ///
-    /// NOTE: This is a T5-preview — the full T5 will expand it with batched
-    /// and AWQ variants. For now it's the minimal path needed by the
-    /// test_fwht_128_gpu_vs_cpu correctness gate (T3).
     pub fn rotate_x_mq_128(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs_128()?;
@@ -6358,6 +6354,15 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.gemv_hfq4g256(a_raw, x_rot, y, m, k)
+    }
+
+    /// MagnumQuant MQ4-G128 with pre-rotated x. Skips the rotation step entirely —
+    /// caller must have called `rotate_x_mq_128` into `x_rot` first.
+    pub fn gemv_mq4g128_prerotated(
+        &mut self, a_raw: &GpuTensor, x_rot: &GpuTensor, y: &GpuTensor, m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.gemv_hfq4g128(a_raw, x_rot, y, m, k)
     }
 
     /// MFP4G32: rotate x once via FWHT, then HFP4G32 GEMV against rotated x.
