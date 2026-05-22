@@ -8,6 +8,7 @@
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, WeightTensor,
                               weight_gemv, weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
+                              fused_rmsnorm_rotate_for_paro,
                               fused_rmsnorm_rotate_mq_batched_for,
                               rotate_x_mq_for, rotate_x_mq_batched_for,
                               fused_silu_mul_rotate_mq_for,
@@ -7609,18 +7610,39 @@ fn run_fa_layer_body(
         _ => unreachable!(),
     };
 
-    // Fused rmsnorm + FWHT rotation for wq/wk/wv.
+    // Fused rmsnorm + FWHT rotation for wq/wk/wv (MQ-family).
     let x_rot = fused_rmsnorm_rotate_for_mq(
         gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
     )?;
+    // Lever 1 — Fused rmsnorm + PARO per-group rotation for wq.
+    // x_rot_paro is valid ONLY for wq (PARO rotation uses wq's pairs/theta/channel_scales);
+    // wk and wv will run their own rotation via the standard weight_gemv path. The fused
+    // kernel ALSO writes s.tmp (post-rmsnorm) so wk/wv get correct input. Saves 1 launch
+    // per FA block (rmsnorm+wq rotate folded into one kernel). Default on; opt out via
+    // HIPFIRE_PARO_FUSE_RMSNORM=0.
+    let x_rot_paro: Option<&GpuTensor> = if x_rot.is_none()
+        && layer.wq.gpu_dtype == DType::PARO4G128T
+        && layer.wq.k % 128 == 0
+        && layer.wq.m % 8 == 0
+    {
+        fused_rmsnorm_rotate_for_paro(
+            gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+        )?
+    } else {
+        None
+    };
 
     // Cross-arch fast path: fused 3-way projection for wq+wk+wv.
     let dt = layer.wq.gpu_dtype;
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+    // Lever 1 disables the env-gated fused_fa3_paro4t path so the fused rmsnorm
+    // path takes precedence. To re-enable the fused QKV path instead, set
+    // HIPFIRE_PARO_FUSE_RMSNORM=0 AND HIPFIRE_PARO_FA3_FUSED=1.
     let fused_fa3_paro4t = fa3_same_dtype
         && dt == DType::PARO4G128T
+        && x_rot_paro.is_none()
         && std::env::var_os("HIPFIRE_PARO_FA3_FUSED").is_some();
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = fa3_same_dtype
@@ -7663,7 +7685,16 @@ fn run_fa_layer_body(
             layer.wq.k,
         )?;
     } else {
-        weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+        // Lever 1 fast path: when fused_rmsnorm_rotate_for_paro produced x_rot_paro,
+        // wq has its rotated x already — call the prerotated GEMV directly (saves the
+        // standalone paro4g128t_rotate launch for wq). wk and wv MUST do their own
+        // rotation since PARO pairs/theta differ per linear; they consume s.tmp
+        // (post-rmsnorm) via the standard weight_gemv path.
+        if let Some(xr_q) = x_rot_paro {
+            gpu.gemv_paro4g128t_prerotated(&layer.wq.buf, xr_q, &s.fa_q_full, layer.wq.m, layer.wq.k)?;
+        } else {
+            weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+        }
         weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
         weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
     }

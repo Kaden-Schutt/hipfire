@@ -830,6 +830,62 @@ pub fn fused_rmsnorm_rotate_mq_batched_for(
     }
 }
 
+/// Lever 1 — Fused RMSNorm + PARO4G128T per-group Givens rotation.
+///
+/// When `next_linear` is PARO4G128T and `HIPFIRE_PARO_FUSE_RMSNORM` is enabled
+/// (default: on, opt-out with `=0`), runs a single fused kernel that produces
+/// BOTH x_rot (for the immediate prerotated GEMV on next_linear) AND
+/// post-rmsnorm x_norm (written into `tmp` for subsequent linears in the
+/// same residual block). Saves 1 launch vs the separated rmsnorm_f32 +
+/// paro4g128t_rotate path.
+///
+/// Returns `Some(x_rot_scratch)` if fused — caller should run
+/// `gemv_paro4g128t_prerotated` for `next_linear`, then standard
+/// `weight_gemv` for subsequent paro linears (they consume `tmp`).
+///
+/// Returns `None` if fusion was skipped (non-PARO dtype or env opt-out) —
+/// in that case `tmp` contains plain rmsnorm output and caller should use
+/// `weight_gemv` as usual.
+pub fn fused_rmsnorm_rotate_for_paro<'a>(
+    gpu: &mut Gpu,
+    next_linear: &WeightTensor,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    tmp: &GpuTensor,
+    x_rot_scratch: &'a GpuTensor,
+    eps: f32,
+) -> HipResult<Option<&'a GpuTensor>> {
+    let opt_out = std::env::var("HIPFIRE_PARO_FUSE_RMSNORM")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+    if opt_out {
+        gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+        return Ok(None);
+    }
+    match next_linear.gpu_dtype {
+        DType::PARO4G128T => {
+            // Fast path: fused kernel emits x_rot (for next_linear's
+            // prerotated GEMV) + tmp (post-rmsnorm x for subsequent linears).
+            gpu.fused_rmsnorm_paro4g128t_rotate(
+                &next_linear.buf,
+                x,
+                norm_weight,
+                x_rot_scratch,
+                Some(tmp),
+                next_linear.m,
+                next_linear.k,
+                eps,
+            )?;
+            Ok(Some(x_rot_scratch))
+        }
+        _ => {
+            // Non-PARO dtype: plain rmsnorm into tmp, caller uses standard path.
+            gpu.rmsnorm_f32(x, norm_weight, tmp, eps)?;
+            Ok(None)
+        }
+    }
+}
+
 pub fn fused_rmsnorm_rotate_for_mq<'a>(
     gpu: &mut Gpu,
     sample_weight: &WeightTensor,

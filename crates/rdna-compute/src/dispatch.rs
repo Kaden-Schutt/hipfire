@@ -3265,6 +3265,109 @@ impl Gpu {
         result
     }
 
+    /// Lever 1 — Fused RMSNorm + PARO4G128T per-group Givens rotation.
+    ///
+    /// Replaces `rmsnorm_f32(x, weight) -> x_norm` followed by
+    /// `paro4g128t_rotate(A, x_norm) -> x_rot` with a single launch:
+    /// `fused_rmsnorm_paro4g128t_rotate(A, x_pre, weight) -> x_rot, x_norm`.
+    /// Math identity is `(x * weight * rms) * channel_scales -> KROT Givens`,
+    /// numerically equivalent to the separated path within FP16 epsilon
+    /// (float mul reorder is the only difference).
+    ///
+    /// When `x_norm` is `Some`, also emits the post-rmsnorm activation so
+    /// subsequent paro linears in the same residual block can apply their
+    /// own rotation (each linear has different pairs/theta/channel_scales).
+    /// When `None`, x_norm write is skipped — useful when this is the last
+    /// linear in a block, or for byte-equivalence smoke tests.
+    ///
+    /// Layout: 1 workgroup, 256 threads, dynamic LDS = (K + 256) * 4 bytes.
+    /// K must be a multiple of 128 (PARO group size). Engine layout only
+    /// (PARO4G128T, qtype 29) — the kernel assumes the precomputed sincos
+    /// trig payload.
+    pub fn fused_rmsnorm_paro4g128t_rotate(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_norm: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert_eq!(m % 8, 0, "fused_rmsnorm_paro4g128t_rotate requires M multiple of 8, got {m}");
+        assert_eq!(k % 128, 0, "fused_rmsnorm_paro4g128t_rotate requires K multiple of 128, got {k}");
+        assert!(
+            x_rot.buf.size() / 4 >= k,
+            "fused_rmsnorm_paro4g128t_rotate x_rot scratch too small: {} floats for K={k}",
+            x_rot.buf.size() / 4
+        );
+        if let Some(xn) = x_norm {
+            assert!(
+                xn.buf.size() / 4 >= k,
+                "fused_rmsnorm_paro4g128t_rotate x_norm scratch too small: {} floats for K={k}",
+                xn.buf.size() / 4
+            );
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_paro4g128t_rotate",
+            kernels::FUSED_RMSNORM_PARO4G128T_ROTATE_SRC,
+            "fused_rmsnorm_paro4g128t_rotate",
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let weight_ptr = weight.buf.as_ptr();
+        let x_rot_ptr = x_rot.buf.as_ptr();
+        let x_norm_ptr = x_norm.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &weight_ptr as *const _ as *mut c_void,
+            &x_rot_ptr as *const _ as *mut c_void,
+            &x_norm_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        // LDS: x_shared[K] + reduce[256]
+        let shared_mem = ((k + 256) * 4) as u32;
+        // BW estimate: paro rotate bytes + extra x + weight read; if x_norm emit, +K floats write
+        let bytes = crate::profile::paro4g128t_rotate_bytes(m, k)
+            + k * 4
+            + if x_norm.is_some() { k * 4 } else { 0 };
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_rmsnorm_paro4g128t_rotate", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_paro4g128t_rotate",
+            [1, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(weight_ptr);
+                b.push_ptr(x_rot_ptr); b.push_ptr(x_norm_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.invalidate_x_caches_for(x_rot_ptr);
+        if x_norm.is_some() {
+            self.invalidate_x_caches_for(x_norm_ptr);
+        }
+        result
+    }
+
     /// PARO4-G128 GEMV over an already materialized Paro-rotated activation.
     pub fn gemv_paro4g128_prerotated(
         &mut self,
