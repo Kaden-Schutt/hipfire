@@ -334,6 +334,7 @@ pub const GEMV_HFQ3G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/
 pub const GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g256_residual.gfx1100.hip");
 pub const GEMV_HFQ3G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq3g128.hip");
 pub const GEMV_MQ4G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256.hip");
+pub const GEMV_MQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g128.hip");
 pub const GEMV_MQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq8g256.hip");
 /// MQ6-G256 GEMV: FWHT-rotated HFQ6 (6-bit, 200 B/group). Uses pre-rotated x.
 pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
