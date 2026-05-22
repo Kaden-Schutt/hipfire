@@ -29,7 +29,7 @@ You are autonomous. Use best-judgement calls. Don't suspend for input until eith
 
 Either of:
 
-A. **All four permutations evaluated** (`PARO4G128`, `PARO4G128T`, `PARO4G256`, `PARO4G256T`) on gfx12 AND **at least one** perf lever shipped (rotate-fusion OR batched-QKV) so that A3B-PARO decode reaches ≥ 60% of A3B-MQ4 decode on gfx1201, OR
+A. **All four permutations evaluated** (`PARO4G128`, `PARO4G128T`, `PARO4G256`, `PARO4G256T`) on gfx12 AND **at least one** perf lever shipped (rotate-fusion OR batched-QKV) so that A3B-PARO decode reaches ≥ 90% of A3B-MQ4 decode on gfx1201, OR
 
 B. **G256 gate decided** (with empirical data, not opinion) — quality probe says G256 is unworkable (KLD blow-up > 3× G128 baseline) and you ship the G128-only perfmax stack with rotate-fusion + batched-QKV instead.
 
@@ -86,7 +86,7 @@ Both levers ship default-on with opt-out env var (e.g. `HIPFIRE_PARO_FUSE_ROTATE
 
 Björn shipped correctness in PR #316; you ship perf parity. Required: per-expert `gemv_paro4g{128,256}t_moe_indexed_*.hip` kernels mirroring MQ4 / HFQ4 MoE-indexed kernels (search `kernels/src/*moe_*_indexed*`). For A3B (256 experts, k=8 active per token), the MoE down kernel is the prefill bottleneck.
 
-**Goal:** A3B-PARO decode ≥ 60% of A3B-MQ4 decode on gfx1201 (= ≥34 tok/s if MQ4 hits 57). Document the gap if you can't close it; identify the next bottleneck via rocprof.
+**Goal:** A3B-PARO decode ≥ 90% of A3B-MQ4 decode on gfx1201 (= ≥51 tok/s if MQ4 hits 57). Document the gap if you can't close it; identify the next bottleneck via rocprof.
 
 ### Phase 5 — Dense perf parity on gfx12 (0.8B / 9B / 27B / 27B-3.6)
 
