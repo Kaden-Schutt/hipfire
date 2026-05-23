@@ -323,6 +323,20 @@ fn is_dot2_gemv_enabled() -> bool {
     })
 }
 
+/// Opt-in gate for the gfx906 fused-projection HFQ4 MMQ kernels (qkv 3-way,
+/// gate_up/qkvza-head 2-way). Mirror of `HIPFIRE_HFQ4_MMQ_RDNA2` for gfx906.
+/// Default OFF until coherence + KLD validation pass on the new kernels.
+/// Enable with `HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`. See
+/// `docs/plans/gfx906_prefill_kernels.md` and
+/// `experiments/gfx906-fused-mmq/probe-results.md`.
+pub fn hfq4_mmq_gfx906_fused_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_FUSED").map_or(false, |v| v == "1")
+    })
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -6344,6 +6358,17 @@ impl Gpu {
                             && self.mmq_screen_weight(a_v, v_m, k)
                     } else { true };
                     if qkv_safe {
+                        // Fused-projection MMQ path (HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1).
+                        // 1 launch instead of 3, L2 hits on the Q8_1 batch tile
+                        // amortize across Q/K/V. Requires q_m/k_m/v_m all multiples
+                        // of MMQ_Y=128 (Qwen3.5 family satisfies trivially).
+                        if hfq4_mmq_gfx906_fused_enabled()
+                            && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+                            return self.gemm_qkv_hfq4g256_mmq_gfx906(
+                                a_q, a_k, a_v, x, y_q, y_k, y_v,
+                                q_m, k_m, v_m, k, batch_size,
+                            );
+                        }
                         let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                         let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_q, xq, y_q, q_m, k, batch_size);
                         let r2 = if r1.is_ok() {
@@ -13897,6 +13922,146 @@ impl Gpu {
                 b.push_ptr(a_ptr); b.push_ptr(xq_ptr); b.push_ptr(y_ptr);
                 b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
                 b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 qkv MMQ fused-projection kernel — gfx906 wave64. 3-way fused
+    /// {Q, K, V} on a single launch, eliminating 2 of 3 launch overheads
+    /// and amortizing L2 hits on the Q8_1 batch tile across the three
+    /// outputs. See `kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh`
+    /// for the kernel design and
+    /// `experiments/gfx906-fused-mmq/probe-results.md` for the §6.1
+    /// probe that motivated this work.
+    ///
+    /// Caller invariants:
+    ///   - q_m, k_m, v_m must each be multiples of MMQ_Y(=128). Qwen3.5
+    ///     family satisfies (9B: q_m=4096, k_m=v_m=1024; 4B: q_m=2048,
+    ///     k_m=v_m=512).
+    ///   - batch_size ≥ should_use_mmq cutover (gfx906 default: 8).
+    ///   - x is the same activation tensor as the residual sibling
+    ///     expects (raw fp16, ensure_q8_1_mmq_x is called internally).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_hfq4g256_mmq_gfx906(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            "qkv_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
+            batch_size, self.capture_mode,
+        );
+        debug_assert!(
+            q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0,
+            "qkv_hfq4g256_mmq_gfx906 requires q_m/k_m/v_m multiples of MMQ_Y=128 (got q={q_m} k={k_m} v={v_m})",
+        );
+
+        // Same mmq_x sweep as the gfx906 single-output mmq_set path so
+        // future MMQ_X tuning translates 1:1. Note: only the {8,16,32,64}
+        // quartet is wired up initially (the most common batch buckets);
+        // the in-between values fall up to the next available mmq_x.
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 32 { 32 }
+            else { 64 };
+
+        let is_full = q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0
+            && batch_size % mmq_x == 0;
+        let base_name = "gemm_qkv_hfq4g256_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_set_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_QKV_HFQ4G256_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_QKV_HFQ4G256_MMQ_GFX906_X16_SRC,
+            32 => kernels::GEMM_QKV_HFQ4G256_MMQ_GFX906_X32_SRC,
+            64 => kernels::GEMM_QKV_HFQ4G256_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_qkv_hfq4g256_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_GFX906_BODY_CUH,
+        );
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+
+        let mut a_q_p = a_q.buf.as_ptr();
+        let mut a_k_p = a_k.buf.as_ptr();
+        let mut a_v_p = a_v.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut y_q_p = y_q.buf.as_ptr();
+        let mut y_k_p = y_k.buf.as_ptr();
+        let mut y_v_p = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_q_p as *mut _ as *mut c_void,
+            &mut a_k_p as *mut _ as *mut c_void,
+            &mut a_v_p as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut y_q_p as *mut _ as *mut c_void,
+            &mut y_k_p as *mut _ as *mut c_void,
+            &mut y_v_p as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        // Option C streaming topology — KEEP IN SYNC WITH body.cuh.
+        // X_STRIDE varies with mmq_x (see body.cuh x_stride_for<>):
+        //   mmq_x ≥ 32 → stride 40 (b128 path), mmq_x < 32 → stride 33 (b32).
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DM_FLOAT2: usize = 128;
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+        let shared_mem = (
+            (MMQ_Y * x_stride * 4)
+            + (X_DM_FLOAT2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 qkv MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        // Total bytes = weight read (Q+K+V) + X read (Q8_1) + Y writes (3 outputs).
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+                  + batch_size * k
+                  + batch_size * (q_m + k_m + v_m) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_mmq_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [64, 4, 1], // wave64 native: 4 wave64s = 256 threads
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_q_p); b.push_ptr(a_k_p); b.push_ptr(a_v_p);
+                b.push_ptr(xq);
+                b.push_ptr(y_q_p); b.push_ptr(y_k_p); b.push_ptr(y_v_p);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(bs_val);
                 b
             },
         );
