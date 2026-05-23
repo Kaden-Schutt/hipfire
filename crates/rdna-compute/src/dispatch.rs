@@ -24238,6 +24238,86 @@ impl Gpu {
         }
     }
 
+    /// FlashAttention WMMA, **M=64** query tile + N=128 K-tile, K/V f16
+    /// in DRAM, V_lds and S_lds in f16, **O register-resident**.
+    /// 4-wave block (128 threads). Halves the query-block count vs
+    /// M=32, which halves K and V DRAM traffic per attention call —
+    /// the dominant cost on this DRAM-bound workload.
+    ///
+    /// LDS at hd=128 ≈ 48.8 KB: V_lds[128*128] f16 + S_lds[64*128] f16
+    /// + scalars. No O_lds — O lives in per-lane register arrays
+    /// (8 float8_t = 64 VGPRs/lane in WMMA frag_c layout).
+    pub fn attention_dflash_wmma_m64_n128_f16kv_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (d_chunks=8 unroll, O_frags[8] register array).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32-equivalent slots; V_lds and S_lds are f16
+        // so they take half their nominal element count):
+        //   V_lds[128 * head_dim]  f16   = 128 * head_dim / 2 f32 slots
+        //   S_lds[64  * 128]       f16   =  64 * 128 / 2      f32 slots
+        //   m + l + alpha (64 each)      = 192                f32 slots
+        let lds_f32 = (128 * head_dim) / 2 + (64 * 128) / 2 + 64 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],   // 4 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════

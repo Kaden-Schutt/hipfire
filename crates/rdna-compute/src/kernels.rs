@@ -1681,6 +1681,16 @@ pub const ATTENTION_DFLASH_WMMA_N64_F16KV_SRC: &str = include_str!("../../../ker
 /// See `kernels/src/attention_dflash_wmma_n128_f16kv.hip`.
 pub const ATTENTION_DFLASH_WMMA_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n128_f16kv.hip");
 
+/// M=64 N=128 variant — 4-wave block, 64 queries per block (vs 32 in
+/// the N128 sibling). Halves the query-block count B/M from 610 to
+/// 305 at vision shape, which halves K and V DRAM traffic per
+/// attention call (~73 GB → ~36.5 GB at f16). O moves from O_lds to
+/// per-lane O_frags register arrays (8 float8_t in WMMA frag_c
+/// layout = 64 VGPRs/lane) to free the LDS budget that the doubled
+/// query rows would have eaten.
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip");
+
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");

@@ -350,13 +350,115 @@ practice:
 
 ### 10.3. Remaining headroom
 
-Theoretical lower bound (Strix Halo, f16 K/V): ~0.63 s K+V DRAM
-transit + WMMA throughput floor + LDS bandwidth floor + cast overhead.
-We're at 1.61 s — still ~2.5× over the DRAM floor. Steps 3 (V in
-registers via WMMA frag_b, eliminates V_lds entirely) and 4 (128-thread
-block) attack the remaining gap.
+Theoretical lower bound (Strix Halo, f16 K/V at M=32): ~0.63 s K+V
+DRAM transit. At M=32, B/M = 610 query blocks → ~73 GB K+V DRAM
+traffic per attention call. We're at 1.61 s; ~2.5× over the floor.
 
 Note: N=256 doesn't fit on gfx1151 LDS even with f16 storage
 (V_lds[256 * 128] f16 alone = 64 KB, saturates the cap). Going wider
-requires either dropping V_lds (step 3) or striping V_lds (load 128
-rows, half-phase-C, sync, reload other 128 rows, half-phase-C).
+requires either dropping V_lds (step 3) or striping V_lds.
+
+## 11. M=64 + N=128 + O register-resident (2026-05-23)
+
+The original step 3 ("V in WMMA frag_b registers") was reconsidered in
+favour of a different lever after the DRAM analysis in §10.3 showed
+that the binding constraint at M=32 was the K+V DRAM traffic — not
+V_lds bandwidth.
+
+`kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip` doubles the
+query tile from M=32 to M=64, which **halves the query-block count**
+(B/M: 610 → 305) and **halves K and V DRAM traffic per attention
+call** (~73 GB → ~36.5 GB at f16). Block size grows from 64 to 128
+threads (4 waves × 32). Each wave still owns 16 query rows.
+
+The LDS budget for M=64 N=128 with V_lds f16 + S_lds f16 + O_lds f32
+came to ~80 KB, over the 64 KB cap. The fix: drop O_lds entirely and
+keep O register-resident in the natural WMMA frag_c lane layout. Each
+lane carries 8 float8_t = 64 VGPRs of running output, alpha-folded
+in place at the end of each K-tile iter.
+
+LDS at hd=128 (no O_lds):
+  V_lds[128 * 128] f16 = 32 KB
+  S_lds[64 * 128]  f16 = 16 KB
+  scalars (m + l + alpha, 64 each) = 0.8 KB
+  **Total ≈ 48.8 KB ≤ 64 KB cap.**
+
+### 11.1. Strix Halo gfx1151 results
+
+bench_attention_vision (B=L=19520, hd=128, 3 iters):
+
+| kernel | dur (ms) | vs M=16 | vs prev |
+|---|---:|---:|---:|
+| M=16                          | 3056 |     —    |     —    |
+| M=32                          | 2936 |   +3.9 % |     —    |
+| M=32 N=64    (f32 K/V)        | 2707 |  +11.5 % |     —    |
+| M=32 N=64    f16 K/V          | 2369 |  +22.5 % |          |
+| M=32 N=128   f16 K/V          | 1609 |  +47.4 % |          |
+| **M=64 N=128 f16 K/V O-reg**  |  **751** | **+75.4 %** | **+53.3 % vs N=128 / 4.07× vs M=16** |
+
+End-to-end `ocr_e2e` vision-encoder wall: **135 s → 98.7 s**
+(+27 % on top of M=32 N=128). Cumulative since initial baseline:
+**198 s → 98.7 s = 50 %** off, **2.01× speedup** at the vision-encoder
+wall.
+
+Parity: 280 cases at hd=128, 0 failed, max-abs-diff 3.052e-5
+(unchanged from M=32 baseline).
+
+### 11.2. Kernel metadata
+
+`llvm-readelf --notes` on the compiled `.hsaco`:
+
+  .vgpr_count:     256  (at the cap)
+  .vgpr_spill_count: 80
+  .private_segment_fixed_size: 324 B/lane
+  .sgpr_count:     34
+  .group_segment_fixed_size: 0  (LDS is dynamically allocated)
+
+80 VGPR spills go into 324 B/lane private memory — small enough to
+stay in L1, so spill cost is negligible on this DRAM-bound workload.
+The kernel ran at 1 block per CU (4 waves) due to the VGPR pressure;
+this is fine because DRAM is still the binding constraint.
+
+### 11.3. Why it worked
+
+- **DRAM K+V traffic halved.** B/M = 305 query blocks (vs 610 at M=32).
+  Each (K, V) f16 element is read once per query block (no cross-block
+  L2 reuse per rocprof). Total halves.
+- **WMMA pipeline better fed.** With 4 waves per block running phase A
+  / phase C in parallel, the WMMA queue stays full across more cycles.
+- **O in registers eliminates O_lds bandwidth.** Phase C used to read
+  O_lds, alpha-scale, and write back. Now it's a register-only
+  fma per (j, dc) commit — purely ALU, no LDS traffic.
+- **Better lane utilization in phase B.** Softmax now uses 64 active
+  lanes (16 per wave × 4 waves) instead of 32 (16 × 2). Per-row work
+  is the same but distributed across more concurrent waves.
+
+### 11.4. What's left
+
+Remaining gap from theoretical DRAM floor (~317 ms at M=64):
+
+  measured: 751 ms
+  DRAM floor (~37 GB / 115 GB/s): 317 ms
+  ratio: 2.37×
+
+The ~430 ms residual is some combination of: WMMA throughput in f32
+accumulate, LDS bandwidth on S_lds reads in phase C, softmax compute
+(still serialised per-row), and L2 effective BW < peak.
+
+Next levers worth trying on this kernel (in expected-impact order):
+
+1. **Block-cooperative softmax.** Currently softmax for row r runs on
+   a single lane (the lane equal to r % 16) within its wave. Could
+   parallelise the max + sum-of-exp across 16 lanes per row using a
+   tree reduce + lane shuffles. Would shrink the phase-B critical
+   path noticeably.
+2. **Replace V_lds with V via WMMA `frag_b` from DRAM** (the original
+   step 3). Now possible because LDS has more room without O_lds. If
+   L1 catches the cross-d-chunk V reuse (32 KB slab per K-tile fits
+   in 32 KB L1 per WGP) this saves the V-stage's 32 KB LDS writes per
+   K-tile. The bet: L1 hit rate on V slab.
+3. **Fuse cast into QKV projection.** ~10 ms × 42 vision blocks = ~420
+   ms saved on E2E vision wall. Bigger downstream change.
+
+Going to N=256 still doesn't fit (V_lds alone at f16 = 64 KB). Would
+need V-frag_b-from-DRAM (lever 2 above) to unlock.
