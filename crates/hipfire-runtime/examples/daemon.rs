@@ -4805,8 +4805,69 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // Markers split across token boundaries are buffered until they
         // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
         let mut parser = deepseek4::dsml::StreamParser::new();
+
+        // Grammar-guided decoding setup. When tools are present, we mask
+        // the logits against a small state machine that mirrors the DSML
+        // format — inside a `<｜DSML｜tool_calls>` block the model can
+        // only emit token IDs whose decoded text is a prefix of a legal
+        // continuation (e.g. `<｜DSML｜invoke name="` or a schema-defined
+        // tool name). In free-emission states (`Out`, `InParamBody`,
+        // and any time tools is None / empty) the mask is all-true and
+        // the mask compute is skipped.
+        //
+        // Why this exists: V4F MQ2-Lloyd has damaged logit precision on
+        // format-structural tokens — even with the byte-identical HF
+        // system prompt at temp=1.0 it deterministically emits invented
+        // variants like `<｜DSML｜tool_cbl>`, `<｜DSML｜calling>`,
+        // `</｜DSML｜paper>` that no parser can recover. The mask makes
+        // those tokens unreachable at the sampler level.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let params: Vec<String> = func
+                            .get("parameters")
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema { name, params }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        // Precompute the decoded vocab once (`tokenizer.decode` per id).
+        // Only walked when the matcher is in a constrained state; in
+        // free mode `is_free()` short-circuits the per-step scan.
+        let decoded_vocab: Vec<String> = if grammar_active {
+            let n = tokenizer.vocab_size();
+            (0..n)
+                .map(|id| tokenizer.decode(&[id as u32]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+
+        // Apply mask to the prefill-returned logits before the first
+        // sample (matcher is in `Out` here so this is a no-op, but the
+        // codepath stays uniform).
+        let mut first_logits = last_logits;
+        if grammar_active && !matcher.is_free() {
+            matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut first_logits);
+        }
         let mut next_tok: u32 =
-            deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
+            deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
         while generated_count < max_tokens && next_tok != eos_tok {
             let frag = tokenizer.decode(&[next_tok]);
@@ -4816,9 +4877,19 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
             let _ = stdout.flush();
             m.conversation_tokens.push(next_tok);
+            if grammar_active {
+                matcher.advance(&frag);
+            }
             generated_count += 1;
             match deepseek4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, pos) {
-                Ok(logits) => {
+                Ok(mut logits) => {
+                    if grammar_active && !matcher.is_free() {
+                        matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+                        deepseek4::grammar::Matcher::apply_mask_to_logits(
+                            &grammar_mask,
+                            &mut logits,
+                        );
+                    }
                     next_tok =
                         deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
                     pos += 1;
