@@ -49,7 +49,7 @@ deferred follow-ons (forward-looking).
 | `ed1f79e6` | **Phase 2c-5d (WIP)** — bf16 round-trip kernel (`bf16_round_trip.hip`, env-gated `HIPFIRE_DOTS_OCR_BF16_RESIDUAL=1`). Hypothesis: HF's bf16 residual stream truncation introduces per-layer rounding that our F32 pipeline doesn't have. Test: zero effect on output cosines. First evidence that the divergence is not residual-stream precision drift. (Same negative result reproduced later for bf16 in QKV output, scores, softmax output — all zero effect.) |
 | `d0f38625` | **Phase 2c-5d (WIP)** — pre-attention QKV linear capture. Added a hook that dumps the post-QKV-linear output before reshape/RoPE/attention. Diff vs HF dump: cos 0.99924 (small input delta). After our attention compute on our QKV: cos 0.99819 vs HF's full attn output. → input delta is small; the post-attention divergence is amplified inside the attention compute or proj GEMM. |
 | `4c059433` | **Phase 2c-5d landed: no bug.** Decisive evidence via `scripts/numpy_attention_replay.py` — F32 numpy attention on captured QKV reproduces our GPU attn pre-proj at **cos 1.00000** (5 decimals). New `examples/dump_proj_weight.rs` extracts `proj.weight` as F32 .npy so the proj GEMM can be numpy-replayed; same result, cos 1.00000 vs our GPU attn_out. **Our GPU pipeline is bit-equivalent to F32 numpy on the SAME QKV inputs.** Meanwhile `numpy(HF_qkv @ proj_w.T)` vs `HF_attn_out` is cos 0.989 — i.e. HF's bf16 compute diverges from the F32 reference by 1%. We are **6× closer to the F32 reference than HF's bf16 path is.** The cos 0.989 we'd been chasing is HF's bf16 truncation drift, not our bug. Also falsifies a UAF / stream-race hypothesis (numpy reproduces our dumps; no corruption). |
-| `1f94da31` | **Phase 2c-5d Strategy A — END-TO-END OCR PASSES 13/13.** Added `qwen2::forward_step_with_embed` (sibling to `forward_step` that uploads a pre-built F32 embedding row instead of doing the lookup — mirrors `qwen35::forward_scratch_embed`) + new `examples/ocr_e2e.rs` (loads HFQ, runs vision_forward, splices merger output at IMGPAD slots during qwen2 prefill, greedy-decodes until EOS) + new `scripts/grade_dots_ocr_e2e.py` (greedy bbox-IoU match + Levenshtein text distance). Result on smoke image vs `dots_ocr_smoke_001_vllm.json`: **regions 13/13, F1 1.000, text exact-match 13/13, max bbox L1 = 1 pixel**. The model is robust to F32-vs-HF-bf16 drift. Strategy B (bf16-truncate-everywhere) NOT needed. Perf one-shot: vision 4.2s + text-weight load 0.4s + prefill 81.6s (5095 tokens, 62.5 tok/s unbatched) + greedy gen 119.9s (4633 tokens until EOS 151673, 38.6 tok/s) ≈ 206s end-to-end. Phase 2 closed. |
+| `1f94da31` | **Phase 2c-5d Strategy A — END-TO-END OCR PASSES 13/13.** Added `qwen2::forward_step_with_embed` (sibling to `forward_step` that uploads a pre-built F32 embedding row instead of doing the lookup — mirrors `qwen35::forward_scratch_embed`) + new `examples/ocr_e2e.rs` (loads HFQ, runs vision_forward, splices merger output at IMGPAD slots during qwen2 prefill, greedy-decodes until EOS) + new `scripts/grade_dots_ocr_e2e.py` (greedy bbox-IoU match + Levenshtein text distance). Result on smoke image vs `dots_ocr_smoke_001_vllm.json`: **regions 13/13, F1 1.000, text exact-match 13/13, max bbox L1 = 1 pixel**. The model is robust to F32-vs-HF-bf16 drift. Strategy B (bf16-truncate-everywhere) NOT needed. Perf one-shot: vision **198 s** + text-weight load 0.4 s + prefill 81.6 s (5095 tokens, 62.5 tok/s unbatched) + greedy gen 119.9 s (4633 tokens until EOS 151673, 38.6 tok/s) ≈ **400 s end-to-end** (initial commit message said 206s — incorrect; the per-block `0.10s` log-line is queue-launch time, not GPU time, and was misread as cumulative). Phase 2 closed. |
 | `47a28359` | docs-only plan sync: §0 progress log + §5 phase status updated to reflect 2c-5d closed. New §2.10 "The bf16-oracle lesson" codifying the rule that HF tensor-dump cosine is NOT a valid correctness oracle for bf16-trained models. Phase 3 marked NOT STARTED; phase 4 PARTIAL (smoke-image scaffolding done, broader reference set pending). |
 | `67cc4ac6` | Merge `upstream/master` into `feat/dots-ocr-qwen2-phase-2` (2026-05-22): brings pflash perfmax, fwht3/4 KV drafters, gfx10 MQ3/HFQ3 prefill kernels, GPT-2 BPE pre-tok fix. 4 conflicts resolved: `Cargo.toml` (add dots-ocr crate row), `docs/architecture-ids.md` (arch_id=8 status updated), `crates/hipfire-arch-qwen2/src/qwen2.rs` (kept HEAD's R5 EOS-fallback parser + `load_norm_weight_raw` length assert + `forward_step` refactor with `forward_step_with_embed` + R5/EOS tests), plan progress log + §5 phase narrative. |
 | `29d08839` | Close 7 `bind_thread()` audit gaps in `dispatch.rs` (surfaced by `scripts/verify-bind-thread.sh` on the post-merge tree). Four phase-2 dots-ocr fns: `bind_thread()?;` already existed but sat after asserts — moved to the top. Three pflash wrappers from master: delegating to an impl that binds — added explicit bind at the wrapper. 446 pub fn audited clean. |
@@ -274,14 +274,48 @@ end-to-end task output.
 | stage | wall | rate |
 |---|---|---|
 | vision weights load | 12.2 s | one-shot |
-| vision encoder (42 blocks) | 4.2 s | ~0.1 s / block (post-2c-5c WMMA) |
+| vision encoder (42 blocks) | ~198 s | ~4.7 s / block (post-2c-5c WMMA; ~74% spent in attention_dflash_wmma) |
 | text weights load | 0.4 s | one-shot |
 | prefill (5095 tokens) | 81.6 s | 62.5 tok/s (one-position-at-a-time, no batched prefill) |
 | greedy generation | 119.9 s | 4633 tokens / 38.6 tok/s until EOS 151673 |
-| total | ~206 s | per OCR page |
+| total | **~400 s** | per OCR page |
 
-The unbatched prefill is the visible bottleneck. Batched prefill is
-a phase 3+ perf item; correctness-wise, this baseline is the
+**Vision encoder is the real bottleneck, not prefill.** Per-block
+trace (block 0, `HIPFIRE_DOTS_OCR_TRACE=1`):
+
+| per-block stage | time | share |
+|---|---|---|
+| attention_dflash_wmma (N=B=L=19520, hd=128) | 2944 ms | 74 % |
+| fc13 GEMM (gate+up fused, [N, 8448]) | 540 ms | 14 % |
+| fc2 GEMM ([N, 1536]) | 306 ms | 8 % |
+| proj GEMM ([N, 1536]) | 127 ms | 3 % |
+| transpose | 24 ms | 0.6 % |
+| silu_mul | 7 ms | 0.2 % |
+| residuals / norms / rope / qkv-split | < 10 ms each | < 1 % |
+| block total | ~4700 ms | |
+
+× 42 blocks ≈ 198 s. The 16-query WMMA tile (M=16 in
+`attention_dflash_wmma`) is the perf ceiling — every K-tile load
+serves only 16 queries, so global-memory traffic dominates.
+Theoretical FMA floor at gfx1151's ~17 TFLOPs F16 sustained is ~5 s;
+we are 25× over that.
+
+**Speedup roadmap (phase 6 — perf):**
+- **Larger M-tile** (M=32 or M=64) in `attention_dflash_wmma`. 2-3×
+  attention speedup → vision ~70-100 s. Moderate kernel rewrite.
+- **Async K-load + double-buffer** on top of larger M-tile. ~1.5-2×
+  more.
+- **Cross-block K-cache sharing** within a head (1220 query-tile
+  blocks all read the same K). 3-5× theoretical. High effort, HIP
+  cooperative-groups territory.
+- **hipBLASLt fused attention** if exposed on gfx1151 — link
+  against the ROCm flash-attn extension instead of carrying our own.
+  Check before committing to a new kernel rewrite.
+
+Prefill is also slow but secondary: 62 tok/s one-position-at-a-time
+is the documented unbatched cost (rev-3 deferred §8 "Prefill
+batching"); a batched-prefill GEMM variant gets it to several
+hundred tok/s. Correctness-wise the current baseline is the
 ship-able floor.
 
 **DFlash parity sweep** (post-2c-5c, re-checked 2026-05-23 after
