@@ -34,7 +34,7 @@ use crate::mtp_head::{
     self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
 use crate::qwen35::{self, Qwen35Weights};
-use crate::speculative::{DeltaNetSnapshot, ModelSlot};
+use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::HipResult;
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -238,6 +238,10 @@ pub struct MtpSpecState {
     /// Sized to `max_n + 1` so verify always fits in one chunk.
     pub trunk_pbs: qwen35::PrefillBatchScratch,
 
+    /// Innovation tape captured during trunk verify. After rollback, replaying
+    /// this advances only the DeltaNet recurrence for the accepted prefix.
+    pub trunk_gdn_tape: GdnTape,
+
     /// MTP head per-call scratch (Task 9). One per slot; reused across cycles.
     pub mtp_scratch: Qwen35MtpHeadScratch,
 
@@ -382,6 +386,7 @@ impl MtpSpecState {
         let verify_argmax = gpu.alloc_tensor(&[max_n + 1], DType::F32)?;
         let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
         let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, max_n + 1)?;
+        let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, max_n + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
         let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
 
@@ -414,6 +419,7 @@ impl MtpSpecState {
             verify_argmax,
             trunk_snap,
             trunk_pbs,
+            trunk_gdn_tape,
             mtp_scratch,
             mtp_kv,
             mtp_t_outs,
@@ -538,6 +544,7 @@ impl MtpSpecState {
         // DeltaNetSnapshot's DeviceBuffers free on drop.
         drop(self.trunk_snap);
         self.trunk_pbs.free_gpu(gpu);
+        self.trunk_gdn_tape.free_gpu(gpu);
         self.mtp_scratch.free_gpu(gpu);
         self.mtp_kv.free_gpu(gpu);
     }
@@ -1588,7 +1595,7 @@ pub fn spec_step_mtp_compressed_serial(
     qwen35::forward_prefill_batch_with_pbs(
         gpu, trunk_weights, &target.config, &verify_tokens, cur_pos,
         &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-        None, Some(&state.verify_hidden), None, None,
+        None, Some(&state.verify_hidden), Some(&mut state.trunk_gdn_tape), None,
         Some(&state.trunk_pbs), None, // mask_override
         None, // max_layer
     )?;
@@ -1797,22 +1804,22 @@ pub fn spec_step_mtp_compressed_serial(
 
     // ── 3. KV / DN rollback (or skip on full accept) ──────────────────────
     //
-    // Replay is REDUNDANT when advance == drafts_generated + 1 (full
+    // Rollback is REDUNDANT when advance == drafts_generated + 1 (full
     // accept, no EOS, no chain truncation matters): verify's forward
     // already left DN state advanced by `drafts_generated + 1` steps from
     // the snapshot, which is exactly where replay would land. KV cache
     // slots `cur_pos..cur_pos + drafts_generated` are also already
-    // populated identically (replay would write the same tokens to the
+    // populated identically (rollback would write the same tokens to the
     // same slots).
     //
-    // Skipping saves the per-cycle replay forward (~30-40 ms / 75 ms total
-    // cycle wall — replay is the second-biggest single cost per
-    // `mtp-cycle-anatomy.md`). At τ≈3.8 on K=5, ~20-30% of cycles full-
-    // accept, so net cycle-wall reduction is ~7-12% on the canonical bench.
+    // For partial accepts, use the same GDN innovation-tape repair that
+    // DFlash uses: restore the pre-verify DeltaNet state, then replay only
+    // conv/GDN recurrence for the accepted prefix. Full trunk forward replay
+    // was the dominant non-verify cost in the MTP cycle.
     //
     // The trunk_snap.save_from() call earlier in the cycle is still made
     // unconditionally (~1 ms, unavoidable since we don't know advance
-    // until verify completes); only the restore + replay are gated.
+    // until verify completes); only the restore + tape replay are gated.
     //
     // On EOS we still take the replay branch: even though no further
     // forwards happen, the caller's KV cache must reflect ONLY the
@@ -1822,19 +1829,13 @@ pub fn spec_step_mtp_compressed_serial(
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
         state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-        if advance >= 2 {
-            let replay = &verify_tokens[..advance];
-            qwen35::forward_prefill_batch(
-                gpu, trunk_weights, &target.config, replay, cur_pos,
-                &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-                None, None, None, None,
-            )?;
-        } else {
-            qwen35::forward_scratch(
-                gpu, trunk_weights, &target.config, verify_tokens[0], cur_pos,
-                &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-            )?;
-        }
+        state.trunk_gdn_tape.replay_gdn(
+            gpu,
+            trunk_weights,
+            &target.config,
+            &mut target.dn_state,
+            advance,
+        )?;
     }
 
     Ok(MtpSpecResult {
