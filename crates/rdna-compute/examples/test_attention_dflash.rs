@@ -119,6 +119,9 @@ fn run_case(
         "wmma" => gpu
             .attention_dflash_wmma_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
             .unwrap(),
+        "wmma_m32" => gpu
+            .attention_dflash_wmma_m32_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
+            .unwrap(),
         _ => unreachable!(),
     }
 
@@ -160,7 +163,7 @@ fn main() {
     let mut max_err_seen = 0.0f32;
 
     println!("tolerance: max-abs-diff < {tol:.0e}");
-    println!("kernels:   scalar = attention_dflash_f32   wmma = attention_dflash_wmma_f32");
+    println!("kernels:   scalar = attention_dflash_f32   wmma = attention_dflash_wmma_f32   wmma_m32 = attention_dflash_wmma_m32_f32 (hd<=128 only)");
     println!();
     println!(
         "{:>3}  {:>5}  {:>3}  {:>6}  {:>11}  {:>11}  {:>4}",
@@ -211,6 +214,25 @@ fn main() {
                     println!(
                         "{:>3}  {:>5}  {:>3}  {:>6}  {:>11}  {:>11}  {}",
                         b, l, hd, "wmma", "—", "—", "SKIP (hd>256)"
+                    );
+                }
+
+                // M=32 WMMA kernel caps at head_dim <= 128 (tighter LDS
+                // budget than the M=16 variant). Skip larger.
+                if hd <= 128 {
+                    let m32_diff = run_case(&mut gpu, "wmma_m32", b, l, n_heads, n_kv_heads, hd, &out_ref);
+                    total += 1;
+                    max_err_seen = max_err_seen.max(m32_diff);
+                    if m32_diff >= tol { failed += 1; }
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>8}  {:>11.3e}  {:>11}  {}",
+                        b, l, hd, "wmma_m32", m32_diff, "—",
+                        if m32_diff < tol { "PASS" } else { "FAIL" }
+                    );
+                } else if !run_scalar {
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>8}  {:>11}  {:>11}  {}",
+                        b, l, hd, "wmma_m32", "—", "—", "SKIP (hd>128)"
                     );
                 }
             }

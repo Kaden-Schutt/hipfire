@@ -1645,6 +1645,14 @@ pub const QKV_SPLIT_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/q
 /// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
 pub const ATTENTION_DFLASH_WMMA_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma.hip");
 
+/// M=32 variant of `ATTENTION_DFLASH_WMMA_SRC` — two-wave block (64
+/// threads), processes 32 queries per block instead of 16. Halves the
+/// number of query-tile blocks at large B, which halves global K-tile
+/// fetches and gives ~2× wall-time speedup at vision-encoder shapes
+/// where the M=16 kernel is memory-bound. LDS-capped at head_dim ≤ 128.
+/// See `kernels/src/attention_dflash_wmma_m32.hip`.
+pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m32.hip");
+
 /// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
 /// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
 /// vision encoder to match HF's bf16 forward path at residual-stream

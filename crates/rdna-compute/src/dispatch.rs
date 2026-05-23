@@ -23868,6 +23868,90 @@ impl Gpu {
         }
     }
 
+    /// FlashAttention-style WMMA with M=32 query tile (vs M=16 in
+    /// `attention_dflash_wmma_f32`). Two waves per block; doubles the
+    /// queries served per K-tile load, halving global-memory K
+    /// traffic at vision-encoder shapes (large B, large L, head_dim ≤
+    /// 128). Same head_dim ≤ 128 ceiling here — LDS budget is
+    /// `(2*32 + 16) * head_dim + 32*16 + 96` f32 slots = 43 KB at
+    /// hd=128, which is the largest tile that fits the 64 KB RDNA3
+    /// wave32 SLM cap with full Q_lds + O_lds + V_lds.
+    ///
+    /// Caller responsibility: dispatch this when `B >= 32` AND
+    /// `head_dim ≤ 128`; fall back to the M=16 variant or the scalar
+    /// `attention_dflash_f32` otherwise.
+    pub fn attention_dflash_wmma_m32_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim % 16 == 0,
+            "attention_dflash_wmma_m32_f32: head_dim={head_dim} must be a multiple of 16",
+        );
+        assert!(
+            head_dim <= 128,
+            "attention_dflash_wmma_m32_f32: head_dim={head_dim} exceeds the 128 cap — \
+             LDS budget at head_dim=160 is 53.4 KB and at head_dim=256 is 84 KB which \
+             exceeds the 64 KB RDNA3 wave32 limit. Fall back to attention_dflash_wmma_f32 \
+             (M=16) for larger head_dim.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m32_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m32_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
+            "attention_dflash_wmma_m32_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m32_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32 slots):
+        //   Q_lds[32 * head_dim] + V_lds[16 * head_dim] + O_lds[32 * head_dim]
+        //   + S_lds[32 * 16]
+        //   + m_lds[32] + l_lds[32] + alpha_lds[32]
+        let lds_f32 = (2 * 32 + 16) * head_dim + 32 * 16 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════

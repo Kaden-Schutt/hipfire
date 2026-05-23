@@ -1092,16 +1092,25 @@ pub fn vision_forward(
         // (no GQA on the vision side per modeling_dots_vision.py:106).
         let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
         // For large-B vision attention (B = L = n_patches ≈ 20k on the
-        // smoke image), use the WMMA-accelerated FlashAttention kernel —
-        // grid `[n_heads, B/16]` with one block tiling 16 queries via
-        // wave-cooperative WMMA. The scalar `attention_dflash_f32` is
-        // ~10× slower at this scale; benchmarks on the smoke image
-        // show ~50s/block → ~5-10s/block after the switch.
+        // smoke image), use the WMMA-accelerated FlashAttention kernel.
+        // Three variants, picked by (head_dim, B) constraints:
         //
-        // Falls back to the scalar variant if head_dim isn't a multiple
-        // of 16 (the WMMA tile-K size) — for dots.ocr (head_dim=128)
-        // we always take the WMMA path.
-        if head_dim % 16 == 0 {
+        //   * `attention_dflash_wmma_m32_f32` — M=32 query tile, 2 waves
+        //     per block. Halves the query-tile-block count vs the M=16
+        //     kernel → halves global-memory K-traffic. LDS budget caps
+        //     it at head_dim ≤ 128. Preferred when applicable.
+        //   * `attention_dflash_wmma_f32` — M=16, 1 wave. LDS budget
+        //     allows head_dim up to 256.
+        //   * `attention_dflash_f32` — scalar online-softmax fallback
+        //     when head_dim isn't a multiple of 16.
+        //
+        // For dots.ocr (head_dim=128) we always take the M=32 path.
+        if head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
+            gpu.attention_dflash_wmma_m32_f32(
+                &q_buf, &k_buf, &v_buf, &attn,
+                n_patches, n_patches, n_heads, n_heads, head_dim,
+            )?;
+        } else if head_dim % 16 == 0 {
             gpu.attention_dflash_wmma_f32(
                 &q_buf, &k_buf, &v_buf, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
