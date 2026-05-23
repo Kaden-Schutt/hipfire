@@ -522,3 +522,73 @@ exhausted; what's left is harder:
 
 The N=256 path or QKV-cast fusion are likely the next big ones; both
 are bigger structural changes than the v2 patches.
+
+## 13. v3 — hoist S_lds reads (null result, archived 2026-05-23)
+
+`kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip` reorders
+phase C to outer c, inner dc so `a_reg_sm` is read once per K-chunk
+(was once per (d-chunk, K-chunk)). Theoretical 8× reduction in phase C
+S_lds reads. Also moves the alpha-fold to start-of-phase-C and
+accumulates SV into a per-d-chunk `o_acc_local[8]` register array.
+
+### 13.1. Result: tied with v2 (within noise)
+
+bench (B=L=19520, hd=128):
+  v2: 518.5 ms
+  v3: 522.6 ms
+
+Parity: 336 cases, 0 failed.
+
+### 13.2. Why it didn't help — rocprof data
+
+`rocprofv3 --pmc LDSBankConflict SQ_INSTS_LDS SQ_INSTS_VALU GL2C_HIT`:
+
+| kernel | LDSBankConflict | SQ_INSTS_LDS | SQ_INSTS_VALU | GL2C_HIT |
+|---|---:|---:|---:|---:|
+| v1            | **66.5** | 3.09 G | 7.44 G | 388 M |
+| v2 (pad+coop) | **3.3**  | 3.74 G | 6.23 G | 339 M |
+| v3 (+hoist)   | **3.3**  | 3.74 G | 6.18 G | 263 M |
+
+`SQ_INSTS_LDS` is **identical between v2 and v3** despite v3's
+theoretical 8× reduction in phase C S_lds reads. The compiler had
+already vectorised the per-lane `for (j=0..15) a_reg_sm[j] = sm_row[j]`
+loop into wide `ds_read_b128` instructions (16 bytes per lane → 1
+LDS instruction per j-loop, not 16). v3's "hoist" was a no-op at
+the instruction level.
+
+### 13.3. What the rocprof DOES show — v1 → v2 attribution
+
+The v2 win (752 → 538 ms = +28%) is almost entirely the **20×
+reduction in LDS bank conflicts** from the S_lds row-stride padding
+(66.5 → 3.3). The cooperative softmax added LDS instruction count
+(3.09 → 3.74 G) but the bank-conflict fix dwarfed any per-instruction
+overhead.
+
+### 13.4. Where the remaining 200ms gap likely lives
+
+GPU_UTIL = 100% but the visible counters show:
+  - VALU utilization ~14% of theoretical peak
+  - LDS utilization ~4% of theoretical peak
+  - LDS bank conflicts near zero
+
+The bottleneck is **not** any of: VALU compute, LDS bandwidth, LDS
+bank conflicts. Most likely **DRAM access latency** — we're consuming
+~33 GB/s effective vs LPDDR5X peak of 115 GB/s (28% of peak), and
+GL2C_HIT is dropping iter-over-iter as we squeeze the inner loop
+denser. The remaining wall-time appears to be cycles waiting on
+in-flight DRAM loads.
+
+v3 is committed but **not wired into dots-ocr dispatch** — kept as a
+documented ablation point. dots-ocr stays on v2.
+
+### 13.5. What still might move the needle
+
+1. **Reduce DRAM traffic further.** Either MFP4 K/V (sub-byte, halves
+   DRAM again) — needs accuracy work — or larger M (M=128 → B/M=152,
+   another 2× DRAM cut). M=128 requires LDS restructure (Q in LDS or
+   K/V both in registers).
+2. **Better DRAM utilization.** Software prefetch of K and V outside
+   the phase-A/C inner loops to keep DRAM bandwidth saturated. CK's
+   `kQLoadOnce + global_read_lds_i+2` pattern.
+3. **QKV-cast fusion** for the E2E vision-encoder win (~420 ms),
+   independent of the attention kernel.

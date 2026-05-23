@@ -1698,6 +1698,15 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC: &str = include_str!("../../.
 /// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip");
 
+/// V3 of M=64 N=128 — keeps v2's S_lds padding + cooperative softmax
+/// and adds hoisted S_lds reads in phase C (outer c, inner dc) so
+/// each a_reg_sm row chunk is read once per c instead of once per
+/// (dc, c). Reduces phase C S_lds reads from 1024/lane/iter to
+/// 128/lane/iter. O alpha-folded at start of phase C so SV
+/// accumulates directly into the running output.
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
+
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");
