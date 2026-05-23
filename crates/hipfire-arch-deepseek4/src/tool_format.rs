@@ -377,23 +377,37 @@ fn parse_one_call(inner: &str) -> Option<ToolCall> {
     // skip straight to the separator.
     let sep_at = inner.find(TOOL_SEP)?;
     let after_sep = sep_at + TOOL_SEP.len();
-    let name_end = inner[after_sep..]
-        .find('\n')
-        .map(|i| after_sep + i)
-        .unwrap_or(inner.len());
-    let name = inner[after_sep..name_end].trim().to_string();
+    // Name terminates at the first newline, fence opener, or whitespace.
+    // Permissive: the format SHOULD put NAME on its own line before the
+    // ```json fence, but tolerate the fence appearing on the same line.
+    let tail = &inner[after_sep..];
+    let name_end_rel = ["\n", "```"]
+        .iter()
+        .filter_map(|needle| tail.find(needle))
+        .min()
+        .unwrap_or(tail.len());
+    let name = tail[..name_end_rel].trim().to_string();
     if name.is_empty() {
         return None;
     }
-    // Locate the ```json ... ``` fenced block.
-    const FENCE_OPEN: &str = "```json";
-    const FENCE_CLOSE: &str = "```";
-    let fence_open_rel = inner[name_end..].find(FENCE_OPEN)?;
-    let payload_start = name_end + fence_open_rel + FENCE_OPEN.len();
-    let payload_end_rel = inner[payload_start..].find(FENCE_CLOSE)?;
+    let name_end = after_sep + name_end_rel;
+    // Locate the JSON payload. Prefer the explicit ```json fence; fall
+    // back to any ``` fence (some clients omit the lang tag).
+    const FENCE_OPEN_JSON: &str = "```json";
+    const FENCE_OPEN_PLAIN: &str = "```";
+    let after_name = &inner[name_end..];
+    let (fence_open_rel, fence_open_len) = match after_name.find(FENCE_OPEN_JSON) {
+        Some(i) => (i, FENCE_OPEN_JSON.len()),
+        None => (after_name.find(FENCE_OPEN_PLAIN)?, FENCE_OPEN_PLAIN.len()),
+    };
+    let payload_start = name_end + fence_open_rel + fence_open_len;
+    let payload_end_rel = inner[payload_start..].find(FENCE_OPEN_PLAIN)?;
     let raw = inner[payload_start..payload_start + payload_end_rel].trim();
-    let arguments: Value = serde_json::from_str(raw)
-        .unwrap_or_else(|_| Value::String(raw.to_string()));
+    let arguments: Value = if raw.is_empty() {
+        Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    };
     Some(ToolCall { name, arguments })
 }
 
@@ -616,5 +630,110 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0][0].name, "f");
         assert_eq!(calls[0][0].arguments["a"], json!(1));
+    }
+
+    #[test]
+    fn zero_arg_call() {
+        let payload = format!(
+            "{open}{co}function{sep}ping\n```json\n{{}}\n```{cc}{close}",
+            open = TOOL_CALLS_OPEN,
+            close = TOOL_CALLS_CLOSE,
+            co = TOOL_CALL_OPEN,
+            cc = TOOL_CALL_CLOSE,
+            sep = TOOL_SEP,
+        );
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&payload);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0].name, "ping");
+        assert_eq!(calls[0][0].arguments, json!({}));
+    }
+
+    #[test]
+    fn plain_fence_without_json_lang_tag() {
+        // Tolerate ``` instead of ```json — some training samples may
+        // omit the language tag.
+        let payload = format!(
+            "{open}{co}function{sep}f\n```\n{{\"a\":1}}\n```{cc}{close}",
+            open = TOOL_CALLS_OPEN,
+            close = TOOL_CALLS_CLOSE,
+            co = TOOL_CALL_OPEN,
+            cc = TOOL_CALL_CLOSE,
+            sep = TOOL_SEP,
+        );
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&payload);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0].name, "f");
+        assert_eq!(calls[0][0].arguments["a"], json!(1));
+    }
+
+    #[test]
+    fn name_terminates_at_fence_when_no_newline() {
+        // If the model emits NAME```json without a newline, name should
+        // still stop at the fence rather than swallowing it.
+        let payload = format!(
+            "{open}{co}function{sep}foo```json\n{{\"a\":1}}\n```{cc}{close}",
+            open = TOOL_CALLS_OPEN,
+            close = TOOL_CALLS_CLOSE,
+            co = TOOL_CALL_OPEN,
+            cc = TOOL_CALL_CLOSE,
+            sep = TOOL_SEP,
+        );
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&payload);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0].name, "foo");
+        assert_eq!(calls[0][0].arguments["a"], json!(1));
+    }
+
+    #[test]
+    fn no_function_prefix_still_parses() {
+        // Some implementations skip the "function" type tag and put NAME
+        // directly after <｜tool▁call▁begin｜>. Sep separates "" from NAME.
+        let payload = format!(
+            "{open}{co}{sep}fn1\n```json\n{{\"a\":1}}\n```{cc}{close}",
+            open = TOOL_CALLS_OPEN,
+            close = TOOL_CALLS_CLOSE,
+            co = TOOL_CALL_OPEN,
+            cc = TOOL_CALL_CLOSE,
+            sep = TOOL_SEP,
+        );
+        let mut p = StreamParser::new();
+        let mut events = p.feed(&payload);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0][0].name, "fn1");
     }
 }
