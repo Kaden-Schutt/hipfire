@@ -1592,10 +1592,28 @@ pub fn spec_step_mtp_compressed_serial(
 
     state.trunk_snap.save_from(&target.dn_state, gpu)?;
 
+    // GDN-tape capture is only valid when verify takes the batched PBS path.
+    // MoE trunks are rejected by the PBS eligibility check (qwen35.rs: MoE
+    // layer types) and fall through to a per-token loop that never writes
+    // the tape — replaying that zero-init tape at rollback corrupts
+    // dn_state.conv_states. Mirror the DFlash guard (speculative.rs): null
+    // the tape on MoE trunks and take the full-trunk replay fallback below.
+    // (The MTP verify's PBS scratch is sized max_n+1, so n_verify always fits
+    // in one chunk — MoE-ness is the only tape-population fallback trigger.)
+    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
+        lw,
+        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
+    ));
+    let verify_tape: Option<&mut GdnTape> = if target_has_moe {
+        None
+    } else {
+        Some(&mut state.trunk_gdn_tape)
+    };
+
     qwen35::forward_prefill_batch_with_pbs(
         gpu, trunk_weights, &target.config, &verify_tokens, cur_pos,
         &mut target.kv_cache, &mut target.dn_state, &target.scratch,
-        None, Some(&state.verify_hidden), Some(&mut state.trunk_gdn_tape), None,
+        None, Some(&state.verify_hidden), verify_tape, None,
         Some(&state.trunk_pbs), None, // mask_override
         None, // max_layer
     )?;
@@ -1829,13 +1847,33 @@ pub fn spec_step_mtp_compressed_serial(
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
         state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-        state.trunk_gdn_tape.replay_gdn(
-            gpu,
-            trunk_weights,
-            &target.config,
-            &mut target.dn_state,
-            advance,
-        )?;
+        if !target_has_moe {
+            // Tape was populated by the batched verify — cheap GDN-only replay.
+            state.trunk_gdn_tape.replay_gdn(
+                gpu,
+                trunk_weights,
+                &target.config,
+                &mut target.dn_state,
+                advance,
+            )?;
+        } else {
+            // Fallback (tape unpopulated on MoE trunks): the original
+            // always-correct full-trunk replay of the committed prefix —
+            // one batched forward, or a single forward_scratch for advance==1.
+            if advance >= 2 {
+                let replay = &verify_tokens[..advance];
+                qwen35::forward_prefill_batch(
+                    gpu, trunk_weights, &target.config, replay, cur_pos,
+                    &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+                    None, None, None, None,
+                )?;
+            } else {
+                qwen35::forward_scratch(
+                    gpu, trunk_weights, &target.config, verify_tokens[0], cur_pos,
+                    &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+                )?;
+            }
+        }
     }
 
     Ok(MtpSpecResult {
