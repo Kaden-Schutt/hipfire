@@ -2226,7 +2226,7 @@ async function serve(port: number, host: string) {
                     }
                   } else if (msg.type === "reasoning") {
                     // V4F daemon arm emits structured `reasoning` events
-                    // from the DSML StreamParser; `<think>` / `</think>`
+                    // from the native tool-format StreamParser; `<think>` / `</think>`
                     // have already been stripped server-side. Forward as
                     // OpenAI-compatible `reasoning_content` delta.
                     const rtext = msg.text as string;
@@ -2239,7 +2239,7 @@ async function serve(port: number, host: string) {
                     }
                   } else if (msg.type === "tool_calls") {
                     // V4F daemon arm emits structured `tool_calls` events
-                    // from the DSML StreamParser. Convert each call into
+                    // from the native tool-format StreamParser. Convert each call into
                     // an OpenAI-format tool_call SSE delta. We emit one
                     // SSE chunk per call so order is preserved; each call
                     // gets a synthetic `call_<index>` id.
