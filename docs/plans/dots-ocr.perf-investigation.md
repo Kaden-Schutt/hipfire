@@ -523,7 +523,7 @@ exhausted; what's left is harder:
 The N=256 path or QKV-cast fusion are likely the next big ones; both
 are bigger structural changes than the v2 patches.
 
-## 13. v3 — hoist S_lds reads (null result, archived 2026-05-23)
+## 13. v3 — hoist S_lds reads (small win, ~2.6% over v2)
 
 `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip` reorders
 phase C to outer c, inner dc so `a_reg_sm` is read once per K-chunk
@@ -531,13 +531,30 @@ phase C to outer c, inner dc so `a_reg_sm` is read once per K-chunk
 S_lds reads. Also moves the alpha-fold to start-of-phase-C and
 accumulates SV into a per-d-chunk `o_acc_local[8]` register array.
 
-### 13.1. Result: tied with v2 (within noise)
+### 13.1. Result: small but real win over v2
 
-bench (B=L=19520, hd=128):
-  v2: 518.5 ms
-  v3: 522.6 ms
+**Initial single-run measurement was misleading** — bench showed v2 =
+518.5 ms, v3 = 522.6 ms (v3 appearing slower), which I committed as a
+"null result." Critical review during pre-push audit caught this:
 
-Parity: 336 cases, 0 failed.
+Fresh-process variance, 4 runs × 10 iters each (cooled GPU):
+
+| | run 1 | run 2 | run 3 | run 4 | median | range |
+|---|---:|---:|---:|---:|---:|---:|
+| v2 | 547.1 | 537.3 | 538.5 | 542.9 | **540.7** | 1.8 % |
+| **v3** | 529.2 | 525.0 | 526.5 | 527.1 | **526.8** | **0.8 %** |
+
+**v3 wins by ~14 ms = 2.6%, with tighter variance.** The single-run
+measurement was confounded by call-order in the same bench binary: v2
+was called first (cold-cache best case), v3 second. With both
+warmed up across separate processes, v3 consistently wins.
+
+Per CLAUDE.md's ±5% rule the 2.6 % delta is below forced-investigation
+threshold, but it is reproducible and worth shipping. dots-ocr
+dispatch is now switched to v3.
+
+Parity: 336 cases at hd=128, 0 failed, max-abs-diff 3.052e-5.
+E2E F1 against vLLM reference: 1.000, 13/13 exact text match.
 
 ### 13.2. Why it didn't help — rocprof data
 
@@ -578,8 +595,8 @@ GL2C_HIT is dropping iter-over-iter as we squeeze the inner loop
 denser. The remaining wall-time appears to be cycles waiting on
 in-flight DRAM loads.
 
-v3 is committed but **not wired into dots-ocr dispatch** — kept as a
-documented ablation point. dots-ocr stays on v2.
+v3 is wired into dots-ocr dispatch (corrected after pre-push audit
+caught the original mis-measurement).
 
 ### 13.5. What still might move the needle
 
