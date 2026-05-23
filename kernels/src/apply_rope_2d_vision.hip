@@ -20,7 +20,13 @@
 
 #include <hip/hip_runtime.h>
 
-extern "C" __global__ void apply_rope_2d_vision_f32(
+// `__launch_bounds__(N, M)` is an occupancy hint: the kernel will be launched
+// with at most N threads/block and the compiler may assume M blocks/CU. For
+// the current Qwen3.5-VL family head_dim ≤ 72, so head_dim/2 ≤ 36 (under 1
+// wave32). Cap at 64 to stay generous for any future variant with head_dim
+// up to 128 while still letting the compiler keep register pressure low —
+// the body does ~6 fma per thread, so this is mostly documentation.
+extern "C" __launch_bounds__(64, 8) __global__ void apply_rope_2d_vision_f32(
     float* __restrict__ qkv,        // [N, 3 * hidden] in-place
     const float* __restrict__ cos_t, // [N, head_dim / 2]
     const float* __restrict__ sin_t, // [N, head_dim / 2]

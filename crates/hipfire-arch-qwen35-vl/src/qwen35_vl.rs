@@ -28,6 +28,11 @@ pub struct VisionConfig {
     /// bilinearly interpolated to each image's `(grid_h, grid_w)` at forward
     /// time — see `fast_pos_embed_interpolate`.
     pub num_position_embeddings: usize,
+    /// Base θ for the 2D vision rotary frequencies (HF default 10000.0).
+    /// Read from `vision_config.rope_theta` if present, else defaulted —
+    /// future variants that override `Qwen3_5VisionRotaryEmbedding(theta=…)`
+    /// will pick up the correct value automatically.
+    pub rope_theta: f32,
     pub norm_eps: f32,
 }
 
@@ -48,12 +53,14 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
     let spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
     let num_position_embeddings = vc.get("num_position_embeddings")
         .and_then(|v| v.as_u64()).unwrap_or(2304) as usize;
+    let rope_theta = vc.get("rope_theta")
+        .and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32;
 
     Some(VisionConfig {
         hidden_size, num_heads, head_dim: hidden_size / num_heads,
         num_layers, mlp_dim, patch_size, temporal_patch_size,
         out_hidden_size, spatial_merge_size, num_position_embeddings,
-        norm_eps: 1e-6,
+        rope_theta, norm_eps: 1e-6,
     })
 }
 
@@ -119,7 +126,7 @@ fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
 
 fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
     let vals = load_f32_cpu(hfq, name, n);
-    gpu.upload_f32(&vals[..n], &[n])
+    gpu.upload_f32(&vals, &[n])
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
@@ -172,6 +179,24 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
 
 pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
+
+    // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,
+    // vit_attention_f32, apply_rope_2d_vision_f32, gelu_tanh_f32, etc.) are
+    // arch-neutral HIP and should COMPILE on any ROCm-supported GPU, but the
+    // 12/12 quality bench against llama.cpp was only run on gfx1100 (RX 7900 XT).
+    // Other archs are unvalidated — we don't refuse, but we warn so users can
+    // distinguish "tested" from "should work in theory."
+    // Tracked validation: gfx1100, gfx1101, gfx1102 (all RDNA3 wave32).
+    match gpu.arch.as_str() {
+        "gfx1100" | "gfx1101" | "gfx1102" => {}
+        other => {
+            eprintln!("  ⚠ vision tower not yet validated on {other}; \
+                       results may differ from gfx1100 reference. See \
+                       benchmarks/vision/comparison-2026-05-23.md for the \
+                       gfx1100 baseline.");
+        }
+    }
+
     // Detect vision weight format (F16 direct vs HFQ4 auto-dequant) and log once.
     // HFQ4 vision weights (qt=6 G256, qt=7 G128) are dequantized to F16 at load
     // time for the gemm_f16 path — there is no GPU HFQ4 kernel for vision yet.
@@ -344,7 +369,7 @@ pub fn fast_pos_embed_interpolate(
 ///
 /// HF reference: `Qwen3_5VisionModel.rot_pos_emb`. The inner rotary dim is
 /// `head_dim/2`; frequencies are
-///     inv_freq[i] = 1 / 10000^(2i / (head_dim/2))    for i in [0, head_dim/4)
+///     inv_freq[i] = 1 / theta^(2i / (head_dim/2))    for i in [0, head_dim/4)
 /// and the per-patch trig argument is
 ///     concat( row_idx * inv_freq, col_idx * inv_freq )    → (head_dim/2,)
 /// where `row_idx`/`col_idx` are the un-merged (gy*ms+sy, gx*ms+sx) positions.
@@ -353,20 +378,24 @@ pub fn fast_pos_embed_interpolate(
 /// along the last dim, so the trig values at `d` and `d + head_dim/2` are
 /// identical. The rotary kernel reuses one scalar for both halves.
 ///
+/// `theta` is the rotary base (HF default 10000.0); read from
+/// `VisionConfig::rope_theta` at the call site.
+///
 /// Returns `(cos, sin)` each of length `n * (head_dim/2)`.
 pub fn compute_vision_rope_cos_sin(
     grid_h: usize,
     grid_w: usize,
     head_dim: usize,
     merge_size: usize,
+    theta: f32,
 ) -> (Vec<f32>, Vec<f32>) {
     assert!(head_dim % 4 == 0, "head_dim must be divisible by 4 (got {head_dim})");
     let rot_dim = head_dim / 2;          // total rotary feature width
     let inner   = head_dim / 4;          // = rot_dim / 2 = #frequencies
 
-    // inv_freq[i] = 1 / 10000^(2i / rot_dim)  for i in [0, inner)
+    // inv_freq[i] = 1 / theta^(2i / rot_dim)  for i in [0, inner)
     let inv_freq: Vec<f32> = (0..inner)
-        .map(|i| 1.0 / (10000f32).powf(2.0 * i as f32 / rot_dim as f32))
+        .map(|i| 1.0 / theta.powf(2.0 * i as f32 / rot_dim as f32))
         .collect();
 
     let n = grid_h * grid_w;
@@ -471,7 +500,7 @@ mod tests {
         // The token at (row=1, col=0) should have cos[:inner] = cos(1*inv_freq)
         // and cos[inner:] = cos(0*inv_freq) = 1.
         let head_dim = 8usize;
-        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 2, head_dim, 1);
+        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 2, head_dim, 1, 10000.0);
         let inner = head_dim / 4;
         let rot = head_dim / 2;
         assert_eq!(cos_t.len(), 4 * rot);
@@ -486,6 +515,86 @@ mod tests {
         let inv0 = 1.0f32; // 10000^0 = 1
         assert!((cos_t[base] - inv0.cos()).abs() < 1e-5);
         assert!((sin_t[base] - inv0.sin()).abs() < 1e-5);
+    }
+
+    /// Non-square grid (4×6 ≠ 6×6 table): bilinear interpolation across
+    /// rows + h-major outer permutation. Catches an h/w transpose bug in
+    /// the 2x2-group permute that the square cases can't see.
+    #[test]
+    fn pos_embed_interp_identity_non_square() {
+        let k = 6usize;
+        let hidden = 2usize;
+        let merge = 2usize;
+        let mut table = vec![0.0f32; k * k * hidden];
+        for r in 0..k {
+            for c in 0..k {
+                for d in 0..hidden {
+                    table[(r * k + c) * hidden + d] = (r * 100 + c) as f32 + (d as f32) * 0.5;
+                }
+            }
+        }
+        // grid_h=4, grid_w=6 — both ≤ K, both even, distinct so a w/h swap
+        // in the permutation would produce a visibly wrong byte at a known
+        // out_idx.
+        let grid_h = 4usize;
+        let grid_w = 6usize;
+        let out = fast_pos_embed_interpolate(&table, hidden, grid_h, grid_w, k, merge);
+        assert_eq!(out.len(), grid_h * grid_w * hidden);
+
+        // Spot-check: 2x2-grouped patch at (gy=1, gx=2, sy=0, sx=1) is at:
+        //   out_idx = gy * (gw * 4) + gx * 4 + sy * 2 + sx
+        //   gw = grid_w / 2 = 3 → out_idx = 1*12 + 2*4 + 0*2 + 1 = 21
+        // Maps to (py = gy*2+sy, px = gx*2+sx) = (2, 5).
+        // linspace(0, K-1, grid_h)[2] for K=6, N=4 → 2 * 5/3 ≈ 3.333
+        // linspace(0, K-1, grid_w)[5] for K=6, N=6 → 5.0 exact
+        // So we sample a bilinear blend between rows 3 and 4 at column 5.
+        let py_lin = 2.0f32 * 5.0 / 3.0;
+        let r_floor = py_lin as i32 as usize;
+        let r_ceil = (r_floor + 1).min(k - 1);
+        let dh = py_lin - r_floor as f32;
+        let want = (1.0 - dh) * table[(r_floor * k + 5) * hidden]
+                 +        dh  * table[(r_ceil * k + 5) * hidden];
+        let got = out[21 * hidden];
+        assert!((got - want).abs() < 1e-4, "non-square spot check failed: got={got} want={want}");
+    }
+
+    /// Rectangular `compute_vision_rope_cos_sin`: a 2×4 grid sanity check
+    /// that distinguishes the row-half vs col-half indexing — col_idx=2
+    /// at head_dim=8 (rot_dim=4, inner=2) yields a deterministic table
+    /// value the row-half cannot match.
+    #[test]
+    fn rope_table_rectangular_grid() {
+        let head_dim = 8usize;
+        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 4, head_dim, 1, 10000.0);
+        let inner = head_dim / 4;          // 2
+        let rot = head_dim / 2;            // 4
+        assert_eq!(cos_t.len(), 8 * rot);
+        // Patch (row=1, col=2): gy=1, gx=2, sy=0, sx=0 → idx = 1*4 + 2 = 6
+        let base = 6 * rot;
+        // Row half uses row_idx=1: cos[base..base+inner] = cos(1 * inv_freq[0..inner])
+        // inv_freq[0] = 1, inv_freq[1] = 10000^(-2/4) = 0.01
+        let inv = [1.0f32, 0.01f32];
+        for i in 0..inner {
+            assert!((cos_t[base + i] - (1.0 * inv[i]).cos()).abs() < 1e-5);
+            assert!((sin_t[base + i] - (1.0 * inv[i]).sin()).abs() < 1e-5);
+        }
+        // Col half uses col_idx=2:
+        for i in 0..inner {
+            assert!((cos_t[base + inner + i] - (2.0 * inv[i]).cos()).abs() < 1e-5);
+            assert!((sin_t[base + inner + i] - (2.0 * inv[i]).sin()).abs() < 1e-5);
+        }
+    }
+
+    /// `rope_theta` actually changes the table — defends against a future
+    /// accidental hardcode regression in `compute_vision_rope_cos_sin`.
+    #[test]
+    fn rope_table_honors_theta_param() {
+        let (c1, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 10000.0);
+        let (c2, _) = compute_vision_rope_cos_sin(2, 2, 8, 1, 50000.0);
+        // Some entry must differ — pick a non-row=0, non-col=0 patch so the
+        // angle is non-zero on both halves.
+        let any_diff = c1.iter().zip(&c2).any(|(a, b)| (a - b).abs() > 1e-5);
+        assert!(any_diff, "theta change must shift at least one trig value");
     }
 }
 
@@ -534,7 +643,15 @@ pub fn vision_forward(
     // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
     // then add. HF's `fast_pos_embed_interpolate`.
     let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-    debug_assert_eq!(num_grid_per_side * num_grid_per_side, config.num_position_embeddings);
+    // Hard assertion (not debug_assert): a non-square pos_embed table is a
+    // model-config malformation that silently produces wrong indexing in
+    // `fast_pos_embed_interpolate` if we round to the nearest int. Fail loud
+    // at vision_forward entry instead of producing garbage tokens.
+    assert_eq!(
+        num_grid_per_side * num_grid_per_side, config.num_position_embeddings,
+        "num_position_embeddings ({}) must be a perfect square",
+        config.num_position_embeddings,
+    );
     let pos_embed_interp = fast_pos_embed_interpolate(
         &weights.pos_embed, h, grid_h, grid_w,
         num_grid_per_side, config.spatial_merge_size,
@@ -549,7 +666,7 @@ pub fn vision_forward(
     // angle, so we store the half only).
     let rot_dim_half = config.head_dim / 2;
     let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
-        grid_h, grid_w, config.head_dim, config.spatial_merge_size,
+        grid_h, grid_w, config.head_dim, config.spatial_merge_size, config.rope_theta,
     );
     let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
     let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
@@ -557,6 +674,16 @@ pub fn vision_forward(
     // Scratch buffers reused across layers
     let qkv_dim = 3 * h;
 
+    // Stream invariant: every kernel below is enqueued on the same default
+    // stream (`gpu.stream_ref()`), and per-layer scratch tensors (`tmp`,
+    // `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`) are freed within the
+    // same iteration. Correctness depends on submission-order serialization:
+    // pool reuse of a freed buffer is fine because the next kernel using
+    // that VRAM is queued AFTER the previous one on the same stream. If
+    // anyone ever refactors `rdna_compute` to use multiple streams for the
+    // vision path (e.g., async memcpy on a side stream), this pattern must
+    // be revisited — either add per-layer syncs or attach kernels to the
+    // freeing buffer's stream. See review notes in `vision_rev_claude.md`.
     for li in 0..config.num_layers {
         let lw = &weights.layers[li];
 

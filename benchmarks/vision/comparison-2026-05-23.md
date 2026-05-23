@@ -195,7 +195,7 @@ Three bugs found by diffing hipfire `extract_patches` output against HF `pixel_v
 | 2. Per-patch layout — `(T, C, H, W)` flat, HF expects `(C, T, H, W)` | +6% on top of bug 1 | loop swap (C-outer, T-inner) |
 | 3. Channel order — deliberate `(R, B, G)` swap from issue #23 | "validated" only on pure-color PNGs | reverted to `(R, G, B)` |
 
-Combined diff vs HF after fix: **rel-L1 0.002** (175× improvement). Residual is the resize-filter difference (PIL bicubic vs Rust `FilterType::Triangle`), well below any inference-quality threshold.
+Combined diff vs HF after fix: **rel-L1 0.002** (175× improvement). Residual was the resize-filter difference (PIL BICUBIC vs Rust `FilterType::Triangle`); a follow-up swap to `FilterType::CatmullRom` (bicubic in the `image` crate) drops it further to **rel-L1 9.2e-5** (now classified by `diff_dumps.py` as "very close — likely just precision"). See `vision_rev_claude.md` review item 5.
 
 A matching spatial-merge fix landed in `qwen35_vl.rs` since the GPU merger was reading `normed_data[(my*sms+dy) * grid_w + (mx*sms+dx)]` — correct for the old row-major layout but wrong for the new 2×2-grouped layout. The fix exploits that 4 patches forming one merged token are now consecutive in the buffer.
 
@@ -290,14 +290,29 @@ broken output (scrambled positional info → scrambled attention).
 
 **Score: hipfire 12/12 matches llama.cpp.** Previously: 0/6 (3 quality failures + 3 crashes).
 
-### Crash bug on >600-patch grids — resolved (incidental)
+### Crash bug on >600-patch grids — no longer triggered; root cause unknown
 
-The page faults on `scene_1` / `scene_2` / `general_qa` (2816-3800 patches) are
-gone. The most plausible explanation: the broken pos_embed indexing was feeding
-totally-aliased positions into the attention path, and on large grids that
-aliasing eventually produced an OOB-shaped score distribution that caused the
-optimized attention kernel to dereference a corrupted address. With correct
-positions, attention behaves and the kernel stays inside its allocations.
+The page faults on `scene_1` / `scene_2` / `general_qa` (2816-3800 patches) do
+not reproduce on this bench set after the pos_embed/rotary fixes landed. The
+mechanism is **not** root-caused. Speculation about "aliased indices into
+attention causing an OOB-shaped score distribution" does not survive scrutiny:
+
+- `vision_forward` calls `vit_attention_f32`, not `vit_attention_opt`, so any
+  LDS-budget theory tied to the optimized variant doesn't apply.
+- `vit_attention_f32` reserves `(N + block_size) * 4` LDS. At N=3800 +
+  block_size=256 that's ~16 KB, well under gfx1100's 64 KB.
+- The kernel has bounds checks (`if (head >= num_heads || qi >= N) return;`),
+  so thread launches past N don't deref past allocations.
+- "Page not present" implies an unmapped address, not bounds-overflow inside
+  a mapped allocation — usually unmapped faults have a different cause from
+  the kind of bug a position-info corruption would produce.
+
+A future stress test that walks patch counts 600/1200/2800/3800/6000/10000
+might expose the same fault if the underlying bug is data-dependent on
+specific grid shapes or specific patch counts. Treat the apparent fix as
+provisional until either the root cause is understood OR an empirical
+stress sweep confirms it stays absent across a wider distribution of
+patch totals.
 
 ### Files touched in this attempt
 

@@ -67,7 +67,8 @@ fn output_matches_load_and_preprocess_for_same_input() {
     let path = dir.join("equiv.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(32, 32, Rgb([10, 200, 50]));
     img.save(&path).unwrap();
-    let (from_path, h2, w2) = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    let (from_path, h2, w2) = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2)
+        .expect("load_and_preprocess failed");
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!((h1, w1), (h2, w2), "dimensions should match between from-bytes and from-path");
