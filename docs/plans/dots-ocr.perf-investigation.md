@@ -433,7 +433,7 @@ this is fine because DRAM is still the binding constraint.
   lanes (16 per wave × 4 waves) instead of 32 (16 × 2). Per-row work
   is the same but distributed across more concurrent waves.
 
-### 11.4. What's left
+### 11.4. What's left at v1
 
 Remaining gap from theoretical DRAM floor (~317 ms at M=64):
 
@@ -441,24 +441,84 @@ Remaining gap from theoretical DRAM floor (~317 ms at M=64):
   DRAM floor (~37 GB / 115 GB/s): 317 ms
   ratio: 2.37×
 
-The ~430 ms residual is some combination of: WMMA throughput in f32
-accumulate, LDS bandwidth on S_lds reads in phase C, softmax compute
-(still serialised per-row), and L2 effective BW < peak.
+Two levers landed in v2 (§12 below).
 
-Next levers worth trying on this kernel (in expected-impact order):
+## 12. M=64 N=128 v2 — S_lds bank-conflict fix + cooperative softmax (2026-05-23)
 
-1. **Block-cooperative softmax.** Currently softmax for row r runs on
-   a single lane (the lane equal to r % 16) within its wave. Could
-   parallelise the max + sum-of-exp across 16 lanes per row using a
-   tree reduce + lane shuffles. Would shrink the phase-B critical
-   path noticeably.
-2. **Replace V_lds with V via WMMA `frag_b` from DRAM** (the original
-   step 3). Now possible because LDS has more room without O_lds. If
-   L1 catches the cross-d-chunk V reuse (32 KB slab per K-tile fits
-   in 32 KB L1 per WGP) this saves the V-stage's 32 KB LDS writes per
-   K-tile. The bet: L1 hit rate on V slab.
-3. **Fuse cast into QKV projection.** ~10 ms × 42 vision blocks = ~420
-   ms saved on E2E vision wall. Bigger downstream change.
+`kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip` adds two
+changes on top of v1:
 
-Going to N=256 still doesn't fit (V_lds alone at f16 = 64 KB). Would
-need V-frag_b-from-DRAM (lever 2 above) to unlock.
+### 12.1. S_lds row stride padded 128 → 130 f16
+
+Phase C reads `S_lds[(my_row_base + half) * 128 + c*16 + j]` from
+each lane in the wave. At unpadded row stride = 128 f16 = 256 bytes =
+**64 dwords**, the lane stride mod 32 = 0 — meaning every lane in the
+wave hits the *same* LDS bank on each read. 16-way bank conflict per
+cycle on every S_lds read.
+
+Padding the row stride to 130 f16 = 65 dwords gives lane bank-stride
+1 (mod 32), so the 16 active lanes land in 16 different banks. No
+conflict. Costs 0.25 KB extra LDS (64 rows × 2 extra f16).
+
+This is the dominant lever — phase C does 8 dc × 8 c × 16 = 1024
+S_lds reads per lane per outer iter, multiplied by 152 outer iters
+across many waves and CUs. A 16× per-read latency cliff at that scale
+is huge.
+
+### 12.2. Cooperative wave-32 softmax
+
+Phase B previously ran 16 lanes in parallel (one per row) with each
+lane sweeping all 128 values sequentially. v2 processes rows
+sequentially within a wave, but each row uses all 32 lanes via
+butterfly reduce (`__shfl_xor` over [1, 2, 4, 8, 16]):
+
+  - 128 values / 32 lanes = 4 vals/lane local max → 5-stage shfl reduce
+  - 128 values / 32 lanes = 4 vals/lane local sum-of-exp → 5-stage shfl reduce
+  - Lane 0 writes l_lds, m_lds, alpha_lds
+
+Smaller lever than the bank-conflict fix, but additive.
+
+### 12.3. Strix Halo gfx1151 results
+
+bench_attention_vision (B=L=19520, hd=128, 3 iters):
+
+| kernel | dur (ms) | vs M=16 | vs prev |
+|---|---:|---:|---:|
+| M=16                              | 3064 |     —    |     —    |
+| M=32 N=64 (f32 K/V)               | 2722 |  +11.2 % |          |
+| M=32 N=64  f16 K/V                | 2288 |  +25.3 % |          |
+| M=32 N=128 f16 K/V                | 1609 |  +47.4 % |          |
+| M=64 N=128 v1 (f16 K/V O-reg)     |  753 |  +75.4 % |          |
+| **M=64 N=128 v2 (pad + coop sm)** |  **519** | **+83.1 %** | **+31.1 % over v1** |
+
+End-to-end `ocr_e2e` vision-encoder wall: **98.7 s → 89.3 s**
+(+10 % on top of v1). Cumulative since initial baseline:
+**198 s → 89.3 s = 2.22× speedup** at the vision-encoder wall.
+
+Parity: 308 cases at hd=128, 0 failed, max-abs-diff 3.052e-5
+(unchanged from M=64 v1).
+
+### 12.4. Headroom
+
+  measured: 519 ms
+  DRAM floor (~37 GB / 115 GB/s): 317 ms
+  ratio: 1.64×
+
+Remaining ~200 ms gap. The big single-change levers are mostly
+exhausted; what's left is harder:
+
+1. **Fuse f32→f16 cast into the QKV projection.** ~10 ms × 42 vision
+   blocks = ~420 ms saved on E2E. Bigger downstream change to the
+   GEMM that produces K and V.
+2. **V via WMMA frag_b from DRAM** (the original step 3 from §8.4).
+   Now possible — LDS has lots of headroom (24 KB used, 64 KB cap).
+   Bets on L1 catching V slab reuse across d-chunks. Would also
+   unlock N=256.
+3. **N=256 K-tile** (with V_lds dropped via step 2 above, or
+   striped V_lds).
+4. **Re-examine LDS bank conflicts on V_lds reads.** Phase C reads
+   V_lds[(c*16+j) * 128 + my_d] — at row stride 128, lane stride 1
+   in f16 → 2 lanes per dword. Maybe also benefits from a small pad.
+
+The N=256 path or QKV-cast fusion are likely the next big ones; both
+are bigger structural changes than the v2 patches.
