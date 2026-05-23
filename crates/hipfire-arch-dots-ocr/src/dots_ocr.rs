@@ -1109,13 +1109,16 @@ pub fn vision_forward(
         //   * `attention_dflash_wmma_f32` — M=16, 1 wave. hd ≤ 256.
         //   * `attention_dflash_f32` — scalar online-softmax fallback.
         //
-        // For dots.ocr (head_dim=128) we take the f16-K/V N=64 path.
+        // For dots.ocr (head_dim=128) we take the f16-K/V N=128 path
+        // (1608 ms vs M=16's 3098 ms at vision shape — see investigation
+        // doc §10). The N=128 width is only feasible because V_lds and
+        // S_lds are stored in f16, reclaiming enough LDS budget.
         if head_dim == 128 && n_patches >= 32 {
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
             gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
-            gpu.attention_dflash_wmma_n64_f16kv_f32(
+            gpu.attention_dflash_wmma_n128_f16kv_f32(
                 &q_buf, &k_f16, &v_f16, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;

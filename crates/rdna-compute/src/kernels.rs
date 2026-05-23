@@ -1672,6 +1672,15 @@ pub const ATTENTION_DFLASH_WMMA_N64_SRC: &str = include_str!("../../../kernels/s
 /// See `kernels/src/attention_dflash_wmma_n64_f16kv.hip`.
 pub const ATTENTION_DFLASH_WMMA_N64_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64_f16kv.hip");
 
+/// N=128 variant — K-tile 128, K/V f16 in DRAM, V_lds and S_lds in
+/// f16. Same shape as the N=64 f16-K/V sibling but with twice the
+/// K-tile width, halving the outer-loop trip count (and therefore
+/// __syncthreads / softmax / alpha-scale overhead per attention call).
+/// Only feasible because moving V_lds and S_lds to f16 reclaimed
+/// enough LDS budget to fit a 128-row V_lds.
+/// See `kernels/src/attention_dflash_wmma_n128_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n128_f16kv.hip");
+
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");

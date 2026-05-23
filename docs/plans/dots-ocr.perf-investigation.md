@@ -290,3 +290,73 @@ combined. At vision shape that's 2 · 19520 · 12 · 128 · 4 B = 240 MB
 of f32 reads + 120 MB of f16 writes per attention call → 360 MB / 115
 GB/s = ~3 ms theoretical, ~10 ms measured (single-pass kernels rarely
 hit peak BW). That's <0.5 % of attention runtime — amortises trivially.
+
+## 10. N=128 K-tile + f16 V_lds / S_lds (2026-05-23)
+
+`kernels/src/attention_dflash_wmma_n128_f16kv.hip` widens the K-tile
+from 64 to 128 keys. The wider tile is only feasible because V_lds and
+S_lds were converted from f32 to f16 storage, reclaiming the LDS
+budget that the doubled V_lds row count would otherwise have eaten.
+LDS at hd=128:
+
+  V_lds[128 * 128] **f16** = 32 KB  (was f32 64-row in N=64 path = 32 KB)
+  O_lds[32 * 128]   f32    = 16 KB
+  S_lds[32 * 128]  **f16** =  8 KB  (was f32 32×64 in N=64 path = 8 KB)
+  scalars (m + l + alpha)  =  0.4 KB
+  **Total ≈ 56.4 KB ✓**
+
+Outer-loop iterations at vision shape: L/64=305 → L/128=152 (half).
+
+### 10.1. Strix Halo gfx1151 results
+
+bench_attention_vision (B=L=19520, hd=128, 3 iters):
+
+| kernel | dur (ms) | vs M=16 | vs prev |
+|---|---:|---:|---:|
+| M=16                   | 3098 |     —   |     —   |
+| M=32                   | 2939 |  +5.1 % |     —   |
+| M=32 N=64  (f32 K/V)   | 2724 | +12.1 % |     —   |
+| M=32 N=64  f16 K/V     | 2210 | +28.7 % | +18.9 % |
+| **M=32 N=128 f16 K/V** | **1608** | **+48.1 %** | **+27.2 %** |
+
+End-to-end `ocr_e2e` vision-encoder wall: **169 s → 135 s** (+25 % on
+top of N=64 f16-K/V). Cumulative since initial baseline: **198 s →
+135 s = 32 %** off.
+
+Parity sweep at hd=128: 252 cases, 0 failed, max-abs-diff 3.052e-5.
+The f16 S_lds storage works because softmax math runs in f32 per row
+(`tm`, `m_new`, `alpha`, `ts` are f32 locals) — the f16 cast is only
+at the LDS write/read boundary, and exp(s - m_new) ∈ [0, 1] always
+fits f16 cleanly.
+
+### 10.2. Why the gain is +27 % not +5–15 %
+
+The investigation's analytic model expected the win to come from
+halving __syncthreads / softmax-setup / per-tile alpha-scale cost.
+That dimension is real but small. Two larger effects show up in
+practice:
+
+- **LDS bandwidth.** Storing V_lds and S_lds in f16 halves the LDS
+  bytes per element. Phase C is LDS-heavy (S_lds reads + V_lds reads
+  per inner WMMA × 8 d-chunks × 8 K-chunks). At our occupancy +
+  workload, LDS bandwidth was a real bottleneck; halving it gives
+  back time the analytic model didn't track.
+
+- **WMMA ILP.** Phase A and phase C now do 64 inner WMMAs per outer
+  iteration (vs 32 at N=64). Longer dependency chains let the
+  compiler interleave the WMMA pipeline with K-row loads (phase A) and
+  V_lds reads (phase C) more aggressively. The WMMA queue stays
+  fuller; fewer pipeline drains between outer iterations.
+
+### 10.3. Remaining headroom
+
+Theoretical lower bound (Strix Halo, f16 K/V): ~0.63 s K+V DRAM
+transit + WMMA throughput floor + LDS bandwidth floor + cast overhead.
+We're at 1.61 s — still ~2.5× over the DRAM floor. Steps 3 (V in
+registers via WMMA frag_b, eliminates V_lds entirely) and 4 (128-thread
+block) attack the remaining gap.
+
+Note: N=256 doesn't fit on gfx1151 LDS even with f16 storage
+(V_lds[256 * 128] f16 alone = 64 KB, saturates the cap). Going wider
+requires either dropping V_lds (step 3) or striping V_lds (load 128
+rows, half-phase-C, sync, reload other 128 rows, half-phase-C).
