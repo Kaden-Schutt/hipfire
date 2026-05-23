@@ -43,6 +43,17 @@ pub const PARAMETER_OPEN_PREFIX: &str = "<｜DSML｜parameter name=\"";
 pub const PARAMETER_CLOSE: &str = "</｜DSML｜parameter>";
 pub const THINK_OPEN: &str = "<think>";
 pub const THINK_CLOSE: &str = "</think>";
+
+/// Variant inner tag observed in the wild: the V4F MQ2-Lloyd checkpoint
+/// emits `<｜DSML｜tool name="X">…</｜DSML｜tool>` instead of the
+/// canonical `<｜DSML｜invoke name="X">…</｜DSML｜invoke>` documented in
+/// the HF encoder reference. Reproduced at both greedy (temp=0) and
+/// sampled (temp=1.0, fixed seed) with the byte-identical HF system
+/// prompt — the divergence is in the model weights, not our render.
+/// We render `invoke` (matching HF) but parse both so the model's
+/// emissions actually deserialise into structured tool calls.
+const TOOL_OPEN_PREFIX_ALT: &str = "<｜DSML｜tool name=\"";
+const TOOL_CLOSE_ALT: &str = "</｜DSML｜tool>";
 pub const TOOL_RESULT_OPEN: &str = "<tool_result>";
 pub const TOOL_RESULT_CLOSE: &str = "</tool_result>";
 
@@ -388,24 +399,35 @@ impl StreamParser {
 pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
     let mut out = Vec::new();
     let mut cursor = 0;
-    while let Some(invoke_start) = body[cursor..].find(INVOKE_OPEN_PREFIX) {
-        let abs = cursor + invoke_start + INVOKE_OPEN_PREFIX.len();
-        // name attribute runs until the closing `">`.
+    loop {
+        // Find the next inner tag. Accept either `<｜DSML｜invoke name="`
+        // (canonical, per HF encoder) or `<｜DSML｜tool name="` (variant
+        // observed from the V4F MQ2-Lloyd checkpoint — see comment on
+        // TOOL_OPEN_PREFIX_ALT). Whichever appears first wins.
+        let invoke_hit = body[cursor..].find(INVOKE_OPEN_PREFIX).map(|i| (i, INVOKE_OPEN_PREFIX.len(), INVOKE_CLOSE));
+        let tool_hit = body[cursor..].find(TOOL_OPEN_PREFIX_ALT).map(|i| (i, TOOL_OPEN_PREFIX_ALT.len(), TOOL_CLOSE_ALT));
+        let (open_rel, open_len, close_marker) = match (invoke_hit, tool_hit) {
+            (Some(a), Some(b)) if a.0 <= b.0 => a,
+            (Some(_), Some(b)) => b,
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => break,
+        };
+        let abs = cursor + open_rel + open_len;
         let close_attr = match body[abs..].find("\">") {
             Some(i) => abs + i,
             None => break,
         };
         let name = body[abs..close_attr].to_string();
-        // Body of invoke runs from after `">` to the matching </｜DSML｜invoke>.
         let body_start = close_attr + 2;
-        let invoke_close = match body[body_start..].find(INVOKE_CLOSE) {
+        let invoke_close = match body[body_start..].find(close_marker) {
             Some(i) => body_start + i,
             None => break,
         };
         let invoke_body = &body[body_start..invoke_close];
         let args = parse_parameters(invoke_body);
         out.push(ToolCall { name, arguments: args });
-        cursor = invoke_close + INVOKE_CLOSE.len();
+        cursor = invoke_close + close_marker.len();
     }
     out
 }
@@ -640,5 +662,63 @@ mod tests {
             .collect();
         assert!(raw.contains(TOOL_CALLS_OPEN));
         assert!(raw.contains("invoke"));
+    }
+
+    #[test]
+    fn parses_tool_variant_inner_tag() {
+        // The V4F MQ2-Lloyd checkpoint emits `<｜DSML｜tool name="X">`
+        // instead of `<｜DSML｜invoke name="X">` (observed
+        // deterministically at temp=0 AND temp=1.0/seed=42). Reproduces
+        // the exact token stream the model committed during 2026-05-23
+        // diagnostic — the parser must accept both.
+        let body = "\n\n<｜DSML｜tool_calls>\n\
+<｜DSML｜tool name=\"read\">\n\
+<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/test.txt</｜DSML｜parameter>\n\
+</｜DSML｜tool>\n\
+</｜DSML｜tool_calls>";
+        let mut p = StreamParser::new();
+        let mut events = p.feed(body);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1, "expected one ToolCalls event");
+        assert_eq!(calls[0].len(), 1, "expected one tool call");
+        assert_eq!(calls[0][0].name, "read");
+        assert_eq!(calls[0][0].arguments["path"], json!("/tmp/test.txt"));
+    }
+
+    #[test]
+    fn parses_mixed_invoke_and_tool_in_one_block() {
+        // Defensive: if the model ever mixes the two tags in one block
+        // (e.g. some training drift), both should still be parsed.
+        let body = "<｜DSML｜tool_calls>\n\
+<｜DSML｜invoke name=\"first\">\n\
+<｜DSML｜parameter name=\"a\" string=\"false\">1</｜DSML｜parameter>\n\
+</｜DSML｜invoke>\n\
+<｜DSML｜tool name=\"second\">\n\
+<｜DSML｜parameter name=\"b\" string=\"true\">x</｜DSML｜parameter>\n\
+</｜DSML｜tool>\n\
+</｜DSML｜tool_calls>";
+        let mut p = StreamParser::new();
+        let mut events = p.feed(body);
+        events.extend(p.finish());
+        let calls: Vec<&Vec<ToolCall>> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ToolCalls(c) => Some(c),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 2);
+        assert_eq!(calls[0][0].name, "first");
+        assert_eq!(calls[0][0].arguments["a"], json!(1));
+        assert_eq!(calls[0][1].name, "second");
+        assert_eq!(calls[0][1].arguments["b"], json!("x"));
     }
 }
