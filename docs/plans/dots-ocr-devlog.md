@@ -54,6 +54,7 @@ deferred follow-ons (forward-looking).
 | `67cc4ac6` | Merge `upstream/master` into `feat/dots-ocr-qwen2-phase-2` (2026-05-22): brings pflash perfmax, fwht3/4 KV drafters, gfx10 MQ3/HFQ3 prefill kernels, GPT-2 BPE pre-tok fix. 4 conflicts resolved: `Cargo.toml` (add dots-ocr crate row), `docs/architecture-ids.md` (arch_id=8 status updated), `crates/hipfire-arch-qwen2/src/qwen2.rs` (kept HEAD's R5 EOS-fallback parser + `load_norm_weight_raw` length assert + `forward_step` refactor with `forward_step_with_embed` + R5/EOS tests), plan progress log + §5 phase narrative. |
 | `29d08839` | Close 7 `bind_thread()` audit gaps in `dispatch.rs` (surfaced by `scripts/verify-bind-thread.sh` on the post-merge tree). Four phase-2 dots-ocr fns: `bind_thread()?;` already existed but sat after asserts — moved to the top. Three pflash wrappers from master: delegating to an impl that binds — added explicit bind at the wrapper. 446 pub fn audited clean. |
 | 2026-05-23 | Plan refactor: split monolithic `qwen_2.0_vlm_plus_dots_ocr.md` into `dots-ocr-prd.md` (durable design) + `dots-ocr-devlog.md` (this file). Renamed `qwen_2.0_vlm_plus_dots_ocr.{dots_ocr,qwen2_1p5b}_manifest.txt` → `dots-ocr.{dots_ocr,qwen2_1p5b}_manifest.txt` for consistency. Dropped 8 stale review-scaffolding files (rev-claude/glm5/gemini artifacts and untracked `dots_ocr_quality_eval_gemini.md`) per `feedback_drop_review_files_after_fold_in`. DFlash parity sweep re-verified after the merge: 112 cases, 0 failed, max-abs-diff 3.052e-5 (under 1e-3 tolerance). |
+| _PR open_ | [Kaden-Schutt/hipfire#321](https://github.com/Kaden-Schutt/hipfire/pull/321) — phase 2 deliverable (vision tower + Strategy A E2E OCR). Awaiting maintainer review + merge. |
 
 ## 2. Phase 0 — ground-truth capture
 
@@ -288,6 +289,15 @@ master merge): 112 cases (L ∈ {1, 127, 128, 13951, 13952, 13953,
 16384} × hd ∈ {64, 128, 256, 512} × B ∈ {1, 16, 17, 32}; scalar at
 B=1, WMMA at all B). 0 failed. Max-abs-diff 3.052e-5 vs CPU naive
 softmax reference, well under the 1e-3 tolerance.
+
+**Outstanding: DFlash spec-decode coherence gate not yet re-run
+post-2c-5c.** The parity sweep above is numerical-correctness only;
+the dflash coherence gate (`scripts/coherence-gate-dflash.sh`)
+covers attractor behavior + unique-token-ratio + 3-gram density
+under real spec-decode workloads (per CLAUDE.md "DFlash Coherence
+Gate"). My 2c-5c changes touched the scalar `attention_dflash_f32`
+that the spec-decoder uses; re-run before claiming DFlash perf
+parity. PR #321's test plan tracks this.
 
 ## 6. ROCm / runtime environment notes
 

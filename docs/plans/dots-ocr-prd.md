@@ -332,6 +332,29 @@ load HFQ → `vision_forward` → download merger output → prefill with
 `forward_step(token)` otherwise → greedy decode. Phase 3 wraps that
 in the daemon's request/response shape.
 
+**Suggested workstream order** (the items below have a natural
+dependency chain — tackle in this order to minimise rework):
+
+1. **Token-id constants + arch-trait overrides.** Cheapest;
+   everything else depends on having `IMGPAD_ID` plumbed and the EOS
+   stop-set + prompt-frame override registered. No daemon-state
+   changes yet.
+2. **Chat-template framing decision + render.** The Jinja2 vs
+   ChatML-only call is a fork point — picks the override
+   implementation shape and decides whether `apply_chatml_frame` is
+   reused or bypassed.
+3. **`LoadedModel` fields + dispatch arm.** Add struct fields, wire
+   `load_model` arm for `arch_id == 8`, plumb `image_grid_thw`
+   through the request payload.
+4. **Splice + IMGPAD assertion.** Implement `generate_vl_dots_ocr`
+   (or generic-dispatch refactor) with the splice loop + hard
+   IMGPAD-count assert from the §"Vision token splicing" subsection
+   below.
+5. **Multi-image per-image loop.** Only matters once multi-image
+   requests need to work; the daemon's existing single-image arms
+   are sufficient for phase-3 ship if multi-image is deferred to a
+   follow-up.
+
 **Daemon `LoadedModel` extension.** Add `dots_ocr_config`,
 `dots_ocr_weights`, `dots_ocr_state` fields (mirroring the `q35_*`
 pattern). The text-side delegation means we hold a `Qwen2Weights`
