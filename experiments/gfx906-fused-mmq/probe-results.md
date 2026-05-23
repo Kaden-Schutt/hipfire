@@ -73,3 +73,36 @@ matching the PR 315 thesis exactly.
   only their composition.
 - `ensure_q8_1_mmq_x` (the Q8_1 quantize pass) is NOT instrumented in the
   profiler today. Adding a timer there would be a tiny extra change.
+
+---
+
+## Update 2026-05-23 — Phase 2 + Phase 3 shipped, measured win
+
+After landing both fused-projection MMQ kernels and gating them behind
+`HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`, the **production async** prefill
+bench on the same hardware shows:
+
+| run | baseline tok/s | fused tok/s |
+|----:|---------------:|------------:|
+|   1 |          726.1 |       779.7 |
+|   2 |          727.6 |       780.5 |
+|   3 |          727.0 |       779.6 |
+| **mean** | **726.9** | **779.9** |
+| Δ   | — | **+7.3%** |
+
+`bench_qwen35_mq4 /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+on `ROCR_VISIBLE_DEVICES=0` (MI50 / gfx906).
+
+Decode tok/s unchanged (~56.0 ±0.4) — the kernels touch only the batched
+prefill path, as designed. Byte-exact A/B (greedy_dump) confirmed
+numerical equivalence: md5 f9bb00845568951675012dbde42bc171 on both
+sides for the 60-token "Capital of France?" generation.
+
+Stddev across 3 runs is ~0.1% on both sides — extraordinarily tight for
+a gfx906 prefill bench, well within the §6.1 ceiling estimate
+(5-12%). The signal is real, not thermal noise.
+
+**Conclusion**: §6 plan steps 2 + 3 deliver as predicted. The kernel
+is correct, numerically equivalent, and ships a measurable +7.3%
+async prefill win. Steps 4-6 (MMQ_Y sweep, HFQ3 port, screen-reject
+analysis) remain optional follow-ups; the structural win is banked.
