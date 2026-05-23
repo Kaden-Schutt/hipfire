@@ -4582,13 +4582,24 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 
     // Build the effective system message: optional user-supplied system
     // text + (if request has tools) the DSML "## Tools" preamble.
+    //
+    // HF reference render: the system role is rendered as `{content}`
+    // (raw, no role prefix), then appended with `"\n\n" + render_tools`
+    // when tools are present. For an empty system + tools this becomes
+    // `"" + "\n\n" + tools_block` = `"\n\n" + tools_block` — the model
+    // was trained to see two newlines BEFORE `## Tools` even with no
+    // system content. Omitting them puts the model in off-distribution
+    // territory; observed 2026-05-23 to drive the V4F MQ2-Lloyd
+    // checkpoint into `<｜DSML｜tool_cin> / <｜DSML｜-cin>` attractor
+    // loops on no-system + 4-tools requests. The leading `\n\n` is
+    // load-bearing — do not drop.
     let tools_block: Option<String> = tools
         .filter(|t| !t.is_empty())
         .map(|t| deepseek4::dsml::tools_prompt_block(t));
     let effective_system: Option<String> = match (system_prompt.filter(|s| !s.is_empty()), tools_block.as_deref()) {
         (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
         (Some(sys), None) => Some(sys.to_string()),
-        (None, Some(tb)) => Some(tb.to_string()),
+        (None, Some(tb)) => Some(format!("\n\n{tb}")),
         (None, None) => None,
     };
 
