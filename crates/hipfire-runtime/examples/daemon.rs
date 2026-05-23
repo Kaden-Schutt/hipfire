@@ -175,7 +175,7 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
-/// Emit a parsed `deepseek4::tool_format::StreamEvent` to the JSONL stream.
+/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
 /// Maps:
 ///   - Token(text)        → `{type:"token",   id, text}`
 ///   - Reasoning(text)    → `{type:"reasoning", id, text}`
@@ -186,9 +186,9 @@ fn block_attractor_unclosed_cpu(
 fn emit_stream_event(
     stdout: &mut std::io::Stdout,
     id: &str,
-    ev: hipfire_arch_deepseek4::tool_format::StreamEvent,
+    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
 ) {
-    use hipfire_arch_deepseek4::tool_format::StreamEvent;
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
     match ev {
         StreamEvent::Token(text) => {
             let _ = writeln!(
@@ -4581,10 +4581,10 @@ fn generate_deepseek4(
 You MUST be very thorough in your thinking and comprehensively decompose the problem.";
 
     // Build the effective system message: optional user-supplied system
-    // text + (if request has tools) the native "## Tools" preamble.
+    // text + (if request has tools) the DSML "## Tools" preamble.
     let tools_block: Option<String> = tools
         .filter(|t| !t.is_empty())
-        .map(|t| deepseek4::tool_format::tools_prompt_block(t));
+        .map(|t| deepseek4::dsml::tools_prompt_block(t));
     let effective_system: Option<String> = match (system_prompt.filter(|s| !s.is_empty()), tools_block.as_deref()) {
         (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
         (Some(sys), None) => Some(sys.to_string()),
@@ -4603,10 +4603,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
 
     // Multi-turn history. Each prior message gets rendered as a turn:
     //   user → `<｜User｜>{content}{tool_results?}`
-    //   assistant → `<｜Assistant｜>{content_or_tool_calls}<｜end▁of▁sentence｜>`
+    //   assistant → `<｜Assistant｜>{content_or_dsml}<｜end▁of▁sentence｜>`
     // Tool result messages (role=tool) attach to the previous user turn
-    // wrapped in the native `<｜tool▁outputs▁begin｜>...<｜tool▁outputs▁end｜>`
-    // envelope. The CURRENT user prompt is appended last (outside this loop).
+    // wrapped in `<tool_result>…</tool_result>` per HF encoding/README.md.
+    // The CURRENT user prompt is appended last (outside this loop).
     if let Some(history) = messages_history {
         // Skip the leading system message (if any) — already handled.
         // Skip the trailing user prompt — we add it explicitly after.
@@ -4625,23 +4625,21 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     prompt_ids.extend(tokenizer.encode(&msg.content));
                 }
                 Role::Tool => {
-                    // Wrap as `<｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>{json}
-                    // <｜tool▁output▁end｜><｜tool▁outputs▁end｜>` inside the
-                    // most recent user turn. We emit the user marker here
-                    // so a standalone "tool" message at history start
-                    // still parses (defensive).
+                    // Wrap as `<tool_result>{json}</tool_result>` inside
+                    // the most recent user turn. We emit the user marker
+                    // here so a standalone "tool" message at history
+                    // start still parses (defensive).
                     if let Some(u) = user_tok { prompt_ids.push(u); }
                     prompt_ids.extend(
-                        tokenizer.encode(&deepseek4::tool_format::render_tool_result(&msg.content))
+                        tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content))
                     );
                 }
                 Role::Assistant => {
                     if let Some(a) = asst_tok { prompt_ids.push(a); }
-                    // Assistant content. If the recorded message included
-                    // tool calls, the caller should have serialised them
-                    // into `msg.content` already via
-                    // `tool_format::render_assistant_tool_calls`; if not,
-                    // the plain text is emitted.
+                    // Assistant content. If the recorded message
+                    // included DSML tool calls, the caller should have
+                    // serialised them into `msg.content` already; if
+                    // not, the plain text is emitted.
                     prompt_ids.extend(tokenizer.encode(&msg.content));
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
@@ -4786,16 +4784,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
         // dangerous — see fn doc.
         //
-        // Tokens are fed through the native-format stream parser that
-        // recognises `<think>…</think>` reasoning blocks and
-        // `<｜tool▁calls▁begin｜>…<｜tool▁calls▁end｜>` tool-call blocks. The
+        // Tokens are fed through a DSML stream parser that recognises
+        // `<think>…</think>` reasoning blocks and
+        // `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` tool-call blocks. The
         // parser emits:
         //   - StreamEvent::Token(text)       → JSONL `{type:"token"}`
         //   - StreamEvent::Reasoning(text)   → JSONL `{type:"reasoning"}`
         //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
         // Markers split across token boundaries are buffered until they
         // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
-        let mut parser = deepseek4::tool_format::StreamParser::new();
+        let mut parser = deepseek4::dsml::StreamParser::new();
         let mut next_tok: u32 =
             deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
