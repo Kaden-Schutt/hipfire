@@ -133,18 +133,29 @@ impl Matcher {
     }
 
     /// Whether the matcher is currently free (no constraints — every
-    /// token is allowed). True in [`State::Out`] (parameter-value
-    /// emission outside any tool-call block) regardless of buffer
-    /// contents — we never force the model INTO a tool call. Also true
-    /// in [`State::InParamBody`] WHEN the close-marker prefix buffer is
-    /// empty; once the model emits `</` (the start of
-    /// `</｜DSML｜parameter>`) the matcher constrains continuations to
-    /// complete that close exactly. This stops the model from emitting
-    /// near-misses like `</｜DSML｜paperameter>` that no parser
-    /// recovers from.
+    /// token is allowed). Dual-mode in both free-emission states:
+    ///
+    /// - [`State::Out`] is free UNTIL the model commits the atomic
+    ///   `｜DSML｜` token (id 128825 in V4 vocab; the literal substring
+    ///   `｜DSML｜` in the buffer). Once that lands, the matcher
+    ///   constrains continuations to complete `<｜DSML｜tool_calls>`
+    ///   exactly. Without this guard the V4F MQ2-Lloyd checkpoint
+    ///   deterministically emits invented opener variants like
+    ///   `<｜DSML｜tool_actions>`, `<｜DSML｜tool_invoke>`,
+    ///   `<｜DSML｜tInvoke name="…">` — none of those match the trigger
+    ///   so the grammar matcher never engages, and the parser sees
+    ///   pure garbage. We accept the rare-but-possible mis-fire where
+    ///   the model emits `｜DSML｜` for non-tool reasons (quoting the
+    ///   format in prose): in that case the constraint will force a
+    ///   `tool_calls>` completion, which is acceptable since this
+    ///   token does not appear in normal output.
+    /// - [`State::InParamBody`] is free until the buffer accumulates a
+    ///   close-marker prefix (`</`). Once it lands, constrain to
+    ///   complete `</｜DSML｜parameter>` exactly — stops the model
+    ///   from emitting near-misses like `</｜DSML｜paperameter>`.
     pub fn is_free(&self) -> bool {
         match self.state {
-            State::Out => true,
+            State::Out => !self.partial_buf.contains("｜DSML｜"),
             State::InParamBody { .. } => self.partial_buf.is_empty(),
             _ => false,
         }
@@ -160,7 +171,17 @@ impl Matcher {
     /// should allow all tokens).
     pub fn allowed_continuations(&self) -> Vec<String> {
         match &self.state {
-            State::Out => Vec::new(),
+            // Out is dual-mode: free emission when no DSML commit is
+            // in-flight (caller short-circuits via `is_free`);
+            // constrain to the OPEN_TOOL_CALLS trigger once the atomic
+            // `｜DSML｜` token has been committed into the buffer.
+            State::Out => {
+                if self.partial_buf.contains("｜DSML｜") {
+                    vec![OPEN_TOOL_CALLS.to_string()]
+                } else {
+                    Vec::new()
+                }
+            }
             // InParamBody is dual-mode: free emission when buf is empty
             // (caller short-circuits via `is_free`); constrain to the
             // close marker once the model has started emitting it.
@@ -752,6 +773,45 @@ mod tests {
         let mut m = Matcher::new(schema_read_write());
         m.advance("<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n");
         assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+    }
+
+    #[test]
+    fn out_state_constrains_after_dsml_token() {
+        // Reproduces the production failure where V4F MQ2-Lloyd emits
+        // `<｜DSML｜tool_actions>` / `<｜DSML｜calling>` / etc. instead
+        // of the canonical `<｜DSML｜tool_calls>` open trigger. Once
+        // `｜DSML｜` lands in the Out buffer, the matcher must restrict
+        // continuations to the trigger so invented tag names get masked.
+        let mut m = Matcher::new(schema_read_write());
+        m.advance("Some prose. ");
+        assert!(m.is_free());
+        m.advance("<");
+        assert!(m.is_free(), "single `<` could just be text");
+        m.advance("｜DSML｜");
+        assert!(!m.is_free(), "committed ｜DSML｜ → must constrain");
+        // Allowed next: tokens that continue toward `tool_calls>`.
+        assert!(m.is_token_allowed("tool_calls>"));
+        assert!(m.is_token_allowed("tool"));
+        assert!(m.is_token_allowed("t"));
+        // Invented openers are masked.
+        assert!(!m.is_token_allowed("tool_actions>"));
+        assert!(!m.is_token_allowed("tool_invoke"));
+        assert!(!m.is_token_allowed("calling"));
+        assert!(!m.is_token_allowed("foo"));
+        // Completing the trigger transitions.
+        m.advance("tool_calls>");
+        assert_eq!(*m.state(), State::InToolCalls);
+    }
+
+    #[test]
+    fn out_state_remains_free_with_partial_unrelated_text() {
+        // Buf accumulating just `<` doesn't constrain (could be HTML,
+        // code, prose). Only `｜DSML｜` in buf flips the constraint.
+        let mut m = Matcher::new(schema_read_write());
+        m.advance("<");
+        assert!(m.is_free());
+        m.advance("html>");
+        assert!(m.is_free());
     }
 
     #[test]
