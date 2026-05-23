@@ -82,7 +82,13 @@ extern "C" __global__ void KERNEL_NAME(
             }
 
             // ── Load X tile metadata (HFQ4 header) ────────────────────────
-            if (window == 0 && tid < 128) {
+            // One thread per output row writes one float2 to x_dm[i] (sized
+            // MMQ_Y). Gating on `tid < MMQ_Y` (NOT the workgroup width 128)
+            // is required: when MMQ_Y=64, threads 64..127 must NOT write,
+            // since `x_dm[64..127]` overlaps the adjacent `tile_y` LDS
+            // region (see allocator at line 64). Without this gate, the
+            // y64 variant corrupts the Q8_1 Y tile and emits NaN.
+            if (window == 0 && tid < MMQ_Y) {
                 const int i = tid;
                 const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
                 const char* gp = A + ((long long)row * groups_per_row + kg) * 136;

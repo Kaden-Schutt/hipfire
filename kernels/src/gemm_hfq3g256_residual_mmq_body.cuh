@@ -85,7 +85,12 @@ extern "C" __global__ void KERNEL_NAME(
             }
 
             // ── Load X tile (HFQ3 3-bit unpack → signed INT8 packed) ──────
-            if (window == 0 && tid < 128) {
+            // One thread per output row writes one float2 to x_dm[i] (sized
+            // MMQ_Y). Mirrors the HFQ4 sibling: at MMQ_Y=64, gating on
+            // `tid < 128` would let threads 64..127 write OOB of x_dm
+            // into the adjacent `tile_y` LDS region. The x32_y64 variant
+            // is reachable from `gemm_hfq3g256_residual` (dispatch.rs:7674).
+            if (window == 0 && tid < MMQ_Y) {
                 const int i = tid;
                 const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
                 const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
