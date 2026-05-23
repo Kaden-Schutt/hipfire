@@ -67,9 +67,14 @@ impl ToolCall {
         out.push_str("\">\n");
         if let Value::Object(map) = &self.arguments {
             for (k, v) in map {
+                // HF rule: string values are the raw text (no JSON
+                // quoting); everything else is `json.dumps(v)` which
+                // uses Python's default `", "` / `": "` separators —
+                // match that via `py_compact_json` so the rendered
+                // bytes are identical to the reference encoder.
                 let (string_attr, payload) = match v {
                     Value::String(s) => ("true", s.clone()),
-                    other => ("false", other.to_string()),
+                    other => ("false", py_compact_json(other)),
                 };
                 out.push_str(PARAMETER_OPEN_PREFIX);
                 out.push_str(&xml_attr_escape(k));
@@ -103,18 +108,35 @@ pub fn render_assistant_tool_calls(calls: &[ToolCall]) -> String {
 
 // ── Prompt-side: render the tools preamble ──────────────────────────────
 
-/// The "## Tools" preamble per HF `encoding/README.md`. Prepended to the
-/// system message (or used as the system message if none was supplied)
-/// when the request specifies `tools`.
+/// The "## Tools" preamble. Byte-for-byte equivalent to `TOOLS_TEMPLATE`
+/// in the upstream HF reference encoder
+/// (`huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/encoding/encoding_dsv4.py`),
+/// because the model's tool-emission behaviour is conditioned on this
+/// exact string pattern — abbreviating or paraphrasing the template
+/// causes the model to emit BPE-fragmented near-misses of the DSML
+/// markers at greedy temperatures (observed 2026-05-23 with a shorter
+/// preamble producing `<｜｜tool_coll｜>` / `<｜｜tool｜name=...>` garbage
+/// instead of well-formed `<｜DSML｜tool_calls>` blocks).
 ///
-/// `tools` is the OpenAI-format tools array, each entry shaped like:
-/// ```json
-/// { "type": "function", "function": { "name": "...", "description": "...", "parameters": {...} } }
-/// ```
-/// We dump the JSON verbatim as the schema; the model treats the block
-/// as a free-form schema reference.
+/// `tools` is the OpenAI-format tools array — each entry shaped like
+/// `{ "type": "function", "function": { "name": "...", "description": "...", "parameters": {...} } }`.
+/// We unwrap each entry's `function` field and render it as compact
+/// (single-line) JSON, joined with `\n` — matching the HF encoder's
+/// `tools_from_openai_format` + `"\n".join(tools_json)` pipeline.
 pub fn tools_prompt_block(tools: &[Value]) -> String {
-    let schema = serde_json::to_string_pretty(&json!(tools)).unwrap_or_else(|_| "[]".to_string());
+    let tool_schemas: String = tools
+        .iter()
+        .map(|t| {
+            // Equivalent of HF's tools_from_openai_format: pull out the
+            // inner "function" dict. Tolerate non-OpenAI entries by
+            // falling back to the raw value. Rendered with Python-style
+            // compact JSON (", " and ": " separators, insertion-order
+            // keys) for byte parity with the HF encoder.
+            let inner = t.get("function").unwrap_or(t);
+            py_compact_json(inner)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
 "## Tools
 
@@ -125,11 +147,22 @@ You have access to a set of tools to help answer the user's question. You can in
 {param_open}$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE{param_close}
 ...
 {invoke_close}
+{invoke_open}$TOOL_NAME2\">
+...
+{invoke_close}
 {close}
+
+String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
+
+If thinking_mode is enabled (triggered by {think_open}), you MUST output your complete reasoning inside {think_open}...{think_close} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {think_close} with tool calls or final response.
 
 ### Available Tool Schemas
 
-{schema}
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 ",
         open = TOOL_CALLS_OPEN,
         close = TOOL_CALLS_CLOSE,
@@ -137,7 +170,9 @@ You have access to a set of tools to help answer the user's question. You can in
         invoke_close = INVOKE_CLOSE,
         param_open = PARAMETER_OPEN_PREFIX,
         param_close = PARAMETER_CLOSE,
-        schema = schema,
+        think_open = THINK_OPEN,
+        think_close = THINK_CLOSE,
+        tool_schemas = tool_schemas,
     )
 }
 
@@ -421,6 +456,55 @@ fn parse_parameters(body: &str) -> Value {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
+
+/// Render a `serde_json::Value` using Python's `json.dumps(...,
+/// ensure_ascii=False)` default formatting: single-line, `", "` between
+/// items, `": "` between key/value. Equivalent to Python's default
+/// `separators=(", ", ": ")`. With the crate-level `preserve_order`
+/// feature on `serde_json`, object key order survives from input to
+/// output — matching the HF encoder's `tools_from_openai_format` →
+/// `json.dumps` pipeline byte-for-byte.
+fn py_compact_json(v: &Value) -> String {
+    let mut out = String::new();
+    write_py_compact(v, &mut out);
+    out
+}
+
+fn write_py_compact(v: &Value, out: &mut String) {
+    match v {
+        Value::Null => out.push_str("null"),
+        Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => {
+            // Use serde_json's string escaping — Python's default
+            // `ensure_ascii=False` keeps non-ASCII raw, which matches
+            // serde_json's default for string values.
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()));
+        }
+        Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_py_compact(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            out.push('{');
+            for (i, (k, val)) in map.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                out.push_str(&serde_json::to_string(k).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push_str(": ");
+                write_py_compact(val, out);
+            }
+            out.push('}');
+        }
+    }
+}
 
 /// XML-attribute escape: replace the four characters that would break
 /// attribute parsing. The DSML format is forgiving (no quoting required
