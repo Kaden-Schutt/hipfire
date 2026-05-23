@@ -163,3 +163,78 @@ performance is left on the table.
 - rocprof CSV (raw): `.tmp/rocprof/vision_shape/aimax01/16690_counter_collection.csv`
 - Failed K-staging kernel (kept in tree as a reference point for the
   rocprof comparison): `kernels/src/attention_dflash_wmma_m32_kstg_FAILED.hip`
+
+## 8. Outcome: N=64 K-tile kernel (2026-05-23)
+
+`kernels/src/attention_dflash_wmma_n64.hip` implements step 4.1 (K-tile
+16 → 64) and step 4.3 (Q register-resident) together for `head_dim==128`.
+Phase C also fuses the alpha-scale with the SV epilogue (one fewer
+`__syncthreads` and one fewer full O_lds traversal per K-tile).
+
+### 8.1. Strix Halo gfx1151 results (bench_attention_vision, B=L=19520, hd=128)
+
+| kernel | dur (ms) | vs M=16 | vs M=32 |
+|---|---:|---:|---:|
+| M=16  | 3034 |     —  |     —  |
+| M=32  | 2931 |  +3.4 % |     —  |
+| **M=32 N=64** | **2720** | **+10.4 %** | **+7.2 %** |
+
+End-to-end `ocr_e2e` vision-encoder wall: **198 s → 182 s** (+8 %).
+Parity sweep: 196 cases at hd=128, 0 failures, max-abs-diff 3.052e-5
+(matches M=16/M=32 baselines).
+
+### 8.2. Falsified-then-rescued: the Q_frags scratch trap
+
+First attempt was a +19 % **regression**. Root cause via
+`llvm-readelf --notes` on the compiled `.hsaco`:
+
+| kernel | VGPR | spill | **private (scratch) segment** |
+|---|---:|---:|---:|
+| M=32 baseline       | 82 | 0 | **0 B/lane** |
+| N=64 v1 (regressed) | 85 | 0 | **544 B/lane** |
+| N=64 v2 (winning)   | 256 | 141 | 376 B/lane |
+
+v1 declared `Q_frags[16]` and loaded it in a runtime-bounded `for (dc=0;
+dc<d_chunks; ++dc)` loop, where `d_chunks = head_dim/16` is computed at
+runtime. The compiler couldn't prove `dc` was compile-time constant and
+put the array in private (scratch) memory — every "register" Q read was
+actually a DRAM round-trip. v2 fixes it by hard-coding `d_chunks=8`,
+adding an early-return guard `if (head_dim != 128) return;`, and adding
+`#pragma unroll` to the dc loops in Q-load + phase A + phase C.
+
+The high VGPR/spill count on v2 (256 / 141) is the unroll's cost in
+expanded live ranges; the spill fits comfortably in the 376 B/lane
+private segment and stays in L1, so it's not a perf factor for this
+DRAM-bound workload.
+
+### 8.3. Why the gain is +7 % on Strix Halo, not the predicted 2–4×
+
+The investigation's analytic model overstated the per-K-tile fixed cost.
+On Strix Halo gfx1151 with 115 GB/s LPDDR5X, the dominant cost remains
+DRAM K+V traffic regardless of K-tile width (rocprof L2 hit % stays
+near 1 % on either). The fixed-cost amortization is real but small
+relative to the bandwidth floor.
+
+**Expected on gfx1100** (RX 7900 XTX, ~960 GB/s GDDR6, 96 CUs, larger
+L2): bigger absolute win. With ~8× the memory bandwidth, the per-tile
+fixed cost is a much larger relative share of runtime, and llama.cpp's
+`FATTN_KQ_STRIDE=256` was tuned for that class of hardware. Strategy
+going forward: optimize on gfx1100 (primary deployment target), tune on
+Strix Halo as a non-regression check.
+
+### 8.4. Open next levers (in order of expected impact on gfx1100)
+
+1. **K/V f16 in DRAM** (step 4.2). Halves DRAM traffic for the
+   memory-bound phase A and the V-stage. Insert an `f32 → f16` cast
+   kernel between `qkv_split` and attention; consume f16 K/V directly.
+   Expected +30–100 % on gfx1100.
+2. **Widen K-tile further** (128 or 256) at hd=128 with f16 K/V.
+   With f16 the V_lds budget halves (32 KB → 16 KB at N=64), which
+   frees room for wider tiles or larger M.
+3. **V in registers via WMMA frag_b** (llama.cpp pattern). Eliminates
+   V_lds entirely. Requires restructuring phase C so the SV WMMA reads
+   V chunks fresh from DRAM (or via a register prefetch pipeline) per
+   inner step.
+4. **128-thread block (4-wave)** like llama.cpp. More parallelism per
+   block for V-stage and softmax; may or may not pay back the lower
+   occupancy on gfx1100.

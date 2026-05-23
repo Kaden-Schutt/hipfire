@@ -23952,6 +23952,93 @@ impl Gpu {
         }
     }
 
+    /// FlashAttention-style WMMA with M=32 query tile and **N=64 K-tile
+    /// width** (vs N=16 in `attention_dflash_wmma_m32_f32`). Q lives in
+    /// registers across all K-tiles within a block; phase C fuses the
+    /// alpha-scale of O with the SV epilogue.
+    ///
+    /// Targets the vision-encoder regime (large B, large L,
+    /// head_dim ≤ 128) where rocprof shows the M=32 baseline is
+    /// per-tile-fixed-cost bound (1220 K-tile visits at N=16 → 305 at
+    /// N=64 means 4× fewer syncs / softmax passes / O-scaling passes).
+    ///
+    /// LDS at hd=128: V_lds[64*128] + O_lds[32*128] + S_lds[32*64] +
+    /// scalars = 57.7 KB (under 64 KB RDNA3 wave32 cap). VGPR per lane
+    /// ≈ 130 (Q_frags + s_acc + scratch).
+    ///
+    /// Caller responsibility: dispatch when `head_dim % 32 == 0`,
+    /// `head_dim ≤ 128`. Falls back to M=32 or M=16 otherwise.
+    pub fn attention_dflash_wmma_n64_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_n64_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128. The dc loop is fully unrolled with d_chunks=8 \
+             so Q_frags[] gets register-promoted instead of spilled to scratch — making \
+             it variable would re-introduce the 544 B/lane private segment that defeats \
+             the Q-in-registers optimization (the v1 attempt regressed +19%). Fall back \
+             to attention_dflash_wmma_m32_f32 (head_dim <= 128) or attention_dflash_wmma_f32 \
+             (head_dim <= 256) for other head dims.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_n64_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_n64_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N64_SRC,
+            "attention_dflash_wmma_n64_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_n64_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32 slots):
+        //   V_lds[64 * head_dim] + O_lds[32 * head_dim]
+        //   + S_lds[32 * 64]
+        //   + m_lds[32] + l_lds[32] + alpha_lds[32]
+        let lds_f32 = (64 + 32) * head_dim + 32 * 64 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════

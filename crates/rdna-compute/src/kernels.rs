@@ -1653,6 +1653,15 @@ pub const ATTENTION_DFLASH_WMMA_SRC: &str = include_str!("../../../kernels/src/a
 /// See `kernels/src/attention_dflash_wmma_m32.hip`.
 pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m32.hip");
 
+/// N=64 K-tile variant — M=32 queries per block, **64 keys per outer
+/// loop iteration** (vs 16 in M32_SRC). Q lives in registers across all
+/// K-tiles; phase C fuses the alpha-scale and SV epilogue. Designed to
+/// amortise per-K-tile fixed costs (syncs, softmax, O-scaling) over 4×
+/// more keys per visit. LDS at hd=128 ≈ 57.7 KB (under 64 KB cap).
+/// See `kernels/src/attention_dflash_wmma_n64.hip` and the rocprof
+/// investigation in `docs/plans/dots-ocr.perf-investigation.md`.
+pub const ATTENTION_DFLASH_WMMA_N64_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64.hip");
+
 /// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
 /// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
 /// vision encoder to match HF's bf16 forward path at residual-stream
