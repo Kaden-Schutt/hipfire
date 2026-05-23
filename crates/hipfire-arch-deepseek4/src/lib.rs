@@ -54,6 +54,7 @@
 pub mod arch;
 pub mod deepseek4;
 pub mod forward;
+pub mod sampling;
 pub mod spec_decode;
 
 pub use arch::DeepseekV4;

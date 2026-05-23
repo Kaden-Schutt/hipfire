@@ -948,9 +948,22 @@ fn main() {
                     },
                     None => None,
                 };
-                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+                // Sampling defaults differ by arch: qwen35 family was tuned
+                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
+                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
+                // for local deployment, and lower values consistently fall
+                // into block-level attractors on this quantized instruct
+                // model. Pick arch-shaped defaults so a vanilla
+                // `/v1/chat/completions` POST (no sampling fields) works on
+                // both. Explicit per-request values still override either.
+                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                    (1.0_f64, 1.0_f64)
+                } else {
+                    (0.3_f64, 0.8_f64)
+                };
+                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(default_temp) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(default_top_p) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -963,6 +976,15 @@ fn main() {
                 // and docs/investigations/2026-05-15-9b-reasoning-loop/.
                 // Clients can still opt in to a non-1.0 value per request.
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                // OpenAI-compatible `reasoning_effort` (also accept our custom
+                // `thinking_mode` alias) — only consumed by arch_id=9 today.
+                // Default = NonThink, matching the safe HF chat frame.
+                let think_mode = msg
+                    .get("reasoning_effort")
+                    .or_else(|| msg.get("thinking_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(ThinkMode::from_str)
+                    .unwrap_or(ThinkMode::NonThink);
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -1115,6 +1137,7 @@ fn main() {
                         pf_cfg_owned.as_ref(),
                         tools_json.as_deref(),
                         messages_history.as_deref(),
+                        think_mode,
                     );
                 }
             }
@@ -3407,7 +3430,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode) {
     // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
     // generate() body is qwen35/llama-shaped and would panic on
     // None unwraps for q35_*/llama_* fields when applied to a
@@ -3430,10 +3453,13 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
         // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
         // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
+        // We honour `system_prompt`, `temp`, `top_p` per HF V4 chat
+        // template + sampling recommendations; everything else routes
+        // through future follow-ups.
         let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
                  assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
-        let _ = (system_prompt, top_p, repeat_penalty, repeat_window);
-        generate_deepseek4(m, gpu, stdout, id, prompt, temp, max_tokens);
+        let _ = (repeat_penalty, repeat_window);
+        generate_deepseek4(m, gpu, stdout, id, prompt, system_prompt, temp, top_p, max_tokens, think_mode);
         return;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
@@ -4384,28 +4410,74 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
 /// without daemon restart):
 ///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
 ///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
-///   HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=1   enable atomic-free MoE-down (load-
-///                                     bearing for spec-decode accept;
-///                                     bit-reproducible at greedy temp=0)
+///   HIPFIRE_DEEPSEEK4_TOP_K=N           top-k filter (default 0 = off; HF rec)
+///   HIPFIRE_DEEPSEEK4_SEED=N            PRNG seed (default: time-based)
+///
+/// Sampling defaults follow the HF model card for `deepseek-ai/DeepSeek-V4-Flash`:
+/// `temperature = 1.0, top_p = 1.0`. Pure greedy (`temp ≤ 1e-6`) is
+/// supported but actively dangerous on this quantized instruct model —
+/// once a code fence opens, `import X\n` self-reinforces into a block-
+/// level token loop. Use `temp = 1.0` (HF default) to avoid the attractor.
+///
+/// Chat template (per HF `encoding/README.md` for V4): non-thinking-mode
+/// frame `<｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>`.
+/// The model expects the `</think>` immediately after `<｜Assistant｜>` in
+/// non-thinking mode, even though no thinking block was generated — this
+/// signals "skip reasoning, go straight to response." Omitting it leaves
+/// the model in undefined-behavior territory.
 ///
 /// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
 /// no CASK eviction, no ChatML scaffolding, no tool-use, no `<think>` /
-/// `max_think_tokens`, no repeat penalty, no top-p sampling, no VL, no
-/// multi-GPU pipeline-parallel. `temp` is currently honored only as a
-/// "≤ 1e-6 means greedy" signal; anything else still falls back to
-/// greedy until a sampler is wired.
+/// `max_think_tokens`, no repeat penalty, no VL, no multi-GPU
+/// pipeline-parallel.
 ///
 /// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
 /// eviction path of its own and the SWA cache wraps automatically below
 /// the sliding-window bound.
+/// HuggingFace DeepSeek V4 thinking modes (per `encoding/README.md`).
+///
+/// The chat template choice changes the open-token after `<｜Assistant｜>`
+/// and (for `Max`) prepends an extended reasoning instruction.
+#[derive(Copy, Clone, Debug)]
+pub enum ThinkMode {
+    /// Non-thinking. Frame: `<｜Assistant｜></think>{response}`.
+    /// Model skips reasoning, replies directly. HF default for chat.
+    NonThink,
+    /// Thinking-high. Frame: `<｜Assistant｜><think>{reasoning}</think>{response}`.
+    /// Model produces a `<think>` block before responding.
+    High,
+    /// Thinking-max. Same frame as `High`, plus prepended
+    /// "Reasoning Effort: Absolute maximum..." system instruction.
+    /// HF recommends context ≥ 384K for this mode.
+    Max,
+}
+
+impl ThinkMode {
+    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
+    /// project-custom `thinking_mode`) to a mode.
+    /// Accepted: "none|off|chat|minimal" → NonThink;
+    ///           "low|medium|high|thinking" → High;
+    ///           "max" → Max. Anything else → NonThink (safe default).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "max" => Self::Max,
+            "high" | "thinking" | "low" | "medium" => Self::High,
+            _ => Self::NonThink,
+        }
+    }
+}
+
 fn generate_deepseek4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
-    _temp: f32,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
     max_tokens: usize,
+    think_mode: ThinkMode,
 ) {
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
@@ -4428,13 +4500,16 @@ fn generate_deepseek4(
     let state = m.deepseek4_state.as_mut().expect("deepseek4_state missing on arch_id=9 generate");
     let eos_tok = m.deepseek4_eos_tok;
 
-    // DeepSeek-family chat-template wrap: BOS + `<｜User｜>` + prompt +
-    // `<｜Assistant｜>`. Raw prompts (without these markers) collapse to
-    // attractor garbage at greedy temp=0 — the model has no instruction
-    // context to predict from. Matches deepseek4_chat's first-turn frame.
-    // Multi-turn isn't wired yet (daemon would need to track conversation
-    // tokens across turns and skip the BOS on turn 2+); for now this
-    // emits a complete single-turn frame per /generate call.
+    // DeepSeek V4 non-thinking chat template (per HF encoding/README.md):
+    //   <｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>
+    //
+    // The `</think>` immediately after `<｜Assistant｜>` is REQUIRED in
+    // non-thinking mode — it tells the model "skip the reasoning block,
+    // go straight to the response." Without it the model is in
+    // undefined-behavior territory. Raw prompts (no chat-template wrap)
+    // also collapse to attractor garbage on this quantized instruct
+    // model. Multi-turn / thinking-mode plumbing is a follow-up; this
+    // emits a single non-thinking turn per /generate call.
     let lookup = |s: &str| -> Option<u32> {
         let ids = tokenizer.encode(s);
         if ids.len() == 1 { Some(ids[0]) } else { None }
@@ -4443,11 +4518,29 @@ fn generate_deepseek4(
     let user_tok = lookup("<｜User｜>");
     let asst_tok = lookup("<｜Assistant｜>");
 
+    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
+    // Quoted from the model card's encoding/README.md.
+    const MAX_THINK_PREAMBLE: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
+You MUST be very thorough in your thinking and comprehensively decompose the problem.";
+
     let mut prompt_ids: Vec<u32> = Vec::new();
     if let Some(b) = bos_tok { prompt_ids.push(b); }
+    if matches!(think_mode, ThinkMode::Max) {
+        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    }
+    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
+        prompt_ids.extend(tokenizer.encode(sys));
+    }
     if let Some(u) = user_tok { prompt_ids.push(u); }
     prompt_ids.extend(tokenizer.encode(prompt));
     if let Some(a) = asst_tok { prompt_ids.push(a); }
+    // Thinking-mode signal token immediately after `<｜Assistant｜>`:
+    //   NonThink → `</think>`   (skip reasoning, respond directly)
+    //   High|Max → `<think>`    (open a reasoning block)
+    match think_mode {
+        ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
+        ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
+    }
 
     if prompt_ids.is_empty() {
         let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
@@ -4505,6 +4598,25 @@ fn generate_deepseek4(
     let mut spec_drafts_offered: u64 = 0;
     let mut spec_drafts_accepted: u64 = 0;
 
+    // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
+    // for local deployment; we honor that as the default. Pure greedy
+    // (temp <= 1e-6) is supported but enters block-level attractors on
+    // structured prompts.
+    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seed: u64 = std::env::var("HIPFIRE_DEEPSEEK4_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        });
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
     if spec_mode {
         // Spec-decode loop. The verifier picks argmax (greedy) so accept
         // semantics stay deterministic.
@@ -4549,8 +4661,12 @@ fn generate_deepseek4(
             last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
         }
     } else {
-        // Plain decode loop. Greedy argmax on host-side logits Vec.
-        let mut next_tok: u32 = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
+        // Plain decode loop. Sampler honours `temp` + `top_p` from the
+        // request; HF default is temp=1.0, top_p=1.0 (multinomial across
+        // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
+        // dangerous — see fn doc.
+        let mut next_tok: u32 =
+            deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
         while generated_count < max_tokens && next_tok != eos_tok {
             let frag = tokenizer.decode(&[next_tok]);
@@ -4562,7 +4678,8 @@ fn generate_deepseek4(
             generated_count += 1;
             match deepseek4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, pos) {
                 Ok(logits) => {
-                    next_tok = deepseek4::spec_decode::logits_argmax(&logits) as u32;
+                    next_tok =
+                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
                     pos += 1;
                 }
                 Err(e) => {
