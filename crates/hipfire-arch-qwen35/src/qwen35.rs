@@ -4838,10 +4838,6 @@ pub fn forward_prefill_batch_with_pbs(
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
-    // Threshold below which the batching overhead isn't worth the alloc +
-    // per-layer dispatch. Single-token prefill obviously should not take
-    // the batched path.
-    const MIN_BATCH: usize = 2;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
     //
@@ -5333,6 +5329,73 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
 /// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
 /// pass synthetic channel tests at FP16 ULP precision but produce
 /// garbage activations in production. Bisection of the offending
+/// Threshold below which batching overhead isn't worth the alloc + per-layer
+/// dispatch — single-token prefill must not take the batched path.
+const MIN_BATCH: usize = 2;
+
+/// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
+/// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
+/// handed to that forward will actually be populated. When this is false the
+/// forward silently drops to a tape-less per-token loop, so spec-decode callers
+/// that later replay the GDN tape MUST gate that cheap replay on this predicate;
+/// otherwise they replay a stale/zero tape and corrupt DeltaNet state. This is
+/// the single source of truth for the eligibility decision — called by the
+/// forward itself and by those callers, so the two can never drift. (The
+/// tree-verify forward keeps its own, deliberately simpler, eligibility check.)
+pub fn prefill_batch_pbs_eligible(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    n: usize,
+    arch: &str,
+    moe_router_logits_present: bool,
+) -> bool {
+    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback (escape hatch).
+    let force_fallback =
+        std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
+    // num_experts ≤ 1024 (bound of the batched top-K shared mem).
+    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    !force_fallback
+        && n >= MIN_BATCH
+        && dn_state.quant == StateQuant::Q8
+        && weights.layers.iter().any(|lw| matches!(
+            lw,
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
+        ))
+        // LA/FA/MoE projection + MoE-FFN weight dtypes must all be batchable;
+        // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
+        && weights.layers.iter().all(|lw| match lw {
+            LayerWeights::DeltaNet(l) =>
+                is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch),
+            LayerWeights::FullAttn(_) => true,
+            LayerWeights::DeltaNetMoe(l) =>
+                moe_topk_ok
+                    && moe_router_logits_present
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && moe_ffn_all_mq4(&l.ffn),
+            LayerWeights::FullAttnMoe(l) =>
+                moe_topk_ok
+                    && moe_router_logits_present
+                    && is_batchable_la(l.wq.gpu_dtype, arch)
+                    && is_batchable_la(l.wk.gpu_dtype, arch)
+                    && is_batchable_la(l.wv.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && moe_ffn_all_mq4(&l.ffn),
+        })
+}
+
 /// dispatch site is pending. Default-off preserves the pre-fan-out
 /// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
 fn moe_ffn_all_mq4(ffn: &MoeFfnWeights) -> bool {

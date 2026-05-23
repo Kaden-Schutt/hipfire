@@ -1592,22 +1592,28 @@ pub fn spec_step_mtp_compressed_serial(
 
     state.trunk_snap.save_from(&target.dn_state, gpu)?;
 
-    // GDN-tape capture is only valid when verify takes the batched PBS path.
-    // MoE trunks are rejected by the PBS eligibility check (qwen35.rs: MoE
-    // layer types) and fall through to a per-token loop that never writes
-    // the tape — replaying that zero-init tape at rollback corrupts
-    // dn_state.conv_states. Mirror the DFlash guard (speculative.rs): null
-    // the tape on MoE trunks and take the full-trunk replay fallback below.
-    // (The MTP verify's PBS scratch is sized max_n+1, so n_verify always fits
-    // in one chunk — MoE-ness is the only tape-population fallback trigger.)
-    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
-        lw,
-        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
-    ));
-    let verify_tape: Option<&mut GdnTape> = if target_has_moe {
-        None
-    } else {
+    // GDN-tape capture happens only when the verify takes the batched (PBS)
+    // path; otherwise the forward silently drops to a tape-less per-token loop
+    // and the persistent `trunk_gdn_tape` is left stale — replaying it at
+    // rollback corrupts dn_state.conv_states. Capture eligibility is broader
+    // than MoE-ness: a non-Q8 kv-mode (dn_state.quant != Q8), a non-batchable
+    // weight dtype, or the HIPFIRE_PREFILL_BATCHED=0 escape hatch all force the
+    // per-token fallback even on a dense trunk. Gate on the forward's OWN
+    // eligibility predicate (single source of truth) so the rollback's
+    // cheap-vs-full replay choice tracks exactly whether the tape was written
+    // this cycle, and pass the tape only when it will actually be captured.
+    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+        trunk_weights,
+        &target.config,
+        &target.dn_state,
+        n_verify,
+        gpu.arch.as_str(),
+        /* moe_router_logits_present — dense trunk: arm never matched */ true,
+    );
+    let verify_tape: Option<&mut GdnTape> = if tape_captured {
         Some(&mut state.trunk_gdn_tape)
+    } else {
+        None
     };
 
     qwen35::forward_prefill_batch_with_pbs(
@@ -1847,8 +1853,8 @@ pub fn spec_step_mtp_compressed_serial(
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
         state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
-        if !target_has_moe {
-            // Tape was populated by the batched verify — cheap GDN-only replay.
+        if tape_captured {
+            // The batched verify populated the tape this cycle — cheap GDN-only replay.
             state.trunk_gdn_tape.replay_gdn(
                 gpu,
                 trunk_weights,
@@ -1857,9 +1863,11 @@ pub fn spec_step_mtp_compressed_serial(
                 advance,
             )?;
         } else {
-            // Fallback (tape unpopulated on MoE trunks): the original
-            // always-correct full-trunk replay of the committed prefix —
-            // one batched forward, or a single forward_scratch for advance==1.
+            // The verify took the tape-less per-token fallback (non-Q8 kv-mode,
+            // non-batchable weight dtype, MoE trunk, or HIPFIRE_PREFILL_BATCHED=0),
+            // so the persistent tape is stale. Do the original always-correct
+            // full-trunk replay of the committed prefix — one batched forward,
+            // or a single forward_scratch for advance==1.
             if advance >= 2 {
                 let replay = &verify_tokens[..advance];
                 qwen35::forward_prefill_batch(
