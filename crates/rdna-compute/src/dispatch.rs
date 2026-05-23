@@ -23994,6 +23994,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds.
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht3_kv",
             kernels::PFLASH_SCORE_FWHT3_KV_SRC,
@@ -24020,6 +24021,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds.
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht4_kv",
             kernels::PFLASH_SCORE_FWHT4_KV_SRC,
@@ -24048,6 +24050,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds.
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht2_kv",
             kernels::PFLASH_SCORE_FWHT2_KV_SRC,
