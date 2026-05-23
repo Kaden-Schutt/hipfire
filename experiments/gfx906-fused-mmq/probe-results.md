@@ -106,3 +106,64 @@ a gfx906 prefill bench, well within the §6.1 ceiling estimate
 is correct, numerically equivalent, and ships a measurable +7.3%
 async prefill win. Steps 4-6 (MMQ_Y sweep, HFQ3 port, screen-reject
 analysis) remain optional follow-ups; the structural win is banked.
+
+---
+
+## Update 2026-05-23 — Phase 4 MMQ_Y=64 sweep — NEGATIVE result
+
+Plan §6 step 5 / §4.2 probe: replace gate_up's MMQ_Y=128 tile with
+MMQ_Y=64, hoping for the same +5-14% PR #315 found on RDNA2 (gfx1030)
+from halved LDS budget + halved accumulator regs → doubled per-CU
+occupancy.
+
+### Measured: −5.6% prefill regression on gfx906
+
+| metric                    | Y=128 (fused)       | Y=64 (fused)        |
+|---------------------------|---------------------|---------------------|
+| prefill tok/s (3 runs)    | 778.6, 780.2, 779.3 | 735.3, 736.9, 735.6 |
+| mean prefill tok/s        | **779.4**           | **735.9**           |
+| Δ                         | —                   | **−5.6%**           |
+| prefill wall (ms)         | 328.5               | 347.9               |
+| per-call gate_up wall (µs)| 2683                | 3012 (**+12.3%**)   |
+
+`bench_qwen35_mq4 /local/hipfire/qwen3.5-9b.mq4 --prefill 256 --prefill-runs 3 --gen 10 --warmup 2`
+`HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1 HIPFIRE_HFQ4_MMQ_GFX906_Y64=1`.
+
+Byte-exact A/B (greedy_dump) confirms numerical equivalence — both
+Y=128 and Y=64 produce md5 `f9bb00845568951675012dbde42bc171` on the
+60-token "Capital of France?" generation. The regression is purely
+perf, not correctness.
+
+### Why Y=64 wins on RDNA2 but loses on gfx906
+
+The gfx906 body's existing commentary
+(`gemm_hfq4g256_residual_mmq_gfx906_body.cuh:95-100`) documents that
+gfx906's MemUnitBusy collapses to 13.8% at mmq_x=32 on the b32 path —
+the kernel is **LDS-issue-rate starved**, not LDS-capacity starved.
+Cutting Y in half:
+- Doubles WG count per grid (9B gate_up: 76 → 152 WGs).
+- Halves per-WG work, but launch + sync overhead doesn't scale down.
+- Doesn't relieve the actual issue-rate bottleneck.
+
+The promised occupancy gain (LDS-permitted 2 WG/CU → 3 WG/CU) doesn't
+materialize because the kernel was already issue-rate-limited at Y=128.
+
+### Y=96 status: deferred
+
+`MMQ_Y=96` is mentioned in plan §4.2 as a non-power-of-2 candidate
+between Y=64 and Y=128. Implementing it requires fixing the
+accumulator sizing — `MMQ_Y / WAVE_SIZE = 96 / 64 = 1.5` truncates to
+1 in the inner loop, so the body needs `i0 < min(MMQ_Y,
+batch_remaining)` guards everywhere. Not worth the refactor without a
+clearer hypothesis that Y=96 would help; deferred indefinitely.
+
+### Disposition
+
+Y=64 wrappers + dispatcher gate stay in the tree as a research scaffold
+gated by `HIPFIRE_HFQ4_MMQ_GFX906_Y64=1` (default OFF), following PR
+#315's convention for kept-gated negative results. Future gfx906 MMQ
+work should target the issue-rate bottleneck, not the occupancy
+ceiling.
+
+**Final wins banked from Phase 2 + 3 (Y=128):** +7.3% async prefill on
+Qwen3.5 9B MQ4. Phase 4 yielded no additional win.

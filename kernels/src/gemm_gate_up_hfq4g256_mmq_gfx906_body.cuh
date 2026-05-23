@@ -53,7 +53,23 @@
 //      Y_b[col][row_in_b]. Matches the existing gate_up_wave64_dp4a
 //      ABI on gfx906.
 
+// MMQ_Y is the row-tile height per workgroup. Default 128 (the
+// established sweet spot from the residual sibling); a Y=64 variant
+// exists to probe the higher-occupancy regime (smaller LDS X-tile,
+// halved accumulator register footprint, 2× more WGs per grid →
+// better utilization on gfx906's 60 CUs at modest grid sizes).
+//
+// IMPORTANT INVARIANT: MMQ_Y must be a multiple of 16. The loader
+// distributes (MMQ_Y * 16) tasks across 256 threads as
+// `loops_per_thread = MMQ_Y / 16`. Y values that aren't multiples of
+// 16 would either over-fetch (OOB LDS writes, same shape as PR #315
+// commit 4e5fefc7's RDNA2 NaN bug) or leave threads idle.
+#ifndef MMQ_Y
 #define MMQ_Y 128
+#endif
+static_assert(MMQ_Y % 16 == 0, "MMQ_Y must be a multiple of 16 (loader invariant)");
+static_assert(MMQ_Y == 64 || MMQ_Y == 128, "Only Y=64 and Y=128 are currently supported (Y=32/96 untested)");
+
 #define MMQ_NWARPS 4
 #define WAVE_SIZE 64
 #define MMQ_TILE_NE_K 32
@@ -95,9 +111,15 @@ static __device__ __forceinline__ void load_hfq4_tile_streaming(
         }
     }
 
+    // Loader fans MMQ_Y rows × 16 chunks-per-row across 256 threads.
+    // loops_per_thread = MMQ_Y * 16 / 256 = MMQ_Y / 16.
+    // Y=128 → 8 loops, Y=64 → 4 loops. Each thread handles consecutive
+    // task_ids so the stride `tid * loops_per_thread` keeps the per-row
+    // chunk distribution unchanged from the Y=128 baseline.
+    constexpr int loops_per_thread = MMQ_Y / 16;
     #pragma unroll
-    for (int loop = 0; loop < 8; ++loop) {
-        const int task_id = tid * 8 + loop;
+    for (int loop = 0; loop < loops_per_thread; ++loop) {
+        const int task_id = tid * loops_per_thread + loop;
         const int i = task_id / 16;
         const int chunk = task_id % 16;
 

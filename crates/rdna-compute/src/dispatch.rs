@@ -337,6 +337,22 @@ pub fn hfq4_mmq_gfx906_fused_enabled() -> bool {
     })
 }
 
+/// Opt-in for the MMQ_Y=64 occupancy variants of the fused-projection
+/// kernels (plan §6 step 5 / §4.2). Halves the per-WG LDS X-tile and
+/// the accumulator register footprint; doubles the WG count per grid.
+/// Better for gfx906's 60 CUs at modest grid sizes — but the actual
+/// occupancy gain depends on register pressure, which is shape-
+/// dependent and must be measured. Currently only the gate_up family
+/// has y64 wrappers; qkv 3-way will be parameterized after y64 is
+/// validated as a net win on gate_up. Default OFF (Y=128).
+pub fn hfq4_mmq_gfx906_y64_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1")
+    })
+}
+
 /// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
 /// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
 /// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
@@ -14139,36 +14155,52 @@ impl Gpu {
             "gate_up_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
             batch_size, self.capture_mode,
         );
+
+        // MMQ_Y selection. Y=64 is the higher-occupancy variant (plan §6.5);
+        // wrappers only exist for {x16, x32}, so larger mmq_x at y64 falls
+        // back to y128. Y=128 is the established default (matches the
+        // residual sibling).
+        let y64 = hfq4_mmq_gfx906_y64_enabled();
+        let mmq_y: usize = if y64 { 64 } else { 128 };
+
         debug_assert!(
-            m_a % 128 == 0 && m_b % 128 == 0,
-            "gate_up_hfq4g256_mmq_gfx906 requires m_a/m_b multiples of MMQ_Y=128 (got a={m_a} b={m_b})",
+            m_a % mmq_y == 0 && m_b % mmq_y == 0,
+            "gate_up_hfq4g256_mmq_gfx906 requires m_a/m_b multiples of MMQ_Y={mmq_y} (got a={m_a} b={m_b})",
         );
 
-        let mmq_x = if batch_size <= 8 { 8 }
+        let mut mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 32 { 32 }
             else { 64 };
+        // Y=64 only has wrappers for x16 and x32; cap mmq_x at 32 when
+        // y64 is requested. Falls through to the y128 path for tiny
+        // batches (x8) since no x8_y64 wrapper exists.
+        let use_y64 = y64 && mmq_x >= 16;
+        if use_y64 && mmq_x > 32 { mmq_x = 32; }
 
-        let is_full = m_a % 128 == 0 && m_b % 128 == 0 && batch_size % mmq_x == 0;
+        let is_full = m_a % mmq_y == 0 && m_b % mmq_y == 0 && batch_size % mmq_x == 0;
         let base_name = "gemm_gate_up_hfq4g256_mmq_gfx906";
+        let y_suffix = if use_y64 { "_y64" } else { "" };
         let kernel_name = if is_full {
-            format!("{}_full_set_x{}", base_name, mmq_x)
+            format!("{}_full_set_x{}{}", base_name, mmq_x, y_suffix)
         } else {
-            format!("{}_x{}", base_name, mmq_x)
+            format!("{}_x{}{}", base_name, mmq_x, y_suffix)
         };
 
-        let wrapper_src = match mmq_x {
-            8  => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X8_SRC,
-            16 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_SRC,
-            32 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_SRC,
-            64 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X64_SRC,
-            _ => unreachable!(),
+        let wrapper_src = match (mmq_x, use_y64) {
+            (8,  false) => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X8_SRC,
+            (16, false) => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_SRC,
+            (32, false) => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_SRC,
+            (64, false) => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X64_SRC,
+            (16, true)  => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_Y64_SRC,
+            (32, true)  => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_Y64_SRC,
+            _ => unreachable!("no gate_up wrapper for mmq_x={mmq_x} y64={use_y64}"),
         };
         let inlined = wrapper_src.replace(
             "#include \"gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh\"",
             kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_BODY_CUH,
         );
-        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+        self.ensure_kernel(&format!("{}_x{}{}", base_name, mmq_x, y_suffix), &inlined, &kernel_name)?;
 
         let mut a_a_p = a_a.buf.as_ptr();
         let mut a_b_p = a_b.buf.as_ptr();
@@ -14191,16 +14223,18 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_Y: usize = 128;
+        // KEEP IN SYNC WITH body.cuh: MMQ_Y is chosen by the wrapper
+        // (`use_y64` above gates which wrapper is included). x_dm sizing
+        // is MMQ_Y float2s. row_tiles uses the same MMQ_Y.
         let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
-        const X_DM_FLOAT2: usize = 128;
+        let x_dm_float2: usize = mmq_y;
         let total_m = m_a + m_b;
-        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let row_tiles = (total_m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
         let shared_mem = (
-            (MMQ_Y * x_stride * 4)
-            + (X_DM_FLOAT2 * 8)
+            (mmq_y * x_stride * 4)
+            + (x_dm_float2 * 8)
             + (mmq_x * Y_STRIDE * 4)
         ) as u32;
         debug_assert!(shared_mem as usize <= 32 * 1024,
@@ -14210,7 +14244,13 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(m_b, k)
                   + batch_size * k
                   + batch_size * (m_a + m_b) * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_mmq_gfx906", bytes);
+        // Distinct timer label per Y variant so attribution shows the split.
+        let timer_label: &'static str = if use_y64 {
+            "gemm_gate_up_hfq4g256_mmq_gfx906_y64"
+        } else {
+            "gemm_gate_up_hfq4g256_mmq_gfx906"
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", timer_label, bytes);
         let result = self.launch_maybe_blob(
             &kernel_name,
             [row_tiles as u32, col_tiles as u32, 1],
