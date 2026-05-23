@@ -23,6 +23,11 @@ pub struct VisionConfig {
     pub temporal_patch_size: usize,
     pub out_hidden_size: usize,
     pub spatial_merge_size: usize,
+    /// Number of entries in the learned `pos_embed` table. The table is laid
+    /// out as a square grid of side `sqrt(num_position_embeddings)` and
+    /// bilinearly interpolated to each image's `(grid_h, grid_w)` at forward
+    /// time — see `fast_pos_embed_interpolate`.
+    pub num_position_embeddings: usize,
     pub norm_eps: f32,
 }
 
@@ -41,11 +46,14 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
         .or_else(|| config.get("text_config").and_then(|tc| tc.get("hidden_size")).and_then(|v| v.as_u64()))
         .unwrap_or(4096) as usize;
     let spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+    let num_position_embeddings = vc.get("num_position_embeddings")
+        .and_then(|v| v.as_u64()).unwrap_or(2304) as usize;
 
     Some(VisionConfig {
         hidden_size, num_heads, head_dim: hidden_size / num_heads,
         num_layers, mlp_dim, patch_size, temporal_patch_size,
-        out_hidden_size, spatial_merge_size, norm_eps: 1e-6,
+        out_hidden_size, spatial_merge_size, num_position_embeddings,
+        norm_eps: 1e-6,
     })
 }
 
@@ -62,7 +70,12 @@ pub struct VisionLayerWeights {
 
 pub struct VisionWeights {
     pub patch_embed_w: GpuTensor, pub patch_embed_b: GpuTensor,
-    pub pos_embed: GpuTensor,
+    /// Learned position-embedding table `(num_position_embeddings, hidden)`,
+    /// resident on CPU because every image bilinearly interpolates a different
+    /// `(grid_h, grid_w)` slice out of it (`fast_pos_embed_interpolate`). Cost
+    /// is small enough (~10 MB at 2304×1152 F32) that keeping it on host is
+    /// strictly simpler than re-uploading shards per image.
+    pub pos_embed: Vec<f32>,
     pub layers: Vec<VisionLayerWeights>,
     pub merger_norm_w: GpuTensor, pub merger_norm_b: GpuTensor,
     pub merger_fc1_w: GpuTensor, pub merger_fc1_b: GpuTensor,
@@ -74,7 +87,6 @@ impl VisionWeights {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.patch_embed_w);
         let _ = gpu.free_tensor(self.patch_embed_b);
-        let _ = gpu.free_tensor(self.pos_embed);
         for l in self.layers {
             for t in [l.norm1_w, l.norm1_b, l.qkv_w, l.qkv_b, l.proj_w, l.proj_b,
                       l.norm2_w, l.norm2_b, l.fc1_w, l.fc1_b, l.fc2_w, l.fc2_b] {
@@ -92,15 +104,21 @@ impl VisionWeights {
 
 // ─── Weight loading ──────────────────────────────────────────────────────────
 
-fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
     let (info, data) = hfq.tensor_data(name)
         .unwrap_or_else(|| panic!("vision tensor not found: {name}"));
-    let vals: Vec<f32> = match info.quant_type {
+    let mut vals: Vec<f32> = match info.quant_type {
         1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
         _ => panic!("expected F16/F32/HFQ4 for {name}, got qt={}", info.quant_type),
     };
+    vals.truncate(n);
+    vals
+}
+
+fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
+    let vals = load_f32_cpu(hfq, name, n);
     gpu.upload_f32(&vals[..n], &[n])
 }
 
@@ -170,7 +188,7 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
     eprintln!("  loading vision weights (GPU)...");
     let patch_embed_w = load_f16_gpu(hfq, gpu, "model.visual.patch_embed.proj.weight")?;
     let patch_embed_b = load_f32_gpu(hfq, gpu, "model.visual.patch_embed.proj.bias", h)?;
-    let pos_embed = load_f32_gpu(hfq, gpu, "model.visual.pos_embed.weight", 2304 * h)?;
+    let pos_embed = load_f32_cpu(hfq, "model.visual.pos_embed.weight", config.num_position_embeddings * h);
 
     let mut layers = Vec::with_capacity(config.num_layers);
     for i in 0..config.num_layers {
@@ -203,6 +221,272 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
         merger_fc2_w: load_f16_gpu(hfq, gpu, "model.visual.merger.linear_fc2.weight")?,
         merger_fc2_b: load_f32_gpu(hfq, gpu, "model.visual.merger.linear_fc2.bias", config.out_hidden_size)?,
     })
+}
+
+// ─── CPU-side per-image precomputes (pos_embed interp + 2D rotary) ───────────
+
+/// Bilinearly interpolate the learned `(K×K, hidden)` position-embedding table
+/// down to the actual `(grid_h, grid_w)`, then reorder into the 2×2 spatial-
+/// merge-grouped layout that `extract_patches` emits. Output: `[n*hidden]`.
+///
+/// HF reference: `Qwen3_5VisionModel.fast_pos_embed_interpolate`. For each
+/// output position `(py, px)` the table is sampled at the four corners
+/// `(floor(py'), floor(px'))`, `(floor(py'), ceil(px'))`, `(ceil(py'),
+/// floor(px'))`, `(ceil(py'), ceil(px'))` with `py' = py * (K-1)/(grid_h-1)`
+/// — i.e. `linspace(0, K-1, grid_h)` — and the four embeddings are blended by
+/// the standard bilinear weights `((1-dh)(1-dw), (1-dh)dw, dh(1-dw), dh dw)`.
+///
+/// The output is permuted from `(grid_h, grid_w, hidden)` row-major into the
+/// same 2x2-grouped order as `extract_patches`: for each merged-block (gy, gx)
+/// in row-major, the four intra-block patches `(sy, sx) ∈ {0,1}²` are
+/// consecutive — matching `view(mh, ms, mw, ms, h).permute(0, 2, 1, 3, 4)`.
+pub fn fast_pos_embed_interpolate(
+    pos_embed: &[f32],
+    hidden: usize,
+    grid_h: usize,
+    grid_w: usize,
+    num_grid_per_side: usize,
+    merge_size: usize,
+) -> Vec<f32> {
+    assert!(grid_h % merge_size == 0 && grid_w % merge_size == 0);
+    assert!(pos_embed.len() == num_grid_per_side * num_grid_per_side * hidden);
+
+    // linspace(0, K-1, N) — torch semantics. With N==1 the only output is 0.0.
+    fn linspace(start: f32, end: f32, n: usize) -> Vec<f32> {
+        if n == 0 { return Vec::new(); }
+        if n == 1 { return vec![start]; }
+        let step = (end - start) / (n as f32 - 1.0);
+        (0..n).map(|i| start + step * i as f32).collect()
+    }
+
+    let kmax = (num_grid_per_side - 1) as f32;
+    let h_idxs = linspace(0.0, kmax, grid_h);
+    let w_idxs = linspace(0.0, kmax, grid_w);
+
+    // Torch `.int()` truncates toward zero; with these non-negative values it
+    // is equivalent to floor. Ceil is floor+1 clamped to K-1.
+    let mut h_floor = vec![0usize; grid_h];
+    let mut h_ceil  = vec![0usize; grid_h];
+    let mut dh      = vec![0.0f32; grid_h];
+    for (i, &v) in h_idxs.iter().enumerate() {
+        let f = v as i32 as usize;
+        h_floor[i] = f;
+        h_ceil[i] = (f + 1).min(num_grid_per_side - 1);
+        dh[i] = v - f as f32;
+    }
+    let mut w_floor = vec![0usize; grid_w];
+    let mut w_ceil  = vec![0usize; grid_w];
+    let mut dw      = vec![0.0f32; grid_w];
+    for (j, &v) in w_idxs.iter().enumerate() {
+        let f = v as i32 as usize;
+        w_floor[j] = f;
+        w_ceil[j] = (f + 1).min(num_grid_per_side - 1);
+        dw[j] = v - f as f32;
+    }
+
+    let n = grid_h * grid_w;
+    // (grid_h, grid_w, hidden) row-major buffer, accumulator at f32.
+    let mut interp = vec![0.0f32; n * hidden];
+    for py in 0..grid_h {
+        let hf = h_floor[py];
+        let hc = h_ceil[py];
+        let dhi = dh[py];
+        for px in 0..grid_w {
+            let wf = w_floor[px];
+            let wc = w_ceil[px];
+            let dwi = dw[px];
+
+            let w_ff = (1.0 - dhi) * (1.0 - dwi);
+            let w_fc = (1.0 - dhi) * dwi;
+            let w_cf = dhi * (1.0 - dwi);
+            let w_cc = dhi * dwi;
+
+            let out_off = (py * grid_w + px) * hidden;
+            let r_ff = (hf * num_grid_per_side + wf) * hidden;
+            let r_fc = (hf * num_grid_per_side + wc) * hidden;
+            let r_cf = (hc * num_grid_per_side + wf) * hidden;
+            let r_cc = (hc * num_grid_per_side + wc) * hidden;
+            for d in 0..hidden {
+                interp[out_off + d] =
+                    w_ff * pos_embed[r_ff + d]
+                  + w_fc * pos_embed[r_fc + d]
+                  + w_cf * pos_embed[r_cf + d]
+                  + w_cc * pos_embed[r_cc + d];
+            }
+        }
+    }
+
+    // Permute to 2x2 spatial-merge-grouped order:
+    //   (gy, gx, sy, sx) ↦ patch row-major (py = gy*ms+sy, px = gx*ms+sx).
+    let mh = grid_h / merge_size;
+    let mw = grid_w / merge_size;
+    let mut out = vec![0.0f32; n * hidden];
+    let mut out_idx = 0usize;
+    for gy in 0..mh {
+        for gx in 0..mw {
+            for sy in 0..merge_size {
+                for sx in 0..merge_size {
+                    let py = gy * merge_size + sy;
+                    let px = gx * merge_size + sx;
+                    let src = (py * grid_w + px) * hidden;
+                    let dst = out_idx * hidden;
+                    out[dst..dst + hidden].copy_from_slice(&interp[src..src + hidden]);
+                    out_idx += 1;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Compute per-patch cos/sin tables for the vision tower's 2D rotary, in the
+/// same 2x2-grouped patch order as `extract_patches`.
+///
+/// HF reference: `Qwen3_5VisionModel.rot_pos_emb`. The inner rotary dim is
+/// `head_dim/2`; frequencies are
+///     inv_freq[i] = 1 / 10000^(2i / (head_dim/2))    for i in [0, head_dim/4)
+/// and the per-patch trig argument is
+///     concat( row_idx * inv_freq, col_idx * inv_freq )    → (head_dim/2,)
+/// where `row_idx`/`col_idx` are the un-merged (gy*ms+sy, gx*ms+sx) positions.
+///
+/// We only store the `head_dim/2` half — HF then concatenates `(rope, rope)`
+/// along the last dim, so the trig values at `d` and `d + head_dim/2` are
+/// identical. The rotary kernel reuses one scalar for both halves.
+///
+/// Returns `(cos, sin)` each of length `n * (head_dim/2)`.
+pub fn compute_vision_rope_cos_sin(
+    grid_h: usize,
+    grid_w: usize,
+    head_dim: usize,
+    merge_size: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    assert!(head_dim % 4 == 0, "head_dim must be divisible by 4 (got {head_dim})");
+    let rot_dim = head_dim / 2;          // total rotary feature width
+    let inner   = head_dim / 4;          // = rot_dim / 2 = #frequencies
+
+    // inv_freq[i] = 1 / 10000^(2i / rot_dim)  for i in [0, inner)
+    let inv_freq: Vec<f32> = (0..inner)
+        .map(|i| 1.0 / (10000f32).powf(2.0 * i as f32 / rot_dim as f32))
+        .collect();
+
+    let n = grid_h * grid_w;
+    let mut cos_t = vec![0.0f32; n * rot_dim];
+    let mut sin_t = vec![0.0f32; n * rot_dim];
+
+    let mh = grid_h / merge_size;
+    let mw = grid_w / merge_size;
+    let mut out_idx = 0usize;
+    for gy in 0..mh {
+        for gx in 0..mw {
+            for sy in 0..merge_size {
+                for sx in 0..merge_size {
+                    let row_idx = (gy * merge_size + sy) as f32;
+                    let col_idx = (gx * merge_size + sx) as f32;
+                    let row_base = out_idx * rot_dim;
+                    let col_base = row_base + inner;
+                    for i in 0..inner {
+                        let angle_r = row_idx * inv_freq[i];
+                        let angle_c = col_idx * inv_freq[i];
+                        cos_t[row_base + i] = angle_r.cos();
+                        sin_t[row_base + i] = angle_r.sin();
+                        cos_t[col_base + i] = angle_c.cos();
+                        sin_t[col_base + i] = angle_c.sin();
+                    }
+                    out_idx += 1;
+                }
+            }
+        }
+    }
+    (cos_t, sin_t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Pure-CPU helper checks. The Python reference values come from
+    // `Qwen3_5VisionModel.fast_pos_embed_interpolate` / `rot_pos_emb` —
+    // see the doc-comments above for the exact formulas.
+
+    #[test]
+    fn pos_embed_interp_identity_when_grid_matches_table() {
+        // grid_h == grid_w == num_grid_per_side: every linspace point lands
+        // exactly on a table entry, so the bilinear weights collapse to
+        // pick a single corner and the interp output is a permutation of
+        // the input table — 2x2-grouped.
+        let k = 4usize;
+        let hidden = 3usize;
+        let merge = 2usize;
+        // Table: pos_embed[r*k+c, d] = (r*k+c)*10 + d
+        let mut table = vec![0.0f32; k * k * hidden];
+        for r in 0..k {
+            for c in 0..k {
+                for d in 0..hidden {
+                    table[(r * k + c) * hidden + d] = (r * k + c) as f32 * 10.0 + d as f32;
+                }
+            }
+        }
+        let out = fast_pos_embed_interpolate(&table, hidden, k, k, k, merge);
+        assert_eq!(out.len(), k * k * hidden);
+        // Walk 2x2-grouped: (gy, gx, sy, sx) → table[(gy*2+sy, gx*2+sx)].
+        let mut idx = 0usize;
+        for gy in 0..(k / merge) {
+            for gx in 0..(k / merge) {
+                for sy in 0..merge {
+                    for sx in 0..merge {
+                        let r = gy * merge + sy;
+                        let c = gx * merge + sx;
+                        for d in 0..hidden {
+                            let want = (r * k + c) as f32 * 10.0 + d as f32;
+                            let got = out[idx * hidden + d];
+                            assert!((got - want).abs() < 1e-4, "idx={idx} d={d} got={got} want={want}");
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pos_embed_interp_bilinear_midpoint() {
+        // 2x2 table → request 3x3 grid. The center sample is at the exact
+        // midpoint of all four corners with weight 1/4 each.
+        let k = 2usize;
+        let hidden = 1usize;
+        let merge = 1usize;
+        let table = vec![10.0f32, 20.0f32, 30.0f32, 40.0f32]; // [(0,0)=10, (0,1)=20, (1,0)=30, (1,1)=40]
+        let out = fast_pos_embed_interpolate(&table, hidden, 3, 3, k, merge);
+        // 3x3 in row-major (no merge): center at out[4*hidden+0].
+        assert!((out[0] - 10.0).abs() < 1e-4);         // (0,0) → (0,0)
+        assert!((out[2] - 20.0).abs() < 1e-4);         // (0,2) → (0,1)
+        assert!((out[6] - 30.0).abs() < 1e-4);         // (2,0) → (1,0)
+        assert!((out[8] - 40.0).abs() < 1e-4);         // (2,2) → (1,1)
+        assert!((out[4] - 25.0).abs() < 1e-4);         // center = mean of all 4
+    }
+
+    #[test]
+    fn rope_table_concat_row_then_col() {
+        // For grid=(2,2), merge=1, head_dim=8 → rot_dim=4, inner=2.
+        // The token at (row=1, col=0) should have cos[:inner] = cos(1*inv_freq)
+        // and cos[inner:] = cos(0*inv_freq) = 1.
+        let head_dim = 8usize;
+        let (cos_t, sin_t) = compute_vision_rope_cos_sin(2, 2, head_dim, 1);
+        let inner = head_dim / 4;
+        let rot = head_dim / 2;
+        assert_eq!(cos_t.len(), 4 * rot);
+        // Patch (row=1, col=0) is at index gy*2+gx with merge=1 → gy=1, gx=0 → idx 2.
+        let base = 2 * rot;
+        // Col half should be all 1 / 0 since col_idx=0.
+        for i in 0..inner {
+            assert!((cos_t[base + inner + i] - 1.0).abs() < 1e-6, "cos col half should be 1");
+            assert!(sin_t[base + inner + i].abs() < 1e-6, "sin col half should be 0");
+        }
+        // Row half (row_idx=1): cos(inv_freq[0]) = cos(1.0) ≈ 0.5403
+        let inv0 = 1.0f32; // 10000^0 = 1
+        assert!((cos_t[base] - inv0.cos()).abs() < 1e-5);
+        assert!((sin_t[base] - inv0.sin()).abs() < 1e-5);
+    }
 }
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
@@ -243,11 +527,32 @@ pub fn vision_forward(
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
 
     // Patch embedding: linear_f16 → [n, h]
-    let mut x = linear_f16(gpu, &weights.patch_embed_w, &x_patches, &weights.patch_embed_b, h, patch_dim, n)?;
+    let x = linear_f16(gpu, &weights.patch_embed_w, &x_patches, &weights.patch_embed_b, h, patch_dim, n)?;
     gpu.free_tensor(x_patches)?;
 
-    // Add position embeddings (first n*h elements of pos_embed)
-    gpu.add_inplace_f32(&x, &weights.pos_embed)?;
+    // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
+    // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
+    // then add. HF's `fast_pos_embed_interpolate`.
+    let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
+    debug_assert_eq!(num_grid_per_side * num_grid_per_side, config.num_position_embeddings);
+    let pos_embed_interp = fast_pos_embed_interpolate(
+        &weights.pos_embed, h, grid_h, grid_w,
+        num_grid_per_side, config.spatial_merge_size,
+    );
+    let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
+    gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
+    gpu.free_tensor(pos_embed_gpu)?;
+
+    // Compute the 2D rotary cos/sin tables once per image and upload. The
+    // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
+    // `cat((rope, rope), dim=-1)` makes the two head_dim halves see the same
+    // angle, so we store the half only).
+    let rot_dim_half = config.head_dim / 2;
+    let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
+        grid_h, grid_w, config.head_dim, config.spatial_merge_size,
+    );
+    let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
+    let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
 
     // Scratch buffers reused across layers
     let qkv_dim = 3 * h;
@@ -262,6 +567,12 @@ pub fn vision_forward(
         // QKV projection → [n, 3h]
         let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, qkv_dim, h, n)?;
         gpu.free_tensor(tmp)?;
+
+        // 2D rotary applied in-place to Q and K halves of the QKV buffer.
+        gpu.apply_rope_2d_vision_f32(
+            &qkv, &rope_cos_gpu, &rope_sin_gpu,
+            n, h, config.num_heads, config.head_dim,
+        )?;
 
         // Self-attention on GPU: qkv[n, 3h] → attn_out[n, h]
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
@@ -295,6 +606,8 @@ pub fn vision_forward(
 
     // Single sync at end of all layers (avoids per-layer sync overhead)
     gpu.hip.device_synchronize()?;
+    gpu.free_tensor(rope_cos_gpu)?;
+    gpu.free_tensor(rope_sin_gpu)?;
     eprintln!("  vision forward complete ({:.2}s)", t0.elapsed().as_secs_f32());
 
     // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)

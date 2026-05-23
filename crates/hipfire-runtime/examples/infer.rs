@@ -123,12 +123,12 @@ fn main() {
             std::fs::write(
                 dir.join("hipfire_chw.json"),
                 format!(
-                    r#"{{"shape":[3,{},{}],"dtype":"<f4","order":"CHW","channel_layout":"R,B,G (deliberate swap, see image.rs:86-96)"}}"#,
+                    r#"{{"shape":[3,{},{}],"dtype":"<f4","order":"CHW","channel_layout":"R,G,B"}}"#,
                     img_h, img_w
                 ),
             ).ok();
 
-            // Patches (HF-comparable layout: (n_patches, temporal*C*ph*pw) = (n, 1536)).
+            // Patches (HF-comparable layout: (n_patches, C*temporal*ph*pw) = (n, 1536)).
             let elems = vision_config.temporal_patch_size * 3
                 * vision_config.patch_size * vision_config.patch_size;
             let n_pat = patches.len() / elems;
@@ -136,7 +136,7 @@ fn main() {
             std::fs::write(
                 dir.join("hipfire_patches.json"),
                 format!(
-                    r#"{{"shape":[{},{}],"dtype":"<f4","grid_thw":[1,{},{}],"layout":"per_patch[temporal,channel,patch_h,patch_w] flattened"}}"#,
+                    r#"{{"shape":[{},{}],"dtype":"<f4","grid_thw":[1,{},{}],"layout":"per_patch[channel,temporal,patch_h,patch_w] flattened, 2x2-merge-grouped"}}"#,
                     n_pat, elems, grid_h, grid_w
                 ),
             ).ok();

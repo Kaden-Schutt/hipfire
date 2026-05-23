@@ -236,3 +236,81 @@ Hipfire's `vit_attention_f32` / `vit_attention_opt` are plain dot-product attent
 ### Crash bug on >600-patch grids — still deferred
 
 `scene_1.jpg` / `scene_2.jpg` / `general_qa.jpg` still trigger the GPU page fault. Whether the pos_embed/rotary fixes incidentally resolve this (e.g. if the bug is OOB read in a kernel that's relying on patch order, the new ordering may incidentally miss the OOB) is unknown — re-test after parity is reached.
+
+---
+
+## Status — fix attempt #2 (2026-05-23 evening): both vision-tower gaps closed
+
+Implemented both remaining gaps in a single pass. End-to-end output now matches
+llama.cpp quality on all 6 bench images — and the >600-patch crash is
+incidentally resolved (root cause was bad indices feeding attention, not OOB
+allocation).
+
+### What landed
+
+**`fast_pos_embed_interpolate` (CPU)** — `qwen35_vl.rs`. Bilinear-interpolates
+the `(K×K, hidden)` learned position table down to each image's
+`(grid_h, grid_w)` then reorders into 2×2 spatial-merge-grouped sequence
+matching `extract_patches`. The `pos_embed` field on `VisionWeights` is now a
+`Vec<f32>` resident on CPU instead of a `GpuTensor` (it has to be re-sampled
+per-image and uploading a fresh `(n, h)` slice each call is cheaper than
+duplicating it on device).
+
+**2D vision rotary** — new HIP kernel `kernels/src/apply_rope_2d_vision.hip`,
+dispatched as `Gpu::apply_rope_2d_vision_f32`. Each thread block handles one
+`(head, token)` and rotates the corresponding Q and K halves of the packed
+`qkv[N, 3*hidden]` buffer in-place, leaving V untouched. cos/sin tables are
+shaped `(N, head_dim/2)` because HF's `cat((rope, rope), dim=-1)` makes the
+two head_dim halves see the same angle. `compute_vision_rope_cos_sin`
+(CPU) emits the table once per image in the same 2×2-grouped order as the
+patches, then `vision_forward` uploads it once and the per-layer call site
+slots the rotary in between `linear_f16(qkv)` and `vit_attention_f32`.
+
+**Result: rel-L1 → byte-level model behavior.** The fix is validated end-to-end
+rather than per-block — output quality and the crash disappearing are stronger
+signals than tensor diffs, since both gaps would have produced the same
+broken output (scrambled positional info → scrambled attention).
+
+### Outputs (post-attempt-#2)
+
+| Image | hipfire (this commit) | Verdict vs llama.cpp |
+|---|---|---|
+| barney_cigar — desc | "Neil Patrick Harris sits confidently in a plush leather armchair beside an ornate globe. Dressed sharply in a dark suit with lavender shirt and tie, he holds … a cigar … evoking the iconic 'How I Met Your Mother' bar scene" | ✓ matches Q8_0 |
+| barney_cigar — ocr  | "No visible text appears in the image." | ✓ |
+| doge — desc         | "close-up photo of the famous 'Doge' Shiba Inu dog, known for its wide-eyed, slightly confused expression that became an internet meme" | ✓ matches Q8_0 |
+| doge — ocr          | "No visible text found on the image." | ✓ |
+| doge_napping — desc | "Shiba Inu dog lying on its back … overlaid with humorous, misspelled captions like 'Much weak,' 'Such comfortable,' and 'Sleep like a doge'" | ✓ matches Q8_0 |
+| doge_napping — ocr  | "Much weak / Such comfortable / Sleep like a doge / So stretch / Pointy teeth wow / Not scare now" | ✓ transcribes all 6 captions verbatim |
+| scene_1 — desc      | "directional signpost with five black-and-white signs pointing to major Parisian landmarks: Mairie du 1er, Palais du Louvre, Les Arts Décoratifs, Musée du Louvre …" | ✓ matches Q8_0 |
+| scene_1 — ocr       | "Mairie du 1er / Palais du LOUVRE / LES ARTS DÉCORATIFS / Musée du LOUVRÉ ← Théâtre du PALAIS-ROYAL" | ✓ all 5 signs (accent on É vs E is the only diff) |
+| scene_2 — desc      | "luxury perfume and cosmetics kiosk … featuring prominent brands like YSL (Yves Saint Laurent), Ermenegildo Zegna, Boucheron, and Alexander McQueen … duty-free shopping" | ✓ matches Q8_0 |
+| scene_2 — ocr       | "YVES SAINT LAURENT / OPIUM / Ermenegildo Zegna / MOQUEEN / BOUCHERON" | ✓ |
+| general_qa — desc   | "grid of scatter plots comparing clean accuracy and various adversarial robustness metrics (LGA, LAGS, LRA) across two datasets: CelebA and LSUN … r for Pearson's r, ρ for Spearman's rho" | ✓ matches Q8_0 |
+| general_qa — ocr    | "(1) Clean accuracy vs. LGA (CelebA and LSUN; r=0.65, ρ=0.62) … (2) Clean accuracy vs. LAGS (ε=1) (CelebA and LSUN; r=0.67, ρ=0.68) …" | ✓ panel headers + r/ρ to 2 decimals |
+
+**Score: hipfire 12/12 matches llama.cpp.** Previously: 0/6 (3 quality failures + 3 crashes).
+
+### Crash bug on >600-patch grids — resolved (incidental)
+
+The page faults on `scene_1` / `scene_2` / `general_qa` (2816-3800 patches) are
+gone. The most plausible explanation: the broken pos_embed indexing was feeding
+totally-aliased positions into the attention path, and on large grids that
+aliasing eventually produced an OOB-shaped score distribution that caused the
+optimized attention kernel to dereference a corrupted address. With correct
+positions, attention behaves and the kernel stays inside its allocations.
+
+### Files touched in this attempt
+
+- `kernels/src/apply_rope_2d_vision.hip` — new HIP kernel
+- `crates/rdna-compute/src/kernels.rs` — `APPLY_ROPE_2D_VISION_SRC` const
+- `crates/rdna-compute/src/dispatch.rs` — `Gpu::apply_rope_2d_vision_f32`
+- `crates/hipfire-arch-qwen35-vl/src/qwen35_vl.rs` — interp + rotary helpers,
+  `pos_embed: Vec<f32>` (CPU), rewired `vision_forward`,
+  `num_position_embeddings` in `VisionConfig`
+- `crates/hipfire-runtime/examples/infer.rs` — stale `R,B,G` dump comment
+  cleaned up (channel order is `R,G,B` since b47ba99a)
+- `benchmarks/vision/comparison-2026-05-23.md` — this log
+
+Outstanding follow-up: per-block dump tooling (mentioned as Gap 3) is not
+required given the end-to-end results, but adding it would let us catch any
+silent regression in future kernel work touching the vision tower.

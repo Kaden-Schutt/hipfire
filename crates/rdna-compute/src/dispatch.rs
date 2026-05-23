@@ -23393,6 +23393,53 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [num_heads as u32, n as u32, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) }
     }
 
+    /// Apply 2D rotary positional embedding to the Q and K halves of a packed
+    /// QKV buffer for the Qwen3.5-VL vision tower (V is left untouched).
+    ///
+    /// `cos_t` and `sin_t` are shaped `[N, head_dim/2]` and are looked up
+    /// per-(token, d) pair; the kernel reuses the same scalar for both
+    /// `d < head_dim/2` and `d + head_dim/2` halves (HF concatenates
+    /// `(rotary_pos_emb, rotary_pos_emb)` along the last dim before the
+    /// trig table, so the two halves see the same angle).
+    ///
+    /// Grid=[num_heads, N], Block=[head_dim/2].
+    pub fn apply_rope_2d_vision_f32(
+        &mut self,
+        qkv: &GpuTensor, cos_t: &GpuTensor, sin_t: &GpuTensor,
+        n: usize, hidden: usize, num_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("apply_rope_2d_vision", kernels::APPLY_ROPE_2D_VISION_SRC, "apply_rope_2d_vision_f32")?;
+        let func = &self.functions["apply_rope_2d_vision_f32"];
+        let mut qp = qkv.buf.as_ptr();
+        let mut cp = cos_t.buf.as_ptr();
+        let mut sp = sin_t.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let half = (head_dim / 2) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, n as u32, 1],
+                [half, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Optimized vision attention with tiled K/V loading and 4 queries per block.
     /// ~3-5x faster than vit_attention_f32 via shared memory reuse.
     /// Grid=[num_heads, ceil(N/4)], Block=[256].
