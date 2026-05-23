@@ -313,17 +313,17 @@ pub fn vision_forward(
     let normed_data = gpu.download_f32(&normed)?;
     gpu.free_tensor(normed)?;
 
+    // Patches in `normed_data` are stored in 2x2-block-grouped order (see
+    // `extract_patches`), so the 4 patches that merge into one output token
+    // are CONSECUTIVE in the buffer: src indices [out_idx*4 .. out_idx*4+4].
     let mut merged = vec![0.0f32; n_merged * merge_dim];
     for my in 0..merged_h {
         for mx in 0..merged_w {
             let out_idx = my * merged_w + mx;
-            for dy in 0..sms {
-                for dx in 0..sms {
-                    let src = (my * sms + dy) * grid_w + (mx * sms + dx);
-                    let sub = dy * sms + dx;
-                    merged[out_idx * merge_dim + sub * h..out_idx * merge_dim + sub * h + h]
-                        .copy_from_slice(&normed_data[src * h..src * h + h]);
-                }
+            for sub in 0..(sms * sms) {
+                let src = out_idx * (sms * sms) + sub;
+                merged[out_idx * merge_dim + sub * h..out_idx * merge_dim + sub * h + h]
+                    .copy_from_slice(&normed_data[src * h..src * h + h]);
             }
         }
     }

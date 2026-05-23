@@ -66,23 +66,18 @@ fn preprocess_dynamic_image(
     let rgb = img.to_rgb8();
     let (w, h) = (rgb.width() as usize, rgb.height() as usize);
 
-    // Convert to CHW float, normalize: pixel / 127.5 - 1.0
+    // CHW float in straight [R, G, B] order, normalize: pixel / 127.5 - 1.0.
     //
-    // Channel-order fix for issue #23: the vision patch_embed weights expect
-    // channels in [R, B, G] layout, not [R, G, B]. Empirically confirmed by
-    // feeding pure-color PNGs (R=(255,0,0), G=(0,255,0), B=(0,0,255)) through
-    // the encoder with temp=0 greedy decoding:
-    //
-    //   input  | RGB-order (pre-fix) | R<->B swap | B<->G swap (this fix)
-    //   -------+---------------------+------------+---------------------
-    //   red    | "Red"   ✓           | "Green"    | "Red"   ✓
-    //   green  | "Blue"  ✗           | "Blue"     | "Green" ✓
-    //   blue   | "Green" ✗           | "Red"      | "Blue"  ✓
-    //
-    // Root cause is most likely a channel permutation in the HF patch_embed
-    // weight export (input conv channels 1 and 2 appear transposed), but the
-    // preprocessing swap here resolves the end-to-end symptom. See
-    // crates/hipfire-runtime/tests/channel_order.rs for the pure-color test matrix.
+    // History: previously had a deliberate B<->G swap (storing as [R, B, G])
+    // because pure-color PNG tests said red/green/blue were misnamed without
+    // it. That diagnosis was wrong — the real cause was the (T,C,H,W) vs
+    // (C,T,H,W) per-patch transpose in `extract_patches` below, which on a
+    // single-color image happens to be re-fixable by any single channel
+    // permutation. On natural images the two bugs compound and the swap
+    // makes things strictly worse. Verified byte-identical to HF's
+    // Qwen2VLImageProcessorFast on `barney_cigar.jpg` once the layout is
+    // straight RGB AND extract_patches uses (C,T,H,W). See
+    // benchmarks/vision/comparison-2026-05-23.md.
     let mut out = vec![0.0f32; 3 * h * w];
     let plane = h * w;
     for y in 0..h {
@@ -90,8 +85,8 @@ fn preprocess_dynamic_image(
             let pixel = rgb.get_pixel(x as u32, y as u32);
             let idx = y * w + x;
             out[idx] = pixel[0] as f32 / 127.5 - 1.0;             // channel 0 = R
-            out[plane + idx] = pixel[2] as f32 / 127.5 - 1.0;     // channel 1 = B  (was G)
-            out[2 * plane + idx] = pixel[1] as f32 / 127.5 - 1.0; // channel 2 = G  (was B)
+            out[plane + idx] = pixel[1] as f32 / 127.5 - 1.0;     // channel 1 = G
+            out[2 * plane + idx] = pixel[2] as f32 / 127.5 - 1.0; // channel 2 = B
         }
     }
     (out, h, w)
@@ -151,9 +146,29 @@ fn map_image_err(e: image::ImageError) -> String {
 }
 
 /// Extract non-overlapping patches from a CHW image.
-/// Input: [C, H, W] where H and W are divisible by patch_size.
-/// For temporal_patch_size=2, duplicates the frame and interleaves.
-/// Output: [N, temporal_patch_size * C * patch_size * patch_size] where N = (H/patch_size) * (W/patch_size).
+///
+/// Input: `[C, H, W]` where H and W are divisible by `patch_size` (and
+/// `patch_size * spatial_merge` — currently 2, enforced by [`smart_resize`]).
+/// Output: `[N, temporal_patch_size * C * patch_size * patch_size]` with
+/// `N = (H/patch_size) * (W/patch_size)`, ordered to match HuggingFace
+/// `Qwen2VLImageProcessorFast`:
+///
+///   * Patches are emitted in **2x2 spatial-merge-grouped order**: outer
+///     `(gy, gx)` row-major over `(ph/2, pw/2)`, inner `(sy, sx)` row-major
+///     over `(2, 2)`. This means 4 consecutive patches in the output buffer
+///     form one spatial-merge output token.
+///   * Per-patch layout is `(C, T, patch_h, patch_w)` flat —
+///     **channel-outer, temporal-inner**.
+///
+/// Pre-2026-05-23 this function used row-major patch order and `(T, C, h, w)`
+/// per-patch layout, both of which disagree with HF. Combined with the
+/// `[R, B, G]` channel swap in [`preprocess_dynamic_image`] (also reverted in
+/// that change) the vision tower received patches that were scrambled in
+/// three independent dimensions — model perceived every image as "vertically
+/// stretched / low-resolution / blurry". Diagnosed by element-wise diff
+/// against HF reference on `barney_cigar.jpg`: rel-L1 dropped from 0.35
+/// (pre-fix) to 0.002 (post-fix, residual is the resize-filter difference).
+/// See `benchmarks/vision/comparison-2026-05-23.md` and `diff_dumps.py`.
 pub fn extract_patches(
     chw: &[f32],
     channels: usize,
@@ -168,22 +183,35 @@ pub fn extract_patches(
     let patch_elems = temporal_patch_size * channels * patch_size * patch_size;
     let mut patches = vec![0.0f32; n_patches * patch_elems];
 
+    let spatial_merge: usize = 2;
+    assert!(
+        ph % spatial_merge == 0 && pw % spatial_merge == 0,
+        "patch grid {ph}x{pw} not divisible by spatial_merge={spatial_merge} — \
+         smart_resize should guarantee this",
+    );
+    let gw = pw / spatial_merge;
+
     for py in 0..ph {
         for px in 0..pw {
-            let patch_idx = py * pw + px;
-            let out_base = patch_idx * patch_elems;
-            // For each temporal frame (duplicated for single image)
-            for t in 0..temporal_patch_size {
-                let _ = t; // same frame duplicated
-                for c in 0..channels {
+            let gy = py / spatial_merge;
+            let gx = px / spatial_merge;
+            let sy = py % spatial_merge;
+            let sx = px % spatial_merge;
+            // 2x2-block-grouped row-major: ((gy, gx), (sy, sx)) flattened.
+            let patch_out_idx = ((gy * gw + gx) * spatial_merge + sy) * spatial_merge + sx;
+            let out_base = patch_out_idx * patch_elems;
+
+            for c in 0..channels {
+                for t in 0..temporal_patch_size {
+                    let _ = t; // same frame duplicated for both temporal slots
                     for dy in 0..patch_size {
                         for dx in 0..patch_size {
                             let y = py * patch_size + dy;
                             let x = px * patch_size + dx;
                             let src_idx = c * height * width + y * width + x;
                             let dst_idx = out_base
-                                + t * channels * patch_size * patch_size
-                                + c * patch_size * patch_size
+                                + c * temporal_patch_size * patch_size * patch_size
+                                + t * patch_size * patch_size
                                 + dy * patch_size
                                 + dx;
                             patches[dst_idx] = chw[src_idx];

@@ -105,6 +105,46 @@ fn main() {
             vision_config.patch_size, vision_config.temporal_patch_size,
         );
 
+        // Optional debug dump for HF-reference numerical diff. Writes raw
+        // little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR.
+        if let Ok(dump_dir) = std::env::var("HIPFIRE_VL_DUMP_DIR") {
+            use std::io::Write;
+            let dir = std::path::Path::new(&dump_dir);
+            std::fs::create_dir_all(dir).ok();
+
+            let write_f32 = |p: &std::path::Path, data: &[f32]| {
+                let mut f = std::fs::File::create(p).expect("create blob");
+                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                f.write_all(&bytes).expect("write blob");
+            };
+
+            // CHW pre-patch tensor.
+            write_f32(&dir.join("hipfire_chw.bin"), &pixels);
+            std::fs::write(
+                dir.join("hipfire_chw.json"),
+                format!(
+                    r#"{{"shape":[3,{},{}],"dtype":"<f4","order":"CHW","channel_layout":"R,B,G (deliberate swap, see image.rs:86-96)"}}"#,
+                    img_h, img_w
+                ),
+            ).ok();
+
+            // Patches (HF-comparable layout: (n_patches, temporal*C*ph*pw) = (n, 1536)).
+            let elems = vision_config.temporal_patch_size * 3
+                * vision_config.patch_size * vision_config.patch_size;
+            let n_pat = patches.len() / elems;
+            write_f32(&dir.join("hipfire_patches.bin"), &patches);
+            std::fs::write(
+                dir.join("hipfire_patches.json"),
+                format!(
+                    r#"{{"shape":[{},{}],"dtype":"<f4","grid_thw":[1,{},{}],"layout":"per_patch[temporal,channel,patch_h,patch_w] flattened"}}"#,
+                    n_pat, elems, grid_h, grid_w
+                ),
+            ).ok();
+
+            eprintln!("[VL-DUMP] wrote CHW ({}x{}x{} f32) + patches ({}x{} f32) to {}",
+                3, img_h, img_w, n_pat, elems, dump_dir);
+        }
+
         eprintln!("Loading vision weights...");
         let vision_weights = qwen35_vl::load_vision_weights(&hfq, &vision_config, &mut gpu)
             .expect("failed to load vision weights");
