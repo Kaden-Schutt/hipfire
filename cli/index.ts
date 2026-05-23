@@ -671,6 +671,13 @@ interface ModelEntry {
   /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
   /// eviction = confident-wrong hallucination on multi-turn).
   triattn?: { file: string };
+  /// Optional published MTP (Multi-Token Prediction) sidecar — currently
+  /// DeepSeek V4 only. When set, `hipfire pull` also fetches the file next
+  /// to the weights. The daemon's V4F arm auto-discovers the sidecar via
+  /// the `<stem>-mtp.<ext>` sibling convention at load time (see
+  /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
+  /// is required once the file is in MODELS_DIR.
+  mtp?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -1224,6 +1231,36 @@ async function pull(tag: string): Promise<string> {
         }
       } catch (e) {
         console.error(`  WARN: sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
+  // MTP sidecar: same pattern as TriAttention. Daemon auto-attaches via the
+  // `<stem>-mtp.<ext>` sibling convention (see arch-deepseek4/src/arch.rs);
+  // missing sidecar = plain decode only, no spec-decode.
+  if (entry.mtp?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.mtp.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  MTP sidecar already present: ${entry.mtp.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.mtp.file}`;
+      console.error(`  Fetching MTP sidecar: ${entry.mtp.file}`);
+      try {
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        if (!sres.ok) {
+          console.error(`  WARN: MTP sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; spec-decode unavailable until sidecar present.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
+          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
       }
     }
   }

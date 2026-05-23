@@ -27,6 +27,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_qwen35::qwen35;
@@ -393,6 +394,22 @@ struct LoadedModel {
     qwen2_config: Option<qwen2::Qwen2Config>,
     qwen2_weights: Option<qwen2::Qwen2Weights>,
     qwen2_state: Option<qwen2::Qwen2State>,
+    // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
+    // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
+    // SWA cache. KV cache lives inside DeepseekV4State; no separate
+    // deepseek4_kv field. None on every other arch path.
+    deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
+    deepseek4_weights: Option<hipfire_arch_deepseek4::DeepseekV4Weights>,
+    deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
+    /// Pre-allocated PrefillBatchScratch sized to `HIPFIRE_DEEPSEEK4_PP_BATCH`
+    /// (default 64). Used by both batched prefill and the MTP spec-decode
+    /// verify pass. Lazy-allocated on first arch_id=9 load — None on every
+    /// other arch path.
+    deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    /// Cached `<｜end▁of▁sentence｜>` token id resolved at load time.
+    /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
+    /// the special-token entry.
+    deepseek4_eos_tok: u32,
     // Vision state (VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -742,6 +759,7 @@ fn main() {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
+                            9 => "deepseek4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some();
@@ -1195,6 +1213,7 @@ fn main() {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
                     7 => "qwen2",
+                    9 => "deepseek4",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1295,6 +1314,26 @@ fn main() {
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 9 {
+                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
+                    // the kernel cache (HC, indexer, compressor,
+                    // attention, MoE) on a short synthetic prompt
+                    // before any user-facing generate. Not the
+                    // production prefill path (that's
+                    // forward_prefill_batch_chunked in `generate`).
+                    let config = m.deepseek4_config.as_ref().unwrap();
+                    let weights = m.deepseek4_weights.as_ref().unwrap();
+                    let state = m.deepseek4_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if deepseek4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        ).is_err() {
                             ok = false;
                             break;
                         }
@@ -1653,6 +1692,61 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 9 {
+        // DeepSeek V4 Flash (hipfire-arch-deepseek4). Standalone bring-up —
+        // no eviction, no DFlash drafter, no PFlash, no VL. The
+        // Architecture trait gives us config + weights + state in three
+        // calls; forward goes through `deepseek4::forward::forward_prefill_*` /
+        // `decode_step` in the generate hot path.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        let state = deepseek4::DeepseekV4State::new(&config)?;
+        // Pre-allocate PrefillBatchScratch. Default B=64 — same as
+        // deepseek4_chat. Override via HIPFIRE_DEEPSEEK4_PP_BATCH. PBS sits in GPU
+        // memory for the model's lifetime; reused across every turn.
+        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
+        // Cache EOS token id. DeepSeek family uses `<｜end▁of▁sentence｜>`;
+        // fall back to 1 if tokenizer lacks the entry.
+        let eos_tok: u32 = {
+            let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+            if ids.len() == 1 { ids[0] } else { 1 }
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
+            deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1826,6 +1920,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
@@ -1856,6 +1951,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1986,6 +2082,7 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -3329,6 +3426,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         );
         return;
     }
+    if m.arch_id == 9 {
+        // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
+        // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
+        // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                 assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
+        let _ = (system_prompt, top_p, repeat_penalty, repeat_window);
+        generate_deepseek4(m, gpu, stdout, id, prompt, temp, max_tokens);
+        return;
+    }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
@@ -4265,6 +4372,239 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         );
         let _ = stdout.flush();
     }
+}
+
+/// DeepSeek V4 Flash generate path (arch_id=9, hipfire-arch-deepseek4).
+///
+/// Parity with `deepseek4_chat`: batched chunked prefill +
+/// optional MTP spec-decode + greedy argmax sampler. PBS is pre-allocated
+/// once at load time (`m.deepseek4_pbs`), reused across every turn.
+///
+/// Env knobs (read fresh per generate call so they can be toggled
+/// without daemon restart):
+///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
+///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
+///   HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=1   enable atomic-free MoE-down (load-
+///                                     bearing for spec-decode accept;
+///                                     bit-reproducible at greedy temp=0)
+///
+/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// no CASK eviction, no ChatML scaffolding, no tool-use, no `<think>` /
+/// `max_think_tokens`, no repeat penalty, no top-p sampling, no VL, no
+/// multi-GPU pipeline-parallel. `temp` is currently honored only as a
+/// "≤ 1e-6 means greedy" signal; anything else still falls back to
+/// greedy until a sampler is wired.
+///
+/// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
+/// eviction path of its own and the SWA cache wraps automatically below
+/// the sliding-window bound.
+fn generate_deepseek4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    _temp: f32,
+    max_tokens: usize,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.deepseek4_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m.deepseek4_weights.as_ref().expect("deepseek4_weights missing on arch_id=9 generate");
+    let pbs = m.deepseek4_pbs.as_ref().expect("deepseek4_pbs missing on arch_id=9 generate");
+    let state = m.deepseek4_state.as_mut().expect("deepseek4_state missing on arch_id=9 generate");
+    let eos_tok = m.deepseek4_eos_tok;
+
+    // DeepSeek-family chat-template wrap: BOS + `<｜User｜>` + prompt +
+    // `<｜Assistant｜>`. Raw prompts (without these markers) collapse to
+    // attractor garbage at greedy temp=0 — the model has no instruction
+    // context to predict from. Matches deepseek4_chat's first-turn frame.
+    // Multi-turn isn't wired yet (daemon would need to track conversation
+    // tokens across turns and skip the BOS on turn 2+); for now this
+    // emits a complete single-turn frame per /generate call.
+    let lookup = |s: &str| -> Option<u32> {
+        let ids = tokenizer.encode(s);
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    };
+    let bos_tok = lookup("<｜begin▁of▁sentence｜>");
+    let user_tok = lookup("<｜User｜>");
+    let asst_tok = lookup("<｜Assistant｜>");
+
+    let mut prompt_ids: Vec<u32> = Vec::new();
+    if let Some(b) = bos_tok { prompt_ids.push(b); }
+    if let Some(u) = user_tok { prompt_ids.push(u); }
+    prompt_ids.extend(tokenizer.encode(prompt));
+    if let Some(a) = asst_tok { prompt_ids.push(a); }
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE").ok().as_deref() == Some("1");
+    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+
+    let t0 = Instant::now();
+    let start_pos: u32 = state.n_tokens as u32;
+
+    // Prefill: batched chunked through PBS. If spec_mode, also fill the
+    // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
+    // draft step sees a populated MTP history.
+    let prefill_result = if spec_mode {
+        deepseek4::forward::prefill_with_mtp_fill(cfg, weights, state, gpu, pbs, &prompt_ids, start_pos)
+    } else {
+        deepseek4::forward::forward_prefill_batch_chunked(cfg, weights, state, gpu, &prompt_ids, start_pos, pbs)
+    };
+    let last_logits = match prefill_result {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4prefill failed: {:?}"}}"#, id, e);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    // `forward_prefill_batch_chunked` does NOT advance `state.n_tokens`.
+    // Callers are responsible for it (mirrors deepseek4_chat's explicit
+    // `state.n_tokens = pos as u64;` at deepseek4_chat.rs:324). Without this,
+    // the next decode_step queries the SWA cache at the BOS position
+    // instead of the next-prediction position and the model emits
+    // attractor garbage at greedy temp=0. The MTP-fill prefill DOES
+    // advance internally (forward.rs:7453), so we only need to update
+    // for the plain-prefill branch.
+    if !spec_mode {
+        state.n_tokens = (start_pos as usize + prompt_ids.len()) as u64;
+    }
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+
+    // Sync to ensure all prefill kernels have completed before stopping
+    // the timer (head's download_f32 already syncs but defensive).
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    let pos_after_prefill = state.n_tokens as u32;
+    let mut spec_windows: u64 = 0;
+    let mut spec_drafts_offered: u64 = 0;
+    let mut spec_drafts_accepted: u64 = 0;
+
+    if spec_mode {
+        // Spec-decode loop. The verifier picks argmax (greedy) so accept
+        // semantics stay deterministic.
+        let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
+        let mut spec_last_position = pos_after_prefill;
+        let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        'outer: while generated_count < max_tokens {
+            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
+                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+            };
+            let r = match deepseek4::spec_decode::speculative_decode_step_with_pbs(
+                cfg, weights, state, gpu, pbs,
+                spec_last_token, spec_last_position, lh, spec_k,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4spec-decode failed: {:?}"}}"#, id, e);
+                    let _ = stdout.flush();
+                    return;
+                }
+            };
+            spec_windows += 1;
+            spec_drafts_offered += spec_k as u64;
+            spec_drafts_accepted += r.n_accepted as u64;
+
+            for &t in &r.accepted_tokens {
+                if generated_count >= max_tokens || t == eos_tok {
+                    break 'outer;
+                }
+                let frag = tokenizer.decode(&[t]);
+                let frag_escaped = json_escape(&frag);
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"{}"}}"#, id, frag_escaped);
+                emit_committed_event(stdout, id, t, generated_count, decode_t0.elapsed().as_millis() as u64);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+            }
+            if let Some(&t) = r.accepted_tokens.last() {
+                spec_last_position += r.accepted_tokens.len() as u32;
+                spec_last_token = t;
+            }
+            last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        }
+    } else {
+        // Plain decode loop. Greedy argmax on host-side logits Vec.
+        let mut next_tok: u32 = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
+        let mut pos = pos_after_prefill;
+        while generated_count < max_tokens && next_tok != eos_tok {
+            let frag = tokenizer.decode(&[next_tok]);
+            let frag_escaped = json_escape(&frag);
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"{}"}}"#, id, frag_escaped);
+            emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
+            let _ = stdout.flush();
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+            match deepseek4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, pos) {
+                Ok(logits) => {
+                    next_tok = deepseek4::spec_decode::logits_argmax(&logits) as u32;
+                    pos += 1;
+                }
+                Err(e) => {
+                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4decode failed: {:?}"}}"#, id, e);
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+    }
+
+    m.seq_pos = state.n_tokens as usize;
+
+    let _ = gpu.hip.device_synchronize();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+
+    if spec_mode {
+        let accept_pct = if spec_drafts_offered > 0 {
+            spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec_k":{},"spec_windows":{},"spec_accept_pct":{:.1}}}"#,
+            id, generated_count, tok_s, prefill_ms, total_ms,
+            spec_k, spec_windows, accept_pct,
+        );
+    } else {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+            id, generated_count, tok_s, prefill_ms, total_ms,
+        );
+    }
+    let _ = stdout.flush();
 }
 
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).

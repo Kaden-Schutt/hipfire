@@ -52,7 +52,7 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
 # multi_gpu\.rs is listed here so that touching the PP dispatch path
 # triggers the coherence battery (same contract as single-GPU forward).
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs'
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise
@@ -143,7 +143,7 @@ echo
 # on Path-A-class single-token attractors (unique_ratio < 0.15 or
 # max_freq > 0.50 in first 128 tokens pre-EOT). Skips silently if 27B
 # target/draft aren't installed.
-SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write'
+SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rope_partial|kv_cache_write|spec_decode\.rs|deepseek4'
 # File-name alternation tracks the spec-decode pieces of the runtime
 # AND the qwen35 arch crate (post-PR-8, speculative.rs moved into
 # crates/hipfire-arch-qwen35/src/). dflash.rs + ddtree.rs stay in
@@ -152,7 +152,7 @@ SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rop
 # (long-context bench), gated separately via PFLASH_HOTSPOT above.
 if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
    || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
-   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
+   || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs|spec_decode\.rs|deepseek4'; then
     # --fast on every commit; --full only when explicitly forced. The fast
     # battery (1 prose + 1 code, dflash only) catches the Path A single-token
     # attractor regression class which is what this gate is here for. The
@@ -192,6 +192,23 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
     echo "NOTE: soft warnings (paragraph-level repetition) do not block but"
     echo "indicate quality drift. Read the report and confirm before commit."
     echo
+
+    # DeepSeek V4 MTP spec-decode sibling gate. Same Path-A attractor guard but
+    # via the daemon's HIPFIRE_DEEPSEEK4_SPEC_DECODE=1 path instead of the
+    # qwen35 dflash_spec_demo binary. Skips cleanly when the DeepSeek V4 base
+    # model isn't symlinked into MODELS_DIR.
+    if [ -f "$HOME/.hipfire/models/deepseek-v4-flash.mq2lloyd" ]; then
+        echo "=== DeepSeek V4 MTP spec-decode Coherence Battery (fast) ==="
+        if ! ./scripts/coherence-gate-deepseek4-mtp.sh --fast; then
+            echo
+            echo "========================================================================"
+            echo "COMMIT BLOCKED: DeepSeek V4 MTP coherence battery hit a HARD error."
+            echo "========================================================================"
+            echo
+            exit 1
+        fi
+        echo
+    fi
 fi
 
 echo

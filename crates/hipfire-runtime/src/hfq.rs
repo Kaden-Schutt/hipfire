@@ -197,6 +197,23 @@ impl HfqFile {
         self.mmap = None;
     }
 
+    /// Release the pread reuse buffer back to the allocator. After a
+    /// large tensor is read (e.g. DeepSeek V4's `head.weight` at ~560 MB on a Q8F16
+    /// build), `pread_buf` keeps that capacity for the rest of the
+    /// `HfqFile`'s lifetime. On UMA systems where GPU and CPU share
+    /// physical RAM, that competes with the routed-expert upload pass —
+    /// the difference between fitting and OOM-at-layer-42 on the 88 GB
+    /// deepseek4-q8-mtp build.
+    ///
+    /// Call between load phases when you know subsequent reads will be
+    /// much smaller than the peak. Safe at any time; the next pread
+    /// auto-grows the buffer as needed.
+    pub fn shrink_pread_buf(&self) {
+        let mut buf = self.pread_buf.borrow_mut();
+        buf.clear();
+        buf.shrink_to_fit();
+    }
+
     /// Path the HFQ file was opened from. The weight pager uses this to
     /// open its own file handle for paged reads — keeping the pager's
     /// transport independent of this struct's lifetime / mmap.

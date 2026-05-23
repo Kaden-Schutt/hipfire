@@ -53,7 +53,11 @@ if [ ! -x "$EXE" ]; then
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
                crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
-               crates/rdna-compute/src/dispatch.rs; do
+               crates/rdna-compute/src/dispatch.rs \
+               crates/hipfire-arch-deepseek4/src/arch.rs \
+               crates/hipfire-arch-deepseek4/src/deepseek4.rs \
+               crates/hipfire-arch-deepseek4/src/forward.rs \
+               crates/hipfire-arch-deepseek4/src/spec_decode.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1
             break
@@ -159,6 +163,19 @@ FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     "qwen3.6-35b-a3b.mq4|moe36-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|800"
     "qwen3.6-27b.mq4|tool-call-27b|What does the file /tmp/fibonacci.c contain?|220|tool_call_system.txt"
+    # DeepSeek V4 Flash (arch_id=9, hipfire-arch-deepseek4). Loads the
+    # 80 GB base from the MTP-sidecar split + the MTP addon via
+    # HIPFIRE_DEEPSEEK4_MTP_ADDON. Skipped unless the symlink is present in
+    # MODELS_DIR; symlink with:
+    #   ln -s /data/hipfire-models/deepseek-v4-flash.mq2lloyd \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash.mq2lloyd"
+    #   ln -s /data/hipfire-models/deepseek-v4-flash-mtp.mq2lloyd \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/deepseek-v4-flash-mtp.mq2lloyd"
+    # HIPFIRE_DEEPSEEK4_MTP_ADDON is auto-set by the run-case when the sibling
+    # addon file exists.
+    "deepseek-v4-flash.mq2lloyd|deepseek4-cap|What is the capital of France? Answer in one short sentence.|80"
+    "deepseek-v4-flash.mq2lloyd|deepseek4-reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    "deepseek-v4-flash.mq2lloyd|deepseek4-long-prefill|@coherence_lloyd_long.txt|220"
 )
 tests=("${SHORT_TESTS[@]}")
 if [ "$FULL" -eq 1 ]; then
@@ -236,8 +253,20 @@ for entry in "${tests[@]}"; do
 {"type":"generate","id":"r1","prompt":${prompt_json},"temperature":0.0,"max_tokens":$max_tok,"repeat_penalty":1.05${system_json}}
 {"type":"unload"}
 JL
+    # DeepSeek V4 (arch_id=9): point HIPFIRE_DEEPSEEK4_MTP_ADDON at the sibling `-mtp`
+    # file if one exists. MoE / expert upload / deterministic MoE-down
+    # are default-on in the DeepSeek V4 arch crate. Other arches inherit the
+    # caller's env unchanged.
+    declare -a deepseek4_env=()
+    if [[ "$model_file" == deepseek-v4* ]]; then
+        addon="${model_path%.mq2lloyd}-mtp.mq2lloyd"
+        if [ -f "$addon" ]; then
+            deepseek4_env+=("HIPFIRE_DEEPSEEK4_MTP_ADDON=$addon")
+        fi
+    fi
+
     t0=$(date +%s.%N)
-    timeout 240 "$EXE" < "$in_file" > "$out_file" 2>&1
+    env "${deepseek4_env[@]}" timeout 240 "$EXE" < "$in_file" > "$out_file" 2>&1
     ec=$?
     t1=$(date +%s.%N)
     wall=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
