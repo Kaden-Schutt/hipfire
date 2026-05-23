@@ -4960,61 +4960,15 @@ pub fn forward_prefill_batch_with_pbs(
     // preamble's rmsnorm+rotate and SwiGLU+rotate kernels differ per dtype),
     // and (b) Q8 S-state for the GDN recurrence. Mixed-dtype layers are
     // allowed; each layer is routed to its own path. HFQ6/others fall back.
-    // `HIPFIRE_PREFILL_BATCHED=0` forces the per-token fallback (escape
-    // hatch for regression bisecting or diagnosing hardware-specific issues).
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
-    // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels)
-    // and num_experts ≤ 1024 (bound of the batched top-K shared mem). When
-    // either constraint is violated, reject all MoE layers so the whole
-    // chunk falls through to per-token.
-    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
     let arch = gpu.arch.as_str();
-    let eligible = !force_fallback
-        && n >= MIN_BATCH
-        && dn_state.quant == StateQuant::Q8
-        && weights.layers.iter().any(|lw| matches!(
-            lw,
-            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-        ))
-        && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch),
-            LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
-            // MoE batched path: LA/FA projections + routed/shared MoE
-            // weights must be batchable per their respective dispatches.
-            // Q8_0 is now admitted alongside MQ4G256 for LA/FA — the
-            // MoE-layer qkvza + wo dispatches handle Q8 via the same
-            // `gemm_qkvza_q8_0_wmma` / `gemm_q8_0_batched_chunked` family
-            // already wired into the dense LA/FA branches (qwen35.rs:4500
-            // + 5404). Engine policy quantizes A3B's attention weights
-            // as Q8 (alongside its Q8 router + shared_expert_gate) so
-            // pre-Q8-admit the batched path was unreachable for every
-            // A3B variant — see commit log.
-            LayerWeights::DeltaNetMoe(l) =>
-                moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_all_mq4(&l.ffn),
-            LayerWeights::FullAttnMoe(l) =>
-                moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wq.gpu_dtype, arch)
-                    && is_batchable_la(l.wk.gpu_dtype, arch)
-                    && is_batchable_la(l.wv.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_all_mq4(&l.ffn),
-        });
+    // Whether the tape-capturing batched (PBS) path runs for this call — the
+    // single source of truth shared with spec-decode callers that later replay a
+    // captured GDN tape. On `false` the forward drops to the tape-less per-token
+    // loop below, leaving any passed tape stale (see `prefill_batch_pbs_eligible`).
+    let moe_router_logits_present =
+        pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true);
+    let eligible =
+        prefill_batch_pbs_eligible(weights, config, dn_state, n, arch, moe_router_logits_present);
 
     if !eligible {
         assert!(
