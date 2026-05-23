@@ -103,7 +103,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_HAVE_2_GPU` | MULTI-GPU | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:159` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | MISC-USER | — | `crates/rdna-compute/src/compiler.rs:298` |
 | `HIPFIRE_HOST_TIMING` | PERF-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:934` |
-| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative) | `crates/rdna-compute/src/compiler.rs:89` |
+| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative; per-arch subdir) | `crates/rdna-compute/src/compiler.rs:100` |
 | `HIPFIRE_KV_MODE` | KV-CACHE | — | `cli/index.ts:400` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | KV-CACHE | — | `crates/hipfire-runtime/examples/daemon.rs:1211` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/kernels.rs:76` |
@@ -333,7 +333,7 @@ Miscellaneous user-facing flags.
 - `HIPFIRE_DETERMINISTIC=1` — byte-exact output mode. Disables non-deterministic optimizations.
 - `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT=1` — gate the `budget_alert_at_tok` / `budget_alert_text` daemon params. Maps to `cfg.experimental_budget_alert`.
 - `HIPFIRE_HIPCC_EXTRA_FLAGS` — extra flags appended to all hipcc invocations during JIT.
-- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache directory. Default `.hipfire_kernels` (cwd-relative). Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
+- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache root. Default `.hipfire_kernels` (cwd-relative). Blobs land under `<root>/{arch}/` so cross-arch workflows (multiple GPUs in one process, parallel CI matrix arches) don't collide. Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
 - `HIPFIRE_ALLOW_MQ2=1`, `HIPFIRE_ALLOW_MQ2_LLOYD=1`, `HIPFIRE_ALLOW_MQ3_LLOYD=1` — opt-in research-grade quant formats during quantizer run.
 
 ### `DIAG-DUMP` (8)
@@ -541,7 +541,7 @@ grep -rE 'env::var(_os)?\("HIPFIRE_|process\.env\.HIPFIRE_' \
     | sort -u
 ```
 
-Note the `(_os)?` group — `compiler.rs:89` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
+Note the `(_os)?` group — `compiler.rs:100` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
 
 A future pass should ship `scripts/regen-env-vars-doc.sh` that mechanically rebuilds the quick-reference table while preserving the prose category guide.
 

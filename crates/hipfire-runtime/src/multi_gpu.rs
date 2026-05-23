@@ -95,7 +95,7 @@ impl Gpus {
         }
         let device_ids = resolve_device_ids(n_devices)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram(&devices)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
         let per_device = uniform_split_counts(n_devices, n_layers);
         Self::from_parts(devices, per_device, n_layers)
     }
@@ -114,7 +114,12 @@ impl Gpus {
         let n_layers: usize = per_device.iter().sum();
         let device_ids = resolve_device_ids(n_devices)?;
         let devices = construct_devices(&device_ids)?;
-        preflight_vram(&devices)?;
+        // init_layers is the documented escape hatch for asymmetric VRAM
+        // splits — the caller has declared the per-device counts, so skip
+        // the VRAM-delta check (which would otherwise reject 32 GB MI50 +
+        // 12 GB 6700 XT pairs out of the box). Arch-mismatch + per-device
+        // bind+free probe still run.
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ false)?;
         Self::from_parts(devices, per_device.to_vec(), n_layers)
     }
 
@@ -382,26 +387,44 @@ fn construct_devices(ids: &[i32]) -> HipResult<Vec<Gpu>> {
     Ok(devices)
 }
 
-fn preflight_vram(devices: &[Gpu]) -> HipResult<()> {
+fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResult<()> {
     if devices.is_empty() {
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
+    let allow_mixed = std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     let mut frees = Vec::with_capacity(devices.len());
     for d in devices {
         if d.arch != arch0 {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
-                     Mixed-arch is not supported in v1.",
+            if allow_mixed {
+                eprintln!(
+                    "preflight_vram: mixed-arch detected — dev 0 is {arch0}, dev {} is {}. \
+                     Proceeding because HIPFIRE_ALLOW_MIXED_ARCH=1. \
+                     Per-arch JIT cache will be populated on first run; boundary_copy uses \
+                     hipMemcpyPeer / hipMemcpyPeerAsync which fall through to host-staging \
+                     if peer access is unsupported by the pair (correctness holds either way).",
                     d.device_id, d.arch,
-                ),
-            ));
+                );
+            } else {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "preflight_vram: arch mismatch — dev 0 is {arch0}, dev {} is {}. \
+                         Mixed-arch is not supported by default; set HIPFIRE_ALLOW_MIXED_ARCH=1 to override.",
+                        d.device_id, d.arch,
+                    ),
+                ));
+            }
         }
         d.bind_thread()?;
         let (free, _total) = d.hip.get_vram_info()?;
         frees.push(free);
+    }
+    if !check_vram_delta {
+        return Ok(());
     }
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
