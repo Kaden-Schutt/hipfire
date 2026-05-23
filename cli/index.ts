@@ -2224,6 +2224,48 @@ async function serve(port: number, host: string) {
                       })}\n\n`));
                       visibleChunkSent = true;
                     }
+                  } else if (msg.type === "reasoning") {
+                    // V4F daemon arm emits structured `reasoning` events
+                    // from the DSML StreamParser; `<think>` / `</think>`
+                    // have already been stripped server-side. Forward as
+                    // OpenAI-compatible `reasoning_content` delta.
+                    const rtext = msg.text as string;
+                    if (rtext) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { reasoning_content: rtext }, finish_reason: null }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                    }
+                  } else if (msg.type === "tool_calls") {
+                    // V4F daemon arm emits structured `tool_calls` events
+                    // from the DSML StreamParser. Convert each call into
+                    // an OpenAI-format tool_call SSE delta. We emit one
+                    // SSE chunk per call so order is preserved; each call
+                    // gets a synthetic `call_<index>` id.
+                    const calls = Array.isArray(msg.calls) ? msg.calls : [];
+                    for (let i = 0; i < calls.length; i++) {
+                      const c = calls[i] as { name: string; arguments: unknown };
+                      const argStr = typeof c.arguments === "string"
+                        ? c.arguments
+                        : JSON.stringify(c.arguments);
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: i,
+                              id: `call_${reqId}_${i}`,
+                              type: "function",
+                              function: { name: c.name, arguments: argStr }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                    }
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;

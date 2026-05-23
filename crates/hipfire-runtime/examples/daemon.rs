@@ -175,6 +175,57 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
+/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
+/// Maps:
+///   - Token(text)        → `{type:"token",   id, text}`
+///   - Reasoning(text)    → `{type:"reasoning", id, text}`
+///   - ToolCalls(calls)   → `{type:"tool_calls", id, calls:[{name, arguments}]}`
+///
+/// The CLI / OpenAI HTTP layer translates these into the corresponding
+/// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
+fn emit_stream_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
+) {
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
+    match ev {
+        StreamEvent::Token(text) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"token","id":"{}","text":{}}}"#,
+                id,
+                serde_json::to_string(&text).unwrap_or_default()
+            );
+        }
+        StreamEvent::Reasoning(text) => {
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"reasoning","id":"{}","text":{}}}"#,
+                id,
+                serde_json::to_string(&text).unwrap_or_default()
+            );
+        }
+        StreamEvent::ToolCalls(calls) => {
+            let arr: Vec<serde_json::Value> = calls
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "arguments": c.arguments,
+                    })
+                })
+                .collect();
+            let payload = serde_json::Value::Array(arr);
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+                id, payload
+            );
+        }
+    }
+}
+
 fn emit_committed_event(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -3453,13 +3504,17 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
         // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
         // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
-        // We honour `system_prompt`, `temp`, `top_p` per HF V4 chat
-        // template + sampling recommendations; everything else routes
-        // through future follow-ups.
+        // We honour `system_prompt`, `temp`, `top_p`, `tools`, and
+        // `messages_history` per HF V4 chat template + sampling
+        // recommendations; everything else routes through future
+        // follow-ups.
         let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
-                 assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
+                 assistant_prefix, pflash_state, pflash_cfg);
         let _ = (repeat_penalty, repeat_window);
-        generate_deepseek4(m, gpu, stdout, id, prompt, system_prompt, temp, top_p, max_tokens, think_mode);
+        generate_deepseek4(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, think_mode, tools, messages_history,
+        );
         return;
     }
     // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
@@ -4478,6 +4533,8 @@ fn generate_deepseek4(
     top_p: f32,
     max_tokens: usize,
     think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
     let tokenizer = match m.tokenizer.as_ref() {
         Some(t) => t,
@@ -4523,14 +4580,75 @@ fn generate_deepseek4(
     const MAX_THINK_PREAMBLE: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
 You MUST be very thorough in your thinking and comprehensively decompose the problem.";
 
+    // Build the effective system message: optional user-supplied system
+    // text + (if request has tools) the DSML "## Tools" preamble.
+    let tools_block: Option<String> = tools
+        .filter(|t| !t.is_empty())
+        .map(|t| deepseek4::dsml::tools_prompt_block(t));
+    let effective_system: Option<String> = match (system_prompt.filter(|s| !s.is_empty()), tools_block.as_deref()) {
+        (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
+        (Some(sys), None) => Some(sys.to_string()),
+        (None, Some(tb)) => Some(tb.to_string()),
+        (None, None) => None,
+    };
+
     let mut prompt_ids: Vec<u32> = Vec::new();
     if let Some(b) = bos_tok { prompt_ids.push(b); }
     if matches!(think_mode, ThinkMode::Max) {
         prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
     }
-    if let Some(sys) = system_prompt.filter(|s| !s.is_empty()) {
+    if let Some(ref sys) = effective_system {
         prompt_ids.extend(tokenizer.encode(sys));
     }
+
+    // Multi-turn history. Each prior message gets rendered as a turn:
+    //   user → `<｜User｜>{content}{tool_results?}`
+    //   assistant → `<｜Assistant｜>{content_or_dsml}<｜end▁of▁sentence｜>`
+    // Tool result messages (role=tool) attach to the previous user turn
+    // wrapped in `<tool_result>…</tool_result>` per HF encoding/README.md.
+    // The CURRENT user prompt is appended last (outside this loop).
+    if let Some(history) = messages_history {
+        // Skip the leading system message (if any) — already handled.
+        // Skip the trailing user prompt — we add it explicitly after.
+        // Heuristic: if last message is role=user, treat its content as
+        // the live prompt and drop it here.
+        use hipfire_runtime::prompt_frame::Role;
+        let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) { 1 } else { 0 };
+        let end = history.len().saturating_sub(trim_end);
+        for msg in &history[..end] {
+            match msg.role {
+                Role::System => {
+                    // Already handled via effective_system; skip.
+                }
+                Role::User => {
+                    if let Some(u) = user_tok { prompt_ids.push(u); }
+                    prompt_ids.extend(tokenizer.encode(&msg.content));
+                }
+                Role::Tool => {
+                    // Wrap as `<tool_result>{json}</tool_result>` inside
+                    // the most recent user turn. We emit the user marker
+                    // here so a standalone "tool" message at history
+                    // start still parses (defensive).
+                    if let Some(u) = user_tok { prompt_ids.push(u); }
+                    prompt_ids.extend(
+                        tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content))
+                    );
+                }
+                Role::Assistant => {
+                    if let Some(a) = asst_tok { prompt_ids.push(a); }
+                    // Assistant content. If the recorded message
+                    // included DSML tool calls, the caller should have
+                    // serialised them into `msg.content` already; if
+                    // not, the plain text is emitted.
+                    prompt_ids.extend(tokenizer.encode(&msg.content));
+                    // Close the assistant turn with the EOS marker so
+                    // the next turn starts cleanly.
+                    prompt_ids.push(m.deepseek4_eos_tok);
+                }
+            }
+        }
+    }
+
     if let Some(u) = user_tok { prompt_ids.push(u); }
     prompt_ids.extend(tokenizer.encode(prompt));
     if let Some(a) = asst_tok { prompt_ids.push(a); }
@@ -4665,13 +4783,25 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
         // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
         // dangerous — see fn doc.
+        //
+        // Tokens are fed through a DSML stream parser that recognises
+        // `<think>…</think>` reasoning blocks and
+        // `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` tool-call blocks. The
+        // parser emits:
+        //   - StreamEvent::Token(text)       → JSONL `{type:"token"}`
+        //   - StreamEvent::Reasoning(text)   → JSONL `{type:"reasoning"}`
+        //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
+        // Markers split across token boundaries are buffered until they
+        // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
+        let mut parser = deepseek4::dsml::StreamParser::new();
         let mut next_tok: u32 =
             deepseek4::sampling::sample_token(&last_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
         while generated_count < max_tokens && next_tok != eos_tok {
             let frag = tokenizer.decode(&[next_tok]);
-            let frag_escaped = json_escape(&frag);
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"{}"}}"#, id, frag_escaped);
+            for ev in parser.feed(&frag) {
+                emit_stream_event(stdout, id, ev);
+            }
             emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
             let _ = stdout.flush();
             m.conversation_tokens.push(next_tok);
@@ -4689,6 +4819,11 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 }
             }
         }
+        // Flush any buffered partial markers / content.
+        for ev in parser.finish() {
+            emit_stream_event(stdout, id, ev);
+        }
+        let _ = stdout.flush();
     }
 
     m.seq_pos = state.n_tokens as usize;

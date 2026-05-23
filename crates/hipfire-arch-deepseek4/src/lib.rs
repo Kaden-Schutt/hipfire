@@ -53,6 +53,7 @@
 
 pub mod arch;
 pub mod deepseek4;
+pub mod dsml;
 pub mod forward;
 pub mod sampling;
 pub mod spec_decode;

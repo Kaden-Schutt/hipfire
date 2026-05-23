@@ -7441,6 +7441,46 @@ pub fn prefill_with_mtp_fill(
     Ok(last_logits)
 }
 
+/// CPU reference implementation of bias-aware top-k: picks the `k` highest
+/// `scores[i] + bias[i]` entries, then weights them by their UNBIASED
+/// scores (per DeepSeek V4 router semantics — bias only steers selection).
+/// Production routing goes through the GPU kernel
+/// `deepseek4_moe_topk_bias_aware_f32`; this is kept as a tested reference.
+#[cfg(test)]
+fn bias_aware_topk_weights(
+    scores: &[f32],
+    bias: &[f32],
+    k: usize,
+) -> Option<(Vec<u32>, Vec<f32>)> {
+    let n = scores.len();
+    if k == 0 || n == 0 {
+        return None;
+    }
+    let mut biased: Vec<f32> = (0..n)
+        .map(|i| scores[i] + bias.get(i).copied().unwrap_or(0.0))
+        .collect();
+    let k = k.min(n);
+    let mut indices: Vec<u32> = Vec::with_capacity(k);
+    for _ in 0..k {
+        let (best_i, _) = biased
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .unwrap();
+        indices.push(best_i as u32);
+        biased[best_i] = f32::NEG_INFINITY;
+    }
+    let mut wts: Vec<f32> = indices.iter().map(|&i| scores[i as usize]).collect();
+    let w_sum: f32 = wts.iter().sum();
+    if w_sum <= 0.0 {
+        return None;
+    }
+    for w in wts.iter_mut() {
+        *w /= w_sum;
+    }
+    Some((indices, wts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
