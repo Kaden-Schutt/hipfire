@@ -5645,10 +5645,22 @@ impl Gpu {
                     } else { true };
                     if qz_safe {
                         let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                        let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
-                        let r2 = if r1.is_ok() {
-                            self.gemm_hfq4g256_mmq_set_gfx906(a_z, xq, y_z, z_m, k, batch_size)
-                        } else { Ok(()) };
+                        // Fused 2-way MMQ for qkv+z head when HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1
+                        // and both Ms are MMQ_Y-aligned. The β+α tail keeps the
+                        // existing dp4a-prequant fall-through (its Ms are typically
+                        // 32, far below MMQ_Y=128 — no point routing through MMQ).
+                        let (r1, r2) = if hfq4_mmq_gfx906_fused_enabled()
+                            && qkv_m % 128 == 0 && z_m % 128 == 0 {
+                            (self.gemm_gate_up_hfq4g256_mmq_gfx906_prequant(
+                                a_qkv, a_z, xq, y_qkv, y_z, qkv_m, z_m, k, batch_size,
+                            ), Ok(()))
+                        } else {
+                            let r_qkv = self.gemm_hfq4g256_mmq_set_gfx906(a_qkv, xq, y_qkv, qkv_m, k, batch_size);
+                            let r_z = if r_qkv.is_ok() {
+                                self.gemm_hfq4g256_mmq_set_gfx906(a_z, xq, y_z, z_m, k, batch_size)
+                            } else { Ok(()) };
+                            (r_qkv, r_z)
+                        };
                         // Tail: beta+alpha. Use dp4a-prequant when available
                         // (reuses the Q8_1 scratch we just produced above, no
                         // re-quantize). Falls back to fp16_wave64 in capture
@@ -7101,6 +7113,15 @@ impl Gpu {
                         && self.mmq_screen_weight(a_up, up_m, k)
                 } else { true };
                 if use_mmq {
+                    // Fused 2-way MMQ (HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1).
+                    // Requires gate_m, up_m multiples of MMQ_Y=128 — Qwen3.5
+                    // family satisfies (9B gate_m=up_m=4864, 4B 2560, 27B 6976).
+                    if hfq4_mmq_gfx906_fused_enabled()
+                        && gate_m % 128 == 0 && up_m % 128 == 0 {
+                        return self.gemm_gate_up_hfq4g256_mmq_gfx906(
+                            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+                        );
+                    }
                     let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
                     let r1 = self.gemm_hfq4g256_mmq_set_gfx906(a_gate, xq, y_gate, gate_m, k, batch_size);
                     let r2 = if r1.is_ok() {
@@ -14061,6 +14082,147 @@ impl Gpu {
                 b.push_ptr(xq);
                 b.push_ptr(y_q_p); b.push_ptr(y_k_p); b.push_ptr(y_v_p);
                 b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 gate_up MMQ fused-projection kernel — gfx906 wave64. 2-way
+    /// fused {a, b} on a single launch. Generic naming so the same
+    /// entry serves BOTH gate_up (a=gate, b=up) and LA QKVZA-head
+    /// (a=qkv, b=z) dispatch sites. See
+    /// `kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh`.
+    ///
+    /// Caller invariants:
+    ///   - m_a, m_b multiples of MMQ_Y(=128).
+    ///   - batch_size ≥ should_use_mmq cutover (gfx906 default: 8).
+    ///   - x is the raw fp16 activation (ensure_q8_1_mmq_x is called
+    ///     internally; caller MAY pre-quantize via the prequant
+    ///     sibling below if Xq is already on hand from another call
+    ///     on the same x).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_hfq4g256_mmq_gfx906(
+        &mut self,
+        a_a: &GpuTensor, a_b: &GpuTensor,
+        x: &GpuTensor,
+        y_a: &GpuTensor, y_b: &GpuTensor,
+        m_a: usize, m_b: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        self.gemm_gate_up_hfq4g256_mmq_gfx906_prequant(
+            a_a, a_b, xq_ptr, y_a, y_b, m_a, m_b, k, batch_size,
+        )
+    }
+
+    /// Pre-quantized X variant — caller passes the Q8_1 scratch pointer
+    /// produced by an earlier `ensure_q8_1_mmq_x(x, batch_size, k)` call.
+    /// Used by the LA QKVZA-head site, which has already quantized X
+    /// when it computed the qkv/z 2-way and then continues to the
+    /// β+α tail. Mirrors the `_prequant` sibling on the dp4a path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_hfq4g256_mmq_gfx906_prequant(
+        &mut self,
+        a_a: &GpuTensor, a_b: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y_a: &GpuTensor, y_b: &GpuTensor,
+        m_a: usize, m_b: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!(
+            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            "gate_up_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
+            batch_size, self.capture_mode,
+        );
+        debug_assert!(
+            m_a % 128 == 0 && m_b % 128 == 0,
+            "gate_up_hfq4g256_mmq_gfx906 requires m_a/m_b multiples of MMQ_Y=128 (got a={m_a} b={m_b})",
+        );
+
+        let mmq_x = if batch_size <= 8 { 8 }
+            else if batch_size <= 16 { 16 }
+            else if batch_size <= 32 { 32 }
+            else { 64 };
+
+        let is_full = m_a % 128 == 0 && m_b % 128 == 0 && batch_size % mmq_x == 0;
+        let base_name = "gemm_gate_up_hfq4g256_mmq_gfx906";
+        let kernel_name = if is_full {
+            format!("{}_full_set_x{}", base_name, mmq_x)
+        } else {
+            format!("{}_x{}", base_name, mmq_x)
+        };
+
+        let wrapper_src = match mmq_x {
+            8  => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X8_SRC,
+            16 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_SRC,
+            32 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_SRC,
+            64 => kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X64_SRC,
+            _ => unreachable!(),
+        };
+        let inlined = wrapper_src.replace(
+            "#include \"gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh\"",
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_BODY_CUH,
+        );
+        self.ensure_kernel(&format!("{}_x{}", base_name, mmq_x), &inlined, &kernel_name)?;
+
+        let mut a_a_p = a_a.buf.as_ptr();
+        let mut a_b_p = a_b.buf.as_ptr();
+        let mut xq = x_q8_ptr;
+        let mut y_a_p = y_a.buf.as_ptr();
+        let mut y_b_p = y_b.buf.as_ptr();
+        let mut m_a_val = m_a as i32;
+        let mut m_b_val = m_b as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_a_p as *mut _ as *mut c_void,
+            &mut a_b_p as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut y_a_p as *mut _ as *mut c_void,
+            &mut y_b_p as *mut _ as *mut c_void,
+            &mut m_a_val as *mut _ as *mut c_void,
+            &mut m_b_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
+        const Y_STRIDE: usize = 36;
+        const X_DM_FLOAT2: usize = 128;
+        let total_m = m_a + m_b;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+        let shared_mem = (
+            (MMQ_Y * x_stride * 4)
+            + (X_DM_FLOAT2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
+        ) as u32;
+        debug_assert!(shared_mem as usize <= 32 * 1024,
+            "gfx906 gate_up MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m_a, k)
+                  + crate::profile::gemv_hfq4g256_bytes(m_b, k)
+                  + batch_size * k
+                  + batch_size * (m_a + m_b) * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_hfq4g256_mmq_gfx906", bytes);
+        let result = self.launch_maybe_blob(
+            &kernel_name,
+            [row_tiles as u32, col_tiles as u32, 1],
+            [64, 4, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_a_p); b.push_ptr(a_b_p);
+                b.push_ptr(xq);
+                b.push_ptr(y_a_p); b.push_ptr(y_b_p);
+                b.push_i32(m_a_val); b.push_i32(m_b_val);
                 b.push_i32(k_val); b.push_i32(bs_val);
                 b
             },
