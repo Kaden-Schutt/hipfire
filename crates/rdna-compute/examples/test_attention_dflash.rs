@@ -125,6 +125,19 @@ fn run_case(
         "wmma_n64" => gpu
             .attention_dflash_wmma_n64_f32(&d_q, &d_k, &d_v, &d_out, b, l, n_heads, n_kv_heads, hd)
             .unwrap(),
+        "wmma_n64_f16kv" => {
+            // Cast K and V to f16 first, then attention.
+            let d_k_f16 = gpu.alloc_tensor(&[l * n_kv_heads * hd], DType::F16).unwrap();
+            let d_v_f16 = gpu.alloc_tensor(&[l * n_kv_heads * hd], DType::F16).unwrap();
+            gpu.cast_f32_to_f16(&d_k, &d_k_f16).unwrap();
+            gpu.cast_f32_to_f16(&d_v, &d_v_f16).unwrap();
+            gpu.attention_dflash_wmma_n64_f16kv_f32(
+                &d_q, &d_k_f16, &d_v_f16, &d_out,
+                b, l, n_heads, n_kv_heads, hd,
+            ).unwrap();
+            gpu.free_tensor(d_k_f16).unwrap();
+            gpu.free_tensor(d_v_f16).unwrap();
+        }
         _ => unreachable!(),
     }
 
@@ -166,7 +179,7 @@ fn main() {
     let mut max_err_seen = 0.0f32;
 
     println!("tolerance: max-abs-diff < {tol:.0e}");
-    println!("kernels:   scalar = attention_dflash_f32   wmma = attention_dflash_wmma_f32   wmma_m32 = attention_dflash_wmma_m32_f32 (hd<=128 only)   wmma_n64 = attention_dflash_wmma_n64_f32 (hd==128 only)");
+    println!("kernels:   scalar = attention_dflash_f32   wmma = attention_dflash_wmma_f32   wmma_m32 = attention_dflash_wmma_m32_f32 (hd<=128 only)   wmma_n64 = attention_dflash_wmma_n64_f32 (hd==128 only)   wmma_n64_f16kv = attention_dflash_wmma_n64_f16kv_f32 (hd==128 only, K/V cast to f16)");
     println!();
     println!(
         "{:>3}  {:>5}  {:>3}  {:>6}  {:>11}  {:>11}  {:>4}",
@@ -257,6 +270,31 @@ fn main() {
                     println!(
                         "{:>3}  {:>5}  {:>3}  {:>8}  {:>11}  {:>11}  {}",
                         b, l, hd, "wmma_n64", "—", "—", "SKIP (hd!=128)"
+                    );
+                }
+
+                // N=64 f16-K/V variant. K/V cast to fp16 before
+                // attention; output stays F32. Tolerance must allow
+                // for the f16 precision loss on K and V (≈ 5e-3 worst
+                // case at moderate input magnitudes).
+                if hd == 128 {
+                    let n64_f16kv_diff = run_case(&mut gpu, "wmma_n64_f16kv", b, l, n_heads, n_kv_heads, hd, &out_ref);
+                    total += 1;
+                    max_err_seen = max_err_seen.max(n64_f16kv_diff);
+                    // f16 K/V introduces a 1/2048 relative quantisation
+                    // on inputs in [-0.1, 0.1] (LCG range), so allow up
+                    // to 5e-3 absolute diff for this variant only.
+                    let tol_f16 = 5.0e-3f32;
+                    if n64_f16kv_diff >= tol_f16 { failed += 1; }
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>14}  {:>11.3e}  {:>11}  {}",
+                        b, l, hd, "wmma_n64_f16kv", n64_f16kv_diff, "—",
+                        if n64_f16kv_diff < tol_f16 { "PASS" } else { "FAIL" }
+                    );
+                } else if !run_scalar {
+                    println!(
+                        "{:>3}  {:>5}  {:>3}  {:>14}  {:>11}  {:>11}  {}",
+                        b, l, hd, "wmma_n64_f16kv", "—", "—", "SKIP (hd!=128)"
                     );
                 }
             }

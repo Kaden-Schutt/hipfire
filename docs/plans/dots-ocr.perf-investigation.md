@@ -224,10 +224,7 @@ Strix Halo as a non-regression check.
 
 ### 8.4. Open next levers (in order of expected impact on gfx1100)
 
-1. **K/V f16 in DRAM** (step 4.2). Halves DRAM traffic for the
-   memory-bound phase A and the V-stage. Insert an `f32 → f16` cast
-   kernel between `qkv_split` and attention; consume f16 K/V directly.
-   Expected +30–100 % on gfx1100.
+1. ~~**K/V f16 in DRAM** (step 4.2)~~ — landed. See §9 below.
 2. **Widen K-tile further** (128 or 256) at hd=128 with f16 K/V.
    With f16 the V_lds budget halves (32 KB → 16 KB at N=64), which
    frees room for wider tiles or larger M.
@@ -238,3 +235,58 @@ Strix Halo as a non-regression check.
 4. **128-thread block (4-wave)** like llama.cpp. More parallelism per
    block for V-stage and softmax; may or may not pay back the lower
    occupancy on gfx1100.
+
+## 9. K/V f16 in DRAM (2026-05-23)
+
+`kernels/src/attention_dflash_wmma_n64_f16kv.hip` is a copy of the
+`n64` kernel that consumes K and V as `_Float16*` in DRAM instead of
+`float*` (Q and output stay f32). The internal `(_Float16)k_row[d]`
+cast disappears at phase A; the V-stage casts f16→f32 on the way to
+V_lds so phase C is byte-identical.
+
+`kernels/src/cast_f32_to_f16.hip` is the matching standalone cast kernel
+(the same body lives inline in the FP16 GEMMs; this standalone copy
+exists so non-GEMM callers can launch it directly). `Gpu::cast_f32_to_f16`
+exposes the dispatch wrapper.
+
+### 9.1. Strix Halo gfx1151 results (bench_attention_vision, B=L=19520, hd=128, 3 iters)
+
+| kernel | dur (ms) | vs M=16 | vs N=64 (f32 K/V) |
+|---|---:|---:|---:|
+| M=16              | 3083 |     —   |     —   |
+| M=32              | 2941 |  +4.6 % |     —   |
+| M=32 N=64 (f32)   | 2725 | +11.6 % |     —   |
+| **M=32 N=64 f16 K/V** | **2237** | **+27.4 %** | **+17.9 %** |
+
+End-to-end `ocr_e2e` vision-encoder wall: **182 s → 169 s** (+7 % on
+top of the N=64 landing — attention is roughly half the vision
+encoder, the rest is QKV / FFN GEMMs and RMSNorm/RoPE which the f16
+K/V change doesn't touch). Cumulative wall: **198 s → 169 s = 15 %**
+off the initial baseline.
+
+Parity sweep: 224 cases, 0 failed, max-abs-diff 3.052e-5 — same as the
+f32-K/V baseline. The f16 quantisation of K and V on LCG-bounded inputs
+in [-0.1, 0.1] is below the f32 accumulator's noise floor at L=19520.
+
+### 9.2. Why the gain is +18 % not +50 %
+
+Per the analytic floor in §1, with K+V at f32 the DRAM traffic per
+attention call is ~146 GB and the LPDDR5X bandwidth is ~115 GB/s →
+~1.27 s lower bound on K+V transit. Halving to f16 gives ~73 GB and
+~0.63 s lower bound. Saving ~0.64 s out of 2.72 s = 23.5 % wall-time
+improvement.
+
+We measured +17.9 % which is 76 % of the theoretical ceiling. The
+remainder is non-DRAM cost: WMMA throughput in phase A and C, LDS
+bandwidth, softmax compute, the cast kernel itself (~10 ms), and the
+V_lds 32 KB write that we didn't shrink (the f32→f32 V_lds path is
+unchanged). Step 2 (wider K-tile with f16 K/V) and step 3 (V in
+registers via frag_b) attack the remaining ~24 %.
+
+### 9.3. Cost of the cast
+
+The cast kernel is `O(L · n_kv_heads · head_dim)` work for both K and V
+combined. At vision shape that's 2 · 19520 · 12 · 128 · 4 B = 240 MB
+of f32 reads + 120 MB of f16 writes per attention call → 360 MB / 115
+GB/s = ~3 ms theoretical, ~10 ms measured (single-pass kernels rarely
+hit peak BW). That's <0.5 % of attention runtime — amortises trivially.

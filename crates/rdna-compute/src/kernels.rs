@@ -1662,6 +1662,20 @@ pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str = include_str!("../../../kernels/s
 /// investigation in `docs/plans/dots-ocr.perf-investigation.md`.
 pub const ATTENTION_DFLASH_WMMA_N64_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64.hip");
 
+/// N=64 variant that consumes K and V already stored as **f16 in DRAM**
+/// (Q and output stay f32). Halves the attention DRAM traffic for K and
+/// V — the dominant cost on memory-bound vision-encoder shapes per the
+/// rocprof analysis. Caller is responsible for casting K and V from f32
+/// to f16 once (see `cast_f32_to_f16`) before calling this kernel; the
+/// cast cost (~120 MB) is trivial against the ~73 GB K+V DRAM traffic
+/// per attention call at vision shape.
+/// See `kernels/src/attention_dflash_wmma_n64_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_N64_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64_f16kv.hip");
+
+/// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
+/// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
+pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");
+
 /// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
 /// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
 /// vision encoder to match HF's bf16 forward path at residual-stream

@@ -24039,6 +24039,124 @@ impl Gpu {
         }
     }
 
+    /// f32 → f16 elementwise cast. `src` must be `DType::F32`, `dst`
+    /// must be `DType::F16`, both with the same logical length. Single
+    /// pass over the buffer; block [256], grid `ceil(n / 256)`.
+    pub fn cast_f32_to_f16(&mut self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(src.dtype, DType::F32, "cast_f32_to_f16: src must be F32");
+        assert_eq!(dst.dtype, DType::F16, "cast_f32_to_f16: dst must be F16");
+        let n_src: usize = src.shape.iter().product();
+        let n_dst: usize = dst.shape.iter().product();
+        assert_eq!(
+            n_src, n_dst,
+            "cast_f32_to_f16: src and dst element counts must match (src={n_src}, dst={n_dst})",
+        );
+        self.ensure_kernel(
+            "cast_f32_to_f16",
+            kernels::CAST_F32_TO_F16_SRC,
+            "cast_f32_to_f16",
+        )?;
+        let func = &self.functions["cast_f32_to_f16"];
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut n_val = n_src as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_src + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention-style WMMA, M=32 query tile and N=64 K-tile,
+    /// with **K and V already stored as f16 in DRAM** (Q and output
+    /// stay f32). Halves the attention kernel's DRAM traffic for K and
+    /// V — the dominant cost on memory-bound vision-encoder shapes.
+    /// Caller must cast K and V to f16 once (via `cast_f32_to_f16`)
+    /// before invoking this kernel.
+    ///
+    /// Same head_dim==128 restriction as `attention_dflash_wmma_n64_f32`
+    /// (Q_frags register-promotion requires the dc loop fully unrolled).
+    pub fn attention_dflash_wmma_n64_f16kv_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_n64_f16kv_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_n64_f16kv_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_n64_f16kv_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_n64_f16kv_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_n64_f16kv_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (same constraint as the f32-K/V sibling — the dc \
+             loop is fully unrolled with d_chunks=8 so Q_frags register-promotes).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_n64_f16kv_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_n64_f16kv_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N64_F16KV_SRC,
+            "attention_dflash_wmma_n64_f16kv_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_n64_f16kv_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout same as the f32-K/V sibling: V_lds stays f32 so
+        // phase C is byte-identical between the two kernels.
+        let lds_f32 = (64 + 32) * head_dim + 32 * 64 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
     // ═══════════════════════════════════════════════════════════════════════════

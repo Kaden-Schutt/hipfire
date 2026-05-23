@@ -1093,28 +1093,34 @@ pub fn vision_forward(
         let attn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
         // For large-B vision attention (B = L = n_patches ≈ 20k on the
         // smoke image), use the WMMA-accelerated FlashAttention kernel.
-        // Four variants, picked by (head_dim, B) constraints:
+        // Five variants, picked by (head_dim, B) constraints:
         //
-        //   * `attention_dflash_wmma_n64_f32` — M=32 query tile, N=64
-        //     K-tile, Q register-resident across K-tiles. Hard-coded to
-        //     head_dim==128 (d_chunks=8 unroll, so Q_frags promotes to
-        //     registers — runtime d_chunks regressed +19% via 544B/lane
-        //     scratch). +7% over M=32 on Strix Halo gfx1151; expected
-        //     larger gain on gfx1100 where memory BW headroom is bigger.
-        //   * `attention_dflash_wmma_m32_f32` — M=32 query tile, N=16,
-        //     2 waves. Halves query-tile-block count vs M=16. LDS caps
-        //     at head_dim ≤ 128.
-        //   * `attention_dflash_wmma_f32` — M=16, 1 wave. LDS allows
-        //     head_dim up to 256.
-        //   * `attention_dflash_f32` — scalar online-softmax fallback
-        //     when head_dim isn't a multiple of 16.
+        //   * `attention_dflash_wmma_n64_f16kv_f32` — same shape as N=64
+        //     above but K and V are cast to f16 in DRAM first. Halves
+        //     the K+V DRAM byte footprint, which is the dominant cost
+        //     on this DRAM-bound workload (L2 hit < 1 %). +18% over the
+        //     f32-K/V N=64 path on Strix Halo gfx1151. The f16 cast
+        //     itself is ~120 MB vs ~73 GB of K+V DRAM traffic per
+        //     attention call → amortises to noise.
+        //   * `attention_dflash_wmma_n64_f32` — M=32, N=64, Q in regs,
+        //     fused alpha-scale. Hard-coded head_dim==128. +7% over M32.
+        //   * `attention_dflash_wmma_m32_f32` — M=32, N=16, 2 waves.
+        //     Halves query-tile-block count vs M=16. LDS caps at hd≤128.
+        //   * `attention_dflash_wmma_f32` — M=16, 1 wave. hd ≤ 256.
+        //   * `attention_dflash_f32` — scalar online-softmax fallback.
         //
-        // For dots.ocr (head_dim=128) we take the N=64 path.
+        // For dots.ocr (head_dim=128) we take the f16-K/V N=64 path.
         if head_dim == 128 && n_patches >= 32 {
-            gpu.attention_dflash_wmma_n64_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
+            let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
+            let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
+            gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
+            gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
+            gpu.attention_dflash_wmma_n64_f16kv_f32(
+                &q_buf, &k_f16, &v_f16, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
+            gpu.free_tensor(k_f16)?;
+            gpu.free_tensor(v_f16)?;
         } else if head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
             gpu.attention_dflash_wmma_m32_f32(
                 &q_buf, &k_buf, &v_buf, &attn,
