@@ -22,7 +22,7 @@ JSON / Markdown / SVG layout output gated by a custom chat template.
 | Daemon load arm (arch_id = 8) | not started — phase 3 |
 | `infer_dots_ocr.rs` driver example | not started — phase 3 |
 
-See [`docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`](../../docs/plans/qwen_2.0_vlm_plus_dots_ocr.md)
+See [`docs/plans/dots-ocr-prd.md`](../../docs/plans/dots-ocr-prd.md)
 for the full bring-up plan, including the silent-failure trap in §2.7
 (the patch reshape+transpose) and the OCR coherence gate in §5 phase 4.
 

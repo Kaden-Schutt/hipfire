@@ -2,7 +2,7 @@
 """Capture intermediate vision-tower activations from dots.ocr under HF.
 
 Phase 2c-1 of the dots.ocr bring-up plan (see
-docs/plans/qwen_2.0_vlm_plus_dots_ocr.md).
+docs/plans/dots-ocr-prd.md).
 
 What this captures, for the page at
 benchmarks/images/dots_ocr_smoke_001.jpg under the prompt_layout_all_en

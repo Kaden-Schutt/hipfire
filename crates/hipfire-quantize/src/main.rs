@@ -194,7 +194,7 @@ impl SafetensorsFile {
 /// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
 /// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
 /// See docs/architecture-ids.md and docs/plans/
-/// qwen_2.0_vlm_plus_dots_ocr.md §6 R1.
+/// dots-ocr-devlog.md §7 (R1).
 fn parse_arch_id_override() -> Option<u32> {
     let args: Vec<String> = std::env::args().collect();
     let pos = args.iter().position(|a| a == "--arch-id")?;
@@ -3168,7 +3168,7 @@ fn run_gguf_pipeline(
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -3917,7 +3917,7 @@ fn main() {
         // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
         // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
         // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
-        // qwen_2.0_vlm_plus_dots_ocr.md.
+        // dots-ocr-prd.md.
         "dots_ocr" => 8,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
@@ -3926,7 +3926,7 @@ fn main() {
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -3980,7 +3980,7 @@ fn main() {
     // generation_config.json. Packing it here lets the arch-side parser
     // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
     // generation_config when config.eos_token_id is absent. Resolves
-    // R5 in docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §6.
+    // R5 in docs/plans/dots-ocr-devlog.md §7.
     let generation_config_path = input_dir.join("generation_config.json");
     let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
         std::fs::read_to_string(&generation_config_path)

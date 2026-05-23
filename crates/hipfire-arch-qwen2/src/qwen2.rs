@@ -16,7 +16,7 @@
 //!   residual → FFN norm → SwiGLU → residual). End-to-end validated
 //!   16/16 top-1 match vs HF F32 reference at Q8F16 precision.
 //!
-//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the
+//! See `docs/plans/dots-ocr-prd.md` phase 1 for the
 //! bring-up plan and `lib.rs` for the rev-3 status summary.
 //!
 //! # TODO(transformer-extraction)
@@ -53,7 +53,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 ///   `<|im_end|>`). dots.ocr's `config.json` carries no EOS at all;
 ///   the array lives only in `generation_config.json`, which the
 ///   quantiser packs into HFQ metadata as of R5. See
-///   `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` §6 R5.
+///   `docs/plans/dots-ocr-devlog.md` §7 (R5).
 #[derive(Debug, Clone)]
 pub struct Qwen2Config {
     pub hidden_size: usize,
@@ -328,7 +328,7 @@ fn load_embed_tokens(
 /// the host before upload; the tied-lm_head path here must do the
 /// same. Uploading raw F16 bytes while tagging `gpu_dtype = F32`
 /// produces a corrupted matmul (kernel reads F16 bytes as F32 values).
-/// See R4 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` §6 for the catch history.
+/// See R4 in `docs/plans/dots-ocr-devlog.md` §7 for the catch history.
 ///
 /// TODO(transformer-extraction): the tied-embedding re-upload and the
 /// DType↔EmbeddingFormat mapping below are cross-arch primitives that

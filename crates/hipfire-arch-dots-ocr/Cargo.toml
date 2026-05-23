@@ -9,7 +9,7 @@ description = "dots.ocr (Qwen2-VL family) — Qwen2 text decoder + 42-block Dots
 # delegates to hipfire-arch-qwen2 unchanged (dots.ocr stores text
 # weights as `model.*`, identical to plain Qwen2). Vision tower and
 # image preprocessing land in subsequent commits. See
-# docs/plans/qwen_2.0_vlm_plus_dots_ocr.md phase 2 for the bring-up plan.
+# docs/plans/dots-ocr-prd.md phase 2 for the bring-up plan.
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }

@@ -21799,7 +21799,7 @@ impl Gpu {
     /// - `kernels/src/rope_2d_halfsplit.hip` — kernel source.
     /// - `crates/hipfire-arch-dots-ocr/src/rope.rs::build_rope_2d_tables`
     ///   — host-side cos/sin builder.
-    /// - docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §2.6 — algorithm spec.
+    /// - docs/plans/dots-ocr-prd.md §1.6 — algorithm spec.
     pub fn rope_2d_halfsplit_f32(
         &mut self,
         q: &GpuTensor,

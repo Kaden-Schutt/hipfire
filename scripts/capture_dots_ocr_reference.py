@@ -3,7 +3,7 @@
 for hipfire validation.
 
 Phase 0 item 5 of the dots.ocr + Qwen2 bring-up plan (see
-docs/plans/qwen_2.0_vlm_plus_dots_ocr.md).
+docs/plans/dots-ocr-prd.md).
 
 What this captures, for the page image at
 benchmarks/images/dots_ocr_smoke_001.jpg under the

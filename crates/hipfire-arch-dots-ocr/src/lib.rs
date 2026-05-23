@@ -63,7 +63,7 @@
 //!
 //! # See also
 //!
-//! - `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` — full bring-up plan.
+//! - `docs/plans/dots-ocr-prd.md` — full bring-up plan.
 //! - `hipfire-arch-qwen2` — the text-side delegate.
 //! - `hipfire-arch-qwen35-vl` — sibling VL arch, closest analog for
 //!   the daemon plumbing (image preprocessing + IMGPAD splicing).

@@ -357,7 +357,7 @@ impl DotsOcrWeights {
 /// Load all dots.ocr vision-tower weights from an HFQ file.
 ///
 /// Tensor name layout (verified against the safetensors manifest at
-/// `docs/plans/qwen_2.0_vlm_plus_dots_ocr.dots_ocr_manifest.txt`):
+/// `docs/plans/dots-ocr.dots_ocr_manifest.txt`):
 ///
 /// - `vision_tower.patch_embed.patchifier.proj.{weight,bias}` — Conv2d
 ///   weight is 4-D `[embed_dim, 3, 14, 14]` on disk; we reshape to a

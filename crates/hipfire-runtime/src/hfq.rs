@@ -683,7 +683,7 @@ pub fn load_weights_hfq(
                  crate is wired in), or — for inspection only — load \
                  directly via `cargo run --example inspect_hfq -p \
                  hipfire-arch-qwen2 -- <path>`. \
-                 See docs/plans/qwen_2.0_vlm_plus_dots_ocr.md §6 R1/R2.",
+                 See docs/plans/dots-ocr-devlog.md §7.",
                 hfq.arch_id
             ),
         ));
