@@ -323,18 +323,251 @@ narrowing the gap raises the floor for everyone.
 
 ## 9. Open questions
 
-- Is there a structural reason the gfx906 MMQ-set kernels can't be
-  fused (e.g., LDS pressure from 3-4 accumulator registers)? Need
-  to count: per-row, an `int sumi` accumulator (4 B) + a final
-  float row scale; 4-way means 4× registers/lane. Wave64 has 256
-  VGPRs/SIMD. Should fit comfortably even at MMQ_Y=128 — but worth
-  confirming before kernel-writing.
-- Does AWQ scaling change the screen-reject rate on the screening
-  predicate in a way that makes tier 4.5 irrelevant or critical?
-  Could be measured cheaply by counting screen rejections in a
-  9B prefill log.
-- Should we ship the gfx906 fused kernels gated symmetrically with
-  the existing `HIPFIRE_HFQ4_MMQ_RDNA2` flag (i.e., introduce a
-  combined `HIPFIRE_HFQ4_MMQ_FUSED` umbrella flag that covers both
-  arches), or keep them separate? Convention so far has been arch-
-  specific flags; staying with that probably reduces blast radius.
+- ~~Is there a structural reason the gfx906 MMQ-set kernels can't be
+  fused (e.g., LDS pressure from 3-4 accumulator registers)?~~
+  **Resolved 2026-05-23:** No structural blocker. The accumulator
+  footprint at the actually-shipped 2-way and 3-way fusions
+  (`(mmq_x/4) × (MMQ_Y/64) × N_OUT` floats per lane) fits comfortably
+  in wave64's 256 VGPRs/SIMD. The dispatcher's row-band routing
+  prologue keeps only ONE accumulator live per WG (different WGs
+  handle different output bands), so 4-way would only need the same
+  per-lane regs as 3-way. The fusion is structurally safe; the
+  4-way QKVZA wasn't built because the gfx906 dispatcher already
+  splits QKVZA into a 2-way head (qkv+z, served by the 2-way kernel)
+  plus a 2-way dp4a tail (β+α) — fusing all four into one kernel
+  would mean ditching the working split, with no clear win.
+- ~~Does AWQ scaling change the screen-reject rate?~~ **Moot:**
+  `mmq_screen` is WMMA-only on gfx906 (confirmed during Phase 2
+  implementation). `self.mmq_screen` defaults to false on gfx906,
+  so `qkv_safe = true` always and the screen-reject branch is dead
+  code on this arch. Tier 4.5 not applicable.
+- ~~Should we ship gated symmetrically with `HIPFIRE_HFQ4_MMQ_RDNA2`?~~
+  **Resolved 2026-05-23:** Shipped as separate flag
+  `HIPFIRE_HFQ4_MMQ_GFX906_FUSED`, matching the established arch-
+  specific convention. An umbrella flag would have to make
+  per-arch routing decisions inside the gate, which is exactly
+  what the per-arch flag already does at the dispatcher level.
+
+## 10. Outcomes (2026-05-23)
+
+Phases 2 + 3 + 4 shipped on branch `feat/gfx906-hfq4-mmq-fused`:
+
+| Phase | Commit | Result |
+|-------|--------|--------|
+| §6.1 probe | 33749bd6 | mmq_set 53.6% of prefill wall; thesis confirmed |
+| §6.2 qkv 3-way | 701b8caa | byte-exact, fires 8×/forward (FA layers) |
+| §6.3 + §6.4 gate_up 2-way (also serves QKVZA-head) | f9f0fb62 | byte-exact, fires 56×/forward (gate_up + qkvza-head) |
+| §6.5 MMQ_Y=64 sweep | 1b52c325 | **NEGATIVE** −5.6%, kept gated |
+| §6.6 HFQ3 port | deferred per plan | n/a |
+
+**Banked win:** +7.3% async prefill on Qwen3.5 9B MQ4 at B=256
+(726.9 → 779.9 tok/s, σ ≈ 0.1%), behind
+`HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`. Within the §6.1 ceiling
+estimate (5-12%). Decode untouched. Byte-exact A/B verified.
+
+## 11. Open next steps (post-Phase 4 lever inventory)
+
+Phase 2-3 closed the structural-fusion gap predicted by §6.1. The
+post-fusion attribution table (2026-05-23 re-probe, all fused
+enabled, B=256 9B MQ4) leaves these as the dominant remaining
+wall-time consumers:
+
+| rank | kernel | %wall | per-call | calls/fwd | fusion state |
+|------|--------|------:|---------:|----------:|--------------|
+| 1 | `gate_up_hfq4g256_mmq_gfx906` | 46.4% | 2681 µs | 56 | fused; only kernel-internal levers left |
+| 2 | `hfq4g256_residual_mmq_gfx906` (wo) | 34.2% | 1726 µs | 64 | single-output, no peer to fuse with |
+| 3 | `gated_delta_net_q8_batch_seq` | 9.3% | 1257 µs | 24 | sequential by construction |
+| 4 | `qkv_hfq4g256_mmq_gfx906` | 3.8% | 1547 µs | 8 | fused |
+| 5+ | tail (rmsnorm-rotate, silu-mul-rotate, etc.) | 6.3% | — | — | already aggressively fused multi-op kernels |
+
+The top 4 = 93.7% of wall. Levers below are ranked by expected
+payoff × tractability. **None of them is on the critical path** —
+the +7.3% from Phases 2-3 is the bulk of what was theoretically
+available. These are diminishing-returns territory.
+
+### 11.1 Tier A — Wider mmq_x sweep on fused gate_up (recommended next)
+
+Today the fused gate_up has wrappers for mmq_x ∈ {8, 16, 32, 64}.
+The residual sibling has the full 8-value sweep {8, 16, 24, 32,
+40, 48, 56, 64}; that sweep exists because PMC validation on the
+residual showed per-call wins at the in-between values. The
+fused 2-way kernel has the same inner loop and likely the same
+sweet spots, but at different absolute values (the LDS layout
+differs because the 2-way kernel has 1 accumulator set vs the
+residual's set-mode-also-1).
+
+**Expected payoff:** 1-5% prefill-wide (most likely 1-3%).
+gate_up dominates 46.4% of wall; even a 5% per-call win there is
+2.3% prefill-wide. The most likely outcome is that the existing
+x32/x64 choices are near-optimal and one in-between value
+(x40 or x48) gives 1-2%.
+
+**Tractability:** Low effort. Generate 4 new .hip wrappers via
+sed (same as we did for x16/x32/x64), wire kernels.rs, extend
+the dispatcher's batch-size heuristic from 4 buckets to 8.
+~1 day work.
+
+**Risks:**
+- LDS budget at large mmq_x: at mmq_x=64 the body already uses
+  30,720 B/WG (per the body's commentary, 2 WG/CU limit). Adding
+  x48, x56 stays under this; no occupancy regression risk for
+  these. x40 with stride=40 sits at the same 2 WG/CU.
+- The b32 fallback path for mmq_x<32 in the body: in-between
+  values straddle the cliff. x24 stays on b32, x40 on b128. The
+  sweep needs to confirm the cliff is at the right boundary for
+  the 2-way kernel (residual's PMC showed it; 2-way is
+  structurally identical so likely the same).
+- The byte-exact A/B test still applies — each new wrapper needs
+  greedy_dump validation before being added to the dispatcher's
+  selection map.
+
+### 11.2 Tier B — Residual `wo` MMQ probe (34.2% of wall, untouched)
+
+The post-attention `wo` GEMM is the SECOND-largest wall consumer
+and has had no Phase 2-3 work. It's a single-output kernel using
+the original `gemm_hfq4g256_residual_mmq_gfx906` path (the
+add-mode variant from the §3 inventory). Per-call it runs slower
+than the fused QKV at similar shape (1726 µs vs 1547 µs), and
+PR #315 didn't ship a Stream-K variant either, suggesting the
+team didn't find an obvious win.
+
+**Possible angles** (ordered by tractability):
+
+1. **rocprof attribution on the residual itself.** Why is it
+   15.3 GiB/s vs the fused gate_up's 21.9 GiB/s? Same body,
+   different write-back (add vs set). The add-mode adds one
+   load + one store per output element vs set's just-store —
+   that's a 2× write-traffic delta. If write-traffic is the
+   limiter, the residual is bandwidth-bound and there's no
+   kernel-internal lever.
+
+2. **Stream-K / split-K reduction.** Plan §4.8 raised this and
+   deferred. The wo shape is `(M=4096, K=v_dim=1024, N=256)` —
+   short K, square M, modest N. Split-K-2 would split the K=1024
+   axis into two K=512 partial GEMMs + an atomic-add reduction.
+   On gfx906 with 60 CUs and a 76-WG residual grid, splitting
+   K would double WG count → better CU utilization.
+   **Expected payoff:** 5-15% on the residual kernel = 1.7-5%
+   prefill-wide. **Tractability:** medium effort (new kernel,
+   new dispatcher entry, atomic-add semantics carry the same
+   "soft output change" risk as any non-deterministic
+   accumulation order).
+
+3. **Same wider mmq_x sweep as Tier A.** Residual already has
+   the full 8-value sweep, but the auto-selector picks one based
+   on a fixed heuristic. May not be optimal post-fusion (the
+   post-fusion forward has different L2 residency for Xq vs
+   pre-fusion). **Tractability:** trivial (no new code, just
+   re-tune the existing sweep selection). **Risk:** very low.
+   **Payoff:** probably <2% — the existing heuristic was tuned
+   pre-Phase 2-3 but the residual's L2 conditions haven't
+   changed much.
+
+**Risks (general):**
+- Stream-K's atomic-add reduction introduces non-deterministic
+  accumulation order. Byte-exact A/B test will fail. Need to
+  switch to the KLD-bound validation strategy from plan §7.3
+  for this kernel.
+- PR #315 not shipping Stream-K is evidence (but not proof) that
+  the team probed it and found no clean win on gfx1030. gfx906
+  may differ — but expect to spend half the time understanding
+  why the obvious approach is more complicated than it looks.
+
+### 11.3 Tier C — gate_up kernel-internal optimization (already-fused improvements)
+
+Three concrete sub-levers inside the existing fused 2-way kernel:
+
+1. **dp4a prefetch.** Prefetch the next sub-block's x_qs / tile_y
+   while the current sub-block computes. **Risk:** memory
+   `feedback_dp4a_prefetch_no_op_2026_05_18` reports this was a
+   measured no-op on MoE dp4a kernels in 2026-05-18 — the dp4a
+   body is too compute-light to benefit from prefetch. The fused
+   2-way is heavier per inner iter than the MoE kernels were
+   (2× accumulators), so it might respond differently. **Honest
+   payoff estimate:** probably 0%, possibly 1-2%. **Tractability:**
+   easy A/B.
+
+2. **LDS bank conflict probe at mmq_x≥32.** The body uses
+   stride=40, which is `40 % 32 = 8` → 4-way bank conflict
+   (documented in body lines 82-100). PMC-validated as the right
+   choice for the residual at mmq_x ∈ {32, 40, 48, 56}, but
+   the 2-way fused kernel may have a different optimum given
+   the different per-WG work distribution. **Tractability:**
+   easy (run a stride=33/40/41/48 sweep at fixed mmq_x). **Risk:**
+   PMC counter access via rocprofv3 segfaults on gfx906 (per
+   the §6.1 probe writeup) — would need to compare via wall-time
+   only, which is noisier. **Payoff:** 1-3% if a different
+   stride wins.
+
+3. **`__launch_bounds__(256, 2)` tuning.** Current hint is 2 WG/CU.
+   At gfx906 LDS budget the actual ceiling is 2 WG/CU (30,720 B
+   each fits in 64 KB). Adjusting the hint to 1 (let compiler
+   spill less) or 3 (over-promise) could shift register
+   allocation. **Tractability:** trivial. **Payoff:** probably 0
+   (the actual ceiling is hardware-determined). Listed for
+   completeness.
+
+### 11.4 Tier D — Knobs (no new kernels)
+
+1. **`PREFILL_MAX_BATCH` increase.** Currently 256 (per plan §4.7
+   reference). Larger chunks → fewer kernel launches per token.
+   **Risk:** VRAM cost grows linearly (`PREFILL_MAX_BATCH × K`
+   for the Q8_1 X scratch alone), and the kernel auto-selector
+   already picks mmq_x=64 at B=256 — at B=512 it'd still pick 64
+   so the per-call cost doesn't scale down. Net effect:
+   half-as-many launches at twice the per-launch cost. Probably
+   ~0%. **Tractability:** trivial (one constant). **Worth
+   probing:** yes, because cheap.
+
+2. **`HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1` becomes default on gfx906.**
+   After this branch lands and bakes for a release cycle without
+   coherence reports, flip the env-gate default to `true`. Saves
+   the production user from having to know about the flag.
+   **Tractability:** one-line dispatch.rs change. **Risk:** the
+   model matrix coverage today is mq4-only (9B verified). MQ3
+   models route through different gemm_hfq3 family kernels not
+   affected by this branch, so no risk there. MQ6 + AWQ-stacked
+   weights should be sanity-checked first.
+
+### 11.5 Tier D / Skip — Already-fused tail kernels
+
+The 6.3% combined tail is fragmented across:
+`fused_rmsnorm_mq_rotate_batched`, `fused_silu_mul_mq_rotate_batched`,
+`fused_qk_l2_norm_scale_interleave_f32_batched`,
+`fused_sigmoid_alpha_gate_f32_batched`, etc. These are already
+multi-op fused kernels. No obvious next-level fusion target —
+they're at different points in the forward pass and can't be
+combined without restructuring the whole layer-level dispatch.
+**Skip.**
+
+### 11.6 Tier D / Skip — DeltaNet recurrence
+
+Plan §4.7 covered this: the recurrence is sequential by construction.
+9.3% of wall is the intrinsic floor without a batched-DN kernel,
+which is a separate research project. **Skip.**
+
+### Honest summary of remaining headroom
+
+| Tier | Lever | Effort | Expected payoff | Risk |
+|------|-------|--------|-----------------|------|
+| A | Wider mmq_x sweep on fused gate_up | 1 day | 1-5% (likely 1-3%) | low |
+| B.1 | Residual rocprof attribution | half day | informational | none |
+| B.2 | Residual Stream-K split-K | 2-3 days | 1.7-5% prefill-wide | medium (non-determinism, may match PR 315's deferred conclusion) |
+| B.3 | Residual mmq_x re-tune | trivial | <2% | very low |
+| C.1 | gate_up dp4a prefetch | 1 day | probably 0%, possibly 1-2% | low |
+| C.2 | gate_up LDS bank conflict probe | 1 day | 1-3% | low (PMC access limited) |
+| C.3 | gate_up launch_bounds tuning | trivial | probably 0% | very low |
+| D.1 | PREFILL_MAX_BATCH increase | trivial | probably 0% | VRAM cost |
+| D.2 | Make FUSED=1 the default | trivial | 0 (latent: ergonomics) | model matrix coverage gap |
+
+**Realistic ceiling on this stack of levers without writing
+fundamentally new kernels: probably +3-7% additional prefill,
+bringing total over baseline to ~10-15%.** That's roughly half
+of what we already banked with Phase 2-3. Diminishing returns.
+
+If we want a step-change rather than another marginal squeeze,
+the right next project is **batched DeltaNet recurrence** (would
+unlock the 9.3% bucket entirely) or **rocBLAS HFQ4 prefill path**
+(plan §4.6 — currently CDNA3-only, gfx906 not eligible until
+rocBLAS's gfx906 GEMM performance improves in a future ROCm
+release). Both are separate plan documents.
