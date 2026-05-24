@@ -4681,6 +4681,22 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 }
                 Role::Assistant => {
                     if let Some(a) = asst_tok { prompt_ids.push(a); }
+                    // Emit `</think>` immediately after `<｜Assistant｜>`
+                    // for prior turns — matches the reference encoder
+                    // (`tmp/ds4/ds4.c:14817-14819`) which always pushes
+                    // `think_end_id` after the assistant marker unless
+                    // the recorded content already starts with `<think>`
+                    // or `</think>`. Without this, replayed turns lack
+                    // the no-thinking signal token the model emitted in
+                    // its original turn, producing a structural
+                    // inconsistency with the live turn (which DOES carry
+                    // `</think>`) and drifting the model off-
+                    // distribution at long histories.
+                    let starts_with_think_tag = msg.content.starts_with("<think>")
+                        || msg.content.starts_with("</think>");
+                    if !starts_with_think_tag {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
                     // Plain assistant text (whatever the upstream caller
                     // serialised into `content`; the OpenAI-compat
                     // surface sends "" for tool_call-only turns).
