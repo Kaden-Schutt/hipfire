@@ -1281,6 +1281,15 @@ fn main() {
                     // entries into attention for the new turn — fluent
                     // garbage, no panic. See `Qwen2State::reset` doc.
                     if let Some(ref mut s) = m.qwen2_state { s.reset(); }
+                    // arch_id=9: same rationale for DeepSeek V4. Prior to
+                    // 2026-05-24 the V4F state was NEVER reset, so
+                    // `state.n_tokens` accumulated across requests and
+                    // every new prefill wrote AFTER the previous turn's
+                    // KV residue — fitting symptom for the multi-turn
+                    // pi-coding-agent corruption (`CLion` for
+                    // `CLionProjects`, `/home/n/` for `/home/nick/`).
+                    // See `DeepseekV4State::reset` doc.
+                    if let Some(ref mut s) = m.deepseek4_state { s.reset(); }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);

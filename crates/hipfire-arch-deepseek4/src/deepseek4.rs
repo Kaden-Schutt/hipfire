@@ -909,6 +909,49 @@ impl DeepseekV4State {
             _scaffold: (),
         })
     }
+
+    /// Reset the per-conversation position cursor so the next prefill
+    /// starts at slot 0 of the SWA cache and slot 0 of the compressed-KV
+    /// rings. Mirrors `Qwen2State::reset` — we keep every allocated GPU
+    /// tensor alive (avoiding the realloc churn of `drop + ::new`) and
+    /// rely on the position-derived slot computations
+    /// (`pos % sliding_window`, `pos / ratio`) plus the
+    /// `n_valid = min(pos+1, sliding_window)` clamp in attention to
+    /// ensure stale data beyond the new `n_tokens` is never attended
+    /// to. Future writes overwrite the slots as prefill progresses.
+    ///
+    /// Why this matters: the daemon's stateless OpenAI-API contract
+    /// is "every request carries the full conversation; daemon serves
+    /// it from scratch." Without this reset, the V4F arm's
+    /// `state.n_tokens` accumulated across requests (Qwen-style arches
+    /// already reset their equivalent counters in
+    /// `daemon.rs::"reset"`), so `forward_prefill_batch_chunked` ran
+    /// with `start_pos = sum_of_prior_prefill_lengths` and wrote the
+    /// new conversation AFTER the prior one's KV slots. The model then
+    /// saw two stacked conversations through compressed-KV attention,
+    /// which matches the multi-turn path-recall corruption reported
+    /// in pi-coding-agent sessions (`/home/nick/CLion/tembrane`,
+    /// `/home/n/Downloads`) — the indexer was top-K-selecting
+    /// compressed slots from BOTH the current turn and an earlier
+    /// turn that had a similar-but-distinct embedding.
+    ///
+    /// If/when we add real prefix caching (LCP detection between the
+    /// new prompt and the existing KV-resident tokens), the daemon
+    /// should grow a separate "continue" command that skips this
+    /// reset and uses `start_pos = lcp_len` instead.
+    pub fn reset(&mut self) {
+        self.n_tokens = 0;
+        // mtp_last_hidden carries the prior decode's full HC residual
+        // stream and is only consumed by `mtp_forward` (spec decode).
+        // Leaving it populated would let the first MTP step of a new
+        // turn read stale data; drop the handle so the next request's
+        // first spec step takes the alloc-then-fill path again.
+        self.mtp_last_hidden = None;
+        // Other transient scratch tensors (`tmp`, `tmp_plain`, residual_streams,
+        // attn_state_host, …) are pure per-step working memory: each
+        // forward step writes them before reading, so stale contents
+        // are overwritten on first use and don't need explicit zeroing.
+    }
 }
 
 #[cfg(test)]
