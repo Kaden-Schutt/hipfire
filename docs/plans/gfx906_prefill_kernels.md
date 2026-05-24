@@ -359,11 +359,24 @@ Phases 2 + 3 + 4 shipped on branch `feat/gfx906-hfq4-mmq-fused`:
 | §6.3 + §6.4 gate_up 2-way (also serves QKVZA-head) | f9f0fb62 | byte-exact, fires 56×/forward (gate_up + qkvza-head) |
 | §6.5 MMQ_Y=64 sweep | 1b52c325 | **NEGATIVE** −5.6%, kept gated |
 | §6.6 HFQ3 port | deferred per plan | n/a |
+| Default-on (no env-gate) | (this commit) | post-coherence-gate + post-KLD-validation |
 
 **Banked win:** +7.3% async prefill on Qwen3.5 9B MQ4 at B=256
-(726.9 → 779.9 tok/s, σ ≈ 0.1%), behind
-`HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`. Within the §6.1 ceiling
-estimate (5-12%). Decode untouched. Byte-exact A/B verified.
+(726.9 → 779.9 tok/s, σ ≈ 0.1%), **default on for gfx906**.
+Within the §6.1 ceiling estimate (5-12%). Decode untouched.
+Byte-exact A/B verified.
+
+**Validation evidence for default-on:**
+- byte-exact greedy_dump A/B (md5 match across all 3 fused paths)
+- coherence-gate.sh on gfx906: 9 model/prompt cells passed (4 MQ4,
+  5 MQ3 collateral), no hard errors
+- KLD eval (n=50 chunks, asym3-KV, prefill scoring): 0.323142,
+  inside CI band of canonical §1.1 master baseline 0.3376
+  (CI 0.3263–0.3494) on the same `qwen3.5-9b.mq4` file
+
+The MMQ_Y=64 research scaffold stays gated behind
+`HIPFIRE_HFQ4_MMQ_GFX906_Y64=1` (default OFF) per PR #315's
+kept-gated-negative-result convention.
 
 ## 11. Open next steps (post-Phase 4 lever inventory)
 

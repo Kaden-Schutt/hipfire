@@ -167,3 +167,49 @@ ceiling.
 
 **Final wins banked from Phase 2 + 3 (Y=128):** +7.3% async prefill on
 Qwen3.5 9B MQ4. Phase 4 yielded no additional win.
+
+---
+
+## Update 2026-05-24 — Default-on validation + env-gate removed
+
+After Phase 2-4 baked behind `HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`, ran the
+canonical validation suite to clear the env-gate for default-on shipping.
+
+### Coherence gate
+
+`scripts/coherence-gate.sh` on gfx906 with fused-by-default kernels:
+9 model/prompt cells exercised (4 MQ4 — the kernels' direct surface;
+5 MQ3 / MQ6 — collateral coverage), no hard errors. Sample cells:
+
+  qwen3.5-0.8b.mq4 / cap         → "Paris."                       OK
+  qwen3.5-9b.mq4 / reason        → correct sheep answer (9)        OK
+  qwen3.5-9b.mq4 / tool-call     → clean <tool_call> JSON shape    OK
+
+### KLD eval (n=50)
+
+`eval_hipfire --max-chunks 50` on `/local/hipfire/qwen3.5-9b.mq4`,
+asym3 KV, prefill scoring, with fused-by-default active. Compared
+against the canonical §1.1 mq4-base entry from
+`docs/plans/kld-measurements-master.md` (on `data/kld-measurements`
+branch):
+
+  measured: KLD = 0.323142  PPL = 9.2493  (n=50)
+  master:   KLD = 0.3376    PPL = 9.116   (n=512, CI 0.3263–0.3494)
+
+KLD is **inside the master CI band**, consistent with the n=50 vs n=512
+spread of ±0.01 expected from slice-mean noise. PPL is within +1.5% of
+the master, well inside the cross-run variance envelope on prefill
+scoring at n=50.
+
+### Disposition
+
+Env-gate `HIPFIRE_HFQ4_MMQ_GFX906_FUSED` removed from `dispatch.rs`.
+Fused-projection kernels are now the default on gfx906 whenever the
+alignment guard passes (q_m/k_m/v_m, gate_m/up_m, qkv_m/z_m all
+multiples of MMQ_Y=128 — Qwen3.5 family always satisfies).
+
+The legacy 3×/2× mmq_set fall-through is retained as the correctness
+backstop for hypothetical future models with non-aligned projection
+dimensions; the dispatcher selects it automatically when alignment fails.
+
+The MMQ_Y=64 research scaffold stays gated as documented (negative result).

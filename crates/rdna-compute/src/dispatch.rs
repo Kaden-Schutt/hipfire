@@ -323,20 +323,6 @@ fn is_dot2_gemv_enabled() -> bool {
     })
 }
 
-/// Opt-in gate for the gfx906 fused-projection HFQ4 MMQ kernels (qkv 3-way,
-/// gate_up/qkvza-head 2-way). Mirror of `HIPFIRE_HFQ4_MMQ_RDNA2` for gfx906.
-/// Default OFF until coherence + KLD validation pass on the new kernels.
-/// Enable with `HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1`. See
-/// `docs/plans/gfx906_prefill_kernels.md` and
-/// `experiments/gfx906-fused-mmq/probe-results.md`.
-pub fn hfq4_mmq_gfx906_fused_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_FUSED").map_or(false, |v| v == "1")
-    })
-}
-
 /// Opt-in for the MMQ_Y=64 occupancy variants of the fused-projection
 /// kernels (plan §6 step 5 / §4.2). Halves the per-WG LDS X-tile and
 /// the accumulator register footprint; doubles the WG count per grid.
@@ -5661,12 +5647,13 @@ impl Gpu {
                     } else { true };
                     if qz_safe {
                         let xq = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
-                        // Fused 2-way MMQ for qkv+z head when HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1
-                        // and both Ms are MMQ_Y-aligned. The β+α tail keeps the
-                        // existing dp4a-prequant fall-through (its Ms are typically
-                        // 32, far below MMQ_Y=128 — no point routing through MMQ).
-                        let (r1, r2) = if hfq4_mmq_gfx906_fused_enabled()
-                            && qkv_m % 128 == 0 && z_m % 128 == 0 {
+                        // Fused 2-way MMQ for qkv+z head when both Ms are
+                        // MMQ_Y-aligned. The β+α tail keeps the existing
+                        // dp4a-prequant fall-through (its Ms are typically 32,
+                        // far below MMQ_Y=128 — no point routing through MMQ).
+                        // Legacy 2× mmq_set path remains the correctness
+                        // fallback for non-aligned future models.
+                        let (r1, r2) = if qkv_m % 128 == 0 && z_m % 128 == 0 {
                             (self.gemm_gate_up_hfq4g256_mmq_gfx906_prequant(
                                 a_qkv, a_z, xq, y_qkv, y_z, qkv_m, z_m, k, batch_size,
                             ), Ok(()))
@@ -6386,12 +6373,13 @@ impl Gpu {
                             && self.mmq_screen_weight(a_v, v_m, k)
                     } else { true };
                     if qkv_safe {
-                        // Fused-projection MMQ path (HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1).
-                        // 1 launch instead of 3, L2 hits on the Q8_1 batch tile
-                        // amortize across Q/K/V. Requires q_m/k_m/v_m all multiples
-                        // of MMQ_Y=128 (Qwen3.5 family satisfies trivially).
-                        if hfq4_mmq_gfx906_fused_enabled()
-                            && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+                        // Fused-projection MMQ path: 1 launch instead of 3, L2 hits
+                        // on the Q8_1 batch tile amortize across Q/K/V. Requires
+                        // q_m/k_m/v_m all multiples of MMQ_Y=128 (Qwen3.5 family
+                        // satisfies trivially); the legacy 3× mmq_set fall-through
+                        // below remains the correctness fallback for hypothetical
+                        // non-aligned future models.
+                        if q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
                             return self.gemm_qkv_hfq4g256_mmq_gfx906(
                                 a_q, a_k, a_v, x, y_q, y_k, y_v,
                                 q_m, k_m, v_m, k, batch_size,
@@ -7129,11 +7117,12 @@ impl Gpu {
                         && self.mmq_screen_weight(a_up, up_m, k)
                 } else { true };
                 if use_mmq {
-                    // Fused 2-way MMQ (HIPFIRE_HFQ4_MMQ_GFX906_FUSED=1).
-                    // Requires gate_m, up_m multiples of MMQ_Y=128 — Qwen3.5
-                    // family satisfies (9B gate_m=up_m=4864, 4B 2560, 27B 6976).
-                    if hfq4_mmq_gfx906_fused_enabled()
-                        && gate_m % 128 == 0 && up_m % 128 == 0 {
+                    // Fused 2-way MMQ: 1 launch instead of 2. Requires gate_m,
+                    // up_m multiples of MMQ_Y=128 — Qwen3.5 family satisfies
+                    // (9B gate_m=up_m=4864, 4B 2560, 27B 6976). The 2× mmq_set
+                    // fall-through below remains the correctness fallback for
+                    // hypothetical non-aligned future models.
+                    if gate_m % 128 == 0 && up_m % 128 == 0 {
                         return self.gemm_gate_up_hfq4g256_mmq_gfx906(
                             a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                         );
