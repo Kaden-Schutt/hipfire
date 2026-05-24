@@ -191,18 +191,32 @@ fn asst_turn_fingerprint(
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
     "assistant".hash(&mut h);
-    // Trim leading/trailing whitespace before hashing. The DSML parser
-    // captures whatever the model emits between `<｜Assistant｜></think>`
-    // and `<｜DSML｜tool_calls>` (typically `\n\n`) as Token events,
-    // which land in our `emit_text_buf` and feed into the STORE
-    // fingerprint. The OpenAI replay side, however, sends
-    // `content: null` (→ "" after `extractContent`) for tool-call-only
-    // assistant turns — the leading whitespace is dropped by every
-    // OpenAI-compat client we've seen. Trimming on both sides
-    // collapses that asymmetry so a turn that emitted "\n\n<tool…>"
-    // still cache-hits when replayed as `{content: null,
-    // tool_calls: [...]}`.
-    content.trim().hash(&mut h);
+    if tool_calls.is_empty() {
+        // Pure-text turn — content IS the message. Trim whitespace
+        // to absorb minor formatting drift between store (model's
+        // verbatim emission) and lookup (whatever the client preserved).
+        content.trim().hash(&mut h);
+    } else {
+        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
+        // the tool_calls — pi-coding-agent (and most OpenAI-compat
+        // clients) sends `content: null` on assistant messages that
+        // carry tool_calls, even when the model originally emitted
+        // prose ahead of the tool block (e.g. "Let me check the
+        // structure first.<｜DSML｜tool_calls>…"). The store-side
+        // sees the prose in `emit_text_buf`; the lookup-side sees
+        // content=`""`. Excluding content from the fingerprint when
+        // tool_calls is non-empty matches the client's effective
+        // identity for tool-call turns and lets the cache hit.
+        //
+        // Collision risk: two distinct turns with identical
+        // tool_calls hash to the same key; the later store wins,
+        // and a replay of the earlier turn replays the later turn's
+        // tokens. In practice this only matters when the model emits
+        // the SAME tool_call twice with different surrounding prose
+        // in the same conversation — uncommon for agent flows, and
+        // the worst-case effect is the model seeing slightly altered
+        // prose in its own history.
+    }
     for tc in tool_calls {
         tc.name.hash(&mut h);
         // Serialize args in a canonical form. `serde_json::to_string`
