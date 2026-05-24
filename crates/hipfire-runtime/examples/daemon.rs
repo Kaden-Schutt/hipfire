@@ -175,6 +175,41 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
+/// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
+/// through `serde_json::json!` so embedded `"` / `\` / control chars in
+/// the message or `id` can't corrupt the line and trigger a client-side
+/// `JSON Parse error: Expected '}'` parse loop. Use this instead of
+/// `writeln!(stdout, r#"{{"type":"error",…}}"#, …)` with raw `{}` / `{:?}`
+/// interpolation of error values — Rust's `Display` will pass through
+/// a `"` unchanged, and `Debug` actively wraps strings in escaped quotes,
+/// both of which break the surrounding JSON.
+fn emit_error_with_id(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "id": id,
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+#[allow(dead_code)]
+fn emit_error_no_id(
+    stdout: &mut std::io::Stdout,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
 /// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
 /// Maps:
 ///   - Token(text)        → `{type:"token",   id, text}`
@@ -4696,8 +4731,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     let last_logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4prefill failed: {:?}"}}"#, id, e);
-            let _ = stdout.flush();
+            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
             return;
         }
     };
@@ -4761,7 +4795,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4spec-decode failed: {:?}"}}"#, id, e);
+                    emit_error_with_id(stdout, id, format!("deepseek4spec-decode failed: {e:?}"));
                     let _ = stdout.flush();
                     return;
                 }
@@ -4907,7 +4941,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     pos += 1;
                 }
                 Err(e) => {
-                    let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4decode failed: {:?}"}}"#, id, e);
+                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
                     let _ = stdout.flush();
                     return;
                 }
@@ -5028,7 +5062,7 @@ fn generate_qwen2(
     // first generated token.
     for &tok in &prompt_ids {
         if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2 prefill failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -5046,7 +5080,7 @@ fn generate_qwen2(
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"argmax failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -5078,7 +5112,7 @@ fn generate_qwen2(
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_step_greedy failed: {:?}"}}"#, id, e);
+                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
                 let _ = stdout.flush();
                 return;
             }
