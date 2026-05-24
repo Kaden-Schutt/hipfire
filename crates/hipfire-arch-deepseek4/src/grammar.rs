@@ -69,18 +69,40 @@ pub enum State {
     /// index into the schema for the in-progress tool, or `None`
     /// while the name is still being matched against schema entries.
     InInvokeName { tool_idx: Option<usize> },
-    /// Inside an invoke body. Next firm bytes must open a parameter or
-    /// close the invoke.
-    InInvokeBody { tool_idx: usize },
+    /// Inside an invoke body. `emitted_params` lists the indices of
+    /// params already serialised in this invoke — the matcher uses
+    /// this to gate the invoke-close alternatives on schema `required`
+    /// being satisfied. Next firm bytes must open a parameter or, if
+    /// required is satisfied, close the invoke.
+    InInvokeBody {
+        tool_idx: usize,
+        emitted_params: Vec<usize>,
+    },
     /// Between `<｜DSML｜parameter name="` and the closing `"`. Emitting
-    /// the parameter name for the in-progress invoke.
-    InParamName { tool_idx: usize, param_idx: Option<usize> },
+    /// the parameter name for the in-progress invoke. `emitted_params`
+    /// is propagated through unchanged until the full param block
+    /// closes.
+    InParamName {
+        tool_idx: usize,
+        param_idx: Option<usize>,
+        emitted_params: Vec<usize>,
+    },
     /// Between the param-name `"` and the attr `">`. Must emit
     /// ` string="true"` or ` string="false"` before continuing.
-    InParamAttr { tool_idx: usize, param_idx: usize },
+    InParamAttr {
+        tool_idx: usize,
+        param_idx: usize,
+        emitted_params: Vec<usize>,
+    },
     /// Between `">` and `</｜DSML｜parameter>`. Free emission of the
-    /// parameter value bytes.
-    InParamBody { tool_idx: usize },
+    /// parameter value bytes. `param_idx` is the in-flight param; on
+    /// close it gets pushed into `emitted_params` as the matcher
+    /// returns to [`State::InInvokeBody`].
+    InParamBody {
+        tool_idx: usize,
+        param_idx: usize,
+        emitted_params: Vec<usize>,
+    },
 }
 
 /// Schema for the available tools. Built from the OpenAI-format tools
@@ -93,6 +115,14 @@ pub struct ToolSchema {
     /// isn't enforced at parse time — params can be emitted in any order
     /// — but the schema is the authoritative set of legal names.
     pub params: Vec<String>,
+    /// Subset of `params` that MUST appear in the emitted invoke
+    /// block. The grammar removes invoke-close alternatives from the
+    /// allowed continuations until every required param has been
+    /// observed — without this the V4F MQ2-Lloyd checkpoint emits
+    /// empty invokes like `<｜DSML｜tool name="bash"></｜DSML｜tool>`
+    /// that the downstream OpenAI client rejects with
+    /// `must have required properties command`.
+    pub required: Vec<String>,
 }
 
 /// The grammar matcher itself: a state plus the bytes committed since
@@ -197,36 +227,71 @@ impl Matcher {
                 OPEN_TOOL_VARIANT.to_string(),
                 CLOSE_TOOL_CALLS.to_string(),
             ],
-            State::InInvokeName { tool_idx: None } => self
+            State::InInvokeName { tool_idx: None, .. } => self
                 .tools
                 .iter()
                 .map(|t| format!("{}\">\n", t.name))
                 .collect(),
             State::InInvokeName {
-                tool_idx: Some(idx),
+                tool_idx: Some(idx), ..
             } => vec![format!("{}\">\n", self.tools[*idx].name)],
-            State::InInvokeBody { .. } => vec![
-                OPEN_PARAM.to_string(),
-                CLOSE_INVOKE.to_string(),
-                CLOSE_TOOL_VARIANT.to_string(),
-            ],
+            State::InInvokeBody {
+                tool_idx,
+                emitted_params,
+            } => {
+                let mut conts = vec![OPEN_PARAM.to_string()];
+                // Allow invoke close only when every required param of
+                // the in-flight tool has been emitted. This is what
+                // forces the model to fill in `command` before closing
+                // a `bash` invoke, etc.
+                if self.required_satisfied(*tool_idx, emitted_params) {
+                    conts.push(CLOSE_INVOKE.to_string());
+                    conts.push(CLOSE_TOOL_VARIANT.to_string());
+                }
+                conts
+            }
             State::InParamName {
                 tool_idx,
                 param_idx: None,
+                emitted_params,
             } => self.tools[*tool_idx]
                 .params
                 .iter()
-                .map(|p| format!("{}\"", p))
+                .enumerate()
+                // Don't allow re-emitting a param already in the block
+                // — `command` appearing twice in one invoke is never
+                // valid and the OpenAI parser rejects it.
+                .filter(|(i, _)| !emitted_params.contains(i))
+                .map(|(_, p)| format!("{}\"", p))
                 .collect(),
             State::InParamName {
                 tool_idx,
                 param_idx: Some(idx),
+                ..
             } => vec![format!("{}\"", self.tools[*tool_idx].params[*idx])],
             State::InParamAttr { .. } => vec![
                 ATTR_STRING_TRUE.to_string(),
                 ATTR_STRING_FALSE.to_string(),
             ],
         }
+    }
+
+    /// True when every entry in `self.tools[tool_idx].required` is
+    /// represented in `emitted_params`.
+    fn required_satisfied(&self, tool_idx: usize, emitted_params: &[usize]) -> bool {
+        let tool = &self.tools[tool_idx];
+        for req_name in &tool.required {
+            let req_idx = match tool.params.iter().position(|p| p == req_name) {
+                Some(i) => i,
+                // Required name not in params list — schema bug. Be
+                // permissive (don't deadlock the matcher).
+                None => continue,
+            };
+            if !emitted_params.contains(&req_idx) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Check whether the candidate decoded token text could be emitted
@@ -353,38 +418,77 @@ impl Matcher {
         }
         match self.state.clone() {
             State::Out => self.transition_from_free(OPEN_TOOL_CALLS, State::InToolCalls),
-            State::InParamBody { tool_idx } => {
-                self.transition_from_free(CLOSE_PARAM, State::InInvokeBody { tool_idx })
+            State::InParamBody {
+                tool_idx,
+                param_idx,
+                mut emitted_params,
+            } => {
+                // On close: record this param as emitted, then return
+                // to InInvokeBody with the updated set.
+                if !emitted_params.contains(&param_idx) {
+                    emitted_params.push(param_idx);
+                }
+                self.transition_from_free(
+                    CLOSE_PARAM,
+                    State::InInvokeBody {
+                        tool_idx,
+                        emitted_params,
+                    },
+                )
             }
             State::InToolCalls => self.transition_from_alternatives(&[
                 (OPEN_INVOKE, State::InInvokeName { tool_idx: None }),
                 (OPEN_TOOL_VARIANT, State::InInvokeName { tool_idx: None }),
                 (CLOSE_TOOL_CALLS, State::Out),
             ]),
-            State::InInvokeName { tool_idx } => {
-                self.transition_invoke_name(tool_idx)
-            }
-            State::InInvokeBody { tool_idx } => self.transition_from_alternatives(&[
-                (
+            State::InInvokeName { tool_idx } => self.transition_invoke_name(tool_idx),
+            State::InInvokeBody {
+                tool_idx,
+                emitted_params,
+            } => {
+                // Walk the alternatives manually so we can build the
+                // gated close alternatives (only legal once `required`
+                // is satisfied) without static `&str` lifetime gymnastics.
+                let mut alts: Vec<(&str, State)> = vec![(
                     OPEN_PARAM,
                     State::InParamName {
                         tool_idx,
                         param_idx: None,
+                        emitted_params: emitted_params.clone(),
                     },
-                ),
-                (CLOSE_INVOKE, State::InToolCalls),
-                (CLOSE_TOOL_VARIANT, State::InToolCalls),
-            ]),
+                )];
+                if self.required_satisfied(tool_idx, &emitted_params) {
+                    alts.push((CLOSE_INVOKE, State::InToolCalls));
+                    alts.push((CLOSE_TOOL_VARIANT, State::InToolCalls));
+                }
+                self.transition_from_alternatives(&alts)
+            }
             State::InParamName {
                 tool_idx,
                 param_idx,
-            } => self.transition_param_name(tool_idx, param_idx),
+                emitted_params,
+            } => self.transition_param_name(tool_idx, param_idx, emitted_params),
             State::InParamAttr {
                 tool_idx,
-                param_idx: _,
+                param_idx,
+                emitted_params,
             } => self.transition_from_alternatives(&[
-                (ATTR_STRING_TRUE, State::InParamBody { tool_idx }),
-                (ATTR_STRING_FALSE, State::InParamBody { tool_idx }),
+                (
+                    ATTR_STRING_TRUE,
+                    State::InParamBody {
+                        tool_idx,
+                        param_idx,
+                        emitted_params: emitted_params.clone(),
+                    },
+                ),
+                (
+                    ATTR_STRING_FALSE,
+                    State::InParamBody {
+                        tool_idx,
+                        param_idx,
+                        emitted_params,
+                    },
+                ),
             ]),
         }
     }
@@ -495,11 +599,14 @@ impl Matcher {
         };
         // Full coverage → transition into invoke body. Buffer keeps the
         // trailing suffix (if the committed token spanned more than the
-        // tool-name terminator).
+        // tool-name terminator). Fresh invoke → emitted_params empty.
         for (idx, full) in &candidates {
             if self.partial_buf.starts_with(full) {
                 self.partial_buf.drain(..full.len());
-                self.state = State::InInvokeBody { tool_idx: *idx };
+                self.state = State::InInvokeBody {
+                    tool_idx: *idx,
+                    emitted_params: Vec::new(),
+                };
                 return Transition::Advanced;
             }
         }
@@ -538,10 +645,14 @@ impl Matcher {
         &mut self,
         tool_idx: usize,
         param_idx: Option<usize>,
+        emitted_params: Vec<usize>,
     ) -> Transition {
         let tool = &self.tools[tool_idx];
+        // Exclude already-emitted params from the candidate set so the
+        // model can't re-emit `command` twice in one invoke.
         let candidates: Vec<(usize, String)> = match param_idx {
             None => (0..tool.params.len())
+                .filter(|i| !emitted_params.contains(i))
                 .map(|i| (i, format!("{}\"", tool.params[i])))
                 .collect(),
             Some(idx) => vec![(idx, format!("{}\"", tool.params[idx]))],
@@ -552,6 +663,7 @@ impl Matcher {
                 self.state = State::InParamAttr {
                     tool_idx,
                     param_idx: *idx,
+                    emitted_params,
                 };
                 return Transition::Advanced;
             }
@@ -566,6 +678,7 @@ impl Matcher {
                 self.state = State::InParamName {
                     tool_idx,
                     param_idx: Some(matching[0]),
+                    emitted_params,
                 };
                 return Transition::Advanced;
             }
@@ -636,6 +749,7 @@ mod tests {
         let s = ToolSchema {
             name: "read".to_string(),
             params: vec!["path".to_string()],
+            required: vec!["path".to_string()],
         };
         assert_eq!(s.name, "read");
         assert_eq!(s.params, vec!["path".to_string()]);
@@ -646,10 +760,12 @@ mod tests {
             ToolSchema {
                 name: "read".to_string(),
                 params: vec!["path".to_string()],
+                required: vec!["path".to_string()],
             },
             ToolSchema {
                 name: "write".to_string(),
                 params: vec!["path".to_string(), "content".to_string()],
+                required: vec!["path".to_string(), "content".to_string()],
             },
         ]
     }
@@ -701,7 +817,13 @@ mod tests {
         m.advance("<｜DSML｜tool_calls>");
         m.advance("<｜DSML｜invoke name=\"");
         m.advance("read\">\n");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![]
+            }
+        );
         assert_eq!(m.partial(), "");
     }
 
@@ -710,7 +832,13 @@ mod tests {
         let mut m = Matcher::new(schema_read_write());
         m.advance("<｜DSML｜tool_calls>");
         m.advance("<｜DSML｜invoke name=\"read\">\n");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![]
+            }
+        );
         m.advance("<｜DSML｜parameter name=\"");
         // `read` has exactly one param (`path`) — matcher locks
         // param_idx to Some(0) immediately since there's only one
@@ -720,6 +848,7 @@ mod tests {
             State::InParamName {
                 tool_idx: 0,
                 param_idx: Some(0),
+                emitted_params: vec![],
             }
         );
         m.advance("path\"");
@@ -728,14 +857,30 @@ mod tests {
             State::InParamAttr {
                 tool_idx: 0,
                 param_idx: 0,
+                emitted_params: vec![],
             }
         );
         m.advance(" string=\"true\">");
-        assert_eq!(*m.state(), State::InParamBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InParamBody {
+                tool_idx: 0,
+                param_idx: 0,
+                emitted_params: vec![],
+            }
+        );
         // Free emission of value
         assert!(m.is_free());
         m.advance("/tmp/test.txt</｜DSML｜parameter>");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        // After close, `path` (param_idx=0) is now in emitted_params.
+        // `read` only has one param so required is now satisfied.
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![0]
+            }
+        );
         m.advance("</｜DSML｜invoke>");
         assert_eq!(*m.state(), State::InToolCalls);
         m.advance("</｜DSML｜tool_calls>");
@@ -772,7 +917,13 @@ mod tests {
     fn newline_consumed_then_real_tag_in_one_advance() {
         let mut m = Matcher::new(schema_read_write());
         m.advance("<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"read\">\n");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![]
+            }
+        );
     }
 
     #[test]
@@ -815,8 +966,74 @@ mod tests {
     }
 
     #[test]
+    fn required_params_block_empty_invoke_close() {
+        // Reproduces the production failure where V4F emitted an empty
+        // bash invoke (`<｜DSML｜tool name="bash"></｜DSML｜tool>`) and
+        // the OpenAI client rejected it with "must have required
+        // properties command".
+        let schema = vec![ToolSchema {
+            name: "bash".to_string(),
+            params: vec!["command".to_string()],
+            required: vec!["command".to_string()],
+        }];
+        let mut m = Matcher::new(schema);
+        m.advance("<｜DSML｜tool_calls>");
+        m.advance("<｜DSML｜tool name=\"bash\">\n");
+        // In InInvokeBody with no params emitted yet — close MUST be
+        // blocked, only OPEN_PARAM is legal.
+        assert!(m.is_token_allowed("<｜DSML｜parameter name=\""));
+        assert!(!m.is_token_allowed("</｜DSML｜tool>"));
+        assert!(!m.is_token_allowed("</｜DSML｜invoke>"));
+        // Emit the required param.
+        m.advance("<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n");
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![0]
+            }
+        );
+        // Now close IS legal.
+        assert!(m.is_token_allowed("</｜DSML｜tool>"));
+        assert!(m.is_token_allowed("</｜DSML｜invoke>"));
+    }
+
+    #[test]
+    fn already_emitted_param_blocked_from_reuse() {
+        // After `command` is emitted once, the matcher must not let
+        // the model emit it again — the OpenAI parser rejects
+        // duplicate keys.
+        let schema = vec![ToolSchema {
+            name: "bash".to_string(),
+            params: vec!["command".to_string(), "cwd".to_string()],
+            required: vec!["command".to_string()],
+        }];
+        let mut m = Matcher::new(schema);
+        m.advance("<｜DSML｜tool_calls>");
+        m.advance("<｜DSML｜tool name=\"bash\">\n");
+        m.advance("<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\n");
+        // Required satisfied — close is legal.
+        assert!(m.is_token_allowed("</｜DSML｜tool>"));
+        // But emitting `command` AGAIN must be blocked. The remaining
+        // schema-legal opener is for `cwd` only.
+        m.advance("<｜DSML｜parameter name=\"");
+        // Now only `cwd` is a legal param name; `command` is masked.
+        assert!(m.is_token_allowed("c"));
+        assert!(m.is_token_allowed("cwd\""));
+        assert!(!m.is_token_allowed("command\""));
+    }
+
+    #[test]
     fn variant_close_tag_returns_to_tool_calls() {
-        let mut m = Matcher::new(schema_read_write());
+        // Use a schema with no required params so the empty-invoke
+        // close is legal (the required-params enforcement otherwise
+        // blocks the close until `path` is filled in).
+        let schema = vec![ToolSchema {
+            name: "read".to_string(),
+            params: vec!["path".to_string()],
+            required: vec![],
+        }];
+        let mut m = Matcher::new(schema);
         m.advance("<｜DSML｜tool_calls>");
         m.advance("<｜DSML｜tool name=\"read\">\n");
         m.advance("</｜DSML｜tool>"); // variant close
@@ -949,9 +1166,16 @@ mod tests {
         // close marker to type more value content.
         assert!(!m.is_token_allowed("paper"));
         assert!(!m.is_token_allowed("foo"));
-        // After completing the close, returns to InvokeBody.
+        // After completing the close, returns to InvokeBody with the
+        // `path` param marked emitted.
         m.advance("｜DSML｜parameter>");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![0]
+            }
+        );
     }
 
     #[test]
@@ -964,6 +1188,12 @@ mod tests {
         m.advance("/etc/passwd");
         assert!(m.is_free());
         m.advance("</｜DSML｜parameter>");
-        assert_eq!(*m.state(), State::InInvokeBody { tool_idx: 0 });
+        assert_eq!(
+            *m.state(),
+            State::InInvokeBody {
+                tool_idx: 0,
+                emitted_params: vec![0]
+            }
+        );
     }
 }

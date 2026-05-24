@@ -4831,13 +4831,26 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let params: Vec<String> = func
-                            .get("parameters")
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
                             .and_then(|p| p.get("properties"))
                             .and_then(|p| p.as_object())
                             .map(|m| m.keys().cloned().collect())
                             .unwrap_or_default();
-                        deepseek4::grammar::ToolSchema { name, params }
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
                     })
                     .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
                     .collect()
