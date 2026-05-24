@@ -5293,7 +5293,24 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // pushes EOS, but a future model that emits EOS mid-stream
         // shouldn't end up with EOS landing in the cached tokens).
         drop(absorb_event); // release the &mut emit_*_buf borrow
-        if generated_count > 0 && m.conversation_tokens.len() > decode_start_tokens_idx {
+        // Skip caching when the turn produced no replay-able payload —
+        // empty trimmed content AND no tool_calls. The fingerprint for
+        // such turns collides on the hash of `("assistant", "")` so
+        // any subsequent empty-emission turn (the model giving up with
+        // a trailing whitespace fragment) overwrites the prior entry.
+        // Pi typically doesn't replay empty assistant turns at all, so
+        // the cache entry is dead weight at best and a subtle
+        // mis-replay risk at worst (Pi sends content="" + tool_calls=[]
+        // for a different reason and our cache hands back the wrong
+        // tokens). Two write conditions to satisfy: at least one
+        // visible event (text OR tool_calls) AND at least one raw
+        // token actually emitted.
+        let have_replayable_payload =
+            !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
+        if have_replayable_payload
+            && generated_count > 0
+            && m.conversation_tokens.len() > decode_start_tokens_idx
+        {
             let cached_seq: Vec<u32> =
                 m.conversation_tokens[decode_start_tokens_idx..].to_vec();
             let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
