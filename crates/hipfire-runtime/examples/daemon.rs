@@ -4711,6 +4711,14 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         return;
     }
 
+    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT").ok().as_deref() == Some("1") {
+        let rendered = tokenizer.decode(&prompt_ids);
+        let path = format!("/tmp/hipfire-prompt-{}.txt", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+        let _ = std::fs::write(&path, format!("# tokens: {}\n{}\n", prompt_ids.len(), rendered));
+        eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
+    }
+
     let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE").ok().as_deref() == Some("1");
     let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
