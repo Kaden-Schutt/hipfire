@@ -1537,6 +1537,19 @@ async function serve(port: number, host: string) {
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
+        // Opt-in request-body dump. Lets an operator see the full
+        // prompt a client (e.g. Pi) is sending without having to attach
+        // a strace. Off by default — gigantic for typical agent prompts.
+        if (process.env.HIPFIRE_DUMP_REQUEST === "1") {
+          try {
+            const path = `/tmp/hipfire-request-${Date.now()}.json`;
+            require("fs").writeFileSync(path, JSON.stringify(body, null, 2));
+            console.error(`[hipfire] dumped request → ${path} (msgs=${messages.length} tools=${tools.length} stream=${body.stream})`);
+          } catch (e: any) {
+            console.error(`[hipfire] request dump failed: ${e?.message ?? e}`);
+          }
+        }
+
         // OpenAI API is stateless: each request has the full conversation.
         // Reset daemon state so prior requests don't bleed into this one.
         await e.send({ type: "reset" }); await e.recv();
