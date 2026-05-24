@@ -1574,6 +1574,15 @@ async function serve(port: number, host: string) {
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
         const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          // OpenAI assistant messages carrying only `tool_calls` send
+          // `content: null`. Returning `String(null) === "null"` here
+          // (the legacy fallback below) leaked the literal text `null`
+          // into the rendered prompt — V4F prompt dumps showed this as
+          // `<｜Assistant｜>null<｜end▁of▁sentence｜>` for every prior
+          // tool-call turn, which the model reads as "the assistant
+          // previously said the word null", not as an empty turn.
+          // Treat null/undefined as empty content.
+          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
           if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
@@ -1795,25 +1804,27 @@ async function serve(port: number, host: string) {
         }
         userPrompt = convParts.join("");
 
-        // V4F (and any other arch with a structured-messages daemon path)
-        // uses `messages` for history and treats `prompt` as the LIVE user
-        // message text only — not as a ChatML-formatted conversation
-        // duplicate. Sending the full ChatML in `prompt` here causes the
-        // V4F daemon to render the conversation twice (once via messages
-        // in V4F format, once via prompt in ChatML format), feeding the
-        // model `<｜User｜>…<｜Assistant｜>null<｜end▁of▁sentence｜>…` plus
-        // `<|im_start|>assistant\nnull\n<tool_call>…` in the same prompt —
-        // catastrophically off-distribution.
+        // V4F's daemon path renders multi-turn history from the
+        // structured `messages` field in V4F-native tokens
+        // (`<｜User｜>` / `<｜Assistant｜>` / DSML tool-call wrappers), and
+        // separately appends whatever lands in `prompt` as the live user
+        // input. If we leave `userPrompt` set to the ChatML rebuild of
+        // the same conversation, the daemon emits both — see the
+        // /tmp/hipfire-prompt-*.txt capture for the catastrophic dual-
+        // format prompt this produces (V4F tokens + ChatML markers,
+        // literal "null" strings, two competing tool-call format
+        // contracts). For V4F, replace `userPrompt` with just the live
+        // user message (or "" when the conversation ends with a
+        // tool/assistant turn and the model is meant to continue
+        // generating).
         //
-        // Override `userPrompt` to just the trailing user message's text
-        // (or empty if the conversation ends with a tool/assistant turn —
-        // the daemon should then continue from `<｜Assistant｜>` directly).
-        // Legacy non-structured-message daemon paths still see the same
-        // bytes because they only read `prompt` and never consult
-        // `messages` — for those, the LEGACY behaviour was to take the
-        // last user turn as the prompt anyway, so this just removes the
-        // duplicate-history noise.
-        {
+        // Legacy arches (Qwen2 in particular) read the full ChatML
+        // history out of `prompt` and ignore `messages` — they NEED
+        // the rebuild, so don't touch `userPrompt` there. Qwen35's
+        // Jinja path can go either way; we leave it on the legacy
+        // bytes for backward-compat until a similar capture confirms
+        // it sees the same double-render issue.
+        if (currentArch === "deepseek4") {
           const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
           if (last && last.role === "user") {
             const lastContent = extractContent(last.content);
