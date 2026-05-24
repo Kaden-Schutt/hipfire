@@ -561,14 +561,30 @@ fn compressor_forward_impl(
     };
 
     // 2. score += ape[pos % ratio]
-    // ape is shape [ratio, proj_dim] F16; row pos%ratio is proj_dim consecutive F16s.
-    // We need an F16→F32 add-in-place. Simplest: convert ape row to F32 once at load.
-    // For now, treat ape as a raw F16 view and do an add via a tiny dispatch wrapper.
-    // PUNT: this needs an f16-add-to-f32 kernel we don't have; skip the ape add
-    // in this commit (the ape is small positional encoding — quality impact bounded).
-    // TODO: write add_f16_to_f32_inplace kernel and call:
-    //   gpu.add_f16_to_f32_inplace(score_buf, ape_row_view, proj_dim)
-    let _ = ape;
+    //
+    // APE (Absolute Position Encoding) is stored as F32 on device after
+    // `upload_global_f16_as_f32` at load time. Shape: [ratio, proj_dim].
+    // The row at index `pos % ratio` is the positional bias for this
+    // slot within the current compression window. Adding it to `score`
+    // BEFORE the softmax-pool is what lets the pool distinguish slot 0
+    // from slot 1/.../ratio-1 — without it the pool is content-only and
+    // distant-token recall degrades to fuzzy paraphrasing
+    // (`mariozechner` → `marioze`, `v20.19.6` → `v20.19.20`, etc.). This
+    // was a known TODO that has now landed.
+    // DIAGNOSTIC: disabled while debugging illegal-memory-access crash.
+    // The APE load to F32 stays — only the add is gated.
+    // The per-layer scratch buffers (comp_kv_buf / comp_score_buf) are
+    // lazy-alloced at the *first* call's proj_dim. For ratio=4 layers we
+    // call compressor_forward twice per layer (main then indexer), and
+    // the indexer's proj_dim is smaller — but the score buffer already
+    // exists at the main proj_dim. `score_buf.numel()` therefore over-
+    // states the live length; we must clamp to `proj_dim` (the GEMV
+    // write length) so add_inplace_f32 doesn't run past the ape row.
+    let ape_row_idx = pos % ratio;
+    let ape_row = ape.sub_offset(ape_row_idx * proj_dim, proj_dim);
+    let score_view = score_buf.sub_offset(0, proj_dim);
+    gpu.add_inplace_f32(&score_view, &ape_row)
+        .map_err(|e| format!("comp ape add l{layer_idx}: {e:?}"))?;
 
     // Compressor commit + compress pipeline.
     //
@@ -934,6 +950,38 @@ fn compressor_forward_batched(
             .as_ref()
             .ok_or_else(|| format!("comp_norm l{layer_idx}"))?
     };
+    let ape = if is_indexer {
+        layer
+            .indexer_compressor_ape
+            .as_ref()
+            .ok_or_else(|| format!("idx_comp_ape l{layer_idx}"))?
+    } else {
+        layer
+            .compressor_ape
+            .as_ref()
+            .ok_or_else(|| format!("comp_ape l{layer_idx}"))?
+    };
+
+    // Apply per-slot APE to the batched score buffer. This MUST happen
+    // before any kernel that reads score_batch_full (compress, ring-write,
+    // or state-update memcpy) — those kernels consume the APE-applied
+    // scores, mirroring the sequential per-position path in
+    // `compressor_forward_impl`.
+    //
+    // The batched score buffer is allocated at `[max_batch, 2 * head_dim]`
+    // but the GEMV writes `proj_dim` floats per slot (head_dim for
+    // ratio=128, 2*head_dim for ratio=4 overlap). The APE add reads the
+    // same `proj_dim` columns of each slot, so the unused tail half
+    // (ratio=128 layers only) stays untouched.
+    gpu.compressor_add_ape_batched_f32(
+        score_batch_full,
+        ape,
+        batch_size as i32,
+        proj_dim as i32,
+        ratio as i32,
+        start_pos as i32,
+    )
+    .map_err(|e| format!("comp ape batched l{layer_idx}: {e:?}"))?;
 
     let slot_base = (start_pos as usize) % ratio;
     // first chunk position whose absolute (p+1) % R == 0:

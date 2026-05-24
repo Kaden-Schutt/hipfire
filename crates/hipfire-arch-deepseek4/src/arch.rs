@@ -698,7 +698,12 @@ impl Architecture for DeepseekV4 {
                     gpu,
                     &format!("layers.{l}.attn.compressor.norm.weight"),
                 )?);
-                layer.compressor_ape = Some(Self::upload_global_raw(
+                // APE (Absolute Position Encoding) is added to the per-step
+                // score in `compressor_forward_impl` via `add_inplace_f32`.
+                // Convert F16 → F32 once at load so the per-step add is a
+                // plain F32-F32 op. Shape is [ratio, proj_dim] — tiny
+                // (max ratio=128 × proj_dim=1024 = 128k F32 = 512KB/layer).
+                layer.compressor_ape = Some(Self::upload_global_f16_as_f32(
                     hfq,
                     gpu,
                     &format!("layers.{l}.attn.compressor.ape"),
@@ -744,7 +749,9 @@ impl Architecture for DeepseekV4 {
                     gpu,
                     &format!("layers.{l}.attn.indexer.compressor.norm.weight"),
                 )?);
-                layer.indexer_compressor_ape = Some(Self::upload_global_raw(
+                // Same F16 → F32 conversion as the main-attn APE; see
+                // comment on `compressor_ape` above for rationale.
+                layer.indexer_compressor_ape = Some(Self::upload_global_f16_as_f32(
                     hfq,
                     gpu,
                     &format!("layers.{l}.attn.indexer.compressor.ape"),

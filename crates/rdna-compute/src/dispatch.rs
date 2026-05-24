@@ -24272,6 +24272,51 @@ impl Gpu {
         }
     }
 
+    /// DeepSeek V4 compressor per-slot APE add over a batched score buffer.
+    /// In-place: `score_batch[b, d] += ape[(start_pos + b) % ratio, d]`.
+    /// Mirrors the per-position add in `compressor_forward_impl` so the
+    /// batched-prefill compress path produces kv_cache entries with the
+    /// same APE-applied scores as the sequential per-position path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compressor_add_ape_batched_f32(
+        &mut self,
+        score_batch: &GpuTensor,  // [B, proj_dim] F32, in-place
+        ape: &GpuTensor,          // [ratio, proj_dim] F32
+        batch_size: i32,
+        proj_dim: i32,
+        ratio: i32,
+        start_pos: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "compressor_add_ape_batched",
+            kernels::COMPRESSOR_ADD_APE_BATCHED_SRC,
+            "compressor_add_ape_batched_f32",
+        )?;
+        let func = &self.functions["compressor_add_ape_batched_f32"];
+        let sb = score_batch.buf.as_ptr();
+        let ap = ape.buf.as_ptr();
+        let mut bs = batch_size;
+        let mut pd = proj_dim;
+        let mut rr = ratio;
+        let mut sp = start_pos;
+        let mut params: Vec<*mut c_void> = vec![
+            &sb as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut pd as *mut _ as *mut c_void,
+            &mut rr as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((proj_dim + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, batch_size as u32, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+
     /// DeepSeek V4 Compressor overlap-transform concat (overlap=true / ratio=4).
     /// Reads [2*ratio, 2*head_dim] kv_state and writes [2*ratio, head_dim]
     /// dst by taking first half-cols for old window rows and second

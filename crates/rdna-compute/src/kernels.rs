@@ -2234,6 +2234,13 @@ pub const COMPRESSOR_COMPRESS_ALIGNED_BATCHED_SRC: &str =
 pub const COMPRESSOR_RING_WRITE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/compressor_ring_write_batched.hip");
 
+/// DeepSeek V4 compressor per-slot APE add over batched score buffer.
+/// Mirrors the per-position add inside `compressor_forward_impl` so that
+/// the batched-prefill compress path produces the same kv_cache entries
+/// as the sequential per-position path.
+pub const COMPRESSOR_ADD_APE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_add_ape_batched.hip");
+
 /// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
 /// 4 independent accumulators per thread for ILP; mirrors qwen35's
 /// HFQ4 K4 unroll. Drop-in replacement for
