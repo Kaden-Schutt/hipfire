@@ -219,15 +219,64 @@ fn asst_turn_fingerprint(
     }
     for tc in tool_calls {
         tc.name.hash(&mut h);
-        // Serialize args in a canonical form. `serde_json::to_string`
-        // on a `Value` produces stable ordering for objects (insertion
-        // order from the upstream `Map<String, Value>`), which is what
-        // we want: two messages with identically-shaped tool_calls
-        // produce identical fingerprints.
-        let args = serde_json::to_string(&tc.arguments).unwrap_or_default();
+        // Serialize args in a CANONICAL form: walk the Value tree and
+        // emit objects with keys sorted lexically (recursively). The
+        // upstream `serde_json::Map` uses insertion order — fine for
+        // round-tripping a single payload, but two clients (or two
+        // parser passes on the same payload) can yield different
+        // insertion orders for the same logical args. Without
+        // canonicalization those two turns hash to DIFFERENT keys,
+        // dropping cache hit rate on otherwise-identical tool calls.
+        let args = canonical_json(&tc.arguments);
         args.hash(&mut h);
     }
     h.finish()
+}
+
+/// Walk a [`serde_json::Value`] and produce a canonical-key
+/// representation: objects emit keys in lexical order (recursively),
+/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
+/// messages with the same logical tool args hash identically
+/// regardless of source-side insertion order.
+fn canonical_json(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                write_canonical_json(&map[*k], out);
+            }
+            out.push('}');
+        }
+    }
 }
 
 /// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
@@ -330,11 +379,18 @@ fn emit_committed_event(
     if !on {
         return;
     }
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
-        id, tok_id, pos, t_ms
-    );
+    // Build through `serde_json::json!` for the same reason
+    // `emit_error_with_id` does: `id` is user-supplied and a single `"`
+    // or `\` in it would corrupt the line, breaking the client's JSONL
+    // parser for every subsequent event on the same connection.
+    let envelope = serde_json::json!({
+        "type": "committed",
+        "id": id,
+        "tok_id": tok_id,
+        "pos": pos,
+        "t_ms": t_ms,
+    });
+    let _ = writeln!(stdout, "{}", envelope);
 }
 
 #[allow(dead_code)]
@@ -601,6 +657,16 @@ struct LoadedModel {
     /// correctness (worst case: VRAM-free Vec<u32> memory growth on
     /// the host).
     asst_turn_cache: std::collections::HashMap<u64, Vec<u32>>,
+
+    /// Lazily-built decoded-vocab cache for grammar-guided sampling.
+    /// `tokenizer.decode(&[id])` for every id ∈ `0..vocab_size`. Built
+    /// once on first tool-using V4F request, reused for every subsequent
+    /// request on the same model. Without this cache, each generate
+    /// rebuilt all ~129k entries at request entry (one tokenizer.decode
+    /// allocation per id), adding tens of milliseconds of pure overhead
+    /// to every tool-using turn. `None` until first build; cleared by
+    /// `unload_model` via `LoadedModel` drop.
+    decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
@@ -1370,7 +1436,23 @@ fn main() {
                     // pi-coding-agent corruption (`CLion` for
                     // `CLionProjects`, `/home/n/` for `/home/nick/`).
                     // See `DeepseekV4State::reset` doc.
-                    if let Some(ref mut s) = m.deepseek4_state { s.reset(); }
+                    if let Some(ref mut s) = m.deepseek4_state {
+                        s.reset();
+                        // Drop the captured V4F decode hipGraph alongside
+                        // the state. The captured kernarg blobs hold
+                        // session-1's device-buffer pointers; a fresh
+                        // capture on session-2 binds against session-2's
+                        // pointers and host scalars. Without this the
+                        // replay path crashes with "illegal memory access"
+                        // on the post-launch logits D2H — the captured
+                        // graph dispatched against a stale slot/n_valid
+                        // computation that mis-ordered against this
+                        // session's prefill state. The matching
+                        // `ar_forward_warmed_up = false` in `reset()`
+                        // ensures we retrace warmup → capture → replay
+                        // rather than jumping straight back to replay.
+                        gpu.invalidate_graph_state();
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1895,7 +1977,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: std::collections::HashMap::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1950,7 +2032,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: std::collections::HashMap::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2125,7 +2207,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: std::collections::HashMap::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -2157,7 +2239,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
-            asst_turn_cache: std::collections::HashMap::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2289,7 +2371,7 @@ fn load_model_pp(
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
-            asst_turn_cache: std::collections::HashMap::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -2391,12 +2473,19 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // free_gpu call handles both. (Compare LLaMA where ForwardScratch and
     // KvCache are separate fields.)
     if let Some(s) = m.qwen2_state { s.free_gpu(gpu); }
+    // V4F (arch_id=9) per-session scratch + per-layer SWA/indexer/
+    // compressor caches. Without these `unload_model` would leak ~tens
+    // of MB of state buffers per load/unload cycle, defeating idle
+    // eviction.
+    if let Some(s) = m.deepseek4_state { s.free_gpu(gpu); }
+    if let Some(pbs) = m.deepseek4_pbs { pbs.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.qwen2_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.deepseek4_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
     // can land at the same device address and silently inherit stale
@@ -4978,6 +5067,19 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
         m.conversation_tokens.clear();
+        // Tear down the captured V4F decode hipGraph alongside the
+        // state, same rationale as the daemon's `"reset"` handler:
+        // a fresh-context turn invalidates every device-buffer pointer
+        // and host scalar the captured graph baked in at capture time
+        // (state.attn_state_buf slot/n_valid/k_active values derived
+        // from the prior n_tokens, compressor ring/commit slots, etc.).
+        // Without this, the warmup-then-replay state machine fires
+        // warmup on the first decode (because `state.reset()` clears
+        // `ar_forward_warmed_up`), then immediately replays the STALE
+        // graph on the second decode and crashes with the same
+        // "download logits (graph path): illegal memory access" we
+        // saw on multi-turn pi sessions before the explicit-reset fix.
+        gpu.invalidate_graph_state();
     }
     let start_pos: u32 = lcp as u32;
 
@@ -5064,6 +5166,11 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         });
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
+    // Track whether the non-spec decode loop saw a complete
+    // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
+    // `done` envelope below — spec_mode leaves this at 0 (it doesn't
+    // run the DSML parser).
+    let mut tool_calls_parsed_count: usize = 0;
     if spec_mode {
         // Spec-decode loop. The verifier picks argmax (greedy) so accept
         // semantics stay deterministic.
@@ -5094,8 +5201,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     break 'outer;
                 }
                 let frag = tokenizer.decode(&[t]);
-                let frag_escaped = json_escape(&frag);
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"{}"}}"#, id, frag_escaped);
+                // Build through serde_json so `id` (user-supplied) and
+                // `frag` (model-generated UTF-8 with possible `"`/`\`)
+                // can't corrupt the JSONL line.
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                });
+                let _ = writeln!(stdout, "{}", envelope);
                 emit_committed_event(stdout, id, t, generated_count, decode_t0.elapsed().as_millis() as u64);
                 let _ = stdout.flush();
                 m.conversation_tokens.push(t);
@@ -5122,7 +5236,19 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
         // Markers split across token boundaries are buffered until they
         // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
-        let mut parser = deepseek4::dsml::StreamParser::new();
+        // Prime the parser's initial state to match the bootstrap tag
+        // we appended to `prompt_ids`. In High/Max think modes the
+        // prompt ends with `<think>` and the model's first generated
+        // token is the body of that thinking block — without
+        // `new_in_think()` the parser would sit in `Normal` and
+        // misclassify every reasoning token as plain content,
+        // including the trailing `</think>` which then leaks into
+        // `message.content`. NonThink mode appends `</think>` (closing
+        // a zero-length think block) so the response starts in Normal.
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
 
         // Grammar-guided decoding setup. When tools are present, we mask
         // the logits against a small state machine that mirrors the DSML
@@ -5176,17 +5302,32 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             .unwrap_or_default();
         let grammar_active = !tool_schemas.is_empty();
         let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
-        // Precompute the decoded vocab once (`tokenizer.decode` per id).
-        // Only walked when the matcher is in a constrained state; in
-        // free mode `is_free()` short-circuits the per-step scan.
-        let decoded_vocab: Vec<String> = if grammar_active {
-            let n = tokenizer.vocab_size();
-            (0..n)
-                .map(|id| tokenizer.decode(&[id as u32]))
-                .collect()
+        // Precompute (or fetch the cached) decoded vocab. `tokenizer.decode`
+        // per id over ~129k ids is allocator-heavy enough that doing it
+        // per-request adds tens of ms of pure overhead to every tool-
+        // using V4F turn. The cache lives on `LoadedModel.decoded_vocab`
+        // as an `Arc<Vec<String>>` and is cleared on model unload.
+        //
+        // Borrow note: `m.decoded_vocab` is a disjoint field from
+        // `m.deepseek4_state` (which `state` holds `&mut` to) and from
+        // `m.tokenizer` (which `tokenizer` holds `&` to), so the
+        // assignment compiles under Rust's split-borrows.
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
         } else {
-            Vec::new()
+            None
         };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
         let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
 
         // Apply mask to the prefill-returned logits before the first
@@ -5293,6 +5434,10 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // pushes EOS, but a future model that emits EOS mid-stream
         // shouldn't end up with EOS landing in the cached tokens).
         drop(absorb_event); // release the &mut emit_*_buf borrow
+        // Now that the closure is dropped, we can read the buffers
+        // immutably. Snapshot the tool_calls count so the `done`
+        // envelope below can carry `finish_reason: "tool_calls"`.
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
         // Skip caching when the turn produced no replay-able payload —
         // empty trimmed content AND no tool_calls. The fingerprint for
         // such turns collides on the hash of `("assistant", "")` so
@@ -5352,6 +5497,31 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // layer maps `cached_tokens` → `usage.prompt_tokens_details.cached_tokens`.
     let prompt_tokens_total = prompt_ids.len();
     let prefill_tokens_actual = suffix_tokens.len();
+    // Tell the OpenAI-compat layer how the decode loop exited. Without
+    // this the CLI fell back to "stop" for every non-tool-call turn,
+    // hiding `max_tokens` truncation behind a natural-completion signal
+    // — strict clients use `finish_reason: "length"` to decide whether
+    // to retry with a longer budget.
+    //
+    //   tool_calls — at least one complete `<｜DSML｜tool_calls>` block
+    //                was parsed (`tool_calls_parsed_count > 0`). Wins
+    //                over "length" even when max_tokens hit after the
+    //                block closed.
+    //   length     — generated_count reached max_tokens with no
+    //                completed tool_calls block.
+    //   stop       — model emitted EOS, or generated_count is < max
+    //                because the spec-decode loop accepted EOS in the
+    //                middle of an accepted-tokens chunk.
+    //
+    // `tool_calls_parsed_count` is set inside the non-spec branch
+    // immediately after parser.finish(); spec_mode leaves it at 0.
+    let finish_reason: &'static str = if tool_calls_parsed_count > 0 {
+        "tool_calls"
+    } else if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
     let done_envelope = if spec_mode {
         let accept_pct = if spec_drafts_offered > 0 {
             spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
@@ -5368,6 +5538,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             "cached_tokens": cached_tokens,
             "prefill_ms": prefill_ms,
             "total_ms": total_ms,
+            "finish_reason": finish_reason,
             "spec_k": spec_k,
             "spec_windows": spec_windows,
             "spec_accept_pct": accept_pct,
@@ -5383,6 +5554,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             "cached_tokens": cached_tokens,
             "prefill_ms": prefill_ms,
             "total_ms": total_ms,
+            "finish_reason": finish_reason,
         })
     };
     let _ = writeln!(stdout, "{}", done_envelope);
@@ -5497,16 +5669,17 @@ fn generate_qwen2(
         }
         // Emit text fragment for this token. Tokenizer.decode handles
         // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. JSON-escape the
-        // chunk so embedded quotes / control chars don't break the
-        // wire format.
+        // to an empty string we still advance the loop. Build through
+        // serde_json so `id` (user-supplied) and `frag` (arbitrary
+        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
+        // the JSONL line.
         let frag = tokenizer.decode(&[next_tok]);
-        let frag_escaped = json_escape(&frag);
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":"{}"}}"#,
-            id, frag_escaped,
-        );
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -5537,30 +5710,6 @@ fn generate_qwen2(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
-}
-
-/// Minimal JSON string escaper for the daemon's token-stream emit
-/// path. We have full control of the alphabet (BPE-decoded UTF-8)
-/// and only need to escape: backslash, double-quote, and control
-/// chars < 0x20. Non-ASCII bytes pass through as-is (the daemon
-/// client parses with serde_json which accepts UTF-8 verbatim).
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {

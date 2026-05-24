@@ -2399,13 +2399,24 @@ async function serve(port: number, host: string) {
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // Daemon-authoritative finish_reason (V4F sets it
+                    // from the decode-loop exit condition). Falls back
+                    // to "stop" when an older daemon build didn't carry
+                    // the field, preserving legacy behaviour for the
+                    // Qwen35 / LLaMA / Qwen2 arches that don't yet emit
+                    // it. Only "stop" | "length" | "tool_calls" are
+                    // OpenAI-valid; clamp anything else to "stop".
+                    const allowedFR = new Set(["stop", "length", "tool_calls"]);
+                    const daemonFR: string | null = typeof (msg as any).finish_reason === "string" && allowedFR.has((msg as any).finish_reason)
+                      ? (msg as any).finish_reason
+                      : null;
                     // V4F-style: structured tool_calls already emitted on the
                     // wire. Skip the legacy text-buffer parser path and close
                     // out with the OpenAI-correct `finish_reason: "tool_calls"`.
                     if (structuredToolCallsEmitted) {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
@@ -2430,7 +2441,7 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       } else {
@@ -2442,7 +2453,7 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                           ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       }
@@ -2450,7 +2461,7 @@ async function serve(port: number, host: string) {
                       const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
                         ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
@@ -2499,8 +2510,22 @@ async function serve(port: number, host: string) {
         // (typically empty) accumulated text and returns
         // `finish_reason: "stop"` with a missing `tool_calls` field.
         let structuredToolCalls: any[] | null = null;
+        // Name-shadowing avoidance: the outer scope has `reasoning`
+        // bound to the request-level reasoning *config* (effort, etc.).
+        // Use `reasoningContent` for the accumulated `<think>…</think>`
+        // body that surfaces under `message.reasoning_content` below.
+        let reasoningContent = "";
+        let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
+          else if (msg.type === "reasoning") {
+            // V4F's StreamParser splits `<think>…</think>` content out
+            // as `reasoning` events. Accumulate so the non-stream chat
+            // completion response can surface it under
+            // `message.reasoning_content` — without this the reasoning
+            // text was silently dropped on every think-mode V4F turn.
+            if (typeof msg.text === "string") reasoningContent += msg.text;
+          }
           else if (msg.type === "done") {
             // `prompt_tokens` is the full client-visible prompt size
             // (V4F emits it). `prefill_tokens` (legacy) is what
@@ -2513,6 +2538,12 @@ async function serve(port: number, host: string) {
             cachedTokens = typeof msg.cached_tokens === "number"
               ? msg.cached_tokens
               : 0;
+            // V4F daemon emits an authoritative finish_reason. Only
+            // accept the three OpenAI-valid values; anything else falls
+            // back to the legacy inference below.
+            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+              daemonFinishReason = msg.finish_reason;
+            }
           }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
           else if (msg.type === "tool_calls") {
@@ -2587,20 +2618,29 @@ async function serve(port: number, host: string) {
           // already streamed any preceding assistant text. Pass that
           // through as the message content (trimmed — the model
           // typically emits trailing `\n\n` after closing `</think>`).
-          choice.finish_reason = "tool_calls";
+          choice.finish_reason = daemonFinishReason ?? "tool_calls";
           choice.message = {
             role: "assistant",
             content: content.trim() || null,
             tool_calls: structuredToolCalls,
           };
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         } else {
           const parsed = parseToolCalls(content);
-          choice.finish_reason = parsed.tool_calls ? "tool_calls" : "stop";
+          // Prefer the daemon's authoritative finish_reason (V4F).
+          // Fall back to the legacy inference: "tool_calls" if the
+          // text parser found inline tool calls, otherwise "stop" —
+          // but if the daemon told us "length" (max_tokens hit), use
+          // that even when there's no tool call, so clients can
+          // detect truncated replies.
+          choice.finish_reason = daemonFinishReason
+            ?? (parsed.tool_calls ? "tool_calls" : "stop");
           if (parsed.tool_calls) {
             choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
           } else {
             choice.message = { role: "assistant", content };
           }
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         }
 
         safeRelease();

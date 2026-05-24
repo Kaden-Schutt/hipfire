@@ -281,6 +281,23 @@ impl StreamParser {
         }
     }
 
+    /// Construct a parser that starts already inside a `<think>…</think>`
+    /// block. The first emitted token is treated as `Reasoning` content
+    /// until the parser observes the closing `</think>`. Used by the
+    /// V4F daemon's think-mode path where the prompt ends with the
+    /// opening `<think>` tag (the model's first generated token is the
+    /// start of the reasoning body, never the `<think>` itself), so a
+    /// plain `new()` would mis-classify the entire reasoning stream as
+    /// regular `Token` content.
+    pub fn new_in_think() -> Self {
+        let holdback = TOOL_CALLS_OPEN.len().max(THINK_OPEN.len());
+        Self {
+            state: State::InThink,
+            buf: String::new(),
+            normal_holdback: holdback,
+        }
+    }
+
     /// Feed a chunk of decoded text. May emit zero, one, or many events.
     pub fn feed(&mut self, chunk: &str) -> Vec<StreamEvent> {
         self.buf.push_str(chunk);
@@ -418,8 +435,20 @@ impl StreamParser {
 /// (without the wrapper tags themselves) into a vector of [`ToolCall`].
 ///
 /// Best-effort: malformed invocations are skipped; well-formed ones are
-/// returned in document order.
+/// returned in document order. The recovery model is "skip past the
+/// broken invoke and keep parsing" rather than "abort the whole block"
+/// — V4F MQ2-Lloyd has been observed emitting bare `</｜DSML｜>` closes
+/// (truncated close marker, neither `</｜DSML｜invoke>` nor
+/// `</｜DSML｜tool>`); without explicit recovery the first such
+/// invocation would discard every subsequent tool call in the same
+/// block.
 pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
+    /// Generic short close — observed in V4F MQ2-Lloyd output when the
+    /// model truncates the canonical close. Treated as a fallback close
+    /// only when we can't find the matched form; the matched form takes
+    /// precedence so a well-formed `</｜DSML｜invoke>` ends an invoke
+    /// even if `</｜DSML｜>` appears later in a parameter value.
+    const GENERIC_CLOSE: &str = "</｜DSML｜>";
     let mut out = Vec::new();
     let mut cursor = 0;
     loop {
@@ -439,60 +468,137 @@ pub fn parse_tool_calls_body(body: &str) -> Vec<ToolCall> {
         let abs = cursor + open_rel + open_len;
         let close_attr = match body[abs..].find("\">") {
             Some(i) => abs + i,
-            None => break,
+            // No `">` after the open: this invoke is truncated. Skip
+            // past the open marker and let the loop pick up any
+            // subsequent well-formed invoke.
+            None => {
+                cursor = abs;
+                continue;
+            }
         };
         let name = body[abs..close_attr].to_string();
         let body_start = close_attr + 2;
-        let invoke_close = match body[body_start..].find(close_marker) {
-            Some(i) => body_start + i,
-            None => break,
+        // Prefer the matched close; fall back to the generic short
+        // close (`</｜DSML｜>`) when the matched form isn't present —
+        // V4F MQ2-Lloyd has been observed truncating to that form.
+        // Whichever appears FIRST in the body wins so a generic close
+        // inside a string param value can't terminate the invoke
+        // prematurely if the matched form precedes it.
+        let matched_at = body[body_start..].find(close_marker).map(|i| (i, close_marker.len()));
+        let generic_at = body[body_start..].find(GENERIC_CLOSE).map(|i| (i, GENERIC_CLOSE.len()));
+        let (rel_off, used_close_len) = match (matched_at, generic_at) {
+            (Some(a), Some(b)) if a.0 <= b.0 => a,
+            (Some(_), Some(b)) => b,
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            // Neither close found — invoke is truncated. Skip past the
+            // open marker (already past the name attr) and continue;
+            // any later well-formed invoke is still recoverable.
+            (None, None) => {
+                cursor = body_start;
+                continue;
+            }
         };
+        let invoke_close = body_start + rel_off;
         let invoke_body = &body[body_start..invoke_close];
         let args = parse_parameters(invoke_body);
         out.push(ToolCall { name, arguments: args });
-        cursor = invoke_close + close_marker.len();
+        cursor = invoke_close + used_close_len;
     }
     out
 }
 
 /// Parse the parameters inside a single invoke block. Returns a JSON
 /// object whose keys are parameter names.
+///
+/// Recovery policy: a single malformed `<｜DSML｜parameter>` (missing
+/// `string="..."` attr, missing close, etc.) advances the cursor past
+/// the broken open and continues scanning so that well-formed params
+/// AFTER it are still collected. Prior to this fix the function broke
+/// out on first error and discarded every subsequent param, which made
+/// "model emits `edits=[]` with no string-attr followed by a correct
+/// `path` param" lose the path entirely.
 fn parse_parameters(body: &str) -> Value {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
     while let Some(param_start) = body[cursor..].find(PARAMETER_OPEN_PREFIX) {
-        let abs = cursor + param_start + PARAMETER_OPEN_PREFIX.len();
+        let open_abs = cursor + param_start;
+        let abs = open_abs + PARAMETER_OPEN_PREFIX.len();
+        // Skip past at least the open marker so we don't loop on the
+        // same broken param if any of the inner finds fail.
+        let next_cursor_on_break = abs;
         // name="..." string="true|false">
         let name_end = match body[abs..].find('"') {
             Some(i) => abs + i,
-            None => break,
+            None => {
+                cursor = next_cursor_on_break;
+                continue;
+            }
         };
         let name = body[abs..name_end].to_string();
-        // Find ` string="...">`
+        // Find ` string="...">`. Bound the search to the CURRENT
+        // parameter tag (everything before the first `>` after the
+        // name's closing `"`) so that a missing-attr param doesn't
+        // grab the next param's `string="..."` and capture its value.
+        // If absent, treat the body up to the next PARAMETER_CLOSE as
+        // a raw string value (defensive: V4F MQ2-Lloyd has been
+        // observed emitting parameters without the string-attr —
+        // `<｜DSML｜parameter name="X">val</｜DSML｜parameter>` — and
+        // dropping those silently loses information).
         let after_name = name_end + 1;
-        let string_attr_idx = match body[after_name..].find("string=\"") {
-            Some(i) => after_name + i + "string=\"".len(),
-            None => break,
+        let tag_end = body[after_name..].find('>').map(|i| after_name + i);
+        let string_attr_present = tag_end.and_then(|end| {
+            body[after_name..end]
+                .find("string=\"")
+                .map(|i| after_name + i)
+        });
+        let (is_string, content_start, content_end_search_from) = match string_attr_present {
+            Some(string_attr_open) => {
+                let string_attr_idx = string_attr_open + "string=\"".len();
+                let string_attr_end = match body[string_attr_idx..].find('"') {
+                    Some(i) => string_attr_idx + i,
+                    None => {
+                        cursor = next_cursor_on_break;
+                        continue;
+                    }
+                };
+                let is_string = &body[string_attr_idx..string_attr_end] == "true";
+                let content_start = match body[string_attr_end..].find("\">") {
+                    Some(i) => string_attr_end + i + 2,
+                    None => {
+                        cursor = next_cursor_on_break;
+                        continue;
+                    }
+                };
+                (is_string, content_start, content_start)
+            }
+            // No string attr — assume legacy/garbled form. Find the
+            // closing `>` immediately after the name's `"` (best
+            // effort) and treat the value as a plain string.
+            None => {
+                let content_start = match body[name_end..].find('>') {
+                    Some(i) => name_end + i + 1,
+                    None => {
+                        cursor = next_cursor_on_break;
+                        continue;
+                    }
+                };
+                (true, content_start, content_start)
+            }
         };
-        let string_attr_end = match body[string_attr_idx..].find('"') {
-            Some(i) => string_attr_idx + i,
-            None => break,
-        };
-        let is_string = &body[string_attr_idx..string_attr_end] == "true";
-        // After `">` find content + </｜DSML｜parameter>.
-        let content_start = match body[string_attr_end..].find("\">") {
-            Some(i) => string_attr_end + i + 2,
-            None => break,
-        };
-        let content_end = match body[content_start..].find(PARAMETER_CLOSE) {
-            Some(i) => content_start + i,
-            None => break,
+        let content_end = match body[content_end_search_from..].find(PARAMETER_CLOSE) {
+            Some(i) => content_end_search_from + i,
+            None => {
+                cursor = next_cursor_on_break;
+                continue;
+            }
         };
         let raw_value = &body[content_start..content_end];
         let value: Value = if is_string {
             Value::String(raw_value.to_string())
         } else {
-            serde_json::from_str(raw_value.trim()).unwrap_or_else(|_| Value::String(raw_value.to_string()))
+            serde_json::from_str(raw_value.trim())
+                .unwrap_or_else(|_| Value::String(raw_value.to_string()))
         };
         map.insert(name, value);
         cursor = content_end + PARAMETER_CLOSE.len();
@@ -713,6 +819,69 @@ mod tests {
         assert_eq!(calls[0].len(), 1, "expected one tool call");
         assert_eq!(calls[0][0].name, "read");
         assert_eq!(calls[0][0].arguments["path"], json!("/tmp/test.txt"));
+    }
+
+    #[test]
+    fn new_in_think_treats_stream_as_reasoning_until_close() {
+        // Simulates the V4F think-mode path: prompt ends with `<think>`,
+        // the parser starts inside the block, every emitted token is
+        // reasoning until `</think>` lands, then content resumes.
+        let mut p = StreamParser::new_in_think();
+        let mut events = p.feed("step one ");
+        events.extend(p.feed("step two</think>"));
+        events.extend(p.feed("final answer"));
+        events.extend(p.finish());
+        let mut reasoning = String::new();
+        let mut tokens = String::new();
+        for e in &events {
+            match e {
+                StreamEvent::Reasoning(t) => reasoning.push_str(t),
+                StreamEvent::Token(t) => tokens.push_str(t),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "step one step two");
+        assert_eq!(tokens, "final answer");
+    }
+
+    #[test]
+    fn recovers_from_bare_generic_close() {
+        // V4F MQ2-Lloyd has been observed truncating the close to the
+        // bare `</｜DSML｜>` form. The parser must still recover the
+        // invoke's name + parameters.
+        let body = "<｜DSML｜tool_calls>\n\
+<｜DSML｜tool name=\"edit\">\n\
+<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/x</｜DSML｜parameter>\n\
+</｜DSML｜>\n\
+</｜DSML｜tool_calls>";
+        let calls = parse_tool_calls_body(
+            &body
+                .strip_prefix("<｜DSML｜tool_calls>\n")
+                .unwrap()
+                .strip_suffix("</｜DSML｜tool_calls>")
+                .unwrap(),
+        );
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "edit");
+        assert_eq!(calls[0].arguments["path"], json!("/tmp/x"));
+    }
+
+    #[test]
+    fn continues_past_param_without_string_attr() {
+        // The model occasionally emits `<｜DSML｜parameter name="X">val</｜DSML｜parameter>`
+        // with no `string="..."` attr. Treat it as a string param and
+        // keep going so later well-formed params are still collected.
+        let body = "\
+<｜DSML｜invoke name=\"f\">\n\
+<｜DSML｜parameter name=\"a\">raw</｜DSML｜parameter>\n\
+<｜DSML｜parameter name=\"b\" string=\"false\">42</｜DSML｜parameter>\n\
+</｜DSML｜invoke>";
+        let calls = parse_tool_calls_body(body);
+        assert_eq!(calls.len(), 1);
+        // First param recovered as a plain string.
+        assert_eq!(calls[0].arguments["a"], json!("raw"));
+        // Second param parses as JSON int — proving the loop didn't bail.
+        assert_eq!(calls[0].arguments["b"], json!(42));
     }
 
     #[test]

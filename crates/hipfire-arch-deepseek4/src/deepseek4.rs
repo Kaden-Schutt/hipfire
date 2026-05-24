@@ -419,6 +419,68 @@ impl DeepseekV4LayerWeights {
             expert_gate_up_stride: 0,
         }
     }
+
+    /// Release every GPU buffer this layer owns back to the pool.
+    /// Used by `DeepseekV4Weights::free_gpu` to walk all 43 main layers
+    /// plus the optional MTP layer.
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.attn_norm);
+        free_opt(gpu, &mut self.ffn_norm);
+        free_opt(gpu, &mut self.q_norm);
+        free_opt(gpu, &mut self.kv_norm);
+        free_opt(gpu, &mut self.attn_sink);
+        free_opt(gpu, &mut self.wq_a);
+        free_opt(gpu, &mut self.wq_b);
+        free_opt(gpu, &mut self.wkv);
+        free_opt(gpu, &mut self.wo_a);
+        free_opt(gpu, &mut self.wo_b);
+        free_opt(gpu, &mut self.compressor_wkv);
+        free_opt(gpu, &mut self.compressor_wgate);
+        free_opt(gpu, &mut self.compressor_norm);
+        free_opt(gpu, &mut self.compressor_ape);
+        free_opt(gpu, &mut self.compressor_wkv_f16);
+        free_opt(gpu, &mut self.compressor_wgate_f16);
+        free_opt(gpu, &mut self.indexer_wq_b);
+        free_opt(gpu, &mut self.indexer_weights_proj);
+        free_opt(gpu, &mut self.indexer_compressor_wkv);
+        free_opt(gpu, &mut self.indexer_compressor_wgate);
+        free_opt(gpu, &mut self.indexer_compressor_wkv_f16);
+        free_opt(gpu, &mut self.indexer_compressor_wgate_f16);
+        free_opt(gpu, &mut self.indexer_compressor_norm);
+        free_opt(gpu, &mut self.indexer_compressor_ape);
+        free_opt(gpu, &mut self.mtp_enorm);
+        free_opt(gpu, &mut self.mtp_hnorm);
+        free_opt(gpu, &mut self.mtp_e_proj);
+        free_opt(gpu, &mut self.mtp_h_proj);
+        free_opt(gpu, &mut self.mtp_final_norm);
+        free_opt(gpu, &mut self.mtp_hc_head_fn);
+        free_opt(gpu, &mut self.mtp_hc_head_base);
+        free_opt(gpu, &mut self.hc_attn_base);
+        free_opt(gpu, &mut self.hc_attn_fn);
+        free_opt(gpu, &mut self.hc_attn_scale);
+        free_opt(gpu, &mut self.hc_ffn_base);
+        free_opt(gpu, &mut self.hc_ffn_fn);
+        free_opt(gpu, &mut self.hc_ffn_scale);
+        free_opt(gpu, &mut self.gate_weight);
+        free_opt(gpu, &mut self.gate_bias);
+        free_opt(gpu, &mut self.tid2eid_dev);
+        free_opt(gpu, &mut self.shared_w1);
+        free_opt(gpu, &mut self.shared_w2);
+        free_opt(gpu, &mut self.shared_w3);
+        free_opt(gpu, &mut self.expert_w1_blob);
+        free_opt(gpu, &mut self.expert_w2_blob);
+        free_opt(gpu, &mut self.expert_w3_blob);
+        free_opt(gpu, &mut self.expert_w1_ptrs);
+        free_opt(gpu, &mut self.expert_w2_ptrs);
+        free_opt(gpu, &mut self.expert_w3_ptrs);
+        free_opt(gpu, &mut self.expert_gate_up_blob);
+        free_opt(gpu, &mut self.expert_gate_up_ptrs);
+    }
 }
 
 /// DeepSeek V4 weights — fully populated: global embeddings + norms, per-layer
@@ -463,6 +525,30 @@ impl DeepseekV4Weights {
     ///
     /// Panics if `idx == layers.len()` but `mtp_layer.is_none()`, or
     /// if `idx > layers.len()`.
+    /// Release every GPU buffer these weights own back to the pool.
+    /// Consumes self. Walked by `unload_model` on idle eviction or
+    /// explicit unload so VRAM is actually returned to the system (not
+    /// just released back into the daemon's pool — `drain_pool` calls
+    /// `hipFree` after this).
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        free_opt(gpu, &mut self.token_embd);
+        free_opt(gpu, &mut self.output_norm);
+        free_opt(gpu, &mut self.head);
+        free_opt(gpu, &mut self.hc_head_fn);
+        free_opt(gpu, &mut self.hc_head_base);
+        for l in self.layers.drain(..) {
+            l.free_gpu(gpu);
+        }
+        if let Some(mtp) = self.mtp_layer.take() {
+            mtp.free_gpu(gpu);
+        }
+    }
+
     pub fn resolve_layer(&self, idx: usize) -> &DeepseekV4LayerWeights {
         if idx < self.layers.len() {
             &self.layers[idx]
@@ -947,10 +1033,119 @@ impl DeepseekV4State {
         // turn read stale data; drop the handle so the next request's
         // first spec step takes the alloc-then-fill path again.
         self.mtp_last_hidden = None;
+        // Force the next decode loop to retrace the warmup path
+        // (`decode_step` direct dispatch) before re-entering capture.
+        // Pairs with `gpu.invalidate_graph_state()` in the daemon's
+        // reset handler: graph_exec is dropped, ar_forward_warmed_up
+        // is dropped, so the next session's first decode call runs
+        // plain `decode_step` (allocs land out of the captured region),
+        // the second call captures fresh, and replay starts on the
+        // third call against state shaped for THIS session.
+        //
+        // Why this matters: the captured graph bakes the device-buffer
+        // pointers visited at capture time. Across reset() the buffers
+        // themselves are stable, but state-derived host scalars
+        // (compressor rope_pos default differs between
+        // `precompute_positions` "mid" and `update_pos_array_host`
+        // "start") and slot-derived lazy allocs (e.g.
+        // `state._attention[l].gathered_k` only allocates when a
+        // mixed-attention layer first fires) can land INSIDE the
+        // captured region of session-2 if session-1 didn't hit them.
+        // Forcing warmup → capture per session sidesteps the whole
+        // class of capture-time/replay-time staleness — and the cost
+        // is one extra direct-dispatch decode per turn, which is
+        // dwarfed by the prefill it follows.
+        self.ar_forward_warmed_up = false;
         // Other transient scratch tensors (`tmp`, `tmp_plain`, residual_streams,
         // attn_state_host, …) are pure per-step working memory: each
         // forward step writes them before reading, so stale contents
         // are overwritten on first use and don't need explicit zeroing.
+    }
+
+    /// Release every GPU buffer this state owns back to the pool.
+    /// Consumes self. Mirrors `Qwen2State::free_gpu`.
+    ///
+    /// Without this, `unload_model` for an `arch_id=9` LoadedModel would
+    /// drop `DeepseekV4State` via plain Rust Drop, which doesn't return
+    /// the pool-managed GpuTensors — every load/unload cycle leaks the
+    /// per-session scratch + per-layer SWA/indexer/compressor caches
+    /// until the daemon exits. Idle eviction can't reclaim VRAM in that
+    /// regime, defeating its purpose.
+    pub fn free_gpu(mut self, gpu: &mut rdna_compute::Gpu) {
+        fn free_opt(gpu: &mut rdna_compute::Gpu, t: &mut Option<rdna_compute::GpuTensor>) {
+            if let Some(t) = t.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Per-layer indexer + main-attention caches.
+        for mut l in self._indexer.drain(..) {
+            free_opt(gpu, &mut l.main_kv_cache);
+            free_opt(gpu, &mut l.main_kv_state);
+            free_opt(gpu, &mut l.main_score_state);
+            free_opt(gpu, &mut l.indexer_kv_cache);
+            free_opt(gpu, &mut l.indexer_kv_state);
+            free_opt(gpu, &mut l.indexer_score_state);
+            free_opt(gpu, &mut l.q_idx);
+            free_opt(gpu, &mut l.idx_weights);
+            free_opt(gpu, &mut l.index_score);
+            free_opt(gpu, &mut l.topk_idx_indices);
+            free_opt(gpu, &mut l.comp_kv_buf);
+            free_opt(gpu, &mut l.comp_score_buf);
+            free_opt(gpu, &mut l.comp_concat_kv);
+            free_opt(gpu, &mut l.comp_concat_score);
+        }
+        for mut l in self._attention.drain(..) {
+            free_opt(gpu, &mut l.swa_k);
+            free_opt(gpu, &mut l.swa_v);
+            free_opt(gpu, &mut l.full_k_cache);
+            free_opt(gpu, &mut l.full_v_cache);
+            free_opt(gpu, &mut l.gathered_k);
+            free_opt(gpu, &mut l.gathered_v);
+        }
+        // Top-level scratch.
+        free_opt(gpu, &mut self.residual_streams);
+        free_opt(gpu, &mut self.embed_scratch);
+        free_opt(gpu, &mut self.tmp);
+        free_opt(gpu, &mut self.tmp_plain);
+        free_opt(gpu, &mut self.mtp_e_norm_scratch);
+        free_opt(gpu, &mut self.mtp_h_norm_scratch);
+        free_opt(gpu, &mut self.mtp_last_hidden);
+        free_opt(gpu, &mut self.q_lat);
+        free_opt(gpu, &mut self.q_lat_rot);
+        free_opt(gpu, &mut self.q);
+        free_opt(gpu, &mut self.kv);
+        free_opt(gpu, &mut self.pos_buf);
+        free_opt(gpu, &mut self.comp_pos_buf);
+        free_opt(gpu, &mut self.pos_array_device);
+        free_opt(gpu, &mut self.token_id_buf);
+        free_opt(gpu, &mut self.attn_state_buf);
+        free_opt(gpu, &mut self.attn_out);
+        free_opt(gpu, &mut self.ffn_out);
+        free_opt(gpu, &mut self.ffn_x_rot);
+        free_opt(gpu, &mut self.ffn_x_plain);
+        free_opt(gpu, &mut self.ffn_gate);
+        free_opt(gpu, &mut self.ffn_up);
+        free_opt(gpu, &mut self.ffn_silu_rot);
+        free_opt(gpu, &mut self.final_norm);
+        free_opt(gpu, &mut self.logits);
+        free_opt(gpu, &mut self.final_norm_rot);
+        free_opt(gpu, &mut self.hc_x_in);
+        free_opt(gpu, &mut self.hc_c);
+        free_opt(gpu, &mut self.router_scores);
+        free_opt(gpu, &mut self.topk_indices);
+        free_opt(gpu, &mut self.routed_expert_out);
+        free_opt(gpu, &mut self.moe_topk_indices);
+        free_opt(gpu, &mut self.moe_topk_weights);
+        free_opt(gpu, &mut self.moe_gate_batch);
+        free_opt(gpu, &mut self.moe_up_batch);
+        free_opt(gpu, &mut self.moe_rot_batch);
+        free_opt(gpu, &mut self.q_head_ones);
+        free_opt(gpu, &mut self.attn_out_raw);
+        free_opt(gpu, &mut self.attn_out_raw_rot);
+        free_opt(gpu, &mut self.wo_a_out);
+        free_opt(gpu, &mut self.wo_a_out_rot);
+        free_opt(gpu, &mut self.head_hc_pre);
+        free_opt(gpu, &mut self.head_hc_out);
     }
 }
 

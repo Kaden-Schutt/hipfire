@@ -1656,11 +1656,32 @@ pub(crate) fn update_pos_array_host(
     state: &mut DeepseekV4State,
     position: u32,
 ) {
-    let comp_rope_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
-    let comp_rope_mode = comp_rope_mode.as_deref();
     let pos_array_host = state.pos_array_host.as_mut().expect(
         "update_pos_array_host: pos_array_host not initialised (call precompute_positions first)",
     );
+    fill_pos_array_host(cfg, pos_array_host, position);
+}
+
+/// Shared host-side fill of the per-layer `[qk_pos, main_comp_rope_pos,
+/// indexer_comp_rope_pos]` triples. Called by both `precompute_positions`
+/// (initial alloc + htod path) and `update_pos_array_host` (graph-replay
+/// host-only path).
+///
+/// Reference ds4 uses `comp_pos = pos + 1 - ratio` at compress events
+/// (i.e. start of the just-closed window). Equivalent to
+/// `pos / ratio * ratio` when `(pos+1) % ratio == 0`, which is exactly
+/// when an event fires. "start" matches the reference; "mid" / "end"
+/// remain available for diagnostic A/B via `HIPFIRE_DEEPSEEK4_COMP_ROPE_POS`.
+///
+/// Why one helper: prior to this refactor `precompute_positions` and
+/// `update_pos_array_host` carried independently-edited copies of this
+/// loop with DIFFERENT defaults (capture path: "mid", replay path:
+/// "start"). The captured graph then read one rope_pos at capture time
+/// and a different value at replay time, drifting compressor RoPE
+/// across the capture/replay boundary.
+fn fill_pos_array_host(cfg: &DeepseekV4Config, pos_array_host: &mut [i32], position: u32) {
+    let comp_rope_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
+    let comp_rope_mode = comp_rope_mode.as_deref();
     for layer_idx in 0..=cfg.num_hidden_layers {
         let ratio = if layer_idx < cfg.num_hidden_layers {
             cfg.compress_ratios[layer_idx] as usize
@@ -1670,11 +1691,6 @@ pub(crate) fn update_pos_array_host(
         let base = layer_idx * POS_SLOTS_PER_LAYER;
         pos_array_host[base] = position as i32;
         if ratio > 0 {
-            // Reference ds4 uses `comp_pos = pos + 1 - ratio` at compress
-            // events (i.e. start of the just-closed window). Equivalent to
-            // `pos / ratio * ratio` when `(pos+1) % ratio == 0`, which is
-            // exactly when an event fires. "start" matches the reference;
-            // "mid" / "end" remain available for diagnostic A/B.
             let main_rope_pos: i32 = match comp_rope_mode {
                 Some("end") => position as i32,
                 Some("mid") => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
@@ -4234,38 +4250,8 @@ pub fn precompute_positions(
         state.pos_array_host = Some(vec![0i32; total_slots].into_boxed_slice());
     }
 
-    // Read env vars once per call (compile-time const + env cache would be
-    // better; this is intentionally a single read, not 43× per-layer reads).
-    let comp_rope_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS").ok();
-    let comp_rope_mode = comp_rope_mode.as_deref();
-
     let pos_array_host = state.pos_array_host.as_mut().unwrap();
-    for layer_idx in 0..=cfg.num_hidden_layers {
-        // Per-layer compress_ratio; MTP layer (idx == num_hidden_layers)
-        // has compress_ratio = 0 by DeepSeek V4 construction (no compressor).
-        let ratio = if layer_idx < cfg.num_hidden_layers {
-            cfg.compress_ratios[layer_idx] as usize
-        } else {
-            0
-        };
-        let base = layer_idx * POS_SLOTS_PER_LAYER;
-        pos_array_host[base] = position as i32;
-        if ratio > 0 {
-            let main_rope_pos: i32 = match comp_rope_mode {
-                Some("end") => position as i32,
-                Some("start") => ((position as usize) / ratio * ratio) as i32,
-                _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
-            };
-            // Indexer always uses start-of-window (matches the indexer Q
-            // rotation derivation in compressor_forward).
-            let indexer_rope_pos = ((position as usize) / ratio * ratio) as i32;
-            pos_array_host[base + 1] = main_rope_pos;
-            pos_array_host[base + 2] = indexer_rope_pos;
-        } else {
-            pos_array_host[base + 1] = 0;
-            pos_array_host[base + 2] = 0;
-        }
-    }
+    fill_pos_array_host(cfg, pos_array_host, position);
 
     // ONE htod for the whole array. Source is the stable Box<[i32]> on
     // the heap, so captured graph nodes can re-read it on replay.
@@ -5025,6 +5011,88 @@ impl PrefillBatchScratch {
                 t
             },
         })
+    }
+
+    /// Release every GPU buffer this prefill-batch scratch owns back to
+    /// the pool. Consumes self. Called from `unload_model` on idle
+    /// eviction / explicit unload so the ~50 sizeable per-chunk buffers
+    /// (embed_batch, streams_batch, swa_staged_batch, MoE grouped
+    /// scratches, …) actually return their VRAM rather than leaking.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        for t in [
+            self.embed_batch,
+            self.streams_batch,
+            self.tokens,
+            self.tmp_batch,
+            self.tmp_plain_batch,
+            self.q_lat_batch,
+            self.q_lat_rot_batch,
+            self.q_batch,
+            self.q_head_ones,
+            self.kv_batch,
+            self.positions,
+            self.hc_c_batch,
+            self.hc_pre_batch,
+            self.hc_post_batch,
+            self.hc_comb_batch,
+            self.hc_x_in_batch,
+            self.attn_out_batch,
+            self.ffn_out_batch,
+            self.streams_out_batch,
+            self.swa_staged_batch,
+            self.topk_staged_batch,
+            self.n_valid_swa_arr,
+            self.n_active_topk_arr,
+            self.attn_out_raw_batch,
+            self.attn_out_raw_rot_batch,
+            self.wo_a_out_batch,
+            self.wo_a_out_rot_batch,
+            self.ffn_x_rot_batch,
+            self.ffn_x_plain_batch,
+            self.ffn_shared_gate_batch,
+            self.ffn_shared_up_batch,
+            self.ffn_shared_rot_batch,
+            self.moe_scores_batch,
+            self.moe_topk_indices_batch,
+            self.moe_topk_weights_batch,
+            self.moe_gate_batch,
+            self.moe_up_batch,
+            self.moe_rot_batch,
+            self.moe_down_expert_outputs,
+            self.idx_q_batch,
+            self.idx_w_batch,
+            self.idx_scores_batch,
+            self.idx_topk_indices_batch,
+            self.comp_main_kv_batch,
+            self.comp_main_score_batch,
+            self.comp_idx_kv_batch,
+            self.comp_idx_score_batch,
+            self.moe_sorted_b,
+            self.moe_sorted_krank,
+            self.moe_sorted_expert,
+            self.moe_expert_starts,
+            self.moe_expert_token_counts,
+            self.moe_expert_offsets,
+            self.moe_sorted_slot_index,
+            self.moe_expert_tile_ids,
+            self.moe_inverse_perm,
+            self.moe_y_gate_up_grouped,
+            self.moe_x_grouped,
+            self.moe_y_down_grouped,
+            self.tmp_batch_f16,
+            self.tmp_plain_batch_f16,
+            self.wmma_x_scratch_f16,
+            self.comp_positions,
+            self.pos_array_device_batch,
+            self.attn_state_buf_batch,
+            self.mtp_tokens_batch,
+            self.mtp_embed_batch,
+            self.mtp_e_norm_batch,
+            self.mtp_h_norm_batch,
+            self.mtp_x_e_batch,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 
