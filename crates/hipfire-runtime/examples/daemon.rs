@@ -4681,11 +4681,37 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 }
                 Role::Assistant => {
                     if let Some(a) = asst_tok { prompt_ids.push(a); }
-                    // Assistant content. If the recorded message
-                    // included DSML tool calls, the caller should have
-                    // serialised them into `msg.content` already; if
-                    // not, the plain text is emitted.
-                    prompt_ids.extend(tokenizer.encode(&msg.content));
+                    // Plain assistant text (whatever the upstream caller
+                    // serialised into `content`; the OpenAI-compat
+                    // surface sends "" for tool_call-only turns).
+                    if !msg.content.is_empty() && msg.content != "null" {
+                        prompt_ids.extend(tokenizer.encode(&msg.content));
+                    }
+                    // Re-render any structured `tool_calls` carried on
+                    // this turn back into the DSML block the model
+                    // emitted in the first place. Without this, the V4F
+                    // arm fed prior tool_call turns to the model as the
+                    // literal string "null" (from `extractText(content)`
+                    // when content is JSON null), which the MQ2-Lloyd
+                    // checkpoint reads as off-distribution noise and
+                    // responds by inventing replacement paths — observed
+                    // 2026-05-24 chasing the `/home/nick/CLion/tembrane`
+                    // (missing `Projects`) regression in pi-coding-agent
+                    // sessions.
+                    if !msg.tool_calls.is_empty() {
+                        let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
+                            .tool_calls
+                            .iter()
+                            .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            })
+                            .collect();
+                        let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
+                            &dsml_calls,
+                        );
+                        prompt_ids.extend(tokenizer.encode(&dsml));
+                    }
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
@@ -4694,8 +4720,18 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     }
 
-    if let Some(u) = user_tok { prompt_ids.push(u); }
-    prompt_ids.extend(tokenizer.encode(prompt));
+    // Append the live user turn ONLY when `prompt` carries one. When the
+    // serve has handed us a structured `messages` history that already
+    // ends in a tool result (mid-conversation, model is meant to continue
+    // generating the next assistant turn) it sends `prompt=""` — in that
+    // case we MUST NOT emit an empty `<｜User｜><｜Assistant｜>` wrapper,
+    // because the empty-user turn is off-distribution and the V4F MQ2-
+    // Lloyd checkpoint drifts into invented paths / repeated wrong tool
+    // calls when fed one.
+    if !prompt.is_empty() {
+        if let Some(u) = user_tok { prompt_ids.push(u); }
+        prompt_ids.extend(tokenizer.encode(prompt));
+    }
     if let Some(a) = asst_tok { prompt_ids.push(a); }
     // Thinking-mode signal token immediately after `<｜Assistant｜>`:
     //   NonThink → `</think>`   (skip reasoning, respond directly)

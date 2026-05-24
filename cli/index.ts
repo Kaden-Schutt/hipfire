@@ -1404,6 +1404,13 @@ async function serve(port: number, host: string) {
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
   let modelHasVL = false;
+  // Architecture tag from the most recent daemon `loaded` event (e.g.
+  // "qwen2", "qwen35", "deepseek4"). Used to gate format-specific
+  // serve-side prompt construction — V4F's daemon path renders tools
+  // via DSML and reads multi-turn history from structured `messages`,
+  // so the legacy Hermes `<tools>` block injection and ChatML
+  // conversation rebuild both turn into off-distribution noise.
+  let currentArch: string | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1470,6 +1477,7 @@ async function serve(port: number, host: string) {
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
         modelHasVL = loadResult.vl === true;
+        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1673,8 +1681,19 @@ async function serve(port: number, host: string) {
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
-        // Format tools into system prompt (Hermes format)
-        if (tools.length > 0) {
+        // Format tools into system prompt (Hermes XML `<tools>` style).
+        // Legacy daemon paths (qwen2 generate) only see tools through the
+        // text prompt — for them the Hermes block is the ONLY tool surface.
+        //
+        // V4F (arch_id=9 / `currentArch === "deepseek4"`) takes the
+        // structured `tools` array straight from the daemon request and
+        // renders its OWN DSML `<｜DSML｜tool_calls>` instruction block
+        // inside `generate_deepseek4`. Prepending a Hermes block here on
+        // top of that gives the model TWO conflicting tool-call format
+        // contracts in the same system message — confirmed cause of the
+        // V4F "<tool_call>{…}</tool_call>" leakage observed in
+        // /tmp/hipfire-prompt-*.txt dumps. Skip it for that arch.
+        if (tools.length > 0 && currentArch !== "deepseek4") {
           const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
             + tools.map((t: any) => JSON.stringify(t)).join("\n")
             + "\n</tools>\n\n"
@@ -1776,6 +1795,34 @@ async function serve(port: number, host: string) {
         }
         userPrompt = convParts.join("");
 
+        // V4F (and any other arch with a structured-messages daemon path)
+        // uses `messages` for history and treats `prompt` as the LIVE user
+        // message text only — not as a ChatML-formatted conversation
+        // duplicate. Sending the full ChatML in `prompt` here causes the
+        // V4F daemon to render the conversation twice (once via messages
+        // in V4F format, once via prompt in ChatML format), feeding the
+        // model `<｜User｜>…<｜Assistant｜>null<｜end▁of▁sentence｜>…` plus
+        // `<|im_start|>assistant\nnull\n<tool_call>…` in the same prompt —
+        // catastrophically off-distribution.
+        //
+        // Override `userPrompt` to just the trailing user message's text
+        // (or empty if the conversation ends with a tool/assistant turn —
+        // the daemon should then continue from `<｜Assistant｜>` directly).
+        // Legacy non-structured-message daemon paths still see the same
+        // bytes because they only read `prompt` and never consult
+        // `messages` — for those, the LEGACY behaviour was to take the
+        // last user turn as the prompt anyway, so this just removes the
+        // duplicate-history noise.
+        {
+          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
+          if (last && last.role === "user") {
+            const lastContent = extractContent(last.content);
+            userPrompt = lastContent.text;
+          } else {
+            userPrompt = "";
+          }
+        }
+
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
@@ -1813,6 +1860,7 @@ async function serve(port: number, host: string) {
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
+          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
