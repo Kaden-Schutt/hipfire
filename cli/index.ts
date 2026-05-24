@@ -2175,6 +2175,13 @@ async function serve(port: number, host: string) {
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
+                // V4F arm emits structured `tool_calls` events via the DSML
+                // StreamParser BEFORE the `done` event lands. We track that
+                // here so the done handler can finish with
+                // `finish_reason: "tool_calls"` instead of falling back to
+                // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
+                // decide whether the message ended with a callable action).
+                let structuredToolCallsEmitted = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
@@ -2265,10 +2272,24 @@ async function serve(port: number, host: string) {
                         }]
                       })}\n\n`));
                       visibleChunkSent = true;
+                      structuredToolCallsEmitted = true;
                     }
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // V4F-style: structured tool_calls already emitted on the
+                    // wire. Skip the legacy text-buffer parser path and close
+                    // out with the OpenAI-correct `finish_reason: "tool_calls"`.
+                    if (structuredToolCallsEmitted) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                      })}\n\n`));
+                      ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                      ctrl.close();
+                      return;
+                    }
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -2347,10 +2368,35 @@ async function serve(port: number, host: string) {
         let promptTokens = 0;
         let daemonError: string | null = null;
         e.generating = true;
+        // V4F arm emits structured `tool_calls` events from the DSML
+        // StreamParser. Capture them here so the non-streaming chat-
+        // completion response can carry an OpenAI-format `tool_calls`
+        // array on the assistant message. Without this, the non-stream
+        // path falls back to `parseToolCalls(content)` on the
+        // (typically empty) accumulated text and returns
+        // `finish_reason: "stop"` with a missing `tool_calls` field.
+        let structuredToolCalls: any[] | null = null;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
           else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+          else if (msg.type === "tool_calls") {
+            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+            if (calls.length > 0) {
+              if (structuredToolCalls === null) structuredToolCalls = [];
+              for (let i = 0; i < calls.length; i++) {
+                const c = calls[i] as { name: string; arguments: unknown };
+                const argStr = typeof c.arguments === "string"
+                  ? c.arguments
+                  : JSON.stringify(c.arguments);
+                structuredToolCalls.push({
+                  id: `call_${reqId}_${structuredToolCalls.length}`,
+                  type: "function",
+                  function: { name: c.name, arguments: argStr }
+                });
+              }
+            }
+          }
         }
         e.generating = false;
 
@@ -2396,13 +2442,30 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Check for tool calls in response
-        const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
-        if (parsed.tool_calls) {
-          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+        // Tool calls. V4F arm yields them as structured events (captured
+        // above into `structuredToolCalls`); legacy arches embed them as
+        // text the parser extracts. Prefer the structured source when it
+        // emitted anything.
+        const choice: any = { index: 0 };
+        if (structuredToolCalls && structuredToolCalls.length > 0) {
+          // V4F's `Token` events outside the `<｜DSML｜tool_calls>` block
+          // already streamed any preceding assistant text. Pass that
+          // through as the message content (trimmed — the model
+          // typically emits trailing `\n\n` after closing `</think>`).
+          choice.finish_reason = "tool_calls";
+          choice.message = {
+            role: "assistant",
+            content: content.trim() || null,
+            tool_calls: structuredToolCalls,
+          };
         } else {
-          choice.message = { role: "assistant", content };
+          const parsed = parseToolCalls(content);
+          choice.finish_reason = parsed.tool_calls ? "tool_calls" : "stop";
+          if (parsed.tool_calls) {
+            choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+          } else {
+            choice.message = { role: "assistant", content };
+          }
         }
 
         safeRelease();

@@ -189,23 +189,22 @@ fn emit_stream_event(
     ev: hipfire_arch_deepseek4::dsml::StreamEvent,
 ) {
     use hipfire_arch_deepseek4::dsml::StreamEvent;
-    match ev {
-        StreamEvent::Token(text) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default()
-            );
-        }
-        StreamEvent::Reasoning(text) => {
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"reasoning","id":"{}","text":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default()
-            );
-        }
+    // The request id is user-supplied. Build the envelope through
+    // `serde_json` so any embedded `"` / `\` / control chars are
+    // escaped — otherwise a malformed id corrupts every subsequent
+    // line of the JSONL stream and the cli/serve loop dies with a
+    // `JSON Parse error: Expected '}'`.
+    let envelope = match ev {
+        StreamEvent::Token(text) => serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": text,
+        }),
+        StreamEvent::Reasoning(text) => serde_json::json!({
+            "type": "reasoning",
+            "id": id,
+            "text": text,
+        }),
         StreamEvent::ToolCalls(calls) => {
             let arr: Vec<serde_json::Value> = calls
                 .into_iter()
@@ -216,14 +215,14 @@ fn emit_stream_event(
                     })
                 })
                 .collect();
-            let payload = serde_json::Value::Array(arr);
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
-                id, payload
-            );
+            serde_json::json!({
+                "type": "tool_calls",
+                "id": id,
+                "calls": serde_json::Value::Array(arr),
+            })
         }
-    }
+    };
+    let _ = writeln!(stdout, "{}", envelope);
 }
 
 fn emit_committed_event(
