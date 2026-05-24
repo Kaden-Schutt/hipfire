@@ -188,10 +188,33 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
 }
 
 /// Render a tool-result payload to embed inside the user-turn of a
-/// follow-up message. `result_json` should already be a JSON-encoded
-/// string of whatever the tool returned.
-pub fn render_tool_result(result_json: &str) -> String {
-    format!("{TOOL_RESULT_OPEN}{result_json}{TOOL_RESULT_CLOSE}")
+/// follow-up message. The reference imatrix dataset renderer
+/// (`gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:101-108`)
+/// XML-escapes `&`, `<`, `>` in the tool-result body so embedded
+/// markup can't terminate the `</tool_result>` sentinel early or
+/// confuse the model into reading an HTML-looking substring as a real
+/// tag. V4F was trained on the escaped form, so we match it bytewise.
+pub fn render_tool_result(result_text: &str) -> String {
+    let escaped = escape_tool_result_body(result_text);
+    format!("{TOOL_RESULT_OPEN}{escaped}{TOOL_RESULT_CLOSE}")
+}
+
+/// Match `build_ds4_imatrix_dataset.py::escape_tool_result` — escape
+/// `&`, `<`, `>` so the tool-result body can't introduce stray markup
+/// that the model reads as structural tokens. Order matters: `&` must
+/// be escaped FIRST so the replacement strings (`&amp;`, `&lt;`,
+/// `&gt;`) aren't double-escaped.
+fn escape_tool_result_body(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 // ── Output-side: streaming parser ───────────────────────────────────────

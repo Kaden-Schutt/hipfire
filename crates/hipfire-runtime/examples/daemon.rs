@@ -4660,6 +4660,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         use hipfire_runtime::prompt_frame::Role;
         let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) { 1 } else { 0 };
         let end = history.len().saturating_sub(trim_end);
+        // Track whether the previous emission was already a tool_result
+        // wrapped in a user turn — when YES, the next consecutive tool
+        // message MUST NOT open a new `<｜User｜>` marker; instead it
+        // stacks its `<tool_result>` body into the existing user turn.
+        // Matches the reference imatrix dataset renderer in
+        // `gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:196-201`
+        // — OpenAI's parallel-tool-call flow produces consecutive tool
+        // messages (one per parallel call), and a fresh `<｜User｜>`
+        // between them isn't what V4F was trained on.
+        let mut pending_tool_result = false;
         for msg in &history[..end] {
             match msg.role {
                 Role::System => {
@@ -4668,16 +4678,19 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 Role::User => {
                     if let Some(u) = user_tok { prompt_ids.push(u); }
                     prompt_ids.extend(tokenizer.encode(&msg.content));
+                    pending_tool_result = false;
                 }
                 Role::Tool => {
-                    // Wrap as `<tool_result>{json}</tool_result>` inside
-                    // the most recent user turn. We emit the user marker
-                    // here so a standalone "tool" message at history
-                    // start still parses (defensive).
-                    if let Some(u) = user_tok { prompt_ids.push(u); }
+                    // Wrap as `<tool_result>{escaped}</tool_result>`. Open
+                    // a new user turn ONLY if the prior message wasn't
+                    // already a tool_result.
+                    if !pending_tool_result {
+                        if let Some(u) = user_tok { prompt_ids.push(u); }
+                    }
                     prompt_ids.extend(
                         tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content))
                     );
+                    pending_tool_result = true;
                 }
                 Role::Assistant => {
                     if let Some(a) = asst_tok { prompt_ids.push(a); }
@@ -4731,6 +4744,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
+                    pending_tool_result = false;
                 }
             }
         }
