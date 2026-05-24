@@ -4801,15 +4801,100 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         .unwrap_or(3);
 
     let t0 = Instant::now();
-    let start_pos: u32 = state.n_tokens as u32;
+
+    // ── Prefix-cache LCP detection ──────────────────────────────────
+    //
+    // Reasonix's prompt-caching model (`tmp/reasonix_arch.md` Pillar 1):
+    // construct prompts as `immutable_prefix + append_only_log` so the
+    // backend's prefix cache hits on every turn. Reasonix is a CLIENT
+    // that targets DeepSeek's server-side cache; for LOCAL inference we
+    // implement the server side here.
+    //
+    // Compare the freshly-tokenized prompt against the tokens we know
+    // are already resident in the V4F KV / SWA / compressed-KV rings
+    // from the prior request (`m.conversation_tokens`). If the new
+    // prompt FULLY EXTENDS the prior conversation — i.e., starts with
+    // the entire `conversation_tokens` — we can skip prefill for those
+    // tokens and only prefill the suffix.
+    //
+    // SWA-safety analysis for partial LCP (lcp < prior.len()):
+    //
+    // Suppose prior wrote positions [0..prior_max_pos], turn 2's suffix
+    // writes [lcp..prompt_ids.len()-1]. After turn 2's prefill the new
+    // max position is `prompt_ids.len() - 1`. The model's first decode
+    // attends to a window of `min(prompt_ids.len(), 128)` positions
+    // ending at `prompt_ids.len() - 1`. Each window position maps to a
+    // unique ring slot via `pos % 128`. For correctness, every slot in
+    // that window must currently hold K_rotated for the matching
+    // position:
+    //
+    //   * For positions in `[0..lcp-1]` — turn 1 wrote them, content
+    //     matches by LCP definition. Untouched since.
+    //   * For positions in `[lcp..prompt_ids.len()-1]` — turn 2's suffix
+    //     prefill just wrote them. Content matches the new prompt.
+    //
+    // Stale-slot risk: if turn 1 had written a slot at some position
+    // `P_late ∈ [lcp..prior_max_pos]` AND turn 2 doesn't overwrite that
+    // slot, the slot holds K_rotated for P_late, not the new prompt's
+    // token at that position. The window read returns wrong content.
+    //
+    // Turn 2's suffix prefill covers positions [lcp..prompt_ids.len()-1].
+    // To overwrite every slot turn 1 wrote in `[lcp..prior_max_pos]`,
+    // we need `prompt_ids.len() - 1 ≥ prior_max_pos`, i.e.
+    // `prompt_ids.len() ≥ prior.len()`. Equivalently: the new prompt
+    // must be at least as long as the cached conversation.
+    //
+    // We additionally guard `lcp == prior.len() && prompt_ids.len() ==
+    // prior.len()` (full match, nothing to do) with a noop check
+    // downstream (suffix_tokens is empty).
+    //
+    // After the daemon's `reset` handler clears `m.conversation_tokens`
+    // (legacy stateless path), `prior` is empty and `lcp = 0` → full
+    // prefill. For prefix-cache mode the serve stops calling reset for
+    // V4F and lets this LCP detection drive cache-hit accounting.
+    let lcp: usize = {
+        let prior = &m.conversation_tokens;
+        if prior.is_empty() || prompt_ids.len() < prior.len() {
+            0
+        } else {
+            let mut n = 0usize;
+            while n < prior.len() && prior[n] == prompt_ids[n] {
+                n += 1;
+            }
+            // Edge case: new prompt is byte-identical to the cached
+            // conversation. Suffix would be empty and
+            // `forward_prefill_batch_chunked` errors on that. Step the
+            // LCP back one so we always prefill ≥ 1 token (and the
+            // post-prefill logits are well-defined for the first
+            // decode step). Costs us one token of cache credit on
+            // exact-repeat prompts — rare in practice.
+            if n == prompt_ids.len() && n > 0 {
+                n - 1
+            } else {
+                n
+            }
+        }
+    };
+
+    if lcp == 0 {
+        // Cache miss — start a fresh conversation in V4F's state.
+        state.reset();
+        m.conversation_tokens.clear();
+    }
+    let start_pos: u32 = lcp as u32;
+
+    // Slice off the suffix — the only tokens we actually need to prefill.
+    // For lcp=0 this is the full prompt; for a full cache hit on a turn
+    // that adds N new tokens this is just those N.
+    let suffix_tokens: &[u32] = &prompt_ids[lcp..];
 
     // Prefill: batched chunked through PBS. If spec_mode, also fill the
     // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
     // draft step sees a populated MTP history.
     let prefill_result = if spec_mode {
-        deepseek4::forward::prefill_with_mtp_fill(cfg, weights, state, gpu, pbs, &prompt_ids, start_pos)
+        deepseek4::forward::prefill_with_mtp_fill(cfg, weights, state, gpu, pbs, suffix_tokens, start_pos)
     } else {
-        deepseek4::forward::forward_prefill_batch_chunked(cfg, weights, state, gpu, &prompt_ids, start_pos, pbs)
+        deepseek4::forward::forward_prefill_batch_chunked(cfg, weights, state, gpu, suffix_tokens, start_pos, pbs)
     };
     let last_logits = match prefill_result {
         Ok(l) => l,
@@ -4827,9 +4912,28 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
     // advance internally (forward.rs:7453), so we only need to update
     // for the plain-prefill branch.
     if !spec_mode {
-        state.n_tokens = (start_pos as usize + prompt_ids.len()) as u64;
+        state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
     }
-    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    // Keep `m.conversation_tokens` in lockstep with what's actually
+    // resident in the KV/SWA/compressed-KV rings:
+    //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
+    //     full-prefilled the whole prompt).
+    //   - On a CACHE HIT (lcp>0): truncate the prior tracker down to
+    //     `lcp` before appending the suffix. For partial LCP this
+    //     matters — tokens in the prior tracker beyond `lcp` came
+    //     from a previous turn's decode but the slots they lived in
+    //     have just been overwritten by the suffix prefill. Leaving
+    //     them in the tracker would let the NEXT request's LCP
+    //     comparison run off the end of what's actually cached and
+    //     make divergent assumptions about ring contents.
+    if lcp == 0 {
+        m.conversation_tokens.clear();
+        m.conversation_tokens.extend_from_slice(&prompt_ids);
+    } else {
+        m.conversation_tokens.truncate(lcp);
+        m.conversation_tokens.extend_from_slice(suffix_tokens);
+    }
+    let cached_tokens: usize = lcp;
 
     // Sync to ensure all prefill kernels have completed before stopping
     // the timer (head's download_f32 already syncs but defensive).
@@ -5048,25 +5152,57 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         0.0
     };
 
-    if spec_mode {
+    // Build the done envelope through serde_json so the new
+    // `cached_tokens` field (V4F prefix-cache LCP hit count) interleaves
+    // cleanly with the legacy `prefill_tokens` / `prefill_ms` / spec
+    // counters. The TTL of stale {} interpolation here is exactly the
+    // surface area we just fixed in `emit_error_with_id` — same risk
+    // class.
+    //
+    // `prefill_tokens` semantics: number of tokens actually FED to the
+    // forward path this turn (i.e., suffix_tokens.len(), == total
+    // prompt minus cached prefix). Cache-hit accounting:
+    //   prompt_tokens (sent by client)       = prompt_ids.len()
+    //   cached_tokens (prefix-cache hit)     = cached_tokens (= lcp)
+    //   prefill_tokens (actually prefilled)  = suffix_tokens.len()
+    // Sum: cached + prefill == prompt_tokens. The CLI's OpenAI-compat
+    // layer maps `cached_tokens` → `usage.prompt_tokens_details.cached_tokens`.
+    let prompt_tokens_total = prompt_ids.len();
+    let prefill_tokens_actual = suffix_tokens.len();
+    let done_envelope = if spec_mode {
         let accept_pct = if spec_drafts_offered > 0 {
             spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
         } else {
             0.0
         };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{},"spec_k":{},"spec_windows":{},"spec_accept_pct":{:.1}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms,
-            spec_k, spec_windows, accept_pct,
-        );
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "spec_k": spec_k,
+            "spec_windows": spec_windows,
+            "spec_accept_pct": accept_pct,
+        })
     } else {
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
-            id, generated_count, tok_s, prefill_ms, total_ms,
-        );
-    }
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+        })
+    };
+    let _ = writeln!(stdout, "{}", done_envelope);
     let _ = stdout.flush();
 }
 

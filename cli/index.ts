@@ -1558,9 +1558,24 @@ async function serve(port: number, host: string) {
           }
         }
 
-        // OpenAI API is stateless: each request has the full conversation.
-        // Reset daemon state so prior requests don't bleed into this one.
-        await e.send({ type: "reset" }); await e.recv();
+        // OpenAI API is stateless: each request CARRIES the full
+        // conversation. For most archs we tell the daemon to reset
+        // here so prior turn KV doesn't bleed into this one.
+        //
+        // V4F is the exception. Its daemon arm runs LCP detection
+        // (Reasonix-style prefix caching): if the freshly-tokenized
+        // prompt fully extends `m.conversation_tokens` from the prior
+        // turn, the daemon skips prefill for the matching prefix and
+        // only prefills the suffix — exactly the cache-hit shape
+        // Reasonix engineers for upstream. Calling `reset` here clears
+        // `m.conversation_tokens` and forces lcp=0 every turn, which
+        // is correct stateless behavior but throws away the cache.
+        // Skip the reset for V4F and let the daemon's auto-LCP
+        // (with a strict "fully extends" guard for SWA-ring safety)
+        // decide whether this is a continuation or a fresh request.
+        if (currentArch !== "deepseek4") {
+          await e.send({ type: "reset" }); await e.recv();
+        }
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -1916,9 +1931,40 @@ async function serve(port: number, host: string) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
-        // Include usage 
+        // Include usage
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
+
+        // Build the OpenAI-format `usage` object. The V4F daemon arm
+        // emits `prompt_tokens` (full client-visible prompt size) and
+        // `cached_tokens` (LCP-hit count from the prefix cache) as
+        // separate fields; legacy arches only emit `prefill_tokens`
+        // (== the number of tokens actually fed through the forward
+        // path) and we fall back to that for `prompt_tokens` so the
+        // total still balances on those paths.
+        //
+        // `usage.prompt_tokens_details.cached_tokens` is the OpenAI
+        // surface DeepSeek / pi-coding-agent / OpenCode read for
+        // cache-hit accounting; we emit it whenever the daemon
+        // reports cached_tokens > 0 (V4F today; other archs when /
+        // if they grow LCP detection).
+        const buildUsage = (msg: any, completion: number) => {
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : (typeof msg.prefill_tokens === "number" ? msg.prefill_tokens : 0);
+          const cachedTokens: number = typeof msg.cached_tokens === "number"
+            ? msg.cached_tokens
+            : 0;
+          const usage: any = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completion,
+            total_tokens: promptTokens + completion,
+          };
+          if (cachedTokens > 0) {
+            usage.prompt_tokens_details = { cached_tokens: cachedTokens };
+          }
+          return usage;
+        };
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -2360,7 +2406,7 @@ async function serve(port: number, host: string) {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                       })}\n\n`));
                       ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                       ctrl.close();
@@ -2385,7 +2431,7 @@ async function serve(port: number, host: string) {
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2397,7 +2443,7 @@ async function serve(port: number, host: string) {
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
                           choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       }
                     } else {
@@ -2405,7 +2451,7 @@ async function serve(port: number, host: string) {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
@@ -2442,6 +2488,7 @@ async function serve(port: number, host: string) {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
+        let cachedTokens = 0;
         let daemonError: string | null = null;
         e.generating = true;
         // V4F arm emits structured `tool_calls` events from the DSML
@@ -2454,7 +2501,19 @@ async function serve(port: number, host: string) {
         let structuredToolCalls: any[] | null = null;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
+          else if (msg.type === "done") {
+            // `prompt_tokens` is the full client-visible prompt size
+            // (V4F emits it). `prefill_tokens` (legacy) is what
+            // actually went through forward — equal to prompt when
+            // cached_tokens is 0. Fall back to prefill_tokens so the
+            // non-V4F paths keep their existing accounting.
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : (msg.prefill_tokens ?? 0);
+            cachedTokens = typeof msg.cached_tokens === "number"
+              ? msg.cached_tokens
+              : 0;
+          }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
           else if (msg.type === "tool_calls") {
             const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
@@ -2548,7 +2607,17 @@ async function serve(port: number, host: string) {
         const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          usage: (() => {
+            const u: any = {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+            };
+            if (cachedTokens > 0) {
+              u.prompt_tokens_details = { cached_tokens: cachedTokens };
+            }
+            return u;
+          })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
