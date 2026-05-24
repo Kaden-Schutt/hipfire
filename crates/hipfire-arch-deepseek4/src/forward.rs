@@ -1065,9 +1065,12 @@ fn compressor_forward_batched(
 
         // Tail RoPE batched. Per event we want a per-event position.
         // Build the position array on host and upload once.
+        // See note in `update_pos_array_host` — "start" matches reference
+        // ds4 (`comp_pos = pos + 1 - ratio`). Default to that; "mid" / "end"
+        // remain available via env var for diagnostic A/B.
         let rope_pos_mode = std::env::var("HIPFIRE_DEEPSEEK4_COMP_ROPE_POS")
             .ok()
-            .unwrap_or_else(|| "mid".to_string());
+            .unwrap_or_else(|| "start".to_string());
         let positions_host: Vec<i32> = (0..n_events_capped)
             .map(|k| {
                 let absolute_event_pos = first_event_chunk_pos + k * ratio + (start_pos as usize);
@@ -1077,8 +1080,8 @@ fn compressor_forward_batched(
                 } else {
                     match rope_pos_mode.as_str() {
                         "end" => absolute_event_pos as i32,
-                        "start" => (absolute_event_pos / ratio * ratio) as i32,
-                        _ => ((absolute_event_pos / ratio * ratio) + ratio / 2) as i32,
+                        "mid" => ((absolute_event_pos / ratio * ratio) + ratio / 2) as i32,
+                        _ => (absolute_event_pos / ratio * ratio) as i32,
                     }
                 }
             })
@@ -1667,10 +1670,15 @@ pub(crate) fn update_pos_array_host(
         let base = layer_idx * POS_SLOTS_PER_LAYER;
         pos_array_host[base] = position as i32;
         if ratio > 0 {
+            // Reference ds4 uses `comp_pos = pos + 1 - ratio` at compress
+            // events (i.e. start of the just-closed window). Equivalent to
+            // `pos / ratio * ratio` when `(pos+1) % ratio == 0`, which is
+            // exactly when an event fires. "start" matches the reference;
+            // "mid" / "end" remain available for diagnostic A/B.
             let main_rope_pos: i32 = match comp_rope_mode {
                 Some("end") => position as i32,
-                Some("start") => ((position as usize) / ratio * ratio) as i32,
-                _ => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
+                Some("mid") => (((position as usize) / ratio * ratio) + ratio / 2) as i32,
+                _ => ((position as usize) / ratio * ratio) as i32,
             };
             let indexer_rope_pos = ((position as usize) / ratio * ratio) as i32;
             pos_array_host[base + 1] = main_rope_pos;
