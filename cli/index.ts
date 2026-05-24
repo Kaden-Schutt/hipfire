@@ -1690,26 +1690,14 @@ async function serve(port: number, host: string) {
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
-        // Format tools into system prompt (Hermes XML `<tools>` style).
-        // Legacy daemon paths (qwen2 generate) only see tools through the
-        // text prompt — for them the Hermes block is the ONLY tool surface.
-        //
-        // V4F (arch_id=9 / `currentArch === "deepseek4"`) takes the
-        // structured `tools` array straight from the daemon request and
-        // renders its OWN DSML `<｜DSML｜tool_calls>` instruction block
-        // inside `generate_deepseek4`. Prepending a Hermes block here on
-        // top of that gives the model TWO conflicting tool-call format
-        // contracts in the same system message — confirmed cause of the
-        // V4F "<tool_call>{…}</tool_call>" leakage observed in
-        // /tmp/hipfire-prompt-*.txt dumps. Skip it for that arch.
-        if (tools.length > 0 && currentArch !== "deepseek4") {
-          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
-            + tools.map((t: any) => JSON.stringify(t)).join("\n")
-            + "\n</tools>\n\n"
-            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
-        }
+        // The legacy Hermes `<tools>` block injection happens LATER, after
+        // the model has actually been loaded/reloaded and `currentArch` is
+        // known to reflect the target model — not the pre-warmed one. See
+        // the post-reload site below for the actual append. We can't add
+        // it here because a request that triggers a reload to a different
+        // arch would flip the rule under our feet (e.g. pre-warmed V4F,
+        // requested Qwen35: at this point currentArch is still "deepseek4"
+        // and we'd skip the Hermes block — but Qwen35 needs it).
 
         // Build conversation as multi-turn ChatML prompt.
         // The daemon wraps the prompt as: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
@@ -1803,36 +1791,10 @@ async function serve(port: number, host: string) {
           }
         }
         userPrompt = convParts.join("");
-
-        // V4F's daemon path renders multi-turn history from the
-        // structured `messages` field in V4F-native tokens
-        // (`<｜User｜>` / `<｜Assistant｜>` / DSML tool-call wrappers), and
-        // separately appends whatever lands in `prompt` as the live user
-        // input. If we leave `userPrompt` set to the ChatML rebuild of
-        // the same conversation, the daemon emits both — see the
-        // /tmp/hipfire-prompt-*.txt capture for the catastrophic dual-
-        // format prompt this produces (V4F tokens + ChatML markers,
-        // literal "null" strings, two competing tool-call format
-        // contracts). For V4F, replace `userPrompt` with just the live
-        // user message (or "" when the conversation ends with a
-        // tool/assistant turn and the model is meant to continue
-        // generating).
-        //
-        // Legacy arches (Qwen2 in particular) read the full ChatML
-        // history out of `prompt` and ignore `messages` — they NEED
-        // the rebuild, so don't touch `userPrompt` there. Qwen35's
-        // Jinja path can go either way; we leave it on the legacy
-        // bytes for backward-compat until a similar capture confirms
-        // it sees the same double-render issue.
-        if (currentArch === "deepseek4") {
-          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
-          if (last && last.role === "user") {
-            const lastContent = extractContent(last.content);
-            userPrompt = lastContent.text;
-          } else {
-            userPrompt = "";
-          }
-        }
+        // V4F-specific override of `userPrompt` (collapse to live user
+        // message only) ALSO happens after the reload check below —
+        // same reasoning as the Hermes block: `currentArch` may change
+        // if the request triggers a reload, so we can't gate on it yet.
 
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
@@ -1872,6 +1834,48 @@ async function serve(port: number, host: string) {
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        }
+
+        // Now that currentArch reflects the model we're ACTUALLY sending
+        // to (post-reload), apply the arch-conditional prompt shaping.
+        //
+        // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
+        //    (Qwen2 generate) only see tools through prompt text and rely
+        //    on this block. V4F (`generate_deepseek4`) builds its own
+        //    DSML tools preamble from the structured `tools` field, so
+        //    injecting Hermes on top gives the model two conflicting
+        //    tool-call format contracts (observed verbatim in
+        //    /tmp/hipfire-prompt-*.txt). Skip for V4F.
+        if (tools.length > 0 && currentArch !== "deepseek4") {
+          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            + tools.map((t: any) => JSON.stringify(t)).join("\n")
+            + "\n</tools>\n\n"
+            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        }
+
+        // 2. `userPrompt` content: V4F's daemon path reads multi-turn
+        //    history from the structured `messages` field and treats
+        //    `prompt` as the live user input. Leaving `userPrompt` set to
+        //    the ChatML rebuild of the conversation causes the daemon to
+        //    render history twice — once in V4F tokens from `messages`,
+        //    once in ChatML tokens from `prompt`. Replace with just the
+        //    trailing user message (or "" when conversation ends with a
+        //    tool/assistant turn — daemon then continues from
+        //    `<｜Assistant｜>` directly).
+        //
+        //    Legacy arches (Qwen2 in particular) ignore the structured
+        //    `messages` field and ONLY read `prompt` — they NEED the
+        //    full ChatML rebuild for multi-turn to survive. Don't touch.
+        if (currentArch === "deepseek4") {
+          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
+          if (last && last.role === "user") {
+            const lastContent = extractContent(last.content);
+            userPrompt = lastContent.text;
+          } else {
+            userPrompt = "";
+          }
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
