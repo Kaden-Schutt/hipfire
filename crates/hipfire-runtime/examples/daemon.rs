@@ -175,6 +175,47 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
+/// Stable fingerprint over an assistant turn — pair of (text content,
+/// tool_calls canonical JSON). Output is identical for two messages
+/// that have the same content+tool_calls regardless of how the
+/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
+/// upstream. Used by the V4F prefix-cache to identify "this is the
+/// same assistant turn the model previously emitted, so reuse the
+/// emitted token IDs verbatim instead of re-encoding via the DSML
+/// renderer + BPE (which is not bijective)."
+fn asst_turn_fingerprint(
+    content: &str,
+    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    "assistant".hash(&mut h);
+    // Trim leading/trailing whitespace before hashing. The DSML parser
+    // captures whatever the model emits between `<｜Assistant｜></think>`
+    // and `<｜DSML｜tool_calls>` (typically `\n\n`) as Token events,
+    // which land in our `emit_text_buf` and feed into the STORE
+    // fingerprint. The OpenAI replay side, however, sends
+    // `content: null` (→ "" after `extractContent`) for tool-call-only
+    // assistant turns — the leading whitespace is dropped by every
+    // OpenAI-compat client we've seen. Trimming on both sides
+    // collapses that asymmetry so a turn that emitted "\n\n<tool…>"
+    // still cache-hits when replayed as `{content: null,
+    // tool_calls: [...]}`.
+    content.trim().hash(&mut h);
+    for tc in tool_calls {
+        tc.name.hash(&mut h);
+        // Serialize args in a canonical form. `serde_json::to_string`
+        // on a `Value` produces stable ordering for objects (insertion
+        // order from the upstream `Map<String, Value>`), which is what
+        // we want: two messages with identically-shaped tool_calls
+        // produce identical fingerprints.
+        let args = serde_json::to_string(&tc.arguments).unwrap_or_default();
+        args.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
 /// through `serde_json::json!` so embedded `"` / `\` / control chars in
 /// the message or `id` can't corrupt the line and trigger a client-side
@@ -520,6 +561,32 @@ struct LoadedModel {
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
+
+    /// Per-turn token cache for V4F prefix-cache stability.
+    ///
+    /// Maps a stable fingerprint of an assistant message — `(role,
+    /// content_text, tool_calls_canonical_json)` — to the token IDs the
+    /// model ACTUALLY emitted for that turn. When the next request
+    /// replays the same assistant message in its `messages` history, the
+    /// V4F render loop uses these cached tokens verbatim instead of
+    /// re-encoding via `render_assistant_tool_calls` + tokenizer.encode.
+    ///
+    /// Why this matters: BPE is not bijective. The model can emit a
+    /// 2-token DSML tool_call (multi-char special tokens picked
+    /// greedily); our re-encode of the same text via Jinja-style
+    /// rendering may produce 67 tokens covering the same string. The
+    /// resulting prompt diverges from the prior turn's KV slots at
+    /// the assistant-turn boundary, capping the prefix-cache LCP at
+    /// the divergence point. Caching the emitted tokens restores
+    /// byte-identical replay and lets LCP extend through all prior
+    /// assistant turns.
+    ///
+    /// Cleared on model unload (LoadedModel destruction). Bounded by
+    /// the natural lifetime of a session — entries that never come
+    /// back in a `messages` history will linger but never affect
+    /// correctness (worst case: VRAM-free Vec<u32> memory growth on
+    /// the host).
+    asst_turn_cache: std::collections::HashMap<u64, Vec<u32>>,
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
@@ -1814,6 +1881,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1868,6 +1936,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2042,6 +2111,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -2073,6 +2143,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2204,6 +2275,7 @@ fn load_model_pp(
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -4702,54 +4774,66 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     pending_tool_result = true;
                 }
                 Role::Assistant => {
+                    // Daemon-emitted surround tokens that bracket every
+                    // assistant turn in V4F format:
+                    //   <｜Assistant｜>{</think> when not in think-replay}
+                    //     {turn body — content + tool_calls}
+                    //   <｜end▁of▁sentence｜>
+                    //
+                    // The cache stores ONLY the inner turn body (the
+                    // tokens the model itself emitted during decode).
+                    // The surround tokens are deterministic functions
+                    // of `msg.content` and `think_mode` and must be
+                    // emitted IDENTICALLY on both hit and miss paths so
+                    // the prompt-cache LCP can extend through every
+                    // prior assistant turn.
                     if let Some(a) = asst_tok { prompt_ids.push(a); }
-                    // Emit `</think>` immediately after `<｜Assistant｜>`
-                    // for prior turns — matches the reference encoder
-                    // (`tmp/ds4/ds4.c:14817-14819`) which always pushes
-                    // `think_end_id` after the assistant marker unless
-                    // the recorded content already starts with `<think>`
-                    // or `</think>`. Without this, replayed turns lack
-                    // the no-thinking signal token the model emitted in
-                    // its original turn, producing a structural
-                    // inconsistency with the live turn (which DOES carry
-                    // `</think>`) and drifting the model off-
-                    // distribution at long histories.
                     let starts_with_think_tag = msg.content.starts_with("<think>")
                         || msg.content.starts_with("</think>");
                     if !starts_with_think_tag {
                         prompt_ids.extend(tokenizer.encode("</think>"));
                     }
-                    // Plain assistant text (whatever the upstream caller
-                    // serialised into `content`; the OpenAI-compat
-                    // surface sends "" for tool_call-only turns).
-                    if !msg.content.is_empty() && msg.content != "null" {
-                        prompt_ids.extend(tokenizer.encode(&msg.content));
-                    }
-                    // Re-render any structured `tool_calls` carried on
-                    // this turn back into the DSML block the model
-                    // emitted in the first place. Without this, the V4F
-                    // arm fed prior tool_call turns to the model as the
-                    // literal string "null" (from `extractText(content)`
-                    // when content is JSON null), which the MQ2-Lloyd
-                    // checkpoint reads as off-distribution noise and
-                    // responds by inventing replacement paths — observed
-                    // 2026-05-24 chasing the `/home/nick/CLion/tembrane`
-                    // (missing `Projects`) regression in pi-coding-agent
-                    // sessions.
-                    if !msg.tool_calls.is_empty() {
-                        let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
-                            .tool_calls
-                            .iter()
-                            .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
-                                name: c.name.clone(),
-                                arguments: c.arguments.clone(),
-                            })
-                            .collect();
-                        let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
-                            &dsml_calls,
+
+                    // Prefix-cache fast path: if we previously emitted
+                    // this exact assistant turn, replay the model's
+                    // verbatim token sequence instead of re-rendering
+                    // via DSML + BPE encode (which is not bijective —
+                    // multi-char DSML special tokens picked greedily
+                    // during decode can come back out of
+                    // `tokenizer.encode(render(...))` as a longer
+                    // sequence with different boundaries, capping the
+                    // LCP at the assistant-turn boundary).
+                    let fp = asst_turn_fingerprint(&msg.content, &msg.tool_calls);
+                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "[asst-cache lookup] fp={:#018x} content.len={} tool_calls={} hit={}",
+                            fp, msg.content.len(), msg.tool_calls.len(),
+                            m.asst_turn_cache.contains_key(&fp),
                         );
-                        prompt_ids.extend(tokenizer.encode(&dsml));
                     }
+                    if let Some(cached) = m.asst_turn_cache.get(&fp) {
+                        prompt_ids.extend_from_slice(cached);
+                    } else {
+                        // Cache miss — render the turn the long way.
+                        if !msg.content.is_empty() && msg.content != "null" {
+                            prompt_ids.extend(tokenizer.encode(&msg.content));
+                        }
+                        if !msg.tool_calls.is_empty() {
+                            let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
+                                .tool_calls
+                                .iter()
+                                .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
+                                    name: c.name.clone(),
+                                    arguments: c.arguments.clone(),
+                                })
+                                .collect();
+                            let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
+                                &dsml_calls,
+                            );
+                            prompt_ids.extend(tokenizer.encode(&dsml));
+                        }
+                    }
+
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
@@ -5102,9 +5186,56 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut next_tok: u32 =
             deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
         let mut pos = pos_after_prefill;
+        // Token-cache capture for the prefix-cache replay path. We
+        // mirror the parser events into local accumulators so that —
+        // after decode completes — we can fingerprint the just-emitted
+        // assistant turn by (content_text, tool_calls) and store the
+        // exact token IDs that the model emitted at
+        // `conversation_tokens[decode_start..decode_end]`.
+        //
+        // Why mirror rather than re-parse: the streamed events from
+        // `parser.feed` carry the parser's reconstructed structure
+        // (Reasoning fragments split off from Token, ToolCalls
+        // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
+        // here once captures all the logical structure without a
+        // second tokenizer pass.
+        let decode_start_tokens_idx = m.conversation_tokens.len();
+        let mut emit_text_buf = String::new();
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            match ev {
+                StreamEvent::Token(t) => emit_text_buf.push_str(t),
+                // Reasoning fragments are NOT replayed in the next
+                // turn (the daemon's history loop emits a fresh
+                // `</think>` after `<｜Assistant｜>` based on the
+                // current `think_mode`; the prior `<think>…</think>`
+                // body is dropped). So we don't include reasoning in
+                // the fingerprint either — two turns that produced
+                // the same content + tool_calls but different
+                // reasoning hash to the same key and reuse the same
+                // cached tokens, which is correct because what we
+                // CACHE excludes the reasoning span (it lives BEFORE
+                // the daemon-emitted `</think>` in the cached tokens
+                // — see below).
+                StreamEvent::Reasoning(_) => {}
+                StreamEvent::ToolCalls(calls) => {
+                    for c in calls {
+                        emit_tool_calls_buf.push(
+                            hipfire_runtime::prompt_frame::ToolCall {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            }
+                        );
+                    }
+                }
+            }
+        };
+
         while generated_count < max_tokens && next_tok != eos_tok {
             let frag = tokenizer.decode(&[next_tok]);
             for ev in parser.feed(&frag) {
+                absorb_event(&ev);
                 emit_stream_event(stdout, id, ev);
             }
             emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
@@ -5136,9 +5267,30 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
         // Flush any buffered partial markers / content.
         for ev in parser.finish() {
+            absorb_event(&ev);
             emit_stream_event(stdout, id, ev);
         }
         let _ = stdout.flush();
+
+        // Cache the just-emitted token sequence under its (content,
+        // tool_calls) fingerprint so the next request's V4F history
+        // render can replay verbatim and avoid BPE re-encode drift.
+        // Trim leading EOS/zero residue defensively (the loop never
+        // pushes EOS, but a future model that emits EOS mid-stream
+        // shouldn't end up with EOS landing in the cached tokens).
+        drop(absorb_event); // release the &mut emit_*_buf borrow
+        if generated_count > 0 && m.conversation_tokens.len() > decode_start_tokens_idx {
+            let cached_seq: Vec<u32> =
+                m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "[asst-cache store] fp={:#018x} content.len={} tool_calls={} tokens={}",
+                    fp, emit_text_buf.len(), emit_tool_calls_buf.len(), cached_seq.len(),
+                );
+            }
+            m.asst_turn_cache.insert(fp, cached_seq);
+        }
     }
 
     m.seq_pos = state.n_tokens as usize;
