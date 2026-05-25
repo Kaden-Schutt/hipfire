@@ -22,6 +22,13 @@ coverage gaps, escalate to v2: trunk-argmax capture across a wide corpus
 (parallel-friendly across 4x R9700 on hiptrx, ~100K-token argmax corpus
 in well under an hour). v2 generator not yet implemented.
 
+Custom corpus (recommended for a real workload): generate assistant outputs from
+a genuine Qwen3.6-27B endpoint with scripts/dump_corpus_openai.py, then:
+    build_mtp_vocab_sidecar.py --tokenizer <hf-dir> --output cvs.json \
+        --top-k 32768 --no-default-corpus --corpus-jsonl 'corpus/*.jsonl'
+Only the assistant OUTPUT side is counted (that's what the draft head predicts);
+all special/added tokens (chatml frame, <think>, <tool_call>) are force-included.
+
 Output JSON schema:
     {
         "draft_to_full": [u32; K],          # draft idx -> full vocab idx
@@ -37,6 +44,7 @@ Output JSON schema:
 """
 
 import argparse
+import glob
 import json
 import os
 import sys
@@ -95,6 +103,65 @@ def gather_corpus(prompt_dir: Path, repo_root: Path) -> list[tuple[str, str]]:
     return corpus
 
 
+def _extract_output_text(obj: dict) -> str:
+    """Pull the ASSISTANT-side text from a dumped JSONL record. Prefers a
+    pre-assembled `output` field (written by dump_corpus_openai.py); otherwise
+    assembles reasoning + content + serialized tool_calls. The user prompt is
+    never counted — the draft head predicts the model's output distribution."""
+    if isinstance(obj.get("output"), str) and obj["output"]:
+        return obj["output"]
+    parts: list[str] = []
+    for k in ("reasoning_content", "reasoning", "content", "response", "text"):
+        v = obj.get(k)
+        if isinstance(v, str) and v:
+            parts.append(v)
+    tcs = obj.get("tool_calls")
+    if isinstance(tcs, list):
+        parts.extend(json.dumps(tc, ensure_ascii=False) for tc in tcs)
+    msgs = obj.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                if isinstance(m.get("content"), str):
+                    parts.append(m["content"])
+                for tc in (m.get("tool_calls") or []):
+                    parts.append(json.dumps(tc, ensure_ascii=False))
+    return "\n".join(parts)
+
+
+def load_custom_corpus(jsonl_globs, corpus_dir) -> list[tuple[str, str]]:
+    """Load a real corpus from dumped JSONL (assistant outputs) and/or a dir of
+    *.jsonl / *.txt files. JSONL records are reduced to assistant-output text."""
+    corpus: list[tuple[str, str]] = []
+    jsonl_paths: list[str] = []
+    for pat in (jsonl_globs or []):
+        jsonl_paths.extend(sorted(glob.glob(pat)))
+    txt_paths: list[Path] = []
+    if corpus_dir:
+        d = Path(corpus_dir)
+        jsonl_paths.extend(str(p) for p in sorted(d.glob("**/*.jsonl")))
+        txt_paths.extend(sorted(d.glob("**/*.txt")))
+    for fp in jsonl_paths:
+        chunks: list[str] = []
+        with open(fp, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                t = _extract_output_text(obj)
+                if t:
+                    chunks.append(t)
+        if chunks:
+            corpus.append((f"jsonl:{Path(fp).name}({len(chunks)}rec)", "\n".join(chunks)))
+    for tp in txt_paths:
+        corpus.append((f"txt:{tp.name}", tp.read_text(encoding="utf-8")))
+    return corpus
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tokenizer", required=True,
@@ -106,6 +173,17 @@ def main() -> int:
                    help="Directory containing canonical bench prompts")
     p.add_argument("--repo-root", default=".",
                    help="Repo root (for additional corpus files)")
+    p.add_argument("--corpus-jsonl", nargs="+", default=None,
+                   help="One or more JSONL files (or globs) of dumped assistant "
+                        "outputs (see scripts/dump_corpus_openai.py). Assistant "
+                        "OUTPUT text is counted, not user prompts.")
+    p.add_argument("--corpus-dir", default=None,
+                   help="Directory scanned recursively for *.jsonl (assistant "
+                        "dumps) and *.txt (raw text) corpus files.")
+    p.add_argument("--no-default-corpus", action="store_true",
+                   help="Skip the small built-in seed corpus; use only "
+                        "--corpus-jsonl / --corpus-dir. Use once you have a real "
+                        "workload corpus so the tiny seed set doesn't dilute it.")
     args = p.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=False)
@@ -121,9 +199,13 @@ def main() -> int:
 
     prompt_dir = Path(args.prompt_dir)
     repo_root = Path(args.repo_root)
-    corpus = gather_corpus(prompt_dir, repo_root)
+    corpus: list[tuple[str, str]] = []
+    if not args.no_default_corpus:
+        corpus.extend(gather_corpus(prompt_dir, repo_root))
+    corpus.extend(load_custom_corpus(args.corpus_jsonl, args.corpus_dir))
     if not corpus:
-        sys.stderr.write("ERROR: no corpus files found\n")
+        sys.stderr.write("ERROR: no corpus files found (default corpus disabled "
+                         "and no --corpus-jsonl/--corpus-dir matched)\n")
         return 1
 
     counter: Counter[int] = Counter()
@@ -147,6 +229,12 @@ def main() -> int:
             must_include.append(sp)
     if hasattr(tokenizer, "all_special_ids"):
         must_include.extend(int(i) for i in tokenizer.all_special_ids)
+    # Force-include ALL added tokens (chatml frame + <think>/<tool_call> markers,
+    # etc.) — high-frequency structural tokens in agentic/chat output that must
+    # be in the draft K-set or the head can never propose them.
+    if hasattr(tokenizer, "added_tokens_encoder"):
+        must_include.extend(int(v) for v in tokenizer.added_tokens_encoder.values()
+                            if isinstance(v, int) and 0 <= v < full_vocab_size)
     must_include = sorted(set(must_include))
 
     selected_ids = set(tid for tid, _ in most_common)
@@ -193,6 +281,7 @@ def main() -> int:
             "unique_tokens": unique,
             "coverage_top_k": coverage,
             "must_include_specials": must_include,
+            "used_default_corpus": not args.no_default_corpus,
         },
     }
 
