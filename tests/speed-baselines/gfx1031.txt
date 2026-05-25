@@ -17,6 +17,3 @@
 9b_mq4_pp32_prefill_tok_s=278.2
 9b_mq4_gen_tok_s=50.7
 9b_mq4_pp128_prefill_tok_s=288.6
-
-
-
