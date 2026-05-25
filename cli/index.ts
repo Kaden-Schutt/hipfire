@@ -555,7 +555,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
+  // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
+  // regardless of per-model/global config, so a missing/dangling sidecar
+  // can never fatally crash serve load. Pairs with cask_auto_attach=false.
+  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1";
   if (
+    !caskForcedOff &&
     (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
     !isA3B &&
     resolved.cask_auto_attach !== false
