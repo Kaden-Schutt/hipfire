@@ -3716,8 +3716,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             (None, None) => String::new(),
         }
     }
-    eprintln!("[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
-        pflash_state.is_some(), m.seq_pos, raw_q_tokens.len(), drafter_gpu.is_some());
+    if std::env::var("HIPFIRE_PFLASH_DEBUG").is_ok() {
+        eprintln!("[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
+            pflash_state.is_some(), m.seq_pos, raw_q_tokens.len(), drafter_gpu.is_some());
+    }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
@@ -3776,7 +3778,6 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 }
             }
         } else {
-            eprintln!("[pflash] skip: seq_pos={} != 0", m.seq_pos);
             raw_q_tokens
         }
     } else {
