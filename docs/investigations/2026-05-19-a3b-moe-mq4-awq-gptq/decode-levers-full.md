@@ -164,4 +164,3 @@ Key hipfire files referenced:
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/hipfire-arch-qwen35/src/qwen35.rs:3765-3825` — MoE graph capture disabled (drift bug)
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/crates/rdna-compute/src/dispatch.rs:18133-18200` — argmax_f32 / argmax_f32_batched GPU kernels (built but unused on decode)
 - `/home/bjoern/hipfire/.worktrees/paroquant-a3b/kernels/src/gated_delta_net_q8.hip` — GDN decode (not fused with norm/gate)
-
