@@ -1,6 +1,11 @@
 # DFlash/MTP prose + sampling sweet-spot (k9lin 7900XTX, 27B MQ4) — 2026-05-24
 
-Pin these. Prior sessions lost the working DFlash config and burned hours re-deriving it.
+Pin the **configs**, not the exact tok/s. Prior sessions lost the working DFlash config and burned hours re-deriving it.
+
+## Reproducibility caveat (read first)
+All tok/s below are SINGLE warm runs, ±3-5% noise — directional, not pinned medians.
+DFlash code ~220 is the only median-validated bar; everything else is indicative.
+Before quoting any cell: 5-run fresh-process median, prompt md5 recorded, `scripts/probe_commits.sh` for cross-commit. Blessed code prompt md5 253c7ac50857fe6d0e10fb0d2c5e35c0 (merge_sort), prose md5 unpinned. Prose temp deltas (49-53) are within noise — treat ranks as ties.
 
 ## Known-good configs (DON'T re-derive)
 - **DFlash code (the real win):** `--no-chatml --kv-mode q8 --ctx 4096 --temp 0.0`, merge_sort_thinking_off prompt → τ≈10.9, ~220 tok/s (~5× AR). rp MUST be 1.0.
