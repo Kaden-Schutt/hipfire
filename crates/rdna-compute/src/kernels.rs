@@ -2192,6 +2192,10 @@ pub const CONV1D_SILU_SPLIT_TREE_SRC: &str = include_str!("../../../kernels/src/
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
 pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache_write.hip");
 
+/// Batched F32 KV cache write: scatter `batch_size` rows into the cache at
+/// the absolute positions array, in one launch. Used by batched prefill.
+pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_f32_batched.hip");
+
 
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.
 /// Single block, 256 threads. Returns token ID + RNG state (8 bytes vs 600KB).

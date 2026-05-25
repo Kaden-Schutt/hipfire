@@ -24102,6 +24102,51 @@ impl Gpu {
         }
     }
 
+    /// Batched F32 KV-cache write: scatter `batch_size` rows of `src`
+    /// (`[batch_size * kv_dim]`) into the F32 cache at the absolute
+    /// positions in `positions` (`[batch_size]` i32), in one launch.
+    /// Batched-prefill replacement for the per-position `kv_cache_write`.
+    pub fn kv_cache_write_f32_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        kv_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("kv_cache_write_f32_batched", kernels::KV_CACHE_WRITE_F32_BATCHED_SRC, "kv_cache_write_f32_batched")?;
+        let func = &self.functions["kv_cache_write_f32_batched"];
+
+        let mut dst_ptr = dst.buf.as_ptr();
+        let mut src_ptr = src.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut kd = kv_dim as i32;
+        let mut bs = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dst_ptr as *mut _ as *mut c_void,
+            &mut src_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut kd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid_x = (kv_dim as u32 + block - 1) / block;
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_size as u32, 1],
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// GPU-side top-K + top-P sampling. Returns (token_id, new_rng_state).
     /// Eliminates 600KB logits download per token.
     pub fn sample_top_p(

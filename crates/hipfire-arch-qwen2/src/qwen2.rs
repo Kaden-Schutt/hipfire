@@ -950,9 +950,6 @@ pub fn forward_prefill_batch_embeds(
     let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 payload, same width
     gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
 
-    let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-    let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
-
     for layer_idx in 0..cfg.num_hidden_layers {
         let layer = &weights.layers[layer_idx];
 
@@ -969,16 +966,11 @@ pub fn forward_prefill_batch_embeds(
         gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
             n_heads, n_kv_heads, head_dim, cfg.rope_theta, batch)?;
 
-        // Persist post-RoPE K/V to the F32 cache at absolute positions so
-        // decode (forward_step) can attend to the whole prompt.
-        for i in 0..batch {
-            let pos_i32 = (base + i) as i32;
-            gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
-            gpu.kv_cache_write(&state.k_cache[layer_idx], &k_slice, &state.pos_buf, kv_dim)?;
-            gpu.kv_cache_write(&state.v_cache[layer_idx], &v_slice, &state.pos_buf, kv_dim)?;
-        }
+        // Persist post-RoPE K/V to the F32 cache at absolute positions
+        // (pos_array = [base..base+batch)) in one launch each, so decode
+        // (forward_step) can attend to the whole prompt.
+        gpu.kv_cache_write_f32_batched(&state.k_cache[layer_idx], &k_batch, &pos_array, kv_dim, batch)?;
+        gpu.kv_cache_write_f32_batched(&state.v_cache[layer_idx], &v_batch, &pos_array, kv_dim, batch)?;
 
         gpu.attention_causal_batched(&q_batch, &k_batch, &v_batch, &attn_out_batch,
             batch, n_heads, n_kv_heads, head_dim)?;
@@ -1005,7 +997,7 @@ pub fn forward_prefill_batch_embeds(
 
     for t in [x_batch, tmp_batch, q_batch, k_batch, v_batch, attn_out_batch,
               o_batch, gate_batch, up_batch, ffn_hidden_batch, ffn_out_batch,
-              pos_array, k_slice, v_slice] {
+              pos_array] {
         gpu.free_tensor(t)?;
     }
     Ok(())
