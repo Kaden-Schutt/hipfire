@@ -1721,6 +1721,11 @@ pub const ATTENTION_SRC: &str = include_str!("../../../kernels/src/attention.hip
 /// Partial results stored in partials buffer: [n_heads × n_chunks × (1 + 1 + head_dim)] floats.
 pub const ATTENTION_FLASH_SRC: &str = include_str!("../../../kernels/src/attention_flash.hip");
 
+/// GQA-aware flash decode partial: grid [n_kv_heads, n_chunks]; each block
+/// reuses one K/V load across its query-head group. Reduce phase reuses
+/// `attention_flash_reduce` (ATTENTION_FLASH_SRC).
+pub const ATTENTION_FLASH_GQA_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa.hip");
+
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.

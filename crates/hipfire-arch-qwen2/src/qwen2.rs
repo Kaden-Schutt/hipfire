@@ -844,15 +844,19 @@ fn forward_step_after_x(
         // [n_heads, n_chunks] saturates the GPU vs the naive single-token
         // attention_f32 (grid [n_heads] = ~14% CU occupancy, 71% of decode
         // GPU time per rocprof). GQA via n_heads / n_kv_heads. F32 KV cache.
-        gpu.attention_flash(
-            &state.q,
-            &state.k_cache[layer_idx],
-            &state.v_cache[layer_idx],
-            &state.attn_out,
-            &state.attn_partials,
-            pos + 1, // seq_len = pos+1 (newest token included)
-            n_heads, n_kv_heads, head_dim,
-            state.max_seq,
+        // GQA-aware split-K when there's a group to share K/V loads and the
+        // context is long enough to fill the grid (n_kv_heads×n_chunks); else
+        // the per-head flash. Both bit-identical; gqa is ~15-23% faster at
+        // OCR decode lengths (5k-11k). Falls to flash for short/non-GQA.
+        let attn = if n_kv_heads < n_heads && pos + 1 >= 4096 {
+            Gpu::attention_flash_gqa
+        } else {
+            Gpu::attention_flash
+        };
+        attn(gpu,
+            &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+            &state.attn_out, &state.attn_partials,
+            pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
         )?;
 
         // (7) o_proj (no bias) + (8) residual.
