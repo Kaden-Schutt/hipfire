@@ -866,6 +866,9 @@ fn main() {
                                         tok, pf_max_kv,
                                     ) {
                                         Ok(()) => {
+                                            eprintln!("[pflash] LOADED drafter={} dev={} mode={} compat={} keep={} thr={}",
+                                                pf_drafter_path, pflash_drafter_device, pflash_mode_str,
+                                                pf_state.tokenizer_compat, pflash_keep_ratio, pflash_threshold);
                                             let _ = writeln!(stdout,
                                                 r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
                                                 pflash_mode_str, pf_drafter_path, pflash_drafter_device,
@@ -876,6 +879,7 @@ fn main() {
                                             pflash_drafter_gpu = sibling; // persist sibling across requests (None if shared)
                                         }
                                         Err(e) => {
+                                            eprintln!("[pflash] LOAD FAILED: {}", e);
                                             let _ = writeln!(stdout,
                                                 r#"{{"type":"pflash_load_failed","reason":"{}"}}"#,
                                                 e.to_string().replace('"', "'"));
@@ -3697,6 +3701,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             (None, None) => String::new(),
         }
     }
+    eprintln!("[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
+        pflash_state.is_some(), m.seq_pos, raw_q_tokens.len(), drafter_gpu.is_some());
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
             let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
