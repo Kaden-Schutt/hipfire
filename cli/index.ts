@@ -8,13 +8,18 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, renameSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
+const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
+const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
+const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
+const SERVE_REQUEST_LOG_FILE = join(HIPFIRE_DIR, "serve-requests.jsonl");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
@@ -289,7 +294,9 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
+// Sparse per-tag overrides. Stored in ~/.hipfire/models.json (schema v2).
+// Legacy ~/.hipfire/per_model_config.json is read once and folded into the
+// catalog on refresh.
 // Resolution order: --flag > per-model > global > engine fallback.
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
@@ -319,42 +326,43 @@ type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
 
 function loadPerModelConfigs(): PerModelConfigs {
-  try {
-    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
-    const out: PerModelConfigs = {};
-    let migrated = false;
-    for (const [tag, ov] of Object.entries(raw ?? {})) {
-      const clean: PerModelOverride = {};
-      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
-      // overlays from PR #104 stored true/false; without this they'd fail the
-      // new tri-state validator and the override would silently disappear.
-      if (typeof (ov as any)?.mmq_screen === "boolean") {
-        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
-        migrated = true;
-      }
-      for (const k of PER_MODEL_KEYS) {
-        const v = (ov as any)?.[k];
-        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
-      }
-      if (Object.keys(clean).length > 0) out[tag] = clean;
-    }
-    // Persist migration so the legacy boolean doesn't sit in the file forever
-    // tripping every read. Best-effort: if the write fails (read-only fs,
-    // permission), the in-memory result is still correct for this run.
-    if (migrated) {
-      try { savePerModelConfigs(out); } catch {}
-    }
-    return out;
-  } catch { return {}; }
+  const out: PerModelConfigs = {};
+  const merge = (tag: string, ov: any) => {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = { ...(out[tag] ?? {}), ...clean };
+  };
+
+  for (const [tag, ov] of Object.entries(loadLegacyPerModelConfigsRaw())) merge(tag, ov);
+
+  const catalog = loadModelsCatalog();
+  for (const [tag, ov] of Object.entries(catalog.configs ?? {})) merge(tag, ov);
+  for (const [id, model] of Object.entries(catalog.models ?? {})) {
+    if (!model.config || Object.keys(model.config).length === 0) continue;
+    merge(id, model.config);
+  }
+  return out;
 }
 
 function savePerModelConfigs(all: PerModelConfigs) {
-  // Drop empty entries so the file stays minimal
-  const clean: PerModelConfigs = {};
+  const catalog = refreshModelsCatalog({ write: false });
+  const configs: PerModelConfigs = {};
+
+  for (const model of Object.values(catalog.models)) delete model.config;
+
   for (const [tag, ov] of Object.entries(all)) {
-    if (Object.keys(ov).length > 0) clean[tag] = ov;
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length === 0) continue;
+    const modelId = catalogModelIdForConfigKey(catalog, tag);
+    if (modelId && catalog.models[modelId]) {
+      catalog.models[modelId].config = { ...(catalog.models[modelId].config ?? {}), ...clean };
+    } else {
+      configs[tag] = clean;
+    }
   }
-  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
+
+  catalog.configs = configs;
+  writeModelsCatalog(catalog);
+  clearLegacyPerModelConfigs();
 }
 
 // Return the effective config for a given model tag. Per-model overrides
@@ -365,7 +373,9 @@ function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
   if (!tag) return base;
   const resolved = resolveModelTag(tag);
-  const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
+  const all = loadPerModelConfigs();
+  const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
+  const overrides = all[catalogId ?? ""] ?? all[resolved] ?? all[tag] ?? {};
   return { ...base, ...overrides };
 }
 
@@ -509,9 +519,10 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
         const dirs = [
           dirname(path),
+          DRAFTS_DIR,
           `${process.cwd()}/models`,
           `${process.cwd()}/../../models`,
-          `${homedir()}/.hipfire/models`,
+          MODELS_DIR,
         ];
         const candidates: string[] = [];
         for (const d of dirs) {
@@ -556,18 +567,28 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
-      const candidate = join(modelDir, entry.triattn.file);
-      if (existsSync(candidate)) autoAttachedSidecar = candidate;
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        const candidate = join(dir, entry.triattn.file);
+        if (existsSync(candidate)) {
+          autoAttachedSidecar = candidate;
+          break;
+        }
+      }
     }
     if (!autoAttachedSidecar) {
       // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
       // hand-installed sidecars not in the registry.
-      try {
-        const baseName = basename(path);
-        const entries = readdirSync(modelDir);
-        const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
-        if (m) autoAttachedSidecar = join(modelDir, m);
-      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
+      const baseName = basename(path);
+      for (const dir of [modelDir, TRIATTN_DIR]) {
+        try {
+          const entries = readdirSync(dir);
+          const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+          if (m) {
+            autoAttachedSidecar = join(dir, m);
+            break;
+          }
+        } catch { /* dir read failures are fine — try the next dir */ }
+      }
     }
   }
   if (autoAttachedSidecar) {
@@ -988,6 +1009,80 @@ async function runViaHttp(
   const secs = (Date.now() - t0) / 1000;
   if (tokens > 0) console.error(`\n[${tokens} tok, ${(tokens / secs).toFixed(1)} tok/s via serve]`);
   return true;
+}
+
+type ServeRequestSummary = {
+  ts: string;
+  event: "request_done";
+  id: string;
+  method: string;
+  path: string;
+  status: number;
+  model: string;
+  stream: boolean;
+  duration_ms: number;
+  finish_reason?: string | null;
+  error?: string | null;
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  total_tokens?: number | null;
+  max_tokens?: number | null;
+  ttft_ms?: number | null;
+  prefill_ms?: number | null;
+  prefill_tok_s?: number | null;
+  decode_tok_s?: number | null;
+  tok_s?: number | null;
+  vram_used_mb?: number | null;
+  vram_free_mb?: number | null;
+  vram_total_mb?: number | null;
+};
+
+function finiteNumber(v: any): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function metric(v: any, decimals = 0): string {
+  const n = finiteNumber(v);
+  if (n === null) return "na";
+  return decimals > 0 ? n.toFixed(decimals) : String(Math.round(n));
+}
+
+function statusForDaemonError(message: string | null | undefined): number {
+  const err = String(message || "").toLowerCase();
+  if (err.includes("maximum size") || err.includes("exceeds maximum")) return 413;
+  if (err.includes("no vision encoder") || err.includes("unsupported image format")
+    || err.includes("image dimensions") || err.includes("failed to decode base64")
+    || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget")) {
+    return 400;
+  }
+  return 500;
+}
+
+function logServeRequest(summary: ServeRequestSummary) {
+  try {
+    mkdirSync(HIPFIRE_DIR, { recursive: true });
+    appendFileSync(SERVE_REQUEST_LOG_FILE, JSON.stringify(summary) + "\n");
+  } catch {}
+
+  const line = [
+    summary.ts,
+    summary.event,
+    `id=${summary.id}`,
+    `model=${summary.model || "unknown"}`,
+    `status=${summary.status}`,
+    `stream=${summary.stream ? 1 : 0}`,
+    `finish=${summary.finish_reason || (summary.error ? "error" : "unknown")}`,
+    `ttft_ms=${metric(summary.ttft_ms, 1)}`,
+    `prompt_tok=${metric(summary.prompt_tokens)}`,
+    `reply_tok=${metric(summary.completion_tokens)}`,
+    `prefill_tps=${metric(summary.prefill_tok_s, 1)}`,
+    `decode_tps=${metric(summary.decode_tok_s, 1)}`,
+    `vram_used_mb=${metric(summary.vram_used_mb)}`,
+    `vram_free_mb=${metric(summary.vram_free_mb)}`,
+    `dur_ms=${metric(summary.duration_ms)}`,
+  ].join(" ");
+  console.log(line);
 }
 
 // ─── Daemon IPC ─────────────────────────────────────────
@@ -1485,6 +1580,44 @@ async function serve(port: number, host: string) {
       await acquireLock();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
+      const requestStartMs = Date.now();
+      const reqId = `chatcmpl-${requestStartMs.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+      let requestLogged = false;
+      let requestModelForLog = "unknown";
+      let requestStreamForLog = false;
+      const writeRequestLog = (patch: Partial<ServeRequestSummary>) => {
+        if (requestLogged) return;
+        requestLogged = true;
+        const promptTokens = finiteNumber(patch.prompt_tokens);
+        const completionTokens = finiteNumber(patch.completion_tokens);
+        logServeRequest({
+          ts: new Date().toISOString(),
+          event: "request_done",
+          id: reqId,
+          method: req.method,
+          path: url.pathname,
+          status: patch.status ?? 500,
+          model: patch.model || "unknown",
+          stream: patch.stream ?? false,
+          duration_ms: Date.now() - requestStartMs,
+          finish_reason: patch.finish_reason ?? null,
+          error: patch.error ?? null,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: finiteNumber(patch.total_tokens) ?? (
+            promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null
+          ),
+          max_tokens: finiteNumber(patch.max_tokens),
+          ttft_ms: finiteNumber(patch.ttft_ms),
+          prefill_ms: finiteNumber(patch.prefill_ms),
+          prefill_tok_s: finiteNumber(patch.prefill_tok_s),
+          decode_tok_s: finiteNumber(patch.decode_tok_s),
+          tok_s: finiteNumber(patch.tok_s),
+          vram_used_mb: finiteNumber(patch.vram_used_mb),
+          vram_free_mb: finiteNumber(patch.vram_free_mb),
+          vram_total_mb: finiteNumber(patch.vram_total_mb),
+        });
+      };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
@@ -1498,6 +1631,8 @@ async function serve(port: number, host: string) {
 
       try {
         const body = (await req.json()) as any;
+        requestModelForLog = body.model || "default";
+        requestStreamForLog = body.stream === true;
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
@@ -1658,6 +1793,13 @@ async function serve(port: number, host: string) {
         // an aggregate across the conversation. Helper unifies the
         // safeRelease + Response.json shape.
         const rejectImage = (message: string) => {
+          writeRequestLog({
+            status: 400,
+            model: body.model || "default",
+            stream: body.stream === true,
+            finish_reason: "error",
+            error: message,
+          });
           safeRelease();
           return Response.json(
             { error: { message, type: "invalid_request_error" } },
@@ -1728,7 +1870,17 @@ async function serve(port: number, host: string) {
         userPrompt = convParts.join("");
 
         const rawPath = findModel(body.model || "default");
-        if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
+        if (!rawPath) {
+          writeRequestLog({
+            status: 404,
+            model: body.model || "default",
+            stream: body.stream === true,
+            finish_reason: "error",
+            error: "model not found",
+          });
+          safeRelease();
+          return Response.json({ error: "model not found" }, { status: 404 });
+        }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = resolve(rawPath);
 
@@ -1758,6 +1910,14 @@ async function serve(port: number, host: string) {
             current = null;
             currentMaxSeq = null;
             modelHasVL = false;
+            writeRequestLog({
+              status: 500,
+              model: body.model || "default",
+              stream: body.stream === true,
+              max_tokens: requestMaxTokens,
+              finish_reason: "error",
+              error: `model load failed: ${loadResult.message}`,
+            });
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
@@ -1766,7 +1926,6 @@ async function serve(port: number, host: string) {
           modelHasVL = loadResult.vl === true;
         }
 
-        const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
@@ -1874,6 +2033,14 @@ async function serve(port: number, host: string) {
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
+            writeRequestLog({
+              status: 400,
+              model: modelName,
+              stream: body.stream === true,
+              max_tokens: requestMaxTokens,
+              finish_reason: "error",
+              error: "model has no vision encoder",
+            });
             safeRelease();
             return Response.json(
               { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
@@ -2191,10 +2358,12 @@ async function serve(port: number, host: string) {
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    let finishReason = "stop";
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
                       if (parsed.tool_calls) {
+                        finishReason = "tool_calls";
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -2234,6 +2403,24 @@ async function serve(port: number, host: string) {
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
+                    writeRequestLog({
+                      status: 200,
+                      model: modelName,
+                      stream: true,
+                      max_tokens: requestMaxTokens,
+                      finish_reason: finishReason,
+                      prompt_tokens: msg.prefill_tokens,
+                      completion_tokens: completionTokens,
+                      total_tokens: (msg.prefill_tokens ?? 0) + completionTokens,
+                      ttft_ms: msg.ttft_ms,
+                      prefill_ms: msg.prefill_ms,
+                      prefill_tok_s: msg.prefill_tok_s,
+                      decode_tok_s: msg.decode_tok_s,
+                      tok_s: msg.tok_s,
+                      vram_used_mb: msg.vram_used_mb,
+                      vram_free_mb: msg.vram_free_mb,
+                      vram_total_mb: msg.vram_total_mb,
+                    });
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
                     return;
@@ -2244,6 +2431,15 @@ async function serve(port: number, host: string) {
                     // normal zero-token "stop" — otherwise clients can't tell a
                     // real failure from a model that just produced no output.
                     const errMsg = msg.message || "generation failed";
+                    writeRequestLog({
+                      status: statusForDaemonError(errMsg),
+                      model: modelName,
+                      stream: true,
+                      max_tokens: requestMaxTokens,
+                      finish_reason: "error",
+                      error: errMsg,
+                      completion_tokens: completionTokens,
+                    });
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                       error: { message: errMsg, type: "invalid_request_error" }
                     })}\n\n`));
@@ -2257,6 +2453,17 @@ async function serve(port: number, host: string) {
               } finally {
                 clearInterval(heartbeat);
                 e.generating = false;
+                if (streamCancelled) {
+                  writeRequestLog({
+                    status: 499,
+                    model: modelName,
+                    stream: true,
+                    max_tokens: requestMaxTokens,
+                    finish_reason: "cancelled",
+                    error: "client disconnected",
+                    completion_tokens: completionTokens,
+                  });
+                }
                 safeRelease();
               }
             },
@@ -2268,10 +2475,11 @@ async function serve(port: number, host: string) {
         let completionTokens = 0;
         let promptTokens = 0;
         let daemonError: string | null = null;
+        let doneMsg: any = null;
         e.generating = true;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
+          else if (msg.type === "done") { doneMsg = msg; promptTokens = msg.prefill_tokens ?? 0; }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
         }
         e.generating = false;
@@ -2281,14 +2489,18 @@ async function serve(port: number, host: string) {
         // returning a 200 with empty content — otherwise a client that sent a
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
+          const status = statusForDaemonError(daemonError);
+          writeRequestLog({
+            status,
+            model: modelName,
+            stream: false,
+            max_tokens: requestMaxTokens,
+            finish_reason: "error",
+            error: daemonError,
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+          });
           safeRelease();
-          let status = 500;
-          const err = daemonError.toLowerCase();
-          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
-          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
-            || err.includes("image dimensions") || err.includes("failed to decode base64")
-            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
-            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
             { status }
@@ -2326,6 +2538,24 @@ async function serve(port: number, host: string) {
         } else {
           choice.message = { role: "assistant", content };
         }
+        writeRequestLog({
+          status: 200,
+          model: modelName,
+          stream: false,
+          max_tokens: requestMaxTokens,
+          finish_reason: choice.finish_reason,
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          ttft_ms: doneMsg?.ttft_ms,
+          prefill_ms: doneMsg?.prefill_ms,
+          prefill_tok_s: doneMsg?.prefill_tok_s,
+          decode_tok_s: doneMsg?.decode_tok_s,
+          tok_s: doneMsg?.tok_s,
+          vram_used_mb: doneMsg?.vram_used_mb,
+          vram_free_mb: doneMsg?.vram_free_mb,
+          vram_total_mb: doneMsg?.vram_total_mb,
+        });
 
         safeRelease();
         const responseBody: any = {
@@ -2338,6 +2568,13 @@ async function serve(port: number, host: string) {
         }
         return Response.json(responseBody);
       } catch (err: any) {
+        writeRequestLog({
+          status: 500,
+          model: requestModelForLog,
+          stream: requestStreamForLog,
+          finish_reason: "error",
+          error: err?.message || "internal error",
+        });
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
@@ -2558,17 +2795,16 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
-    const aliasPath = join(HIPFIRE_DIR, "models.json");
-    let aliases: Record<string, any> = {};
-    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
-    aliases[opts.register] = {
+    const catalog = refreshModelsCatalog({ write: false });
+    catalog.aliases[opts.register] = {
       repo: opts.uploadRepo ?? "",
       file: basename(primary.path),
       local_path: primary.path,
       registered_at: new Date().toISOString(),
     };
-    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
+    writeModelsCatalog(catalog);
+    refreshModelsCatalog();
     console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
     console.error(`  Try: hipfire run ${opts.register} "hello"`);
   }
@@ -2583,10 +2819,308 @@ interface UserAlias {
   registered_at?: string;
 }
 
-function loadUserAliases(): Record<string, UserAlias> {
+interface LocalModelRecord {
+  id: string;
+  file: string;
+  path: string;
+  size_bytes: number;
+  size_gb: number;
+  registry_tag?: string | null;
+  aliases?: string[];
+  chat_templates?: string[];
+  dflash_drafts?: string[];
+  triattn?: string[];
+  config?: PerModelOverride;
+}
+
+interface ModelsCatalog {
+  schema_version: 2;
+  updated_at: string;
+  aliases: Record<string, UserAlias>;
+  configs?: PerModelConfigs;
+  models: Record<string, LocalModelRecord>;
+}
+
+const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6)$/i;
+
+function readJsonFile(path: string): any | null {
   try {
-    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
-  } catch { return {}; }
+    const raw = readFileSync(path, "utf-8").trim();
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch { return null; }
+}
+
+function sanitizePerModelOverride(ov: any): PerModelOverride {
+  const clean: PerModelOverride = {};
+  if (!ov || typeof ov !== "object") return clean;
+  const src = { ...ov };
+  // Migrate legacy boolean mmq_screen -> tri-state.
+  if (typeof src.mmq_screen === "boolean") src.mmq_screen = src.mmq_screen ? "on" : "off";
+  for (const k of PER_MODEL_KEYS) {
+    const v = src[k];
+    if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+  }
+  return clean;
+}
+
+function normalizeAliasMap(raw: any): Record<string, UserAlias> {
+  const aliases: Record<string, UserAlias> = {};
+  if (!raw || typeof raw !== "object") return aliases;
+  for (const [tag, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.file !== "string") continue;
+    aliases[tag] = {
+      repo: typeof v.repo === "string" ? v.repo : "",
+      file: v.file,
+      local_path: typeof v.local_path === "string" ? v.local_path : undefined,
+      registered_at: typeof v.registered_at === "string" ? v.registered_at : undefined,
+    };
+  }
+  return aliases;
+}
+
+function emptyModelsCatalog(aliases: Record<string, UserAlias> = {}): ModelsCatalog {
+  return {
+    schema_version: 2,
+    updated_at: new Date().toISOString(),
+    aliases,
+    configs: {},
+    models: {},
+  };
+}
+
+function loadModelsCatalog(): ModelsCatalog {
+  const raw = readJsonFile(MODELS_CATALOG_PATH);
+  if (raw?.schema_version === 2) {
+    return {
+      schema_version: 2,
+      updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date().toISOString(),
+      aliases: normalizeAliasMap(raw.aliases),
+      configs: sanitizePerModelConfigs(raw.configs),
+      models: normalizeCatalogModels(raw.models),
+    };
+  }
+  // Legacy models.json was a flat alias map written by quantize --register.
+  return emptyModelsCatalog(normalizeAliasMap(raw));
+}
+
+function sanitizePerModelConfigs(raw: any): PerModelConfigs {
+  const out: PerModelConfigs = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [tag, ov] of Object.entries(raw)) {
+    const clean = sanitizePerModelOverride(ov);
+    if (Object.keys(clean).length > 0) out[tag] = clean;
+  }
+  return out;
+}
+
+function normalizeCatalogModels(raw: any): Record<string, LocalModelRecord> {
+  const models: Record<string, LocalModelRecord> = {};
+  if (!raw || typeof raw !== "object") return models;
+  for (const [id, value] of Object.entries(raw)) {
+    if (!value || typeof value !== "object") continue;
+    const v = value as any;
+    if (typeof v.path !== "string" || typeof v.file !== "string") continue;
+    models[id] = {
+      id,
+      file: v.file,
+      path: v.path,
+      size_bytes: Number(v.size_bytes) || 0,
+      size_gb: Number(v.size_gb) || 0,
+      registry_tag: typeof v.registry_tag === "string" ? v.registry_tag : null,
+      aliases: Array.isArray(v.aliases) ? v.aliases.filter((x: any) => typeof x === "string") : [],
+      chat_templates: Array.isArray(v.chat_templates) ? v.chat_templates.filter((x: any) => typeof x === "string") : [],
+      dflash_drafts: Array.isArray(v.dflash_drafts) ? v.dflash_drafts.filter((x: any) => typeof x === "string") : [],
+      triattn: Array.isArray(v.triattn) ? v.triattn.filter((x: any) => typeof x === "string") : [],
+      config: sanitizePerModelOverride(v.config),
+    };
+    if (Object.keys(models[id].config ?? {}).length === 0) delete models[id].config;
+  }
+  return models;
+}
+
+function loadLegacyPerModelConfigsRaw(): Record<string, any> {
+  const raw = readJsonFile(PER_MODEL_CONFIG_PATH);
+  return raw && typeof raw === "object" ? raw : {};
+}
+
+function clearLegacyPerModelConfigs() {
+  try {
+    if (existsSync(PER_MODEL_CONFIG_PATH)) writeFileSync(PER_MODEL_CONFIG_PATH, "{}\n");
+  } catch {}
+}
+
+function writeModelsCatalog(catalog: ModelsCatalog) {
+  mkdirSync(HIPFIRE_DIR, { recursive: true });
+  catalog.schema_version = 2;
+  catalog.updated_at = new Date().toISOString();
+  const tmp = `${MODELS_CATALOG_PATH}.tmp`;
+  writeFileSync(tmp, JSON.stringify(catalog, null, 2) + "\n");
+  renameSync(tmp, MODELS_CATALOG_PATH);
+}
+
+function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
+  try {
+    return readdirSync(dir)
+      .filter(pred)
+      .map(f => join(dir, f))
+      .filter(p => {
+        try { return statSync(p).isFile(); } catch { return false; }
+      })
+      .sort();
+  } catch { return []; }
+}
+
+function registryTagForFile(file: string): string | null {
+  const fNorm = file
+    .replace(/\.q4\.hfq$/i, ".hf4")
+    .replace(/\.hfq6\.hfq$/i, ".hf6")
+    .replace(/-hfq4\.hfq$/i, ".hf4")
+    .replace(/\.hfq$/i, ".hf4");
+  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
+}
+
+function modelFamily(id: string): string | null {
+  const lower = id.toLowerCase();
+  const m = lower.match(/^(qwen3(?:\.[56])?|carnice|qwopus|gemma|mistral)/);
+  return m?.[1] ?? null;
+}
+
+function templateMatchesModel(templatePath: string, modelId: string): boolean {
+  const t = basename(templatePath).toLowerCase();
+  const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
+  const lowerId = modelId.toLowerCase();
+  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6)$/i, "");
+  if (tStem === lowerId || tStem === modelStem) return true;
+  const family = modelFamily(modelId);
+  if (!family) return false;
+  return tStem === `${family}-chat_template`
+    || tStem === `${family}_chat_template`
+    || tStem === `${family}.chat_template`;
+}
+
+function draftMatchesModel(draftPath: string, modelId: string): boolean {
+  const d = basename(draftPath).toLowerCase();
+  if (!d.endsWith(".hfq")) return false;
+  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq)/);
+  if (!m) return false;
+  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
+}
+
+function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
+  const s = basename(sidecarPath).toLowerCase();
+  return s.startsWith(`${modelId.toLowerCase()}.triattn`) && s.endsWith(".bin");
+}
+
+function catalogModelIdForConfigKey(catalog: ModelsCatalog, key: string): string | null {
+  if (catalog.models[key]) return key;
+  const resolved = resolveModelTag(key);
+  for (const model of Object.values(catalog.models)) {
+    if (model.registry_tag === key || model.registry_tag === resolved) return model.id;
+    if ((model.aliases ?? []).includes(key) || (model.aliases ?? []).includes(resolved)) return model.id;
+  }
+  return null;
+}
+
+function refreshModelsCatalog(opts: { write?: boolean } = {}): ModelsCatalog {
+  const shouldWrite = opts.write !== false;
+  const previous = loadModelsCatalog();
+  const legacyConfigs = sanitizePerModelConfigs(loadLegacyPerModelConfigsRaw());
+  const catalog = emptyModelsCatalog(previous.aliases);
+  const templates = scanFiles(TEMPLATES_DIR, f => /\.(j2|jinja|jinja2)$/i.test(f));
+  const drafts = [
+    ...scanFiles(DRAFTS_DIR, f => f.toLowerCase().endsWith(".hfq")),
+    ...scanFiles(MODELS_DIR, f => /dflash/i.test(f) && f.toLowerCase().endsWith(".hfq")),
+  ];
+  const triattn = [
+    ...scanFiles(TRIATTN_DIR, f => f.toLowerCase().endsWith(".triattn.bin")),
+    ...scanFiles(MODELS_DIR, f => /\.triattn.*\.bin$/i.test(f)),
+  ];
+
+  const existingConfigs: PerModelConfigs = { ...(previous.configs ?? {}), ...legacyConfigs };
+  for (const [id, model] of Object.entries(previous.models ?? {})) {
+    if (model.config && Object.keys(model.config).length > 0) existingConfigs[id] = model.config;
+  }
+
+  const modelPaths = [
+    ...scanFiles(MODELS_DIR, f => MODEL_EXT_RE.test(f)),
+    ...scanFiles(resolve(__dirname, "../models"), f => MODEL_EXT_RE.test(f)),
+  ];
+  const seen = new Set<string>();
+  for (const path of modelPaths) {
+    const file = basename(path);
+    if (seen.has(file)) continue;
+    seen.add(file);
+    let st;
+    try { st = statSync(path); } catch { continue; }
+    const registryTag = registryTagForFile(file);
+    const aliases = Object.entries(catalog.aliases)
+      .filter(([_, a]) => {
+        if (a.local_path && resolve(a.local_path) === resolve(path)) return true;
+        return a.file === file;
+      })
+      .map(([tag]) => tag)
+      .sort();
+
+    const config =
+      sanitizePerModelOverride(existingConfigs[file])
+      || {};
+    const configCandidates = [file, registryTag, ...aliases].filter(Boolean) as string[];
+    let mergedConfig: PerModelOverride = {};
+    for (const key of configCandidates) {
+      mergedConfig = { ...mergedConfig, ...sanitizePerModelOverride(existingConfigs[key]) };
+    }
+    if (Object.keys(config).length > 0) mergedConfig = { ...mergedConfig, ...config };
+
+    const rec: LocalModelRecord = {
+      id: file,
+      file,
+      path: resolve(path),
+      size_bytes: st.size,
+      size_gb: Number((st.size / 1e9).toFixed(3)),
+      registry_tag: registryTag,
+      aliases,
+      chat_templates: templates.filter(t => templateMatchesModel(t, file)),
+      dflash_drafts: drafts.filter(d => draftMatchesModel(d, file)),
+      triattn: triattn.filter(s => triattnMatchesModel(s, file)),
+    };
+    if (Object.keys(mergedConfig).length > 0) rec.config = mergedConfig;
+    catalog.models[file] = rec;
+  }
+
+  const unresolved: PerModelConfigs = {};
+  for (const [key, ov] of Object.entries(existingConfigs)) {
+    if (!catalogModelIdForConfigKey(catalog, key)) {
+      const clean = sanitizePerModelOverride(ov);
+      if (Object.keys(clean).length > 0) unresolved[key] = clean;
+    }
+  }
+  catalog.configs = unresolved;
+
+  if (shouldWrite) {
+    try {
+      writeModelsCatalog(catalog);
+      if (Object.keys(legacyConfigs).length > 0) clearLegacyPerModelConfigs();
+    } catch {}
+  }
+  return catalog;
+}
+
+function catalogModelOptions(): string[] {
+  const catalog = loadModelsCatalog();
+  const values = new Set<string>();
+  for (const model of Object.values(catalog.models)) {
+    values.add(model.id);
+    if (model.registry_tag) values.add(model.registry_tag);
+    for (const alias of model.aliases ?? []) values.add(alias);
+  }
+  return [...values].sort();
+}
+
+function loadUserAliases(): Record<string, UserAlias> {
+  return loadModelsCatalog().aliases;
 }
 
 export function findModel(name: string): string | null {
@@ -2692,26 +3226,13 @@ export function findModel(name: string): string | null {
 
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
-  const seen = new Set<string>();
-  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
-    let entries: string[];
-    try { entries = readdirSync(dir); } catch { continue; }
-    for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
-        seen.add(f);
-        // statSync may throw on dangling symlinks or files removed mid-scan;
-        // skip those individually instead of aborting the rest of the loop
-        // (a previous try/catch wrapping the entire iteration ate everything
-        // after the first stale symlink — see commit log for the bug story).
-        try {
-          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
-          // Find matching registry tag (check new and old naming)
-          const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
-          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
-          models.push({ name: f, tag, size: `${sz}GB` });
-        } catch {}
-      }
-    }
+  const catalog = loadModelsCatalog();
+  for (const model of Object.values(catalog.models).sort((a, b) => a.id.localeCompare(b.id))) {
+    models.push({
+      name: model.id,
+      tag: model.registry_tag ?? "",
+      size: `${(model.size_bytes / 1e9).toFixed(1)}GB`,
+    });
   }
   return models;
 }
@@ -3433,9 +3954,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
-  // Build default_model options from REGISTRY so users can cycle through
-  // known tags without typing. "custom" lets them fall back to free text.
-  const modelOptions = Object.keys(REGISTRY).sort();
+  // Build default_model options from the local catalog so config does not
+  // offer registry-only models that are not actually installed. Fall back to
+  // the registry only on a completely fresh install with no local catalog yet.
+  const modelOptions = catalogModelOptions();
+  if (modelOptions.length === 0) modelOptions.push(...Object.keys(REGISTRY).sort());
 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
@@ -3766,7 +4289,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
-      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${MODELS_CATALOG_PATH}${C.reset}\n`);
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
@@ -4093,16 +4616,17 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
 }
 
 // Sub-TUI launched from the global config TUI's "[per-model configs]" row.
-// Lists registered models (REGISTRY + any user-registered aliases), shows
-// which have overrides, and returns the selected tag or null if user escapes.
+// Lists local catalog models, shows which have overrides, and returns the
+// selected model id or null if user escapes.
 function modelPickerTui(): Promise<string | null> {
+  const catalog = loadModelsCatalog();
   const tags = [
-    ...Object.keys(REGISTRY),
-    ...Object.keys(loadUserAliases()),
+    ...Object.keys(catalog.models),
+    ...Object.keys(catalog.configs ?? {}),
   ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
 
   if (tags.length === 0) {
-    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
+    console.log("No local models. Pull one first: hipfire pull qwen3.5:9b");
     return Promise.resolve(null);
   }
 
@@ -4125,9 +4649,10 @@ function modelPickerTui(): Promise<string | null> {
       const ov = overlays[tag];
       const cnt = ov ? Object.keys(ov).length : 0;
       const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
-      const entry = REGISTRY[tag];
-      const desc = entry?.desc ?? "(user-registered)";
-      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
+      const model = catalog.models[tag];
+      const entry = model?.registry_tag ? REGISTRY[model.registry_tag] : undefined;
+      const desc = entry?.desc ?? (model ? model.path : "(config-only)");
+      const size = model ? `${model.size_gb.toFixed(1)}GB`.padStart(7) : "".padStart(7);
       const marker = cnt > 0
         ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
         : `${C.dim}(no overrides)${C.reset}`;
@@ -4209,6 +4734,8 @@ function findDep(binary: string, extraDirs: string[]): string | null {
 }
 
 // ─── Main ───────────────────────────────────────────────
+
+refreshModelsCatalog();
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
@@ -5332,10 +5859,13 @@ Examples:
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
-      // If looks like a tag, scope to that model
+      // Scope to a local catalog model when possible. Registry-only tags are
+      // still accepted for scripting/backward compatibility, but the picker
+      // no longer advertises models that are not installed.
       const resolved = resolveModelTag(firstArg);
-      if (REGISTRY[resolved] || firstArg.includes(":")) {
-        modelScope = resolved;
+      const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
+      if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = catalogId ?? resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
     }
@@ -5394,7 +5924,7 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
-        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
+        console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
           const v = (merged as any)[k];
