@@ -67,7 +67,8 @@ fn output_matches_load_and_preprocess_for_same_input() {
     let path = dir.join("equiv.png");
     let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(32, 32, Rgb([10, 200, 50]));
     img.save(&path).unwrap();
-    let (from_path, h2, w2) = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2);
+    let (from_path, h2, w2) = hipfire_arch_qwen35_vl::image::load_and_preprocess(&path, 16, 2)
+        .expect("load_and_preprocess failed");
     let _ = std::fs::remove_dir_all(&dir);
 
     assert_eq!((h1, w1), (h2, w2), "dimensions should match between from-bytes and from-path");
@@ -88,9 +89,10 @@ fn channel_order_preserved_from_bytes() {
     // channel ordering — pure red (255, 0, 0) is identical under RGB
     // and BGR and would silently pass either way.
     //
-    // Implementation outputs CHW as [R, B, G] (NOT canonical R, G, B):
-    // a workaround for the HF patch_embed weight export — see
-    // `preprocess_dynamic_image` in src/image.rs for the rationale.
+    // Implementation outputs CHW in canonical (R, G, B) order. The prior
+    // (R, B, G) swap was a misdiagnosis (see `image.rs` history note and
+    // `benchmarks/vision/comparison-2026-05-23.md`); the real bug was the
+    // patch transpose in `extract_patches`, not the channel layout.
     let bytes = solid_png_bytes(10, 100, 200, 32, 32);
     let (out, h, w) = load_and_preprocess_from_bytes(&bytes, 16, 2).unwrap();
     assert!(
@@ -99,13 +101,13 @@ fn channel_order_preserved_from_bytes() {
         channel_at(&out, h, w, 0, 0, 0),
     );
     assert!(
-        (channel_at(&out, h, w, 1, 0, 0) - norm(200)).abs() < 1e-4,
-        "channel 1 should carry B=200 (got {:.4}) — note R,B,G layout",
+        (channel_at(&out, h, w, 1, 0, 0) - norm(100)).abs() < 1e-4,
+        "channel 1 should carry G=100 (got {:.4})",
         channel_at(&out, h, w, 1, 0, 0),
     );
     assert!(
-        (channel_at(&out, h, w, 2, 0, 0) - norm(100)).abs() < 1e-4,
-        "channel 2 should carry G=100 (got {:.4}) — note R,B,G layout",
+        (channel_at(&out, h, w, 2, 0, 0) - norm(200)).abs() < 1e-4,
+        "channel 2 should carry B=200 (got {:.4})",
         channel_at(&out, h, w, 2, 0, 0),
     );
 }
