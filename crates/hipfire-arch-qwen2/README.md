@@ -9,7 +9,7 @@ forward pass with KV cache, and standalone driver + daemon arm all
 landed. Validated 16/16 top-1 match against HuggingFace F32 reference
 at Q8F16 precision (see
 `benchmarks/references/qwen2_1p5b_instruct_smoke.json`). See
-`docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` for the bring-up plan and
+`docs/plans/dots-ocr-prd.md` for the bring-up plan and
 deferred follow-ons.
 
 ## Architecture

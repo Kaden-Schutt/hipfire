@@ -194,7 +194,7 @@ impl SafetensorsFile {
 /// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
 /// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
 /// See docs/architecture-ids.md and docs/plans/
-/// qwen_2.0_vlm_plus_dots_ocr.md §6 R1.
+/// dots-ocr-devlog.md §7 (R1).
 fn parse_arch_id_override() -> Option<u32> {
     let args: Vec<String> = std::env::args().collect();
     let pos = args.iter().position(|a| a == "--arch-id")?;
@@ -2460,8 +2460,17 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    // Vision encoder weights stay FP16 (only 456M params, run once per image)
-    if name.starts_with("model.visual.") || name.starts_with("visual.") {
+    // Vision encoder weights stay FP16 (only ~500M params, run once per image).
+    // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
+    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
+    // per-stage diff against the HF reference activations
+    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
+    // both forward-pass implementation noise AND quant noise — clean
+    // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
+    if name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+        || name.starts_with("vision_tower.")
+    {
         return false;
     }
     if name.contains("norm") || name.contains("bias") {
@@ -3267,7 +3276,7 @@ fn run_gguf_pipeline(
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -4049,6 +4058,11 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
+        // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
+        // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
+        // dots-ocr-prd.md.
+        "dots_ocr" => 8,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -4056,7 +4070,7 @@ fn main() {
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -4102,12 +4116,31 @@ fn main() {
         None
     };
 
+    // Read generation_config.json. HF stores some sampler-side defaults
+    // here (eos_token_id, pad_token_id, bos_token_id, do_sample, etc.)
+    // separately from config.json. For most checkpoints these duplicate
+    // config.json fields, but dots.ocr's config.json carries no
+    // eos_token_id at all — the [151643, 151673] array lives only in
+    // generation_config.json. Packing it here lets the arch-side parser
+    // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
+    // generation_config when config.eos_token_id is absent. Resolves
+    // R5 in docs/plans/dots-ocr-devlog.md §7.
+    let generation_config_path = input_dir.join("generation_config.json");
+    let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
+        std::fs::read_to_string(&generation_config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
     // Build metadata JSON for .hfq
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
+        "generation_config": generation_config,
     });
     let metadata_json = serde_json::to_string(&metadata).unwrap();
 
@@ -4351,8 +4384,14 @@ fn main() {
         .unwrap_or_default();
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip MTP head; optionally include vision encoder for VL inference
-        let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
+        // Skip MTP head; optionally include vision encoder for VL inference.
+        // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
+        // dots.ocr names them `vision_tower.*`. Both fall through to the
+        // F16 fallback path (see should_quantize: vision_tower.* is
+        // skipped from quantization) when --include-vision is set.
+        let is_vision = name.starts_with("model.visual.")
+            || name.starts_with("visual.")
+            || name.starts_with("vision_tower.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
