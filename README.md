@@ -42,7 +42,8 @@ and the cross-arch matrix (RDNA1 / RDNA2 / APU / MI300X).
 
 CASK-based KV cache eviction lets you run long-context prompts without
 OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
-caching with `cask_sidecar on` in your config. See [CONFIG.md](docs/CONFIG.md) for details.
+eviction with `hipfire config cask-profile balanced`. See
+[CONFIG.md](docs/CONFIG.md) for details.
 
 ## Install
 

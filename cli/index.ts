@@ -5253,9 +5253,14 @@ Examples:
         process.exit(1);
       }
 
-      // Determine if we should use dev source or installed source.
-      const srcDir = existsSync(devSrc) ? dirname(dirname(devSrc)) : dirname(dirname(hipfireSrc));
-      const workspaceRoot = existsSync(join(srcDir, "Cargo.toml")) ? srcDir : resolve(__dirname, "..");
+      // Determine if we should use the dev checkout or the installed source.
+      // Build from the workspace root so Cargo writes the example under
+      // <workspace>/target/release/examples/, matching the binPath below.
+      const workspaceRoot = existsSync(devSrc) ? resolve(__dirname, "..") : join(HIPFIRE_DIR, "src");
+      if (!existsSync(join(workspaceRoot, "Cargo.toml"))) {
+        console.error(`Could not find hipfire workspace root at ${workspaceRoot}`);
+        process.exit(1);
+      }
       console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
 
       // Parse deps for PATH augmentation (same as update command does).
@@ -5270,7 +5275,8 @@ Examples:
         if (p) augmentDirs.add(p.substring(0, p.lastIndexOf("/")));
       }
       // Also add bun dir for its subtree helpers.
-      const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);        if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
+      const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
+      if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
       if (augmentDirs.size) {
         const curr = (process.env.PATH || "").split(":").filter(Boolean);
         const fresh = [...augmentDirs].filter(d => !curr.includes(d));

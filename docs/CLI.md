@@ -53,7 +53,7 @@ generate the calibration sidecar:
 
 | Command | Purpose |
 |---|---|
-| `hipfire sidecar-gen <model>` | Generate a `.triattn.bin` sidecar for the given model. The daemon auto-discovers it alongside the model file when CASK is enabled (`cask_sidecar on`). |
+| `hipfire sidecar-gen <model>` | Generate a `.triattn.bin` sidecar for the given model. The daemon auto-discovers it alongside the model file when a CASK profile is enabled. |
 
 Usage:
 
@@ -65,10 +65,10 @@ Flags for `sidecar-gen`:
 
 | Flag | Purpose |
 |---|---|
-| `<model>` (positional) | Model tag or local file path. The sidecar is written next to the model file by default with the same base name: `my-finetune.mq4` → `my-finetune.triattn.bin`. See **Filename discovery** below for details. |
+| `<model>` (positional) | Model tag or local file path. The sidecar is written next to the model file by default using the full model filename: `my-finetune.mq4` → `my-finetune.mq4.triattn.bin`. See **Filename discovery** below for details. |
 | `--corpus PATH` | Text corpus for calibration. If omitted, uses an internal default. |
-| `--max-tokens N` | Maximum tokens of context to calibrate over (default: 8192). |
-| `--chunk-len N` | Chunk size for KV cache statistics collection (default: 1024). |
+| `--max-tokens N` | Maximum tokens of context to calibrate over (default: 4000). |
+| `--chunk-len N` | Chunk size for KV cache statistics collection (default: 256). |
 | `--gpu-calib` | Run calibration on GPU instead of CPU. |
 | `--cpu-calib` | Override to run on CPU even if a compatible GPU is available. |
 | `-o PATH` | Output path for the `.triattn.bin` file (default: next to model). |
@@ -84,7 +84,8 @@ critical early tokens on long context prompts, causing quality drop-off.
 ```bash
 hipfire quantize ./my-model/ --format mq4 -o my-finetune.mq4
 hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
-# The daemon will auto-attach the sidecar when you run with cask_sidecar on
+hipfire config cask-profile balanced
+# The daemon will auto-attach the sidecar on the next model load
 ```
 
 See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
@@ -97,7 +98,7 @@ See [CONFIG.md](CONFIG.md) for CASK-related configuration keys.
 >
 > **Filename discovery:** When `cask_sidecar` is unset, the daemon looks for
 > a sidecar in the same directory as the model file using `<basename>.triattn*.bin`
-> (e.g., `my-finetune.mq4` → `my-finetune.triattn.bin`). If you specify a
+> (e.g., `my-finetune.mq4` → `my-finetune.mq4.triattn.bin`). If you specify a
 > path with directories (`foo/bar/model.mq4`), it scans `foo/bar/` for the
 > sidecar — not the current working directory.
 

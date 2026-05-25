@@ -105,10 +105,11 @@ published `.triattn.bin` ships alongside the weights and is auto-attached.
 
 ```bash
 # After pushing your model to ~/.hipfire/models/:
-hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt -o my-finetune.triattn.bin
+hipfire sidecar-gen ~/.hipfire/models/my-finetune.mq4 --corpus /path/to/corpus.txt
 ```
 
-The generated file is placed next to the model by default.
+The generated file is placed next to the model by default, for example
+`my-finetune.mq4.triattn.bin`.
 The daemon auto-discovers it using `<basename>.triattn*.bin` matching.
 See [CLI.md](CLI.md) for full `sidecar-gen` flag details and
 [QUANTIZE.md](QUANTIZE.md) for the post-quantization workflow.

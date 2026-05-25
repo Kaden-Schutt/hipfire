@@ -99,7 +99,7 @@ models pulled via `hipfire pull`, a sidecar is auto-attached — just enable
 eviction with:
 
 ```bash
-hipfire config set cask-profile balanced   # or conservative / aggressive-vram
+hipfire config cask-profile balanced   # or conservative / aggressive-vram
 ```
 
 The daemon automatically discovers the shipped `.triattn.bin` beside the
@@ -111,9 +111,8 @@ you must set a CASK profile (`balanced`, `conservative`, or `aggressive-vram`) t
 For custom or quantized models, generate the sidecar first:
 
 ```bash
-hipfire sidecar-gen my-finetune.mq4 --corpus corpus.txt -o my-finetune.triattn.bin
-hipfire config set cask_sidecar ~/models/my-finetune.triattn.bin
-hipfire config set cask-profile balanced
+hipfire sidecar-gen ~/models/my-finetune.mq4 --corpus corpus.txt
+hipfire config cask-profile balanced
 ```
 
 See [CONFIG.md](CONFIG.md) for profiles, knobs, and safety constraints.

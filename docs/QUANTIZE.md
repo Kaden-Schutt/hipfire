@@ -151,9 +151,10 @@ tokens (which often carry critical instructions) may be evicted.
 hipfire sidecar-gen my-finetune.mq4 --corpus /path/to/corpus.txt
 ```
 
-The sidecar is written as `my-finetune.triattn.bin` next to your model
-file by default. The daemon auto-discovers it when CASK eviction is
-enabled (`cask_sidecar on`). See [CLI.md](CLI.md) for full flag details.
+The sidecar is written as `my-finetune.mq4.triattn.bin` next to your
+model file by default. The daemon auto-discovers it when you enable a
+CASK profile with `hipfire config cask-profile balanced`. See
+[CLI.md](CLI.md) for full flag details.
 
 > **Tip:** If you're quantizing from a HuggingFace safetensors source,
 > use `--install` to copy your model into the models directory, then
