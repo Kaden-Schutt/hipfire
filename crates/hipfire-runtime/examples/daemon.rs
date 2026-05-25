@@ -29,6 +29,7 @@ use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
+use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35_vl::qwen35_vl;
@@ -393,6 +394,13 @@ struct LoadedModel {
     qwen2_config: Option<qwen2::Qwen2Config>,
     qwen2_weights: Option<qwen2::Qwen2Weights>,
     qwen2_state: Option<qwen2::Qwen2State>,
+    // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
+    // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
+    // `qwen2::forward_step*`, and the per-step decode state reuses the
+    // `qwen2_state` field above. `dots_ocr_weights.vision` holds the
+    // resident vision-tower weights for `dots_ocr::vision_forward`.
+    dots_ocr_config: Option<dots_ocr::DotsOcrConfig>,
+    dots_ocr_weights: Option<dots_ocr::DotsOcrWeights>,
     // Vision state (VL models only)
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
@@ -998,7 +1006,8 @@ fn main() {
                 };
 
                 let has_image = image_base64.is_some() || image.is_some();
-                let has_vl = m.vision_config.is_some();
+                let is_dots_ocr = m.arch_id == 8;
+                let has_vl = m.vision_config.is_some() || is_dots_ocr;
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -1030,7 +1039,11 @@ fn main() {
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                     };
-                    generate_vl(m, &mut gpu, &mut stdout, &params);
+                    if is_dots_ocr {
+                        generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params);
+                    } else {
+                        generate_vl(m, &mut gpu, &mut stdout, &params);
+                    }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
                     // and apply any per-request overrides from `params`.
@@ -1660,6 +1673,50 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 8 {
+        // dots.ocr (Qwen2-VL family). Text decoder is Qwen2; vision tower
+        // is the 42-block DotsVisionTransformer. Both load side-by-side in
+        // DotsOcrWeights and stay resident. Single-image, greedy decode at
+        // bring-up — no eviction, DFlash, CASK, or PP.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=8 (dots.ocr). Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=8 (dots.ocr). Reload without --cask-sidecar.".to_string());
+        }
+        if pp > 1 {
+            return Err("pipeline-parallel (pp>1) not supported on arch_id=8 (dots.ocr).".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        use hipfire_arch_dots_ocr::DotsOcr;
+        let config = <DotsOcr as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <DotsOcr as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        // Size the decode KV cache to the requested window (the trait's
+        // new_state uses a default max_seq; OCR prompts are long).
+        let state = qwen2::Qwen2State::new_with_max_seq(gpu, &config.text, max_seq)
+            .map_err(|e| format!("dots-ocr: Qwen2State::new_with_max_seq failed: {e:?}"))?;
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
+            dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1833,6 +1890,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
@@ -1863,6 +1921,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -1941,6 +2000,8 @@ fn load_model_safetensors(
             qwen2_config: None,
             qwen2_weights: None,
             qwen2_state: None,
+            dots_ocr_config: None,
+            dots_ocr_weights: None,
             kv_cache: None,
             dn_state: None,
             llama_config: Some(config),
@@ -1999,6 +2060,8 @@ fn load_model_safetensors(
         qwen2_config: None,
         qwen2_weights: None,
         qwen2_state: None,
+        dots_ocr_config: None,
+        dots_ocr_weights: None,
         kv_cache: Some(kv_cache),
         dn_state: Some(dn_state),
         llama_config: None,
@@ -2138,6 +2201,7 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        dots_ocr_config: None, dots_ocr_weights: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
@@ -4970,6 +5034,165 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
+        id, generated, tok_s, prefill_tokens,
+        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
+    );
+    let _ = stdout.flush();
+}
+
+/// dots.ocr (arch_id=8) VL generation. Single-image, greedy decode —
+/// the phase-3 bring-up serving path that promotes the standalone
+/// `ocr_e2e` example into the daemon.
+///
+/// Flow: preprocess image → `build_prompt_ids` (HF-exact framing) →
+/// `vision_forward` → per-token prefill splicing merged visual
+/// embeddings at `<|imgpad|>` slots → greedy decode to EOS, streaming
+/// tokens in the daemon's JSONL protocol.
+///
+/// MVP scope: greedy only (sampling params ignored), single image,
+/// per-token prefill, `--image <path>` only (base64 deferred). The text
+/// side is Qwen2; the decode state reuses `m.qwen2_state`.
+fn generate_vl_dots_ocr(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
+    use hipfire_arch_dots_ocr::image as dots_image;
+    let t0 = Instant::now();
+    let GenerateVLParams { id, prompt, ref image_source, max_tokens, .. } = *params;
+
+    // 1. Preprocess image (CPU; no model borrow yet so error returns are clean).
+    let img = match image_source {
+        ImageSource::Path(path) => {
+            eprintln!("[dots-ocr] preprocessing image: {path}");
+            dots_image::preprocess_image(Path::new(path))
+        }
+        ImageSource::Base64(_) => {
+            write_error(stdout, id,
+                "dots.ocr: base64 image input not yet supported (phase-3 MVP) — use a file path");
+            return;
+        }
+    };
+    let img = match img {
+        Ok(i) => i,
+        Err(e) => { write_error(stdout, id, &format!("dots.ocr image preprocess failed: {e}")); return; }
+    };
+    let n_visual = img.n_visual_tokens();
+    let n_patches = img.n_patches();
+    eprintln!("[dots-ocr] grid {}x{}, {} patches → {} visual tokens",
+        img.grid_h, img.grid_w, n_patches, n_visual);
+
+    let max_seq = m.max_seq;
+
+    // 2. Model state (disjoint field borrows of `m`).
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let config = m.dots_ocr_config.as_ref().unwrap();
+    let weights = m.dots_ocr_weights.as_ref().unwrap();
+    let state = m.qwen2_state.as_mut().unwrap();
+    let text_cfg = &config.text;
+    let dim = text_cfg.hidden_size;
+
+    // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
+    let prompt_ids = dots_ocr::build_prompt_ids(tokenizer, prompt, n_visual);
+    if prompt_ids.len() + max_tokens > max_seq {
+        write_error(stdout, id, &format!(
+            "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
+            prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+
+    // 4. Vision encoder → merged visual tokens.
+    let patch_cols = img.patches.len() / n_patches;
+    let patches_gpu = match gpu.upload_f32(&img.patches, &[n_patches, patch_cols]) {
+        Ok(t) => t,
+        Err(e) => { write_error(stdout, id, &format!("dots.ocr patch upload failed: {e:?}")); return; }
+    };
+    let merged_gpu = match dots_ocr::vision_forward(gpu, &weights.vision, &config.vision, &patches_gpu, img.grid_h, img.grid_w) {
+        Ok(t) => t,
+        Err(e) => { let _ = gpu.free_tensor(patches_gpu); write_error(stdout, id, &format!("dots.ocr vision_forward failed: {e:?}")); return; }
+    };
+    let _ = gpu.free_tensor(patches_gpu);
+    let merged = match gpu.download_f32(&merged_gpu) {
+        Ok(v) => v,
+        Err(e) => { let _ = gpu.free_tensor(merged_gpu); write_error(stdout, id, &format!("dots.ocr merger download failed: {e:?}")); return; }
+    };
+    let _ = gpu.free_tensor(merged_gpu);
+    // Hard guard: merger output count MUST equal the imgpad-slot count, or
+    // the splice silently corrupts the text context (PRD §"Vision token splicing").
+    if merged.len() != n_visual * dim {
+        write_error(stdout, id, &format!(
+            "dots.ocr: merger produced {} values but prompt has {} <|imgpad|> slots × {} dims = {}",
+            merged.len(), n_visual, dim, n_visual * dim));
+        return;
+    }
+
+    // 5. Prefill: splice merged visual embeddings at IMGPAD slots, else token lookup.
+    state.reset();
+    let t_prefill = Instant::now();
+    let mut visual_idx = 0usize;
+    for &token in &prompt_ids {
+        let r = if token == dots_ocr::IMGPAD_ID {
+            let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
+            visual_idx += 1;
+            qwen2::forward_step_with_embed(gpu, &weights.text, text_cfg, state, emb)
+        } else {
+            qwen2::forward_step(gpu, &weights.text, text_cfg, state, token)
+        };
+        if let Err(e) = r { write_error(stdout, id, &format!("dots.ocr prefill failed: {e:?}")); return; }
+    }
+    let prefill_tokens = prompt_ids.len();
+    let prefill_s = t_prefill.elapsed().as_secs_f64();
+
+    // 6. Greedy decode, streaming in the daemon JSONL protocol.
+    let eos_set: Vec<u32> = if text_cfg.eos_token_ids.is_empty() {
+        vec![text_cfg.eos_token_id]
+    } else {
+        text_cfg.eos_token_ids.clone()
+    };
+    let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
+        Ok(t) => t,
+        Err(e) => { write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}")); return; }
+    };
+    let t_gen = Instant::now();
+    let mut streamed: Vec<u32> = Vec::new();
+    let mut emitted_bytes = 0usize;
+    let mut generated = 0usize;
+    // No ngram loop-guard here: dots.ocr layout-JSON legitimately repeats
+    // short structures (`<td>…</td>`, `"category":`, bracket patterns), and
+    // the default guard force-stops mid-table (observed: truncation at 391
+    // tokens on a table-heavy page). The proven ocr_e2e path decodes
+    // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
+
+    while generated < max_tokens {
+        if eos_set.contains(&next) { break; }
+        emit_committed_event(stdout, id, next, generated, t0.elapsed().as_millis() as u64);
+        generated += 1;
+        streamed.push(next);
+
+        // Incremental UTF-8 streaming — only emit complete code points.
+        let all_bytes = tokenizer.decode_bytes(&streamed);
+        let new_bytes = &all_bytes[emitted_bytes..];
+        let valid_len = match std::str::from_utf8(new_bytes) {
+            Ok(_) => new_bytes.len(),
+            Err(e) => e.valid_up_to(),
+        };
+        if valid_len > 0 {
+            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+            emitted_bytes += valid_len;
+        }
+
+        match qwen2::forward_step_greedy(gpu, &weights.text, text_cfg, state, next) {
+            Ok(t) => next = t,
+            Err(e) => { write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}")); return; }
+        }
+    }
+
+    let decode_s = t_gen.elapsed().as_secs_f64();
+    let total_s = t0.elapsed().as_secs_f64();
     let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
     let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
     let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
