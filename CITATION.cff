@@ -1,0 +1,37 @@
+cff-version: 1.2.0
+title: hipfire
+message: >-
+  If you use or build on hipfire, please cite it as below.
+type: software
+authors:
+  - given-names: Kaden
+    family-names: Schutt
+    email: kaden@hipfire.dev
+    affiliation: Independent
+repository-code: 'https://github.com/Kaden-Schutt/hipfire'
+url: 'https://github.com/Kaden-Schutt/hipfire'
+abstract: >-
+  hipfire is a Rust-native LLM inference engine for AMD RDNA / CDNA
+  GPUs. It targets the full RDNA1 -> RDNA4 family (plus CDNA where
+  ROCm support overlaps) without a build-time HIP/ROCm dependency,
+  loading libamdhip64 at runtime via dlopen. The engine ships an
+  original quantization family (HFQ4-G256, MagnumQuant MQ4/MQ8 with
+  offline FWHT rotation, HFP4/MFP4 FP4), an asym3 KV cache with
+  asym-aware flash attention, and a DDTree-RDNA tree-speculative
+  decode path on top of DFlash. See PRIOR-ART.md for the full
+  inventory of original architectural innovations with first-commit
+  dates and canonical hashes.
+keywords:
+  - inference
+  - llm
+  - amd
+  - rdna
+  - rocm
+  - hip
+  - rust
+  - quantization
+  - speculative-decoding
+  - flash-attention
+license: MIT OR Apache-2.0
+version: 0.1.20
+date-released: '2026-05-19'

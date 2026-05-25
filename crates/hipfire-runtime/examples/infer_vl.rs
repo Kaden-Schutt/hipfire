@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen3.5-VL inference: image + text question → text answer.
 //! Usage: infer_vl <model.hfq> <image.png> [question...]
 
@@ -44,7 +48,7 @@ fn main() {
     use hipfire_runtime::arch::Architecture;
     use hipfire_arch_qwen35::Qwen35;
     use hipfire_arch_qwen35_vl::Qwen35Vl;
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let text_config = <Qwen35 as Architecture>::config_from_hfq(&hfq)
         .expect("failed to read text config");
     let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq)
@@ -81,7 +85,7 @@ fn main() {
 
     // Load vision weights (GPU-side for fast inference)
     eprintln!("Loading vision weights...");
-    let vision_weights = <Qwen35Vl as Architecture>::load_weights(&hfq, &vision_config, &mut gpu)
+    let vision_weights = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vision_config, &mut gpu)
         .expect("failed to load vision weights");
 
     // Run vision encoder (GPU linear layers + CPU attention).
@@ -94,7 +98,7 @@ fn main() {
     assert_eq!(visual_tokens.len(), n_visual_tokens * text_config.dim);
 
     eprintln!("Loading text weights...");
-    let weights = <Qwen35 as Architecture>::load_weights(&hfq, &text_config, &mut gpu)
+    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &text_config, &mut gpu)
         .expect("failed to load text weights");
 
     let kv_seq = 2048usize;

@@ -144,13 +144,13 @@ are wanted.
 CLI surface added:
 
 ```
---prompts-file <path>   Mutually exclusive with --prompt. JSON-lines:
+--prompts-file <path>   Mutually exclusive with --prompt and --prompt-file. JSON-lines:
                         {"label":"...","prompt":"...","max":N}
                         max is optional; defaults to global --max.
                         label must not contain '@@@' or newline.
                         Malformed line: log to stderr and continue
                         with next row (don't kill a long battery).
-                        Mutually exclusive with --cask-sidecar.
+                        Mutually exclusive with --cask-sidecar and --pflash.
 ```
 
 What stays one-time (outside the per-row loop):
@@ -222,12 +222,12 @@ Migration is larger than v1 of the plan implied:
   match. In multi-row output it would always analyze row 1 and silently
   ignore row 2+. Rewrite required: split `out` on `@@@ ROW \d+: \S+ @@@`
   / `@@@ ROW \d+ END @@@` boundaries first, then run detector per row.
- 
+
 - Stats extraction at line 270 uses `grep … | head -3` which always
   yields row 1's stats. Same row-aware split required.
 - Output-text extraction at line 295 (`sed -n '/--- OUTPUT ---/,
   /-------------/p'`) matches the **first** OUTPUT fence. Same fix.
- 
+
 - The hard-error counter aggregates across rows. Each row contributes
   independently; one bad row in a group still reports as one hard-error
   in the gate's exit code.

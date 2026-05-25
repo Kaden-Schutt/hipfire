@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA QKV scaffold.
 //!
 //! Compiles `gemm_qkv_hfq4g256_wmma.gfx12.hip` and compares its output
@@ -15,7 +19,7 @@
 //! Bails with a clear message on non-gfx12 archs (this kernel uses the
 //! `_w32_gfx12` builtin which does not exist on gfx11).
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkv_gfx12
 
 use rdna_compute::{DType, Gpu};

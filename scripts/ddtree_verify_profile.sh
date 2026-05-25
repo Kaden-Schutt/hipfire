@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Profile batched-verify at b12-k2 (our current winner) vs b22-k4 (Lucebox
 # config we match on τ but lose on tok/s). Uses HIPFIRE_HOST_TIMING=1 to
 # dump per-cycle host breakdown (launch/h2d/d2h/d2d/memset/ssync/esync

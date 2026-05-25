@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Björn Bösel
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Compare WMMA-only vs MMQ vs MMQ+screening on a tool-call prompt.
 set -uo pipefail
 

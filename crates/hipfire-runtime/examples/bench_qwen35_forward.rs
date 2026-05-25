@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Deterministic forward-pass benchmark for Qwen3.5. Warms up and measures
 //! N forward_scratch calls at a fixed KV position, removing sampling variance.
 //!
@@ -28,9 +32,9 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading {}...", model_path);
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
     eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
 
     let max_seq = 2048;

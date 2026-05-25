@@ -256,4 +256,4 @@ gets us close and the marginal gain matters for the product story.
 
 - `crates/redline/PHASE3_NONGEMV.md` (this file)
 - Profile data: re-runnable via
-  `cargo run --release -p engine --example profile_bandwidth_fwd --features deltanet -- <model.hfq> 32 16`
+  `cargo run --release -p hipfire-runtime --example profile_bandwidth_fwd --features deltanet -- <model.hfq> 32 16`

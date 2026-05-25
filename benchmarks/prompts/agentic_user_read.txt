@@ -1,0 +1,1 @@
+Read the file /tmp/fibonacci.c and tell me what it does. If it has a bug, fix it.

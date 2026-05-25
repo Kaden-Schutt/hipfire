@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Simulate a 2-turn conversation as ONE prefill sequence to isolate
 //! whether multi-turn quality issues come from the engine's per-turn
 //! state management (KV cache + DeltaNet across separate prefill calls)
@@ -18,10 +22,10 @@ fn main() {
     let n_gen: usize = std::env::var("HIPFIRE_GEN")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(80);
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load");
 
     let mut kv = KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 2048).unwrap();
     let mut dn = DeltaNetState::new(&mut gpu, &config).unwrap();

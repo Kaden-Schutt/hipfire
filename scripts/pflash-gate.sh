@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # PFlash regression gate.
 #
 # Runs the 6 Phase 5 NIAH fixtures (8K, 16K, multi-16K, longcode,

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Per-layer profiling of hipfire inference.
 //! Measures every kernel with hipDeviceSynchronize barriers.
 //! Usage: cargo run --release --example profile_layers <model.hfq> [n_tokens]

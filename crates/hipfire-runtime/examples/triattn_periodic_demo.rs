@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Periodic TriAttention eviction during long decode.
 //!
 //! Prefills a prompt, then generates `gen` tokens while `EvictionCtx`
@@ -33,7 +37,7 @@ fn main() {
 
     let prompt = "James Madison wrote Federalist No. 10 to argue that a large republic would check the dangers of majority factions. The paper is famous for its insight that";
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(sidecar_path)).expect("load sidecar");
@@ -43,7 +47,7 @@ fn main() {
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let prompt_tokens = tok.encode(prompt);
     let prompt_len = prompt_tokens.len();

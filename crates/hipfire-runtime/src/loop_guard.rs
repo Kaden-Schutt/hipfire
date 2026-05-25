@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stateless / per-request guards on the emitted token stream.
 //! Pure Rust, no GPU calls. Detects pathological generation patterns
 //! and signals when generation should be force-stopped.

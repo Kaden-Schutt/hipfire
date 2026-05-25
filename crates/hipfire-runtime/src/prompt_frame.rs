@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! ChatML prompt framing — single source of truth for assembling
 //! the token sequence that gets fed to the model. Replaces the three
 //! near-copies that lived in daemon.rs (AR, PFlash, DFlash paths).
@@ -49,13 +53,37 @@ pub enum AssistantPrefix {
     /// silently inserting raw text bytes that would tokenize
     /// differently from the special-token path.
     OpenThink,
+    /// Assistant turn with an immediately closed empty think block
+    /// for non-thinking mode:
+    /// `<|im_start|>assistant\n<think>\n\n</think>\n\n`.
+    ///
+    /// This mirrors the merged Qwen 3.6 community template behavior
+    /// when `enable_thinking=false`. The model starts generation in
+    /// visible-answer mode because the think block is already closed.
+    /// Useful for routing/agentic contexts where we need visible
+    /// output without disabling DFlash (still valid at temp=0).
+    ///
+    /// Requires both `<think>` and `</think>` as single special
+    /// tokens. Falls back to `Plain` if either is absent.
+    ClosedThink,
 }
 
-/// Direction of a multi-turn history entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Role of a multi-turn history entry. `User` / `Assistant` are
+/// canonical for `ChatFrame::Plain` (the hand-rolled ChatML path).
+/// `System` / `Tool` are accepted by `JinjaChatFrame::render_messages`
+/// (the upstream-template path) but rejected by `ChatFrame::Plain`,
+/// which has no scaffold for them — that route panics loudly to
+/// signal "migrate this caller to JinjaChatFrame".
+///
+/// Lowercase serialization matches what the Qwen3.5/3.6 + Gemma 4
+/// templates compare against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Role {
+    System,
     User,
     Assistant,
+    Tool,
 }
 
 /// ChatML frame builder. Holds borrowed references to the tokenizer
@@ -149,6 +177,10 @@ impl<'a> ChatFrame<'a> {
             match role {
                 Role::User => scaffold.append_user_turn(&mut out, content),
                 Role::Assistant => scaffold.append_assistant_turn(&mut out, content),
+                Role::System | Role::Tool => panic!(
+                    "ChatFrame::Plain does not support {role:?} role in history. \
+                     Use JinjaChatFrame::render_messages for system/tool turns."
+                ),
             }
         }
         scaffold.append_user_turn(&mut out, self.user);
@@ -173,6 +205,10 @@ struct ChatScaffold<'a> {
     /// special token). When `None`, `OpenThink` falls back to `Plain`
     /// — see `append_assistant_prefix`.
     think_open: Option<u32>,
+    /// `</think>` closer (if the tokenizer recognizes it as a single
+    /// special token). When `None`, `ClosedThink` falls back to `Plain`
+    /// — see `append_assistant_prefix`.
+    think_close: Option<u32>,
 }
 
 impl<'a> ChatScaffold<'a> {
@@ -186,6 +222,7 @@ impl<'a> ChatScaffold<'a> {
             user_role: t.encode("user"),
             assistant_role: t.encode("assistant"),
             think_open: t.special_token_id("<think>"),
+            think_close: t.special_token_id("</think>"),
         }
     }
 
@@ -228,18 +265,248 @@ impl<'a> ChatScaffold<'a> {
         out.extend_from_slice(&self.im_start);
         out.extend_from_slice(&self.assistant_role);
         out.extend_from_slice(&self.nl);
-        if matches!(prefix, AssistantPrefix::OpenThink) {
-            // Only emit `<think>\n` when the tokenizer registers
-            // `<think>` as a single special token. Otherwise the
-            // string would tokenize as ordinary BPE pieces and behave
-            // differently from the special-token path the model was
-            // trained on. Falling back to `Plain` in that case is
-            // safer than silently emitting wrong-shaped tokens.
-            if let Some(think_id) = self.think_open {
-                out.push(think_id);
-                out.extend_from_slice(&self.nl);
+        match prefix {
+            AssistantPrefix::OpenThink => {
+                // Only emit `<think>\n` when the tokenizer registers
+                // `<think>` as a single special token. Otherwise the
+                // string would tokenize as ordinary BPE pieces and behave
+                // differently from the special-token path the model was
+                // trained on. Falling back to `Plain` in that case is
+                // safer than silently emitting wrong-shaped tokens.
+                if let Some(think_id) = self.think_open {
+                    out.push(think_id);
+                    out.extend_from_slice(&self.nl);
+                }
             }
+            AssistantPrefix::ClosedThink => {
+                // Emit an immediately-closed empty think block:
+                // `<think>\n\n</think>\n\n`.
+                // Mirrors the merged Qwen 3.6 community template's
+                // `enable_thinking=false` behavior. Falls back to
+                // `Plain` if either `<think>` or `</think>` is not
+                // a single special token.
+                if let (Some(open_id), Some(close_id)) = (self.think_open, self.think_close) {
+                    out.push(open_id);
+                    out.extend_from_slice(&self.nl);
+                    out.extend_from_slice(&self.nl);
+                    out.push(close_id);
+                    out.extend_from_slice(&self.nl);
+                    out.extend_from_slice(&self.nl);
+                }
+            }
+            AssistantPrefix::Plain => {}
         }
+    }
+}
+
+// ─── Jinja path — render upstream HF chat_template ──────────────────────────
+//
+// `ChatFrame` above is a hand-rolled approximation of ChatML scaffolding.
+// `JinjaChatFrame` renders the actual `chat_template` shipped with the
+// model (via the .hfq metadata blob). When the template is present this
+// is strictly more correct: the model sees the exact prefix shape it
+// was trained on, including default system prompts, `<think>\n` openers
+// gated by `enable_thinking`, tool-call scaffolding, and any other
+// per-arch quirks the upstream tokenizer_config encodes.
+//
+// Failure modes (template parse error, missing context var, explicit
+// `raise_exception`) bubble up as `Err(String)` so the caller can fall
+// back to `ChatFrame::Plain` rather than panicking.
+//
+// The render output is a plain UTF-8 string. Tokenization goes through
+// `Tokenizer::encode` which recognizes registered special tokens
+// (`<|im_start|>`, `<|im_end|>`, `<think>`, etc.) and emits their
+// single-token IDs — so the rendered string round-trips to the same
+// token sequence the model would see under transformers' apply_chat_template.
+
+/// Renders the upstream HF Jinja `chat_template` to produce a prompt
+/// token sequence. Use when the .hfq carries a chat_template; fall back
+/// to `ChatFrame::Plain` when it doesn't or when render fails.
+pub struct JinjaChatFrame<'a> {
+    pub tokenizer: &'a Tokenizer,
+    /// The Jinja template source string from the model's
+    /// `tokenizer_config.json:chat_template` field.
+    pub template: &'a str,
+    /// Optional system message for this turn. `None` = no system block.
+    /// Ignored by `render_messages` (the multi-turn entry point); use
+    /// only when going through the single-turn `render()` convenience.
+    pub system: Option<&'a str>,
+    /// User content for the new turn. Ignored by `render_messages`.
+    pub user: &'a str,
+    /// Maps to the upstream `enable_thinking` template kwarg. For
+    /// Qwen3.5/3.6 thinking-mode models, `true` (the upstream default)
+    /// emits `<|im_start|>assistant\n<think>\n` at the end; `false`
+    /// emits the empty-think pattern `<think>\n\n</think>\n\n` which
+    /// is known to cause loop pathologies (see
+    /// `feedback_no_think_directive_loops.prd`). Default callers
+    /// should pass `true`.
+    pub enable_thinking: bool,
+    /// Optional explicit bos_token string for the template's
+    /// `{{ bos_token }}` expression. Required when the tokenizer's
+    /// `decode_bytes(bos_id)` does NOT match the canonical BOS string
+    /// the template expects. Example: Gemma 4's tokenizer reports
+    /// bos_id=203 (and id=2 decodes to LLaMA-cosmetic `<s>`), but the
+    /// Gemma 4 template needs the literal `<bos>` which re-tokenizes to
+    /// single special token id=2 (the actual BOS the model trained on).
+    /// When None, falls back to decoding bos_id (works for Qwen3.5/3.6).
+    pub bos_token: Option<&'a str>,
+}
+
+/// Multi-turn message representation for `JinjaChatFrame::render_messages`.
+///
+/// The fields are intentionally serialize-friendly so the entire `&[Message]`
+/// slice can be passed straight into the Jinja `messages` context var via
+/// `Value::from_serialize(...)`. Templates probe `message['role']`,
+/// `message['content']`, `message['tool_calls']`, and (less commonly)
+/// `message['tool_call_id']` under strict-undefined mode; all four fields
+/// are always present (defaults: empty content, empty tool_calls vec, no
+/// tool_call_id) so probes never raise.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Message {
+    pub role: Role,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<ToolCall>,
+    /// Set on Tool-role messages to identify which assistant tool_call
+    /// this is responding to. Qwen3.5/3.6 templates currently ignore
+    /// this field; OpenAI-spec clients and some other templates require
+    /// it. Skipped from the serialized JSON when None so templates that
+    /// `is defined` against it don't see a misleading null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// One assistant-emitted tool call, attached to an assistant `Message`.
+/// `arguments` is a free-form JSON value (typically an object). Templates
+/// that render in XML format (Qwen3.5/3.6's `<function=NAME><parameter=ARG>`
+/// shape) walk this with `arguments | items` under pycompat.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+impl<'a> JinjaChatFrame<'a> {
+    /// Render the template and tokenize the result. Returns `Err` on
+    /// any template-side failure so the caller can fall back to
+    /// `ChatFrame::Plain` framing.
+    pub fn render_and_encode(&self) -> Result<Vec<u32>, String> {
+        let rendered = self.render()?;
+        Ok(self.tokenizer.encode(&rendered))
+    }
+
+    /// Render the template to a string without tokenizing. Single-turn
+    /// convenience wrapper around `render_messages` that synthesizes a
+    /// `[system?, user]` message slice from the struct's `system` /
+    /// `user` fields. Exposed separately so a diagnostic example can
+    /// dump the rendered prompt for byte-level comparison against
+    /// transformers' output.
+    pub fn render(&self) -> Result<String, String> {
+        let mut messages: Vec<Message> = Vec::new();
+        if let Some(sys) = self.system {
+            messages.push(Message {
+                role: Role::System,
+                content: sys.to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            });
+        }
+        messages.push(Message {
+            role: Role::User,
+            content: self.user.to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        });
+        self.render_messages(&messages, None, None)
+    }
+
+    /// Render the template against a full multi-turn message history.
+    /// This is the canonical entry point — `render()` above is just a
+    /// single-turn convenience.
+    ///
+    /// `tools` is the OpenAI tool definitions list (each entry an object
+    /// with `type` + `function`); pass `None` for plain (no-tools)
+    /// turns and the template's `if tools` predicate evaluates false.
+    /// `tool_call_kwargs` is a free-form map propagated to the template
+    /// context for templates that opt into per-call rendering switches;
+    /// pass `None` for the default empty map.
+    ///
+    /// Strict-undefined empty defaults still apply when args are `None`,
+    /// so templates that probe `tools` / `documents` / `tool_call_kwargs`
+    /// don't raise.
+    pub fn render_messages(
+        &self,
+        messages: &[Message],
+        tools: Option<&[serde_json::Value]>,
+        tool_call_kwargs: Option<&serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<String, String> {
+        use minijinja::{Environment, Error, ErrorKind, Value};
+        use minijinja_contrib::pycompat::unknown_method_callback;
+
+        let mut env = Environment::new();
+        // Strict-undefined: a missing context variable raises Err instead of
+        // silently rendering empty/partial output. Without this, malformed
+        // prompts could propagate to the model unnoticed (Codex review on
+        // PR #175 flagged this; we apply it here in the same port).
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Make Python-style str/list/dict methods (`.startswith`,
+        // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
+        // ordinary Jinja values. Required by the Qwen3 family
+        // template — it calls these throughout the assistant-turn
+        // and tool branches.
+        env.set_unknown_method_callback(unknown_method_callback);
+        // The Qwen3 template uses `raise_exception('...')` to fail
+        // fast on malformed inputs (e.g. system message in the
+        // middle of the conversation). minijinja has no builtin
+        // for this, so we register it as a global function that
+        // surfaces the message as a render error.
+        env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
+            Err(Error::new(ErrorKind::InvalidOperation, msg))
+        });
+
+        env.add_template("chat", self.template)
+            .map_err(|e| format!("template parse: {e}"))?;
+        let tmpl = env.get_template("chat")
+            .map_err(|e| format!("template lookup: {e}"))?;
+
+        // Pass bos_token to the template context. Caller may override via
+        // `self.bos_token` (Gemma 4 needs explicit `<bos>` because its
+        // tokenizer returns LLaMA-cosmetic `<s>` for decode_bytes(bos_id)
+        // and that re-tokenizes to a 3-token BPE fragment instead of
+        // single id=2 the template expects). Default: decode bos_id back
+        // to text (works for Qwen / LLaMA).
+        let bos_token: String = match self.bos_token {
+            Some(s) => s.to_string(),
+            None => {
+                let bytes = self.tokenizer.decode_bytes(&[self.tokenizer.bos_id]);
+                String::from_utf8_lossy(&bytes).to_string()
+            }
+        };
+        // Strict-undefined empty defaults so templates that probe
+        // `tools` / `documents` / `tool_call_kwargs` on plain turns
+        // don't raise. Caller-provided values override the empties.
+        let empty_list: Vec<serde_json::Value> = Vec::new();
+        let empty_map = serde_json::Map::new();
+        let tools_val = match tools {
+            Some(t) => Value::from_serialize(t),
+            None => Value::from_serialize(&empty_list),
+        };
+        let kwargs_val = match tool_call_kwargs {
+            Some(k) => Value::from_serialize(k),
+            None => Value::from_serialize(&empty_map),
+        };
+        let ctx = minijinja::context! {
+            messages => Value::from_serialize(messages),
+            add_generation_prompt => true,
+            enable_thinking => self.enable_thinking,
+            bos_token => bos_token,
+            tools => tools_val,
+            documents => Value::from_serialize(&empty_list),
+            tool_call_kwargs => kwargs_val,
+        };
+        tmpl.render(ctx).map_err(|e| format!("template render: {e}"))
     }
 }
 
@@ -309,6 +576,36 @@ mod tests {
             vocab = vocab_block,
         );
         Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    /// Like `make_tokenizer` but WITHOUT `<think>` / `</think>`
+    /// as special added tokens — used to verify ClosedThink fallback.
+    fn test_tokenizer_no_think() -> Tokenizer {
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""<|im_start|>": 0"#.to_string());
+        entries.push(r#""<|im_end|>": 1"#.to_string());
+        entries.push(r#""system": 4"#.to_string());
+        entries.push(r#""user": 5"#.to_string());
+        entries.push(r#""assistant": 6"#.to_string());
+        entries.push(r#""\n": 7"#.to_string());
+        entries.push(r#""Ġ": 8"#.to_string());
+        for b in 0u32..=255u32 {
+            let ch = byte_to_gpt2_char_test(b as u8);
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
+        }
+        let vocab_block = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}}
+                ]
+            }}"#,
+            vocab = vocab_block,
+        );
+        Tokenizer::from_hf_json(&json).expect("test tokenizer without think tokens")
     }
 
     /// Mirror of `byte_to_gpt2_char` from tokenizer.rs (private). The
@@ -412,6 +709,65 @@ mod tests {
     }
 
     #[test]
+    fn closed_think_appends_empty_closed_block_when_tokens_present() {
+        let t = make_tokenizer();
+        let plain = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let closed = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        }
+        .build();
+        let think_id = t.special_token_id("<think>")
+            .expect("test tokenizer registers <think> as special");
+        let close_id = t.special_token_id("</think>")
+            .expect("test tokenizer registers </think> as special");
+        let nl = t.encode("\n");
+        let mut expected = plain.clone();
+        // <think>\n\n</think>\n\n
+        expected.push(think_id);
+        expected.extend_from_slice(&nl);
+        expected.extend_from_slice(&nl);
+        expected.push(close_id);
+        expected.extend_from_slice(&nl);
+        expected.extend_from_slice(&nl);
+        assert_eq!(closed, expected, "ClosedThink should append <think>\\n\\n</think>\\n\\n after the assistant prefix");
+        assert!(closed.len() > plain.len(), "ClosedThink output must be strictly longer than Plain");
+    }
+
+    #[test]
+    fn closed_think_falls_back_to_plain_when_tokens_missing() {
+        // tokenize from scratch with no think/close special tokens
+        let t = test_tokenizer_no_think();
+        let plain = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        }
+        .build();
+        let closed = ChatFrame {
+            tokenizer: &t,
+            system: None,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::ClosedThink,
+            raw: false,
+        }
+        .build();
+        assert_eq!(closed, plain, "ClosedThink without special tokens must fall back to Plain");
+    }
+
+    #[test]
     fn raw_bypasses_chatml() {
         let t = make_tokenizer();
         let frame = ChatFrame {
@@ -488,6 +844,173 @@ mod tests {
         let via_string = frame.build();
         let via_tokens = frame.build_with_user_tokens(&t.encode(user_text));
         assert_eq!(via_string, via_tokens, "build_with_user_tokens must match build() when tokens align");
+    }
+
+    #[test]
+    fn message_deserializes_minimal_shape() {
+        // The daemon's stdin schema must accept the smallest valid
+        // message: role + content, no tool_calls, no tool_call_id.
+        let json = r#"{"role":"user","content":"hi"}"#;
+        let m: Message = serde_json::from_str(json).expect("minimal message parses");
+        assert_eq!(m.role, Role::User);
+        assert_eq!(m.content, "hi");
+        assert!(m.tool_calls.is_empty());
+        assert!(m.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn message_deserializes_assistant_tool_call() {
+        // OpenAI-style assistant turn that emitted a tool call. The
+        // template path consumes `tool_calls[]` to render the model's
+        // own prior call (XML on Qwen3.5/3.6, JSON on others).
+        let json = r#"{
+            "role":"assistant",
+            "content":"",
+            "tool_calls":[{"name":"get_weather","arguments":{"city":"SF","unit":"f"}}]
+        }"#;
+        let m: Message = serde_json::from_str(json).expect("assistant w/ tool_call parses");
+        assert_eq!(m.role, Role::Assistant);
+        assert_eq!(m.tool_calls.len(), 1);
+        assert_eq!(m.tool_calls[0].name, "get_weather");
+        assert_eq!(
+            m.tool_calls[0].arguments,
+            serde_json::json!({"city":"SF","unit":"f"}),
+        );
+    }
+
+    #[test]
+    fn message_deserializes_tool_response() {
+        // Tool-role response carries a `tool_call_id` referencing the
+        // assistant call it answers. Field must round-trip through
+        // serde so templates that read it (OpenAI-spec ones) see it.
+        let json = r#"{"role":"tool","content":"72F","tool_call_id":"call_42"}"#;
+        let m: Message = serde_json::from_str(json).expect("tool response parses");
+        assert_eq!(m.role, Role::Tool);
+        assert_eq!(m.content, "72F");
+        assert_eq!(m.tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn render_messages_with_tools_fires_tools_block() {
+        // Smoke test: a minimal template gated on `{% if tools %}`
+        // must render the tools branch when the caller supplies a
+        // non-empty tools array — and skip it when tools is None.
+        // This is the architectural invariant Phase 1 unblocks:
+        // structured tools from daemon stdin reach the Jinja template's
+        // `{% if tools %}` predicate.
+        let t = make_tokenizer();
+        let template = "{% if tools %}TOOLS:{% for f in tools %}{{ f.function.name }};{% endfor %}{% endif %}MSGS:{% for m in messages %}{{ m.role }}={{ m.content }};{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }];
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        })];
+
+        let with_tools = frame
+            .render_messages(&messages, Some(&tools), None)
+            .expect("render_messages w/ tools succeeds");
+        assert!(
+            with_tools.contains("TOOLS:get_weather;"),
+            "tools-block must fire when tools is Some: got {with_tools:?}",
+        );
+        assert!(
+            with_tools.contains("MSGS:user=hi;"),
+            "messages must still render: got {with_tools:?}",
+        );
+
+        // None branch: empty tools array means `{% if tools %}` evaluates false.
+        let without_tools = frame
+            .render_messages(&messages, None, None)
+            .expect("render_messages w/o tools succeeds");
+        assert!(
+            !without_tools.contains("TOOLS:"),
+            "tools-block must NOT fire when tools is None: got {without_tools:?}",
+        );
+        assert!(
+            without_tools.contains("MSGS:user=hi;"),
+            "messages must still render w/o tools: got {without_tools:?}",
+        );
+    }
+
+    #[test]
+    fn render_messages_with_history_and_tools_includes_assistant_call() {
+        // Full agentic round-trip shape: system + user + assistant w/
+        // tool_calls + tool response. The template walks tool_calls and
+        // tool_call_id so the trip-record must reach it.
+        let t = make_tokenizer();
+        // `tool_call_id` is serialize-skipped when None, so under
+        // strict-undefined the template MUST guard with `is defined`
+        // (matching how the upstream Qwen3.5/3.6 + Hermes templates
+        // probe the field). The Message doc comment on this struct
+        // describes the same convention.
+        let template = "{% for m in messages %}{{ m.role }}:{% if m.tool_calls %}call={% for tc in m.tool_calls %}{{ tc.name }}({{ tc.arguments.city }});{% endfor %}{% else %}{{ m.content }}{% endif %}{% if m.tool_call_id is defined %}[id={{ m.tool_call_id }}]{% endif %};{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+        };
+        let messages = vec![
+            Message {
+                role: Role::System,
+                content: "be brief".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::User,
+                content: "weather?".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Assistant,
+                content: "".to_string(),
+                tool_calls: vec![ToolCall {
+                    name: "get_weather".to_string(),
+                    arguments: serde_json::json!({"city":"SF"}),
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: "72F".to_string(),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+            },
+        ];
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("multi-turn render succeeds");
+        assert!(out.contains("system:be brief;"), "system content visible: {out:?}");
+        assert!(out.contains("user:weather?;"), "user content visible: {out:?}");
+        assert!(
+            out.contains("assistant:call=get_weather(SF);"),
+            "assistant tool_call rendered: {out:?}",
+        );
+        assert!(
+            out.contains("tool:72F[id=call_1];"),
+            "tool response w/ tool_call_id rendered: {out:?}",
+        );
     }
 
     #[test]

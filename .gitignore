@@ -2,6 +2,7 @@
 /target
 *.o
 *.so
+*.triattn.bin
 *.dll
 
 # Editor
@@ -22,6 +23,12 @@
 *.safetensors
 *.hfq
 
+# Exception: imatrix .gguf files (1-5 MB calibration sidecars for AWQ) ARE
+# tracked — see benchmarks/quality-baselines/refs/. They're tiny and unlock
+# `hipfire-quantize --awq` reproduction from a clean clone, including for
+# gfx906 (the original RDNA1 target) without an imatrix-collect prereq.
+!benchmarks/quality-baselines/refs/*.imatrix.gguf
+
 # JIT-compiled kernel cache
 kernels/compiled/
 .hipfire_kernels/
@@ -30,6 +37,11 @@ kernels/compiled/
 .serena/
 .remember/
 .codex
+.sisyphus/
+
+# Local secrets (lmx api key, etc.) — never commit
+.env
+.env.*
 docs/superpowers/
 .worktrees/
 .dflash-reference/
@@ -90,3 +102,7 @@ research/
 .codeinsight+research/
 
 bench/coherence-results/
+
+# kld_reduce.py outputs when run from repo root
+result-data.json
+result-table.md

@@ -1,0 +1,194 @@
+# PRD: Hetero PFlash + DFlash Pipeline (v1.2)
+
+**Status:** Draft 2026-05-07
+**Author:** Kaden + Claude (autoresearch session)
+**Empirical anchor:** Exp #9 (5.07× WMMA prefill on gfx1151), Exp #10 (1.84× DFlash on gfx1151), session memory entries `project_wmma_prefill_tier_validated_2026_05_07`, `project_pp3_hetero_rdna1_2_2026_05_07`.
+
+## Goal
+
+Build a tier-aware request pipeline that uses one card's silicon strengths against another's, in a heterogeneous configuration empirically validated to win on a real hipx rig (gfx1151 + 2× gfx1010).
+
+For each user request:
+- **Prefill** runs on a WMMA-equipped card (gfx1100/1150/1151/1200+), with PFlash compression of the prompt to ~30% of input tokens.
+- **Decode** runs as cross-card DFlash spec-decode, with the small DFlash drafter on a BW-strong RDNA1 card (gfx1010 / gfx1011 e.g. BC-160) and the K-batched verify on the WMMA card.
+
+Empirical projection: 3-3.5× faster end-to-end than solo gfx1151 AR, on workloads from 1100-token / 100-token output up through long-context / large-output regimes.
+
+## Non-goals
+
+- New model training. Drafter (2B DFlash) and PFlash scorer (0.8B) already exist for Qwen3.5/3.6 27B; reuse.
+- Vulkan / cross-vendor. HIP/ROCm only per CLAUDE.md rule 7.
+- Single-card "tier emulation." If only one card is present, fall back to solo DFlash + PFlash composition (already implemented in v1.1).
+- Default-on. The full hetero pipeline is opt-in via env vars; existing pp=1 / pp>1 paths preserved byte-for-byte when the new envs are unset.
+
+## Architecture
+
+### Request flow
+
+```
+[Prefill stage — one-time per request]
+
+  prompt ──► PFlash scorer (gfx1151)
+                │
+                │ compressed_tokens: Vec<u32>  (~30% of input)
+                │
+                ├──► drafter prefill on gfx1010 ──► drafter KV initialized
+                │
+                └──► target prefill on gfx1151 ──► target KV initialized
+                     (WMMA-accelerated batched GEMM)
+
+[Decode stage — per spec-decode cycle]
+
+  cycle N+1 (overlapped with cycle N verify):
+    gfx1010: drafter forward × K candidate tokens (sequential decode)
+    gfx1010: drafter KV advances K positions
+    gfx1010: ship K token IDs to gfx1151
+
+  cycle N (in flight):
+    gfx1151: K-batched verify forward against target (WMMA)
+    gfx1151: compute acceptance bitmap (greedy match for now)
+    gfx1151: target KV advances by accepted_count positions
+    gfx1151: ship acceptance to gfx1010 → drafter rolls back unaccepted KV positions
+```
+
+### Component map
+
+- **PFlash scorer** (existing, currently 0.8B). Lives on gfx1151. Compute-bound prefill of the prompt to produce token-importance scores. WMMA-accelerated.
+- **DFlash drafter** (existing, 2B for 27B target, 877 MB on disk). Lives on gfx1010. BW-bound autoregressive decode at K-token chains.
+- **Target model** (any size that fits gfx1151's ~96 GB shared VRAM: 27B / 70B / 122B-A10B). Lives on gfx1151. WMMA-accelerated batched verify.
+- **Target KV cache** lives on gfx1151. Drafter KV cache lives on gfx1010. Independent KV state per card; cross-card sync only on accepted-token boundary.
+
+### Variant A vs Variant B
+
+**Variant A (ship first):** PFlash scorer is a separate small model (0.8B as today). Two small models + target. Simpler since each component already exists and is shippable independently. ~14.5 GB on gfx1151 (target + PFlash scorer), ~1.5 GB on gfx1010 (DFlash drafter + drafter KV).
+
+**Variant B (future optimization):** DFlash drafter does double duty as PFlash scorer. One forward pass on gfx1010 produces both (a) drafter KV state and (b) per-token importance scores. Eliminates the separate PFlash scorer. Requires exposing token-level signals from the drafter's forward pass.
+
+This PRD targets Variant A. Variant B is a follow-on optimization once Variant A is shipping.
+
+## Build sequence (PRs)
+
+### PR 1: Lift DFlash + pp>1 refusal (env-gated)
+
+- File: `crates/hipfire-runtime/examples/daemon.rs:594` (DFlash refusal site).
+- Env: `HIPFIRE_PP_DFLASH=1` opts into the experimental pp>1 DFlash path.
+- Mechanically identical to the PFlash + pp>1 refusal lift we already shipped (commit `ea2b8b7`, `HIPFIRE_PP_PFLASH=1`).
+- Default behavior unchanged when env unset; refusal still fires.
+- ~10 lines.
+
+### PR 2: DFlash drafter device pinning
+
+- New env: `HIPFIRE_DFLASH_DRAFTER_DEVICE=N` selects the HIP device index for the drafter (defaults to current behavior — same device as target).
+- Modify `daemon.rs::load_model_pp` to open a separate `Gpu` instance bound to the specified device, load the drafter weights into that Gpu's VRAM, and store as `m.dflash_drafter_gpu: Option<Gpu>` alongside `m.pp_gpus`.
+- Drafter inference now runs on that dedicated Gpu instead of the same Gpu as the target.
+- Includes preflight: drafter weights fit on chosen device, device exists, etc.
+- ~80 lines.
+
+### PR 3: Cross-card spec-decode coordination loop
+
+- Modify `crates/hipfire-runtime/src/dflash.rs` and `daemon.rs::generate_dflash` to accept two Gpu handles instead of one (drafter Gpu + target Gpu).
+- Per cycle:
+  1. Drafter forward × K on `drafter_gpu`, producing K candidate token IDs.
+  2. Token IDs shipped to target host (`hipMemcpy` host→device, ~K * 4 bytes, microseconds).
+  3. Target K-batched verify forward on `target_gpu` (or `pp_gpus` if target uses PP).
+  4. Acceptance bitmap computed on `target_gpu`.
+  5. Bitmap shipped to drafter host (`hipMemcpy`, K bits ~ 1 byte).
+  6. Drafter advances KV with accepted prefix; truncates K - accepted positions.
+  7. Target KV advances by accepted_count.
+- Initial implementation is sequential (no overlap). Pipelining is PR 5.
+- ~200-300 lines.
+
+### PR 4: PFlash + DFlash composition
+
+- The compressed `Vec<u32>` from PFlash compression (already implemented in `generate_multi` per commit `ea2b8b7`) becomes the seed for BOTH the drafter prefill on `drafter_gpu` AND the target prefill on the target device set.
+- Adds the drafter-prefill plumbing: drafter sees the compressed prompt at first turn (`m.seq_pos == 0`).
+- ~50-100 lines.
+
+### PR 5 (deferred): Cycle pipelining
+
+- Overlap cycle N+1 drafter forward with cycle N verify forward.
+- Stream events coordinate cross-card timing.
+- Genuinely new code path — not in scope for v1.2 initial ship; ships as v1.2.1 follow-on.
+
+## Validation plan
+
+### Smoke (after PR 4)
+
+- Load 27B target on gfx1151 + 2B drafter on gfx1010 via the new envs.
+- Send a 1100-token prompt (LRU-cache canonical from CLAUDE.md).
+- Expect: load succeeds, generation produces coherent output, decode tok/s reported.
+- No specific perf bar; this validates the path runs end-to-end.
+
+### Coherence gate
+
+- Standard `scripts/coherence-gate.sh` extended to run with hetero env set.
+- All 5 short-battery prompts produce fluent on-topic output.
+- No hard errors, panics, or token loops.
+
+### Perf bench (post-coherence)
+
+- 9B target + 0.8B drafter on gfx1010 + gfx1151, vs solo gfx1151 DFlash baseline (Exp #10 already establishes 27.0 tok/s solo).
+- 27B target + 2B drafter, same comparison.
+- 70B / 122B-A10B target where solo gfx1151 alone struggles or doesn't fit.
+- Pre-registered criterion: hetero ≥ 1.25× solo DFlash on at least one config (sequential, no pipelining).
+
+### Pipelining bench (post-PR 5, future)
+
+- Same configs, with cycle pipelining enabled.
+- Pre-registered criterion: pipelined ≥ 1.7× sequential hetero (≥ 2.1× solo DFlash).
+
+## Empirical anchors (already validated this session)
+
+| Component | Validated | Result |
+|---|---|---|
+| Hetero RDNA1+RDNA2 PP=3 | Exp #1 (PP=3 9B/27B) | 22.1 tok/s 27B max_seq=4096 |
+| Cross-arch boundary_copy host-staging | PP=2 + PP=3 work | 1.8% overhead 9B PP=2 |
+| Mixed-arch env override | `HIPFIRE_ALLOW_MIXED_ARCH=1` | shipped on master |
+| PFlash + PP compose | Earlier today (commit `ea2b8b7`) | -42% TTFT 9B PP=2, -41% TTFT 27B PP=3 |
+| WMMA prefill speedup | Exp #9 | 5.07× gfx1151/gfx1010, 2.94× gfx1151/gfx1030 isolated WMMA |
+| DFlash on gfx1151 | Exp #10 | 1.84× over AR on 27B |
+| Drafter fits on gfx1010 | Confirmed via file sizes | 877 MB << 8.6 GB |
+
+## Risks and unknowns
+
+### Cross-card token ID handoff cost
+
+- Token IDs are tiny (15 × 4 bytes = 60 bytes per cycle).
+- USB4 latency is ~5-10 μs per round-trip. At 30 ms per draft cycle, this is in the noise.
+- Verified by: no actual code yet; estimated from existing PP boundary measurements.
+
+### Drafter KV synchronization on rollback
+
+- When N tokens are accepted out of K drafted, drafter KV must roll back K-N positions on `drafter_gpu`.
+- Existing DFlash already handles this on a single Gpu; need to confirm the rollback logic works with KV state on a different Gpu. Likely just needs the same calls dispatched to `drafter_gpu` instead of the shared one.
+
+### Memory pressure on prefill stage
+
+- During prefill: target prefill on gfx1151 needs full target weights + PFlash scorer + scratch.
+- 14 GB target + 0.8 GB scorer + ~1 GB scratch = 15.8 GB out of ~96 GB. Fine.
+- Drafter prefill on gfx1010: 0.9 GB drafter + KV + scratch ≈ 2 GB out of 8.6 GB. Fine.
+
+### τ degradation in heterogeneous compute
+
+- gfx1151 solo DFlash got τ=2.72 vs 7900 XTX τ=10.36 on the same prompt. The hetero variant could see different τ depending on draft↔target numerical alignment.
+- Mitigation: bench to confirm; if τ drops further, investigate.
+
+### Smaller drafter for arbitrarily-large targets
+
+- The 2B drafter we have was trained for 27B target. Larger targets (70B, 122B-A10B) might require either a larger drafter OR confirmation that the 2B drafter still aligns well with the larger target.
+- Not blocking; can run with 2B drafter as a starting point and validate empirically.
+
+## Out of scope
+
+- Single-host vs multi-host topologies. This PRD targets single-host hetero. Multi-host (RDMA / RoCE / gpudirect) is a separate PRD.
+- All-reduce / TP at scale. PRD is single-target-PP, drafter on dedicated device.
+- Prefill compression for large drafter (Variant B above). Variant A ships first.
+- Performance autotuning of K (draft chain length). K=15 from upstream DFlash spec; tune later if needed.
+
+## Acceptance criteria
+
+- PRs 1-4 land on master with full coherence gate green.
+- Smoke bench produces working hetero DFlash output on hipx for at least 27B target.
+- v1.2 release notes document the env vars: `HIPFIRE_PP_DFLASH=1`, `HIPFIRE_DFLASH_DRAFTER_DEVICE=N`.
+- Default behavior unchanged for non-opt-in users.
+- Pipelining (PR 5) is a follow-on; not blocking v1.2.

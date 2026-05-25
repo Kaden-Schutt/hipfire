@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Per-kernel profiler for Qwen3.5 MQ4 forward pass.
 //!
 //! Runs the exact same forward_scratch path as bench_qwen35_mq4 /
@@ -56,7 +60,7 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Prefill: {prefill_len}  Warmup: {warmup_len}  Profile: {profile_steps}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!("Config: dim={} layers={} heads={} kv_heads={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads);
@@ -65,7 +69,7 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + profile_steps + 16).max(512);

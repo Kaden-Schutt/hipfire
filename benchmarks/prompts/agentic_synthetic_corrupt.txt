@@ -1,0 +1,22 @@
+This file is the synthetic corrupt payload for agentic-gate.sh's --self-check mode.
+The gate's detector script reads this file and asserts that all four detectors fire:
+
+1. JSON.parse failure on the tool_call body
+2. Schema violation: missing required fields (`name` and/or `arguments`)
+3. Special-token leak inside the tool_call body (`<|im_start|>` substring)
+4. Stacked openers: two consecutive `<tool_call>` tokens
+
+If any detector fails to fire, the gate exits 2 with "self-check failed: detector rot suspected".
+
+The payload below intentionally trips all four detectors:
+
+----PAYLOAD-BEGIN----
+Here is my response:
+
+<tool_call>
+<tool_call>
+{"arguments": {"path": "/tmp/x"<|im_start|>}}
+</tool_call><|im_end|>
+----PAYLOAD-END----
+
+Note that this file's role is documentation. The gate constructs the payload literally inside the script (between the begin/end markers) so the test does not depend on file IO.

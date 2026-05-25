@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 1 smoke test: load Qwen3.5-35B-A3B (or any qwen3_5_moe HFQ) end-to-end
 //! and report success/failure. No forward pass — just exercises the loader so we
 //! catch tensor-name mismatches, dimension mismatches, and unsupported quant
@@ -23,7 +27,7 @@ fn main() {
     let model_path = &args[1];
     eprintln!("Opening: {model_path}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
 
     eprintln!("Config:");
@@ -49,7 +53,7 @@ fn main() {
 
     eprintln!("\nInitializing GPU + loading weights ...");
     let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init failed");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights failed");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights failed");
 
     eprintln!("\n=== LOAD SUCCEEDED ===");
     eprintln!("Loaded {} layers:", weights.layers.len());

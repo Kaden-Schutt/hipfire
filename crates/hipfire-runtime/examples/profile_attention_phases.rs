@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase-level breakdown of attention_q8_0_kv at long context.
 //!
 //! The normal profile_qwen35_mq4 only reports per-kernel totals — it shows
@@ -51,7 +55,7 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Prefill: {prefill_len}  Repeats: {repeats}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     eprintln!(
         "Config: dim={} layers={} n_heads={} n_kv_heads={} head_dim={}",
@@ -62,7 +66,7 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
 
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     // Find first FA layer so we know which layer's KV to probe.

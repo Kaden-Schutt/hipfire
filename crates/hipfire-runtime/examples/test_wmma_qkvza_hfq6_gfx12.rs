@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA QKVZA HFQ6 scaffold.
 //!
 //! Final kernel in the gfx11 → gfx12 WMMA port series. Combines the
@@ -5,7 +9,7 @@
 //! 4-output qkvza routing coverage (from test_wmma_qkvza_gfx12).
 //! Compares against the validated `gemm_qkvza_hfq6g256_dot2` reference.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkvza_hfq6_gfx12
 
 use rdna_compute::{DType, Gpu};

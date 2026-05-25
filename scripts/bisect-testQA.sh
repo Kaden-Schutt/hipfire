@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # QA bisect harness mirror.
 # Preserves the original workflow but records explicit command statuses and clearer failure modes.
 set -euo pipefail

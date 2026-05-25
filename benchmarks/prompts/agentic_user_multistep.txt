@@ -1,0 +1,1 @@
+Read /tmp/foo.py, identify a bug, edit it to fix the bug, then run the script to verify the fix worked.

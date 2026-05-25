@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA gate_up scaffold.
 //!
 //! Sister to test_wmma_qkv_gfx12 — same harness pattern, applied to the
@@ -7,7 +11,7 @@
 //!
 //! Bails on non-gfx12 (the `_w32_gfx12` builtin doesn't exist on gfx11).
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_gate_up_gfx12
 
 use rdna_compute::{DType, Gpu};

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Björn Bösel
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! MMQ vs WMMA bit-comparison diagnostic for Qwen3.5/3.6 GEMM call sites.
 //!
 //! Compares i8 WMMA + Q8_1 (MMQ) output against f16 WMMA output at each
@@ -162,13 +166,13 @@ fn main() {
 
     // ── Model loading ────────────────────────────────────────────────────
     eprintln!("Loading model: {model_path}");
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config_from_hfq");
     eprintln!(
         "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
         config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
     );
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load_weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
     eprintln!("Weights loaded. Running stage: {stage}");
 
     // ── Dispatch stage ───────────────────────────────────────────────────

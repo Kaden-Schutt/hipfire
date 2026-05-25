@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal GGUF reader + dequant copied from `crates/engine/src/{gguf.rs,llama.rs}`.
 //! Self-contained so hipfire-quantize doesn't pull engine's GPU dependency tree.
 //! TODO: factor into a shared `gguf-codec` crate.
@@ -412,6 +416,63 @@ fn dequant_q4_k(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+fn dequant_q5_k(data: &[u8], n: usize) -> Vec<f32> {
+    let block_size = 256;
+    let block_bytes = 176;
+    let nblocks = (n + block_size - 1) / block_size;
+    let mut out = vec![0.0f32; n];
+    for b in 0..nblocks {
+        let off = b * block_bytes;
+        if off + block_bytes > data.len() {
+            break;
+        }
+        let d = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([data[off + 2], data[off + 3]]));
+
+        // 12-byte packed scales/mins — same layout as Q4_K
+        let sc_data = &data[off + 4..off + 16];
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for i in 0..4 {
+            scales[i] = sc_data[i] & 63;
+            mins[i] = sc_data[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc_data[8 + i] & 0xF) | ((sc_data[i] >> 6) << 4);
+            mins[4 + i] = (sc_data[8 + i] >> 4) | ((sc_data[4 + i] >> 6) << 4);
+        }
+
+        // 32 bytes of high bits (1 bit per element), then 128 bytes of low nibbles
+        let qh = &data[off + 16..off + 48];
+        let ql = &data[off + 48..off + 176];
+
+        for group in 0..4 {
+            let sb_even = group * 2;
+            let sb_odd = group * 2 + 1;
+            let sc_even = d * scales[sb_even] as f32;
+            let m_even = dmin * mins[sb_even] as f32;
+            let sc_odd = d * scales[sb_odd] as f32;
+            let m_odd = dmin * mins[sb_odd] as f32;
+            for l in 0..32 {
+                let byte = ql[group * 32 + l];
+                let hbit = ((qh[l] >> group) & 1) as u8;
+                let hbit2 = ((qh[l] >> (group + 4)) & 1) as u8;
+                let idx_even = b * block_size + group * 64 + l;
+                let idx_odd = idx_even + 32;
+                if idx_even < n {
+                    let q = ((byte & 0x0F) | (hbit << 4)) as f32;
+                    out[idx_even] = q * sc_even - m_even;
+                }
+                if idx_odd < n {
+                    let q = (((byte >> 4) & 0x0F) | (hbit2 << 4)) as f32;
+                    out[idx_odd] = q * sc_odd - m_odd;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn dequant_q6_k(data: &[u8], n: usize) -> Vec<f32> {
     let block_size = 256;
     let block_bytes = 210;
@@ -480,6 +541,7 @@ pub fn tensor_to_f32(info: &TensorInfo, data: &[u8]) -> Vec<f32> {
         GgmlType::Q4_0 => dequant_q4_0(data, n),
         GgmlType::Q8_0 => dequant_q8_0(data, n),
         GgmlType::Q4K => dequant_q4_k(data, n),
+        GgmlType::Q5K => dequant_q5_k(data, n),
         GgmlType::Q6K => dequant_q6_k(data, n),
         other => panic!(
             "GGUF tensor type {:?} not implemented (tensor: {})",

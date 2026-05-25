@@ -50,7 +50,19 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - The 4 PR1-4 modules (loop_guard, sampler, prompt_frame, eos_filter)
 #   are all hot-path; touching any of them affects every model load.
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs'
+# multi_gpu\.rs is listed here so that touching the PP dispatch path
+# triggers the coherence battery (same contract as single-GPU forward).
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs'
+
+# Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
+# runs only when one of these is touched AND 2+ GPUs are visible; otherwise
+# it skips (CI / single-GPU dev box).
+PP_HOTSPOT='multi_gpu\.rs|peer_access|pp_|pipeline|stages|forward_prefill_batch_multi|forward_scratch_multi|Gpus|init_uniform|init_layers|boundary_copy'
+
+PP_TOUCHED=0
+if echo "$CHANGED" | grep -qE "$PP_HOTSPOT"; then
+    PP_TOUCHED=1
+fi
 
 if ! echo "$CHANGED" | grep -qE "$HOTSPOT"; then
     exit 0
@@ -70,6 +82,26 @@ if [ "${HIPFIRE_FORCE_PFLASH_GATE:-0}" = "1" ] \
 else
     PFLASH_GATE_ENV="HIPFIRE_SKIP_PFLASH_GATE=1"
     PFLASH_GATE_NOTE="(skipped — no pflash path in diff; force with HIPFIRE_FORCE_PFLASH_GATE=1)"
+fi
+
+# ── bind_thread invariant on dispatch.rs ────────────────────────────────
+# Multi-GPU plan (issue #58) requires every pub fn in `impl Gpu` to either
+# call `self.bind_thread()` first, or carry a `// bind_thread: skip` marker.
+# Silent mis-bind = malloc-on-wrong-device → cross-device pointer corruption.
+if echo "$CHANGED" | grep -qE 'crates/rdna-compute/src/dispatch\.rs'; then
+    if ! ./scripts/verify-bind-thread.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: dispatch.rs has pub fn missing bind_thread()."
+        echo "========================================================================"
+        echo
+        echo 'Add `self.bind_thread()?;` (or `self.bind_thread_or_warn();` for'
+        echo 'non-HipResult fn) as the first statement, OR add a'
+        echo '`// bind_thread: skip — <reason>` comment for pure-state queries.'
+        echo
+        exit 1
+    fi
+    echo
 fi
 
 # ── Coherence battery ────────────────────────────────────────────────────
@@ -121,10 +153,22 @@ SPEC_HOTSPOT='dflash|ddtree|spec_step|tree_verify|gdn_tape|kv_compact_gather|rop
 if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
    || echo "$CHANGED" | grep -qE "$SPEC_HOTSPOT" \
    || echo "$CHANGED" | grep -qE 'speculative\.rs|qwen35\.rs|ddtree\.rs|dflash\.rs|dflash_spec_demo\.rs'; then
-    echo "=== DFlash/DDTree Coherence Battery ==="
-    echo "Spec-decode path changed. Running dflash coherence battery (~3 min)..."
+    # --fast on every commit; --full only when explicitly forced. The fast
+    # battery (1 prose + 1 code, dflash only) catches the Path A single-token
+    # attractor regression class which is what this gate is here for. The
+    # ddtree variants in the short battery add ~2 min of redundant cover for
+    # the same failure mode.
+    if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ]; then
+        DFLASH_FLAG=""
+        DFLASH_NOTE="(forced full battery)"
+    else
+        DFLASH_FLAG="--fast"
+        DFLASH_NOTE="(fast: 2 cells, ~1 min — full battery via HIPFIRE_FORCE_SPEC_GATE=1)"
+    fi
+    echo "=== DFlash/DDTree Coherence Battery $DFLASH_NOTE ==="
+    echo "Spec-decode path changed. Running dflash coherence battery..."
     echo
-    if ! ./scripts/coherence-gate-dflash.sh; then
+    if ! ./scripts/coherence-gate-dflash.sh $DFLASH_FLAG; then
         echo
         echo "========================================================================"
         echo "COMMIT BLOCKED: dflash coherence battery hit a HARD error."
@@ -139,8 +183,8 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
         echo "+τ / +tok-s wins on stat gates and silently corrupt outputs."
         echo
         echo "Investigation:"
-        echo "  ./scripts/coherence-gate-dflash.sh    # re-run short"
-        echo "  ./scripts/coherence-gate-dflash.sh --full   # add b22-k4 + b8-k2"
+        echo "  ./scripts/coherence-gate-dflash.sh           # re-run short (4 cells)"
+        echo "  ./scripts/coherence-gate-dflash.sh --full    # add b22-k4 + b8-k2"
         echo
         exit 1
     fi
@@ -151,6 +195,78 @@ if [ "${HIPFIRE_FORCE_SPEC_GATE:-0}" = "1" ] \
 fi
 
 echo
+
+# ── Agentic gate (--fast) ────────────────────────────────────────────────
+# Tool-call shape regression battery for A3B variants under realistic-length
+# agent system prompts (Pi-style ~1300 tok, Hermes-style ~780 tok). Guards
+# against issue #87-class regressions: prompt-length-sensitive corruption of
+# tool_call JSON (special-token leak, malformed JSON, stacked openers) that
+# coherence-gate.sh's 50-token system prompt cannot reproduce.
+#
+# Fires on any HOTSPOT match (same surface as coherence-gate). Skips silently
+# if A3B models absent (CI-safe). Force full battery via
+# HIPFIRE_FORCE_AGENTIC_GATE=1; skip entirely via HIPFIRE_SKIP_AGENTIC_GATE=1.
+if [ "${HIPFIRE_SKIP_AGENTIC_GATE:-0}" != "1" ]; then
+    if [ "${HIPFIRE_FORCE_AGENTIC_GATE:-0}" = "1" ]; then
+        AGENTIC_FLAG=""
+        AGENTIC_NOTE="(forced full: 8 cells, ~5 min)"
+    else
+        AGENTIC_FLAG="--fast"
+        AGENTIC_NOTE="(fast: 1 cell, ~2 min — full via HIPFIRE_FORCE_AGENTIC_GATE=1)"
+    fi
+    echo "=== Agentic Gate $AGENTIC_NOTE ==="
+    echo "Tool-call shape regression cover. Skips if A3B models absent."
+    echo
+    if ! ./scripts/agentic-gate.sh $AGENTIC_FLAG; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: agentic-gate.sh hit a HARD failure."
+        echo "========================================================================"
+        echo
+        echo "One or more A3B + agent-prompt cells produced corrupt tool_call output:"
+        echo "malformed JSON, missing required fields, special-token leak, stacked"
+        echo "openers, or > 1 soft-warn (collective threshold)."
+        echo
+        echo "DO NOT bypass with --no-verify. This regression class silently breaks"
+        echo "tool-call parsers downstream — see issue #87 (April 2026 auto-MMQ"
+        echo "regression that ChatML-leaked into <tool_call> JSON)."
+        echo
+        echo "Investigation:"
+        echo "  ./scripts/agentic-gate.sh --fast        # re-run single cell"
+        echo "  ./scripts/agentic-gate.sh               # full 8-cell battery"
+        echo "  ./scripts/agentic-gate.sh --self-check  # verify detectors not rotted"
+        echo
+        echo "Per-commit escape (use with care): HIPFIRE_SKIP_AGENTIC_GATE=1"
+        echo
+        exit 1
+    fi
+    echo
+fi
+
+# ── Multi-GPU PP gate ────────────────────────────────────────────────────
+# Skips silently when fewer than 2 GPU are visible — single-GPU CI and
+# dev boxes don't block on multi-GPU regressions. When 2+ GPU AND a
+# multi_gpu/pp_/peer_access hotspot is touched, run the parity battery.
+if [ "$PP_TOUCHED" -eq 1 ]; then
+    echo "=== Multi-GPU PP Gate ==="
+    echo "Multi-GPU code changed. Running pp-gate (skips if <2 GPU)..."
+    echo
+    if ! ./scripts/pp-gate.sh; then
+        echo
+        echo "========================================================================"
+        echo "COMMIT BLOCKED: pp-gate.sh hit a HARD failure."
+        echo "========================================================================"
+        echo
+        echo "Multi-GPU pp=2 ≢ pp=1 byte-identical, refusal contract broken,"
+        echo "or daemon panic. Investigation:"
+        echo "  ./scripts/pp-gate.sh                       # full battery"
+        echo "  ./scripts/pp-gate.sh --skip-end-to-end     # parity-only"
+        echo
+        echo "Refer to docs/multi-gpu.md for the validation contract."
+        exit 1
+    fi
+    echo
+fi
 
 # ── Speed gate ────────────────────────────────────────────────────────────
 echo "=== MQ4 Speed Gate (fast) ==="

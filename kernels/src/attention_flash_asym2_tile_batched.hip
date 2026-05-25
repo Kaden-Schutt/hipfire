@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym2: K at 2-bit rotated, V at Q8_0.
 // Structure mirrors asym4_tile_batched but with 2-bit K packing (1 byte per thread per half).
 #include <hip/hip_runtime.h>

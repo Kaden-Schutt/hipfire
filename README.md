@@ -6,7 +6,7 @@ in the hot path. Ollama-style UX.
 ```bash
 hipfire pull qwen3.5:9b
 hipfire run  qwen3.5:9b "What is the capital of France?"
-hipfire serve -d        # background daemon, OpenAI-compatible API on :11435
+hipfire serve -d        # background daemon, OpenAI-compatible API on 0.0.0.0:11435
 ```
 
 Current release: **v0.1.20** — engine modularization. See [CHANGELOG.md](CHANGELOG.md).
@@ -40,6 +40,11 @@ DFlash speedup is genre-conditional — see
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
 and the cross-arch matrix (RDNA1 / RDNA2 / APU / MI300X).
 
+CASK-based KV cache eviction lets you run long-context prompts without
+OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
+eviction with `hipfire config cask-profile balanced`. See
+[CONFIG.md](docs/CONFIG.md) for details.
+
 ## Install
 
 Linux with ROCm 6+:
@@ -51,6 +56,26 @@ curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/in
 For Windows, source builds, and verifying the install:
 [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md).
 
+## NixOS
+
+First-class support via Nix flake. See [docs/NIXOS.md](docs/NIXOS.md).
+
+```bash
+nix develop github:Kaden-Schutt/hipfire  # dev shell with Rust + ROCm + bun
+nix build github:Kaden-Schutt/hipfire    # build package
+```
+
+NixOS module:
+
+```nix
+{
+  inputs.hipfire.url = "github:Kaden-Schutt/hipfire";
+  # then in configuration.nix:
+  services.hipfire.enable = true;
+  services.hipfire.gpuTargets = [ "gfx1100" ];
+}
+```
+
 ## Inspiration: Lucebox
 
 hipfire's DFlash work was substantially shaped by Davide Ciffa's
@@ -61,24 +86,76 @@ concrete published numbers to target, n_gen-aware bench methodology,
 and pointers at where the fat is. Cached snapshot at
 `.research-cache/lucebox-dflash27b.html` for forensic reproducibility.
 
+## Inspiration: gfx906 (MI50/MI60) optimizations
+
+hipfire's gfx906 prefill MMQ kernel and AR-decode optimizations were
+shaped by two community forks of `llama.cpp` that target Vega 20:
+
+- **[iacopPBK/llama.cpp-gfx906](https://github.com/iacopPBK/llama.cpp-gfx906)**
+  — the original fork that ported and tuned gfx906-specific code paths
+  (warp-cooperative GEMV via half-wave split, Y-tile prefetch via
+  inline-asm `global_load_dword`, `__builtin_amdgcn_readfirstlane`-based
+  SGPR hoisting, separate HBM-load → register-cache → LDS-store
+  pipelining in the MMQ body). The "2602.01 version" commit
+  `eec153c086df6a9e7a69499bea3639597c085fff` was the canonical reference
+  we audited against.
+- **[skyne98/llama.cpp-gfx906](https://github.com/skyne98/llama.cpp-gfx906)**
+  — fork-of-fork that propagates iacop's optimizations (commit
+  `42c298c` "port iacop optimizations") and tracks upstream more
+  aggressively. The accompanying
+  [skyne98/wiki-gfx906](https://skyne98.github.io/wiki-gfx906/intro.html)
+  is the best public reference for gfx906 ISA quirks (LDS bank-conflict
+  patterns at stride 32, dp4a issue-rate ceiling, Q8_1 activation
+  layout) — we used it as a sanity-check for several PMC-driven
+  redesign decisions.
+
+And of course an extra shout-out to `ggml-org/llama.cpp` itself: the
+templated `mmq_x` body in `mul_mat_q.cu` was the architectural scaffold
+we ported to gfx906 (templated mmq_x ladder, per-thread accumulator
+layout, MMQ_TILE_NE_K=32 sub-block factoring, Q8_1 quantize math). The
+inner loop is gfx906-specific; the outer shape is descendant.
+
+A standalone gfx906 perf investigation log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`](docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md);
+the prefill MMQ redesign log is at
+[`docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md`](docs/perf-checkpoints/2026-05-05-gfx906-mmq-redesign-final.md).
+
 ## Documentation
 
 | Page | Topic |
 |---|---|
 | [GETTING_STARTED.md](docs/GETTING_STARTED.md) | Install, first run, what to read next |
+| [NIXOS.md](docs/NIXOS.md) | NixOS flake, module, dev shell |
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
-| [CONFIG.md](docs/CONFIG.md) | Every config key, env overrides |
+| [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |
+| [multi-gpu.md](docs/multi-gpu.md) | Pipeline-parallel (pp≥2) — memory budget, deployment, refusals |
 | [methodology/perf-benchmarking.md](docs/methodology/perf-benchmarking.md) | Bench protocol — read before claiming a perf win |
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+hipfire is dual-licensed under MIT or Apache-2.0 at your option. See
+[LICENSE](LICENSE) (dual-license pointer), [LICENSE-MIT](LICENSE-MIT),
+[LICENSE-APACHE](LICENSE-APACHE), and [NOTICE](NOTICE) for details.
+
+New contributions default to Apache-2.0 via DCO sign-off; existing
+contributors' MIT-licensed contributions remain MIT unless they opt
+in. Each source file carries an `SPDX-License-Identifier` reflecting
+actual authorship (MIT, Apache-2.0, or `MIT OR Apache-2.0`). See
+[CONTRIBUTING.md](CONTRIBUTING.md) for the contributor side and
+[docs/governance/relicense-2026-05.md](docs/governance/relicense-2026-05.md)
+for the decision record (including the 2026-05-19 course correction
+from a unilateral Apache-2.0 relicense to dual licensing).
+
+Original architectural innovations originating in hipfire are
+catalogued in [PRIOR-ART.md](PRIOR-ART.md); derivative works
+(including reimplementations informed by hipfire's design) should
+attribute the corresponding inventions per [AGENTS.md](AGENTS.md).
 
 ## Contributing
 

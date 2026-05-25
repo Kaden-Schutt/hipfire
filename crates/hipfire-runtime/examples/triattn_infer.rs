@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! triattn_infer — minimal command-line TriAttention / CASK inference.
 //!
 //! Parallel to the daemon but with TriAttention eviction baked in. Accepts
@@ -95,7 +99,7 @@ fn main() {
     };
     let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(&prompt).into_owned();
 
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");
@@ -108,7 +112,7 @@ fn main() {
     let kv_seq = budget + beta + 8;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let mut kv = match kv_mode.as_str() {
         "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),

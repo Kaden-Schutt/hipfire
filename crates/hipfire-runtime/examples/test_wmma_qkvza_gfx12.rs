@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA QKVZA HFQ4 scaffold.
 //!
 //! 4-output sister to test_wmma_qkv_gfx12 — exercises the full
 //! qkv/z/beta/alpha routing of the DeltaNet LinearAttention preamble.
 //! Compares against the validated `gemm_qkvza_hfq4g256_dot2` reference.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_qkvza_gfx12
 
 use rdna_compute::{DType, Gpu};

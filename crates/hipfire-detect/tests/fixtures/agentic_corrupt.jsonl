@@ -1,0 +1,10 @@
+{"type":"committed","id":"r1","tok_id":83,"pos":0,"t_ms":50}
+{"type":"token","id":"r1","text":"<tool_call>\n"}
+{"type":"committed","id":"r1","tok_id":120,"pos":1,"t_ms":60}
+{"type":"token","id":"r1","text":"<tool_call>\n"}
+{"type":"committed","id":"r1","tok_id":140,"pos":2,"t_ms":70}
+{"type":"token","id":"r1","text":"{\"arguments\": {\"path\": \"/tmp/x\"<|im_start|>}}\n"}
+{"type":"committed","id":"r1","tok_id":160,"pos":3,"t_ms":80}
+{"type":"token","id":"r1","text":"</tool_call>"}
+{"type":"committed","id":"r1","tok_id":248046,"pos":4,"t_ms":90}
+{"type":"done","id":"r1","tokens":5,"tok_s":55.6,"wall_ms":90,"ttft_ms":50}

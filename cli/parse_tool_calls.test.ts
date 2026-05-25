@@ -37,6 +37,20 @@ function parseOneToolCall(raw: string): { name: string; arguments: any; repaired
     /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
     /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
   ];
+  // Probe (1): Qwen3.5/3.6 native `<function=NAME>...<parameter=K>V</parameter>...</function>`.
+  const fnMatch = raw.match(/^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)(?:<\s*\/\s*function\s*>|$)/);
+  if (fnMatch) {
+    const fname = fnMatch[1];
+    const body = fnMatch[2];
+    const params: Record<string, any> = {};
+    const paramRe = /<\s*parameter\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/g;
+    let anyParam = false;
+    for (const pm of body.matchAll(paramRe)) {
+      params[pm[1]] = coerceParamValue(pm[2].trim());
+      anyParam = true;
+    }
+    if (anyParam) return { name: fname, arguments: params, repaired: true };
+  }
   for (const pat of xmlPatterns) {
     const nm = raw.match(pat);
     if (!nm) continue;
@@ -46,6 +60,19 @@ function parseOneToolCall(raw: string): { name: string; arguments: any; repaired
     return { name: nm[1], arguments: {}, repaired: true };
   }
   return null;
+}
+
+function coerceParamValue(s: string): any {
+  if (s === "") return "";
+  if (s === "true" || s === "false" || s === "null") return JSON.parse(s);
+  if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(s)) {
+    const n = Number(s);
+    if (Number.isFinite(n)) return n;
+  }
+  if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+    try { return JSON.parse(s); } catch {}
+  }
+  return s;
 }
 
 function extractFirstJsonObject(s: string): any | null {
@@ -209,4 +236,71 @@ test("nested openers with empty body returns null (no false-positive call)", () 
   const raw = '<tool_call>\n<tool_call>\n<tool_call>';
   const r = parseToolCallsBlock(raw);
   expect(r).toBeNull();
+});
+
+// --- Qwen3.5/3.6 native XML output (Phase 2, Jinja path) ---
+
+test("Qwen3.6 native <function=NAME>...<parameter=K>V</parameter>...</function> shape", () => {
+  // Bytes captured from the daemon smoke (qwen3.6-27b + DFlash drafter
+  // + HIPFIRE_JINJA_CHAT=1) — the template emits parameter siblings
+  // separated by newlines, with one leading + one trailing newline
+  // inside each <parameter> body.
+  const raw = '<function=get_weather>\n<parameter=city>\nSan Francisco\n</parameter>\n<parameter=unit>\nf\n</parameter>\n</function>';
+  const r = parseOneToolCall(raw);
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("get_weather");
+  expect(r!.arguments).toEqual({ city: "San Francisco", unit: "f" });
+  expect(r!.repaired).toBe(true);
+});
+
+test("Qwen3.6 XML coerces typed parameter values (numbers / bool / null / json)", () => {
+  // Tool runners downstream expect typed args — coerce string bodies
+  // that look like JSON primitives so `{"count": 42}` doesn't arrive
+  // as `{"count": "42"}`. Strings that don't match a JSON shape stay
+  // strings (Qwen often emits e.g. paths or free-text).
+  const raw = '<function=execute>'
+    + '<parameter=count>42</parameter>'
+    + '<parameter=ratio>3.14</parameter>'
+    + '<parameter=enabled>true</parameter>'
+    + '<parameter=missing>null</parameter>'
+    + '<parameter=cfg>{"k":1}</parameter>'
+    + '<parameter=tags>["a","b"]</parameter>'
+    + '<parameter=path>/tmp/x.txt</parameter>'
+    + '</function>';
+  const r = parseOneToolCall(raw);
+  expect(r).not.toBeNull();
+  expect(r!.arguments).toEqual({
+    count: 42,
+    ratio: 3.14,
+    enabled: true,
+    missing: null,
+    cfg: { k: 1 },
+    tags: ["a", "b"],
+    path: "/tmp/x.txt",
+  });
+});
+
+test("Qwen3.6 XML with zero parameters (no-arg call)", () => {
+  // `<function=NAME></function>` with no parameter siblings — the
+  // probe-(1) anyParam guard must NOT fire (else `arguments` would be
+  // {} but `repaired` set spuriously). Should fall through to the
+  // legacy probe-(3) shape which emits empty args + repaired=true.
+  const raw = '<function=list_dirs></function>';
+  const r = parseOneToolCall(raw);
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("list_dirs");
+  expect(r!.arguments).toEqual({});
+});
+
+test("<function=NAME>{JSON} (MQ4 corruption shape) still parses via probe-(2)", () => {
+  // Regression: the existing MQ4 XML-corruption repair must still work
+  // — probe-(1)'s parameter-sibling logic falls through cleanly when
+  // there are no <parameter=...> blocks but a JSON-object args body
+  // is present.
+  const raw = '<function=read>{"path": "/etc/passwd"}';
+  const r = parseOneToolCall(raw);
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("read");
+  expect(r!.arguments).toEqual({ path: "/etc/passwd" });
+  expect(r!.repaired).toBe(true);
 });

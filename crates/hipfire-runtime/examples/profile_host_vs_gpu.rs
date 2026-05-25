@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase 3a Option C: isolate where forward-pass wall clock goes.
 //!
 //! Splits a single forward pass into three measurements:
@@ -41,9 +45,9 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("Gpu::init");
     eprintln!("Loading {}...", model_path);
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
     eprintln!("Loaded: {} layers, dim={}", config.n_layers, config.dim);
 
     let max_seq = 2048;

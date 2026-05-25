@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention reduce for asym KV modes (asym4 / asym3 / asym2).
 // V is in NORMAL (un-rotated) space — no inverse rotation needed.
 // Shared across all asym bit-widths because partials layout is dim-indexed

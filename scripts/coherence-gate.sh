@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Coherence battery — replaces the byte-exact MQ4 quality gate.
 #
 # Rationale: byte-exact comparison blocks legitimate numerical-correctness
@@ -91,6 +96,64 @@ SHORT_TESTS=(
     # drift between bit-widths is comparable.
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    # MQ3-Lloyd coverage (PR #115 — research-gated format, --allow-mq3-lloyd
+    # at quantize time only; no runtime gate). 4B + 9B exercise the K4 +
+    # fp32-LDS-codebook gfx1100 kernel + tail-rotation logic. Runs anywhere
+    # with the model file present.
+    "qwen3.5-4b.mq3-lloyd|cap-mq3-lloyd-4b|What is the capital of France? Answer in one short sentence.|80"
+    "qwen3.5-9b.mq3-lloyd|reason-mq3-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # MQ3-Lloyd batched-prefill coverage (companion to issue #116 Phase B2).
+    # Uses a ~180-token prompt (well above MIN_BATCH=2) to exercise the
+    # batched-prefill path's new WMMA fused kernels (qkv, qkvza, gate_up,
+    # residual) under a realistic single-chunk forward. Prompt is loaded
+    # from benchmarks/prompts/coherence_lloyd_long.txt — referenced by
+    # md5 below to detect drift (per CLAUDE.md prompt-md5 rule).
+    #   md5(coherence_lloyd_long.txt) = f20bbc4f5b88ab5f7b44fe7c7da0e2e3
+    "qwen3.5-4b.mq3-lloyd|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
+    "qwen3.5-9b.mq3-lloyd|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
+    # Q8_0 batched-prefill coverage (companion to docs/plans/q8-fused-prefill-kernels.md
+    # T3-0 prerequisite). Exercises the Tier 2 dispatch arms
+    # (gemm_q8_0_batched_chunked at qkv/qkvza/gate_up/wo+residual/w_down+residual)
+    # via the daemon's prefill path on a 9B Q8 model. Tier 3 will replace
+    # those arms with fused WMMA kernels — this row is the regression detector.
+    # Same long prompt as the MQ3-Lloyd rows so output drift across quant
+    # formats is comparable. Single-chunk because the prompt fits comfortably
+    # inside one PrefillBatchScratch chunk (PREFILL_MAX_BATCH=256).
+    "qwen3.5-9b.q8f16|long-prefill-q8-9b|@coherence_lloyd_long.txt|220"
+    # MQ6 coverage — different quant family (HFQ6-G256, 200 B/group). Used
+    # as a regression-safety check that gfx906's new HFQ4 dp4a/prefetch
+    # defaults don't disturb the mq6 dispatch routing. Skipped if model
+    # absent (download via `hipfire pull qwen3.5-9b.mq6`).
+    "qwen3.5-9b.mq6|reason-mq6|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
+    # MQ3-AWQ coverage — regression catcher for the 2026-05-18 loader bug
+    # where `qwen35.rs:907` gated AWQ-sidecar attachment on
+    # `matches!(wt.gpu_dtype, DType::MQ4G256)` and silently dropped sidecars
+    # for MQ3G256 weights (fixed by extending to MQ4G256|MQ3G256 and then
+    # centralized behind `DType::supports_awq_sidecar` — see the
+    # `mq3-awq-paris` case below for the corresponding hard-fail check).
+    # Uses the 4B-awq-only variant because it produces a verbose answer
+    # containing "Paris" reliably at temp=0 + repeat_penalty=1.05; the
+    # awq-gptq sibling terses out on this prompt (7 tokens, no Paris), so
+    # it would false-positive the gate. Skipped if the canonical file
+    # isn't symlinked into MODELS_DIR — symlink it as:
+    #   ln -s /data/hipfire/mq3-sweep/qwen3.5-4b.mq3-awq-only.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-4b.mq3-awq-only"
+    "qwen3.5-4b.mq3-awq-only|mq3-awq-paris|What is the capital of France? Answer in one short sentence.|80"
+    # lm_head AWQ coverage — regression catcher for the AWQ-aware lm_head
+    # dispatch landed in 2026-05-18's lm-head-awq-runtime PR. The 9B file
+    # ships `lm_head.awq_scale.weight` alongside the 248 per-layer
+    # sidecars; the runtime applies `x /= s` before the lm_head matmul
+    # via `weight_gemv` → `rotate_x_mq_for` (decode) and
+    # `speculative.rs::rotate_x_mq_batched_for` (spec-verify). With
+    # those wirings in place, the model produces coherent output;
+    # without them, the lm_head computes `(W·s)·x ≠ W·x` and emits
+    # gibberish at the output projection (KLD 0.67 → 13.5 class —
+    # see docs/plans/awq_fix_claude.md). max_tokens=300 because 9B
+    # Qwen3.5 thinking mode spends more tokens in `<think>` before
+    # emitting the final answer. Symlink to enable:
+    #   ln -s /data/hipfire/qwen3.5-9b.mq4-awq-gptq-f2-lmhead-a100.hfq \
+    #         "${HIPFIRE_DIR:-$HOME/.hipfire}/models/qwen3.5-9b.mq4-awq-gptq-f2-lmhead"
+    "qwen3.5-9b.mq4-awq-gptq-f2-lmhead|lmhead-awq-paris|What is the capital of France? Answer in one short sentence.|300"
 )
 FULL_EXTRA=(
     "qwen3.5-35b-a3b.mq4|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
@@ -125,6 +188,23 @@ for entry in "${tests[@]}"; do
         echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
         echo >> "$OUT"
         continue
+    fi
+
+    # `@filename` syntax: read the user prompt from benchmarks/prompts/<file>.
+    # Used for long-prompt batched-prefill rows where embedding the prompt
+    # inline would violate CLAUDE.md's prompt-md5 rule (heredocs in scripts
+    # are reformatting-sensitive, breaking byte-identical reproduction).
+    prompt_md5=""
+    prompt_ref=""
+    if [ "${prompt:0:1}" = "@" ]; then
+        prompt_ref="${prompt:1}"
+        prompt_path="benchmarks/prompts/$prompt_ref"
+        if [ ! -f "$prompt_path" ]; then
+            echo "## $model_file — $prompt_id — SKIPPED (prompt file $prompt_path not found)" >> "$OUT"
+            continue
+        fi
+        prompt=$(cat "$prompt_path")
+        prompt_md5=$(md5sum "$prompt_path" | awk '{print $1}')
     fi
 
     # Optional system prompt: load from benchmarks/prompts/ if specified
@@ -197,6 +277,30 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
                 status="OK (soft: no <tool_call> emitted; model answered inline)"
             fi
             ;;
+        mq3-awq-paris|lmhead-awq-paris)
+            # Regression catcher for AWQ-sidecar load + dispatch bugs.
+            # Two flavors share this hard-fail check:
+            #   - mq3-awq-paris (4B): catches the 2026-05-18 loader bug
+            #     where `qwen35.rs:907` gated AWQ-sidecar attachment on
+            #     `matches!(_, DType::MQ4G256)` and silently dropped MQ3
+            #     sidecars.
+            #   - lmhead-awq-paris (9B): catches the 2026-05-18 spec-verify
+            #     dispatch bug where `speculative.rs`'s lm_head path
+            #     called the non-AWQ `rotate_x_mq_batched` even when an
+            #     lm_head sidecar was attached. Same dispatch class as
+            #     the DFlash drafter bug fixed in PR #290.
+            # A healthy Qwen3.5 MQ4-AWQ answer always contains "Paris"
+            # verbatim at temp=0 — even the lowest-PPL calibration gets
+            # the capital right. Anything else means the AWQ rescale is
+            # not being applied at some stage.
+            text=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))')
+            if ! printf '%s' "$text" | grep -q 'Paris'; then
+                status="HARD_ERROR (AWQ regression: answer missing 'Paris' — AWQ rescale likely not applied; check DType::supports_awq_sidecar gate and rotate_x_mq_for / rotate_x_mq_batched_for dispatch)"
+                hard_errors=$((hard_errors + 1))
+            fi
+            ;;
     esac
 
     {
@@ -206,7 +310,11 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
         if [ -n "$done_line" ]; then
             echo "- stats: \`$done_line\`"
         fi
-        echo "- prompt: \"$prompt\""
+        if [ -n "$prompt_md5" ]; then
+            echo "- prompt: \`@$prompt_ref\` (md5: \`$prompt_md5\`)"
+        else
+            echo "- prompt: \"$prompt\""
+        fi
         echo
         if [ -n "$panic" ]; then
             echo '**PANIC/ERROR DETECTED:**'

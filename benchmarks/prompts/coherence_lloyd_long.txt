@@ -1,0 +1,8 @@
+You are reviewing a Python module that implements a fixed-capacity LRU cache backed by a doubly linked list and a hash map. The list keeps usage order: most-recently-used at the head, least-recently-used at the tail. The hash map maps keys to list nodes for O(1) lookup. On `get(key)`, the entry is moved to the head; on `put(key, value)`, the entry is inserted at the head and, if capacity is exceeded, the tail is evicted. There are no thread-safety guarantees.
+
+Briefly answer in two short paragraphs:
+
+1. Why is the doubly linked list necessary instead of a singly linked list?
+2. What is the worst-case time complexity of `put` and `get`, and why is it constant?
+
+Keep the answer under 120 words total. Do not write code.

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Grégory D
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Path C smoke gate — runs `spec_step_ddtree_path_c` (Phase 1 and Phase 2)
 # end-to-end through `dflash_spec_demo`, applies the Path A/B token-attractor
 # detector, and reports per-mode pass/fail.

@@ -5,6 +5,7 @@
 //   hipfire run qwen3.5:9b [prompt]  → generate (auto-pulls if needed)
 //   hipfire serve                     → start daemon + HTTP server
 //   hipfire list                      → show local + available models
+//   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
@@ -14,6 +15,7 @@ import { homedir } from "os";
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
+const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
 
@@ -31,6 +33,7 @@ export interface HipfireConfig {
   max_seq: number;        // KV cache capacity allocated at model load (shared across turns)
   thinking: string;       // "on" (model reasons in <think>, stripped from display) | "off" (suppress thinking)
   max_think_tokens: number; // per-turn budget for <think>...</think> reasoning (0 = unlimited)
+  host: string;           // default serve bind address
   port: number;           // default serve port
   idle_timeout: number;   // serve: seconds of inactivity before unloading the model (0 = never)
   // ── Experimental / research knobs (OFF by default, no stable contract) ──
@@ -169,6 +172,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   max_seq: 32768,
   thinking: "on",
   max_think_tokens: 0,
+  host: DEFAULT_HOST,
   port: DEFAULT_PORT,
   idle_timeout: 300,
   experimental_budget_alert: false,
@@ -221,6 +225,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "max_seq": return typeof value === "number" && Number.isInteger(value) && value >= 512 && value <= 524288;
     case "thinking": return ["on", "off"].includes(value);
     case "max_think_tokens": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 32768;
+    case "host": return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 255 && !/\s/.test(value);
     case "port": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
     case "idle_timeout": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 86400;
     case "default_model": return typeof value === "string" && value.trim().length > 0;
@@ -289,7 +294,7 @@ const cfg = loadConfig();
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
 
-// Fields that make sense to override per-model. port + idle_timeout + default_model
+// Fields that make sense to override per-model. host + port + idle_timeout + default_model
 // are serve-wide so they stay global-only.
 const PER_MODEL_KEYS = [
   "kv_cache", "flash_mode", "temperature", "top_p",
@@ -641,6 +646,15 @@ function buildLoadMessage(path: string, tag?: string | null): any {
 
 const HF_BASE = "https://huggingface.co";
 
+function hfHeaders(): Record<string, string> {
+  const h: Record<string, string> = {
+    "User-Agent": "hipfire",
+  };
+  const token = process.env.HF_TOKEN;
+  if (token) h["Authorization"] = `Bearer ${token}`;
+  return h;
+}
+
 interface ModelEntry {
   /// Empty string = local-only. `pull()` short-circuits with a clear message
   /// instead of attempting a 404'ing fetch against a HF repo that doesn't
@@ -848,11 +862,22 @@ function readServePid(): number | null {
   } catch { return null; }
 }
 
+export function serveProbeHost(host: string): string {
+  if (host === "0.0.0.0" || host === "::" || host === "") return "127.0.0.1";
+  if (host.includes(":") && !host.startsWith("[")) return `[${host}]`;
+  return host;
+}
+
+export function formatServeBind(host: string, port: number): string {
+  const h = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `${h}:${port}`;
+}
+
 // Cheap liveness probe: 500ms health check. Used by `run` to decide HTTP vs local spawn.
-export async function isServeUp(port: number): Promise<boolean> {
+export async function isServeUp(port: number, host = "127.0.0.1"): Promise<boolean> {
   try {
     const ctl = AbortSignal.timeout(500);
-    const r = await fetch(`http://127.0.0.1:${port}/health`, { signal: ctl });
+    const r = await fetch(`http://${serveProbeHost(host)}:${port}/health`, { signal: ctl });
     return r.ok;
   } catch { return false; }
 }
@@ -860,24 +885,45 @@ export async function isServeUp(port: number): Promise<boolean> {
 // Drive `hipfire run` through an existing serve's /v1/chat/completions stream.
 // Returns false if it couldn't connect (caller falls back to local spawn).
 async function runViaHttp(
-  port: number, model: string, prompt: string,
+  port: number, host: string, model: string, prompt: string,
   image: string | undefined,
   temp: number, maxTokens: number, repeatPenalty: number, topP: number,
+  system?: string,
 ): Promise<boolean> {
-  // VL flows go through the image-base64 path on the daemon which the HTTP
-  // wrapper doesn't expose — fall back to local spawn.
-  if (image) return false;
+  // VL requests proxy through the daemon's `image_base64` IPC field —
+  // `hipfire run --image` can hit a running serve instead of cold-spawning
+  // a fresh daemon per call.
 
+  const messages: any[] = [];
+  if (system) messages.push({ role: "system", content: system });
+  messages.push({ role: "user", content: prompt });
   const body: any = {
     model, stream: true,
-    messages: [{ role: "user", content: prompt }],
+    messages,
     temperature: temp, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
 
+  if (image) {
+    const imgBuf = Bun.file(resolve(image));
+    if (!(await imgBuf.exists())) { console.error(`Image not found: ${image}`); return false; }
+    const imgBytes = await imgBuf.arrayBuffer();
+    const imgBase64 = Buffer.from(imgBytes).toString("base64");
+    const ext = image.toLowerCase().split(".").pop();
+    const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "png" ? "image/png" : null;
+    if (!mime) { console.error(`Unsupported image format: ${ext} — supported: png, jpeg`); return false; }
+    body.messages = [{
+      role: "user",
+      content: [
+        { type: "text", text: prompt },
+        { type: "image_url", image_url: { url: `data:${mime};base64,${imgBase64}` } },
+      ],
+    }];
+  }
+
   let resp: Response;
   try {
-    resp = await fetch(`http://127.0.0.1:${port}/v1/chat/completions`, {
+    resp = await fetch(`http://${serveProbeHost(host)}:${port}/v1/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -948,29 +994,37 @@ async function runViaHttp(
 
 class Engine {
   private proc: ReturnType<typeof spawn> | null = null;
-  private reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  private reader: {
+    read(): Promise<{ done: boolean; value?: Uint8Array }>;
+    releaseLock(): void;
+  } | null = null;
   private lines: string[] = [];
   private buffer = "";
 
   async start() {
     const exe = process.platform === "win32" ? ".exe" : "";
+    const envBin = process.env.HIPFIRE_DAEMON_BIN;
     const bins = [
+      ...(envBin ? [envBin] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe}`),
     ];
     const bin = bins.find(p => existsSync(p));
-    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p engine");
+    if (!bin) throw new Error("daemon not found. cargo build --release --features deltanet --example daemon -p hipfire-runtime");
 
     this.proc = spawn([bin], { stdin: "pipe", stdout: "pipe", stderr: "inherit", env: { ...process.env } });
-    this.reader = this.proc.stdout!.getReader();
+    const stdout = this.proc.stdout;
+    if (!stdout || typeof stdout === "number") throw new Error("daemon stdout pipe unavailable");
+    this.reader = stdout.getReader();
     this.buffer = "";
     this.lines = [];
   }
 
   async send(msg: object) {
-    if (!this.proc?.stdin) throw new Error("not running");
-    this.proc.stdin.write(JSON.stringify(msg) + "\n");
-    await this.proc.stdin.flush();
+    const stdin = this.proc?.stdin;
+    if (!stdin || typeof stdin === "number") throw new Error("not running");
+    stdin.write(JSON.stringify(msg) + "\n");
+    await stdin.flush();
   }
 
   async recv(): Promise<any> {
@@ -1108,7 +1162,7 @@ async function pull(tag: string): Promise<string> {
   console.error(`Pulling ${resolved} (${entry.size_gb}GB)...`);
   console.error(`  ${url}`);
 
-  const res = await fetch(url);
+  const res = await fetch(url, { headers: hfHeaders() });
   if (!res.ok) {
     console.error(`Download failed: ${res.status} ${res.statusText}`);
     console.error(`URL: ${url}`);
@@ -1156,7 +1210,7 @@ async function pull(tag: string): Promise<string> {
       const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.triattn.file}`;
       console.error(`  Fetching TriAttention sidecar: ${entry.triattn.file}`);
       try {
-        const sres = await fetch(sidecarUrl);
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
         if (!sres.ok) {
           console.error(`  WARN: sidecar fetch failed (${sres.status} ${sres.statusText}) — model is usable, run hipfire config cask-profile off to silence.`);
         } else {
@@ -1180,7 +1234,7 @@ async function pull(tag: string): Promise<string> {
 
 // ─── Commands ───────────────────────────────────────────
 
-async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8) {
+async function run(model: string, prompt: string, image?: string, temp = 0.3, maxTokens = 512, repeatPenalty = 1.3, topP = 0.8, system?: string) {
   let path = findModel(model);
 
   // Auto-pull if model tag is recognized but not downloaded
@@ -1202,9 +1256,9 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   // If a serve daemon is already running on this port, proxy through its HTTP
   // API — saves the 2-5s cold-start cost of loading the model every invocation.
   // Local spawn falls through only when no serve is present (or HTTP errors out).
-  const useLocal = process.env.HIPFIRE_LOCAL === "1" || image !== undefined;
-  if (!useLocal && await isServeUp(cfg.port)) {
-    const ok = await runViaHttp(cfg.port, model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+  const useLocal = process.env.HIPFIRE_LOCAL === "1";
+  if (!useLocal && await isServeUp(cfg.port, cfg.host)) {
+    const ok = await runViaHttp(cfg.port, cfg.host, model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     if (ok) return;
     // runViaHttp logged its own failure reason; fall back to local spawn.
   }
@@ -1230,14 +1284,20 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     temperature: temp * TEMP_CORRECTION, max_tokens: maxTokens,
     repeat_penalty: repeatPenalty, top_p: topP,
   };
-  // thinking=off: hard-suppress by capping thinking to 1 token (model still
-  // emits <think> but is immediately force-closed). This mirrors the
-  // enable_thinking=false semantics from the OpenAI API path.
+  // thinking=off: hard-suppress by capping thinking to 1 token AND emitting
+  // a closed `<think></think>` block via assistant_prefix=closed_think, so
+  // the model never starts a thinking turn at all. This mirrors the
+  // enable_thinking=false semantics from the OpenAI API path
+  // (cli/index.ts ~1668-1680). The Jinja path keys off max_think_tokens==1
+  // for `enable_thinking=false`; the legacy ChatFrame path keys off
+  // assistant_prefix=closed_think. Setting both makes either daemon path
+  // do the right thing.
   // Previous attempts to inject prose directives with <think>/<no_think>
   // caused Qwen3.5 to halt at 3-4 tokens — the token-cap approach works
   // reliably because it operates at the daemon level, not in the prompt.
   if (modelCfg.thinking === "off") {
     genMsg.max_think_tokens = 1;
+    genMsg.assistant_prefix = "closed_think";
   } else if (modelCfg.max_think_tokens > 0) {
     genMsg.max_think_tokens = modelCfg.max_think_tokens;
   }
@@ -1245,6 +1305,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
     genMsg.image = resolve(image);
     console.error(`[VL: ${image}]`);
   }
+  if (system) genMsg.system = system;
 
   let inThink = false;
   let stripNextLeadingNl = false;
@@ -1277,7 +1338,7 @@ async function run(model: string, prompt: string, image?: string, temp = 0.3, ma
   await e.stop();
 }
 
-async function serve(port: number) {
+async function serve(port: number, host: string) {
   applyConfigEnv(cfg);
   // Write the PID so `hipfire stop` / `hipfire ps` / `hipfire run` can find us.
   // Cleanup on normal exit; stale PID on crash is tolerated (isPidAlive catches it).
@@ -1306,6 +1367,7 @@ async function serve(port: number) {
   // or a client-sent body.max_tokens) needs more headroom than the KV cache
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
+  let modelHasVL = false;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1337,10 +1399,16 @@ async function serve(port: number) {
       console.error(`[hipfire] idle for ${cfg.idle_timeout}s — unloading model (VRAM freed; next request will reload)`);
       await e.send({ type: "unload" });
       await e.recv();
-      current = null;
-      currentMaxSeq = null;
     } catch (err: any) {
       console.error(`[hipfire] eviction failed: ${err?.message ?? err}`);
+    } finally {
+      // Reset capability state regardless of whether send/recv threw.
+      // Leaving these stale (e.g. modelHasVL=true after a broken-pipe
+      // eviction) makes the next request forward image_base64 to a
+      // daemon that has nothing loaded.
+      current = null;
+      currentMaxSeq = null;
+      modelHasVL = false;
     }
   }, Math.min(60_000, idleTimeoutMs)) : null;
   // Keep process alive irrespective of the interval; clean up on exit.
@@ -1365,6 +1433,7 @@ async function serve(port: number) {
         await e.send({ type: "reset" }); await e.recv();
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
+        modelHasVL = loadResult.vl === true;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1389,9 +1458,10 @@ async function serve(port: number) {
     else busy = false;
   }
 
-  console.error(`[hipfire] http://localhost:${port}/v1/chat/completions`);
+  console.error(`[hipfire] http://${formatServeBind(host, port)}/v1/chat/completions`);
 
   Bun.serve({
+    hostname: host,
     port,
     idleTimeout: 255, // max allowed — model loading can take 30s+
     async fetch(req) {
@@ -1446,15 +1516,103 @@ async function serve(port: number) {
         // prompt, which the model has no way to recover from. Issue #79.
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
-        const extractText = (content: any): string => {
-          if (typeof content === "string") return content;
+        const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
-            return content
-              .filter((p: any) => p && p.type === "text")
-              .map((p: any) => p.text ?? "")
-              .join("");
+            const textParts: string[] = [];
+            const images: string[] = [];
+            let unsupportedImage = false;
+            let malformedImage = false;
+            for (const p of content) {
+              if (p?.type === "text") textParts.push(p.text ?? "");
+              else if (p?.type === "image_url") {
+                if (p.image_url?.url) {
+                  const url: string = p.image_url.url;
+                  if (url.startsWith("data:")) {
+                    const mimeMatch = url.match(/^data:(image\/(png|jpeg));base64,/);
+                    if (mimeMatch) {
+                      const raw = url.slice(url.indexOf(",") + 1);
+                      images.push(raw);
+                    } else {
+                      // Anything else under `data:` is unsupported. Flag
+                      // both data:image/<other> (webp, gif, ...) AND
+                      // non-image data: URIs (data:application/pdf, ...)
+                      // so the request fails loudly instead of silently
+                      // dropping the part and proceeding as text-only.
+                      unsupportedImage = true;
+                    }
+                  }
+                } else {
+                  malformedImage = true;
+                }
+              }
+            }
+            return { text: textParts.join(""), images, unsupportedImage, malformedImage };
           }
-          return "";
+          return { text: String(content), images: [], unsupportedImage: false, malformedImage: false };
+        };
+
+        const extractText = (content: any): string => extractContent(content).text;
+
+        // Strip <think>...</think> blocks from historical assistant text. Same
+        // rationale as the inline-ChatML builder below (line 1513): the Qwen3.5
+        // chat template doesn't carry thinking forward, and including it in
+        // history-shaped structured messages pollutes the KV cache.
+        const stripThinkingInline = (s: string): string =>
+          s.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
+           .replace(/<think>[\s\S]*$/, "");
+
+        // Map OpenAI chat-completion messages to the daemon's structured
+        // `messages` JSONL field (Phase 2 of Jinja-everywhere). Roles:
+        //   developer → system (OpenAI o1/o3 alias — chat templates
+        //                       only know system/user/assistant/tool).
+        //   tool_calls.function.arguments is JSON-string in OpenAI;
+        //   the daemon expects a raw JSON value, so we parse here and
+        //   pass through any non-string `arguments` unchanged.
+        //
+        // The daemon arbitrates whether to consume `messages` or fall
+        // back to the legacy inline-ChatML `prompt` based on
+        // HIPFIRE_JINJA_CHAT — clients don't need to know which path
+        // fires. We always send both shapes so backward-compat with
+        // Jinja-off daemons holds.
+        const mapMessagesToStructured = (msgs: any[]): any[] => {
+          const out: any[] = [];
+          for (const m of msgs) {
+            if (!m || typeof m !== "object") continue;
+            let role: string = m.role;
+            if (role === "developer") role = "system";
+            if (role !== "system" && role !== "user" && role !== "assistant" && role !== "tool") {
+              continue;
+            }
+            const entry: any = { role, content: "" };
+            if (role === "assistant") {
+              entry.content = stripThinkingInline(extractText(m.content));
+              if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                const tcs: any[] = [];
+                for (const tc of m.tool_calls) {
+                  const fn = tc?.function ?? tc ?? {};
+                  let args: any = {};
+                  if (typeof fn.arguments === "string") {
+                    try { args = JSON.parse(fn.arguments); }
+                    catch { args = { _raw: fn.arguments }; }
+                  } else if (fn.arguments !== undefined) {
+                    args = fn.arguments;
+                  }
+                  tcs.push({ name: fn.name ?? "unknown", arguments: args });
+                }
+                if (tcs.length > 0) entry.tool_calls = tcs;
+              }
+            } else if (role === "tool") {
+              entry.content = extractText(m.content);
+              if (typeof m.tool_call_id === "string" && m.tool_call_id.length > 0) {
+                entry.tool_call_id = m.tool_call_id;
+              }
+            } else {
+              entry.content = extractText(m.content);
+            }
+            out.push(entry);
+          }
+          return out;
         };
 
         // Extract system message. OpenAI's o1/o3-style reasoning surface
@@ -1493,7 +1651,19 @@ async function serve(port: number) {
            .replace(/<think>[\s\S]*$/, "");
 
         const nonSystem = messages.filter((m: any) => m.role !== "system" && m.role !== "developer");
+        let requestImages: string[] = [];
         const convParts: string[] = [];
+        // Image-validation errors fire inline (per-message) so the
+        // returned 400 reflects the actual offending turn rather than
+        // an aggregate across the conversation. Helper unifies the
+        // safeRelease + Response.json shape.
+        const rejectImage = (message: string) => {
+          safeRelease();
+          return Response.json(
+            { error: { message, type: "invalid_request_error" } },
+            { status: 400 },
+          );
+        };
         for (let i = 0; i < nonSystem.length; i++) {
           const m = nonSystem[i];
           const role = m.role;
@@ -1506,9 +1676,38 @@ async function serve(port: number) {
             if (m.tool_calls) {
               for (const tc of m.tool_calls) {
                 const fn = tc.function || tc;
-                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: JSON.parse(fn.arguments || "{}") })}\n</tool_call>`;
+                let args = {};
+                try {
+                  args = JSON.parse(fn.arguments || "{}");
+                } catch (err: any) {
+                  // Surface the parse failure so a malformed-args call
+                  // doesn't silently turn into a "tool was called with {}"
+                  // entry in the conversation. Keep the call in-stream
+                  // (using {}) so the model isn't left with a torn turn,
+                  // but make the divergence visible in serve logs.
+                  console.error(`[hipfire] tool_call: failed to parse arguments JSON for "${fn.name}" (${err?.message ?? err}) — substituting {}`);
+                }
+                text += `\n<tool_call>\n${JSON.stringify({ name: fn.name, arguments: args })}\n</tool_call>`;
               }
             }
+          } else if (role === "user") {
+            const content = extractContent(m.content);
+            if (content.malformedImage) {
+              return rejectImage("malformed image part — image_url.url is required");
+            }
+            if (content.unsupportedImage) {
+              return rejectImage("unsupported image format — supported: png, jpeg");
+            }
+            if (content.images.length > 0) {
+              if (i < nonSystem.length - 1) {
+                return rejectImage("images in earlier user turns are not supported — image must be in the last user message");
+              }
+              if (content.images.length + requestImages.length > 1) {
+                return rejectImage("multiple images not supported — only one image per request");
+              }
+              requestImages.push(...content.images);
+            }
+            text = content.text;
           } else {
             text = extractText(m.content);
           }
@@ -1540,7 +1739,8 @@ async function serve(port: number) {
         // the daemon would either reject or, worse, overrun the buffer with.
         const effective = resolveModelConfig(body.model);
         const requestMaxTokens = body.max_tokens ?? effective.max_tokens;
-        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024);
+        const visualHeadroom = requestImages.length > 0 ? 1024 : 0;
+        const requiredMaxSeq = Math.max(effective.max_seq, requestMaxTokens + 1024 + visualHeadroom);
 
         const needReload = current !== path
           || (currentMaxSeq !== null && requiredMaxSeq > currentMaxSeq);
@@ -1557,11 +1757,13 @@ async function serve(port: number) {
           if (loadResult.type === "error") {
             current = null;
             currentMaxSeq = null;
+            modelHasVL = false;
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
+          modelHasVL = loadResult.vl === true;
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
@@ -1654,17 +1856,50 @@ async function serve(port: number) {
           if (reasoningEffort === 0) delete genParams.max_think_tokens;
           else genParams.max_think_tokens = reasoningEffort;
         }
-        // thinking=off is currently a no-op at the CLI layer. Earlier
-        // versions injected a prose system directive ("Respond directly
-        // without using <think>...</think> reasoning blocks") here, but
-        // the literal special tokens in that string caused Qwen3.5 to
-        // halt at 3-4 tokens — coherence-gate (which hits the daemon
-        // direct, no system injection) consistently passes on the same
-        // models, while CLI-routed requests with this directive break.
-        // Pass through whatever system prompt the client sent, no
-        // augmentation. The downstream <think>...</think> filter still
-        // strips visible reasoning so users get clean answers.
+        // Wire thinking control for both legacy assistant_prefix
+        // (ChatFrame::ClosedThink) and the new Jinja template path.
+        // The Jinja path uses max_think_tokens==1 as the signal for
+        // enable_thinking=false (daemon.rs line 3099). For the legacy
+        // ChatFrame path, assistant_prefix="closed_think" is sufficient.
+        if (effective.thinking === "off") {
+          genParams.assistant_prefix = "closed_think";
+        } else if ((body as any).chat_template_kwargs?.enable_thinking === false) {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1; // Jinja path signal
+        } else if ((body as any).reasoning?.effort === "none") {
+          genParams.assistant_prefix = "closed_think";
+          genParams.max_think_tokens = 1;
+        }
         if (systemPrompt) genParams.system = systemPrompt;
+
+        if (requestImages.length === 1) {
+          if (!modelHasVL) {
+            safeRelease();
+            return Response.json(
+              { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
+              { status: 400 },
+            );
+          }
+          genParams.image_base64 = requestImages[0];
+        }
+
+        // Phase 2: structured tools + messages passed alongside the
+        // legacy prompt/system text. Under HIPFIRE_JINJA_CHAT=1 the
+        // daemon's Jinja path renders `messages` + `tools` through the
+        // model's upstream chat_template (XML tool-call format on
+        // Qwen3.5/3.6 etc.) and ignores `prompt`/`system`. Under
+        // HIPFIRE_JINJA_CHAT=0 (default) the daemon ignores the
+        // structured fields and falls back to the inline-ChatML prompt
+        // + text-rendered tools-block already built above. We send both
+        // shapes so the same OpenAI request works against either
+        // daemon mode without per-client awareness.
+        if (Array.isArray(body.tools) && body.tools.length > 0) {
+          genParams.tools = body.tools;
+        }
+        const structuredMessages = mapMessagesToStructured(messages);
+        if (structuredMessages.length > 0) {
+          genParams.messages = structuredMessages;
+        }
 
         // Parse tool calls from model output: <tool_call>{"name":..., "arguments":...}</tool_call>
         //
@@ -1758,28 +1993,87 @@ async function serve(port: number) {
             }
           } catch {}
 
-          // Form 3: XML-tag corruption. Look for a function name in
-          //   <plain>NAME</param>  or  <function=NAME>  or  <NAME>
-          // patterns at the head of the block, followed by a JSON object.
+          // Form 3: XML-tag forms.
+          //
+          // Originally introduced as a defensive repair for MQ4
+          // quantization drift (`<plain>NAME</param> {ARGS}`), this branch
+          // now also serves as the primary path for Qwen3.5/3.6's
+          // upstream chat_template, which emits a fully-structured
+          //   <function=NAME>
+          //     <parameter=KEY>VALUE</parameter>
+          //     <parameter=KEY>VALUE</parameter>
+          //   </function>
+          // shape under the Jinja-everywhere path (Phase 2).
+          //
+          // Order of probes:
+          //   1) `<function=NAME>` followed by `<parameter=K>V</parameter>`
+          //       siblings — Qwen3.5/3.6 native (Jinja path).
+          //   2) Any of the 3 legacy XML name patterns + a JSON-object
+          //       args tail — MQ4-corruption repair shape.
+          //   3) Any of the 3 name patterns w/ empty args — last-resort
+          //       so we never silently drop a call we can identify by name.
           const xmlPatterns = [
             /^<\s*plain\s*>\s*([A-Za-z_][\w.]*)\s*<\s*\/\s*param\s*>/,
             /^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>/,
             /^<\s*tool\s*name\s*=\s*"?([A-Za-z_][\w.]*)"?\s*>/,
           ];
+          // Probe (1): Qwen3.5/3.6 `<function=NAME>...<parameter=K>V</parameter>...</function>`.
+          const fnMatch = raw.match(/^<\s*function\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)(?:<\s*\/\s*function\s*>|$)/);
+          if (fnMatch) {
+            const fname = fnMatch[1];
+            const body = fnMatch[2];
+            const params: Record<string, any> = {};
+            const paramRe = /<\s*parameter\s*=\s*([A-Za-z_][\w.]*)\s*>([\s\S]*?)<\s*\/\s*parameter\s*>/g;
+            let anyParam = false;
+            for (const pm of body.matchAll(paramRe)) {
+              const key = pm[1];
+              // VALUE often arrives with one leading + one trailing newline
+              // (the template emits `<parameter=K>\nVALUE\n</parameter>`).
+              // Trim whitespace; coerce strings that look like JSON values
+              // (numbers, booleans, null, objects, arrays) so downstream
+              // tool runners see typed args instead of stringy "42".
+              const valueRaw = pm[2].trim();
+              params[key] = coerceParamValue(valueRaw);
+              anyParam = true;
+            }
+            if (anyParam) {
+              return { name: fname, arguments: params, repaired: true };
+            }
+            // No parameter siblings: fall through to JSON-object probe
+            // below (the JSON-corruption repair case may still apply).
+          }
+          // Probe (2): name pattern + JSON-object args tail (legacy
+          // MQ4-corruption repair).
           for (const pat of xmlPatterns) {
             const nm = raw.match(pat);
             if (!nm) continue;
             const after = raw.slice(nm[0].length).trim();
-            // Find the first balanced JSON object in the remainder.
             const args = extractFirstJsonObject(after);
             if (args !== null) {
               return { name: nm[1], arguments: args, repaired: true };
             }
-            // Even if we cannot parse args, the function name is usable;
-            // emit empty args rather than dropping the call entirely.
+            // Probe (3): emit empty args so the call isn't silently
+            // dropped when only the name is recoverable.
             return { name: nm[1], arguments: {}, repaired: true };
           }
           return null;
+        }
+
+        // Coerce a `<parameter=K>VALUE</parameter>` body. Strings that
+        // parse as JSON (numbers, booleans, null, objects, arrays)
+        // become typed values; everything else stays as a string.
+        function coerceParamValue(s: string): any {
+          if (s === "") return "";
+          if (s === "true" || s === "false" || s === "null") return JSON.parse(s);
+          if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(s)) {
+            const n = Number(s);
+            if (Number.isFinite(n)) return n;
+          }
+          // Object/array literal — try a strict parse; on fail keep raw.
+          if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            try { return JSON.parse(s); } catch {}
+          }
+          return s;
         }
 
         // Best-effort balanced-brace JSON extraction. Returns the parsed
@@ -1915,10 +2209,10 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       } else {
-                        // No tool calls — flush accumulated content
                         if (accumulated) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -1927,7 +2221,8 @@ async function serve(port: number) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         })}\n\n`));
                       }
                     } else {
@@ -1935,7 +2230,7 @@ async function serve(port: number) {
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
                         choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: msg.prefill_tokens + completionTokens } },
+                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
@@ -1987,9 +2282,16 @@ async function serve(port: number) {
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
           safeRelease();
+          let status = 500;
+          const err = daemonError.toLowerCase();
+          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
+          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
+            || err.includes("image dimensions") || err.includes("failed to decode base64")
+            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
+            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
-            { status: 400 }
+            { status }
           );
         }
 
@@ -2000,12 +2302,20 @@ async function serve(port: number) {
         // intact in message.content for clients that want a single-string
         // representation including reasoning. <|im_end|> stripping always
         // applies (it would break clients that re-encode message history).
+        const strippedContent = content;
         if (preserveThinking) {
           content = content.replace(/<\|im_end\|>/g, "").trim();
         } else {
           content = content.replace(/<think>[\s\S]*?<\/think>\s*/g, "")
             .replace(/<think>[\s\S]*$/, "") // unclosed think block
             .replace(/<\|im_end\|>/g, "").trim();
+        }
+
+        // Diagnostic: detect empty-after-unclosed-think-strip.
+        let thinkWarning: string | null = null;
+        if (!content && completionTokens > 0 && strippedContent.includes("<think>")) {
+          thinkWarning = "empty after unclosed think strip";
+          console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
         // Check for tool calls in response
@@ -2018,11 +2328,15 @@ async function serve(port: number) {
         }
 
         safeRelease();
-        return Response.json({
+        const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
           usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
-        });
+        };
+        if (thinkWarning) {
+          responseBody.x_hipfire_warning = thinkWarning;
+        }
+        return Response.json(responseBody);
       } catch (err: any) {
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
@@ -2046,6 +2360,15 @@ function findQuantizeBinary(): string | null {
     join(HIPFIRE_DIR, "bin", `hipfire-quantize${exe}`),
   ];
   return candidates.find(p => existsSync(p)) || null;
+}
+
+function findTriAttnValidateBinary(): string | null {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  // Dev: workspace root/target/release/examples/
+  const devCandidates = [resolve(__dirname, `../target/release/examples/triattn_validate${exe}`)];
+  // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
+  const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
+  return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
 }
 
 interface QuantizeOpts {
@@ -2374,7 +2697,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
@@ -3165,6 +3488,10 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "Budget for reasoning inside <think>...</think> (0 = unlimited). Truncates if exceeded.",
       range: [0, 32768], step: 128,
     },
+    host: {
+      label: "host",
+      desc: "listen address for `hipfire serve` (examples: 127.0.0.1, 0.0.0.0, ::1)",
+    },
     port: {
       label: "port",
       desc: "HTTP port for `hipfire serve` (OpenAI-compatible API)",
@@ -3865,36 +4192,91 @@ function listConfig(cfg: HipfireConfig): void {
   console.log(`Reset:       hipfire config reset [key]`);
 }
 
+// ─── Shared helpers ─────────────────────────────────────
+
+/** Find a binary in PATH or known extra directories. Returns absolute path or null.**/
+function findDep(binary: string, extraDirs: string[]): string | null {
+  // 1. Already in PATH (use `which` to avoid shell interpolation)
+  const inPath = Bun.spawnSync(["which", binary], { stdout: "pipe", stderr: "pipe" });
+  const found = (inPath.stdout?.toString() ?? "").trim();
+  if (inPath.exitCode === 0 && found) return found;
+  // 2. Distro-specific known locations
+  for (const dir of extraDirs) {
+    const path = join(dir, binary);
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
   case "serve": {
-    // Parse flags: `hipfire serve [port] [-d|--detach]`. Port can be anywhere.
+    // Parse flags: `hipfire serve [host] [port] [-d|--detach]`.
+    // Also accepts `host:port`, e.g. `hipfire serve 0.0.0.0:11435`.
     let port: number | null = null;
+    let host: string | null = null;
     let detach = false;
+    const setPort = (raw: string) => {
+      const n = parseInt(raw, 10);
+      if (!Number.isInteger(n) || n < 1 || n > 65535) {
+        console.error(`Invalid serve port: ${raw}`);
+        process.exit(1);
+      }
+      if (port !== null && port !== n) {
+        console.error(`Serve port specified more than once: ${port} and ${n}`);
+        process.exit(1);
+      }
+      port = n;
+    };
+    const setHost = (raw: string) => {
+      if (!raw) {
+        console.error("Serve host cannot be empty");
+        process.exit(1);
+      }
+      if (host !== null && host !== raw) {
+        console.error(`Serve host specified more than once: ${host} and ${raw}`);
+        process.exit(1);
+      }
+      host = raw;
+    };
     for (const a of rest) {
       if (a === "-d" || a === "--detach" || a === "--background") detach = true;
-      else if (/^\d+$/.test(a)) port = parseInt(a, 10);
+      else if (/^\d+$/.test(a)) setPort(a);
+      else if (/^\[[^\]]+\]:\d+$/.test(a)) {
+        const m = a.match(/^\[([^\]]+)\]:(\d+)$/)!;
+        setHost(m[1]);
+        setPort(m[2]);
+      }
+      else if (/^[^:]+:\d+$/.test(a)) {
+        const idx = a.lastIndexOf(":");
+        setHost(a.slice(0, idx));
+        setPort(a.slice(idx + 1));
+      }
       else if (a === "-h" || a === "--help") {
-        console.error(`Usage: hipfire serve [port] [-d|--detach]\n\n`
+        console.error(`Usage: hipfire serve [host] [port] [-d|--detach]\n\n`
+          + `  [host]     Bind address (default: cfg.host = ${cfg.host}; examples: 127.0.0.1, 0.0.0.0, ::1)\n`
           + `  [port]     HTTP port (default: cfg.port = ${cfg.port})\n`
+          + `  host:port  Shorthand bind address and port (example: 0.0.0.0:11435)\n`
           + `  -d, --detach   Fork to background; log to ${SERVE_LOG_FILE}, PID in ${SERVE_PID_FILE}\n\n`
           + `Background daemon:\n`
           + `  hipfire serve -d           # start in background\n`
+          + `  hipfire serve 0.0.0.0:11435 -d\n`
           + `  hipfire stop               # kill it\n`
           + `  hipfire ps                 # check if running\n`
           + `  tail -f ${SERVE_LOG_FILE}  # follow log\n`);
         process.exit(0);
-      } else { console.error(`Unknown serve arg: ${a}`); process.exit(1); }
+      } else setHost(a);
     }
+    host = host ?? cfg.host;
     port = port ?? cfg.port;
 
     if (detach) {
       // Refuse to start a second one.
       const existing = readServePid();
       if (existing) {
-        console.error(`hipfire serve already running (PID ${existing}) on port ${cfg.port}.`);
+        console.error(`hipfire serve already running (PID ${existing}) on port ${port}.`);
         console.error(`  Stop it: hipfire stop`);
         process.exit(1);
       }
@@ -3905,7 +4287,8 @@ switch (cmd) {
       const self = process.argv[0];
       const script = process.argv[1];
       const logFd = require("fs").openSync(SERVE_LOG_FILE, "a");
-      const child = Bun.spawn([...runBg, self, script, "serve", String(port)], {
+      const childArgs = ["serve", host, String(port)];
+      const child = Bun.spawn([...runBg, self, script, ...childArgs], {
         stdin: "ignore",
         stdout: logFd,
         stderr: logFd,
@@ -3921,15 +4304,16 @@ switch (cmd) {
       console.log(`Waiting for serve to become ready (up to ${READINESS_TIMEOUT_MS / 1000}s for first-run kernel JIT)...`);
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, 500));
-        if (await isServeUp(port)) break;
+        if (await isServeUp(port, host)) break;
         // Show progress every 30s
         const elapsed = Math.floor((Date.now() - (deadline - READINESS_TIMEOUT_MS)) / 1000);
         if (elapsed > 0 && elapsed % 30 === 0) {
           process.stderr.write(`  ...still starting (${elapsed}s — tail ${SERVE_LOG_FILE} to watch)\r`);
         }
       }
-      if (await isServeUp(port)) {
-        console.log(`hipfire serve started in background (PID ${child.pid}, port ${port})`);
+      if (await isServeUp(port, host)) {
+        const bind = formatServeBind(host, port);
+        console.log(`hipfire serve started in background (PID ${child.pid}, bind ${bind})`);
         console.log(`  log:  ${SERVE_LOG_FILE}`);
         console.log(`  stop: hipfire stop`);
       } else {
@@ -3938,7 +4322,7 @@ switch (cmd) {
       }
       break;
     }
-    await serve(port);
+    await serve(port, host);
     break;
   }
   case "stop": {
@@ -3968,13 +4352,15 @@ switch (cmd) {
   }
   case "run": {
     const model = rest[0];
-    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\""); process.exit(1); }
+    if (!model) { console.error("Usage: hipfire run <model> [flags] [prompt]\n\nFlags:\n  --temp <float>           Temperature (default 0.3)\n  --top-p <float>          Top-p sampling (default 0.8)\n  --repeat-penalty <float> Repeat penalty (default 1.05)\n  --max-tokens <int>       Max tokens to generate (default 512)\n  --image <path>           Image for VL models\n  --system <text>          System prompt (overrides per-model default)\n\nExamples:\n  hipfire run qwen3.5:9b \"Hello\"\n  hipfire run qwen3.5:9b --temp 0.7 --max-tokens 256 \"Write a poem\"\n  hipfire run qwen3.5:4b --image photo.png \"Describe this\"\n  hipfire run qwen3.5:9b --system \"You are terse.\" \"Summarize quantum mechanics\""); process.exit(1); }
     // Parse --key value flags
     const flagDefs: Record<string, { default: number | string | undefined }> = {
       "--image": { default: undefined }, "--temp": { default: 0.3 },
       "--top-p": { default: 0.8 }, "--repeat-penalty": { default: 1.05 },
       "--max-tokens": { default: 512 },
+      "--system": { default: undefined },
     };
+    const stringFlags = new Set(["--image", "--system"]);
     const flags: Record<string, string> = {};
     const flagIndices = new Set<number>();
     for (const key of Object.keys(flagDefs)) {
@@ -3984,7 +4370,7 @@ switch (cmd) {
         // Reject flag values that look like other flags
         if (val.startsWith("--")) { console.error(`Error: ${key} requires a value, got '${val}'`); process.exit(1); }
         // Validate numeric flags
-        if (key !== "--image" && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
+        if (!stringFlags.has(key) && isNaN(Number(val))) { console.error(`Error: ${key} requires a number, got '${val}'`); process.exit(1); }
         flags[key] = val;
         flagIndices.add(idx); flagIndices.add(idx + 1);
       } else if (idx >= 0) {
@@ -3992,6 +4378,7 @@ switch (cmd) {
       }
     }
     const image = flags["--image"];
+    const system = flags["--system"];
     const runCfg = resolveModelConfig(model);
     const temp = Number(flags["--temp"] ?? runCfg.temperature);
     const topP = Number(flags["--top-p"] ?? runCfg.top_p);
@@ -4003,7 +4390,7 @@ switch (cmd) {
     if (maxTokens < 1) { console.error("Error: --max-tokens must be >= 1"); process.exit(1); }
     const filtered = rest.slice(1).filter((_, i) => !flagIndices.has(i + 1));
     const prompt = filtered.join(" ") || (image ? "Describe this image." : "Hello");
-    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP);
+    await run(model, prompt, image, temp, maxTokens, repeatPenalty, topP, system);
     break;
   }
   case "chat": {
@@ -4104,16 +4491,18 @@ switch (cmd) {
       for (const e of g.entries) console.log(e);
     }
     // Show local serve port availability + detached PID (if any)
+    const host = cfg.host;
     const port = cfg.port;
     const portInUse = sh(`ss -tlnp 2>/dev/null | grep :${port}`);
     const detachedPid = readServePid();
+    const bind = formatServeBind(host, port);
     if (detachedPid) {
-      console.log(`\nserve port ${port}: ACTIVE (detached, PID ${detachedPid})`);
+      console.log(`\nserve ${bind}: ACTIVE (detached, PID ${detachedPid})`);
       console.log(`  stop: hipfire stop    |    log: tail -f ${SERVE_LOG_FILE}`);
     } else if (portInUse) {
-      console.log(`\nserve port ${port}: ACTIVE (foreground)`);
+      console.log(`\nserve ${bind}: ACTIVE (foreground)`);
     } else {
-      console.log(`\nserve port ${port}: free`);
+      console.log(`\nserve ${bind}: free`);
     }
     break;
   }
@@ -4141,18 +4530,6 @@ switch (cmd) {
     // interactive shell loads those bindirs via profile snippets. We probe
     // well-known locations, augment process.env.PATH with any found dirs,
     // and error fast with an install hint if a required dep is missing.
-    const findDep = (binary: string, extraDirs: string[]): string | null => {
-      // 1. Already in PATH
-      const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
-      const found = (inPath.stdout?.toString() ?? "").trim();
-      if (inPath.exitCode === 0 && found) return found;
-      // 2. Distro-specific known locations
-      for (const dir of extraDirs) {
-        const path = join(dir, binary);
-        if (existsSync(path)) return path;
-      }
-      return null;
-    };
     const depsNeeded = [
       { name: "git",   dirs: ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"],
         hint: "Install git via your distro's package manager." },
@@ -4281,7 +4658,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "engine"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4291,7 +4668,7 @@ switch (cmd) {
       console.error("  daemon binary was NOT rebuilt.");
       console.error("");
       console.error("  To diagnose:  hipfire diag");
-      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p engine --example daemon");
+      console.error("  To retry:     cd ~/.hipfire/src && cargo build --release --features deltanet -p hipfire-runtime --example daemon");
       process.exit(1);
     }
     // Build the CPU quantizer binary too so `hipfire quantize` works out of the box.
@@ -4304,7 +4681,7 @@ switch (cmd) {
     }
     // Recopy binaries
     // Example binaries live under target/release/examples/
-    for (const bin of ["daemon", "infer", "run"]) {
+    for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -4477,7 +4854,9 @@ switch (cmd) {
     // ── 4. Daemon binary + models ──────────────────────────
     console.log("");
     const exe2 = process.platform === "win32" ? ".exe" : "";
+    const envBin2 = process.env.HIPFIRE_DAEMON_BIN;
     const daemonBins = [
+      ...(envBin2 ? [envBin2] : []),
       resolve(__dirname, `../target/release/examples/daemon${exe2}`),
       join(HIPFIRE_DIR, "bin", `daemon${exe2}`),
     ];
@@ -4764,6 +5143,182 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     });
     break;
   }
+  case "sidecar-gen": {
+    const tag = rest[0];
+    if (!tag || tag === "-h" || tag === "--help") {
+      console.error(`Usage: hipfire sidecar-gen <model> [flags]
+
+Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
+The sidecar enables automatic KV-cache eviction and is required for CASK
+generation on large-context models (e.g. 27B with >16K max_position_embeddings).
+
+The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
+so the daemon auto-discovers it.
+
+Model:
+  hipfire sidecar-gen qwen3.5:9b              # use a local model by tag
+  hipfire sidecar-gen ~/.hipfire/models/...    # or pass a direct path
+
+Flags:
+  --corpus PATH          Path to a text file for calibration corpus (default: builtin seed prompts)
+  --max-tokens N         Max tokens to process during calibration (default: 4000)
+  --chunk-len N          Chunk length in tokens (default: 256)
+  --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
+  --cpu-calib            Force CPU calibration path
+  -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
+  --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
+
+Examples:
+  hipfire sidecar-gen qwen3.5:9b
+  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
+      process.exit(tag ? 0 : 1);
+    }
+    let corpusPath: string | undefined;
+    let maxTokens = 4000;
+    let chunkLen = 256;
+    let gpuCalib = true; // GPU calibration is default (Phase 2, 2026-04-28)
+    let output: string | undefined;
+    let skipValidation = false; // sidecar generation doesn't need Phase 2 validation
+    for (let i = 1; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--corpus") {
+        corpusPath = rest[++i];
+        if (!corpusPath) { console.error("--corpus requires a value"); process.exit(1); }
+      } else if (a === "--max-tokens") {
+        maxTokens = parseInt(rest[++i]);
+        if (isNaN(maxTokens) || maxTokens < 1 || maxTokens > 1_000_000) { console.error("--max-tokens must be between 1 and 1,000,000"); process.exit(1); }
+      } else if (a === "--chunk-len") {
+        chunkLen = parseInt(rest[++i]);
+        if (isNaN(chunkLen) || chunkLen < 1 || chunkLen > 16384) { console.error("--chunk-len must be between 1 and 16,384"); process.exit(1); }
+      } else if (a === "--gpu-calib") {
+        gpuCalib = true;
+      } else if (a === "--cpu-calib") {
+        gpuCalib = false;
+      } else if (a === "-o" || a === "--output") {
+        output = rest[++i];
+        if (!output) { console.error("--output requires a value"); process.exit(1); }
+      } else if (a === "--skip-validation") {
+        skipValidation = true;
+      } else {
+        console.error(`Unknown argument: ${a}\nRun 'hipfire sidecar-gen --help' for usage.`);
+        process.exit(1);
+      }
+    }
+
+    // Resolve model — same resolution as other commands (tag → local path).
+    let resolved = findModel(tag);
+    if (!resolved) {
+      console.error(`Model not found: ${tag}`);
+      console.error("Run 'hipfire list' to see available models.");
+      process.exit(1);
+    }
+
+    // Determine output path — default is <model>.triattn.bin next to the model file.
+    const sidecarPath = output ?? `${resolved}.triattn.bin`;
+
+    console.error(`Generating TriAttention calibration sidecar for: ${tag}`);
+    console.error(`  Model:        ${resolved}`);
+    console.error(`  Output:       ${sidecarPath}`);
+    console.error(`  Max tokens:   ${maxTokens}`);
+    console.error(`  Chunk len:    ${chunkLen}`);
+    console.error(`  Calibration:  ${gpuCalib ? "GPU" : "CPU"}`);
+
+    // Find triattn_validate binary — from installed location or fall back to cargo run.
+    const bin = findTriAttnValidateBinary();
+    if (bin) {
+      // Binary is available directly (installed). Run it synchronously.
+      console.error(`  Using: ${bin}`);
+      const args = [resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync([bin, ...args], { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    } else {
+      // No installed binary — fall back to cargo run --example.
+      // This has cold-start overhead from compilation if not already built.
+      // Try the development source first, then ~/.hipfire/src (installed via update).
+      const devSrc = resolve(__dirname, "../crates/hipfire-runtime/examples/triattn_validate.rs");
+      const hipfireSrc = join(HIPFIRE_DIR, "src/crates/hipfire-runtime/examples/triattn_validate.rs");
+      const srcExists = existsSync(devSrc) || existsSync(hipfireSrc);
+
+      if (!srcExists) {
+        console.error("triattn_validate binary not found and source not available.");
+        console.error("  Build: cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate");
+        console.error("  Or update: hipfire update (which builds the example during rebuild)");
+        process.exit(1);
+      }
+
+      // Determine if we should use the dev checkout or the installed source.
+      // Build from the workspace root so Cargo writes the example under
+      // <workspace>/target/release/examples/, matching the binPath below.
+      const workspaceRoot = existsSync(devSrc) ? resolve(__dirname, "..") : join(HIPFIRE_DIR, "src");
+      if (!existsSync(join(workspaceRoot, "Cargo.toml"))) {
+        console.error(`Could not find hipfire workspace root at ${workspaceRoot}`);
+        process.exit(1);
+      }
+      console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
+
+      // Parse deps for PATH augmentation (same as update command does).
+      // findDep is defined at module level above.
+      const depsNeeded = ["cargo", "hipcc"];
+      const augmentDirs = new Set<string>();
+      for (const dep of depsNeeded) {
+        const extraDirs = dep === "cargo"
+          ? [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"]
+          : ["/opt/rocm/bin", "/opt/rocm-6.0.0/bin", "/opt/rocm-5.7.0/bin", "/usr/bin"];
+        const p = findDep(dep, extraDirs);
+        if (p) augmentDirs.add(p.substring(0, p.lastIndexOf("/")));
+      }
+      // Also add bun dir for its subtree helpers.
+      const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
+      if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
+      if (augmentDirs.size) {
+        const curr = (process.env.PATH || "").split(":").filter(Boolean);
+        const fresh = [...augmentDirs].filter(d => !curr.includes(d));
+        if (fresh.length) process.env.PATH = [...fresh, ...curr].join(":");
+      }
+
+      // Build the example first.
+      console.error("Building triattn_validate...");
+      const build = Bun.spawnSync(
+        ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triattn_validate"],
+        { cwd: workspaceRoot, stdio: ["inherit", "inherit", "inherit"] },
+      );
+      if (build.exitCode !== 0) {
+        console.error("Failed to build triattn_validate. Check for ROCm/compilation errors above.");
+        process.exit(1);
+      }
+
+      // Run the built example — bin is at workspace_root/target/release/examples/triattn_validate
+      const exe = process.platform === "win32" ? ".exe" : "";
+      const binPath = join(workspaceRoot, `target/release/examples/triattn_validate${exe}`);
+      console.error("  Running triattn_validate...");
+      const args = [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    }
+
+    // Verify the output file exists.
+    if (!existsSync(sidecarPath)) {
+      console.error(`Output file not found: ${sidecarPath}`);
+      process.exit(1);
+    }
+    const sz = (statSync(sidecarPath).size / 1e6).toFixed(1);
+    console.error("\nDone. Sidecar saved:");
+    console.error(`  ${sidecarPath} (${sz} MB)`);
+    break;
+  }
   case "config": {
     // `hipfire config`                                  → global TUI
     // `hipfire config list|get|set|reset [...]`          → global scripting
@@ -4897,6 +5452,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
           max_seq: "KV cache capacity (tokens). Integer 512-524288",
           thinking: "one of: on, off. Controls whether the model reasons in <think> blocks.",
           max_think_tokens: "integer 0-32768. Budget for reasoning tokens (0 = unlimited).",
+          host: "non-empty bind address without whitespace (examples: 127.0.0.1, 0.0.0.0, ::1)",
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
@@ -5032,7 +5588,8 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
 
   pull <model>          Download model from HuggingFace
   run <model> [prompt]  Generate text (auto-pulls; uses running serve if any)
-  serve [port] [-d]     Start OpenAI-compatible server (-d = background daemon)
+  serve [host] [port] [-d]
+                        Start OpenAI-compatible server (-d = background daemon)
   stop                  Stop the background serve daemon
   quantize <hf-id|dir>  Quantize to MQ4/MQ6 (CPU) — with optional HF upload
   bench <model> [opts]  Benchmark tok/s (--exp for RDNA2 variant sweep, --runs N)
@@ -5042,6 +5599,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):

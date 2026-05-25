@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 
 // Batched Q8_0 GEMM: Y[batch, M] = X[batch, K] @ W[M, K]^T where W is Q8_0
@@ -22,7 +26,7 @@
 // the per-batch slice of the output equals what the per-row GEMV would
 // produce — preserves greedy parity for spec decode.
 
-#define MAX_BATCH 16
+#define MAX_BATCH 64
 
 extern "C" __global__ void gemm_q8_0_batched(
     const unsigned char* __restrict__ A_q8,  // [M, K/32 * 34] packed Q8_0

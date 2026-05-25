@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kevin Read
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # gfx906 wave64 FP16 hybrid vs wave32 fallback: logit divergence test.
 #
 # Addresses PR #127 review point 2: the coherence gate hard-fails only on

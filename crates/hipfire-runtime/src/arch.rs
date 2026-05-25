@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! The bring-up contract for a hipfire architecture. Implement this
 //! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
 //! model into the runtime. Generation, sampling, eviction, spec
@@ -128,7 +132,7 @@ pub trait Architecture: Send + 'static {
     /// (lazy load + LRU eviction for >VRAM models) is wired through
     /// `WeightTensor` and is not arch-specific.
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String>;

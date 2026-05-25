@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! End-to-end prune demo for TriAttention (arXiv:2604.04921 §4.3).
 //!
 //! Populates a Q8_0 K-cache with synthetic data, runs `triattn_score_q8`

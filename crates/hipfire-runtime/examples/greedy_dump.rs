@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Pure greedy token dump for byte-exact regression comparison.
 
 #[cfg(not(feature = "deltanet"))]
@@ -27,7 +31,7 @@ fn main() {
     let mode = std::env::var("PROMPT_MODE").unwrap_or_else(|_| "thinking".to_string());
     eprintln!("greedy_dump: {model_path} mode={mode}");
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
@@ -60,7 +64,7 @@ fn main() {
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = 2048usize;
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());

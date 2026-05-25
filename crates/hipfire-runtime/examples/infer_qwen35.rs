@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen3.5 (DeltaNet) inference — matches ollama quality settings.
 //! Usage: infer_qwen35 <model.hfq> [--guards on|off] [prompt text...]
 //!
@@ -71,12 +75,12 @@ fn main() {
         eprintln!("Guards: ON (prompt_frame + sampler + eos_filter + loop_guard)");
     }
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
     eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
 
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .unwrap_or_else(|| {
+        .unwrap_or_else(|_| {
             let gguf = hipfire_runtime::gguf::GgufFile::open(Path::new("/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf")).expect("need GGUF for tokenizer");
             hipfire_runtime::tokenizer::Tokenizer::from_gguf(&gguf).expect("tokenizer failed")
         });
@@ -130,7 +134,7 @@ fn main() {
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());

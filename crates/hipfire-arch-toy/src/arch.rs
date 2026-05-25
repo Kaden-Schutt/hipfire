@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `Architecture` trait impl for the toy arch — minimum-viable reference.
 //!
 //! This file is the *shape* a new arch's `arch.rs` should take: a
@@ -55,7 +59,7 @@ impl Architecture for Toy {
     /// The weight pager (lazy-load + LRU eviction) is wired through
     /// `WeightTensor` and is not arch-specific.
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         _gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {

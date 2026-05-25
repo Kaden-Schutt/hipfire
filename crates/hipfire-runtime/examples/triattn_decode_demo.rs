@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention end-to-end decode sanity check.
 //!
 //! 1. Load Qwen3.5-9B with Q8 KV.
@@ -37,7 +41,7 @@ fn main() {
     let prompt = "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one. Drawing on his reading of Montesquieu, Hume, and his own experiences in the Virginia legislature, Madison argued that factions were inevitable in a free society and that the only way to control them was to extend the sphere of the republic. By enlarging the territory and population, the influence of any single faction would be diluted because the larger the society, the more varied the interests and passions of its members. This diversity, Madison reasoned, made it harder for a single faction to gain a majority large enough to tyrannize the minority. The paper was written in November 1787 and published under the pseudonym Publius. It stands today as one of the most important works of political philosophy in American history. The core insight";
 
     // ── Model + centers ────────────────────────────────────────────────
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(sidecar_path)).expect("load sidecar");
@@ -55,7 +59,7 @@ fn main() {
     eprintln!("budget={budget} prefill={prefill_len} gen={gen_len}");
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let kv_seq = 512usize;
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");

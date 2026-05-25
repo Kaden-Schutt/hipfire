@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Time HFQ4 vs HFQ6 WMMA GEMM at prefill-realistic sizes.
 //! Same matrix shape, same X — just different weight format.
 

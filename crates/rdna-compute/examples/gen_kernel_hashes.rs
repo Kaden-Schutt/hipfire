@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Generate .hash sidecar files for pre-compiled kernel blobs.
 //! Reads kernel sources from kernels/src/*.hip and hashes them with
 //! the same DefaultHasher(source + arch) algorithm as compiler.rs.
@@ -39,6 +43,14 @@ fn main() {
                 let module_name = format!("gemv_hfq4g256_rdna2v{v_num}");
                 let raw_source = std::fs::read_to_string(&path).unwrap();
                 rdna2_variant_sources.push((module_name, raw_source));
+                continue;
+            }
+            // gfx906-specific dp4a MMQ kernel: hash for gfx906 only.
+            // The file is not a variant override (no `.gfxNNN.` infix); it's a
+            // distinct kernel only built and dispatched on gfx906.
+            if stem == "gemm_hfq4g256_residual_mmq_gfx906" {
+                let raw_source = std::fs::read_to_string(&path).unwrap();
+                kernel_sources.push((stem.to_string(), raw_source));
                 continue;
             }
             if stem.contains("gfx") {

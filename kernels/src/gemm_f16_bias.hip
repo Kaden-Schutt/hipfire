@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 nickfinease
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 

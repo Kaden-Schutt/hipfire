@@ -82,11 +82,23 @@ Decode tok/s, default config:
 | RDNA2 (gfx1030) | V620 Pro, RX 6800 XT | 250 | — | 65 | 22 |
 | RDNA1 (gfx1010) | RX 5700 XT | 190 | 61 | 43 (HF4) | OOM |
 | APU (gfx1013) | BC-250 | 207 | 77 | 47 | OOM |
+| GCN5 (gfx906) | MI50 / MI60 | 231 | 61 | 59 | 21 |
 | MI300X (gfx942) | datacenter | 850 | 480 | 320 | 130 |
 
 MI300X is wave64 + MFMA — different kernel family. RDNA4 (gfx1200 /
 gfx1201) ships a dispatch fallback to dot2 today; per-arch WMMA
-kernels are in progress (issue #54).
+kernels are in progress (issue #54). gfx906 (Vega 20) uses the
+nwarps=4 dp4a MMQ kernel for prefill at batch≥16
+(`docs/plans/gfx906-mmq-prd.md`). Decode at batch=1 uses two
+gfx906-specific optimizations from the 2026-05-05 perf
+investigation
+(`docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md`):
+the residual-GEMV runs a software-pipelined ILP-injection variant
+(+4.8% on 9B), and the three fused projections (`gate_up`, `qkv`,
+`qkvza`) pre-quantize x to Q8_1 and use `v_dot4_i32_i8` (+9.3% on
+9B). Combined: 50.7 → 58.9 tok/s (+16.2%) on Qwen 3.5 9B. Stock
+llama.cpp Q4_K_M on the same hardware: 61.55 tok/s (1.04× ahead),
+skyne98/iacopPBK fork: 63.48 (1.08× ahead).
 
 ## Reproducing
 

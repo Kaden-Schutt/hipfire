@@ -40,11 +40,12 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "deltanet"]
 deltanet = ["rdna-compute/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
+arch-qwen2 = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
@@ -53,8 +54,31 @@ memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+base64 = "0.22"
 libc = "0.2"
 rayon = "1"
+# GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
+# (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
+# then BPE each chunk independently; without that step the merge PQ runs
+# on the whole prompt as one problem and goes O(N log N) with a huge
+# constant from cross-word merges + stale-entry churn. PR #230 fixed
+# per-iteration costs but not the algorithmic shape — this regex restores
+# the canonical chunking.
+regex = "1"
+# Renders the upstream HF chat_template (Jinja) when present in
+# .hfq metadata, so prompt framing matches what the model was
+# trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`
+# scaffolding when the template is absent or fails to render.
+# `json` enables the `tojson` filter — Qwen3.5/3.6 + Gemma 4 tool-rendering
+# branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
+# inside the system block; without it, tool-using turns die at render time
+# (caught by jinja_smoke scenario C, 2026-05-09).
+minijinja = { version = "2", features = ["loop_controls", "json"] }
+# `pycompat` ships an unknown-method callback that makes Python
+# str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
+# work on plain Jinja values — required by the Qwen3 family
+# template which uses these throughout.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
 
 # Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -68,6 +92,9 @@ rayon = "1"
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-detect = { path = "../hipfire-detect" }
+hipfire-atlas = { path = "../hipfire-atlas" }
 
 # Each example below carries `required-features` listing the cargo
 # features its `use hipfire_arch_*` imports depend on. This documents
@@ -80,7 +107,15 @@ hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2"]
+
+[[example]]
+name = "coherence_probe"
+required-features = []
+
+[[example]]
+name = "gpus_smoke"
+required-features = []
 
 [[example]]
 name = "infer_qwen35"
@@ -139,6 +174,10 @@ name = "dump_logits_qwen35"
 required-features = ["arch-qwen35"]
 
 [[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
 name = "greedy_dump"
 required-features = ["arch-qwen35"]
 
@@ -157,6 +196,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "pflash_load_demo"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "perplexity"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "pflash_niah_bench"
@@ -185,6 +228,10 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "profile_qwen35_mq4"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_prefill_qwen35"
+required-features = ["arch-qwen35", "deltanet"]
 
 [[example]]
 name = "test_inference"
@@ -229,3 +276,78 @@ required-features = ["arch-qwen35"]
 [[example]]
 name = "triattn_validate"
 required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity_chatml"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
+required-features = ["arch-qwen35", "deltanet"]
+
+# build_kld_ref needs no GPU / arch features — it just orchestrates
+# llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
+[[example]]
+name = "build_kld_ref"
+required-features = []
+
+[[example]]
+name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
+# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
+# eval_hipfire, but the forward path goes through
+# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
+# the qwen35 arch. Per-token scoring only — llama-arch
+# `forward_prefill_batch` doesn't expose the hidden-state capture hook
+# that eval_hipfire's prefill mode relies on.
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
+# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
+# No GPU / arch features needed (tokenizer is pure CPU).
+[[example]]
+name = "tokenize_slice"
+required-features = []
+
+# eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "eval_gguf"
+required-features = []
+
+# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
+# llama-imatrix for the activation-weighted-LS calibration pipeline.
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "imatrix_collect"
+required-features = []
+
+# ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
+#
+# `collect_imatrix` and `collect_hessian` are the hipfire-native
+# replacements for the Tier 2 wrappers above. Both currently ship as
+# `unimplemented!()` scaffolds — argument parsing + module docs only —
+# so that the workspace compiles cleanly while follow-on subagent
+# tasks build the forward pass, on-GPU activation/Hessian reductions,
+# and the GGUF/HFHS-v1 writers on top.
+#
+# Stdlib only at this stage; no GPU / arch features required for the
+# scaffold itself. When the forward pass lands these bins will pick up
+# `required-features = ["arch-qwen35", "arch-llama"]` (or whichever
+# arches the Tier 1 path supports).
+[[bin]]
+name = "collect_imatrix"
+path = "src/bin/collect_imatrix.rs"
+required-features = []
+
+[[bin]]
+name = "collect_hessian"
+path = "src/bin/collect_hessian.rs"
+required-features = []

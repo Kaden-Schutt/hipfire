@@ -7,15 +7,16 @@ before contributing kernels or dispatch changes.
 
 ```
 crates/
-├── engine/             model loaders, forward pass, KV cache, DeltaNet state
+├── hipfire-runtime/    inference orchestrator, KV cache, sampler, loaders
+├── hipfire-arch-*/     per-family forward pass (qwen35, llama, qwen35-vl, etc.)
 ├── rdna-compute/       kernel dispatch, hipGraph capture, JIT loader
 ├── hip-bridge/         safe Rust FFI over libamdhip64.so
 ├── hipfire-quantize/   CPU-side safetensors / GGUF → .mq4 / .hf4 encoder
 └── redline/            direct-KMD dispatch research (future, skips HIP)
 ```
 
-`engine` depends on `rdna-compute`. `rdna-compute` depends on
-`hip-bridge`. `hipfire-quantize` is standalone (no GPU deps) so a CI
+`hipfire-runtime` depends on `rdna-compute` and the arch crates.
+`rdna-compute` depends on `hip-bridge`. `hipfire-quantize` is standalone (no GPU deps) so a CI
 node without ROCm can still build the quantizer.
 
 ## Request lifecycle
@@ -28,14 +29,14 @@ hipfire run qwen3.5:9b "..."
     ├── if running daemon detected → POST /v1/chat/completions
     └── else → spawn one-shot daemon binary
 
-  Daemon (crates/engine/examples/daemon.rs)
+  Daemon (crates/hipfire-runtime/examples/daemon.rs)
     ├── HfqFile::open(path)               # mmap, read header + tensor index
     ├── config_from_hfq                   # rebuild LlamaConfig / Qwen35Config
     ├── Tokenizer::from_hfq_metadata      # vocab, merges, BOS/EOS
     ├── load_weights / load_weights_hfq   # tensor → GPU upload
     └── for each token: prompt + sample loop
 
-  Forward pass (crates/engine/src/{llama,qwen35}.rs)
+  Forward pass (crates/hipfire-arch-*/src/*.rs)
     ├── per layer:
     │   ├── rmsnorm
     │   ├── (rotate_x_for_mq if MQ-quantized)
@@ -58,8 +59,8 @@ hipfire has two largely-independent model loaders:
 
 | Path | Files | Targets |
 |---|---|---|
-| `llama.rs` | `crates/engine/src/llama.rs` | Llama / Qwen3 / Mistral / generic dense |
-| `qwen35.rs` | `crates/engine/src/qwen35.rs` | Qwen 3.5 / 3.6 hybrid (DeltaNet + FullAttention) |
+| `llama.rs` | `crates/hipfire-runtime/src/llama.rs` | Llama / Qwen3 / Mistral / generic dense |
+| `qwen35.rs` | `crates/hipfire-arch-qwen35/src/qwen35.rs` | Qwen 3.5 / 3.6 hybrid (DeltaNet + FullAttention) |
 
 `config_from_hfq` (in `hfq.rs`) sniffs `architecture` in the model's
 metadata blob and dispatches to the right loader. The qwen35 path adds
@@ -152,11 +153,11 @@ The Qwen 3.5 config carries a `layer_types` array that decides which
 layers are linear vs full. A 1D causal conv across the time axis runs
 before the linear-attention update for local mixing. Per-head
 learnable decay + per-head per-token gate parameterize the state
-update; see `crates/engine/src/qwen35.rs` for the exact form.
+update; see `crates/hipfire-arch-qwen35/src/qwen35.rs` for the exact form.
 
 ## DFlash (speculative decode)
 
-`crates/engine/src/dflash.rs`. Target model + small same-family draft
+`crates/hipfire-arch-qwen35/src/dflash.rs`. Target model + small same-family draft
 model run in parallel; the draft proposes K tokens, the target
 verifies in one batched forward pass and accepts the longest
 correctly-predicted prefix. Average accepted-tokens-per-cycle (τ)
@@ -201,7 +202,7 @@ and any first-time arch transition.
 
 ## Where to start contributing
 
-- **A new arch port**: read `.skills/hipfire-arch-port/` first — it
+- **A new arch port**: read `.agents/skills/hipfire-arch-port/` first — it
   has the WMMA matrix, dispatch routing rules, validation gates, and
   the contributor onboarding workflow.
 - **A new kernel variant**: `kernels/src/<existing>.<chip>.hip` and
@@ -211,5 +212,5 @@ and any first-time arch transition.
   llama.cpp's `ggml-quants.c` into
   `crates/hipfire-quantize/src/gguf_input.rs`.
 - **A new model architecture** (Gemma, Mistral-NeMo, etc.): start
-  with `llama.rs` as the template; add the architecture string to
+  with `crates/hipfire-runtime/src/llama.rs` as the template; add the architecture string to
   `from_gguf` / `from_hfq` and any tensor-shape divergences.

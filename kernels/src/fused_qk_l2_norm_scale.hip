@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 
 // Fused L2-norm Q + L2-norm K + scale Q. Replaces the sequence

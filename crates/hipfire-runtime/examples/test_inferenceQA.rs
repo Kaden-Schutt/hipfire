@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #[cfg(not(feature = "deltanet"))]
 fn main() -> std::process::ExitCode {
     eprintln!("test_inferenceQA requires --features deltanet");
@@ -280,7 +284,7 @@ fn run_case(case_name: &str, model_path: Option<&Path>) -> ExitCode {
 
 #[cfg(feature = "deltanet")]
 fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
-    let hfq = HfqFile::open(model_path)
+    let mut hfq = HfqFile::open(model_path)
         .map_err(|e| CaseOutcome::Fail(format!("failed to open HFQ: {e}")))?;
     let model_label = classify_qwen35_candidate(&hfq)?;
     let config = qwen35::config_from_hfq(&hfq)
@@ -289,7 +293,7 @@ fn build_context(model_path: &Path) -> Result<Context, CaseOutcome> {
     let mut gpu = rdna_compute::Gpu::init()
         .map_err(|e| CaseOutcome::Skip(format!("GPU init unavailable: {e}")))?;
     let weights = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        qwen35::load_weights(&hfq, &config, &mut gpu)
+        qwen35::load_weights(&mut hfq, &config, &mut gpu)
     }))
     .map_err(|panic| CaseOutcome::Fail(format!("weight load panicked: {}", panic_message(panic))))?
     .map_err(|e| CaseOutcome::Fail(format!("failed to load weights: {e}")))?;
@@ -330,7 +334,7 @@ fn classify_qwen35_candidate(hfq: &HfqFile) -> Result<String, CaseOutcome> {
 
 #[cfg(feature = "deltanet")]
 fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
-    if let Some(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
+    if let Ok(tokenizer) = Tokenizer::from_hfq_metadata(&hfq.metadata_json) {
         return Ok((tokenizer, "hfq-metadata".to_string()));
     }
 
@@ -345,7 +349,7 @@ fn load_tokenizer(hfq: &HfqFile) -> Result<(Tokenizer, String), CaseOutcome> {
     let gguf = GgufFile::open(fallback)
         .map_err(|e| CaseOutcome::Skip(format!("failed to open fallback GGUF tokenizer: {e}")))?;
     let tokenizer = Tokenizer::from_gguf(&gguf)
-        .ok_or_else(|| CaseOutcome::Skip("failed to parse fallback GGUF tokenizer".to_string()))?;
+        .map_err(|e| CaseOutcome::Skip(format!("failed to parse fallback GGUF tokenizer: {e}")))?;
     Ok((tokenizer, format!("gguf:{}", fallback.display())))
 }
 

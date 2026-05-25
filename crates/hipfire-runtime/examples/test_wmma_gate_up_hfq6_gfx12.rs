@@ -1,10 +1,14 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA gate_up HFQ6 scaffold.
 //!
 //! Combines the hfq6 helpers from test_wmma_qkv_hfq6_gfx12 with the
 //! gate_up routing from test_wmma_gate_up_gfx12. Compares against the
 //! validated `gemm_gate_up_hfq6g256_dot2` reference.
 //!
-//! Run: cargo run --release --features deltanet -p engine \
+//! Run: cargo run --release --features deltanet -p hipfire-runtime \
 //!         --example test_wmma_gate_up_hfq6_gfx12
 
 use rdna_compute::{DType, Gpu};

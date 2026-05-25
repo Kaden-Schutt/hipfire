@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention long-context decode with *constant* KV memory footprint.
 //!
 //! Allocates `KvCache` at `max_seq = budget + beta + 2` — the minimum that
@@ -38,7 +42,7 @@ fn main() {
     // Stitch a long prompt. ~175 tokens; comfortably exceeds budget=64.
     let prompt = "James Madison wrote Federalist No. 10 arguing that a large republic would curb the effects of factions better than a small one. Drawing on his reading of Montesquieu, Hume, and his own experiences in the Virginia legislature, Madison argued that factions were inevitable in a free society and that the only way to control them was to extend the sphere of the republic. By enlarging the territory and population, the influence of any single faction would be diluted. The paper was written in November 1787 and published under the pseudonym Publius. Its core insight, often cited today, is";
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
     let centers = TriAttnCenters::load(Path::new(sidecar_path)).expect("load sidecar");
@@ -48,7 +52,7 @@ fn main() {
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
     let mut gpu = Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let prompt_tokens = tok.encode(prompt);
     let prompt_len = prompt_tokens.len();

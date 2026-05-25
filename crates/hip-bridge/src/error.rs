@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Error types for HIP runtime operations.
 
 use std::ffi::CStr;
@@ -8,6 +12,10 @@ pub type HipErrorCode = u32;
 
 /// HIP operation result.
 pub type HipResult<T> = Result<T, HipError>;
+
+pub const HIP_ERROR_PEER_ACCESS_UNSUPPORTED: HipErrorCode = 217;
+pub const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorCode = 704;
+pub const HIP_ERROR_PEER_ACCESS_NOT_ENABLED: HipErrorCode = 705;
 
 #[derive(Debug)]
 pub struct HipError {

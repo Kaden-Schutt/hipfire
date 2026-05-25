@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """
 dflash_train_poc.py — DFlash draft training loop, paper-aligned.
 

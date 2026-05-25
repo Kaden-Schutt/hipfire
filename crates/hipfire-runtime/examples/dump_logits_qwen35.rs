@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Dump prefill logits to a binary f32 file for path-divergence comparison.
 //!
 //! Single-purpose tool: runs ONE prefill pass on a deterministic fake prompt
@@ -47,12 +51,12 @@ fn main() {
         }
     }
 
-    let hfq = HfqFile::open(Path::new(model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("dump_logits_qwen35: arch={} prefill_len={}", gpu.arch, prefill_len);
 
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("load weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = (prefill_len + 16).max(512);
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());

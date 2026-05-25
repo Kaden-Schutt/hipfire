@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention reconstruction-correlation harness (arXiv:2604.04921, §3.3).
 //!
 //! 1. Run forward on a small calibration corpus, collecting pre-RoPE Q at
@@ -151,12 +155,12 @@ fn main() {
     }
 
     // ── Load model ─────────────────────────────────────────────────────
-    let hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
+    let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&hfq, &config, &mut gpu).expect("weights");
+    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("weights");
 
     let kv_seq = 512usize;
     let mut kv = KvCache::new_gpu_q8(
@@ -349,6 +353,12 @@ fn main() {
     for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
     for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
 
+    // Destroy any cached hipGraph from Phase 1. The TriAttn capture tap
+    // does synchronous D2H copies (gpu::download_f32) which are incompatible
+    // with hipGraph stream capture mode (hipErrorStreamCaptureImplicit).
+    // Keeping graph disabled via ar_forward_warmed_up reset avoids re-capture.
+    gpu.graph_destroy();
+
     let cap = TriAttnCapture::new(config.n_heads, config.n_kv_heads, config.head_dim);
     triattn::install_capture(cap);
 
@@ -356,6 +366,10 @@ fn main() {
     let val_len = val_tokens.len().min(kv_seq.saturating_sub(4));
     eprintln!("validation: {val_len} tokens");
     for (pos, tid) in val_tokens.iter().take(val_len).enumerate() {
+        // Reset warmup flag so forward_scratch stays on the warmup/direct
+        // path instead of attempting graph capture (which would fail on the
+        // D2H copy inside the TriAttn capture tap).
+        gpu.ar_forward_warmed_up = false;
         qwen35::forward_scratch(
             &mut gpu, &weights, &config, *tid, pos,
             &mut kv, &mut dn, &scratch,
@@ -370,73 +384,76 @@ fn main() {
     // the TriAttn scoring vs ground-truth Q·K dot products. Because we
     // want to cover short-to-long distances evenly the way the paper does,
     // we score against the LAST token's query.
-    let last = val_len - 1;
-    let p_q = last as f32;
-    let n_bands = config.head_dim / 2;
-    let d_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    // Skipped when val_len == 0 (e.g. --skip-validation).
+    if val_len > 0 {
+        let last = val_len - 1;
+        let p_q = last as f32;
+        let n_bands = config.head_dim / 2;
+        let d_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
-    // Map kv_head h_kv to the set of query heads sharing it.
-    let kv_group = config.n_heads / config.n_kv_heads;
+        // Map kv_head h_kv to the set of query heads sharing it.
+        let kv_group = config.n_heads / config.n_kv_heads;
 
-    let mut per_layer_r: Vec<f32> = Vec::new();
-    for (fa_pos, &layer_idx) in capture.layer_ids_per_token[last].iter().enumerate() {
-        // Ignore layers that aren't FA (those arrays are empty).
-        if capture.q_samples[last][fa_pos].is_empty() { continue; }
-        let q_last = &capture.q_samples[last][fa_pos];
-        assert_eq!(q_last.len(), config.n_heads * config.head_dim);
+        let mut per_layer_r: Vec<f32> = Vec::new();
+        for (fa_pos, &layer_idx) in capture.layer_ids_per_token[last].iter().enumerate() {
+            // Ignore layers that aren't FA (those arrays are empty).
+            if capture.q_samples[last][fa_pos].is_empty() { continue; }
+            let q_last = &capture.q_samples[last][fa_pos];
+            assert_eq!(q_last.len(), config.n_heads * config.head_dim);
 
-        let mut per_head_r = Vec::with_capacity(config.n_heads);
-        for h in 0..config.n_heads {
-            let h_kv = h / kv_group;
-            let q_head = &q_last[h * config.head_dim..(h + 1) * config.head_dim];
+            let mut per_head_r = Vec::with_capacity(config.n_heads);
+            for h in 0..config.n_heads {
+                let h_kv = h / kv_group;
+                let q_head = &q_last[h * config.head_dim..(h + 1) * config.head_dim];
 
-            // Post-RoPE Q for the last position.
-            let q_post = apply_rope(q_head, p_q, d_rot, config.rope_theta);
+                // Post-RoPE Q for the last position.
+                let q_post = apply_rope(q_head, p_q, d_rot, config.rope_theta);
 
-            let mut predicted = Vec::with_capacity(val_len);
-            let mut actual = Vec::with_capacity(val_len);
+                let mut predicted = Vec::with_capacity(val_len);
+                let mut actual = Vec::with_capacity(val_len);
 
-            for i in 0..val_len {
-                if capture.k_samples[i].is_empty() { continue; }
-                let k_row = &capture.k_samples[i][fa_pos];
-                if k_row.is_empty() { continue; }
-                let k_head = &k_row[h_kv * config.head_dim..(h_kv + 1) * config.head_dim];
+                for i in 0..val_len {
+                    if capture.k_samples[i].is_empty() { continue; }
+                    let k_row = &capture.k_samples[i][fa_pos];
+                    if k_row.is_empty() { continue; }
+                    let k_head = &k_row[h_kv * config.head_dim..(h_kv + 1) * config.head_dim];
 
-                // Ground truth: dot product of post-RoPE Q and post-RoPE K
-                // (standard attention, no softmax — softmax is monotonic
-                // so correlation of logits ≈ correlation of softmaxed).
-                let k_post = apply_rope(k_head, i as f32, d_rot, config.rope_theta);
-                let mut dot = 0.0f32;
-                for d in 0..config.head_dim { dot += q_post[d] * k_post[d]; }
-                actual.push(dot);
+                    // Ground truth: dot product of post-RoPE Q and post-RoPE K
+                    // (standard attention, no softmax — softmax is monotonic
+                    // so correlation of logits ≈ correlation of softmaxed).
+                    let k_post = apply_rope(k_head, i as f32, d_rot, config.rope_theta);
+                    let mut dot = 0.0f32;
+                    for d in 0..config.head_dim { dot += q_post[d] * k_post[d]; }
+                    actual.push(dot);
 
-                // TriAttn prediction (post-RoPE path, uses stored post-RoPE K).
-                let centers_slice = center_slice(&centers, layer_idx, h);
-                let k_post_bands = triattn::kpost_per_band(&k_post);
-                let s = triattn::s_total(centers_slice, &k_post_bands, p_q, |f| centers.omega(f));
-                predicted.push(s);
+                    // TriAttn prediction (post-RoPE path, uses stored post-RoPE K).
+                    let centers_slice = center_slice(&centers, layer_idx, h);
+                    let k_post_bands = triattn::kpost_per_band(&k_post);
+                    let s = triattn::s_total(centers_slice, &k_post_bands, p_q, |f| centers.omega(f));
+                    predicted.push(s);
+                }
+
+                let r = triattn::pearson(&actual, &predicted);
+                per_head_r.push(r);
             }
 
-            let r = triattn::pearson(&actual, &predicted);
-            per_head_r.push(r);
+            let mean_r: f32 = per_head_r.iter().sum::<f32>() / per_head_r.len() as f32;
+            let (min_r, max_r) = per_head_r.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &r| (lo.min(r), hi.max(r)));
+            let pct_above_05 = per_head_r.iter().filter(|&&r| r > 0.5).count() as f32 * 100.0 / per_head_r.len() as f32;
+            eprintln!(
+                "layer {layer_idx:2}: r̄={mean_r:.3}  [{min_r:.3}, {max_r:.3}]  {pct_above_05:.0}% of heads > 0.5",
+            );
+            per_layer_r.push(mean_r);
         }
 
-        let mean_r: f32 = per_head_r.iter().sum::<f32>() / per_head_r.len() as f32;
-        let (min_r, max_r) = per_head_r.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &r| (lo.min(r), hi.max(r)));
-        let pct_above_05 = per_head_r.iter().filter(|&&r| r > 0.5).count() as f32 * 100.0 / per_head_r.len() as f32;
-        eprintln!(
-            "layer {layer_idx:2}: r̄={mean_r:.3}  [{min_r:.3}, {max_r:.3}]  {pct_above_05:.0}% of heads > 0.5",
-        );
-        per_layer_r.push(mean_r);
-    }
-
-    if !per_layer_r.is_empty() {
-        let overall: f32 = per_layer_r.iter().sum::<f32>() / per_layer_r.len() as f32;
-        eprintln!("\n=== overall mean r̄ across FA layers: {overall:.3} ===");
-        eprintln!("paper target: ≈0.5 (Figure 3 mean), per-head 0.6-0.9 common; calibration corpus is tiny here");
-        eprintln!("note: r̄ plateaus by ~20k calibration tokens under running-mean aggregation — more data does NOT improve r̄ past that point. r̄ is also validation-prompt-dependent; for sidecar quality decisions, validate against a downstream long-context recall test rather than this number alone.");
-        if using_builtin_corpus && default_val_prompt {
-            eprintln!("⚠ r̄ above is CONTAMINATED by corpus/val-prompt overlap (see warning at startup). Do not compare this number against runs with a disjoint corpus.");
+        if !per_layer_r.is_empty() {
+            let overall: f32 = per_layer_r.iter().sum::<f32>() / per_layer_r.len() as f32;
+            eprintln!("\n=== overall mean r̄ across FA layers: {overall:.3} ===");
+            eprintln!("paper target: ≈0.5 (Figure 3 mean), per-head 0.6-0.9 common; calibration corpus is tiny here");
+            eprintln!("note: r̄ plateaus by ~20k calibration tokens under running-mean aggregation — more data does NOT improve r̄ past that point. r̄ is also validation-prompt-dependent; for sidecar quality decisions, validate against a downstream long-context recall test rather than this number alone.");
+            if using_builtin_corpus && default_val_prompt {
+                eprintln!("⚠ r̄ above is CONTAMINATED by corpus/val-prompt overlap (see warning at startup). Do not compare this number against runs with a disjoint corpus.");
+            }
         }
     }
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Double-D feasibility probe — p_outer measurement.
 //!
 //! Loads BOTH a small qwen3.5 model (e.g. 0.8B) and a large target
@@ -46,21 +50,21 @@ fn main() {
 
     // Load both models.
     let t0 = Instant::now();
-    let small_hfq = HfqFile::open(Path::new(small_path)).expect("small hfq");
+    let mut small_hfq = HfqFile::open(Path::new(small_path)).expect("small hfq");
     let small_cfg = qwen35::config_from_hfq(&small_hfq).expect("small cfg");
     eprintln!("small: dim={} layers={} heads={} vocab={}",
         small_cfg.dim, small_cfg.n_layers, small_cfg.n_heads, small_cfg.vocab_size);
-    let small_weights = qwen35::load_weights(&small_hfq, &small_cfg, &mut gpu).expect("small load");
+    let small_weights = qwen35::load_weights(&mut small_hfq, &small_cfg, &mut gpu).expect("small load");
     eprintln!("small loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let t1 = Instant::now();
-    let large_hfq = HfqFile::open(Path::new(large_path)).expect("large hfq");
+    let mut large_hfq = HfqFile::open(Path::new(large_path)).expect("large hfq");
     let large_cfg = qwen35::config_from_hfq(&large_hfq).expect("large cfg");
     eprintln!("large: dim={} layers={} heads={} vocab={}",
         large_cfg.dim, large_cfg.n_layers, large_cfg.n_heads, large_cfg.vocab_size);
     assert_eq!(small_cfg.vocab_size, large_cfg.vocab_size,
         "vocab sizes must match for argmax comparison");
-    let large_weights = qwen35::load_weights(&large_hfq, &large_cfg, &mut gpu).expect("large load");
+    let large_weights = qwen35::load_weights(&mut large_hfq, &large_cfg, &mut gpu).expect("large load");
     eprintln!("large loaded in {:.1}s", t1.elapsed().as_secs_f32());
 
     let tokenizer = Tokenizer::from_hfq_metadata(&large_hfq.metadata_json)

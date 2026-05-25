@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! `Architecture` trait implementation for Qwen3.5.
 //!
 //! This is the canary arch implementation (PR 8 of
@@ -63,7 +67,7 @@ impl Architecture for Qwen35 {
     }
 
     fn load_weights(
-        hfq: &HfqFile,
+        hfq: &mut HfqFile,
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {

@@ -1,8 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 #include <hip/hip_runtime.h>
 
 // MagnumQuant MQ8 GEMV: FWHT-rotated symmetric INT8 with dp4a.
 // x_rot is PRE-ROTATED and PRE-QUANTIZED to INT8 by the caller.
-// Inner loop uses v_dot4_i32_iu8 for 4x VALU throughput vs FP32.
+// Inner loop uses v_dot4_i32_i8 (sdot4) for 4x VALU throughput vs FP32.
+// Both operands are signed int8 (Q8_1 activations + symmetric MQ8 weights),
+// so sdot4 (gfx906+, dot2-insts) is correct. sudot4 (RDNA3+, dot8-insts)
+// is the mixed-mode form for unsigned-weight quants and is gratuitous here;
+// it also fails to compile on gfx906 since the iu8 instruction is RDNA3+.
 //
 // Weight format per group (258 bytes for 256 elements):
 //   [0:2]   f16 scale
@@ -66,8 +74,8 @@ extern "C" __global__ void gemv_mq8g256(
             int wp1 = *(const int*)(wb + w_off + 4); \
             int xp0 = *(const int*)(xb + w_off); \
             int xp1 = *(const int*)(xb + w_off + 4); \
-            int dot = __builtin_amdgcn_sudot4(true, wp0, true, xp0, 0, false); \
-            dot = __builtin_amdgcn_sudot4(true, wp1, true, xp1, dot, false); \
+            int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false); \
+            dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false); \
             acc_var += ws * xs * (float)dot; \
         }
 
@@ -86,8 +94,8 @@ extern "C" __global__ void gemv_mq8g256(
         int wp1 = *(const int*)(wb + w_off + 4);
         int xp0 = *(const int*)(xb + w_off);
         int xp1 = *(const int*)(xb + w_off + 4);
-        int dot = __builtin_amdgcn_sudot4(true, wp0, true, xp0, 0, false);
-        dot = __builtin_amdgcn_sudot4(true, wp1, true, xp1, dot, false);
+        int dot = __builtin_amdgcn_sdot4(wp0, xp0, 0, false);
+        dot = __builtin_amdgcn_sdot4(wp1, xp1, dot, false);
         acc0 += ws * xs * (float)dot;
     }
 

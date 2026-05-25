@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // CASK m-folding merge kernel for asym3 K cache (givens-rotated 3-bit).
 //
 // Each source K row: [4B cnorm][32 threads × 3 bytes packed 3-bit indices]

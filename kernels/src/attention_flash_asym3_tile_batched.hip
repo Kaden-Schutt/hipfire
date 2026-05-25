@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Batched flash attention tile for asym3: K at 3-bit rotated, V at Q8_0.
 // Processes sub_batch_size positions in one launch via blockIdx.z.
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
