@@ -53,6 +53,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_ADAPTIVE_B_DOWN` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:981` |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | DFLASH-ADAPT | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:444` |
 | `HIPFIRE_ADAPTIVE_B_UP` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:979` |
+| `HIPFIRE_ALLOW_MIXED_ARCH` | MULTI-GPU | "" (set to "1" or "true" to enable) | `crates/hipfire-runtime/src/multi_gpu.rs:395` |
 | `HIPFIRE_ALLOW_MQ2` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2106` |
 | `HIPFIRE_ALLOW_MQ2_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2141` |
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2126` |
@@ -218,16 +219,17 @@ Hot-path kernel choice levers. **All silent today.** Power users who tune for sp
 - `HIPFIRE_ROCBLAS_ALL_ARCHS`, `HIPFIRE_ROCBLAS_MIN_BATCH`, `HIPFIRE_ROCBLAS_OFF` — rocBLAS dispatch gates.
 - `HIPFIRE_WO_MMQ`, `HIPFIRE_WO_WMMA_VARIANT` — workaround flags for specific arch quirks.
 
-### `MULTI-GPU` (6)
+### `MULTI-GPU` (7)
 
 Pipeline-parallel and multi-device orchestration. Tied to `crates/hipfire-runtime/src/multi_gpu.rs` + Stage 7 of issue #58.
 
+- `HIPFIRE_ALLOW_MIXED_ARCH=1` — opt into mixed-architecture device pairs after the default arch-mismatch guard.
 - `HIPFIRE_DEVICES` — explicit device selection (alternate to `ROCR_VISIBLE_DEVICES`).
 - `HIPFIRE_PP_LAYERS="a,b,..."` — explicit asymmetric layer split (PR #190).
 - `HIPFIRE_PP_PFLASH=1` — opt into experimental PFlash + pp>1 compose (PR #190).
 - `HIPFIRE_HAVE_2_GPU=1` — pp_parity test gate; required for the 2-GPU parity battery.
 - `HIPFIRE_PP_PARITY_MODEL` — model path override for the pp_parity test.
-- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — VRAM-tolerance threshold above which mixed-arch warning fires under `HIPFIRE_ALLOW_MIXED_ARCH=1`.
+- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — free-VRAM delta tolerance for `init_uniform`; `init_layers` skips this gate.
 
 ### `PFLASH` (13)
 

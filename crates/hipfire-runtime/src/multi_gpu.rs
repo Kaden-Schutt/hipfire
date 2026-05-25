@@ -100,8 +100,9 @@ impl Gpus {
         Self::from_parts(devices, per_device, n_layers)
     }
 
-    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits. Same
-    /// pre-flight checks as `init_uniform`. `per_device` length determines
+    /// Explicit escape hatch for asymmetric VRAM / hand-tuned splits.
+    /// Keeps arch-mismatch and per-device bind/free pre-flight checks, but
+    /// skips the uniform VRAM-delta gate. `per_device` length determines
     /// `n_devices`; sum determines `n_layers`.
     pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
