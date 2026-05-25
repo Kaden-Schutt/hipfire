@@ -898,7 +898,10 @@ fn main() {
                         let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                         let free_mb = vram_free / (1024 * 1024);
                         let total_mb = vram_total / (1024 * 1024);
-                        let _ = writeln!(stdout, r#"{{"type":"error","message":"load failed: {}. GPU: {} ({} MB free / {} MB total)"}}"#, e, gpu.arch, free_mb, total_mb);
+                        // serde-escape: raw HipError debug contains { } and "
+                        // which corrupt the JSONL protocol if interpolated raw.
+                        write_error(&mut stdout, "", &format!(
+                            "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)", gpu.arch));
                     }
                 }
                 let _ = stdout.flush();
@@ -3715,6 +3718,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             gpu.bind_thread_or_warn();
             match decision {
                 Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
+                    eprintln!("[pflash] COMPRESSED {} -> {} tok dev1 ({}ms)", cp.source_tokens, cp.kept_tokens, cp.timings.total_ms);
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_compressed","id":"{}","source_tokens":{},"kept_tokens":{},"keep_ratio":{:.6},"source_md5":"{}","compressed_md5":"{}","score_ms":{},"select_ms":{},"gather_ms":{},"total_ms":{}}}"#,
@@ -3749,6 +3753,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     raw_q_tokens
                 }
                 Err(e) => {
+                    eprintln!("[pflash] ERROR compress: {e}");
                     let _ = writeln!(
                         stdout,
                         r#"{{"type":"pflash_error","id":"{}","reason":"{}"}}"#,
@@ -3759,6 +3764,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 }
             }
         } else {
+            eprintln!("[pflash] skip: seq_pos={} != 0", m.seq_pos);
             raw_q_tokens
         }
     } else {
