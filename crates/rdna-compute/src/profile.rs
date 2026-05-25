@@ -151,6 +151,18 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
+/// 4 B zero + 64 B packed 4-bit weights).
+pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 128;
+    m * groups * 72
+}
+
+/// Bytes for a single-row HFQ4-G128 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
+    hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
 /// 4 B zero + 96 B packed 3-bit weights).
 pub fn hfq3g256_weight_bytes(m: usize, k: usize) -> usize {

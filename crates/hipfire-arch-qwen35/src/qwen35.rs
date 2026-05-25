@@ -2747,14 +2747,31 @@ fn moe_ffn_decode_impl(
     let routed_gate_up_mq6 = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
         .unwrap_or(false);
+    // ParoQuant routed-expert eligibility. shisa-Qwen3.6-A3B-PARO and
+    // friends carry ParoQ4G128 routed experts whose pairs/theta/channel_scales
+    // are shared across all 256 experts via `ffn.paro_shared`. The indexed
+    // HFQ4G128 kernels assume both halves (gate_up and down) live in this
+    // layout — checking experts[0] is sufficient because the loader
+    // (`paro_load_moe_ffn`) builds every expert's `paro` alias from the
+    // same `MoeParoSidecars`.
+    let routed_paro = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::ParoQ4G128)
+        .unwrap_or(false)
+        && ffn.paro_shared.is_some();
+    let routed_gate_up_paro = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::ParoQ4G128)
+        .unwrap_or(false)
+        && ffn.paro_shared.is_some();
     // The indexed gate_up and down kernels live in separate dtype families;
     // we require the routed gate_up and down dtypes to match (i.e., both
-    // MQ4 or both MQ6) so the FWHT-rotated x_rot_local feeds both
-    // consistently. Mixed gate_up/down within a layer is not produced by
-    // the quantizer.
+    // MQ4, both MQ6, or both ParoQ4G128) so the rotated x_rot_local feeds
+    // both consistently. Mixed gate_up/down within a layer is not produced
+    // by the quantizer.
     let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
     let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
-    let routed_dtype_indexable = routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6;
+    let routed_dtype_indexable_paro = routed_paro && routed_gate_up_paro;
+    let routed_dtype_indexable =
+        routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6 || routed_dtype_indexable_paro;
     // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
     // device and the indexed MoE kernels consume topk_indices /
     // topk_weights directly — no D2H sync, hipGraph-capture-safe.
@@ -2767,28 +2784,44 @@ fn moe_ffn_decode_impl(
     // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
     // of the HFQ4 ones — same control flow, different kernel binary.
     let use_gpu_topk = k == 8 && routed_dtype_indexable;
-    let needs_x_rot_local = gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6;
+    let needs_x_rot_local =
+        gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6 || routed_gate_up_paro;
     let x_rot_local = if needs_x_rot_local {
-        gpu.ensure_mq_signs()?;
-        if !x_rot_prerotated {
-            // F2 / F1: AWQ-aware rotate. All MQ4 weights in this layer
-            // consume the same post-rmsnorm x, so they share the same
-            // input basis → identical imatrix → byte-identical AWQ
-            // scales. When gate_side_mq4 is true the 4-way fused GEMV
-            // expects rotation aligned with `ffn.router`'s AWQ scale;
-            // otherwise pick `ffn.experts[0].gate_up` as the routed-
-            // expert representative for the indexed kernel path. When
-            // AWQ is disabled (no sidecar), `rotate_x_mq_for` routes
-            // to the non-AWQ kernel — byte-identical to pre-F2 either
-            // way.
-            let next_lin = if gate_side_mq4 {
-                &ffn.router
-            } else {
-                &ffn.experts[0].gate_up
-            };
-            rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
+        if !routed_gate_up_paro {
+            // FWHT-rotated path needs the MQ sign LUT.
+            gpu.ensure_mq_signs()?;
         }
-        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
+        if !x_rot_prerotated {
+            if routed_gate_up_paro {
+                // ParoQuant routed experts: use the per-layer shared Givens
+                // rotation (from `ffn.paro_shared.gate_up_*`). The loader
+                // builds every expert's `paro` alias from the same sidecars,
+                // so experts[0].gate_up.paro is the canonical handle.
+                let paro = ffn.experts[0].gate_up.paro.as_ref()
+                    .expect("routed_gate_up_paro implies experts[0].gate_up.paro.is_some()");
+                hipfire_runtime::llama::rotate_x_paro_for(
+                    gpu, paro, x_norm, s.x_rot_local, config.dim,
+                )?;
+            } else {
+                // F2 / F1: AWQ-aware FWHT rotate. All MQ4 weights in this
+                // layer consume the same post-rmsnorm x, so they share the
+                // same input basis → identical imatrix → byte-identical
+                // AWQ scales. When gate_side_mq4 is true the 4-way fused
+                // GEMV expects rotation aligned with `ffn.router`'s AWQ
+                // scale; otherwise pick `ffn.experts[0].gate_up` as the
+                // routed-expert representative for the indexed kernel
+                // path. When AWQ is disabled (no sidecar),
+                // `rotate_x_mq_for` routes to the non-AWQ kernel —
+                // byte-identical to pre-F2 either way.
+                let next_lin = if gate_side_mq4 {
+                    &ffn.router
+                } else {
+                    &ffn.experts[0].gate_up
+                };
+                rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
+            }
+        }
+        // else caller guarantees s.x_rot_local already holds the rotated x.
         Some(s.x_rot_local)
     } else {
         None
@@ -2918,35 +2951,60 @@ fn moe_ffn_decode_impl(
         // Expanding into `s.down_expanded` (no atomics) then summing via
         // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
         // output byte-deterministic, eliminating the cumulative drift.
-        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_mq{4,6} implies x_rot_local is Some");
+        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_{mq4,mq6,paro} implies x_rot_local is Some");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
         // Dispatch the right indexed-GEMV layout for this layer's routed
         // dtype. Within a layer, gate_up and down share the same dtype
-        // (kmap promotes whole expert tensor groups together); the
-        // `routed_dtype_indexable_mq{4,6}` checks above enforce this.
+        // (kmap promotes whole expert tensor groups together; ParoQuant
+        // loader builds gate_up + down at matching ParoQ4G128); the
+        // `routed_dtype_indexable_*` checks above enforce this.
         if routed_dtype_indexable_mq4 {
             gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, gate_up_k,
             )?;
-        } else {
-            // routed_dtype_indexable_mq6 — HFQ6 (200 B/group) indexed kernel.
+        } else if routed_dtype_indexable_mq6 {
+            // HFQ6 (200 B/group) indexed kernel.
             gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
                 &ffn.expert_gate_up_ptrs, s.topk_indices,
                 xr, s.gate_batch, s.up_batch,
                 2 * mi, gate_up_k,
             )?;
+        } else {
+            // routed_dtype_indexable_paro — HFQ4G128 (72 B/group) indexed
+            // kernel. xr is already Givens-rotated above by rotate_x_paro_for.
+            gpu.gemv_hfq4g128_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
         }
-        // F2: AWQ-aware silu_mul+rotate. All experts in this MoE layer
-        // share the same input residual basis → same imatrix → byte-
-        // identical AWQ scales; experts[0].down is representative. The
-        // helper is dtype-agnostic — it dispatches on awq_scale presence,
-        // not on weight bytes layout — so MQ6 down's AWQ scale (if any)
-        // routes through the same _awq_batched variant as MQ4.
-        fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+        // Gate→down hop. MQ paths use a single fused silu+mul+FWHT kernel;
+        // ParoQuant uses the structural mirror `fused_silu_mul_givens_rotate`
+        // (silu+mul+per-channel-scale+krot Givens rounds in one launch).
+        // The earlier 2-launch decomposition (silu_mul_f32 + givens_rotate)
+        // produced a small but reproducible direct-vs-graph numerical
+        // delta on gfx1151/HIP 7.13; fusing matches the MQ4 pattern that
+        // hipGraph captures byte-identically.
+        if routed_dtype_indexable_paro {
+            let paro_down = ffn.experts[0].down.paro.as_ref()
+                .expect("routed_paro implies experts[0].down.paro.is_some()");
+            gpu.fused_silu_mul_givens_rotate_f32(
+                s.gate_batch, s.up_batch, s.rot_batch,
+                &paro_down.pairs, &paro_down.theta, &paro_down.channel_scales,
+                k, mi, paro_down.krot as usize,
+            )?;
+        } else {
+            // F2: AWQ-aware silu_mul+FWHT-rotate. All experts in this MoE
+            // layer share the same input residual basis → same imatrix
+            // → byte-identical AWQ scales; experts[0].down is
+            // representative. Helper dispatches on awq_scale presence,
+            // not on weight bytes layout.
+            fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
+        }
         // Atomic-free expanded write: [k_top × down_m] f32, one block per
         // (m, krank) pair, no cross-block contention.
         if routed_dtype_indexable_mq4 {
@@ -2955,8 +3013,15 @@ fn moe_ffn_decode_impl(
                 s.rot_batch, s.down_expanded,
                 down_m, down_k, k, 1,
             )?;
-        } else {
+        } else if routed_dtype_indexable_mq6 {
             gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, s.topk_indices,
+                s.rot_batch, s.down_expanded,
+                down_m, down_k, k, 1,
+            )?;
+        } else {
+            // routed_dtype_indexable_paro
+            gpu.gemv_hfq4g128_moe_down_k8_indexed_batched_expanded(
                 &ffn.expert_down_ptrs, s.topk_indices,
                 s.rot_batch, s.down_expanded,
                 down_m, down_k, k, 1,
@@ -3701,12 +3766,35 @@ impl Qwen35Scratch {
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
             //   HIPFIRE_ATTN_FLASH=never|0|off    → non-flash at all contexts
-            //   HIPFIRE_ATTN_FLASH=auto|1|on      → (default) flash at ctx >= 2048
+            //   HIPFIRE_ATTN_FLASH=auto|1|on      → flash at ctx >= 2048
             //   HIPFIRE_ATTN_FLASH=always|2|force → flash at all contexts
+            //
+            // Default on gfx11/gfx12 (graph-capable archs): `2` (always
+            // flash). On other archs: `1` (auto). The capture path at
+            // qwen35.rs:8199 hard-wires `use_flash = capture_mode || ...`
+            // because attention_q8_0_kv has variable block_size + variable
+            // shared-mem (not capture-safe). Without an always-flash default
+            // on capture-capable archs, direct mode at small ctx silently
+            // uses attention_q8_0_kv while a captured-and-replayed forward
+            // uses attention_flash_q8_0 — same math, different fp32
+            // reduction order, observed as ~0.44 logit delta direct-vs-graph
+            // on shisa-Qwen3.6-A3B-PARO (see
+            // .scratch/hipgraph-moe-drift-audit.md Part A). Aligning the
+            // default flips both paths to `attention_flash_q8_0` and makes
+            // direct vs graph byte-identical at the cost of moving small-
+            // context decode off the non-flash kernel (~few % attention
+            // perf hit, small contribution to total MoE decode time).
+            // Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
+            // for users who prefer the non-flash kernel and don't intend
+            // to use graph capture.
             flash_mode: match std::env::var("HIPFIRE_ATTN_FLASH").as_deref() {
                 Ok("never") | Ok("0") | Ok("off") => 0,
                 Ok("always") | Ok("2") | Ok("force") => 2,
-                _ => 1, // auto / unset / any other value
+                _ => {
+                    let graph_capable_arch =
+                        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
+                    if graph_capable_arch { 2 } else { 1 }
+                }
             },
 
             moe_router_logits: None,

@@ -903,6 +903,26 @@ pub fn rotate_x_mq_for(
     }
 }
 
+/// ParoQuant single-token rotation: read x, write Givens-rotated
+/// activation to x_rot via a single out-of-place kernel. Earlier
+/// versions did `copy_d2d(x → x_rot)` then `givens_rotate(x_rot)`;
+/// fusing into one launch eliminates an inter-node dependency that
+/// the hipGraph dependency analyzer can fail to enforce (observed
+/// numerical delta direct-vs-graph on gfx1151 / HIP 7.13).
+pub fn rotate_x_paro_for(
+    gpu: &mut Gpu,
+    paro: &ParoRotation,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    gpu.givens_rotate_to(
+        x, x_rot,
+        &paro.pairs, &paro.theta, &paro.channel_scales,
+        1, k, paro.krot as usize,
+    )
+}
+
 /// Phase A Stage A — F2: batched AWQ-aware variant of `rotate_x_mq`.
 /// Grid.y is the batch dim. See `rotate_x_mq_for` for routing logic.
 pub fn rotate_x_mq_batched_for(
