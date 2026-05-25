@@ -750,15 +750,18 @@ fn main() {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
+                            8 => "dots-ocr",
                             _ => "qwen3",
                         };
-                        let vl = m.vision_config.is_some();
+                        let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
                         let (dim, layers, vocab) = if let Some(ref c) = m.q35_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.llama_config {
                             (c.dim, c.n_layers, c.vocab_size)
                         } else if let Some(ref c) = m.qwen2_config {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
+                        } else if let Some(ref c) = m.dots_ocr_config {
+                            (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
                         } else { (0, 0, 0) };
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
@@ -5069,10 +5072,20 @@ fn generate_vl_dots_ocr(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout
             eprintln!("[dots-ocr] preprocessing image: {path}");
             dots_image::preprocess_image(Path::new(path))
         }
-        ImageSource::Base64(_) => {
-            write_error(stdout, id,
-                "dots.ocr: base64 image input not yet supported (phase-3 MVP) — use a file path");
-            return;
+        ImageSource::Base64(b64) => {
+            // Strip an optional `data:<mime>;base64,` URL prefix.
+            let raw_b64 = match b64.strip_prefix("data:") {
+                Some(rest) => match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => { write_error(stdout, id, "malformed data URL: missing ',' separator"); return; }
+                },
+                None => &b64[..],
+            };
+            eprintln!("[dots-ocr] preprocessing base64 image (<{}-byte payload>)", raw_b64.len());
+            match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(bytes) => dots_image::preprocess_image_bytes(&bytes),
+                Err(e) => { write_error(stdout, id, &format!("dots.ocr: base64 decode failed: {e}")); return; }
+            }
         }
     };
     let img = match img {

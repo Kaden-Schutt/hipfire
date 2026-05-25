@@ -376,6 +376,15 @@ pub fn preprocess_image(path: &Path) -> Result<PreprocessedImage, String> {
     preprocess_dynamic_image(&dyn_img)
 }
 
+/// Variant of [`preprocess_image`] that decodes raw image bytes from
+/// memory (e.g. a base64-decoded payload off the daemon's request).
+/// The format is sniffed from the byte content.
+pub fn preprocess_image_bytes(bytes: &[u8]) -> Result<PreprocessedImage, String> {
+    let dyn_img = image::load_from_memory(bytes)
+        .map_err(|e| format!("dots-ocr: failed to decode image bytes: {e}"))?;
+    preprocess_dynamic_image(&dyn_img)
+}
+
 /// Variant of [`preprocess_image`] that takes an already-decoded
 /// `DynamicImage`. Useful for callers that load image bytes from a
 /// non-filesystem source (HTTP, memory, etc.).
