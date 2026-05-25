@@ -672,6 +672,12 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
+        30 => { // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook, 160 bytes per 256 elements.
+                // Renumbered from qtype 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+                // Models quantized pre-renumber MUST be re-quantized.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
         1 => { // F16 — dequant to F32 for F32 GEMV
             let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))

@@ -181,6 +181,12 @@ pub fn gemv_mq3g256_lloyd_bytes(m: usize, k: usize) -> usize {
     m * groups * 112 + k * 4 + m * 4
 }
 
+/// MQ4-Lloyd GEMV bytes: weight (160 B / group) + x + y.
+pub fn gemv_mq4g256_lloyd_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 160 + k * 4 + m * 4
+}
+
 /// Bytes for a B-way batched HFQ4-G256 GEMM (weight read once, B input/output
 /// vectors).
 pub fn gemm_hfq4g256_bytes(m: usize, k: usize, batch: usize) -> usize {
