@@ -5141,19 +5141,42 @@ fn generate_vl_dots_ocr(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout
         return;
     }
 
-    // 5. Prefill: splice merged visual embeddings at IMGPAD slots, else token lookup.
+    // 5. Prefill: build the [seq × dim] embedding matrix (token-embedding
+    // rows for text positions, spliced vision-merger rows at IMGPAD slots)
+    // and run it through the batched prefill in one pass. Only the ~215
+    // text positions need a GPU embedding lookup; the 4880 visual rows are
+    // already host-resident in `merged`.
     state.reset();
     let t_prefill = Instant::now();
+    let mut embeds = vec![0f32; prompt_ids.len() * dim];
+    let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
+        Ok(t) => t,
+        Err(e) => { write_error(stdout, id, &format!("dots.ocr embed scratch alloc failed: {e:?}")); return; }
+    };
     let mut visual_idx = 0usize;
-    for &token in &prompt_ids {
-        let r = if token == dots_ocr::IMGPAD_ID {
-            let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
+    let mut embed_err: Option<String> = None;
+    for (pos, &token) in prompt_ids.iter().enumerate() {
+        if token == dots_ocr::IMGPAD_ID {
+            embeds[pos * dim..(pos + 1) * dim]
+                .copy_from_slice(&merged[visual_idx * dim..(visual_idx + 1) * dim]);
             visual_idx += 1;
-            qwen2::forward_step_with_embed(gpu, &weights.text, text_cfg, state, emb)
         } else {
-            qwen2::forward_step(gpu, &weights.text, text_cfg, state, token)
-        };
-        if let Err(e) = r { write_error(stdout, id, &format!("dots.ocr prefill failed: {e:?}")); return; }
+            // dots.ocr text weights are Q8_0 (q8.hfq).
+            if let Err(e) = gpu.embedding_lookup_q8(&weights.text.token_embd, &emb_scratch, token, dim) {
+                embed_err = Some(format!("embedding lookup: {e:?}")); break;
+            }
+            match gpu.download_f32(&emb_scratch) {
+                Ok(row) => embeds[pos * dim..(pos + 1) * dim].copy_from_slice(&row),
+                Err(e) => { embed_err = Some(format!("embedding download: {e:?}")); break; }
+            }
+        }
+    }
+    let _ = gpu.free_tensor(emb_scratch);
+    if let Some(e) = embed_err {
+        write_error(stdout, id, &format!("dots.ocr prefill embed build failed: {e}")); return;
+    }
+    if let Err(e) = qwen2::forward_prefill_batch_embeds(gpu, &weights.text, text_cfg, state, &embeds) {
+        write_error(stdout, id, &format!("dots.ocr batched prefill failed: {e:?}")); return;
     }
     let prefill_tokens = prompt_ids.len();
     let prefill_s = t_prefill.elapsed().as_secs_f64();

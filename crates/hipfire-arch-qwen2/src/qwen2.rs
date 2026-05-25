@@ -29,7 +29,7 @@
 
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, weight_gemv, weight_gemm, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Qwen2 model-shape constants parsed from `HfqFile::metadata_json`.
@@ -879,6 +879,136 @@ pub fn forward_step_greedy(
 ) -> HipResult<u32> {
     forward_step(gpu, weights, cfg, state, token)?;
     gpu.argmax_f32(&state.logits, cfg.vocab_size)
+}
+
+/// Batched prefill over a pre-built `[batch × dim]` embedding matrix
+/// (row-major F32). The caller resolves every prompt position to an
+/// embedding row — token-embedding lookups for text positions, spliced
+/// vision-merger rows for image positions — so this path works for both
+/// plain Qwen2 and the dots.ocr VL splice without an embedding-lookup
+/// branch inside the hot loop.
+///
+/// Processes the whole prompt in one pass with batched GEMM / RoPE /
+/// causal-attention kernels instead of the per-token `forward_step`
+/// loop. Fills `state.k_cache` / `state.v_cache` for positions
+/// `[next_pos, next_pos + batch)`, advances `state.next_pos`, and leaves
+/// the LAST position's logits in `state.logits` (ready for argmax →
+/// first generated token). Decode then continues with `forward_step`.
+///
+/// KV-cache writes use a per-position F32 loop (the cache is F32 and only
+/// a single-position `kv_cache_write` exists); a batched-F32 KV kernel is
+/// the follow-up if that loop dominates prefill time.
+pub fn forward_prefill_batch_embeds(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    embeds: &[f32],
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    let n_heads = cfg.num_attention_heads;
+    let n_kv_heads = cfg.num_key_value_heads;
+    let head_dim = cfg.head_dim;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv_heads * head_dim;
+    let hidden_dim = cfg.intermediate_size;
+
+    assert_eq!(embeds.len() % dim, 0,
+        "forward_prefill_batch_embeds: embeds.len()={} not a multiple of dim={dim}", embeds.len());
+    let batch = embeds.len() / dim;
+    let base = state.next_pos;
+    if base + batch > state.max_seq {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            "qwen2: prefill batch={batch} + next_pos={base} > max_seq={}", state.max_seq)));
+    }
+
+    // Batched projection: Q8 weights get a true batched GEMM; other dtypes
+    // fall back to weight_gemm (HFQ4 batched, else a per-row GEMV loop).
+    fn proj(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor, batch: usize) -> HipResult<()> {
+        match w.gpu_dtype {
+            DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch),
+            _ => weight_gemm(gpu, w, x, y, batch),
+        }
+    }
+
+    let x_batch = gpu.upload_f32(embeds, &[batch, dim])?;
+    let tmp_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let q_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let k_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let v_batch = gpu.alloc_tensor(&[batch, kv_dim], DType::F32)?;
+    let attn_out_batch = gpu.alloc_tensor(&[batch, q_dim], DType::F32)?;
+    let o_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+    let gate_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let up_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
+    let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
+
+    // Absolute positions [base .. base+batch) for batched RoPE.
+    let pos_bytes: Vec<u8> = (0..batch as i32)
+        .flat_map(|i| (i + base as i32).to_ne_bytes())
+        .collect();
+    let pos_array = gpu.alloc_tensor(&[batch], DType::F32)?; // i32 payload, same width
+    gpu.hip.memcpy_htod(&pos_array.buf, &pos_bytes)?;
+
+    let k_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+    let v_slice = gpu.alloc_tensor(&[kv_dim], DType::F32)?;
+
+    for layer_idx in 0..cfg.num_hidden_layers {
+        let layer = &weights.layers[layer_idx];
+
+        gpu.rmsnorm_batched(&x_batch, &layer.attn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
+
+        proj(gpu, &layer.wq, &tmp_batch, &q_batch, batch)?;
+        proj(gpu, &layer.wk, &tmp_batch, &k_batch, batch)?;
+        proj(gpu, &layer.wv, &tmp_batch, &v_batch, batch)?;
+
+        gpu.bias_add_f32(&q_batch, &layer.wq_bias, batch, q_dim)?;
+        gpu.bias_add_f32(&k_batch, &layer.wk_bias, batch, kv_dim)?;
+        gpu.bias_add_f32(&v_batch, &layer.wv_bias, batch, kv_dim)?;
+
+        gpu.rope_batched_f32(&q_batch, &k_batch, &pos_array,
+            n_heads, n_kv_heads, head_dim, cfg.rope_theta, batch)?;
+
+        // Persist post-RoPE K/V to the F32 cache at absolute positions so
+        // decode (forward_step) can attend to the whole prompt.
+        for i in 0..batch {
+            let pos_i32 = (base + i) as i32;
+            gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
+            gpu.hip.memcpy_dtod_at(&k_slice.buf, 0, &k_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
+            gpu.hip.memcpy_dtod_at(&v_slice.buf, 0, &v_batch.buf, i * kv_dim * 4, kv_dim * 4)?;
+            gpu.kv_cache_write(&state.k_cache[layer_idx], &k_slice, &state.pos_buf, kv_dim)?;
+            gpu.kv_cache_write(&state.v_cache[layer_idx], &v_slice, &state.pos_buf, kv_dim)?;
+        }
+
+        gpu.attention_causal_batched(&q_batch, &k_batch, &v_batch, &attn_out_batch,
+            batch, n_heads, n_kv_heads, head_dim)?;
+
+        proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
+        gpu.add_inplace_f32(&x_batch, &o_batch)?;
+
+        gpu.rmsnorm_batched(&x_batch, &layer.ffn_norm, &tmp_batch, batch, dim, cfg.rms_norm_eps)?;
+
+        proj(gpu, &layer.w_gate, &tmp_batch, &gate_batch, batch)?;
+        proj(gpu, &layer.w_up, &tmp_batch, &up_batch, batch)?;
+        gpu.silu_mul_f32(&gate_batch, &up_batch, &ffn_hidden_batch)?;
+        proj(gpu, &layer.w_down, &ffn_hidden_batch, &ffn_out_batch, batch)?;
+        gpu.add_inplace_f32(&x_batch, &ffn_out_batch)?;
+    }
+
+    // Final norm + lm_head for the LAST position only → state.logits.
+    let last_off = (batch - 1) * dim * 4;
+    gpu.hip.memcpy_dtod_at(&state.x.buf, 0, &x_batch.buf, last_off, dim * 4)?;
+    gpu.rmsnorm_f32(&state.x, &weights.output_norm, &state.tmp, cfg.rms_norm_eps)?;
+    weight_gemv(gpu, &weights.output, &state.tmp, &state.logits)?;
+
+    state.next_pos = base + batch;
+
+    for t in [x_batch, tmp_batch, q_batch, k_batch, v_batch, attn_out_batch,
+              o_batch, gate_batch, up_batch, ffn_hidden_batch, ffn_out_batch,
+              pos_array, k_slice, v_slice] {
+        gpu.free_tensor(t)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
