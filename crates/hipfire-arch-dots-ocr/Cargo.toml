@@ -1,0 +1,24 @@
+[package]
+name = "hipfire-arch-dots-ocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dots.ocr (Qwen2-VL family) — Qwen2 text decoder + 42-block DotsVisionTransformer. arch_id=8."
+
+# Bring-up status: skeleton at phase 2 start. Text-side trait impl
+# delegates to hipfire-arch-qwen2 unchanged (dots.ocr stores text
+# weights as `model.*`, identical to plain Qwen2). Vision tower and
+# image preprocessing land in subsequent commits. See
+# docs/plans/dots-ocr-prd.md phase 2 for the bring-up plan.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde_json = "1"
+# Used by `image.rs` for PNG/JPEG decode. Matches the version pin in
+# hipfire-arch-qwen35-vl/Cargo.toml; default-features off keeps the
+# build closure small (only PNG + JPEG are needed for dots.ocr's
+# page-image inputs).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

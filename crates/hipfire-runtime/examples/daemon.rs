@@ -4618,11 +4618,17 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let (pixels, img_h, img_w) = match image_source {
         ImageSource::Path(path) => {
             eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
-            image::load_and_preprocess(
+            match image::load_and_preprocess(
                 Path::new(path),
                 vision_config.patch_size,
                 vision_config.spatial_merge_size,
-            )
+            ) {
+                Ok(result) => result,
+                Err(e) => {
+                    write_error(stdout, id, &e);
+                    return;
+                }
+            }
         }
         ImageSource::Base64(b64) => {
             // Strip optional `data:...;base64,` prefix. A `data:` URL
@@ -4751,6 +4757,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
+        vision_config.spatial_merge_size,
     );
     let visual_tokens = qwen35_vl::vision_forward(gpu, vision_weights, vision_config, &patches, grid_h, grid_w)
         .expect("vision forward failed");

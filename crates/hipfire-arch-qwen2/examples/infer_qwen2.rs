@@ -1,7 +1,7 @@
 //! Standalone forward-pass driver for `hipfire-arch-qwen2`.
 //!
 //! This binary is the bring-up validation harness called out in §6 R3
-//! of `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`. It bypasses the
+//! of `docs/plans/dots-ocr-prd.md`. It bypasses the
 //! daemon entirely — no `arch_id`-based dispatch, no `LoadedModel`
 //! plumbing — so the forward pass can be validated against the HF
 //! reference at `benchmarks/references/qwen2_1p5b_instruct_smoke.json`

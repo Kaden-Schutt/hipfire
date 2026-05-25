@@ -63,6 +63,150 @@ static __device__ __forceinline__ void paro4g128_apply_pair(
     xg[j] = fmaf(c, xj, -s * xi);
 }
 
+static __device__ __forceinline__ void paro4g128t_offsets_f16(
+    int M,
+    int K,
+    long long* qzeros_off,
+    long long* scales_off,
+    long long* pairs_off,
+    long long* theta_off,
+    long long* channel_scales_off
+) {
+    constexpr int GROUP_SIZE = 128;
+    constexpr int PACK = 8;
+    constexpr int KROT = 8;
+    const int groups = K / GROUP_SIZE;
+    const int m_pack = M / PACK;
+    *qzeros_off = (long long)K * m_pack * (long long)sizeof(int);
+    *scales_off = *qzeros_off + (long long)groups * m_pack * (long long)sizeof(int);
+    *pairs_off = *scales_off + (long long)groups * M * (long long)sizeof(_Float16);
+    *theta_off = *pairs_off + (long long)KROT * K * (long long)sizeof(short);
+    *channel_scales_off = *theta_off + (long long)KROT * (K / 2) * (long long)sizeof(_Float16);
+}
+
+static __device__ __forceinline__ void rmsnorm_from_x(
+    const float* __restrict__ x,
+    const float* __restrict__ norm_weight,
+    float* __restrict__ x_norm,
+    float* __restrict__ reduce,
+    int K
+) {
+    const int tid = threadIdx.x;
+    float local_sum = 0.0f;
+    for (int i = tid; i < K; i += blockDim.x) {
+        const float v = x[i];
+        x_norm[i] = v;
+        local_sum += v * v;
+    }
+    reduce[tid] = local_sum;
+    __syncthreads();
+}
+
+static __device__ void fused_decode_one_projection_paro4g128t(
+    const char* __restrict__ A,
+    const float* __restrict__ x_norm,
+    float* __restrict__ y,
+    float* __restrict__ xg,
+    int M,
+    int K,
+    int m_col
+) {
+    constexpr int GROUP_SIZE = 128;
+    constexpr int KROT = 8;
+    constexpr int PACK = 8;
+
+    const int tid = threadIdx.x;
+    const int groups = K / GROUP_SIZE;
+    const int m_pack = M / PACK;
+
+    const long long qweight_off = 0;
+    long long qzeros_off = 0;
+    long long scales_off = 0;
+    long long pairs_off = 0;
+    long long theta_off = 0;
+    long long channel_scales_off = 0;
+    paro4g128t_offsets_f16(M, K, &qzeros_off, &scales_off, &pairs_off, &theta_off, &channel_scales_off);
+
+    const int* __restrict__ qweight = (const int*)(A + qweight_off);
+    const int* __restrict__ qzeros = (const int*)(A + qzeros_off);
+    const _Float16* __restrict__ scales = (const _Float16*)(A + scales_off);
+    const short* __restrict__ pairs = (const short*)(A + pairs_off);
+    const _Float16* __restrict__ theta = (const _Float16*)(A + theta_off);
+    const _Float16* __restrict__ channel_scales = (const _Float16*)(A + channel_scales_off);
+
+    float acc[PACK] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int g = 0; g < groups; ++g) {
+        const int base = g * GROUP_SIZE;
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int lane = tid * 4 + i;
+            xg[lane] = x_norm[base + lane] * load_f16_as_f32(channel_scales + base + lane);
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int r = 0; r < KROT; ++r) {
+            const int pair_base = r * K + base;
+            const int theta_base = r * (K / 2) + g * (GROUP_SIZE / 2);
+
+            #pragma unroll
+            for (int p = 0; p < 2; ++p) {
+                const int pair_idx = tid + p * 32;
+                const int i = (int)pairs[pair_base + 2 * pair_idx];
+                const int j = (int)pairs[pair_base + 2 * pair_idx + 1];
+                const float th = load_f16_as_f32(theta + theta_base + pair_idx);
+                float s, c;
+                __sincosf(th, &s, &c);
+                paro4g128_apply_pair(xg, s, c, i, j);
+            }
+            __syncthreads();
+        }
+
+        const int zp_word = qzeros[g * m_pack + m_col];
+        float scale[PACK];
+        float bias[PACK];
+        #pragma unroll
+        for (int out = 0; out < PACK; ++out) {
+            const int row = m_col * PACK + out;
+            const int slot = awq_slot_for_output(out);
+            const int zp = (zp_word >> (4 * slot)) & 0xF;
+            scale[out] = load_f16_as_f32(scales + (long long)g * M + row);
+            bias[out] = -scale[out] * (float)zp;
+        }
+
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int lane = tid * 4 + i;
+            const int k_idx = base + lane;
+            const int qw_word = qweight[(long long)m_col * K + k_idx];
+            const float xv = xg[lane];
+            #pragma unroll
+            for (int out = 0; out < PACK; ++out) {
+                const int slot = awq_slot_for_output(out);
+                const int q = (qw_word >> (4 * slot)) & 0xF;
+                acc[out] += (scale[out] * (float)q + bias[out]) * xv;
+            }
+        }
+        __syncthreads();
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (int out = 0; out < PACK; ++out) {
+            acc[out] += __shfl_down(acc[out], offset);
+        }
+    }
+    if (tid == 0) {
+        #pragma unroll
+        for (int out = 0; out < PACK; ++out) {
+            const int row = m_col * PACK + out;
+            if (row < M) y[row] = acc[out];
+        }
+    }
+}
+
 template <bool RESIDUAL, bool SWIGLU, bool PRECOMPUTED_TRIG, bool QWEIGHT_TILED>
 static __device__ void gemv_paro4g128_impl(
     const char* __restrict__ A,
@@ -962,6 +1106,56 @@ extern "C" __global__ void gemv_paro4g128t_prerotated_residual_pack1(
     int M, int K
 ) {
     gemv_paro4g128_prerotated_pack1_impl<true, true>(A, x_rot, y, M, K);
+}
+
+__launch_bounds__(32, 8)
+extern "C" __global__ void fused_decode_paro4g128t_qkv(
+    const char* __restrict__ A_q,
+    const char* __restrict__ A_k,
+    const char* __restrict__ A_v,
+    const float* __restrict__ x,
+    const float* __restrict__ norm_weight,
+    float* __restrict__ y_q,
+    float* __restrict__ y_k,
+    float* __restrict__ y_v,
+    int M_q,
+    int M_k,
+    int M_v,
+    int K,
+    float eps
+) {
+    extern __shared__ float smem[];
+    float* x_norm = smem;
+    float* xg = smem + K;
+    float* reduce = xg + 128;
+
+    const int tid = threadIdx.x;
+    const int m_col = blockIdx.x;
+    const int m_pack_q = M_q / 8;
+    const int m_pack_k = M_k / 8;
+    const int m_pack_v = M_v / 8;
+
+    rmsnorm_from_x(x, norm_weight, x_norm, reduce, K);
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) reduce[tid] += reduce[tid + s];
+        __syncthreads();
+    }
+    const float rms = rsqrtf(reduce[0] / (float)K + eps);
+    for (int i = tid; i < K; i += blockDim.x) {
+        x_norm[i] = x_norm[i] * norm_weight[i] * rms;
+    }
+    __syncthreads();
+
+    if (m_col < m_pack_q) {
+        fused_decode_one_projection_paro4g128t(A_q, x_norm, y_q, xg, M_q, K, m_col);
+    }
+    if (m_col < m_pack_k) {
+        fused_decode_one_projection_paro4g128t(A_k, x_norm, y_k, xg, M_k, K, m_col);
+    }
+    if (m_col < m_pack_v) {
+        fused_decode_one_projection_paro4g128t(A_v, x_norm, y_v, xg, M_v, K, m_col);
+    }
 }
 
 __launch_bounds__(32, 12)

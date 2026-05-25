@@ -8120,6 +8120,8 @@ fn run_fa_layer_body(
     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
     // Lever 1 disables the env-gated fused_fa3_paro4t path so the fused rmsnorm
     // path takes precedence. To re-enable the fused QKV path instead, set
     // HIPFIRE_PARO_FUSE_RMSNORM=0 AND HIPFIRE_PARO_FA3_FUSED=1.
@@ -8143,6 +8145,15 @@ fn run_fa_layer_body(
     } else if fused_fa3_lloyd_mq3 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_qkv_mq3g256_lloyd(
+            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+            eff_x,
+            &s.fa_q_full, &s.fa_k, &s.fa_v,
+            layer.wq.m, layer.wk.m, layer.wv.m,
+            layer.wq.k,
+        )?;
+    } else if fused_fa3_lloyd_mq4 {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_qkv_mq4g256_lloyd(
             &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
             eff_x,
             &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -8327,6 +8338,7 @@ fn run_fa_layer_body(
     let same_dtype = layer.w_up.gpu_dtype == dt_g;
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
     let fused_gu_paro4t = same_dtype
         && dt_g == DType::PARO4G128T
         && layer.w_gate.m == layer.w_up.m
@@ -8349,6 +8361,15 @@ fn run_fa_layer_body(
     } else if fused_gu_lloyd_mq3 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_mq3g256_lloyd(
+            &layer.w_gate.buf, &layer.w_up.buf,
+            eff_x,
+            &s.gate_ffn, &s.up,
+            layer.w_gate.m, layer.w_up.m,
+            layer.w_gate.k,
+        )?;
+    } else if fused_gu_lloyd_mq4 {
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+        gpu.fused_gate_up_mq4g256_lloyd(
             &layer.w_gate.buf, &layer.w_up.buf,
             eff_x,
             &s.gate_ffn, &s.up,
@@ -8582,6 +8603,7 @@ fn forward_scratch_layers(
                     && layer.w_alpha.gpu_dtype == dt;
                 let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                 let fused_la4_paro4t = la4_same_dtype
                     && dt == DType::PARO4G128T
                     && x_rot_paro.is_none()
@@ -8614,6 +8636,17 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkvza_mq3g256_lloyd(
+                        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+                        eff_x,
+                        &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
+                        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+                        layer.wqkv.k,
+                    )?;                } else if fused_la4_lloyd_mq4 {
+                    let eff_x = match x_rot {
+                        Some(xr) => xr,
+                        None => &s.tmp,
+                    };
+                    gpu.fused_qkvza_mq4g256_lloyd(
                         &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
                         eff_x,
                         &s.dn_qkv, &s.dn_z, &s.dn_beta, &s.dn_alpha,
@@ -8788,6 +8821,7 @@ fn forward_scratch_layers(
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                 let fused_gu_paro4t = same_dtype
                     && dt_g == DType::PARO4G128T
                     && layer.w_gate.m == layer.w_up.m
@@ -8816,6 +8850,14 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_mq3g256_lloyd(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        eff_x,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;                } else if fused_gu_lloyd_mq4 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_gate_up_mq4g256_lloyd(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
@@ -8897,6 +8939,7 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                 let fused_fa3_paro4t = fa3_same_dtype
                     && dt == DType::PARO4G128T
                     && x_rot_paro.is_none()
@@ -8923,6 +8966,14 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_mq3g256_lloyd(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        eff_x,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;                } else if fused_fa3_lloyd_mq4 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_qkv_mq4g256_lloyd(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -9131,6 +9182,7 @@ fn forward_scratch_layers(
                 let same_dtype = layer.w_up.gpu_dtype == dt_g;
                 let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                 let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                 let fused_gu_paro4t = same_dtype
                     && dt_g == DType::PARO4G128T
                     && layer.w_gate.m == layer.w_up.m
@@ -9159,6 +9211,14 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_gate_up_mq3g256_lloyd(
+                        &layer.w_gate.buf, &layer.w_up.buf,
+                        eff_x,
+                        &s.gate_ffn, &s.up,
+                        layer.w_gate.m, layer.w_up.m,
+                        layer.w_gate.k,
+                    )?;                } else if fused_gu_lloyd_mq4 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_gate_up_mq4g256_lloyd(
                         &layer.w_gate.buf, &layer.w_up.buf,
                         eff_x,
                         &s.gate_ffn, &s.up,
@@ -9239,6 +9299,7 @@ fn forward_scratch_layers(
                     && layer.w_alpha.gpu_dtype == dt;
                 let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                 let fused_la4_paro4t = la4_same_dtype
                     && dt == DType::PARO4G128T
                     && x_rot_paro.is_none()
@@ -9397,6 +9458,7 @@ fn forward_scratch_layers(
                 let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                 let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                 let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                 let fused_fa3_paro4t = fa3_same_dtype
                     && dt == DType::PARO4G128T
                     && x_rot_paro.is_none()
@@ -9423,6 +9485,14 @@ fn forward_scratch_layers(
                         None => &s.tmp,
                     };
                     gpu.fused_qkv_mq3g256_lloyd(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
+                        eff_x,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v,
+                        layer.wq.m, layer.wk.m, layer.wv.m,
+                        layer.wq.k,
+                    )?;                } else if fused_fa3_lloyd_mq4 {
+                    let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
+                    gpu.fused_qkv_mq4g256_lloyd(
                         &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
                         eff_x,
                         &s.fa_q_full, &s.fa_k, &s.fa_v,
@@ -9722,6 +9792,7 @@ fn forward_scratch_layers_multi(
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     let fused_la4_paro4t = la4_same_dtype
                         && dt == DType::PARO4G128T
                         && x_rot_paro.is_none()
@@ -9845,6 +9916,7 @@ fn forward_scratch_layers_multi(
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     let fused_gu_paro4t = same_dtype
                         && dt_g == DType::PARO4G128T
                         && layer.w_gate.m == layer.w_up.m
@@ -9914,6 +9986,7 @@ fn forward_scratch_layers_multi(
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     let fused_fa3_paro4t = fa3_same_dtype
                         && dt == DType::PARO4G128T
                         && x_rot_paro.is_none()
@@ -10093,6 +10166,7 @@ fn forward_scratch_layers_multi(
                     let same_dtype = layer.w_up.gpu_dtype == dt_g;
                     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
                     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
+                    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
                     let fused_gu_paro4t = same_dtype
                         && dt_g == DType::PARO4G128T
                         && layer.w_gate.m == layer.w_up.m
@@ -10163,6 +10237,7 @@ fn forward_scratch_layers_multi(
                         && layer.w_alpha.gpu_dtype == dt;
                     let fused_la4_mq4 = la4_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_la4_lloyd_mq3 = la4_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
                     let fused_la4_paro4t = la4_same_dtype
                         && dt == DType::PARO4G128T
                         && x_rot_paro.is_none()
@@ -10301,6 +10376,7 @@ fn forward_scratch_layers_multi(
                     let fa3_same_dtype = layer.wk.gpu_dtype == dt && layer.wv.gpu_dtype == dt;
                     let fused_fa3_mq4 = fa3_same_dtype && (dt == DType::MQ4G256 || dt == DType::HFQ4G256);
                     let fused_fa3_lloyd_mq3 = fa3_same_dtype && dt == DType::MQ3G256Lloyd;
+                    let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
                     let fused_fa3_paro4t = fa3_same_dtype
                         && dt == DType::PARO4G128T
                         && x_rot_paro.is_none()

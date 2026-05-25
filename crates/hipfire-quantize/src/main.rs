@@ -194,7 +194,7 @@ impl SafetensorsFile {
 /// Plain Qwen2 should be `arch_id=7` (hipfire-arch-qwen2) and Qwen2-VL
 /// family (dots.ocr) should be `arch_id=8` (hipfire-arch-dots-ocr).
 /// See docs/architecture-ids.md and docs/plans/
-/// qwen_2.0_vlm_plus_dots_ocr.md §6 R1.
+/// dots-ocr-devlog.md §7 (R1).
 fn parse_arch_id_override() -> Option<u32> {
     let args: Vec<String> = std::env::args().collect();
     let pos = args.iter().position(|a| a == "--arch-id")?;
@@ -1444,6 +1444,108 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
     output
 }
 
+/// MagnumQuant HFQ4-G256-Lloyd: per-block 16-entry fp16 codebook fitted via
+/// Lloyd's algorithm. 32 B header (16 fp16) + 128 B packed 4-bit indices =
+/// 160 B/group (vs uniform MQ4's 136 B — +17.6% bandwidth). Direct extension
+/// of MQ3-Lloyd with K=16; the conjecture (from
+/// `benchmarks/results/devlog_20260506_lloyd_mq4_extension.md`) is that the
+/// 16-centroid placement narrows the MQ4 → MQ6 ppl gap at lower bandwidth
+/// than uniform MQ6 (200 B/group).
+fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 160;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            // Initial centroid placement: 16 evenly-spaced percentiles
+            // (1/32, 3/32, ..., 31/32) of the rotated block.
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let mut cb: [f32; 16] = [0.0; 16];
+            for k in 0..16 {
+                let frac = (2 * k + 1) as f32 / 32.0;
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                cb[k] = sorted[idx];
+            }
+
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 8;
+                let mut prev_assignments = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 16];
+                    let mut counts = [0u32; 16];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..16 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        prev_assignments[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..16 {
+                        if counts[k] > 0 {
+                            cb[k] = (sums[k] / counts[k] as f64) as f32;
+                        }
+                    }
+                }
+            }
+
+            // Sort centroids ascending; remap indices.
+            let mut order: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 16];
+            let mut inv: [u8; 16] = [0; 16];
+            for new_idx in 0..16 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+
+            // Header: 16 fp16 centroids = 32 bytes.
+            for k in 0..16 {
+                let bits = f32_to_fp16_bits(sorted_cb[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+
+            // Data: 128 bytes — same nibble packing as uniform MQ4
+            // (low nibble = idx[2i], high nibble = idx[2i+1]) so kernel
+            // unpack code is identical; only the recon changes from
+            // `min + scale*q` to `cb[q]`.
+            for i in 0..128 {
+                let lo = indices[2 * i]     & 0x0F;
+                let hi = indices[2 * i + 1] & 0x0F;
+                out_chunk[32 + i] = lo | (hi << 4);
+            }
+        });
+
+    output
+}
+
 /// MagnumQuant HFQ2-G256-Lloyd: per-block 4-entry fp16 codebook fitted via
 /// Lloyd's algorithm to minimize squared reconstruction error on FWHT-rotated
 /// weights. 8 B header (4 fp16) + 64 B packed 2-bit indices = 72 B/group —
@@ -1879,7 +1981,10 @@ enum QuantType {
     PARO4G128 = 28,     // ParoQuant native AWQ W4 + pairwise activation rotation metadata
     PARO4G128T = 29,    // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
-    // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
+// HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
+    MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
+                       // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+                       // Models quantized pre-renumber MUST be re-quantized.
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -1911,7 +2016,7 @@ enum QuantLevel {
 fn default_promote_target(base: GgufFormat) -> GgufFormat {
     match base {
         GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd => GgufFormat::Mq6,
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
         GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
         GgufFormat::Hfp4 => GgufFormat::Hfp4,
         GgufFormat::Mfp4 => GgufFormat::Mfp4,
@@ -2357,8 +2462,17 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
 
 /// Determine which tensors to quantize (weight matrices) vs keep as F16 (norms, embeddings)
 fn should_quantize(name: &str) -> bool {
-    // Vision encoder weights stay FP16 (only 456M params, run once per image)
-    if name.starts_with("model.visual.") || name.starts_with("visual.") {
+    // Vision encoder weights stay FP16 (only ~500M params, run once per image).
+    // Qwen3.5-VL uses `model.visual.*` / `visual.*`; dots.ocr uses
+    // `vision_tower.*`. Both arches keep vision F16 during bring-up so the
+    // per-stage diff against the HF reference activations
+    // (`benchmarks/references/<image>_activations/`) doesn't have to absorb
+    // both forward-pass implementation noise AND quant noise — clean
+    // attribution. See memory `feedback_dots_ocr_vision_f16_during_bringup`.
+    if name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+        || name.starts_with("vision_tower.")
+    {
         return false;
     }
     if name.contains("norm") || name.contains("bias") {
@@ -3084,6 +3198,7 @@ enum GgufFormat {
     Mq2,
     Mq2Lloyd,
     Mq3Lloyd,
+    Mq4Lloyd,
     Hfp4,  // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
     Mfp4,  // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
 }
@@ -3099,6 +3214,7 @@ impl GgufFormat {
             "mq2" | "mq2g256" => Some(Self::Mq2),
             "mq2-lloyd" | "mq2g256-lloyd" | "mq2lloyd" => Some(Self::Mq2Lloyd),
             "mq3-lloyd" | "mq3g256-lloyd" | "mq3lloyd" => Some(Self::Mq3Lloyd),
+            "mq4-lloyd" | "mq4g256-lloyd" | "mq4lloyd" => Some(Self::Mq4Lloyd),
             "hfp4" | "hfp4g32" | "hf4p" | "fp4" => Some(Self::Hfp4),
             "mfp4" | "mfp4g32" | "mf4p" => Some(Self::Mfp4),
             _ => None,
@@ -3115,6 +3231,7 @@ impl GgufFormat {
             Self::Mq2 => "MQ2G256",
             Self::Mq2Lloyd => "MQ2G256Lloyd",
             Self::Mq3Lloyd => "MQ3G256Lloyd",
+            Self::Mq4Lloyd => "MQ4G256Lloyd",
             Self::Hfp4 => "HFP4G32",
             Self::Mfp4 => "MFP4G32",
         }
@@ -3161,7 +3278,7 @@ fn run_gguf_pipeline(
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id: u32 = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -3186,7 +3303,8 @@ fn run_gguf_pipeline(
     // safetensors path so the engine's runtime FWHT inverse stays identical.
     let needs_signs = matches!(format,
         GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mfp4);
+        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd
+        | GgufFormat::Mfp4);
     let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
 
@@ -3344,6 +3462,10 @@ fn run_gguf_pipeline(
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                 }
+                GgufFormat::Mq4Lloyd => {
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                }
                 GgufFormat::Hfq4 => {
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
@@ -3387,6 +3509,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Mq4Lloyd => {
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                 }
                 GgufFormat::Hfp4 => {
                     let m = info.shape[0] as usize;
@@ -3435,6 +3561,10 @@ fn run_gguf_pipeline(
                 GgufFormat::Mq3Lloyd => {
                     let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                }
+                GgufFormat::Mq4Lloyd => {
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                 }
                 GgufFormat::Hfp4 => {
                     let m = info.shape[0] as usize;
@@ -3562,6 +3692,7 @@ fn main() {
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
     let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
     let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
+    let use_mq4g256_lloyd = format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
@@ -3823,6 +3954,28 @@ fn main() {
         );
         std::process::exit(1);
     }
+    // MQ4-Lloyd: extension of MQ3-Lloyd to K=16 centroids. Conjectured to
+    // narrow the MQ4 → MQ6 ppl gap at +17.6% bandwidth over uniform MQ4
+    // (160 vs 136 B/group). Per
+    // benchmarks/results/devlog_20260506_lloyd_mq4_extension.md the
+    // 9B projection is ppl 8.0–9.3 (vs uniform MQ4 ppl 10.34, MQ6 ppl 9.36).
+    // Quality not yet validated — same opt-in gate as MQ3-Lloyd until ppl
+    // numbers land.
+    let allow_mq4_lloyd = args.iter().any(|a| a == "--allow-mq4-lloyd")
+        || std::env::var("HIPFIRE_ALLOW_MQ4_LLOYD").ok().as_deref() == Some("1");
+    if use_mq4g256_lloyd && !allow_mq4_lloyd {
+        eprintln!(
+            "note: --format mq4-lloyd is research — Lloyd-Max 16-entry codebook +\n\
+             4-bit indices (160 B/group, +17.6% over uniform MQ4). Hypothesis is\n\
+             non-uniform codebook narrows the MQ4 → MQ6 ppl gap at lower bandwidth\n\
+             than uniform MQ6. Ppl evidence pending — DO NOT ship MQ4-Lloyd\n\
+             artifacts to users until quality is validated against baseline\n\
+             MQ4/MQ6 ppl on the target model.\n\
+             \n\
+             To proceed, pass --allow-mq4-lloyd or set HIPFIRE_ALLOW_MQ4_LLOYD=1."
+        );
+        std::process::exit(1);
+    }
     // MQ3 quality threshold ≈ 9B from the same sweep — 27B + 9B fluent,
     // 4B partial-collapse (intent recognised, language drifts), 0.8B
     // gibberish. Print a soft advisory so users running --format mq3
@@ -3907,6 +4060,11 @@ fn main() {
         // to qwen3_5 dense, but every layer's FFN is MoE with stacked-3D expert
         // tensors (mlp.experts.gate_up_proj/down_proj are [num_experts, ...]).
         "qwen3_5_moe" | "qwen3_5_moe_text" => 6,
+        // dots.ocr (Qwen2-VL family layout-extraction VLM): plain Qwen2-1.5B
+        // text decoder + 42-block DotsVisionTransformer with 2-D RoPE,
+        // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
+        // dots-ocr-prd.md.
+        "dots_ocr" => 8,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -3914,7 +4072,7 @@ fn main() {
     // (e.g. plain Qwen2 → arch_id=7 for the hipfire-arch-qwen2 crate
     // instead of the LLaMA-family default 1, which silently drops
     // Q/K/V bias on the LLaMA loader path). See docs/plans/
-    // qwen_2.0_vlm_plus_dots_ocr.md §6 R1 for the bring-up context.
+    // dots-ocr-devlog.md §7 (R1) for the bring-up context.
     let arch_id = parse_arch_id_override().unwrap_or(auto_arch_id);
     if arch_id != auto_arch_id {
         eprintln!("Architecture: {arch_str} (auto id={auto_arch_id}, overridden via --arch-id to {arch_id})");
@@ -3960,12 +4118,31 @@ fn main() {
         None
     };
 
+    // Read generation_config.json. HF stores some sampler-side defaults
+    // here (eos_token_id, pad_token_id, bos_token_id, do_sample, etc.)
+    // separately from config.json. For most checkpoints these duplicate
+    // config.json fields, but dots.ocr's config.json carries no
+    // eos_token_id at all — the [151643, 151673] array lives only in
+    // generation_config.json. Packing it here lets the arch-side parser
+    // (e.g. `hipfire-arch-qwen2::Qwen2Config::from_hfq`) fall back to
+    // generation_config when config.eos_token_id is absent. Resolves
+    // R5 in docs/plans/dots-ocr-devlog.md §7.
+    let generation_config_path = input_dir.join("generation_config.json");
+    let generation_config: Option<serde_json::Value> = if generation_config_path.exists() {
+        std::fs::read_to_string(&generation_config_path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
+
     // Build metadata JSON for .hfq
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
+        "generation_config": generation_config,
     });
     let metadata_json = serde_json::to_string(&metadata).unwrap();
 
@@ -4209,8 +4386,14 @@ fn main() {
         .unwrap_or_default();
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip MTP head; optionally include vision encoder for VL inference
-        let is_vision = name.starts_with("model.visual.") || name.starts_with("visual.");
+        // Skip MTP head; optionally include vision encoder for VL inference.
+        // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
+        // dots.ocr names them `vision_tower.*`. Both fall through to the
+        // F16 fallback path (see should_quantize: vision_tower.* is
+        // skipped from quantization) when --include-vision is set.
+        let is_vision = name.starts_with("model.visual.")
+            || name.starts_with("visual.")
+            || name.starts_with("vision_tower.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
@@ -4333,6 +4516,10 @@ fn main() {
                             GgufFormat::Mq3Lloyd => {
                                 let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
                                 (q, QuantType::MQ3G256Lloyd, 256u32)
+                            }
+                            GgufFormat::Mq4Lloyd => {
+                                let q = quantize_mq4g256_lloyd(&f32_slice, &signs1, &signs2);
+                                (q, QuantType::MQ4G256Lloyd, 256u32)
                             }
                             GgufFormat::Hfq4 => {
                                 let q = quantize_hfq4g256(&f32_slice);
@@ -4568,6 +4755,10 @@ fn main() {
                             let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                             (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                         }
+                        GgufFormat::Mq4Lloyd => {
+                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                        }
                         GgufFormat::Hfq4 => {
                             let q = quantize_hfq4g256(&f32_data);
                             (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
@@ -4672,6 +4863,10 @@ fn main() {
                         GgufFormat::Mq3Lloyd => {
                             let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
                             (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                        }
+                        GgufFormat::Mq4Lloyd => {
+                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
                         }
                         GgufFormat::Mfp4 => {
                             let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
@@ -4926,9 +5121,21 @@ fn main() {
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
-            } else if (use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq3g256_lloyd) && is_embed {
+            } else if (use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq3g256_lloyd || use_mq4g256_lloyd) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
+            } else if use_mq4g256_lloyd {
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if k_dim % 256 == 0 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                } else {
+                    // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
+                    let q = quantize_hfq4g128(&f32_data);
+                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                }
             } else if use_mq3g256_lloyd {
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if k_dim % 256 == 0 {
