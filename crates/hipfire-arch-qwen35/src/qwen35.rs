@@ -4929,6 +4929,10 @@ fn forward_prefill_chunk(
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
 
     for layer_idx in layer_start..layer_end {
+        // Set the MMQ layer counter for per-layer KLD attribution sweeps
+        // (issue #302). No-op outside the sweep — the layer gate is open
+        // by default. Cheap atomic store, runs once per layer.
+        rdna_compute::MMQ_CURRENT_LAYER.store(layer_idx, std::sync::atomic::Ordering::Relaxed);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Per-layer dtype branch: MQ4 needs FWHT-rotation on the

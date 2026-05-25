@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -200,6 +201,37 @@ fn hfq3_dp4a_enabled(arch: &str) -> bool {
         return false;
     }
     hfq3_sdot4_gfx10_enabled(arch)
+}
+
+/// Current layer index, set by the qwen35 forward_prefill_chunk at the
+/// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
+/// support per-layer MMQ-on/off experiments (see issue #302 — KLD
+/// attribution sweep). Default 0; no semantic meaning outside an
+/// instrumented sweep.
+pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the current layer index falls within the
+/// `HIPFIRE_HFQ3_MMQ_LAYER_MIN..=HIPFIRE_HFQ3_MMQ_LAYER_MAX` range, if
+/// either is set. Both env vars are OnceLock-cached. Default open
+/// (always pass) when neither var is set — preserves current routing.
+fn hfq3_mmq_layer_gate_pass() -> bool {
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    let lo = *MIN.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_MMQ_LAYER_MIN").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    let hi = *MAX.get_or_init(|| {
+        std::env::var("HIPFIRE_HFQ3_MMQ_LAYER_MAX").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    if lo.is_none() && hi.is_none() {
+        return true;  // gate open
+    }
+    let layer = MMQ_CURRENT_LAYER.load(Ordering::Relaxed);
+    if let Some(lo) = lo { if layer < lo { return false; } }
+    if let Some(hi) = hi { if layer > hi { return false; } }
+    true
 }
 
 /// Whether to route HFQ3 residual through the experimental wave32 MMQ
@@ -474,6 +506,40 @@ fn fp16_disabled() -> bool {
     *CACHE.get_or_init(|| {
         std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
     })
+}
+
+/// Whether FP16 fast paths are disabled FOR THE CURRENT LAYER, considering
+/// both the global `HIPFIRE_FP16=0` flag and the per-layer
+/// `HIPFIRE_FP16_LAYER_MIN..=HIPFIRE_FP16_LAYER_MAX` range. Used by the
+/// HFQ3 dispatcher chain to support per-layer FP16-vs-scalar KLD
+/// attribution sweeps (issue #302).
+///
+/// Returns `true` (= disable FP16, force scalar) when either:
+///   - the global `HIPFIRE_FP16=0` is set, OR
+///   - the current layer (`MMQ_CURRENT_LAYER`) falls within the
+///     `HIPFIRE_FP16_LAYER_MIN..=HIPFIRE_FP16_LAYER_MAX` range
+///
+/// When neither env var is set the per-layer range is inactive — the
+/// function reduces to `fp16_disabled()` and routing is unchanged.
+fn fp16_disabled_for_current_layer() -> bool {
+    if fp16_disabled() { return true; }
+    static MIN: OnceLock<Option<usize>> = OnceLock::new();
+    static MAX: OnceLock<Option<usize>> = OnceLock::new();
+    let lo = *MIN.get_or_init(|| {
+        std::env::var("HIPFIRE_FP16_LAYER_MIN").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    let hi = *MAX.get_or_init(|| {
+        std::env::var("HIPFIRE_FP16_LAYER_MAX").ok()
+            .and_then(|v| v.parse::<usize>().ok())
+    });
+    if lo.is_none() && hi.is_none() {
+        return false;  // per-layer gate not active
+    }
+    let layer = MMQ_CURRENT_LAYER.load(Ordering::Relaxed);
+    let above_min = lo.map(|m| layer >= m).unwrap_or(true);
+    let below_max = hi.map(|m| layer <= m).unwrap_or(true);
+    above_min && below_max  // in-range → disable FP16 for this layer
 }
 
 /// Cached env-var read for `HIPFIRE_WO_MMQ=1` (opt-in MMQ for the wo path
@@ -5721,6 +5787,39 @@ impl Gpu {
                     return r1.and(r2).and(r3).and(r4);
                 }
             }
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 4). Three modes:
+            //   (a) all 4 Ms aligned to MMQ_Y=128 → single 4-way fused MMQ kernel
+            //   (b) qkv_m and z_m aligned but beta_m/alpha_m not (LinearAttention
+            //       β+α are typically tiny, well below 128) → split routing:
+            //       2-way gate_up MMQ on (wqkv, wz) + 2-way gate_up dot2 on
+            //       (w_beta, w_alpha). Mirrors MQ3 phase-2 finding that
+            //       gave +22% prefill on Qwen3.5 LA layers.
+            //   (c) something else not aligned → fall through to dot2/wmma.
+            if hfq4_mmq_rdna2_enabled(&self.arch) {
+                let all_aligned = qkv_m % 128 == 0 && z_m % 128 == 0
+                               && beta_m % 128 == 0 && alpha_m % 128 == 0;
+                if all_aligned {
+                    return self.gemm_qkvza_hfq4g256_mmq(
+                        a_qkv, a_z, a_beta, a_alpha, x,
+                        y_qkv, y_z, y_beta, y_alpha,
+                        qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+                    );
+                }
+                if qkv_m % 128 == 0 && z_m % 128 == 0 {
+                    // Split: 2-way MMQ on qkv+z, 2-way dot2 on β+α.
+                    let r1 = self.gemm_gate_up_hfq4g256_mmq(
+                        a_qkv, a_z, x, y_qkv, y_z, qkv_m, z_m, k, batch_size,
+                    );
+                    let r2 = if r1.is_ok() {
+                        self.gemm_gate_up_hfq4g256_dot2(
+                            a_beta, a_alpha, x, y_beta, y_alpha,
+                            beta_m, alpha_m, k, batch_size,
+                        )
+                    } else { Ok(()) };
+                    return r1.and(r2);
+                }
+                // else fall through to dot2/wmma
+            }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
@@ -5828,21 +5927,54 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
-        // AND all four output strides are MMQ_Y-aligned. Auto-selector falls
-        // back to dot2 at small batch.
+        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1.
+        // Auto-selector falls back to dot2 at small batch. Layer-gate
+        // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
+        // per-layer KLD attribution sweeps (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
-            && qkv_m % 128 == 0 && z_m % 128 == 0
-            && beta_m % 128 == 0 && alpha_m % 128 == 0
+            && hfq3_mmq_layer_gate_pass()
         {
-            return self.gemm_qkvza_hfq3g256_mmq(
-                a_qkv, a_z, a_beta, a_alpha, x,
-                y_qkv, y_z, y_beta, y_alpha,
-                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
-            );
+            // Best case: all four output strides MMQ_Y-aligned → 4-way fused MMQ.
+            // Hits on Qwen3.5-VL ViT and any model where beta/alpha aren't
+            // per-head scalars.
+            if qkv_m % 128 == 0 && z_m % 128 == 0
+                && beta_m % 128 == 0 && alpha_m % 128 == 0
+            {
+                return self.gemm_qkvza_hfq3g256_mmq(
+                    a_qkv, a_z, a_beta, a_alpha, x,
+                    y_qkv, y_z, y_beta, y_alpha,
+                    qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+                );
+            }
+            // Common case: qkv + z are aligned but beta/alpha are small
+            // (per-head scalars — Qwen3.5/A3B DeltaNet LA layers have
+            // beta_m = alpha_m = num_value_heads, often 16 or 32). Split
+            // routing: MMQ on the qkv+z 2-way, dot2 on the beta+alpha 2-way.
+            // Reuses the existing `gemm_gate_up_*` 2-way kernels which are
+            // semantically agnostic (any 2 weights, any 2 outputs).
+            //
+            // Cost: 1 extra kernel launch per LA layer per chunk vs the
+            // ideal fused path (~5μs × num_LA_layers ≈ 100-150μs across
+            // a full forward — well under 0.1% of prefill wall).
+            //
+            // Win: the qkv+z chunk is the dominant compute (qkv_m + z_m
+            // is typically 100-200× larger than beta_m + alpha_m); MMQ-ing
+            // it gives ~the full MMQ speedup on the qkvza preamble.
+            if qkv_m % 128 == 0 && z_m % 128 == 0 {
+                self.gemm_gate_up_hfq3g256_mmq(
+                    a_qkv, a_z, x, y_qkv, y_z, qkv_m, z_m, k, batch_size,
+                )?;
+                return self.gemm_gate_up_hfq3g256_dot2(
+                    a_beta, a_alpha, x, y_beta, y_alpha, beta_m, alpha_m, k, batch_size,
+                );
+            }
+            // No MMQ-able split possible — fall through to dot2/fp16.
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302): falls through to scalar when the
+        // current layer falls in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when
+        // those env vars are unset.
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_qkvza_hfq3g256_dot2(
                     a_qkv, a_z, a_beta, a_alpha, x,
@@ -6425,6 +6557,12 @@ impl Gpu {
                     return r1.and(r2).and(r3);
                 }
             }
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
+            // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
+            // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
+            if hfq4_mmq_rdna2_enabled(&self.arch) && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+                return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
+            }
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -6527,8 +6665,9 @@ impl Gpu {
         // Phase 3 experimental: MMQ family (auto-tile-selecting). Fires only
         // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
-        // safe at any batch_size.
+        // safe at any batch_size. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && hfq3_mmq_layer_gate_pass()
             && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0
         {
             return self.gemm_qkv_hfq3g256_mmq(
@@ -6543,7 +6682,9 @@ impl Gpu {
         }
         // FP16 fast paths — gfx10xx admits MQ3 via is_batchable_la, all of
         // these archs support FP16 ISA. Phase 2b (dot2) + Phase 2c (fp16).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302) falls through to scalar when layer
+        // in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when those vars are unset.
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             // v_dot2_f32_f16 on archs with the dot extension
             // (gfx1011/1012/1030-1032, gfx11/12).
             if has_dot2_f32_f16(&self.arch) {
@@ -7164,6 +7305,10 @@ impl Gpu {
                     return r1.and(r2);
                 }
             }
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 3).
+            if hfq4_mmq_rdna2_enabled(&self.arch) && gate_m % 128 == 0 && up_m % 128 == 0 {
+                return self.gemm_gate_up_hfq4g256_mmq(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
+            }
             // WMMA on gfx12 (RDNA4)
             if has_wmma_f16_gfx12(&self.arch) {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
@@ -7301,8 +7446,9 @@ impl Gpu {
         self.bind_thread()?;
         // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
         // AND gate_m/up_m are MMQ_Y-aligned. Auto-selector falls back to dot2
-        // at small batch.
+        // at small batch. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+            && hfq3_mmq_layer_gate_pass()
             && gate_m % 128 == 0 && up_m % 128 == 0
         {
             return self.gemm_gate_up_hfq3g256_mmq(
@@ -7316,7 +7462,8 @@ impl Gpu {
             );
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -7605,12 +7752,20 @@ impl Gpu {
             }
             return self.gemm_hfq3g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
+        // Gate boundaries from `examples/bench_hfq3_mmq_sweep.rs`:
+        //   batch ≤ 12:  dot2 (MMQ tile granularity wastes compute)
+        //   13..=63:     mmq_x=16 (wins moderate-N regime)
+        //   batch ≥ 64:  mmq_x=32 with MMQ_Y=64 (higher-occupancy variant
+        //                — wins at long N where the LDS budget reduction
+        //                from y128→y64 lets 4 WG/CU instead of 2 → ~48%
+        //                occupancy. Beats both mmq_x32_y128 and mmq_x16
+        //                at N≥64 by 5-14%).
         if batch_size <= 12 {
             self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size)
-        } else if batch_size <= 127 {
+        } else if batch_size <= 63 {
             self.gemm_hfq3g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
         } else {
-            self.gemm_hfq3g256_residual_mmq_x32(a_raw, x, y, m, k, batch_size)
+            self.gemm_hfq3g256_residual_mmq_x32_y64(a_raw, x, y, m, k, batch_size)
         }
     }
 
@@ -7623,6 +7778,27 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        self.launch_hfq3_mmq_tile_with_y(a_raw, x, y, m, k, batch_size, mmq_x, 128, kernel_name, src)
+    }
+
+    /// MMQ_Y-parameterized variant of `launch_hfq3_mmq_tile`. The body.cuh
+    /// uses `#ifndef MMQ_Y / #define MMQ_Y 128 / #endif`, so each wrapper
+    /// can override the row-tile size. The y=64 variant trades per-WG
+    /// compute for higher occupancy (issue #300 follow-up).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hfq3_mmq_tile_with_y(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
         kernel_name: &'static str,
         src: &'static str,
     ) -> HipResult<()> {
@@ -7652,14 +7828,13 @@ impl Gpu {
         ];
 
         // LDS layout — must match the body.cuh constants:
-        //   x_qs: 128 × X_STRIDE(40) ints + x_dm: 128 × float2
+        //   x_qs: mmq_y × X_STRIDE(40) ints + x_dm: mmq_y × float2
         //   tile_y: mmq_x × Y_STRIDE(36) ints
-        const MMQ_Y: usize = 128;
         const X_STRIDE: usize = 40;
         const Y_STRIDE: usize = 36;
-        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
 
-        let row_tiles = (m + MMQ_Y - 1) / MMQ_Y;
+        let row_tiles = (m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let bytes = crate::profile::gemm_hfq3g256_bytes(m, k, batch_size)
@@ -7719,6 +7894,42 @@ impl Gpu {
             a_raw, x, y, m, k, batch_size,
             32, "gemm_hfq3g256_residual_mmq_x32",
             kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ3 MMQ residual experimental MMQ_Y=64 variant (mmq_x=32).
+    /// Halves the row tile to cut LDS budget (~26 KB → ~15 KB per WG),
+    /// targeting 4 WGs/CU instead of 2 → ~48% occupancy vs ~24%.
+    /// Issue #300 follow-up; for A/B vs the default `_mmq_x32` (MMQ_Y=128).
+    pub fn gemm_hfq3g256_residual_mmq_x32_y64(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 64,
+            "gemm_hfq3g256_residual_mmq_x32_y64",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y64_SRC,
+        )
+    }
+
+    /// HFQ3 MMQ residual experimental MMQ_Y=32 variant (mmq_x=32).
+    /// Further LDS cut: ~10 KB/WG → 6 WG/CU theoretical (~72% occupancy).
+    /// Risk: per-WG work is 1/4 of y128 → dispatch overhead and reduced
+    /// latency-hiding margin may negate the occupancy win.
+    pub fn gemm_hfq3g256_residual_mmq_x32_y32(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq3_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 32,
+            "gemm_hfq3g256_residual_mmq_x32_y32",
+            kernels::GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y32_SRC,
         )
     }
 
@@ -7919,6 +8130,11 @@ impl Gpu {
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
+        // y64 variant TESTED but REGRESSED on gate_up (LRU 240: 668 → 641
+        // tok/s, -4%). Gate_up has different characteristics from residual —
+        // per-WG work is 2× (gate + up weights) so halving rows hurts more
+        // than the occupancy improvement gains. Keep y128 for gate_up.
+        // Dedicated gate_up sweep would let us re-tune (#300 follow-up).
         if batch_size <= 12 {
             self.gemm_gate_up_hfq3g256_dot2(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -7944,6 +8160,28 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            mmq_x, 128, kernel_name, src,
+        )
+    }
+
+    /// MMQ_Y-parameterized variant of the gate_up MMQ launch helper.
+    /// Mirrors `launch_hfq3_mmq_tile_with_y` for the 2-way fused path.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_hfq3_mmq_tile_with_y(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
         kernel_name: &'static str,
         src: &'static str,
     ) -> HipResult<()> {
@@ -7977,13 +8215,12 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
-        const MMQ_Y: usize = 128;
         const X_STRIDE: usize = 40;
         const Y_STRIDE: usize = 36;
-        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
 
         let total_m = gate_m + up_m;
-        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let row_tiles = (total_m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
 
         let bytes = crate::profile::gemm_hfq3g256_bytes(gate_m, k, batch_size)
@@ -8050,6 +8287,44 @@ impl Gpu {
             a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             32, "gemm_gate_up_hfq3g256_mmq_x32",
             kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ3 gate_up MMQ mmq_x=32, MMQ_Y=96 — sweet-spot probe between
+    /// y=64 (regressed) and y=128 (current default). 20 KB LDS/WG → 3
+    /// WG/CU → ~37% occupancy.
+    pub fn gemm_gate_up_hfq3g256_mmq_x32_y96(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            32, 96,
+            "gemm_gate_up_hfq3g256_mmq_x32_y96",
+            kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y96_SRC,
+        )
+    }
+
+    /// HFQ3 gate_up MMQ mmq_x=32, MMQ_Y=64 — higher-occupancy variant.
+    /// Halves the row tile to drop LDS to ~15 KB/WG (4 WG/CU instead of 2).
+    /// Issue #300 follow-up. Used by the auto-selector at batch ≥ 64.
+    pub fn gemm_gate_up_hfq3g256_mmq_x32_y64(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq3_mmq_tile_with_y(
+            a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
+            32, 64,
+            "gemm_gate_up_hfq3g256_mmq_x32_y64",
+            kernels::GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y64_SRC,
         )
     }
 
@@ -8244,6 +8519,531 @@ impl Gpu {
             32, "gemm_qkvza_hfq3g256_mmq_x32",
             kernels::GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC,
         )
+    }
+
+    /// MMQ_Y-parameterized tile launcher for HFQ4 residual kernels.
+    /// Mirrors `launch_hfq3_mmq_tile_with_y`; body.cuh uses `#ifndef MMQ_Y`
+    /// so each wrapper can override the row tile. Issue #299.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_hfq4_mmq_tile_with_y(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        mmq_x: usize,
+        mmq_y: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_hfq4g256_residual_mmq_body.cuh\"",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut ap = a_raw.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut yp = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (mmq_y * X_STRIDE * 4 + mmq_y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let row_tiles = (m + mmq_y - 1) / mmq_y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+                  + batch_size * k
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 MMQ residual mmq_x=16. Mid-batch tile (best in HFQ3 sweep for
+    /// 13 ≤ N ≤ 63). Issue #299.
+    pub fn gemm_hfq4g256_residual_mmq_x16(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            16, 128,
+            "gemm_hfq4g256_residual_mmq_x16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 MMQ residual mmq_x=32. Long-prefill tile (N ≥ 64 in HFQ3 sweep).
+    pub fn gemm_hfq4g256_residual_mmq_x32(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 128,
+            "gemm_hfq4g256_residual_mmq_x32",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 MMQ residual mmq_x=32, MMQ_Y=64. Halves the row tile to
+    /// double theoretical CU occupancy. MQ3 phase-2 finding transferred.
+    pub fn gemm_hfq4g256_residual_mmq_x32_y64(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_hfq4_mmq_tile_with_y(
+            a_raw, x, y, m, k, batch_size,
+            32, 64,
+            "gemm_hfq4g256_residual_mmq_x32_y64",
+            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_X32_Y64_SRC,
+        )
+    }
+
+    /// HFQ4 RDNA2 MMQ residual auto-selector — batch-size gated tile picker.
+    /// Mirrors `gemm_hfq3g256_residual_mmq` boundaries pending HFQ4 sweep.
+    /// Distinct from `gemm_hfq4g256_residual_mmq` (RDNA3+ llama.cpp-style
+    /// path gated by `HIPFIRE_WO_MMQ=1`) which lives at a different LDS
+    /// layout and was not part of the gfx10 MQ3 prefill work.
+    pub fn gemm_hfq4g256_residual_mmq_rdna2_auto(
+        &mut self,
+        a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_hfq4g256_residual_mmq_x16(a_raw, x, y, m, k, batch_size)
+        } else {
+            self.gemm_hfq4g256_residual_mmq_x32_y64(a_raw, x, y, m, k, batch_size)
+        }
+    }
+
+    // ── HFQ4 qkv MMQ family (3-way fused Q+K+V) — issue #299 Phase 2 ────
+    //
+    // Same launch shape as the residual family but takes 3 weight pointers
+    // and 3 output pointers; routes per-WG based on which of q_m / k_m / v_m
+    // the row tile falls into.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qkv_hfq4_mmq_tile(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_qkv_hfq4g256_mmq_body.cuh\"",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut a_q_p = a_q.buf.as_ptr();
+        let mut a_k_p = a_k.buf.as_ptr();
+        let mut a_v_p = a_v.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut y_q_p = y_q.buf.as_ptr();
+        let mut y_k_p = y_k.buf.as_ptr();
+        let mut y_v_p = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_q_p as *mut _ as *mut c_void,
+            &mut a_k_p as *mut _ as *mut c_void,
+            &mut a_v_p as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut y_q_p as *mut _ as *mut c_void,
+            &mut y_k_p as *mut _ as *mut c_void,
+            &mut y_v_p as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(k_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(v_m, k)
+                  + batch_size * k
+                  + batch_size * (q_m + k_m + v_m) * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 qkv MMQ mmq_x=16. Issue #299 Phase 2.
+    pub fn gemm_qkv_hfq4g256_mmq_x16(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkv_hfq4_mmq_tile(
+            a_q, a_k, a_v, x, y_q, y_k, y_v,
+            q_m, k_m, v_m, k, batch_size,
+            16, "gemm_qkv_hfq4g256_mmq_x16",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 qkv MMQ mmq_x=32. Issue #299 Phase 2.
+    pub fn gemm_qkv_hfq4g256_mmq_x32(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkv_hfq4_mmq_tile(
+            a_q, a_k, a_v, x, y_q, y_k, y_v,
+            q_m, k_m, v_m, k, batch_size,
+            32, "gemm_qkv_hfq4g256_mmq_x32",
+            kernels::GEMM_QKV_HFQ4G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 qkv MMQ batch-size auto-selector. Mirrors HFQ3 boundaries.
+    pub fn gemm_qkv_hfq4g256_mmq(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_qkv_hfq4g256_mmq_x16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
+        } else {
+            self.gemm_qkv_hfq4g256_mmq_x32(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size)
+        }
+    }
+
+    // ── HFQ4 gate_up MMQ family (2-way fused gate+up) — issue #299 Phase 3 ──
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gate_up_hfq4_mmq_tile(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_gate_up_hfq4g256_mmq_body.cuh\"",
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut a_gate_p = a_gate.buf.as_ptr();
+        let mut a_up_p = a_up.buf.as_ptr();
+        let mut xq = xq_ptr;
+        let mut y_gate_p = y_gate.buf.as_ptr();
+        let mut y_up_p = y_up.buf.as_ptr();
+        let mut gate_m_val = gate_m as i32;
+        let mut up_m_val = up_m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_gate_p as *mut _ as *mut c_void,
+            &mut a_up_p as *mut _ as *mut c_void,
+            &mut xq as *mut _ as *mut c_void,
+            &mut y_gate_p as *mut _ as *mut c_void,
+            &mut y_up_p as *mut _ as *mut c_void,
+            &mut gate_m_val as *mut _ as *mut c_void,
+            &mut up_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let total_m = gate_m + up_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(up_m, k)
+                  + batch_size * k
+                  + batch_size * (gate_m + up_m) * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 gate_up MMQ mmq_x=16. Issue #299 Phase 3.
+    pub fn gemm_gate_up_hfq4g256_mmq_x16(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq4_mmq_tile(
+            a_gate, a_up, x, y_gate, y_up,
+            gate_m, up_m, k, batch_size,
+            16, "gemm_gate_up_hfq4g256_mmq_x16",
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 gate_up MMQ mmq_x=32. Issue #299 Phase 3.
+    pub fn gemm_gate_up_hfq4g256_mmq_x32(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_gate_up_hfq4_mmq_tile(
+            a_gate, a_up, x, y_gate, y_up,
+            gate_m, up_m, k, batch_size,
+            32, "gemm_gate_up_hfq4g256_mmq_x32",
+            kernels::GEMM_GATE_UP_HFQ4G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 gate_up MMQ batch-size auto-selector.
+    pub fn gemm_gate_up_hfq4g256_mmq(
+        &mut self,
+        a_gate: &GpuTensor, a_up: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor, y_up: &GpuTensor,
+        gate_m: usize, up_m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_gate_up_hfq4g256_mmq_x16(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size)
+        } else {
+            self.gemm_gate_up_hfq4g256_mmq_x32(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size)
+        }
+    }
+
+    // ── HFQ4 qkvza MMQ family (4-way fused LA preamble) — issue #299 Phase 4 ──
+    #[allow(clippy::too_many_arguments)]
+    fn launch_qkvza_hfq4_mmq_tile(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize, batch_size: usize,
+        mmq_x: usize,
+        kernel_name: &'static str,
+        src: &'static str,
+    ) -> HipResult<()> {
+        let inlined = src.replace(
+            "#include \"gemm_qkvza_hfq4g256_mmq_body.cuh\"",
+            kernels::GEMM_QKVZA_HFQ4G256_MMQ_BODY_CUH,
+        );
+        self.ensure_kernel(kernel_name, &inlined, kernel_name)?;
+        let xq_ptr = self.ensure_q8_1_mmq_x(x, batch_size, k)?;
+        let func = &self.functions[kernel_name];
+
+        let mut a_qkv_p   = a_qkv.buf.as_ptr();
+        let mut a_z_p     = a_z.buf.as_ptr();
+        let mut a_beta_p  = a_beta.buf.as_ptr();
+        let mut a_alpha_p = a_alpha.buf.as_ptr();
+        let mut xq        = xq_ptr;
+        let mut y_qkv_p   = y_qkv.buf.as_ptr();
+        let mut y_z_p     = y_z.buf.as_ptr();
+        let mut y_beta_p  = y_beta.buf.as_ptr();
+        let mut y_alpha_p = y_alpha.buf.as_ptr();
+        let mut qkv_m_val   = qkv_m   as i32;
+        let mut z_m_val     = z_m     as i32;
+        let mut beta_m_val  = beta_m  as i32;
+        let mut alpha_m_val = alpha_m as i32;
+        let mut k_val       = k as i32;
+        let mut bs_val      = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_qkv_p   as *mut _ as *mut c_void,
+            &mut a_z_p     as *mut _ as *mut c_void,
+            &mut a_beta_p  as *mut _ as *mut c_void,
+            &mut a_alpha_p as *mut _ as *mut c_void,
+            &mut xq        as *mut _ as *mut c_void,
+            &mut y_qkv_p   as *mut _ as *mut c_void,
+            &mut y_z_p     as *mut _ as *mut c_void,
+            &mut y_beta_p  as *mut _ as *mut c_void,
+            &mut y_alpha_p as *mut _ as *mut c_void,
+            &mut qkv_m_val   as *mut _ as *mut c_void,
+            &mut z_m_val     as *mut _ as *mut c_void,
+            &mut beta_m_val  as *mut _ as *mut c_void,
+            &mut alpha_m_val as *mut _ as *mut c_void,
+            &mut k_val       as *mut _ as *mut c_void,
+            &mut bs_val      as *mut _ as *mut c_void,
+        ];
+
+        const MMQ_Y: usize = 128;
+        const X_STRIDE: usize = 40;
+        const Y_STRIDE: usize = 36;
+        let shared_mem = (MMQ_Y * X_STRIDE * 4 + MMQ_Y * 8 + mmq_x * Y_STRIDE * 4) as u32;
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
+        let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(z_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
+                  + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
+                  + batch_size * k
+                  + batch_size * total_m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [row_tiles as u32, col_tiles as u32, 1],
+                [32, 4, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ4 qkvza MMQ mmq_x=16. Issue #299 Phase 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_mmq_x16(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkvza_hfq4_mmq_tile(
+            a_qkv, a_z, a_beta, a_alpha, x,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            16, "gemm_qkvza_hfq4g256_mmq_x16",
+            kernels::GEMM_QKVZA_HFQ4G256_MMQ_X16_SRC,
+        )
+    }
+
+    /// HFQ4 qkvza MMQ mmq_x=32. Issue #299 Phase 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_mmq_x32(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_qkvza_hfq4_mmq_tile(
+            a_qkv, a_z, a_beta, a_alpha, x,
+            y_qkv, y_z, y_beta, y_alpha,
+            qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            32, "gemm_qkvza_hfq4g256_mmq_x32",
+            kernels::GEMM_QKVZA_HFQ4G256_MMQ_X32_SRC,
+        )
+    }
+
+    /// HFQ4 qkvza MMQ batch-size auto-selector.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_mmq(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if batch_size <= 63 {
+            self.gemm_qkvza_hfq4g256_mmq_x16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size)
+        } else {
+            self.gemm_qkvza_hfq4g256_mmq_x32(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size)
+        }
     }
 
     /// Wave32 MMQ residual kernel for HFQ4 on RDNA2+ — Phase 3 side-win probe.
@@ -13101,8 +13901,13 @@ impl Gpu {
         // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
         // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
         // gate is OnceLock-cached. Default off.
+        //
+        // Issue #299 follow-up: route through the tile-size auto-selector
+        // so narrow-batch calls pick mmq_x=16 and long-prefill picks
+        // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
+        // internally, so no alignment check needed.
         if batch_size > 1 && hfq4_mmq_rdna2_enabled(&self.arch) {
-            return self.gemm_hfq4g256_residual_mmq_rdna2(a_raw, x, y, m, k, batch_size);
+            return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
 
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
@@ -13260,12 +14065,13 @@ impl Gpu {
         // Phase 3 experimental: wave32 MMQ if HIPFIRE_HFQ3_MMQ=1. Env gate is
         // OnceLock-cached so the env read is one-shot per process; the arch
         // match is a handful of cycles per dispatch call (not in any inner
-        // loop). Default off.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) {
+        // loop). Default off. Layer-gate is a no-op when unset (#302).
+        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) && hfq3_mmq_layer_gate_pass() {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !fp16_disabled_for_current_layer() {
             if has_dot2_f32_f16(&self.arch) {
                 return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
             }
