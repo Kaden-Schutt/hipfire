@@ -10,6 +10,10 @@
 //!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
 //!       ~/.hipfire/models/qwen3.5-35b-a3b.mq4
 //!
+//!   # ParoQuant / HF safetensors directory (auto-routes by path-is-dir):
+//!   cargo run --release --features deltanet --example a3b_smoke_forward -- \
+//!       ~/.hipfire/models/shisa-Qwen3.6-35B-A3B-PARO-packed
+//!
 //!   # Optional: generate N tokens greedily to probe short-term stability.
 //!   HIPFIRE_SMOKE_STEPS=8 cargo run --release ...
 
@@ -25,25 +29,50 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: a3b_smoke_forward <model.mq4>");
+        eprintln!("Usage: a3b_smoke_forward <model.mq4 | safetensors-dir>");
         std::process::exit(1);
     }
-    let model_path = &args[1];
+    let model_path = Path::new(&args[1]);
     let n_steps: usize = std::env::var("HIPFIRE_SMOKE_STEPS")
         .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
 
-    eprintln!("Opening: {model_path}");
-    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    assert!(config.num_experts > 0, "this smoke test expects a MoE model");
-
-    eprintln!("A3B config: dim={}, layers={}, experts={}, top_k={}, moe_inter={}, shared_inter={}",
-        config.dim, config.n_layers, config.num_experts, config.num_experts_per_tok,
-        config.moe_intermediate_size, config.shared_expert_intermediate_size);
-
-    eprintln!("Loading weights ...");
+    eprintln!("Opening: {}", model_path.display());
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+
+    // Auto-route safetensors directories (ParoQuant / HF native) — mirrors
+    // eval_hipfire.rs:165-176 and daemon.rs:1500-1504. HFQ files take the
+    // canonical HFQ path below.
+    let (config, weights, tokenizer) = if model_path.is_dir() {
+        use hipfire_runtime::safetensors_source::SafetensorsSource;
+        use hipfire_runtime::model_source::ModelSource;
+        let source = SafetensorsSource::open(model_path).expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
+        assert!(config.num_experts > 0, "this smoke test expects a MoE model");
+        eprintln!("A3B config: dim={}, layers={}, experts={}, top_k={}, moe_inter={}, shared_inter={}",
+            config.dim, config.n_layers, config.num_experts, config.num_experts_per_tok,
+            config.moe_intermediate_size, config.shared_expert_intermediate_size);
+        eprintln!("Loading weights via safetensors (ParoQuant path) ...");
+        let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("load_weights_paroquant");
+        let tok_path = source.tokenizer_json_path()
+            .expect("tokenizer.json in safetensors directory");
+        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&tok_path)
+            .expect("tokenizer parse")
+            .expect("tokenizer load");
+        (config, weights, tokenizer)
+    } else {
+        let mut hfq = HfqFile::open(model_path).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        assert!(config.num_experts > 0, "this smoke test expects a MoE model");
+        eprintln!("A3B config: dim={}, layers={}, experts={}, top_k={}, moe_inter={}, shared_inter={}",
+            config.dim, config.n_layers, config.num_experts, config.num_experts_per_tok,
+            config.moe_intermediate_size, config.shared_expert_intermediate_size);
+        eprintln!("Loading weights ...");
+        let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+        let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+            .expect("tokenizer");
+        (config, weights, tokenizer)
+    };
     eprintln!("Loaded {} layers.", weights.layers.len());
 
     let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
@@ -82,8 +111,6 @@ fn main() {
     let prompt_mode = std::env::var("HIPFIRE_SMOKE_MODE").unwrap_or_else(|_| "raw".to_string());
     let user_prompt = std::env::var("HIPFIRE_SMOKE_PROMPT")
         .unwrap_or_else(|_| "Hello".to_string());
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .expect("tokenizer");
 
     let prompt_tokens: Vec<u32> = if prompt_mode == "chat" {
         let im_start = tokenizer.encode("<|im_start|>");

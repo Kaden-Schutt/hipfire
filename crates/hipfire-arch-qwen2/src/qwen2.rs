@@ -379,6 +379,7 @@ fn load_lm_head(
             m: cfg.vocab_size,
             k: cfg.hidden_size,
             row_stride: 0,
+            paro: None,
             awq_scale: None,
         };
         Ok((wt, true))
@@ -497,11 +498,11 @@ fn load_weight_tensor(
     match info.quant_type {
         6 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         7 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         3 => {
             // Q8F16 (= GGML Q8_0 layout): [F16 scale ‖ 32× INT8]. The fused
@@ -511,11 +512,11 @@ fn load_weight_tensor(
             // the high-precision sweep (`--format q8`) to discriminate
             // forward-pass correctness from HFQ4 quant noise.
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         1 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
                      This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \

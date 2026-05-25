@@ -19,12 +19,20 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
+// MMQ_Y is the row tile (output rows per workgroup). Default 128.
+// Per-WG LDS budget scales with MMQ_Y; lowering it to 64 trades
+// per-WG compute for higher CU occupancy (experiment in #300 follow-up).
+#ifndef MMQ_Y
 #define MMQ_Y 128
+#endif
 #define MMQ_NWARPS 4
 #define WAVE_SIZE 32
 #define QK8_1 32
 #define X_STRIDE 40
 #define Y_STRIDE 36
+// X-tile loader task count: each thread loops `(MMQ_Y * 16) / 128` times.
+// At MMQ_Y=128 → 16 loops/thread (the original); at MMQ_Y=64 → 8 loops.
+#define X_LOADER_TASKS_PER_THREAD ((MMQ_Y * 16) / 128)
 
 #ifndef MMQ_X
 #error "MMQ_X must be defined before #including this body"
@@ -77,7 +85,12 @@ extern "C" __global__ void KERNEL_NAME(
             }
 
             // ── Load X tile (HFQ3 3-bit unpack → signed INT8 packed) ──────
-            if (window == 0 && tid < 128) {
+            // One thread per output row writes one float2 to x_dm[i] (sized
+            // MMQ_Y). Mirrors the HFQ4 sibling: at MMQ_Y=64, gating on
+            // `tid < 128` would let threads 64..127 write OOB of x_dm
+            // into the adjacent `tile_y` LDS region. The x32_y64 variant
+            // is reachable from `gemm_hfq3g256_residual` (dispatch.rs:7674).
+            if (window == 0 && tid < MMQ_Y) {
                 const int i = tid;
                 const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
                 const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
@@ -86,9 +99,12 @@ extern "C" __global__ void KERNEL_NAME(
                 x_dm[i] = make_float2(sc, zp + 4.0f * sc);
             }
 
+            // X-tile loader: each thread loops X_LOADER_TASKS_PER_THREAD
+            // times to cover MMQ_Y rows × 16 chunks/row. At MMQ_Y=128 this is
+            // 16 loops/thread (the original); MMQ_Y=64 → 8 loops/thread.
             #pragma unroll
-            for (int loop = 0; loop < 16; ++loop) {
-                const int task_id = tid * 16 + loop;
+            for (int loop = 0; loop < X_LOADER_TASKS_PER_THREAD; ++loop) {
+                const int task_id = tid * X_LOADER_TASKS_PER_THREAD + loop;
                 const int i = task_id / 16;
                 const int chunk = task_id % 16;
 

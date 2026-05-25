@@ -487,12 +487,30 @@ fn load_tensor_f32(gguf: &GgufFile, info: &TensorInfo) -> Vec<f32> {
 }
 
 /// A weight matrix on GPU — may be quantized or F32.
+/// ParoQuant Givens rotation metadata for a single linear layer.
+/// Stored alongside the weight buffer; applied to activations before GEMV.
+pub struct ParoRotation {
+    pub pairs: GpuTensor,           // I16 [krot, in_dim] — pair indices per rotation layer
+    pub theta: GpuTensor,           // F16 [krot, in_dim/2] — learned angles
+    pub channel_scales: GpuTensor,  // F16 [in_dim] — per-channel scaling factor alpha
+    pub krot: u32,                  // number of rotation layers (typically 8)
+    pub group_size: u32,            // quantization group size (typically 128)
+    /// True if `pairs`/`theta`/`channel_scales` are non-owning aliases into
+    /// shared per-layer sidecars (e.g. MoE routed experts that share one
+    /// rotation tuple across all experts in a layer). Owning ParoRotations
+    /// set this to false; `WeightTensor::free_all` skips tensor frees when
+    /// is_alias is true so the shared sidecars aren't double-freed.
+    pub is_alias: bool,
+}
+
 pub struct WeightTensor {
     pub buf: GpuTensor,
     pub gpu_dtype: DType, // dispatch type for kernel selection
     pub m: usize,         // output dim (rows)
     pub k: usize,         // input dim (cols)
     pub row_stride: usize, // padded row bytes (Q8HFQ only, 0 for others)
+    /// ParoQuant Givens rotation metadata. None for all non-ParoQuant formats.
+    pub paro: Option<ParoRotation>,
     /// Phase A Stage A — AWQ per-channel scale vector, length K, dtype F16.
     ///
     /// Populated by the loader when the .hfq carries a sibling sidecar tensor
@@ -505,6 +523,26 @@ pub struct WeightTensor {
     /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
     /// with all existing .hfq files.
     pub awq_scale: Option<GpuTensor>,
+}
+
+impl WeightTensor {
+    /// Free the weight buffer and any associated metadata (ParoQuant rotation,
+    /// AWQ sidecar) from GPU.
+    pub fn free_all(self, gpu: &mut Gpu) {
+        if let Some(paro) = self.paro {
+            // Aliased rotations point into shared per-layer sidecars; the owner
+            // (e.g. MoeFfnWeights.paro_shared) frees them. Skip here.
+            if !paro.is_alias {
+                let _ = gpu.free_tensor(paro.pairs);
+                let _ = gpu.free_tensor(paro.theta);
+                let _ = gpu.free_tensor(paro.channel_scales);
+            }
+        }
+        if let Some(awq) = self.awq_scale {
+            let _ = gpu.free_tensor(awq);
+        }
+        let _ = gpu.free_tensor(self.buf);
+    }
 }
 
 /// How the embedding table is stored on GPU.
@@ -677,6 +715,16 @@ pub fn weight_gemv(
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq3g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ4G256Lloyd => {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g256_lloyd(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         DType::MQ8G256 => {
             gpu.ensure_mq_signs()?;
             gpu.gemv_mq8g256_with_rotate(&w.buf, x, y, w.m, w.k)
@@ -688,6 +736,28 @@ pub fn weight_gemv(
         DType::HFQ6G256 => gpu.gemv_hfq6g256(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G64 => gpu.gemv_q4f16_g64(&w.buf, x, y, w.m, w.k),
         DType::Q4F16G32 => gpu.gemv_q4f16_g32(&w.buf, x, y, w.m, w.k),
+        DType::ParoQ4G128 => {
+            // ParoQuant: copy x → scratch, Givens-rotate scratch, GEMV from scratch.
+            // Must NOT rotate x in-place: the same x_norm is shared across multiple
+            // weight_gemv calls in a layer (wqkv, wz, w_alpha, w_beta, etc.),
+            // each with different rotation metadata.
+            let paro = w.paro.as_ref().expect("ParoQ4G128 weight missing ParoRotation metadata");
+            // Lazily allocate the scratch buffer on first use
+            gpu.ensure_paro_scratch(w.k)?;
+            // Alias the scratch buffer to avoid borrow conflicts with gpu methods
+            let scratch_alias = GpuTensor {
+                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                shape: vec![w.k],
+                dtype: DType::F32,
+            };
+            // Copy x → scratch, rotate scratch, GEMV from scratch
+            gpu.copy_d2d(x, &scratch_alias, w.k * 4)?;
+            gpu.givens_rotate(
+                &scratch_alias, &paro.pairs, &paro.theta, &paro.channel_scales,
+                1, w.k, paro.krot as usize,
+            )?;
+            gpu.gemv_hfq4g128(&w.buf, &scratch_alias, y, w.m, w.k)
+        }
         other => {
             eprintln!("WARNING: no GPU kernel for {:?}", other);
             Err(hip_bridge::HipError::new(0, &format!("unsupported dtype {:?}", other)))
@@ -750,7 +820,8 @@ pub fn fused_rmsnorm_rotate_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd
+        | DType::MFP4G32 => {
             // Phase A Stage A — AWQ-aware dispatch. When the upcoming linear
             // carries an AWQ scale sidecar, use the AWQ variant of the fused
             // kernel which divides activations by `awq_scale[i]` before the
@@ -796,7 +867,8 @@ pub fn rotate_x_for_mq<'a>(
 ) -> HipResult<Option<&'a GpuTensor>> {
     match sample_weight.gpu_dtype {
         DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MQ2G256
-        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MFP4G32 => {
+        | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ4G256Lloyd
+        | DType::MFP4G32 => {
             // Phase A Stage A — F2: route to AWQ variant when the
             // downstream linear (the GEMV consuming x_rot) carries an
             // `awq_scale` sidecar. `sample_weight` IS that downstream
@@ -841,6 +913,26 @@ pub fn rotate_x_mq_for(
     } else {
         gpu.rotate_x_mq(x, x_rot, k)
     }
+}
+
+/// ParoQuant single-token rotation: read x, write Givens-rotated
+/// activation to x_rot via a single out-of-place kernel. Earlier
+/// versions did `copy_d2d(x → x_rot)` then `givens_rotate(x_rot)`;
+/// fusing into one launch eliminates an inter-node dependency that
+/// the hipGraph dependency analyzer can fail to enforce (observed
+/// numerical delta direct-vs-graph on gfx1151 / HIP 7.13).
+pub fn rotate_x_paro_for(
+    gpu: &mut Gpu,
+    paro: &ParoRotation,
+    x: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+) -> HipResult<()> {
+    gpu.givens_rotate_to(
+        x, x_rot,
+        &paro.pairs, &paro.theta, &paro.channel_scales,
+        1, k, paro.krot as usize,
+    )
 }
 
 /// Phase A Stage A — F2: batched AWQ-aware variant of `rotate_x_mq`.
@@ -967,6 +1059,13 @@ pub fn weight_gemv_prerotated(
                 weight_gemv(gpu, w, x, y)
             }
         }
+        DType::MQ4G256Lloyd => {
+            if let Some(xr) = x_rot {
+                gpu.gemv_mq4g256_lloyd(&w.buf, xr, y, w.m, w.k)
+            } else {
+                weight_gemv(gpu, w, x, y)
+            }
+        }
         DType::MQ8G256 => gpu.gemv_mq8g256_prerotated(&w.buf, y, w.m, w.k),
         _ => weight_gemv(gpu, w, x, y),
     }
@@ -1058,6 +1157,18 @@ pub fn weight_gemv_residual(
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
         }
+        DType::MQ4G256Lloyd => {
+            // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
+            // single-acc fast variant (see kernel header for why single-acc).
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
+            gpu.gemv_mq4g256_lloyd_residual(&w.buf, &x_rot_alias, y, w.m, w.k)
+        }
         _ => {
             // Fallback: plain weight_gemv into a scratch, then add_inplace.
             // Allocates a scratch each call; only used for niche dtypes.
@@ -1137,6 +1248,18 @@ pub fn weight_gemv_swiglu_residual(
             // `w_down` IS the downstream weight; route through _for helper.
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_mq3g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
+        }
+        DType::MQ4G256Lloyd => {
+            // Same fusion shape as MQ3-Lloyd; gfx1100 picks the K4 + LDS +
+            // single-acc fast variant of the residual GEMV.
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
+            gpu.gemv_mq4g256_lloyd_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
         DType::MQ6G256 => {
             // MQ6 down + residual fusion: same FWHT rotate + fused-residual
@@ -2095,19 +2218,19 @@ pub fn load_weights(
         match info.dtype {
             GgmlType::Q4K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
             GgmlType::Q6K => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q6K, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
             GgmlType::Q8_0 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
             GgmlType::F32 => {
                 let buf = gpu.upload_raw(raw_data, &[raw_data.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
             _ => {
                 // Unsupported: dequant to F32 on CPU, upload as raw bytes
@@ -2116,7 +2239,7 @@ pub fn load_weights(
                     std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
                 };
                 let buf = gpu.upload_raw(bytes, &[bytes.len()])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
         }
     }
@@ -2143,7 +2266,7 @@ pub fn load_weights(
         let info = gguf.find_tensor("token_embd.weight").unwrap();
         let data = load_tensor_f32(gguf, info);
         let buf = gpu.upload_f32(&data, &[config.vocab_size, config.dim])?;
-        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, awq_scale: None }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
