@@ -31,6 +31,12 @@ pub const GEMV_Q4K_SRC: &str = include_str!("../../../kernels/src/gemv_q4k.hip")
 /// Minimal metadata → minimal VGPRs. Hypothesis: ≤32 VGPRs → max occupancy.
 pub const GEMV_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128.hip");
 
+/// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
+/// HFQ4-G256 sister: `GEMV_HFQ4G256_RESIDUAL_SCALED_SRC`. Used by the
+/// PARO shared-expert down dispatch (Phase 2 — moe_ffn_batched_admissible
+/// under HIPFIRE_PARO_BATCHED=1).
+pub const GEMV_HFQ4G128_RESIDUAL_SIGMOID_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g128_residual_sigmoid_scaled.hip");
+
 /// PARO4-G128: ParoQuant-compatible rotated activation + W4 GEMV.
 /// Block: [f32 scale][f32 zero][64B nibbles] = 72 bytes per 128 weights,
 /// followed by shared pair-rotation metadata and channel scales.
@@ -39,6 +45,17 @@ pub const GEMV_PARO4G128_SRC: &str = include_str!("../../../kernels/src/gemv_par
 
 /// HFQ4-G128 batched GEMM: same tiled approach as G256 but 72 bytes/group, 4 weights/thread.
 pub const GEMM_HFQ4G128_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g128.hip");
+
+/// HFQ4-G128 i8 WMMA MMQ (non-grouped) for gfx1151. Mirror of the routed
+/// grouped k8 kernel minus expert scatter — same i8 WMMA pattern, same
+/// 16×16 tile, same 8-WMMA-per-group K-pipeline. Activation must be
+/// pre-quantized to block_q8_1_mmq via `quantize_q8_1_mmq_ds4` (handled
+/// transparently by the dispatcher). Closes the perf gap left when only
+/// the routed-expert path got the MMQ port — see the
+/// `paroquant-real-bottleneck-gemm-hfq4g128` rocprof finding (66% of
+/// pp256 prefill time was the non-grouped baseline).
+pub const GEMM_HFQ4G128_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g128_mmq.gfx1151.hip");
 
 
 /// HFQ2-G256: flat 2-bit with 256-weight groups.
@@ -480,8 +497,17 @@ pub const GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_SRC: &str =
 /// HFQ4G256 sibling; closes the residual hipGraph-capture gap for
 /// ParoQuant routed experts (Qwen3.6-A3B-PARO etc.) left open by
 /// PR #317.
-pub const GEMV_HFQ4G128_MOE_GATE_UP_INDEXED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g128_moe_gate_up_indexed.hip");
+pub const GEMV_PARO_Q4G128_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_indexed.hip");
+
+/// N-batched indexed MoE gate_up GEMV for HFQ4G128 (ParoQuant routed
+/// experts). Sister of `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` with
+/// 72 B/group stride. Used by Path 1 fallback in
+/// `prefill_moe_ffn_body_batched` when ParoQ4G128 expert weights are admitted
+/// (HIPFIRE_PARO_BATCHED=1) on non-WMMA archs (CDNA/gfx10). gfx11/gfx12 takes
+/// Path 2's grouped-WMMA kernel instead (Phase 4).
+pub const GEMV_PARO_Q4G128_MOE_GATE_UP_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_gate_up_k8_indexed_batched.hip");
 
 /// CDNA3 (MI300X / gfx94x) wave64-native counterpart to the indexed
 /// gate_up GEMV. Block=[64,1,1] with 2 rows per block (one per warp) —
@@ -541,8 +567,37 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
 /// down. Same expanded-output contract as the HFQ4G256 sibling; pairs
 /// with `MOE_DOWN_COMBINE_K8_BATCHED_SRC` for the K_TOP fold. Closes the
 /// hipGraph-capture gap for ParoQuant routed experts.
-pub const GEMV_HFQ4G128_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_hfq4g128_moe_down_k8_indexed_batched_expanded.hip");
+pub const GEMV_PARO_Q4G128_MOE_DOWN_K8_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_paro_q4g128_moe_down_k8_indexed_batched.hip");
+
+/// SGLang-style grouped-WMMA-GEMM for HFQ4G128 (ParoQuant) routed-expert
+/// gate_up + down dispatch on RDNA3/4. Port of
+/// `GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC` with 72 B/group stride and 128
+/// elements per group. Same scatter-pipeline contract (expert_tile_ids +
+/// sorted_slot_index) and same WMMA 16×16×16 F16 layout. Caller pre-
+/// rotates X by the layer's shared Givens sidecar (gate_up or down) and
+/// the kernel reads HFQ4G128 nibbles; F32→F16 X conversion is handled by
+/// the Rust dispatch wrapper via `ensure_fp16_x`.
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_wmma_k2.hip");
+
+/// i8 WMMA MMQ MoE grouped GEMM for HFQ4G128 (ParoQuant) on gfx1151
+/// (Strix Halo iGPU). Port of GEMM_HFQ4G256_MOE_GROUPED_MMQ_GFX1151_SRC
+/// with the 72 B/group HFQ4G128 stride. Targets the same +2× FP16 WMMA
+/// throughput lift on routed-expert grouped GEMM. Compute-bound regime
+/// per Phase 4 rocprof attribution (gemm_paro_q4g128_moe_grouped_wmma_k2
+/// = 68.5% of GPU time, 25.8 GiB/s effective — far from the ~256 GB/s BW
+/// roof, so compute-throughput doubling has full upside).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx1151.hip");
+
+/// k8 (deepest pipeline) sibling of GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_GFX1151_SRC.
+/// Processes all 4 Q8_1 sub-blocks of the (single) mmq block per HFQ4G128 group
+/// in one inner iteration — 8 WMMAs into 4 independent int32 accumulators
+/// before the per-sub-block scale FMA resolves. Same kernarg + grid as k2.
+/// Opt-IN via HIPFIRE_MOE_PARO_I8_K8=1 (default OFF pending bench validation).
+pub const GEMM_PARO_Q4G128_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k8.gfx1151.hip");
 
 /// Fused silu(gate)*up + per-channel scale + krot rounds of Givens
 /// rotation. Replaces the silu_mul_f32 + givens_rotate two-launch
@@ -1956,6 +2011,30 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+/// PFlash per-block scoring kernel — fwht3 K-cache variant.
+/// Drop-in replacement for `pflash_score_q8_kv` when the drafter runs
+/// with fwht3 KV (the LDS-cliff-free long-context path). Reads fwht3 K
+/// cache (4 B cnorm + packed 3-bit TURBO_C3_256 codes), dequantizes
+/// inline, and computes cosine in FWHT-rotated space — orthonormal
+/// FWHT makes that exactly equal to the original-space cosine, with no
+/// inverse FWHT needed in the scoring kernel.
+pub const PFLASH_SCORE_FWHT3_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht3_kv.hip");
+
+/// PFlash per-block scoring — fwht4 variant. 4-bit codes / TURBO_C4 LUT.
+/// 132 B/head at head_dim=256, two FWHT-128 halves per head. Higher
+/// per-element precision than fwht3 (16 centroids vs 8) at the cost of
+/// larger K storage. Shipped as a research / ablation variant — fwht3
+/// is expected to dominate on the cosine-scorer's throughput/quality
+/// curve.
+pub const PFLASH_SCORE_FWHT4_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht4_kv.hip");
+
+/// PFlash per-block scoring — fwht2 variant. 2-bit codes / TURBO_C2 LUT.
+/// 68 B/head at head_dim=256, two FWHT-128 halves per head. Most
+/// aggressive K compression in the family; lowest precision (4
+/// centroids). May regress NIAH needle recovery at long ctx — shipped
+/// for ablation / lower-bound study.
+pub const PFLASH_SCORE_FWHT2_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");
 
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
 /// to activations in-place. Called before each ParoQ4G128 GEMV.
