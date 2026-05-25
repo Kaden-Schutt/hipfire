@@ -3730,6 +3730,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     token_ids
                 }
                 Ok(hipfire_arch_qwen35::pflash::PflashDecision::Bypass { reason }) => {
+                    eprintln!("[pflash] BYPASS reason={} q={}", reason.as_str(), raw_q_tokens.len());
                     // Only emit bypass events for non-trivial reasons.
                     // ModeOff is the silent default; nothing to report.
                     if !matches!(reason, hipfire_arch_qwen35::pflash::BypassReason::ModeOff) {
