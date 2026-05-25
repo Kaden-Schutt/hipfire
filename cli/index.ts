@@ -149,6 +149,7 @@ export interface HipfireConfig {
   prefill_recent: number;          // Always-keep tail. Default 1024.
   prefill_block: number;           // Scoring block size. Default 128.
   prefill_drafter: string;         // Path to drafter HFQ. "" disables.
+  prefill_drafter_device: number;  // HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device for hetero compress.
   prefill_profile: boolean;        // Per-stage timing logs.
   prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
 }
@@ -210,6 +211,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_recent: 1024,
   prefill_block: 128,
   prefill_drafter: "",
+  prefill_drafter_device: -1,
   prefill_profile: false,
   prefill_sparse_threshold: 32768,
 };
@@ -252,6 +254,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_recent": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "prefill_block": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4096;
     case "prefill_drafter": return typeof value === "string";
+    case "prefill_drafter_device": return typeof value === "number" && Number.isInteger(value) && value >= -1 && value <= 15;
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     default: return false;
@@ -310,7 +313,7 @@ const PER_MODEL_KEYS = [
   // changing other targets.
   "prefill_compression", "prefill_threshold", "prefill_keep_ratio",
   "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
-  "prefill_block", "prefill_drafter", "prefill_profile",
+  "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
@@ -625,6 +628,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     params.prefill_recent = resolved.prefill_recent;
     params.prefill_block = resolved.prefill_block;
     params.prefill_drafter = resolved.prefill_drafter;
+    params.prefill_drafter_device = resolved.prefill_drafter_device;
     params.prefill_profile = resolved.prefill_profile;
     params.prefill_sparse_threshold = resolved.prefill_sparse_threshold;
   } else if (resolved.prefill_compression !== "off") {

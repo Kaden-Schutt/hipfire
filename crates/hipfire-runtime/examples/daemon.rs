@@ -531,6 +531,12 @@ fn main() {
     // params override individual fields; the rest fall back to these
     // load-time defaults. Cleared alongside `pflash_state`.
     let mut pflash_cfg: Option<hipfire_arch_qwen35::pflash::PflashConfig> = None;
+    // Hetero PFlash: when prefill_drafter_device differs from the target,
+    // the drafter weights/KV/scratch live on a sibling device. The compress
+    // output is a host-side Vec<u32>, so no peer-copy is needed — generate
+    // routes maybe_compress_prompt to this handle, decode stays on target.
+    // None means the drafter shares the target gpu (single-card, unchanged).
+    let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
 
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -563,7 +569,13 @@ fn main() {
                 // load (the explicit "unload" handler has the same
                 // ordering for the same reason).
                 if let Some(mut pf) = pflash_state.take() {
-                    pf.unload_drafter(&mut gpu);
+                    if let Some(mut dg) = pflash_drafter_gpu.take() {
+                        dg.bind_thread_or_warn();
+                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                        gpu.bind_thread_or_warn();
+                    } else {
+                        pf.unload_drafter(&mut gpu);
+                    }
                 }
                 pflash_cfg = None;
                 if let Some(m) = model.take() {
@@ -687,6 +699,10 @@ fn main() {
                     .and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 let pflash_drafter = msg.get("params").and_then(|p| p.get("prefill_drafter"))
                     .and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                // -1 = drafter shares the target gpu (default). >=0 routes
+                // the drafter to that HIP device for hetero compress.
+                let pflash_drafter_device: i32 = msg.get("params").and_then(|p| p.get("prefill_drafter_device"))
+                    .and_then(|v| v.as_i64()).unwrap_or(-1) as i32;
                 let pflash_profile = msg.get("params").and_then(|p| p.get("prefill_profile"))
                     .and_then(|v| v.as_bool()).unwrap_or(false);
                 let pflash_sparse_threshold = msg.get("params").and_then(|p| p.get("prefill_sparse_threshold"))
@@ -826,19 +842,38 @@ fn main() {
                                 let tgt_tok_ref = m.tokenizer.as_ref();
                                 if let Some(tok) = tgt_tok_ref {
                                     let pf_max_kv = max_seq.max(2048);
+                                    // Hetero: when prefill_drafter_device >= 0 and isn't
+                                    // device 0 (target), allocate a sibling Gpu handle so
+                                    // drafter weights/KV/scratch live on the secondary
+                                    // card. Compress output is host-side, so decode stays
+                                    // on target. -1 / 0 => share target gpu (unchanged).
+                                    let mut sibling: Option<rdna_compute::Gpu> = None;
+                                    if pflash_drafter_device > 0 {
+                                        match rdna_compute::Gpu::init_with_device(pflash_drafter_device) {
+                                            Ok(g) => sibling = Some(g),
+                                            Err(e) => {
+                                                let _ = writeln!(stdout,
+                                                    r#"{{"type":"pflash_load_failed","reason":"drafter device {} init: {}"}}"#,
+                                                    pflash_drafter_device, e.to_string().replace('"', "'"));
+                                            }
+                                        }
+                                    }
+                                    let dg: &mut rdna_compute::Gpu = sibling.as_mut().unwrap_or(&mut gpu);
+                                    dg.bind_thread_or_warn();
                                     match hipfire_arch_qwen35::pflash::load_drafter(
-                                        &mut pf_state, &mut gpu,
+                                        &mut pf_state, dg,
                                         std::path::Path::new(pf_drafter_path),
                                         tok, pf_max_kv,
                                     ) {
                                         Ok(()) => {
                                             let _ = writeln!(stdout,
-                                                r#"{{"type":"pflash","mode":"{}","drafter":"{}","tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
-                                                pflash_mode_str, pf_drafter_path,
+                                                r#"{{"type":"pflash","mode":"{}","drafter":"{}","drafter_device":{},"tokenizer_compat":{},"keep_ratio":{},"threshold":{}}}"#,
+                                                pflash_mode_str, pf_drafter_path, pflash_drafter_device,
                                                 pf_state.tokenizer_compat,
                                                 pflash_keep_ratio, pflash_threshold);
                                             pflash_state = Some(pf_state);
                                             pflash_cfg = Some(pf_cfg);
+                                            pflash_drafter_gpu = sibling; // persist sibling across requests (None if shared)
                                         }
                                         Err(e) => {
                                             let _ = writeln!(stdout,
@@ -1089,7 +1124,7 @@ fn main() {
                         continue;
                     }
                     generate(
-                        m, &mut gpu, &mut stdout, id, prompt, system,
+                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
                         temp, top_p, max_tokens, repeat_penalty, repeat_window,
                         budget_alert_at_tok, &budget_alert_text, max_think_tokens,
                         assistant_prefix,
@@ -1172,7 +1207,13 @@ fn main() {
                 // no drain to follow, so the VRAM stays resident until
                 // the next load message arrives. Order matters here.
                 if let Some(mut pf) = pflash_state.take() {
-                    pf.unload_drafter(&mut gpu);
+                    if let Some(mut dg) = pflash_drafter_gpu.take() {
+                        dg.bind_thread_or_warn();
+                        pf.unload_drafter(&mut dg); // sibling-device drafter: free on its own handle, then drop
+                        gpu.bind_thread_or_warn();
+                    } else {
+                        pf.unload_drafter(&mut gpu);
+                    }
                 }
                 pflash_cfg = None;
                 if let Some(m) = model.take() {
@@ -3462,7 +3503,11 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+    // Compress runs on the PFlash drafter handle when one is set (hetero
+    // sibling device), else on the target gpu. The handle is consumed at
+    // the seq_pos==0 compress site; decode always uses `gpu`.
+    let mut drafter_gpu = drafter_gpu;
     // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
     // generate() body is qwen35/llama-shaped and would panic on
     // None unwraps for q35_*/llama_* fields when applied to a
@@ -3654,9 +3699,14 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     }
     let q_tokens = if let (Some(state), Some(cfg)) = (pflash_state, pflash_cfg) {
         if m.seq_pos == 0 {
+            let compress_gpu: &mut rdna_compute::Gpu = drafter_gpu.as_deref_mut().unwrap_or(gpu);
+            // Sibling-device drafter: bind its device before compress, then
+            // restore the target binding for decode. No-op when shared.
+            compress_gpu.bind_thread_or_warn();
             let decision = hipfire_arch_qwen35::pflash::maybe_compress_prompt(
-                gpu, state, cfg, &raw_q_tokens, request_kind, &[],
+                compress_gpu, state, cfg, &raw_q_tokens, request_kind, &[],
             );
+            gpu.bind_thread_or_warn();
             match decision {
                 Ok(hipfire_arch_qwen35::pflash::PflashDecision::Compressed(cp)) => {
                     let _ = writeln!(
