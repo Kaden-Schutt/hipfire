@@ -1816,8 +1816,20 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // effect on arch_id 5/6 — see the cask.rs docs for why CASK targets full-
         // attention layers only.
         let eviction = if let Some(ref sidecar_path) = cask.sidecar {
-            let centers = TriAttnCenters::load(Path::new(sidecar_path))
-                .map_err(|e| format!("load cask sidecar {}: {e}", sidecar_path))?;
+            let centers = TriAttnCenters::load(Path::new(sidecar_path)).map_err(|e| {
+                use std::io::ErrorKind;
+                let p = Path::new(sidecar_path);
+                let why = match e.kind() {
+                    // os error 2: open failed. Disambiguate missing vs dangling symlink.
+                    ErrorKind::NotFound if p.symlink_metadata().is_ok() =>
+                        format!("dangling symlink (target absent): {sidecar_path}"),
+                    ErrorKind::NotFound => format!("file not found: {sidecar_path}"),
+                    ErrorKind::InvalidData => format!("bad format ({e}): {sidecar_path}"),
+                    ErrorKind::UnexpectedEof => format!("truncated/corrupt sidecar: {sidecar_path}"),
+                    _ => format!("read error ({e}): {sidecar_path}"),
+                };
+                format!("cask sidecar load failed — {why} (regen: hipfire sidecar-gen, or HIPFIRE_CASK_OFF=1)")
+            })?;
             let fa_layer_ids: Vec<usize> = config.layer_types.iter().enumerate()
                 .filter_map(|(i, t)| if *t == LayerType::FullAttention { Some(i) } else { None })
                 .collect();
