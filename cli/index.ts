@@ -367,9 +367,13 @@ function savePerModelConfigs(all: PerModelConfigs) {
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
   if (!tag) return base;
+  const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
-  const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
-  return { ...base, ...overrides };
+  // Layer both keys: a model can carry overrides under the canonical
+  // registry tag AND under the user alias. Alias wins where both set a
+  // key, but neither drops the other. Previous `resolved ?? tag` picked
+  // exactly one entry, so any key only present on the other vanished.
+  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
