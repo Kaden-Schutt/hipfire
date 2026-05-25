@@ -570,6 +570,9 @@ pub struct Qwen2State {
     pub ffn_hidden: GpuTensor,
     pub ffn_out: GpuTensor,
     pub logits: GpuTensor,
+    /// Scratch for the split-K flash decode attention (`attention_flash`):
+    /// per-(head, chunk) partials `[n_heads * ceil(max_seq/128) * (2 + head_dim)]`.
+    pub attn_partials: GpuTensor,
     pub pos_buf: DeviceBuffer,
     pub k_cache: Vec<GpuTensor>,
     pub v_cache: Vec<GpuTensor>,
@@ -610,6 +613,11 @@ impl Qwen2State {
             v_cache.push(gpu.zeros(&[max_seq * kv_dim], DType::F32)?);
         }
 
+        // Flash-decode partials: chunk_size is 128 for seq_len > 128, so the
+        // max chunk count is ceil(max_seq/128); stride is (max, sum, head_dim).
+        let n_chunks_max = (max_seq + 127) / 128;
+        let attn_partials_len = cfg.num_attention_heads * n_chunks_max * (2 + cfg.head_dim);
+
         Ok(Self {
             x:           gpu.alloc_tensor(&[dim], DType::F32)?,
             tmp:         gpu.alloc_tensor(&[dim], DType::F32)?,
@@ -623,6 +631,7 @@ impl Qwen2State {
             ffn_hidden:  gpu.alloc_tensor(&[hidden_dim], DType::F32)?,
             ffn_out:     gpu.alloc_tensor(&[dim], DType::F32)?,
             logits:      gpu.alloc_tensor(&[cfg.vocab_size], DType::F32)?,
+            attn_partials: gpu.alloc_tensor(&[attn_partials_len], DType::F32)?,
             pos_buf:     gpu.hip.malloc(4)?,
             k_cache,
             v_cache,
@@ -648,7 +657,7 @@ impl Qwen2State {
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for t in [self.x, self.tmp, self.q, self.k, self.v, self.attn_out,
                   self.o, self.gate, self.up, self.ffn_hidden,
-                  self.ffn_out, self.logits] {
+                  self.ffn_out, self.logits, self.attn_partials] {
             let _ = gpu.free_tensor(t);
         }
         for t in self.k_cache { let _ = gpu.free_tensor(t); }
@@ -831,14 +840,17 @@ fn forward_step_after_x(
         gpu.kv_cache_write(&state.k_cache[layer_idx], &state.k, &state.pos_buf, kv_dim)?;
         gpu.kv_cache_write(&state.v_cache[layer_idx], &state.v, &state.pos_buf, kv_dim)?;
 
-        // (6) Attention (F32 KV cache; GQA via n_heads / n_kv_heads).
-        gpu.attention_f32(
+        // (6) Attention — split-K flash decode (`attention_flash`): grid
+        // [n_heads, n_chunks] saturates the GPU vs the naive single-token
+        // attention_f32 (grid [n_heads] = ~14% CU occupancy, 71% of decode
+        // GPU time per rocprof). GQA via n_heads / n_kv_heads. F32 KV cache.
+        gpu.attention_flash(
             &state.q,
             &state.k_cache[layer_idx],
             &state.v_cache[layer_idx],
             &state.attn_out,
-            &state.pos_buf,
-            pos + 1, // seq_len_hint = pos+1 (newest token included)
+            &state.attn_partials,
+            pos + 1, // seq_len = pos+1 (newest token included)
             n_heads, n_kv_heads, head_dim,
             state.max_seq,
         )?;
