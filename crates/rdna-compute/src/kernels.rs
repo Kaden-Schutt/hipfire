@@ -520,6 +520,19 @@ pub const GEMV_HFQ4G256_MOE_DOWN_INDEXED_BATCHED_WAVE64_SRC: &str =
 pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip");
 
+/// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts. Used
+/// by mixed-kmap MoE models where some layers are promoted from MQ4 → MQ6
+/// (post-PR-199 alternating-kmap default). Without this kernel, those
+/// layers fall to the CPU-topK D2H path which crashes under hipGraph capture.
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
+
+/// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
+/// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
+/// (combine is dtype-independent — operates on the f32 expanded buffer).
+pub const GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip");
+
 /// Combine kernel for the atomic-free MoE down path. Sums K_TOP expert
 /// slots per (token, m) with topk_weights applied; accumulates into the
 /// per-token residual row. No cross-token contention.
@@ -807,6 +820,25 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
+// gfx906 QKV 3-way fused MMQ — sibling to residual_mmq_gfx906 above.
+// Shared body + per-mmq_x wrappers. See
+// kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh for the design.
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x8.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x16.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x32.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x64.hip");
+// gfx906 gate_up 2-way fused MMQ — used for BOTH FFN gate_up AND LinearAttention
+// QKVZA-head (qkv+z). Same kernel shape, two dispatch sites.
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x8.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x16.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x32.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x64.hip");
+// MMQ_Y=64 occupancy variants — halves LDS X-tile + accumulator regs,
+// 2× WGs/grid. Probe via HIPFIRE_HFQ4_MMQ_GFX906_Y64=1. See plan §6.5.
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x16_y64.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x32_y64.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
@@ -1935,3 +1967,27 @@ pub const REPEAT_INTERLEAVE_QK_BATCHED_SRC: &str = include_str!("../../../kernel
 /// mean K and cosine similarity vs the last position's K. Output: one
 /// f32 score per block. Phase 2.1 of #93.
 pub const PFLASH_SCORE_Q8_KV_SRC: &str = include_str!("../../../kernels/src/pflash_score_q8_kv.hip");
+
+/// PFlash per-block scoring kernel — fwht3 K-cache variant.
+/// Drop-in replacement for `pflash_score_q8_kv` when the drafter runs
+/// with fwht3 KV (the LDS-cliff-free long-context path). Reads fwht3 K
+/// cache (4 B cnorm + packed 3-bit TURBO_C3_256 codes), dequantizes
+/// inline, and computes cosine in FWHT-rotated space — orthonormal
+/// FWHT makes that exactly equal to the original-space cosine, with no
+/// inverse FWHT needed in the scoring kernel.
+pub const PFLASH_SCORE_FWHT3_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht3_kv.hip");
+
+/// PFlash per-block scoring — fwht4 variant. 4-bit codes / TURBO_C4 LUT.
+/// 132 B/head at head_dim=256, two FWHT-128 halves per head. Higher
+/// per-element precision than fwht3 (16 centroids vs 8) at the cost of
+/// larger K storage. Shipped as a research / ablation variant — fwht3
+/// is expected to dominate on the cosine-scorer's throughput/quality
+/// curve.
+pub const PFLASH_SCORE_FWHT4_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht4_kv.hip");
+
+/// PFlash per-block scoring — fwht2 variant. 2-bit codes / TURBO_C2 LUT.
+/// 68 B/head at head_dim=256, two FWHT-128 halves per head. Most
+/// aggressive K compression in the family; lowest precision (4
+/// centroids). May regress NIAH needle recovery at long ctx — shipped
+/// for ablation / lower-bound study.
+pub const PFLASH_SCORE_FWHT2_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");

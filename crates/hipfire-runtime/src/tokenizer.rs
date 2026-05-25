@@ -6,9 +6,35 @@
 //! Supports encode (text → token IDs) and decode (token IDs → text).
 
 use crate::gguf::{GgufFile, MetaValue};
+use regex::Regex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 use std::fmt;
+use std::sync::OnceLock;
+
+/// GPT-2 / cl100k-style pre-tokenization regex. Same family of pattern
+/// every reference byte-level BPE encoder uses (tiktoken, HF tokenizers,
+/// GPT-2): chunk input into contractions, letter words, digit runs ≤3,
+/// punctuation runs, and whitespace runs. BPE then runs per-chunk
+/// instead of on the whole prompt, restoring the canonical O(N) shape
+/// with bounded per-chunk constants.
+///
+/// Lookahead `\s+(?!\S)` is omitted from the canonical pattern; the
+/// `regex` crate doesn't support lookaround and the surviving `\s+`
+/// branch matches the same byte spans. Order of alternation preserves
+/// the priority the reference encoders use, so chunking boundaries
+/// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
+/// (verified against locked niah_4k token md5).
+const GPT2_PRETOK_PATTERN: &str =
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+fn gpt2_pretok_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(GPT2_PRETOK_PATTERN)
+            .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
+    })
+}
 
 /// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
 #[derive(Debug, Clone, Copy)]
@@ -756,21 +782,49 @@ impl Tokenizer {
     /// encoded token IDs will silently diverge from every reference
     /// implementation.
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
-        // 1. Convert text to GPT-2 byte-encoded symbol IDs. Construction
-        // guarantees `byte_to_id` covers every byte 0..=255 for GPT-2 BPE
-        // tokenizers (else `from_*` returned `MissingByteSymbol`), so the
-        // table lookup is infallible.
+        // Pre-tokenize via GPT-2 / cl100k regex, then BPE each chunk
+        // independently. Reference behaviour for byte-level BPE; without
+        // this step the merge PQ degenerates to a single O(N log N)
+        // problem over the whole prompt (~150K cross-word merges with
+        // stale-entry churn on a 14K-byte prompt). Per-chunk problems
+        // are typically ≤10 bytes with <8 merges each, so total work
+        // becomes O(N) with tiny constants — matches HF tokenizers /
+        // tiktoken / GPT-2 reference encoders byte-for-byte.
+        //
+        // Capacity hint: typical BPE compression on prose is ~3.5× bytes
+        // → tokens, so `len/4` is a sane lower bound that avoids early
+        // reallocs without wasting memory on short inputs.
+        let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
+        for m in gpt2_pretok_re().find_iter(text) {
+            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        }
+        result
+    }
+
+    /// BPE-encode a single pre-tokenized chunk (byte slice from
+    /// `gpt2_pretok_re().find_iter`) and append the resulting token ids
+    /// to `out`. Splitting this out of `encode_gpt2_bpe` lets the regex
+    /// driver feed many small chunks through the same PQ machinery
+    /// without re-allocating the heap/linked-list state across the full
+    /// prompt — each chunk is typically ≤10 bytes so the per-chunk state
+    /// is tiny.
+    fn encode_gpt2_chunk(&self, chunk_bytes: &[u8], out: &mut Vec<u32>) {
+        // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
+        // Construction guarantees `byte_to_id` covers every byte 0..=255
+        // for GPT-2 BPE tokenizers (else `from_*` returned
+        // `MissingByteSymbol`), so the table lookup is infallible.
         let byte_to_id = self
             .byte_to_id
             .as_ref()
-            .expect("encode_gpt2_bpe called on non-GPT2 tokenizer");
-        let mut syms: Vec<u32> = text.bytes().map(|b| byte_to_id[b as usize]).collect();
+            .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
+        let mut syms: Vec<u32> = chunk_bytes.iter().map(|&b| byte_to_id[b as usize]).collect();
         let n = syms.len();
         if n == 0 {
-            return Vec::new();
+            return;
         }
         if n == 1 {
-            return syms;
+            out.push(syms[0]);
+            return;
         }
 
         // 2. Pre-built merge rank map keyed on (left_id, right_id). u32
@@ -866,9 +920,9 @@ impl Tokenizer {
             }
         }
 
-        // 7. Walk the linked list collecting live symbol ids. Every slot
-        // holds a token id that was validated at construction time:
-        // `byte_to_id` rejected any byte whose char wasn't in vocab,
+        // 7. Walk the linked list, appending live symbol ids to `out`.
+        // Every slot holds a token id that was validated at construction
+        // time: `byte_to_id` rejected any byte whose char wasn't in vocab,
         // `resolve_merges` rejected any merge whose result wasn't in
         // vocab, and the merge loop only writes `merges[rank]` (which is
         // itself a validated id). The encoder therefore CANNOT emit id 0
@@ -876,15 +930,13 @@ impl Tokenizer {
         // is structurally unreachable now and removed. The explicit head
         // scan (`prev == -1 && !dead`) survives any future invariant
         // breakage that a `debug_assert!` would silently miss in release.
-        let mut result = Vec::with_capacity(n);
         let head = (0..n).find(|&i| prev[i] == -1 && !dead[i]);
         let mut p: i32 = head.map(|i| i as i32).unwrap_or(-1);
         while p >= 0 {
             let pi = p as usize;
-            result.push(syms[pi]);
+            out.push(syms[pi]);
             p = next[pi];
         }
-        result
     }
 
     pub fn vocab_size(&self) -> usize {
