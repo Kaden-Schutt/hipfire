@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Effective-bandwidth probe for `gemv_hfp4g32` at production decode shapes
 //! on gfx1201 (R9700). Determines whether decode is BW-bound (FP8 dot4
 //! won't help) or ALU-bound (FP8 dot4 could deliver a real win).

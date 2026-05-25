@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Unified Qwen3.5 inference — text-only or vision-language.
 //! Usage:
 //!   infer <model.hfq> [prompt...]                          # text-only
@@ -91,7 +95,7 @@ fn main() {
             Path::new(img),
             vision_config.patch_size,
             vision_config.spatial_merge_size,
-        );
+        ).unwrap_or_else(|e| panic!("{e}"));
         let grid_h = img_h / vision_config.patch_size;
         let grid_w = img_w / vision_config.patch_size;
         n_visual_tokens = (grid_h * grid_w) / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
@@ -99,7 +103,48 @@ fn main() {
         let patches = hipfire_arch_qwen35_vl::image::extract_patches(
             &pixels, 3, img_h, img_w,
             vision_config.patch_size, vision_config.temporal_patch_size,
+            vision_config.spatial_merge_size,
         );
+
+        // Optional debug dump for HF-reference numerical diff. Writes raw
+        // little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR.
+        if let Ok(dump_dir) = std::env::var("HIPFIRE_VL_DUMP_DIR") {
+            use std::io::Write;
+            let dir = std::path::Path::new(&dump_dir);
+            std::fs::create_dir_all(dir).ok();
+
+            let write_f32 = |p: &std::path::Path, data: &[f32]| {
+                let mut f = std::fs::File::create(p).expect("create blob");
+                let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+                f.write_all(&bytes).expect("write blob");
+            };
+
+            // CHW pre-patch tensor.
+            write_f32(&dir.join("hipfire_chw.bin"), &pixels);
+            std::fs::write(
+                dir.join("hipfire_chw.json"),
+                format!(
+                    r#"{{"shape":[3,{},{}],"dtype":"<f4","order":"CHW","channel_layout":"R,G,B"}}"#,
+                    img_h, img_w
+                ),
+            ).ok();
+
+            // Patches (HF-comparable layout: (n_patches, C*temporal*ph*pw) = (n, 1536)).
+            let elems = vision_config.temporal_patch_size * 3
+                * vision_config.patch_size * vision_config.patch_size;
+            let n_pat = patches.len() / elems;
+            write_f32(&dir.join("hipfire_patches.bin"), &patches);
+            std::fs::write(
+                dir.join("hipfire_patches.json"),
+                format!(
+                    r#"{{"shape":[{},{}],"dtype":"<f4","grid_thw":[1,{},{}],"layout":"per_patch[channel,temporal,patch_h,patch_w] flattened, 2x2-merge-grouped"}}"#,
+                    n_pat, elems, grid_h, grid_w
+                ),
+            ).ok();
+
+            eprintln!("[VL-DUMP] wrote CHW ({}x{}x{} f32) + patches ({}x{} f32) to {}",
+                3, img_h, img_w, n_pat, elems, dump_dir);
+        }
 
         eprintln!("Loading vision weights...");
         let vision_weights = qwen35_vl::load_vision_weights(&hfq, &vision_config, &mut gpu)

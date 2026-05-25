@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Robin Van Cauter
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Cold-process bench harness — fresh-process distribution for any single
 # kernel-tuning experiment.
 #
 # Use it whenever you need a comparison across two code states that has to
 # be NOISE-RESISTANT — i.e. anywhere the kernel-tuning playbook's "trust
 # the speed-gate, not your gut" rule kicks in
-# (`.skills/hipfire-kernel-tuning/playbook.md` §6). Within-session A/B on
+# (`.agents/skills/hipfire-kernel-tuning/playbook.md` §6). Within-session A/B on
 # RDNA is ±10–15 % wide on its own; this wrapper drives the noise band
 # down by replacing in-shell repetition with N fresh processes per
 # (model, pp) point.

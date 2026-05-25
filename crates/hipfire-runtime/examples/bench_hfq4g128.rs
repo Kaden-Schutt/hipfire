@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Benchmark HFQ4-G256 vs Q4K at multiple matrix sizes.
 //! Tests whether HFQ4-G256's 2x occupancy advantage shows at small matrices.
 

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! FFI bindings to libamdhip64.so via dlopen.
 //! No link-time dependency — runtime loads the shared library.
 
@@ -127,6 +131,9 @@ impl Default for HipPointerAttribute {
 /// Loaded HIP runtime — holds the dlopen'd library and resolved function pointers.
 pub struct HipRuntime {
     _lib: Library,
+
+    // Init
+    fn_init: unsafe extern "C" fn(c_uint) -> u32,
 
     // Version
     fn_runtime_get_version: unsafe extern "C" fn(*mut c_int) -> u32,
@@ -283,8 +290,9 @@ impl HipRuntime {
                 })?
         };
 
-        unsafe {
-            Ok(Self {
+        let runtime = unsafe {
+            Self {
+                fn_init: load_fn!(lib, "hipInit", unsafe extern "C" fn(c_uint) -> u32),
                 fn_runtime_get_version: load_fn!(lib, "hipRuntimeGetVersion", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_get_device_count: load_fn!(lib, "hipGetDeviceCount", unsafe extern "C" fn(*mut c_int) -> u32),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
@@ -333,8 +341,19 @@ impl HipRuntime {
                 fn_get_device_attribute: load_fn!(lib, "hipDeviceGetAttribute", unsafe extern "C" fn(*mut c_int, c_int, c_int) -> u32),
                 fn_mem_get_info: load_fn!(lib, "hipMemGetInfo", unsafe extern "C" fn(*mut usize, *mut usize) -> u32),
                 _lib: lib,
-            })
-        }
+            }
+        };
+
+        // Empirically required on ROCm 7.2 — hipcc-linked binaries get an
+        // implicit init via shared-library constructors at process start;
+        // a dlopen'd runtime doesn't, and ROCm 7.2's hipModuleLoad returns
+        // 303 (hipErrorSharedObjectInitFailed) on otherwise-valid .hsaco
+        // blobs without it. Older HIP libs implicitly init on the first
+        // hipMalloc/hipGetDevice call, so the absence used to be tolerated.
+        // hipInit(0) is documented as safe to call repeatedly.
+        let code = unsafe { (runtime.fn_init)(0) };
+        runtime.check(code, "hipInit")?;
+        Ok(runtime)
     }
 
     fn check(&self, code: u32, context: &str) -> HipResult<()> {

@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # hipfire installer — detects GPU, installs deps, downloads binary + kernels.
 # Usage: curl -L https://raw.githubusercontent.com/Kaden-Schutt/hipfire/master/scripts/install.sh | bash
 set -euo pipefail
@@ -373,7 +378,7 @@ else
     echo "  No pre-built binaries. Building from source..."
     (cd "$REPO_DIR" && \
         echo "  cargo build --release (this may take several minutes)..." && \
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime 2>&1 | tail -5)
+        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime 2>&1 | tail -5)
     if [ ! -f "$TARGET_DIR/release/examples/daemon" ]; then
         echo ""
         echo "  BUILD FAILED."
@@ -382,7 +387,7 @@ else
         echo "    - Missing system libs (check error above)"
         echo ""
         echo "  After fixing, re-run this installer or build manually:"
-        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon -p hipfire-runtime"
+        echo "    cd $REPO_DIR && cargo build --release --features deltanet --example daemon --example infer --example infer_hfq --example triattn_validate -p hipfire-runtime"
         exit 1
     fi
     echo "  Build complete ✓"
@@ -392,6 +397,7 @@ fi
 cp "$TARGET_DIR/release/examples/daemon" "$BIN_DIR/daemon"
 cp "$TARGET_DIR/release/examples/infer" "$BIN_DIR/infer" 2>/dev/null || true
 cp "$TARGET_DIR/release/examples/infer_hfq" "$BIN_DIR/infer_hfq" 2>/dev/null || true
+cp "$TARGET_DIR/release/examples/triattn_validate" "$BIN_DIR/triattn_validate" 2>/dev/null || true
 
 # Copy CLI
 # Recursive copy of the whole cli/ directory, then prune dev/test artifacts

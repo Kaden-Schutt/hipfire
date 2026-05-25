@@ -1,0 +1,65 @@
+
+tensor                                                                        qt             n           MSE   max_abs_err
+------------------------------------------------------------------------------------------------------------------------
+model.language_model.layers.28.linear_attn.conv1d.weight                 MQ4G256         32768     9.8608e-5     6.5130e-2
+model.language_model.layers.24.linear_attn.conv1d.weight                 MQ4G256         32768     9.2411e-5     5.9532e-2
+model.language_model.layers.21.linear_attn.conv1d.weight                 MQ4G256         32768     8.7637e-5     7.1464e-2
+model.language_model.layers.25.linear_attn.conv1d.weight                 MQ4G256         32768     8.6657e-5     5.8477e-2
+model.language_model.layers.20.linear_attn.conv1d.weight                 MQ4G256         32768     8.0061e-5     7.4439e-2
+model.language_model.layers.30.linear_attn.conv1d.weight                 MQ4G256         32768     7.9129e-5     6.8338e-2
+model.language_model.layers.26.linear_attn.conv1d.weight                 MQ4G256         32768     7.6512e-5     8.5218e-2
+model.language_model.layers.29.linear_attn.conv1d.weight                 MQ4G256         32768     6.9206e-5     5.8963e-2
+model.language_model.layers.22.linear_attn.conv1d.weight                 MQ4G256         32768     5.6378e-5     4.8334e-2
+model.language_model.layers.17.linear_attn.conv1d.weight                 MQ4G256         32768     4.4710e-5     6.2127e-2
+model.language_model.layers.12.linear_attn.conv1d.weight                 MQ4G256         32768     4.0536e-5     6.0405e-2
+model.language_model.layers.8.linear_attn.conv1d.weight                  MQ4G256         32768     3.8059e-5     5.7008e-2
+model.language_model.layers.18.linear_attn.conv1d.weight                 MQ4G256         32768     3.6822e-5     5.9768e-2
+model.language_model.layers.9.linear_attn.conv1d.weight                  MQ4G256         32768     3.3557e-5     6.0348e-2
+model.language_model.layers.0.linear_attn.conv1d.weight                  MQ4G256         32768     3.1657e-5     5.7093e-2
+model.language_model.layers.14.linear_attn.conv1d.weight                 MQ4G256         32768     3.0846e-5     4.3235e-2
+model.language_model.layers.16.linear_attn.conv1d.weight                 MQ4G256         32768     2.9816e-5     6.0894e-2
+model.language_model.layers.13.linear_attn.conv1d.weight                 MQ4G256         32768     2.8801e-5     4.1997e-2
+model.language_model.layers.10.linear_attn.conv1d.weight                 MQ4G256         32768     2.7473e-5     4.2482e-2
+model.language_model.layers.6.linear_attn.conv1d.weight                  MQ4G256         32768     2.6715e-5     4.0471e-2
+model.language_model.layers.4.linear_attn.conv1d.weight                  MQ4G256         32768     2.2606e-5     4.2435e-2
+model.language_model.layers.5.linear_attn.conv1d.weight                  MQ4G256         32768     1.9787e-5     3.7581e-2
+model.language_model.layers.2.linear_attn.conv1d.weight                  MQ4G256         32768     1.1947e-5     4.2709e-2
+model.language_model.layers.1.linear_attn.in_proj_a.weight               MQ4G256        131072     1.1391e-5     2.2704e-2
+model.language_model.layers.1.linear_attn.conv1d.weight                  MQ4G256         32768     1.0816e-5     3.1958e-2
+model.language_model.layers.27.self_attn.v_proj.weight                   MQ4G256       4194304     8.5718e-6     5.0273e-2
+model.language_model.layers.31.self_attn.v_proj.weight                   MQ4G256       4194304     7.9313e-6     2.4673e-2
+model.language_model.layers.2.linear_attn.in_proj_a.weight               MQ4G256        131072     7.7553e-6     1.7368e-2
+model.language_model.layers.1.linear_attn.in_proj_b.weight               MQ4G256        131072     7.3299e-6     1.7330e-2
+model.language_model.layers.0.linear_attn.in_proj_a.weight               MQ4G256        131072     7.1460e-6     1.6524e-2
+model.language_model.layers.4.linear_attn.in_proj_a.weight               MQ4G256        131072     6.8179e-6     1.7073e-2
+model.language_model.layers.27.self_attn.o_proj.weight                   MQ4G256      16777216     5.1598e-6     5.1935e-2
+model.language_model.layers.23.self_attn.v_proj.weight                   MQ4G256       4194304     5.0456e-6     1.5197e-2
+model.language_model.layers.2.linear_attn.in_proj_b.weight               MQ4G256        131072     4.9103e-6     1.3217e-2
+model.language_model.layers.6.linear_attn.in_proj_a.weight               MQ4G256        131072     4.6295e-6     1.3664e-2
+model.language_model.layers.30.linear_attn.in_proj_a.weight              MQ4G256        131072     4.4313e-6     1.2980e-2
+model.language_model.layers.19.self_attn.v_proj.weight                   MQ4G256       4194304     4.4174e-6     1.4451e-2
+model.language_model.layers.29.linear_attn.in_proj_a.weight              MQ4G256        131072     4.3866e-6     1.1047e-2
+model.language_model.layers.5.linear_attn.in_proj_a.weight               MQ4G256        131072     4.2587e-6     1.2136e-2
+model.language_model.layers.12.linear_attn.in_proj_a.weight              MQ4G256        131072     4.2325e-6     1.3078e-2
+model.language_model.layers.28.linear_attn.in_proj_qkv.weight            MQ4G256      33554432     4.0660e-6     3.7744e-2
+model.language_model.layers.3.self_attn.q_proj.weight                    MQ4G256      33554432     4.0649e-6     2.0440e-2
+model.language_model.layers.31.self_attn.o_proj.weight                   MQ4G256      16777216     4.0076e-6     4.0884e-2
+model.language_model.layers.24.linear_attn.in_proj_qkv.weight            MQ4G256      33554432     4.0032e-6     1.7486e-2
+model.language_model.layers.25.linear_attn.in_proj_qkv.weight            MQ4G256      33554432     3.9812e-6     1.8312e-2
+model.language_model.layers.20.linear_attn.in_proj_qkv.weight            MQ4G256      33554432     3.8985e-6     1.7689e-2
+model.language_model.layers.8.linear_attn.in_proj_a.weight               MQ4G256        131072     3.8545e-6     1.2322e-2
+model.language_model.layers.21.linear_attn.in_proj_qkv.weight            MQ4G256      33554432     3.8528e-6     1.5746e-2
+model.language_model.layers.23.self_attn.o_proj.weight                   MQ4G256      16777216     3.8497e-6     3.3337e-2
+model.language_model.layers.4.linear_attn.in_proj_b.weight               MQ4G256        131072     3.8306e-6     1.1408e-2
+
+=== Aggregate stats by quant type ===
+qt          tensors    total_params        mean MSE         p99 MSE         max MSE
+-------------------------------------------------------------------------------------
+F16             153          274944       7.4372e-9       1.1683e-7       1.3392e-7
+Q8_0              1      1017118720       5.2574e-9       5.2574e-9       5.2574e-9
+MQ4G256         273      7936409600       6.6245e-6       8.7637e-5       9.8608e-5
+
+=== Skipped ===
+  filter:           0
+  no safetensors:   0
+  3D expert:        0

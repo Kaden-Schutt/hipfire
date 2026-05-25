@@ -1,34 +1,149 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! BPE tokenizer loaded from GGUF metadata.
 //! Supports encode (text → token IDs) and decode (token IDs → text).
 
 use crate::gguf::{GgufFile, MetaValue};
+use regex::Regex;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
+use std::fmt;
+use std::sync::OnceLock;
+
+/// GPT-2 / cl100k-style pre-tokenization regex. Same family of pattern
+/// every reference byte-level BPE encoder uses (tiktoken, HF tokenizers,
+/// GPT-2): chunk input into contractions, letter words, digit runs ≤3,
+/// punctuation runs, and whitespace runs. BPE then runs per-chunk
+/// instead of on the whole prompt, restoring the canonical O(N) shape
+/// with bounded per-chunk constants.
+///
+/// Lookahead `\s+(?!\S)` is omitted from the canonical pattern; the
+/// `regex` crate doesn't support lookaround and the surviving `\s+`
+/// branch matches the same byte spans. Order of alternation preserves
+/// the priority the reference encoders use, so chunking boundaries
+/// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
+/// (verified against locked niah_4k token md5).
+const GPT2_PRETOK_PATTERN: &str =
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+
+fn gpt2_pretok_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(GPT2_PRETOK_PATTERN)
+            .expect("GPT2_PRETOK_PATTERN must compile — pattern is a const")
+    })
+}
+
+/// Which side of a merge rule failed validation. Used by `MissingMergeOperand`.
+#[derive(Debug, Clone, Copy)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Errors returned by `Tokenizer::from_*` constructors.
+///
+/// Replaces the prior silent `Option::None` returns. Variants distinguish
+/// malformed-input failures (`MetadataMissing`, `MalformedJson`) from
+/// vocab/merges inconsistencies that would cause the encoder to silently
+/// corrupt output downstream (`MissingByteSymbol`, `MissingMergeOperand`,
+/// `MissingMergeResult`) — see #203.
+#[derive(Debug)]
+pub enum TokenizerError {
+    /// A required metadata field was missing or had the wrong type in the source format.
+    MetadataMissing { field: &'static str },
+    /// Raw JSON did not parse.
+    MalformedJson(serde_json::Error),
+    /// `byte_to_gpt2_char(b)` produced a char with no entry in `token_to_id`.
+    /// GPT-2 BPE tokenizers MUST cover every byte 0..=255; without this,
+    /// `encode_gpt2_bpe`'s initial seed would silently map to id 0.
+    MissingByteSymbol { byte: u8, char: char },
+    /// A merge rule referenced a left or right symbol with no entry in `token_to_id`.
+    MissingMergeOperand {
+        rank: usize,
+        left: String,
+        right: String,
+        missing_side: Side,
+    },
+    /// A merge rule's resolved result (`left + right`) has no entry in `token_to_id`.
+    /// The encoder cannot represent the post-merge state without this.
+    MissingMergeResult { rank: usize, expected: String },
+}
+
+impl fmt::Display for TokenizerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MetadataMissing { field } => {
+                write!(f, "tokenizer metadata field missing or wrong type: {field}")
+            }
+            Self::MalformedJson(e) => write!(f, "tokenizer JSON parse error: {e}"),
+            Self::MissingByteSymbol { byte, char } => write!(
+                f,
+                "GPT-2 BPE vocab missing byte symbol: byte 0x{byte:02x} maps to char {char:?} which is not in token_to_id"
+            ),
+            Self::MissingMergeOperand { rank, left, right, missing_side } => write!(
+                f,
+                "merge rule rank {rank} ({left:?}, {right:?}): {missing_side:?} symbol not in vocab"
+            ),
+            Self::MissingMergeResult { rank, expected } => write!(
+                f,
+                "merge rule rank {rank}: merged result {expected:?} not in vocab"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TokenizerError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MalformedJson(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for TokenizerError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::MalformedJson(e)
+    }
+}
 
 pub struct Tokenizer {
     /// Token ID → string
     vocab: Vec<String>,
     /// String → token ID (for encoding)
     token_to_id: HashMap<String, u32>,
-    /// BPE merge rules: (left, right) → merged token
-    merges: Vec<(String, String)>,
-    /// Pre-built BPE merge-rank lookup: (left, right) → rank index. Built
-    /// ONCE per tokenizer construction so `encode_gpt2_bpe` doesn't pay the
-    /// O(M) String-clone-into-HashMap cost on every encode call (M is the
-    /// merges count, ~150K for Qwen3+ — without this, ~50ms per encode call,
-    /// which compounds across the 9+ encodes-per-request the daemon does for
-    /// chat-template scaffolding and adds ~450ms to TTFT for short prompts).
+    /// BPE merge results in rank order: `merges[i]` is the merged token id
+    /// for the merge rule at rank `i`. The pair → rank lookup is in
+    /// `merge_pair_rank` (keyed on `(left_id, right_id)`); when a rule
+    /// fires, the encoder writes `merges[rank]` directly. Empty for SP.
+    ///
+    /// Replaces the prior `Vec<(String, String)>` (and the intermediate
+    /// `Vec<MergeRule { left, right, result }>` in earlier drafts of this
+    /// refactor — `left` and `right` were never read on any path because
+    /// pair lookups already go through `merge_pair_rank`, so storing only
+    /// the result is sufficient and ~3× smaller per entry).
+    merges: Vec<u32>,
+    /// `(left_id, right_id) → rank` (= index into `merges`). Built once at
+    /// construction. `(u32, u32)` is `Copy` so heap-pair lookups never clone.
     ///
     /// Named `merge_pair_rank` (not `merge_rank`) to disambiguate from the
     /// public `merge_rank(&self, id: u32) -> Option<usize>` diagnostic
     /// method (token-id → rank, O(merges) linear scan — different lookup,
-    /// different shape). The two compiled fine sharing a name but invited
+    /// different shape). They compiled fine sharing the name but invited
     /// subtle field-vs-method confusion at call sites.
-    merge_pair_rank: HashMap<(String, String), usize>,
-    /// Special tokens: strings like "<|im_start|>" → their token ID
-    /// Sorted longest-first for greedy matching
+    merge_pair_rank: HashMap<(u32, u32), u32>,
+    /// For GPT-2 BPE only: byte `b` → token id of `byte_to_gpt2_char(b).to_string()`.
+    /// Construction guarantees every byte 0..=255 has a valid id (else
+    /// `from_*` returns `MissingByteSymbol`), so `encode_gpt2_bpe`'s initial
+    /// seed is infallible. `None` for SentencePiece tokenizers (no
+    /// byte-level encoding).
+    byte_to_id: Option<[u32; 256]>,
+    /// Special tokens: strings like "<|im_start|>" → their token ID.
+    /// Sorted longest-first for greedy matching.
     special_tokens: Vec<(String, u32)>,
-    /// Special tokens
     pub bos_id: u32,
     pub eos_id: u32,
     /// Auxiliary end-of-generation id (e.g. `<|endoftext|>` when `eos_id` is
@@ -36,26 +151,95 @@ pub struct Tokenizer {
     /// it emits this, not `eos_id` — stop-loops must check both via
     /// `is_terminator()`. None if the vocab only has one terminator.
     pub eot_id: Option<u32>,
-    /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA)
+    /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
 }
 
-/// Pre-build the BPE merge-rank lookup. Called once at tokenizer construction
-/// time to amortize the O(M) String-clone-into-HashMap across the lifetime of
-/// the tokenizer rather than paying it per encode call.
-fn build_merge_pair_rank(merges: &[(String, String)]) -> HashMap<(String, String), usize> {
-    merges
-        .iter()
-        .enumerate()
-        .map(|(i, (l, r))| ((l.clone(), r.clone()), i))
-        .collect()
+/// Resolve a list of `(left_string, right_string)` merge pairs into a
+/// rank-ordered `Vec<u32>` of result ids + `(left_id, right_id) → rank`
+/// lookup, verifying that every operand and every merged result is
+/// present in `token_to_id`. Returns `Err` on the first missing entry —
+/// see #203.
+fn resolve_merges(
+    merges_strings: &[(String, String)],
+    token_to_id: &HashMap<String, u32>,
+) -> Result<(Vec<u32>, HashMap<(u32, u32), u32>), TokenizerError> {
+    let mut merges = Vec::with_capacity(merges_strings.len());
+    let mut merge_pair_rank: HashMap<(u32, u32), u32> =
+        HashMap::with_capacity(merges_strings.len());
+    let mut result_buf = String::new();
+    for (rank, (l_str, r_str)) in merges_strings.iter().enumerate() {
+        let left = token_to_id.get(l_str.as_str()).copied().ok_or_else(|| {
+            TokenizerError::MissingMergeOperand {
+                rank,
+                left: l_str.clone(),
+                right: r_str.clone(),
+                missing_side: Side::Left,
+            }
+        })?;
+        let right = token_to_id.get(r_str.as_str()).copied().ok_or_else(|| {
+            TokenizerError::MissingMergeOperand {
+                rank,
+                left: l_str.clone(),
+                right: r_str.clone(),
+                missing_side: Side::Right,
+            }
+        })?;
+        // Merged result string is `left + right` by BPE construction. Reuse
+        // one scratch buffer across all rules.
+        result_buf.clear();
+        result_buf.push_str(l_str);
+        result_buf.push_str(r_str);
+        let result =
+            token_to_id.get(result_buf.as_str()).copied().ok_or_else(|| {
+                TokenizerError::MissingMergeResult {
+                    rank,
+                    expected: result_buf.clone(),
+                }
+            })?;
+        merges.push(result);
+        // First-rank-wins on duplicate `(left_id, right_id)` pairs:
+        // `entry().or_insert()` keeps the earlier rank. This is correct for
+        // BPE semantics because the encoder's min-heap pops lowest rank
+        // first — a later duplicate would never fire even if we inserted
+        // it. Pathological vocabs with duplicate merge rules thus behave
+        // deterministically (drop the later rule) instead of being
+        // overwritten silently.
+        merge_pair_rank.entry((left, right)).or_insert(rank as u32);
+    }
+    Ok((merges, merge_pair_rank))
+}
+
+/// For GPT-2 BPE tokenizers: build the byte → token-id lookup table by
+/// running every byte 0..=255 through `byte_to_gpt2_char` and resolving
+/// the resulting char string against `token_to_id`. Returns `Err` on the
+/// first byte whose char isn't in the vocab — that would silently corrupt
+/// `encode_gpt2_bpe`'s initial seed (#203).
+fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], TokenizerError> {
+    let mut out = [0u32; 256];
+    let mut buf = [0u8; 4];
+    for b in 0u32..=255 {
+        let ch = byte_to_gpt2_char(b as u8);
+        let s = ch.encode_utf8(&mut buf);
+        let id = token_to_id
+            .get(s)
+            .copied()
+            .ok_or(TokenizerError::MissingByteSymbol {
+                byte: b as u8,
+                char: ch,
+            })?;
+        out[b as usize] = id;
+    }
+    Ok(out)
 }
 
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
-    pub fn from_gguf(gguf: &GgufFile) -> Option<Self> {
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
         // Read vocabulary
-        let tokens_meta = gguf.meta("tokenizer.ggml.tokens")?;
+        let tokens_meta = gguf
+            .meta("tokenizer.ggml.tokens")
+            .ok_or(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" })?;
         let vocab: Vec<String> = match tokens_meta {
             MetaValue::Array(arr) => arr
                 .iter()
@@ -64,7 +248,7 @@ impl Tokenizer {
                     _ => String::new(),
                 })
                 .collect(),
-            _ => return None,
+            _ => return Err(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" }),
         };
 
         let mut token_to_id = HashMap::with_capacity(vocab.len());
@@ -72,25 +256,26 @@ impl Tokenizer {
             token_to_id.insert(tok.clone(), i as u32);
         }
 
-        // Read merge rules
-        let merges = if let Some(MetaValue::Array(arr)) = gguf.meta("tokenizer.ggml.merges") {
-            arr.iter()
-                .filter_map(|v| {
-                    if let MetaValue::String(s) = v {
-                        let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                        if parts.len() == 2 {
-                            Some((parts[0].to_string(), parts[1].to_string()))
+        // Read merge rules (raw string pairs; resolved to ids below).
+        let merges_strings: Vec<(String, String)> =
+            if let Some(MetaValue::Array(arr)) = gguf.meta("tokenizer.ggml.merges") {
+                arr.iter()
+                    .filter_map(|v| {
+                        if let MetaValue::String(s) = v {
+                            let parts: Vec<&str> = s.splitn(2, ' ').collect();
+                            if parts.len() == 2 {
+                                Some((parts[0].to_string(), parts[1].to_string()))
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
@@ -118,13 +303,21 @@ impl Tokenizer {
         // Sort longest-first for greedy matching
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let merge_pair_rank = build_merge_pair_rank(&merges);
+        // Resolve merges to token ids; reject inconsistent vocab/merges (#203).
+        let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
+        // For GPT-2 BPE, every byte 0..=255 must have a vocab entry. SP doesn't need this.
+        let byte_to_id = if is_gpt2_bpe {
+            Some(build_byte_to_id(&token_to_id)?)
+        } else {
+            None
+        };
 
-        Some(Tokenizer {
+        Ok(Tokenizer {
             vocab,
             token_to_id,
             merges,
             merge_pair_rank,
+            byte_to_id,
             special_tokens,
             bos_id,
             eos_id,
@@ -134,17 +327,25 @@ impl Tokenizer {
     }
 
     /// Load tokenizer from HuggingFace tokenizer.json (embedded in HFQ metadata).
-    pub fn from_hf_json(json_str: &str) -> Option<Self> {
-        let tok: serde_json::Value = serde_json::from_str(json_str).ok()?;
-        let model = tok.get("model")?;
+    pub fn from_hf_json(json_str: &str) -> Result<Self, TokenizerError> {
+        let tok: serde_json::Value = serde_json::from_str(json_str)?;
+        let model = tok
+            .get("model")
+            .ok_or(TokenizerError::MetadataMissing { field: "model" })?;
 
-        let vocab_map = model.get("vocab")?.as_object()?;
+        let vocab_map = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or(TokenizerError::MetadataMissing { field: "model.vocab" })?;
         let vocab_size = vocab_map.len();
 
         let mut vocab = vec![String::new(); vocab_size + 100];
         let mut token_to_id = HashMap::with_capacity(vocab_size);
         for (token, id_val) in vocab_map {
-            let id = id_val.as_u64()? as u32;
+            let id = id_val
+                .as_u64()
+                .ok_or(TokenizerError::MetadataMissing { field: "model.vocab[*]: non-integer id" })?
+                as u32;
             if (id as usize) >= vocab.len() {
                 vocab.resize(id as usize + 1, String::new());
             }
@@ -152,29 +353,31 @@ impl Tokenizer {
             token_to_id.insert(token.clone(), id);
         }
 
-        let merges = if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
-            merges_arr.iter()
-                .filter_map(|v| {
-                    // HF tokenizer.json stores merges as either "a b" strings or ["a", "b"] arrays
-                    if let Some(s) = v.as_str() {
-                        let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                        if parts.len() == 2 {
-                            return Some((parts[0].to_string(), parts[1].to_string()));
-                        }
-                    }
-                    if let Some(arr) = v.as_array() {
-                        if arr.len() == 2 {
-                            if let (Some(a), Some(b)) = (arr[0].as_str(), arr[1].as_str()) {
-                                return Some((a.to_string(), b.to_string()));
+        let merges_strings: Vec<(String, String)> =
+            if let Some(merges_arr) = model.get("merges").and_then(|v| v.as_array()) {
+                merges_arr
+                    .iter()
+                    .filter_map(|v| {
+                        // HF tokenizer.json stores merges as either "a b" strings or ["a", "b"] arrays
+                        if let Some(s) = v.as_str() {
+                            let parts: Vec<&str> = s.splitn(2, ' ').collect();
+                            if parts.len() == 2 {
+                                return Some((parts[0].to_string(), parts[1].to_string()));
                             }
                         }
-                    }
-                    None
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+                        if let Some(arr) = v.as_array() {
+                            if arr.len() == 2 {
+                                if let (Some(a), Some(b)) = (arr[0].as_str(), arr[1].as_str()) {
+                                    return Some((a.to_string(), b.to_string()));
+                                }
+                            }
+                        }
+                        None
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         if let Some(added) = tok.get("added_tokens").and_then(|v| v.as_array()) {
@@ -214,13 +417,19 @@ impl Tokenizer {
 
         let is_gpt2_bpe = token_to_id.contains_key("Ġthe") || token_to_id.contains_key("Ġ");
 
-        let merge_pair_rank = build_merge_pair_rank(&merges);
+        let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
+        let byte_to_id = if is_gpt2_bpe {
+            Some(build_byte_to_id(&token_to_id)?)
+        } else {
+            None
+        };
 
-        Some(Tokenizer {
+        Ok(Tokenizer {
             vocab,
             token_to_id,
             merges,
             merge_pair_rank,
+            byte_to_id,
             special_tokens,
             bos_id,
             eos_id,
@@ -237,24 +446,39 @@ impl Tokenizer {
     ///      GGUF-side quantizer writes (preserves the original GGUF
     ///      tokenizer verbatim, no HF-format translation).
     ///
-    /// Returns None if neither is present.
-    pub fn from_hfq_metadata(metadata_json: &str) -> Option<Self> {
-        let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    /// Returns `Err(MetadataMissing)` if neither is present.
+    ///
+    /// Load tokenizer from a tokenizer.json file on disk.
+    /// Returns `Ok(None)` if the file is missing or unreadable; `Err` if the
+    /// file exists but fails to parse as a valid tokenizer.
+    pub fn from_tokenizer_json(path: &std::path::Path) -> Result<Option<Self>, TokenizerError> {
+        let json_str = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        Self::from_hf_json(&json_str).map(Some)
+    }
+
+    pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
+        let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
         if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {
             return Self::from_hf_json(tok_str);
         }
         if let Some(gguf_meta) = meta.get("gguf_meta") {
             return Self::from_gguf_meta_json(gguf_meta);
         }
-        None
+        Err(TokenizerError::MetadataMissing { field: "tokenizer | gguf_meta" })
     }
 
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
     /// `from_gguf` field-for-field but reads `serde_json::Value` instead of
     /// the live `GgufFile`. Used by the GGUF→MQ4 quantize path so a
     /// converted `.mq4` is fully self-sufficient (no GGUF-on-disk fallback).
-    pub fn from_gguf_meta_json(meta: &serde_json::Value) -> Option<Self> {
-        let tokens_arr = meta.get("tokenizer.ggml.tokens")?.as_array()?;
+    pub fn from_gguf_meta_json(meta: &serde_json::Value) -> Result<Self, TokenizerError> {
+        let tokens_arr = meta
+            .get("tokenizer.ggml.tokens")
+            .and_then(|v| v.as_array())
+            .ok_or(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" })?;
         let vocab: Vec<String> = tokens_arr
             .iter()
             .map(|v| v.as_str().unwrap_or("").to_string())
@@ -265,7 +489,7 @@ impl Tokenizer {
             token_to_id.insert(tok.clone(), i as u32);
         }
 
-        let merges: Vec<(String, String)> = meta
+        let merges_strings: Vec<(String, String)> = meta
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -316,13 +540,19 @@ impl Tokenizer {
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let merge_pair_rank = build_merge_pair_rank(&merges);
+        let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
+        let byte_to_id = if is_gpt2_bpe {
+            Some(build_byte_to_id(&token_to_id)?)
+        } else {
+            None
+        };
 
-        Some(Tokenizer {
+        Ok(Tokenizer {
             vocab,
             token_to_id,
             merges,
             merge_pair_rank,
+            byte_to_id,
             special_tokens,
             bos_id,
             eos_id,
@@ -564,25 +794,59 @@ impl Tokenizer {
     /// encoded token IDs will silently diverge from every reference
     /// implementation.
     fn encode_gpt2_bpe(&self, text: &str) -> Vec<u32> {
-        // 1. Convert text to GPT-2 byte-encoded symbols.
-        let mut syms: Vec<String> = text
-            .bytes()
-            .map(|b| byte_to_gpt2_char(b).to_string())
-            .collect();
+        // Pre-tokenize via GPT-2 / cl100k regex, then BPE each chunk
+        // independently. Reference behaviour for byte-level BPE; without
+        // this step the merge PQ degenerates to a single O(N log N)
+        // problem over the whole prompt (~150K cross-word merges with
+        // stale-entry churn on a 14K-byte prompt). Per-chunk problems
+        // are typically ≤10 bytes with <8 merges each, so total work
+        // becomes O(N) with tiny constants — matches HF tokenizers /
+        // tiktoken / GPT-2 reference encoders byte-for-byte.
+        //
+        // Capacity hint: typical BPE compression on prose is ~3.5× bytes
+        // → tokens, so `len/4` is a sane lower bound that avoids early
+        // reallocs without wasting memory on short inputs.
+        let mut result: Vec<u32> = Vec::with_capacity(text.len() / 4 + 1);
+        for m in gpt2_pretok_re().find_iter(text) {
+            self.encode_gpt2_chunk(m.as_str().as_bytes(), &mut result);
+        }
+        result
+    }
+
+    /// BPE-encode a single pre-tokenized chunk (byte slice from
+    /// `gpt2_pretok_re().find_iter`) and append the resulting token ids
+    /// to `out`. Splitting this out of `encode_gpt2_bpe` lets the regex
+    /// driver feed many small chunks through the same PQ machinery
+    /// without re-allocating the heap/linked-list state across the full
+    /// prompt — each chunk is typically ≤10 bytes so the per-chunk state
+    /// is tiny.
+    fn encode_gpt2_chunk(&self, chunk_bytes: &[u8], out: &mut Vec<u32>) {
+        // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
+        // Construction guarantees `byte_to_id` covers every byte 0..=255
+        // for GPT-2 BPE tokenizers (else `from_*` returned
+        // `MissingByteSymbol`), so the table lookup is infallible.
+        let byte_to_id = self
+            .byte_to_id
+            .as_ref()
+            .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
+        let mut syms: Vec<u32> = chunk_bytes.iter().map(|&b| byte_to_id[b as usize]).collect();
         let n = syms.len();
         if n == 0 {
-            return Vec::new();
+            return;
         }
         if n == 1 {
-            return vec![self.token_to_id.get(&syms[0]).copied().unwrap_or(0)];
+            out.push(syms[0]);
+            return;
         }
 
-        // 2. Use the pre-built merge rank map cached on the Tokenizer.
-        // Earlier this was rebuilt every call (~50ms per encode for Qwen3+
-        // with ~150K merges); the daemon makes 9+ encode calls per request
-        // for chat-template scaffolding, so the per-call rebuild added
-        // ~450ms to TTFT for short prompts. Now O(1) per encode.
-        let merge_rank = &self.merge_pair_rank;
+        // 2. Pre-built merge rank map keyed on (left_id, right_id). u32
+        // pairs are `Copy` so heap-pair lookups never clone. Cached on the
+        // Tokenizer so we don't pay the O(M) build cost per encode call
+        // (was ~50ms per encode for Qwen3+ with ~150K merges; the daemon
+        // makes 9+ encode calls per request for chat-template scaffolding,
+        // so the per-call rebuild added ~450ms to TTFT for short prompts).
+        let merge_pair_rank = &self.merge_pair_rank;
+        let merges = &self.merges;
 
         // 3. Doubly-linked-list state. `prev/next` are i32 with -1 sentinel.
         let mut prev: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
@@ -593,16 +857,14 @@ impl Tokenizer {
         let mut gen: Vec<u32> = vec![0; n];
 
         // 4. Min-heap of (rank, left_idx, gen_at_push). Reverse for min-heap.
-        let mut heap: BinaryHeap<Reverse<(usize, usize, u32)>> = BinaryHeap::with_capacity(n);
-        let push_pair = |heap: &mut BinaryHeap<Reverse<(usize, usize, u32)>>,
-                         syms: &[String],
+        let mut heap: BinaryHeap<Reverse<(u32, usize, u32)>> = BinaryHeap::with_capacity(n);
+        let push_pair = |heap: &mut BinaryHeap<Reverse<(u32, usize, u32)>>,
+                         syms: &[u32],
                          gen: &[u32],
                          l: usize,
                          r: usize| {
-            // HashMap key requires owned Strings — clone is the cost. The
-            // naive impl did this on every (i, i+1) pair × every merge
-            // step (O(N²) clones); we do it O(N log N) times.
-            if let Some(&rank) = merge_rank.get(&(syms[l].clone(), syms[r].clone())) {
+            // O(1) HashMap lookup on a Copy `(u32, u32)` key — no clones.
+            if let Some(&rank) = merge_pair_rank.get(&(syms[l], syms[r])) {
                 heap.push(Reverse((rank, l, gen[l])));
             }
         };
@@ -632,21 +894,15 @@ impl Tokenizer {
             // either side bumps `gen[l]` (or kills `r`) and would have failed
             // the check above. Verified in debug builds; release trusts it.
             debug_assert_eq!(
-                merge_rank
-                    .get(&(syms[l].clone(), syms[r].clone()))
-                    .copied(),
+                merge_pair_rank.get(&(syms[l], syms[r])).copied(),
                 Some(rank),
                 "BPE pq invariant: popped rank must match live pair rank",
             );
 
-            // Apply the merge: l absorbs r.
-            let merged = {
-                let mut s = String::with_capacity(syms[l].len() + syms[r].len());
-                s.push_str(&syms[l]);
-                s.push_str(&syms[r]);
-                s
-            };
-            syms[l] = merged;
+            // Apply the merge: l absorbs r. The merged token id is a direct
+            // index into `merges` (rank-ordered) — no string concat, no
+            // HashMap lookup, infallible by construction (#203).
+            syms[l] = merges[rank as usize];
             dead[r] = true;
             // Plain `+= 1`: bumps are bounded by N − 1 per slot, N < 2³², so
             // overflow is unreachable. `wrapping_add` would silently un-stale
@@ -676,21 +932,23 @@ impl Tokenizer {
             }
         }
 
-        // 7. Walk the linked list collecting live symbols → token ids.
-        // Slot 0 is always the head under our merge-left-into-right invariant,
-        // but we scan explicitly for `prev == -1 && !dead`. The scan is O(N)
-        // once and is robust against any future invariant breakage (a
-        // `debug_assert!` here would be a release-mode no-op and walk
-        // tombstoned data silently; the explicit scan can't).
-        let mut result = Vec::with_capacity(n);
+        // 7. Walk the linked list, appending live symbol ids to `out`.
+        // Every slot holds a token id that was validated at construction
+        // time: `byte_to_id` rejected any byte whose char wasn't in vocab,
+        // `resolve_merges` rejected any merge whose result wasn't in
+        // vocab, and the merge loop only writes `merges[rank]` (which is
+        // itself a validated id). The encoder therefore CANNOT emit id 0
+        // for an OOV symbol — the previous `unwrap_or(0)` fallback (#203)
+        // is structurally unreachable now and removed. The explicit head
+        // scan (`prev == -1 && !dead`) survives any future invariant
+        // breakage that a `debug_assert!` would silently miss in release.
         let head = (0..n).find(|&i| prev[i] == -1 && !dead[i]);
         let mut p: i32 = head.map(|i| i as i32).unwrap_or(-1);
         while p >= 0 {
             let pi = p as usize;
-            result.push(self.token_to_id.get(&syms[pi]).copied().unwrap_or(0));
+            out.push(syms[pi]);
             p = next[pi];
         }
-        result
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -903,15 +1161,12 @@ impl Tokenizer {
     /// Build a token-id → merge-rank table by scanning the BPE merges list.
     /// O(n_merges) one-time. Used only by diagnostics; not on the hot path.
     pub fn build_merge_rank_table(&self) -> HashMap<u32, usize> {
+        // `merges: Vec<u32>` is rank-ordered result ids, so the merged-id
+        // is just `*m` — no string concatenation, no `token_to_id` lookup,
+        // infallible by construction.
         let mut out = HashMap::with_capacity(self.merges.len());
-        let mut buf = String::new();
-        for (i, (l, r)) in self.merges.iter().enumerate() {
-            buf.clear();
-            buf.push_str(l);
-            buf.push_str(r);
-            if let Some(&id) = self.token_to_id.get(&buf) {
-                out.entry(id).or_insert(i);
-            }
+        for (i, &result_id) in self.merges.iter().enumerate() {
+            out.entry(result_id).or_insert(i);
         }
         out
     }
@@ -923,16 +1178,8 @@ impl Tokenizer {
         if s.len() <= 1 {
             return Some(0); // base byte
         }
-        let mut buf = String::new();
-        for (i, (l, r)) in self.merges.iter().enumerate() {
-            buf.clear();
-            buf.push_str(l);
-            buf.push_str(r);
-            if buf == *s {
-                return Some(i);
-            }
-        }
-        None
+        // Linear scan of the rank-ordered `merges` Vec for the result id.
+        self.merges.iter().position(|&m| m == id)
     }
 
     fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
@@ -1224,16 +1471,32 @@ mod bpe_tests {
             .enumerate()
             .map(|(i, s)| (s.clone(), i as u32))
             .collect();
-        let merges: Vec<(String, String)> = merges
+        let merges_strings: Vec<(String, String)> = merges
             .iter()
             .map(|(l, r)| (l.to_string(), r.to_string()))
             .collect();
-        let merge_pair_rank = build_merge_pair_rank(&merges);
+        let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)
+            .expect("synth: merges must be consistent with vocab");
+        // Test-only `byte_to_id`: best-effort fill, defaults to 0 for any
+        // byte whose char isn't in vocab. Production constructors require
+        // full 256-byte coverage (else MissingByteSymbol). The BPE tests
+        // deliberately use minimal vocabs and only feed ASCII inputs whose
+        // bytes ARE present.
+        let mut byte_to_id_arr = [0u32; 256];
+        for b in 0u32..=255 {
+            let ch = byte_to_gpt2_char(b as u8);
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            if let Some(&id) = token_to_id.get(s) {
+                byte_to_id_arr[b as usize] = id;
+            }
+        }
         Tokenizer {
             vocab,
             token_to_id,
             merges,
             merge_pair_rank,
+            byte_to_id: Some(byte_to_id_arr),
             special_tokens: Vec::new(),
             bos_id: 0,
             eos_id: 0,
@@ -1326,11 +1589,172 @@ mod bpe_tests {
 }
 
 #[cfg(test)]
+mod consistency_tests {
+    //! Tests for the constructor-time vocab/merges consistency checks
+    //! introduced for #203. The pre-refactor `Option`-returning constructors
+    //! silently dropped inconsistent vocabs (or worse, let the encoder emit
+    //! id 0 for missing symbols); the new `Result`-returning constructors
+    //! reject loud at load time.
+    //!
+    //! All tests use `from_gguf_meta_json` since it takes a
+    //! `serde_json::Value` directly — the cheapest way to construct
+    //! deliberately-broken inputs without going through GGUF or HF formats.
+
+    use super::*;
+    use serde_json::json;
+
+    /// Build a SentencePiece-mode meta JSON. Skips byte-coverage check.
+    fn sp_meta(tokens: &[&str], merges: &[&str]) -> serde_json::Value {
+        json!({
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.merges": merges,
+            "tokenizer.ggml.model": "llama",
+        })
+    }
+
+    /// Build a GPT-2-mode meta JSON. Triggers byte-coverage check.
+    /// `tokens` becomes `[byte0_char, byte1_char, ..., byte255_char, ...extras]`,
+    /// optionally replacing one byte's char with a placeholder to trigger
+    /// `MissingByteSymbol`.
+    fn gpt2_meta_full_bytes(
+        skip_byte: Option<u8>,
+        extras: &[&str],
+        merges: &[&str],
+    ) -> serde_json::Value {
+        let mut tokens: Vec<String> = (0u32..=255)
+            .map(|b| {
+                if Some(b as u8) == skip_byte {
+                    "__placeholder__".to_string()
+                } else {
+                    byte_to_gpt2_char(b as u8).to_string()
+                }
+            })
+            .collect();
+        for e in extras {
+            tokens.push((*e).to_string());
+        }
+        json!({
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.merges": merges,
+            "tokenizer.ggml.model": "gpt2",
+        })
+    }
+
+    #[test]
+    fn rejects_missing_merge_operand_left() {
+        // Vocab has "b" and "ab" but not "a"; merge "a b" → left absent.
+        let meta = sp_meta(&["b", "ab"], &["a b"]);
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MissingMergeOperand { rank: 0, missing_side: Side::Left, ref left, ref right } => {
+                assert_eq!(left, "a");
+                assert_eq!(right, "b");
+            }
+            other => panic!("expected MissingMergeOperand{{Left}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_merge_operand_right() {
+        // Vocab has "a" and "ab" but not "b"; merge "a b" → right absent.
+        let meta = sp_meta(&["a", "ab"], &["a b"]);
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MissingMergeOperand { rank: 0, missing_side: Side::Right, .. } => {}
+            other => panic!("expected MissingMergeOperand{{Right}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_merge_result() {
+        // Vocab has "a" and "b" but NOT "ab"; merge "a b" produces an "ab"
+        // that isn't a token id.
+        let meta = sp_meta(&["a", "b"], &["a b"]);
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MissingMergeResult { rank: 0, ref expected } => {
+                assert_eq!(expected, "ab");
+            }
+            other => panic!("expected MissingMergeResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_missing_byte_symbol_for_gpt2() {
+        // GPT-2 vocab missing byte 0x41 ('A')'s char triggers
+        // MissingByteSymbol — encode_gpt2_bpe's initial seed would have
+        // silently mapped to id 0 otherwise.
+        let meta = gpt2_meta_full_bytes(Some(b'A'), &[], &[]);
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MissingByteSymbol { byte: 0x41, char: 'A' } => {}
+            other => panic!("expected MissingByteSymbol{{0x41,'A'}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skips_byte_check_for_sp() {
+        // SP tokenizers (model != "gpt2") don't have byte-coverage
+        // requirement — minimal vocab + no merges should succeed.
+        let meta = sp_meta(&["a", "b"], &[]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta)
+            .expect("minimal SP vocab with no merges should succeed");
+        assert_eq!(tok.vocab.len(), 2);
+        assert!(tok.byte_to_id.is_none());
+        assert!(tok.merges.is_empty());
+    }
+
+    #[test]
+    fn succeeds_on_consistent_gpt2_with_one_merge() {
+        // GPT-2 with full 256-byte coverage + one consistent merge.
+        // Need 'A' (0x41) and 'B' (0x42) in vocab plus an "AB" extra.
+        // byte_to_gpt2_char maps printable ASCII to itself, so the
+        // byte chars *are* "A" and "B".
+        let meta = gpt2_meta_full_bytes(None, &["AB"], &["A B"]);
+        let tok = Tokenizer::from_gguf_meta_json(&meta)
+            .expect("consistent GPT-2 vocab should succeed");
+        assert!(tok.byte_to_id.is_some());
+        assert_eq!(tok.merges.len(), 1);
+        // Merge resolved to ids: A → 0x41, B → 0x42, AB → 256 (first extra).
+        // `merges[0]` is the result id; `merge_pair_rank` carries the pair → rank.
+        assert_eq!(tok.merges[0], 256);
+        assert_eq!(tok.merge_pair_rank.get(&(0x41, 0x42)).copied(), Some(0));
+    }
+
+    #[test]
+    fn rejects_metadata_missing_tokens() {
+        let meta = json!({});
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MetadataMissing { field } => {
+                assert_eq!(field, "tokenizer.ggml.tokens");
+            }
+            other => panic!("expected MetadataMissing, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod sp_tests {
     //! Tests for `encode_sentencepiece`. Added alongside the
-    //! `Vec<char>` + per-trial `String::collect()` → `Vec<usize>`
-    //! boundary-offset + `&str` slice rewrite. The four cases below
-    //! cover the boundary-vec correctness contract (off-by-one between
+    //! `Vec<char>` + per-trial `String::collect()` → boundary-offset
+    //! + `&str` slice rewrite from #229. The four cases below cover
+    //! the boundary-vec correctness contract (off-by-one between
     //! char index and byte offset, multi-byte UTF-8, and the
     //! `best_len == 0` fallback branch).
 
@@ -1338,7 +1762,8 @@ mod sp_tests {
 
     /// Build a synthetic SentencePiece Tokenizer from a vocab list.
     /// `is_gpt2_bpe = false` selects the SentencePiece encode path.
-    /// No merges (SP doesn't use them).
+    /// No merges (SP doesn't use them), no byte_to_id (SP doesn't
+    /// require byte-level coverage).
     fn synth_sp(vocab: &[&str]) -> Tokenizer {
         let vocab: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
         let token_to_id: HashMap<String, u32> = vocab
@@ -1346,13 +1771,12 @@ mod sp_tests {
             .enumerate()
             .map(|(i, s)| (s.clone(), i as u32))
             .collect();
-        let merges: Vec<(String, String)> = Vec::new();
-        let merge_pair_rank = build_merge_pair_rank(&merges);
         Tokenizer {
             vocab,
             token_to_id,
-            merges,
-            merge_pair_rank,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
             special_tokens: Vec::new(),
             bos_id: 0,
             eos_id: 0,

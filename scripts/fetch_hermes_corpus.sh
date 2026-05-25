@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # fetch_hermes_corpus.sh — pull `lambda/hermes-agent-reasoning-traces` from
 # HuggingFace and flatten it into a plain-text calibration corpus suitable
 # for `triattn_validate --corpus`.

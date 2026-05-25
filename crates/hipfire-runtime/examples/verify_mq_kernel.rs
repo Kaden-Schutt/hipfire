@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Q0 — Bit-exact kernel verification for MQ3/MQ2 GEMV pipelines.
 //!
 //! Generates synthetic weights, quantizes to MQ3 and MQ2, then compares

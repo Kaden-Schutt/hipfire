@@ -8,7 +8,7 @@ This document is the single canonical reference for every environment variable h
 
 | Layer | Count | Notes |
 |---|---|---|
-| `HIPFIRE_*` env vars | 117 | 14 plumbed through TUI, 44 mentioned in some doc, 59 silent |
+| `HIPFIRE_*` env vars | 118 | 14 plumbed through TUI, 45 mentioned in some doc, 59 silent |
 | Non-`HIPFIRE_*` project env vars | 21 | Test/example/diag scaffolding. Should be renamed `HIPFIRE_*` for consistency. |
 | `config.json` schema (`HipfireConfig`) | ~40 keys | Validated by `validateConfigValue()` in `cli/index.ts`. Some keys map 1:1 to env vars set at daemon spawn. |
 | `per_model_config.json` overrides | same surface | Sparse overrides on top of the base config, applied per model tag. |
@@ -53,6 +53,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_ADAPTIVE_B_DOWN` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:981` |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | DFLASH-ADAPT | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:444` |
 | `HIPFIRE_ADAPTIVE_B_UP` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:979` |
+| `HIPFIRE_ALLOW_MIXED_ARCH` | MULTI-GPU | "" (set to "1" or "true" to enable) | `crates/hipfire-runtime/src/multi_gpu.rs:395` |
 | `HIPFIRE_ALLOW_MQ2` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2106` |
 | `HIPFIRE_ALLOW_MQ2_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2141` |
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2126` |
@@ -99,15 +100,16 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_GEN` | DAEMON-RUNTIME | — | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:18` |
 | `HIPFIRE_GPU_TOPK` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/infer_qwen35.rs:167` |
 | `HIPFIRE_GRAPH` | HIPGRAPH | — | `cli/index.ts:3448` |
-| `HIPFIRE_GRAPH_MOE` | HIPGRAPH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:2933` |
+| `HIPFIRE_GRAPH_MOE` | HIPGRAPH | "" (opt-in; set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:3203` |
 | `HIPFIRE_HAVE_2_GPU` | MULTI-GPU | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:159` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | MISC-USER | — | `crates/rdna-compute/src/compiler.rs:298` |
 | `HIPFIRE_HOST_TIMING` | PERF-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:934` |
-| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative) | `crates/rdna-compute/src/compiler.rs:89` |
+| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative; per-arch subdir) | `crates/rdna-compute/src/compiler.rs:100` |
 | `HIPFIRE_KV_MODE` | KV-CACHE | — | `cli/index.ts:400` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | KV-CACHE | — | `crates/hipfire-runtime/examples/daemon.rs:1211` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/kernels.rs:76` |
 | `HIPFIRE_LLOYD_GFX12` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:3779` |
+| `HIPFIRE_LM_HEAD_F16` | KERNEL-SELECTOR | auto/native | `crates/hipfire-arch-qwen35/src/qwen35.rs:35` |
 | `HIPFIRE_LM_HEAD_WMMA` | KERNEL-SELECTOR | — | `crates/rdna-compute/src/dispatch.rs:7954` |
 | `HIPFIRE_LOCAL` | DAEMON-RUNTIME | — | `cli/index.ts:1205` |
 | `HIPFIRE_MEMSET_DUMP` | DIAG-DUMP | "" (set to "1" to enable) | `crates/hip-bridge/src/ffi.rs:669` |
@@ -188,7 +190,7 @@ KV cache mode and physical capacity. Maps to `cfg.kv_cache` in `config.json`.
 Decode-loop graph capture, ~5-15% decode speedup on stable kernel sets.
 
 - `HIPFIRE_GRAPH` — set to `1` to enable graph capture. Maps to `cfg.flash_mode == "auto"` in CLI. Default: capture for 4B/9B/27B, off for 0.8B (known hipGraph bug).
-- `HIPFIRE_GRAPH_MOE` — opt-in graph capture for MoE forward path. Default off because MoE expert routing changes per-token, breaking graph reuse.
+- `HIPFIRE_GRAPH_MOE` — opt-in graph capture for MoE forward path. Set to `1` to enable. The atomicAdd-determinism fix on 2026-05-21 (task #100) removed the use_gpu_topk path's ~30-50-token attractor drift, but the CPU-topK fallback still uses a non-capture-safe `download_f32(router_logits)` D2H sync. Default remains off until that fallback is migrated; safe-for-graph models (uniform-MQ4 gate-side weights → `use_gpu_topk=true`) opt in with this flag.
 
 ### `MMQ` (5)
 
@@ -200,7 +202,7 @@ Mixed-precision GEMM (Q8_1 activation × 4-bit weight on dp4a, RDNA3+/gfx906). ~
 - `HIPFIRE_MMQ_SCREEN_THRESHOLD` — float; reject Q8_1 quantize when error exceeds this. Default `0.10`.
 - `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY` — diag flag isolating Q8_1 quantize cost from dp4a kernel cost. Read once at init via the read-once-cache pattern.
 
-### `KERNEL-SELECTOR` (15)
+### `KERNEL-SELECTOR` (16)
 
 Hot-path kernel choice levers. **All silent today.** Power users who tune for specific arches need to read source.
 
@@ -211,21 +213,23 @@ Hot-path kernel choice levers. **All silent today.** Power users who tune for sp
 - `HIPFIRE_GPU_TOPK` — opt-in GPU-resident topk folding (Gemma4 perf lever). Set `1` to enable.
 - `HIPFIRE_LLOYD_FORCE_BASELINE` — disable Lloyd-MQ3 K4+LDS fast variants on gfx11. Used to bisect drift.
 - `HIPFIRE_LLOYD_GFX12=1` — opt-in dispatch of Lloyd-MQ3 WMMA kernels on gfx12 (RDNA4) inside `is_batchable_la`. Default off because the gfx12 sibling kernels ship code-complete but runtime-unvalidated locally; gfx12 reviewers set this to exercise parity / coherence-gate on RDNA4. Once external CI confirms gfx12 parity, the gate can be dropped or default-flipped. Ships with PR #195 (MQ3-Lloyd WMMA prefill).
+- `HIPFIRE_LM_HEAD_F16` — qt=1 lm_head storage shim. Default `auto`/`native` keeps raw F16 and routes through the native F16 dispatch path; `f32`/`fp32`/`legacy` expands to F32 at load time.
 - `HIPFIRE_LM_HEAD_WMMA` — lm_head dispatch lever.
 - `HIPFIRE_RDNA2_VARIANT` — RDNA2 (gfx10x0) variant override. Plumbed via TUI + `cfg.rdna2_variant`.
 - `HIPFIRE_ROCBLAS_ALL_ARCHS`, `HIPFIRE_ROCBLAS_MIN_BATCH`, `HIPFIRE_ROCBLAS_OFF` — rocBLAS dispatch gates.
 - `HIPFIRE_WO_MMQ`, `HIPFIRE_WO_WMMA_VARIANT` — workaround flags for specific arch quirks.
 
-### `MULTI-GPU` (6)
+### `MULTI-GPU` (7)
 
 Pipeline-parallel and multi-device orchestration. Tied to `crates/hipfire-runtime/src/multi_gpu.rs` + Stage 7 of issue #58.
 
+- `HIPFIRE_ALLOW_MIXED_ARCH=1` — opt into mixed-architecture device pairs after the default arch-mismatch guard.
 - `HIPFIRE_DEVICES` — explicit device selection (alternate to `ROCR_VISIBLE_DEVICES`).
 - `HIPFIRE_PP_LAYERS="a,b,..."` — explicit asymmetric layer split (PR #190).
 - `HIPFIRE_PP_PFLASH=1` — opt into experimental PFlash + pp>1 compose (PR #190).
 - `HIPFIRE_HAVE_2_GPU=1` — pp_parity test gate; required for the 2-GPU parity battery.
 - `HIPFIRE_PP_PARITY_MODEL` — model path override for the pp_parity test.
-- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — VRAM-tolerance threshold above which mixed-arch warning fires under `HIPFIRE_ALLOW_MIXED_ARCH=1`.
+- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — free-VRAM delta tolerance for `init_uniform`; `init_layers` skips this gate.
 
 ### `PFLASH` (13)
 
@@ -331,7 +335,7 @@ Miscellaneous user-facing flags.
 - `HIPFIRE_DETERMINISTIC=1` — byte-exact output mode. Disables non-deterministic optimizations.
 - `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT=1` — gate the `budget_alert_at_tok` / `budget_alert_text` daemon params. Maps to `cfg.experimental_budget_alert`.
 - `HIPFIRE_HIPCC_EXTRA_FLAGS` — extra flags appended to all hipcc invocations during JIT.
-- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache directory. Default `.hipfire_kernels` (cwd-relative). Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
+- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache root. Default `.hipfire_kernels` (cwd-relative). Blobs land under `<root>/{arch}/` so cross-arch workflows (multiple GPUs in one process, parallel CI matrix arches) don't collide. Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
 - `HIPFIRE_ALLOW_MQ2=1`, `HIPFIRE_ALLOW_MQ2_LLOYD=1`, `HIPFIRE_ALLOW_MQ3_LLOYD=1` — opt-in research-grade quant formats during quantizer run.
 
 ### `DIAG-DUMP` (8)
@@ -539,7 +543,7 @@ grep -rE 'env::var(_os)?\("HIPFIRE_|process\.env\.HIPFIRE_' \
     | sort -u
 ```
 
-Note the `(_os)?` group — `compiler.rs:89` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
+Note the `(_os)?` group — `compiler.rs:100` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
 
 A future pass should ship `scripts/regen-env-vars-doc.sh` that mechanically rebuilds the quick-reference table while preserving the prose category guide.
 

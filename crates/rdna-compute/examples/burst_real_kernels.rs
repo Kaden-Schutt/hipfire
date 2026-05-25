@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Time the REAL rdna-compute kernels in burst mode (no per-call sync,
 //! no profiling, just back-to-back launches with one device sync at the
 //! end). Compares against the bandwidth profiler's 9-16 µs/kernel

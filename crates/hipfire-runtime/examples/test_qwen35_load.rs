@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Minimal test: load Qwen3.5 HFQ, parse config, print layer types.
 //! Usage: cargo run --release --features deltanet --example test_qwen35_load -- models/qwen3.5-0.8b.q4.hfq
 
@@ -57,8 +61,8 @@ fn main() {
     // Check tokenizer
     let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json);
     match tok {
-        Some(t) => eprintln!("\nTokenizer: {} tokens", t.vocab_size()),
-        None => eprintln!("\nTokenizer: FAILED to load"),
+        Ok(t) => eprintln!("\nTokenizer: {} tokens", t.vocab_size()),
+        Err(e) => eprintln!("\nTokenizer: FAILED to load: {e}"),
     }
 
     // List some tensors

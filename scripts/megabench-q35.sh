@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # Qwen3.5 megabench — all models, all quants, KV modes, coherence check.
 # Auto-detects the GPU; runs on whatever the host happens to be.
 set -uo pipefail

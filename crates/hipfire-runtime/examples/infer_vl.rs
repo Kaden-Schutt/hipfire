@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Qwen3.5-VL inference: image + text question → text answer.
 //! Usage: infer_vl <model.hfq> <image.png> [question...]
 
@@ -63,7 +67,7 @@ fn main() {
         Path::new(image_path),
         vision_config.patch_size,
         vision_config.spatial_merge_size,
-    );
+    ).unwrap_or_else(|e| panic!("{e}"));
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;
@@ -74,6 +78,7 @@ fn main() {
     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
         &pixels, 3, img_h, img_w,
         vision_config.patch_size, vision_config.temporal_patch_size,
+        vision_config.spatial_merge_size,
     );
 
     // Init GPU first (needed for vision weight loading)

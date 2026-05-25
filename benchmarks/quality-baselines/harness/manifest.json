@@ -11,6 +11,23 @@
     "magic_ascii": "HFKLDR + 2 nul bytes"
   },
   "references": {
+    "qwen3.5-0.8b-bf16.kldref.bin": {
+      "sha256": "9c78a501efe46edcea3dd8ff35c9406c24074f2901c62fc87fb9b2cc4747984b",
+      "size_bytes": 2480989032,
+      "host_arch": "gfx1151",
+      "llamacpp_commit": "9dcf83552887bb898b4a98a5761361e504e31fc3",
+      "slice_md5": "83b0205a304bf4e52172ecdb05f2e895",
+      "top_k": 256,
+      "n_ctx": 2048,
+      "n_vocab": 248320,
+      "n_chunk": 1175,
+      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf /data/models/unsloth/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
+      "source_gguf": "unsloth/Qwen3.5-0.8B-GGUF :: Qwen3.5-0.8B-BF16.gguf",
+      "source_gguf_sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
+      "hf_repo": null,
+      "hf_repo_type": null,
+      "comment": "0.8B BF16 reference dump, 2026-05-11, ~16 min wall, 1238 reduced tok/s on gfx1151. Source GGUF pulled from unsloth (same lineage as 9B ref); local-only pending HF upload to hipfire-models/qwen-kldref."
+    },
     "qwen3.5-9b-bf16.kldref.bin": {
       "sha256": "06948cd36bab71fce2df5d9af1be03c9cfb4090637d881056a6937a29caa65a7",
       "size_bytes": 2480989032,

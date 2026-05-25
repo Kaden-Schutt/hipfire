@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! 5-stage correctness + performance harness for Q4_F16 GEMV kernels.
 //! Tests both G32 and G64 variants against CPU F32 reference.
 //! Compares bandwidth vs Q4_K baseline.

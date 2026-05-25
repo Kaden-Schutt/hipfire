@@ -1,0 +1,28 @@
+{
+  "name": "hipfire-kernel-atlas",
+  "version": "0.1.0",
+  "description": "Collect phase-aware hipfire Kernel Atlas rows and render ASCII ISA Fit View visualizations that connect AMD GPU arch capability, quant format intent, observed ISA mix, resource usage, and the likely performance left on the table.",
+  "triggers": [
+    "render-fit",
+    "kernel atlas",
+    "ISA Fit View",
+    "quant fit",
+    "visualize ISA",
+    "left on table",
+    "how does this quant use the hardware",
+    "gfx1010 atlas",
+    "gfx1030 atlas",
+    "gfx1201 atlas"
+  ],
+  "entry": "./SKILL.md",
+  "interpret": "./SKILL.md",
+  "requires": {
+    "repo": "hipfire checkout with scripts/kernel_atlas.py",
+    "python": "python3",
+    "optional_rocm_tools": "clang-offload-bundler, llvm-readobj, llvm-objdump for ISA manifests"
+  },
+  "related": [
+    "hipfire-kernel-tuning",
+    "hipfire-arch-port"
+  ]
+}

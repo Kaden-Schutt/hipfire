@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Correctness + perf test for `gemm_qkvza_hfq4g256`, the batched
 //! counterpart of `fused_qkvza_hfq4g256` (Qwen3.5 LA preamble, 4-way).
 //!

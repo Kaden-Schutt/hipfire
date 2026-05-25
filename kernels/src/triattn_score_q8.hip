@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // TriAttention scoring on a Q8 post-RoPE K cache (arXiv:2604.04921).
 //
 // For each cached key at position p_k, compute S_total(k, Δ) = S_trig + S_norm,

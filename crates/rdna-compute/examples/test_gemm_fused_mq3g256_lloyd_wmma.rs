@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Phase B1 parity test for the 3 fused MQ3-Lloyd WMMA GEMMs (qkvza / qkv /
 //! gate_up). Each test is small — covers a few canonical shapes, exercises
 //! tile-row straddling projection boundaries, and uses **distinct codebooks

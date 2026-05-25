@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 """Isolate target's cache-vs-no-cache behavior.
 
 Test A: target(full_prompt, use_cache=False). logits[:, -1] argmax = next token.

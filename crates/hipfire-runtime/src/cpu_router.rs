@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 mad-lab-kbando
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! CPU-side router replica (MAD-93 v0.1).
 //!
 //! Replicates the per-layer MoE router GEMV on CPU so the

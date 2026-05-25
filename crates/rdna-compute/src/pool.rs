@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! GPU memory pool — eliminates hipMalloc/hipFree overhead in the hot loop.
 //! Pre-allocates buffers of common sizes and reuses them via a free list.
 

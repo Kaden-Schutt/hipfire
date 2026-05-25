@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 // Flash attention reduce kernel — 2-pass combination of tile partials.
 //
 // Grid: [n_heads, 1, 1]. Block: [32, 1, 1] (one WAVE32).

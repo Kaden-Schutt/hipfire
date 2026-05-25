@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+# hipfire — see LICENSE and NOTICE in the project root.
+
 # bench_variants.sh — Benchmark all 5 RDNA2 GEMV kernel variants back-to-back.
 # Usage: ./scripts/bench_variants.sh <model.hfq> [prompt] [extra-flags...]
 #

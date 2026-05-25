@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Compile HIP kernels to code objects (.hsaco) via hipcc.
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
@@ -86,9 +90,17 @@ impl KernelCompiler {
         // thrashed each other's hash sidecars. $CWD isolation fixes that.
         // End-user / CI can pin the old location back via
         // HIPFIRE_KERNEL_CACHE=/tmp/hipfire_kernels if tmpfs speed matters.
-        let cache_dir = std::env::var_os("HIPFIRE_KERNEL_CACHE")
+        // Per-arch keying matters for hetero (gfx906 + gfx1031 in one process):
+        // without it, both arches would race for the same `{name}.hsaco` path,
+        // surviving correctness via the source+arch hash check but thrashing
+        // recompiles every cross-arch interleaving. Path layout matches the
+        // pre-compiled `kernels/compiled/{arch}/` install dir + the already-
+        // documented `.hipfire_kernels/{arch}/{name}.hsaco` shape in
+        // docs/perf-checkpoints/2026-05-04-gfx906-mmq-junroll.md.
+        let cache_root = std::env::var_os("HIPFIRE_KERNEL_CACHE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".hipfire_kernels"));
+        let cache_dir = cache_root.join(arch);
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to create cache dir: {e}"))
         })?;
@@ -115,7 +127,8 @@ impl KernelCompiler {
         // (or with stale hash) to avoid churn when both locations agree.
         // `hipfire update` wipes BOTH /tmp and the install dir, so after an
         // update + restart we get a fully-fresh re-seed.
-        let hot_dir = cache_dir.join(arch);
+        // cache_dir is already arch-keyed; the hot dir IS the cache dir.
+        let hot_dir = cache_dir.clone();
         if let Some(ref cold) = precompiled_dir {
             if let Err(e) = seed_hot_from_cold(cold, &hot_dir) {
                 eprintln!("  hot-path seed failed ({e}) — falling back to install dir reads");

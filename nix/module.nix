@@ -55,6 +55,10 @@ let
         pkgs.rocmPackages.rocm-comgr
         pkgs.rocmPackages.rocprofiler-register
       ]}"
+      # JIT hipcc needs HIP_PATH (clr) and rocm-device-libs bitcode dir.
+      # Without these the daemon panics on first kernel compile.
+      "HIP_PATH=${pkgs.rocmPackages.clr}"
+      "HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
     ];
 in
 {
@@ -147,7 +151,10 @@ in
       default = true;
       description = ''
         Use nixpkgs ROCm libraries (rocmPackages.clr).
-        Set to false to provide your own libamdhip64.so via environment.
+        When true (the default), the module automatically enables
+        hardware.graphics and registers the ROCm ICD so the HIP
+        runtime can discover GPUs. Set to false only if you provide
+        your own libamdhip64.so via services.hipfire.environment.
       '';
     };
 
@@ -288,16 +295,40 @@ in
   config = lib.mkIf cfg.enable (lib.mkMerge [
 
     {
-      assertions = [{
-        assertion = cfg.gpuTargets != [ ];
-        message = ''
-          services.hipfire.gpuTargets is empty. Set it to your GPU architecture(s).
-          Detect yours by running:
-            rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
-          Example: services.hipfire.gpuTargets = [ "gfx1100" ];
-        '';
-      }];
+      assertions = [
+        {
+          assertion = cfg.gpuTargets != [ ];
+          message = ''
+            services.hipfire.gpuTargets is empty. Set it to your GPU architecture(s).
+            Detect yours by running:
+              rocminfo 2>/dev/null | grep -oP 'amdgcn-amd-amdhsa--\K\S+' | sort -u
+            Example: services.hipfire.gpuTargets = [ "gfx1100" ];
+          '';
+        }
+        {
+          assertion = !cfg.rocmSupport || config.hardware.graphics.enable;
+          message = ''
+            services.hipfire requires hardware.graphics.enable = true so the
+            HIP runtime can discover GPUs via the Mesa/DRI stack.
+            Either set hardware.graphics.enable = true (recommended) or set
+            services.hipfire.rocmSupport = false and provide your own
+            libamdhip64.so via services.hipfire.environment.
+          '';
+        }
+      ];
     }
+
+    # GPU driver stack (ICD + DRI). The HIP runtime discovers GPUs via
+    # the ROCm ICD registered through hardware.graphics.extraPackages.
+    # Without this, the daemon loads libamdhip64.so but hipGetDeviceCount
+    # returns 0 on hosts that don't manually configure the graphics stack.
+    (lib.mkIf cfg.rocmSupport {
+      hardware.graphics.enable = lib.mkDefault true;
+      hardware.graphics.extraPackages = [
+        pkgs.rocmPackages.clr.icd
+        pkgs.rocmPackages.clr
+      ];
+    })
 
     # Expose the CLI globally so `hipfire pull`, `hipfire diag`, etc. work
     { environment.systemPackages = [ hipfirePkg ]; }
@@ -348,7 +379,12 @@ in
           RemainAfterExit = true;
           User = cfg.user;
           Group = cfg.group;
-          Environment = envList;
+          StateDirectory = "hipfire";
+          CacheDirectory = "hipfire";
+          WorkingDirectory = "/var/lib/hipfire";
+          Environment = envList ++ [
+            "HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels"
+          ];
         };
         script = ''
           export HOME=/var/lib/hipfire
@@ -369,14 +405,27 @@ in
           RestartSec = 5;
           User = cfg.user;
           Group = cfg.group;
+          # systemd creates these under /var/lib + /var/cache and chowns
+          # them to User:Group with 0700, so the daemon can always write
+          # its kernel cache + state without race or perm guesswork.
+          StateDirectory = "hipfire";
+          CacheDirectory = "hipfire";
+          WorkingDirectory = "/var/lib/hipfire";
           Environment = envList ++ [
             "HOME=/var/lib/hipfire"
+            "HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels"
           ];
           ProtectSystem = "strict";
-          ReadWritePaths = [ cfg.modelDir "/var/lib/hipfire" ];
+          ReadWritePaths = [ cfg.modelDir "/var/lib/hipfire" "/var/cache/hipfire" ];
+          PrivateTmp = true;
           NoNewPrivileges = true;
           DevicePolicy = "closed";
-          DeviceAllow = [ "/dev/kfd rw" "/dev/dri rw" "/dev/dri/* rw" ];
+          DeviceAllow = [
+            "/dev/kfd rw"
+            "char-drm rw"      # /dev/dri/* — glob is silently ineffective
+                               # under DevicePolicy=closed on systemd 258.5+
+            "/dev/accel/accel0 rw"  # kernel 6.2+ DRM_ACCEL node
+          ];
         };
       };
     })

@@ -46,7 +46,16 @@
     ) // {
       nixosModules.default = import ./nix/module.nix;
 
+      # Inject rocmPackages from this flake's pinned nixpkgs (unstable,
+      # ROCm 7.x). nixos-25.11 ships rocm 6.4.3 whose libamdhip64 segfaults
+      # on gfx1151 (Strix Halo) during weight upload. The override flows to
+      # both hipfire/hipfire-kernels (callPackage with `final`) and to the
+      # NixOS module's `pkgs.rocmPackages` LD_LIBRARY_PATH.
       overlays.default = final: prev: {
+        rocmPackages = (import nixpkgs {
+          inherit (final) system;
+          config = { rocmSupport = true; allowUnfree = true; };
+        }).rocmPackages;
         hipfire = final.callPackage ./nix/package.nix {
           rocmSupport = true;
           src = lib.cleanSource ./.;

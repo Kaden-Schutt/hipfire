@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kevin Read
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! eval_hipfire — KLD eval for hipfire quant variants against a BF16 reference.
 //!
 //! Loads a hipfire model, reads the slice (or pre-tokenized tokens), reads
@@ -149,8 +153,6 @@ fn main() {
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
     // -------- load model --------
-    let mut hfq = HfqFile::open(&args.model).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("eval_hipfire: arch={} model={}", gpu.arch, args.model.display());
     // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
@@ -159,7 +161,25 @@ fn main() {
         unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
         eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+
+    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
+    // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+    let (config, weights) = if args.model.is_dir() {
+        use hipfire_runtime::safetensors_source::SafetensorsSource;
+        let source = SafetensorsSource::open(&args.model)
+            .expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source)
+            .expect("config_from_safetensors");
+        eprintln!("  loading via safetensors (ParoQuant path)");
+        let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("load_weights_paroquant");
+        (config, weights)
+    } else {
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+        (config, weights)
+    };
 
     // -------- read reference (HFKLDR β) header + tokens --------
     let ref_file = File::open(&args.ref_path).expect("open ref");
@@ -408,18 +428,48 @@ fn main() {
                 None, Some(h_buf), None, None,
             ).expect("forward_prefill_batch scored");
 
-            // 3. lm_head fan-out + KLD per scored position. weight_gemv
-            //    writes into scratch.logits each iteration; score_position
-            //    then reads + computes KLD. Same per-position math as the
-            //    per-token branch.
+            // 3. lm_head fan-out + KLD per scored position.
+            //
+            // F16 fast path: when the lm_head weight is stored as F16 on
+            // GPU (e.g. q8f16 models with a separate F16 lm_head), one
+            // batched `gemm_f16_batched_lmhead` reads the lm_head matrix
+            // ONCE for all `scored_per_chunk` positions instead of
+            // `scored_per_chunk` independent GEMV calls. On gfx11 this
+            // routes through the WMMA `gemm_mw16_residual_wmma` kernel;
+            // on non-gfx11 it falls back to a scalar F32 GEMM. Drops eval
+            // wall-clock for F16 lm_head from ~280 s/chunk to 0.8 s/chunk
+            // measured on gfx1151 (Qwen3.5-0.8B per-token kv-q8).
+            //
+            // Other lm_head dtypes (Q8, MQ4, etc.) keep the per-position
+            // weight_gemv path until a batched variant is wired for each.
+            let f16_lmhead = weights.output.gpu_dtype == DType::F16;
+            let batched_logits: Option<rdna_compute::GpuTensor> = if f16_lmhead {
+                let alloc = gpu.alloc_tensor(
+                    &[scored_per_chunk, config.vocab_size],
+                    DType::F32,
+                ).expect("alloc batched lm_head logits");
+                gpu.gemm_f16_batched_lmhead(
+                    &weights.output.buf, h_buf, &alloc,
+                    config.vocab_size, config.dim, scored_per_chunk,
+                ).expect("gemm_f16_batched_lmhead");
+                Some(alloc)
+            } else {
+                None
+            };
+
             for j in 0..scored_per_chunk {
-                let row_view = h_buf.sub_offset(j * config.dim, config.dim);
-                weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
-                    .expect("weight_gemv lm_head");
+                let logits_view = if let Some(ref all_logits) = batched_logits {
+                    all_logits.sub_offset(j * config.vocab_size, config.vocab_size)
+                } else {
+                    let row_view = h_buf.sub_offset(j * config.dim, config.dim);
+                    weight_gemv(&mut gpu, &weights.output, &row_view, &scratch.logits)
+                        .expect("weight_gemv lm_head");
+                    scratch.logits.sub_offset(0, config.vocab_size)
+                };
                 let pos = scoring_start + j;
                 let actual_next = chunk_tokens[pos + 1] as usize;
                 let (kld, nll) = score_position(
-                    &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
+                    &mut gpu, &logits_view, &mut ref_in, &mut block_buf, actual_next,
                 );
                 chunk_klds.push(kld);
                 if let Some(n) = nll {
@@ -436,6 +486,10 @@ fn main() {
                         c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
                     );
                 }
+            }
+
+            if let Some(alloc) = batched_logits {
+                let _ = gpu.free_tensor(alloc);
             }
         }
 

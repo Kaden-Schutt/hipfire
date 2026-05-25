@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Smoke: load a Qwen3-family drafter into PflashState and verify
 //! tokenizer compatibility against a Qwen3.5 target.
 //!

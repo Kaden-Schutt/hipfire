@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Bisection test: dispatch a no-op compute kernel.
 //! If this hangs, the issue is fundamental dispatch setup.
 //! If this passes, the issue is in kernarg/memory setup.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! TriAttention: KV-cache compression via trigonometric series scoring.
 //!
 //! Reference: Mao et al. 2026 "TriAttention: Efficient Long Reasoning with

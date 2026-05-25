@@ -137,6 +137,49 @@ The expected residual gap between probe `gen tok/s` and bench
 further is a separate workstream; it is uniform across quant formats
 so does not interfere with format ranking.
 
+## eval_hipfire wall-clock is NOT a kernel-speed meter
+
+`eval_hipfire`'s reported `tok/s` (the trailing `(N tok/s)` line) is
+**scored-tokens-per-wall-second across the entire eval loop**, not
+forward-pass throughput. The eval loop runs, per chunk:
+
+1. `forward_prefill_batch` (prefix, no logit capture)
+2. `forward_prefill_batch` (scored region, with hidden-state capture)
+3. **`weight_gemv` × `scored_per_chunk` (≈1023) for the lm_head fan-out**
+4. `score_position` × scored_per_chunk (CPU-side KLD compute, F32→F16
+   block I/O against the ref file)
+
+For non-F16 lm_head dtypes (Q8_0, MQ4G256, …), step 3 issues one GEMV
+call per scored position against the full lm_head matrix (vocab=248K
+on Qwen3.5). On Q8 that's ~1 GB read per call × 1023 calls = ~1 TB/chunk
+of HBM traffic just for lm_head. That dominates the wall-clock and
+masks any projection-kernel win. Concrete numbers from `feat/q8-prefill-tier2`
+validation on gfx1100 / RX 7900 XT:
+
+| Path | eval_hipfire tok/s | daemon `prefill_tok_s` |
+|---|---:|---:|
+| q8f16 (Q8 lm_head, T3 WMMA projections) | 27 | 1069 |
+| q8f16-f16lm (F16 lm_head batched, T3 WMMA) | 187 | 1069 |
+| mq4 (MQ4 lm_head, MQ4 batched projections) | 248 | ~1100+ |
+
+**Rules:**
+
+- **For kernel-speed perf claims**, read `daemon prefill_tok_s` from
+  the daemon's `done` event (`coherence_probe`, `coherence-gate.sh`
+  matrix rows all expose it), or use `scripts/probe_commits.sh`
+  which also uses the daemon. Do NOT cite eval_hipfire `tok/s`.
+- **For KLD validation and silent-corruption checks**, eval_hipfire
+  is the right tool — its wall-clock is incidental, only the slice-mean
+  KLD and PPL matter.
+- **For end-to-end "user-visible" throughput** (TTFT + decode), use
+  the daemon. eval_hipfire's scoring loop is not representative of
+  any production workload.
+
+The lm_head fan-out itself is fixable — see PR #242 (F16 batched
+fan-out via `gemm_f16_batched_lmhead`) for the pattern; a parallel
+batched Q8 lm_head kernel is currently out of scope per
+`docs/plans/q8-fused-prefill-kernels.md §Out of scope`.
+
 ## Speed-gate baselines
 
 `tests/speed-baselines/<arch>.txt` records the "ground floor" decode
@@ -190,6 +233,71 @@ The engine collapses `\n{3,}` → `\n\n` at prompt entry by default
 (`prompt_normalize=true`). This eliminates the whitespace-variance
 source for normal use, but bench scripts that bypass the engine entry
 point still need the prompt-md5 discipline.
+
+## Resident-bench mode (avoid per-row 17 GB model reload)
+
+Bench scripts that shell out to `dflash_spec_demo` once per row pay
+the full target+drafter H2D on every invocation. On a 27 B mq4 pair
+that's ~56 s of model load to measure ~1.5 s of decode — a 24-row A/B
+battery is ~25 min wallclock for ~36 s of GPU compute, and
+`amdgpu_top` mostly shows the H2D rather than the kernel under test.
+
+Use `--prompts-file <path>` instead of `--prompt`: the binary loads
+target+drafter once and runs each manifest row against the resident
+pair, with full state reset between rows. Manifest is JSON-lines:
+
+```
+{"label":"humaneval-0","prompt":"...","max":16}
+{"label":"lru-cache","prompt":"...","max":16}
+```
+
+Each row's stderr output is bracketed by `@@@ ROW <i>: <label> @@@`
+and `@@@ ROW <i> END @@@` markers so a downstream parser can split
+the multi-row stream. Single `--prompt` mode is unchanged
+(byte-identical output, no separators).
+
+**Prompt-fixture discipline still applies** (§"Prompt structure
+matters"): assemble the manifest at runtime from committed `.txt`
+fixtures rather than inlining prompts in heredocs. Either `jq` or
+`python3 -c` works — the only requirement is byte-stable output:
+
+```bash
+# jq form
+jq -nR --arg p "$(cat benchmarks/prompts/humaneval_0_has_close_elements.txt)" \
+   '{label:"humaneval-0", prompt:$p, max:16}' >  manifest.jsonl
+jq -nR --arg p "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
+   '{label:"lru-cache",  prompt:$p, max:16}' >> manifest.jsonl
+
+# python3 form (no jq dependency; see scripts/dflash_bench_resident_smoke.sh)
+python3 -c '
+import json, sys
+for label, path in [("humaneval-0","benchmarks/prompts/humaneval_0_has_close_elements.txt"),
+                    ("lru-cache", "benchmarks/prompts/lru_cache_pep8_strict.txt")]:
+    print(json.dumps({"label":label, "prompt":open(path).read(), "max":16}))
+' > manifest.jsonl
+
+dflash_spec_demo --target T --draft D --prompts-file manifest.jsonl …
+```
+
+Or commit the JSONL fixture directly (see
+`benchmarks/prompts/longcode_pflash.jsonl` for the shape).
+
+Caveats:
+- `--prompts-file` rejects `--cask-sidecar` — `EvictionCtx.eviction_count`
+  has no per-row reset, and a cumulative count is silently misleading
+  in the FlashCASK report. Run CASK benches as separate per-row
+  invocations.
+- `--prompts-file` rejects `--pflash` for now; PFlash drafter loading
+  and compression state are single-prompt only. Run PFlash benches as
+  separate invocations until a per-row reset path exists.
+- Cross-row validation: pass the same prompt twice with `--temp 0`;
+  the two `DFlash tokens: [...]` lines must match byte-for-byte.
+  `scripts/dflash_bench_resident_smoke.sh` is the reference check.
+- Per-process flags (e.g. `HIPFIRE_MMQ_MIN_BATCH` cutover, ddtree
+  budget/topk, kv-mode) still vary across invocations, not within.
+  Group manifest rows by these flags and run one invocation per group.
+
+See issue #173 for the full design.
 
 ## DFlash speed gate
 

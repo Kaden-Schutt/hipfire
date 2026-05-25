@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! hipfire-runtime: GGUF model loading and LLaMA inference on RDNA GPUs.
 //!
 //! This crate is arch-agnostic. Architecture implementations live in
@@ -10,10 +14,13 @@
 //! [`arch::Architecture`] trait.
 
 pub mod arch;
+pub mod bf16_loader;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod llama;
+pub mod model_source;
+pub mod safetensors_source;
 pub mod loop_guard;
 pub mod multi_gpu;
 pub mod sampler;

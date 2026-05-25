@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Dual-GPU smoke: Gpu::init_with_device + bind_thread + per-device
 //! pointer ownership via hipPointerGetAttributes.
 //!

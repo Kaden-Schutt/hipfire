@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Robin Van Cauter
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Channel-test for the gfx12 (RDNA4) WMMA gate_up HFQ6 scaffold.
 //!
 //! Combines the hfq6 helpers from test_wmma_qkv_hfq6_gfx12 with the

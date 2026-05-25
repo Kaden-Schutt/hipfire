@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 alpineq
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Stage 4 smoke: load qwen3.5 weights distributed across 2 GPUs via
 //! `qwen35::load_weights_multi`. Verifies Variant 2 placement
 //! (token_embd → dev 0, output_norm + lm_head → dev_last, per-layer

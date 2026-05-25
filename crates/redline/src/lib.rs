@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
 //! Redline — direct-KMD GPU compute engine for AMD RDNA GPUs.
 //!
 //! Bypasses the HIP runtime entirely. Talks to /dev/dri/renderD128 via
