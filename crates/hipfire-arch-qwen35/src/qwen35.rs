@@ -1878,6 +1878,12 @@ struct MoeScratchRef<'a> {
     rot_batch:     &'a GpuTensor,
     topk_indices:  &'a GpuTensor,
     topk_weights:  &'a GpuTensor,
+    // [k_top × dim] f32 — per-(expert-rank) MoE down output buffer for
+    // the atomic-free expand+combine decode path. Mirrors the prefill
+    // `pbs.moe_down_expanded_batch` layout with batch=1. Required so
+    // the MoE FFN is byte-deterministic under hipGraph replay; see
+    // task #100 root-cause notes in `forward_scratch`.
+    down_expanded: &'a GpuTensor,
 }
 
 impl<'a> MoeScratchRef<'a> {
@@ -1898,6 +1904,7 @@ impl<'a> MoeScratchRef<'a> {
             rot_batch:     s.moe_rot_batch.as_ref().expect("MoE scratch"),
             topk_indices:  s.moe_topk_indices.as_ref().expect("MoE scratch"),
             topk_weights:  s.moe_topk_weights.as_ref().expect("MoE scratch"),
+            down_expanded: s.moe_down_expanded.as_ref().expect("MoE scratch"),
         }
     }
 }
@@ -1933,6 +1940,7 @@ fn moe_ffn_decode(
     let rot_batch     = gpu.alloc_tensor(&[k * mi], DType::F32)?;
     let topk_indices  = gpu.alloc_tensor(&[k], DType::F32)?;
     let topk_weights  = gpu.alloc_tensor(&[k], DType::F32)?;
+    let down_expanded = gpu.alloc_tensor(&[k * hidden], DType::F32)?;
 
     let refs = MoeScratchRef {
         router_logits: &router_logits,
@@ -1948,12 +1956,13 @@ fn moe_ffn_decode(
         rot_batch:     &rot_batch,
         topk_indices:  &topk_indices,
         topk_weights:  &topk_weights,
+        down_expanded: &down_expanded,
     };
     let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
 
     for t in [router_logits, scalar_buf, x_rot_local, gate_up_buf, gate_buf,
               up_buf, ffn_hidden, ffn_out, gate_batch, up_batch, rot_batch,
-              topk_indices, topk_weights] {
+              topk_indices, topk_weights, down_expanded] {
         gpu.free_tensor(t)?;
     }
     result
@@ -2050,41 +2059,84 @@ fn moe_ffn_decode_impl(
     let ffn_out       = s.ffn_out;
 
     // Phase 2a-iii: rotate x_norm once per layer and share the rotated
-    // buffer across every gate-side GEMV. Only MQ4 GEMVs benefit; mixed
-    // configs fall back to weight_gemv which rotates internally.
+    // buffer across every MQ4 GEMV that consumes it. Two independent users:
+    //   1. The 4-way fused gate-side GEMV (gate_side_mq4) — requires router,
+    //      shared_expert_gate, shared_expert.{gate,up} all MQ4G256.
+    //   2. The indexed routed-expert gate_up GEMV (routed_gate_up_mq4) — fires
+    //      whenever the routed gate_up family is MQ4G256, independent of the
+    //      gate-side family's dtype.
+    // We compute x_rot_local if EITHER user will fire. Models with a Q8
+    // router (e.g. the post-PR-171 attractor rule for MoE) thus still get
+    // the device-side top-K + indexed expert GEMV path — only the 4-way
+    // fused GEMV falls back to four individual `weight_gemv` calls.
     let gate_side_mq4 = ffn.router.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.up.gpu_dtype == DType::MQ4G256
         && ffn.experts.iter().all(|e| e.gate_up.gpu_dtype == DType::MQ4G256);
-    let x_rot_local = if gate_side_mq4 {
-        gpu.ensure_mq_signs()?;
-        if !x_rot_prerotated {
-            // F2 / F1: AWQ-aware rotate. All gate-side downstream linears
-            // (router, shared_expert_gate, shared_expert.{gate,up}, all
-            // experts.gate_up) share the same input basis → identical
-            // imatrix → byte-identical AWQ scales. Pick `ffn.router` as a
-            // representative (it's on the F1 whitelist for AWQ scales).
-            // When AWQ is disabled (no sidecar), routes to the non-AWQ
-            // kernel — byte-identical to pre-F2.
-            rotate_x_mq_for(gpu, &ffn.router, x_norm, s.x_rot_local, config.dim)?;
-        }
-        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
-        Some(s.x_rot_local)
-    } else {
-        None
-    };
-
-    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
-    // device and the indexed MoE kernels consume topk_indices /
-    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
     let routed_mq4 = ffn.experts.first()
         .map(|e| e.down.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
     let routed_gate_up_mq4 = ffn.experts.first()
         .map(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
         .unwrap_or(false);
-    let use_gpu_topk = k == 8 && gate_side_mq4 && routed_mq4 && routed_gate_up_mq4;
+    // MQ6-routed eligibility: layers promoted by the alternating kmap
+    // (post-PR-199) carry MQ6G256 experts. The HFQ6 indexed kernels mirror
+    // the HFQ4 ones — same compute shape, different per-group byte layout
+    // (200 vs 136). All routed experts within a layer share the same
+    // promotion decision, so checking experts[0] is sufficient.
+    let routed_mq6 = ffn.experts.first()
+        .map(|e| e.down.gpu_dtype == DType::MQ6G256)
+        .unwrap_or(false);
+    let routed_gate_up_mq6 = ffn.experts.first()
+        .map(|e| e.gate_up.gpu_dtype == DType::MQ6G256)
+        .unwrap_or(false);
+    // The indexed gate_up and down kernels live in separate dtype families;
+    // we require the routed gate_up and down dtypes to match (i.e., both
+    // MQ4 or both MQ6) so the FWHT-rotated x_rot_local feeds both
+    // consistently. Mixed gate_up/down within a layer is not produced by
+    // the quantizer.
+    let routed_dtype_indexable_mq4 = routed_mq4 && routed_gate_up_mq4;
+    let routed_dtype_indexable_mq6 = routed_mq6 && routed_gate_up_mq6;
+    let routed_dtype_indexable = routed_dtype_indexable_mq4 || routed_dtype_indexable_mq6;
+    // Detect Phase 2b+2c GPU-only fast path. When true, top-K runs on
+    // device and the indexed MoE kernels consume topk_indices /
+    // topk_weights directly — no D2H sync, hipGraph-capture-safe.
+    // Note: this no longer requires `gate_side_mq4`. The device-side
+    // `moe_topk_renorm_k8` kernel and the indexed gate_up/down GEMVs
+    // consume router_logits/topk_indices/topk_weights/x_rot from device
+    // buffers regardless of how router_logits was produced (fused-4 or
+    // individual weight_gemv). Q8 routers (issue-#171 attractor rule)
+    // are now first-class for graph capture. Mixed-kmap A3B layers
+    // promoted to MQ6 dispatch through the HFQ6 indexed kernels instead
+    // of the HFQ4 ones — same control flow, different kernel binary.
+    let use_gpu_topk = k == 8 && routed_dtype_indexable;
+    let needs_x_rot_local = gate_side_mq4 || routed_gate_up_mq4 || routed_gate_up_mq6;
+    let x_rot_local = if needs_x_rot_local {
+        gpu.ensure_mq_signs()?;
+        if !x_rot_prerotated {
+            // F2 / F1: AWQ-aware rotate. All MQ4 weights in this layer
+            // consume the same post-rmsnorm x, so they share the same
+            // input basis → identical imatrix → byte-identical AWQ
+            // scales. When gate_side_mq4 is true the 4-way fused GEMV
+            // expects rotation aligned with `ffn.router`'s AWQ scale;
+            // otherwise pick `ffn.experts[0].gate_up` as the routed-
+            // expert representative for the indexed kernel path. When
+            // AWQ is disabled (no sidecar), `rotate_x_mq_for` routes
+            // to the non-AWQ kernel — byte-identical to pre-F2 either
+            // way.
+            let next_lin = if gate_side_mq4 {
+                &ffn.router
+            } else {
+                &ffn.experts[0].gate_up
+            };
+            rotate_x_mq_for(gpu, next_lin, x_norm, s.x_rot_local, config.dim)?;
+        }
+        // else caller guarantees s.x_rot_local already holds FWHT(rmsnorm(x)).
+        Some(s.x_rot_local)
+    } else {
+        None
+    };
 
     // ── 1+2b+3a. Fused 4-way GEMV (router + shared_expert_gate + shared.gate + shared.up) ──
     // All four read the SAME rotated x_rot_local with the SAME K. Fusing them
@@ -2094,12 +2146,13 @@ fn moe_ffn_decode_impl(
     // = 120 launches/fwd, ~8-12% cycle-time savings on 7900 XTX.
     let shared_gate = slice_f32_view(gate_buf, 0, smi);
     let shared_up   = slice_f32_view(up_buf,   0, smi);
-    if let Some(xr) = x_rot_local {
-        // All MQ4: use the 4-way fused prerotated GEMV. Router weight, shared
-        // sigmoid-gate weight, shared gate weight, shared up weight — all
+    if gate_side_mq4 {
+        // All-MQ4 gate-side: use the 4-way fused prerotated GEMV. Router,
+        // shared_expert_gate, shared_expert.gate, shared_expert.up — all
         // M×K matrices in HFQ4G256 storage (MQ4 weights are HFQ4 bytes pre-
         // rotated at quant time, so `gemv_hfq4g256` inner loop with the
         // FWHT-rotated input is mathematically equivalent to `gemv_mq4g256`).
+        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local is Some");
         gpu.fused_qkvza_hfq4g256(
             &ffn.router.buf, &ffn.shared_expert_gate.buf,
             &ffn.shared_expert.gate.buf, &ffn.shared_expert.up.buf,
@@ -2111,7 +2164,10 @@ fn moe_ffn_decode_impl(
         )?;
     } else {
         // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
-        // weight_gemv handles its own rotation for MQ4 weights internally.
+        // weight_gemv handles its own rotation for MQ4 weights internally
+        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
+        // so the externally-computed `x_rot_local` is preserved for the
+        // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
         weight_gemv(gpu, &ffn.shared_expert_gate, x_norm, scalar_buf)?;
         weight_gemv(gpu, &ffn.shared_expert.gate, x_norm, &shared_gate)?;
@@ -2191,25 +2247,71 @@ fn moe_ffn_decode_impl(
 
     if use_gpu_topk {
         // Phase 2b+2c GPU-only fast path: indexed MoE kernels read expert
-        // IDs and weights from device buffers. 3 launches for routed
-        // compute, zero D2H sync — hipGraph-capturable.
-        let xr = x_rot_local.expect("gate_side_mq4 implies x_rot_local");
+        // IDs and weights from device buffers, zero D2H sync.
+        //
+        // Task #100 fix (2026-05-21): atomic-free expand+combine, mirroring
+        // the prefill path (forward_prefill_batch_with_pbs L5217-5232). The
+        // earlier single-launch `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
+        // used `atomicAdd` across K_TOP=8 blocks per row, which gives FP32
+        // sums whose final bits depend on wavefront-scheduling order
+        // (see gemv_hfq4g256_moe_down.hip:14-19 — the kernel's own comment
+        // admits non-determinism). Under hipGraph capture the ordering
+        // diverges from direct mode, so each forward step accumulates a
+        // ~1-ULP delta that compounds through the KV cache + GDN state,
+        // crossing the top-1 margin at step ~7 (q8 KV) or ~114 (asym3 KV).
+        // Expanding into `s.down_expanded` (no atomics) then summing via
+        // the fixed-order `moe_down_combine_k8_batched` makes the MoE FFN
+        // output byte-deterministic, eliminating the cumulative drift.
+        let xr = x_rot_local.expect("use_gpu_topk implies routed_gate_up_mq{4,6} implies x_rot_local is Some");
         let down_m = ffn.experts[0].down.m;
         let down_k = ffn.experts[0].down.k;
         let gate_up_k = ffn.experts[0].gate_up.k;
-        gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
-            &ffn.expert_gate_up_ptrs, s.topk_indices,
-            xr, s.gate_batch, s.up_batch,
-            2 * mi, gate_up_k,
-        )?;
+        // Dispatch the right indexed-GEMV layout for this layer's routed
+        // dtype. Within a layer, gate_up and down share the same dtype
+        // (kmap promotes whole expert tensor groups together); the
+        // `routed_dtype_indexable_mq{4,6}` checks above enforce this.
+        if routed_dtype_indexable_mq4 {
+            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
+        } else {
+            // routed_dtype_indexable_mq6 — HFQ6 (200 B/group) indexed kernel.
+            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                &ffn.expert_gate_up_ptrs, s.topk_indices,
+                xr, s.gate_batch, s.up_batch,
+                2 * mi, gate_up_k,
+            )?;
+        }
         // F2: AWQ-aware silu_mul+rotate. All experts in this MoE layer
         // share the same input residual basis → same imatrix → byte-
-        // identical AWQ scales; experts[0].down is representative.
+        // identical AWQ scales; experts[0].down is representative. The
+        // helper is dtype-agnostic — it dispatches on awq_scale presence,
+        // not on weight bytes layout — so MQ6 down's AWQ scale (if any)
+        // routes through the same _awq_batched variant as MQ4.
         fused_silu_mul_rotate_mq_batched_for(gpu, &ffn.experts[0].down, s.gate_batch, s.up_batch, s.rot_batch, mi, k)?;
-        gpu.gemv_hfq4g256_moe_down_residual_scaled_k8_indexed(
-            &ffn.expert_down_ptrs, s.topk_indices, s.topk_weights,
-            s.rot_batch, x_residual,
-            down_m, down_k,
+        // Atomic-free expanded write: [k_top × down_m] f32, one block per
+        // (m, krank) pair, no cross-block contention.
+        if routed_dtype_indexable_mq4 {
+            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, s.topk_indices,
+                s.rot_batch, s.down_expanded,
+                down_m, down_k, k, 1,
+            )?;
+        } else {
+            gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                &ffn.expert_down_ptrs, s.topk_indices,
+                s.rot_batch, s.down_expanded,
+                down_m, down_k, k, 1,
+            )?;
+        }
+        // Deterministic combine: sums K_TOP slots into x_residual in a
+        // fixed iteration order with `topk_weights` applied. This kernel
+        // is dtype-independent — it operates on the f32 expanded buffer.
+        gpu.moe_down_combine_k8_batched(
+            s.down_expanded, s.topk_weights, x_residual,
+            down_m, k, 1,
         )?;
     } else {
         // CPU-top-K fallback path. Two sub-paths from here:
@@ -2219,7 +2321,15 @@ fn moe_ffn_decode_impl(
         //   (b) Mixed-dtype or k != 8: per-expert loop.
         let topk_indices = topk_indices_cpu.expect("CPU-fallback path implies CPU top-K");
         let topk_weights = topk_weights_cpu.expect("CPU-fallback path implies CPU top-K");
-        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && x_rot_local.is_some();
+        // `use_kernarg_fused` dispatches both gate_up and down through
+        // HFQ4G256-layout kernels, so it needs routed.down MQ4 as well as
+        // routed.gate_up. Previously this constraint was carried implicitly
+        // by `x_rot_local.is_some()` (which required gate_side_mq4, which in
+        // shipped configs implied routed_mq4); now that x_rot_local fires
+        // for `routed_gate_up_mq4` alone, check `routed_mq4` explicitly.
+        // With both checks the condition equals `use_gpu_topk`, so this
+        // branch is effectively dead — kept for clarity until the cleanup.
+        let use_kernarg_fused = k == 8 && routed_gate_up_mq4 && routed_mq4 && x_rot_local.is_some();
         if use_kernarg_fused {
             let xr = x_rot_local.unwrap();
             let e0 = &ffn.experts[topk_indices[0]];
@@ -2836,6 +2946,13 @@ pub struct Qwen35Scratch {
     /// can stay in a graph-capturable stream).
     pub moe_topk_indices:  Option<GpuTensor>,   // [k] i32 stored as f32 alias
     pub moe_topk_weights:  Option<GpuTensor>,   // [k] f32
+    // Atomic-free MoE down expansion buffer for decode — [k × dim] f32.
+    // Paired with `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded` +
+    // `moe_down_combine_k8_batched` (batch_size=1) in `moe_ffn_decode_impl`'s
+    // use_gpu_topk path. Replaces the K_TOP-way atomicAdd that introduced
+    // non-deterministic wavefront-order-dependent FP rounding under hipGraph
+    // replay (task #100).
+    pub moe_down_expanded: Option<GpuTensor>,
 
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
@@ -2949,6 +3066,7 @@ impl Qwen35Scratch {
             moe_rot_batch:     None,
             moe_topk_indices:  None,
             moe_topk_weights:  None,
+            moe_down_expanded: None,
             prefill_batch:     None,
         })
         .and_then(|mut s| {
@@ -2978,6 +3096,8 @@ impl Qwen35Scratch {
                 // indexed MoE GEMV kernels read it as int*.
                 s.moe_topk_indices  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
                 s.moe_topk_weights  = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                // Atomic-free decode MoE down output: [k × dim].
+                s.moe_down_expanded = Some(gpu.alloc_tensor(&[k * hidden], DType::F32)?);
                 // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
                 // ensure_mq_signs fires during the first moe_ffn_decode and
                 // blows up hipGraph capture with a hipMalloc-in-capture
@@ -3020,7 +3140,8 @@ impl Qwen35Scratch {
                    self.moe_gate_up_buf, self.moe_gate_buf, self.moe_up_buf,
                    self.moe_ffn_hidden, self.moe_ffn_out,
                    self.moe_gate_batch, self.moe_up_batch, self.moe_rot_batch,
-                   self.moe_topk_indices, self.moe_topk_weights] {
+                   self.moe_topk_indices, self.moe_topk_weights,
+                   self.moe_down_expanded] {
             if let Some(buf) = t { let _ = gpu.free_tensor(buf); }
         }
         if let Some(pbs) = self.prefill_batch {
@@ -3074,39 +3195,58 @@ pub fn forward_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let dim = config.dim;
-    // hipGraph capture is currently DISABLED for MoE configs. Single-shot
-    // replay looks fine for short sequences, but state diverges from the
-    // direct-dispatch path after ~30–50 decoded tokens — the model drops
-    // a number in a count (skips "8" → "9"), loops on a single token, etc.
-    // The divergence is consistent under HIPFIRE_GRAPH=1 with the same
-    // prompt that succeeds with HIPFIRE_GRAPH=0. Investigated without
-    // finding the root cause: all kernels used by the MoE forward path
-    // appear individually graph-safe (pos-dependent ones read pos_buf
-    // dynamically; size-dependent ones use max_tiles/max_seq; the indexed
-    // MoE kernels have only static pointer kernargs). Suspect a numerical
-    // reordering between capture and replay in one of the flash-attn or
-    // GDN state-update kernels that compounds over many replays.
-    // Until that's isolated, MoE always takes the direct path.
-    // HIPFIRE_GRAPH_MOE=1 (diagnostic-only): bypass the MoE guard. Required
-    // to reproduce task #100. Under-graph A3B does NOT corrupt at step 1 —
-    // it accumulates numerical drift and diverges from direct at step ~6
-    // with q8 KV or step ~114 with asym3 KV on the Count-from-1-to-20
-    // prompt. Migrating `kv_cache_write_q8_0` to the blob launch path (it
-    // was the only remaining non-blob kernel in the MoE hot path) did not
-    // resolve the drift — the root cause is elsewhere, likely DeltaNet
-    // state accumulating tiny bit-level differences across replays via a
-    // numerical-reordering path (atomics or wavefront-scheduling dependent
-    // reductions inside gated_delta_net_*). Reproducer for next dig:
+    // hipGraph capture for MoE was previously gated off-by-default behind
+    // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
+    // capture, A3B accumulated a per-step ~1-ULP delta that compounded
+    // through the KV cache + GDN state and crossed the top-1 margin at
+    // step ~7 (q8 KV) or ~114 (asym3 KV), producing visible token-loop
+    // attractors by step 30-50 ("- **One**\n- **One**\n…").
+    //
+    // Root cause (fixed 2026-05-21): `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed`
+    // used K_TOP=8 concurrent `atomicAdd` writes per output row. FP32
+    // addition is non-associative, so the final bits depend on wavefront
+    // scheduling order. Under hipGraph replay that order differs from
+    // direct execution (graph scheduling pipelines kernels differently),
+    // introducing the systematic per-step delta. The kernel's own header
+    // (`kernels/src/gemv_hfq4g256_moe_down.hip:14-19`) had already flagged
+    // this non-determinism but rated it negligible based on the
+    // direct-only smoke test — capture amplifies the effect.
+    //
+    // Fix: the MoE FFN decode path now uses the atomic-free expand+combine
+    // pattern already used in prefill (`forward_prefill_batch_with_pbs`
+    // L5217-5232): `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`
+    // writes one row per (expert-rank, m), then `moe_down_combine_k8_batched`
+    // sums K_TOP slots into x_residual in a fixed iteration order. The
+    // resulting MoE FFN output is byte-deterministic under both direct
+    // execution and hipGraph replay.
+    //
+    // HIPFIRE_GRAPH_MOE remains opt-in (set to "1" to enable). The atomic
+    // fix is necessary but not sufficient — the CPU-topK fallback path
+    // (when not all gate-side MoE weights are MQ4G256, e.g. router=Q8 per
+    // the post-2026-04 router-attractor fix) calls `download_f32(router_logits)`,
+    // a sync D2H that fails under graph capture with hipError 906. Until
+    // that D2H is migrated to a capture-safe equivalent, opting in only
+    // works for models where the runtime takes the use_gpu_topk path.
+    //
+    // Reproducer used to characterize the fix:
     //   HIPFIRE_GRAPH=1 HIPFIRE_GRAPH_MOE=1 HIPFIRE_SMOKE_KV=q8 \
     //   HIPFIRE_SMOKE_MODE=chat HIPFIRE_SMOKE_STEPS=200 \
     //   HIPFIRE_SMOKE_PROMPT="Count from one to twenty in English." \
-    //   ./target/release/examples/a3b_smoke_forward <a3b.mq4>
+    //   ./target/release/examples/a3b_smoke_forward <uniform-mq4-a3b>
+    //
     // Per-forward env var lookups cached via OnceLock — these used to fire
     // ~16-46 std::env::var() syscalls per cycle on 27B decode, allocating a
     // String and walking the env table each time. Process env can't legitimately
     // change between forward calls; cache once and read atomically.
     static ALLOW_MOE_ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     static GRAPH_OVERRIDE_ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    // Opt-in: set HIPFIRE_GRAPH_MOE=1 to enable graph capture for the MoE
+    // forward path. Default-off until a follow-up makes the CPU-topK
+    // fallback's `download_f32(router_logits)` D2H sync capture-safe —
+    // mixed-kmap A3B (post-PR #199) routes through that fallback and crashes
+    // with hipError 906 under graph capture. The atomicAdd-determinism fix in
+    // this commit removes the use_gpu_topk path's drift, which is the necessary
+    // first step, but is not sufficient to enable MoE+graph by default.
     let allow_moe = *ALLOW_MOE_ENV.get_or_init(|| {
         std::env::var("HIPFIRE_GRAPH_MOE").ok().as_deref() == Some("1")
     });
@@ -3120,9 +3260,14 @@ pub fn forward_scratch(
     //     and consistent across model sizes.
     //   - other archs (RDNA1/2, CDNA): default-OFF (opt-in via
     //     HIPFIRE_GRAPH=1) since not yet A/B'd on those.
-    //   - MoE configs: always direct unless HIPFIRE_GRAPH_MOE=1; the
-    //     graph path numerically drifts after ~30-50 tokens on MoE
-    //     (see surrounding comment block for repro).
+    //   - MoE configs: opt-in via HIPFIRE_GRAPH_MOE=1. The ~30-50-token
+    //     attractor drift in the use_gpu_topk MoE down step was fixed
+    //     2026-05-21 (task #100 — atomicAdd → expand+combine), but the
+    //     CPU-topK fallback's `download_f32(router_logits)` D2H sync
+    //     remains capture-incompatible, so mixed-kmap A3B (post-PR #199)
+    //     can crash under graph capture even with the fix. Once that
+    //     D2H is migrated to a capture-safe path, the MoE default can
+    //     be flipped to follow the arch defaults.
     // Explicit HIPFIRE_GRAPH=0 always wins (kill switch).
     let graph_override = *GRAPH_OVERRIDE_ENV.get_or_init(|| {
         match std::env::var("HIPFIRE_GRAPH").ok().as_deref() {

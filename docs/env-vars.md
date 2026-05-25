@@ -100,7 +100,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_GEN` | DAEMON-RUNTIME | — | `crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs:18` |
 | `HIPFIRE_GPU_TOPK` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/infer_qwen35.rs:167` |
 | `HIPFIRE_GRAPH` | HIPGRAPH | — | `cli/index.ts:3448` |
-| `HIPFIRE_GRAPH_MOE` | HIPGRAPH | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:2933` |
+| `HIPFIRE_GRAPH_MOE` | HIPGRAPH | "" (opt-in; set to "1" to enable) | `crates/hipfire-arch-qwen35/src/qwen35.rs:3203` |
 | `HIPFIRE_HAVE_2_GPU` | MULTI-GPU | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:159` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | MISC-USER | — | `crates/rdna-compute/src/compiler.rs:298` |
 | `HIPFIRE_HOST_TIMING` | PERF-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:934` |
@@ -190,7 +190,7 @@ KV cache mode and physical capacity. Maps to `cfg.kv_cache` in `config.json`.
 Decode-loop graph capture, ~5-15% decode speedup on stable kernel sets.
 
 - `HIPFIRE_GRAPH` — set to `1` to enable graph capture. Maps to `cfg.flash_mode == "auto"` in CLI. Default: capture for 4B/9B/27B, off for 0.8B (known hipGraph bug).
-- `HIPFIRE_GRAPH_MOE` — opt-in graph capture for MoE forward path. Default off because MoE expert routing changes per-token, breaking graph reuse.
+- `HIPFIRE_GRAPH_MOE` — opt-in graph capture for MoE forward path. Set to `1` to enable. The atomicAdd-determinism fix on 2026-05-21 (task #100) removed the use_gpu_topk path's ~30-50-token attractor drift, but the CPU-topK fallback still uses a non-capture-safe `download_f32(router_logits)` D2H sync. Default remains off until that fallback is migrated; safe-for-graph models (uniform-MQ4 gate-side weights → `use_gpu_topk=true`) opt in with this flag.
 
 ### `MMQ` (5)
 

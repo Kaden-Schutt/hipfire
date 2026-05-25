@@ -11522,6 +11522,120 @@ impl Gpu {
         result
     }
 
+    /// Index-aware MoE gate_up GEMV for HFQ6G256-layout routed experts.
+    /// Wave32 (RDNA) only — CDNA wave64 path stays on the residual_scaled
+    /// kernel family. Used to keep mixed-kmap A3B (post-PR-199 alternating
+    /// MQ4→MQ6 promotion) on the device-side top-K path under hipGraph
+    /// capture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq6g256_moe_gate_up_k8_indexed(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up:   &GpuTensor,
+        m: usize, k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq6g256_moe_gate_up_indexed",
+            kernels::GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC,
+            "gemv_hfq6g256_moe_gate_up_k8_indexed",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        // HFQ6 uses 200 bytes/group vs HFQ4's 136. Bytes estimate scales
+        // accordingly. Reuse the existing profile helper with a 200/136
+        // ratio so timer estimates are roughly correct.
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = 8 * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq6g256_moe_gate_up_k8_indexed", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq6g256_moe_gate_up_k8_indexed",
+            [m as u32, 8, 1], [32u32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(xp);
+                b.push_ptr(ygp); b.push_ptr(yup);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// HFQ6G256 counterpart to `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
+    /// Atomic-free expand-then-combine for the MoE down step. Pairs with
+    /// `moe_down_combine_k8_batched` (dtype-independent — operates on the
+    /// f32 expanded buffer). Wave32 (RDNA) only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor,
+        m: usize, k: usize, k_top: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded",
+            kernels::GEMV_HFQ6G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded",
+        )?;
+        let pp  = expert_ptrs.buf.as_ptr();
+        let ip  = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp  as *const _ as *mut c_void,
+            &ip  as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let hfq4_bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let bytes = batch_size * k_top * (hfq4_bytes * 200 / 136 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq6g256_moe_down_k8_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp); b.push_ptr(ip); b.push_ptr(rbp); b.push_ptr(eop);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Combine pass for the atomic-free MoE down path. Sums K_TOP expert
     /// outputs per (token, m) weighted by topk_weights, accumulates into
     /// the residual stream. No cross-token contention — each token writes
@@ -23947,6 +24061,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht3_kv",
             kernels::PFLASH_SCORE_FWHT3_KV_SRC,
@@ -23973,6 +24088,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht4_kv",
             kernels::PFLASH_SCORE_FWHT4_KV_SRC,
@@ -24001,6 +24117,7 @@ impl Gpu {
         n_blocks: usize,
         last_pos: usize,
     ) -> HipResult<()> {
+        // bind_thread: skip — delegates to pflash_score_fwht_kv_impl which binds
         self.pflash_score_fwht_kv_impl(
             "pflash_score_fwht2_kv",
             kernels::PFLASH_SCORE_FWHT2_KV_SRC,
