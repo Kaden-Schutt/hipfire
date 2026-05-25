@@ -53,20 +53,49 @@ fn main() {
     eprintln!("Model: {model_path}");
     eprintln!("Phases: prefill={prefill_len} prefill_runs={prefill_runs} warmup={warmup_len} gen={gen_len}");
 
-    let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    eprintln!(
-        "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
-        config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
-    );
-    let model_bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
-    eprintln!("Model size: {:.3} GiB ({} bytes)", model_bytes as f64 / (1024.0 * 1024.0 * 1024.0), model_bytes);
-
+    let model_path_buf = Path::new(model_path);
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
 
+    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) —
+    // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
+    // take the canonical HFQ path below.
     let t_load = Instant::now();
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+    let (config, weights, model_bytes) = if model_path_buf.is_dir() {
+        use hipfire_runtime::safetensors_source::SafetensorsSource;
+        let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source)
+            .expect("config_from_safetensors");
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::read_dir(model_path_buf)
+            .ok()
+            .map(|rd| rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().is_some_and(|x| x == "safetensors"))
+                .filter_map(|e| std::fs::metadata(e.path()).ok())
+                .map(|m| m.len()).sum::<u64>())
+            .unwrap_or(0);
+        eprintln!("Model size: {:.3} GiB ({} bytes, safetensors)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0), bytes);
+        eprintln!("  loading via safetensors (ParoQuant path)");
+        let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("load_weights_paroquant");
+        (config, weights, bytes)
+    } else {
+        let mut hfq = HfqFile::open(model_path_buf).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!("Model size: {:.3} GiB ({} bytes)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0), bytes);
+        let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+        (config, weights, bytes)
+    };
     eprintln!("Weights loaded in {:.2}s", t_load.elapsed().as_secs_f64());
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);

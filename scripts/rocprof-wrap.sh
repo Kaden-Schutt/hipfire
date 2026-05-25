@@ -47,17 +47,17 @@ echo "[rocprof-wrap] stats CSV:  ${STATS_CSV}" >&2
 echo "[rocprof-wrap] command:    $*" >&2
 
 # Run under rocprofv3.
-# --kernel-trace : record per-dispatch kernel execution times
-# --stats        : aggregate per-kernel totals into _kernel_stats.csv
-# -S             : print a human-readable summary to stderr after the run
-# -f csv         : CSV output format (default is JSON in newer versions)
-# -d <dir>       : output directory
-# -o <prefix>    : output filename prefix
+# --kernel-trace   : record per-dispatch kernel execution times
+# --stats          : aggregate per-kernel totals into _kernel_stats.csv
+# -S               : print a human-readable summary to stderr after the run
+# --output-format  : CSV output format (newer rocprofv3 dropped the `-f csv` short form)
+# -d <dir>         : output directory
+# -o <prefix>      : output filename prefix
 exec rocprofv3 \
     --kernel-trace \
     --stats \
     -S \
-    -f csv \
+    --output-format csv \
     -d "${OUTPUT_DIR}" \
     -o "${PREFIX}" \
     -- "$@"

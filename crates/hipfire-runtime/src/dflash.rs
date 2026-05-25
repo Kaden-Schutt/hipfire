@@ -26,7 +26,7 @@
 //!   equivalent to the reference's cropped draft-KV cache and avoids
 //!   one whole layer of persistence bookkeeping.
 
-use crate::hfq::HfqFile;
+use crate::hfq::{load_awq_scale, HfqFile};
 use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -212,7 +212,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             if use_f16 {
                 assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
                 let buf = gpu.upload_raw(data, &[m * k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
             } else {
                 let f32_data: Vec<f32> = data
                     .chunks_exact(2)
@@ -220,7 +220,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
                     .collect();
                 assert_eq!(f32_data.len(), m * k, "dflash {name} F16 size mismatch");
                 let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
+                Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
             }
         }
         2 => {
@@ -230,20 +230,20 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
                 .collect();
             assert_eq!(f32_data.len(), m * k, "dflash {name} F32 size mismatch");
             let buf = gpu.upload_f32(&f32_data, &[m * k])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         13 => {
             // MQ4-G256: 136 bytes per 256 weights. The buffer is opaque to
             // the engine; the gemm_hfq4g256 kernel reads it directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         17 => {
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
             // as MQ4. Dispatch path (`gemm_dispatch`) routes through
             // `rotate_x_mq_batched` + `gemm_hfq3g256_batched_lmhead`.
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),
     }?;
@@ -252,31 +252,8 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
     // `DType::supports_awq_sidecar` allow-list so future widening (MQ6,
     // MQ2, MQ3-Lloyd, MFP4) is a single helper edit. Sidecar absent →
     // `awq_scale` stays None, dispatch path matches the pre-fix behavior.
-    //
-    // Logic is inlined rather than calling out to hfq.rs's closure or
-    // qwen35.rs's `load_awq_scale_for` to avoid pulling in a cross-crate
-    // dependency for what is structurally a third copy of the same load.
-    // Factor-out (one shared `pub fn load_awq_scale_for` in this crate)
-    // is tracked as a follow-up.
     if wt.gpu_dtype.supports_awq_sidecar() {
-        let sidecar_name = match name.strip_suffix(".weight") {
-            Some(stem) => format!("{stem}.awq_scale.weight"),
-            None => format!("{name}.awq_scale.weight"),
-        };
-        if let Some((sc_info, sc_data)) = hfq.tensor_data(&sidecar_name) {
-            if sc_info.quant_type != 1 {
-                eprintln!("warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping", sc_info.quant_type);
-            } else if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
-                eprintln!("warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping", sc_info.shape, k);
-            } else {
-                let f32_data: Vec<f32> = sc_data
-                    .chunks_exact(2)
-                    .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                    .collect();
-                let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-                wt.awq_scale = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok();
-            }
-        }
+        wt.awq_scale = load_awq_scale(hfq, gpu, name, k);
     }
     Ok(wt)
 }
