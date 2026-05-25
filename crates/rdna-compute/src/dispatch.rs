@@ -621,6 +621,10 @@ pub enum DType {
     HFQ2G256,  // 72 bytes per 256 elements (flat 2-bit, f32 scale+zero, ~19 VGPRs)
     HFQ2G128,  // 40 bytes per 128 elements (flat 2-bit, f32 scale+zero)
     HFQ6G256,  // 200 bytes per 256 elements (6-bit, f32 scale+zero)
+    ParoQ4G128, // ParoQuant: AWQ-packed INT4 G128 repacked to HFQ4G128 layout at load.
+                // Weights are standard HFQ4G128 (72 bytes/group); the ParoQuant distinction
+                // is that weight_gemv applies Givens rotation to activations before GEMV.
+                // Rotation metadata (pairs, theta, channel_scales) lives on WeightTensor::paro.
     Raw,       // raw bytes, no element interpretation
 }
 
@@ -629,7 +633,7 @@ impl DType {
         match self {
             DType::F32 => 4,
             DType::F16 => 2,
-            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::Raw => 1, // byte-level
+            DType::Q4K | DType::Q6K | DType::Q8_0 | DType::Q4F16G64 | DType::Q4F16G32 | DType::Q8HFQ | DType::HFQ4G256 | DType::HFQ4G128 | DType::HFQ3G256 | DType::HFQ3G128 | DType::HFQ2G256 | DType::HFQ2G128 | DType::HFQ6G256 | DType::MQ4G256 | DType::MQ6G256 | DType::MQ8G256 | DType::MQ3G256 | DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::HFP4G32 | DType::MFP4G32 | DType::ParoQ4G128 | DType::Raw => 1, // byte-level
         }
     }
 
@@ -762,6 +766,7 @@ pub struct Gpu {
     pub mq_signs1: Option<GpuTensor>,
     pub mq_signs2: Option<GpuTensor>,
     pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
+    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
     pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
     pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
     /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
@@ -1078,6 +1083,7 @@ impl Gpu {
             mq_signs1: None,
             mq_signs2: None,
             mq_x_rot: None,
+            paro_x_scratch: None,
             mq_x_q8: None,
             mq_x_scales: None,
             fp16_x_scratch: None,
@@ -2530,6 +2536,94 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// ParoQuant Givens rotation: apply learned pairwise rotations + channel
+    /// scaling to activation vector x in-place. Called before GEMV on
+    /// ParoQ4G128 weights.
+    ///
+    /// x: [seq_len, hidden_dim] F16 (modified in place)
+    /// pairs: [krot, hidden_dim] I16
+    /// theta: [krot, hidden_dim/2] F16
+    /// channel_scales: [hidden_dim] F16
+    pub fn givens_rotate(
+        &mut self,
+        x: &GpuTensor,
+        pairs: &GpuTensor,
+        theta: &GpuTensor,
+        channel_scales: &GpuTensor,
+        seq_len: usize,
+        hidden_dim: usize,
+        krot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("givens_rotate_f32", kernels::GIVENS_ROTATE_SRC, "givens_rotate_f32")?;
+        let func = &self.functions["givens_rotate_f32"];
+
+        let cta_m: u32 = 4;
+        let group_size: u32 = 128;
+        let groups_per_row = (hidden_dim as u32 + group_size - 1) / group_size;
+        let grid_x = ((seq_len as u32) + cta_m - 1) / cta_m;
+
+        let mut x_ptr = x.buf.as_ptr();
+        let mut pairs_ptr = pairs.buf.as_ptr();
+        let mut theta_ptr = theta.buf.as_ptr();
+        let mut cs_ptr = channel_scales.buf.as_ptr();
+        let mut seq_val = seq_len as i32;
+        let mut dim_val = hidden_dim as i32;
+        let mut krot_val = krot as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut pairs_ptr as *mut _ as *mut c_void,
+            &mut theta_ptr as *mut _ as *mut c_void,
+            &mut cs_ptr as *mut _ as *mut c_void,
+            &mut seq_val as *mut _ as *mut c_void,
+            &mut dim_val as *mut _ as *mut c_void,
+            &mut krot_val as *mut _ as *mut c_void,
+        ];
+
+        let smem = (cta_m * group_size * 4) as u32; // CTA_M * GROUP_SIZE * sizeof(float)
+
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, groups_per_row, 1],
+                [group_size / 2, 1, 1],  // 64 threads
+                smem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
+    pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        if let Some(ref s) = self.paro_x_scratch {
+            if s.buf.size() >= dim * 4 { return Ok(()); }
+        }
+        let buf = self.hip.malloc(dim * 4)?; // F32
+        self.paro_x_scratch = Some(GpuTensor { buf, shape: vec![dim], dtype: DType::F32 });
+        Ok(())
+    }
+
+    /// Device-to-device copy.
+    ///
+    /// Routes through `memcpy_dtod_auto` so it picks `memcpy_dtod_async` on
+    /// the active (capturing) stream when one is set, falling back to the sync
+    /// legacy-stream path otherwise. The raw `hip.memcpy_dtod` call would
+    /// deadlock hipGraph capture with "operation would make the legacy stream
+    /// depend on a capturing blocking stream" (matches the H2D fix in 7790ac6a).
+    ///
+    /// Callers must pass `n_bytes` explicitly to state intent — the prior
+    /// implicit `min(src.size(), dst.size())` silently truncated mismatched
+    /// copies, which was a footgun.
+    pub fn copy_d2d(&self, src: &GpuTensor, dst: &GpuTensor, n_bytes: usize) -> HipResult<()> {
+        // bind_thread: skip — delegates to memcpy_dtod_auto which binds
+        debug_assert!(n_bytes <= src.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds src.buf.size ({})", src.buf.size());
+        debug_assert!(n_bytes <= dst.buf.size(), "copy_d2d: n_bytes ({n_bytes}) exceeds dst.buf.size ({})", dst.buf.size());
+        self.memcpy_dtod_auto(&dst.buf, &src.buf, n_bytes)
     }
 
     /// Batched HFQ4-G128 GEMM. Same tiled approach as G256.

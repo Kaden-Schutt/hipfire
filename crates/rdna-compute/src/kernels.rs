@@ -1991,3 +1991,7 @@ pub const PFLASH_SCORE_FWHT4_KV_SRC: &str = include_str!("../../../kernels/src/p
 /// centroids). May regress NIAH needle recovery at long ctx — shipped
 /// for ablation / lower-bound study.
 pub const PFLASH_SCORE_FWHT2_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");
+
+/// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
+/// to activations in-place. Called before each ParoQ4G128 GEMV.
+pub const GIVENS_ROTATE_SRC: &str = include_str!("../../../kernels/src/givens_rotate.hip");

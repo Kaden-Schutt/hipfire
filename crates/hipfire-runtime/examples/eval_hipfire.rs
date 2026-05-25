@@ -153,8 +153,6 @@ fn main() {
     hipfire_runtime::eval_common::verify_ref_sha256(&args.ref_path, "eval_hipfire");
 
     // -------- load model --------
-    let mut hfq = HfqFile::open(&args.model).expect("open model");
-    let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("eval_hipfire: arch={} model={}", gpu.arch, args.model.display());
     // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
@@ -163,7 +161,25 @@ fn main() {
         unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
         eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+
+    // Auto-route safetensors directories (ParoQuant / AWQ / HF native) — mirrors
+    // daemon.rs:1500-1504. HFQ files take the canonical HFQ path below.
+    let (config, weights) = if args.model.is_dir() {
+        use hipfire_runtime::safetensors_source::SafetensorsSource;
+        let source = SafetensorsSource::open(&args.model)
+            .expect("safetensors open");
+        let config = qwen35::config_from_safetensors(&source)
+            .expect("config_from_safetensors");
+        eprintln!("  loading via safetensors (ParoQuant path)");
+        let weights = qwen35::load_weights_paroquant(&source, &config, &mut gpu)
+            .expect("load_weights_paroquant");
+        (config, weights)
+    } else {
+        let mut hfq = HfqFile::open(&args.model).expect("open model");
+        let config = qwen35::config_from_hfq(&hfq).expect("read config");
+        let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
+        (config, weights)
+    };
 
     // -------- read reference (HFKLDR β) header + tokens --------
     let ref_file = File::open(&args.ref_path).expect("open ref");
