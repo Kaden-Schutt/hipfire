@@ -19,6 +19,8 @@ pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod llama;
+pub mod model_source;
+pub mod safetensors_source;
 pub mod loop_guard;
 pub mod multi_gpu;
 pub mod sampler;

@@ -447,6 +447,18 @@ impl Tokenizer {
     ///      tokenizer verbatim, no HF-format translation).
     ///
     /// Returns `Err(MetadataMissing)` if neither is present.
+    ///
+    /// Load tokenizer from a tokenizer.json file on disk.
+    /// Returns `Ok(None)` if the file is missing or unreadable; `Err` if the
+    /// file exists but fails to parse as a valid tokenizer.
+    pub fn from_tokenizer_json(path: &std::path::Path) -> Result<Option<Self>, TokenizerError> {
+        let json_str = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        Self::from_hf_json(&json_str).map(Some)
+    }
+
     pub fn from_hfq_metadata(metadata_json: &str) -> Result<Self, TokenizerError> {
         let meta: serde_json::Value = serde_json::from_str(metadata_json)?;
         if let Some(tok_str) = meta.get("tokenizer").and_then(|v| v.as_str()) {

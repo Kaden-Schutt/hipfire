@@ -691,6 +691,19 @@ not the priority.
   wave64-dp4a to RDNA2 wave32 with HFQ3 unpack is ~15% SLOWER than
   the shipping dot2 path. Code retained behind `HIPFIRE_HFQ3_DP4A=1`
   for reproducibility / future experiments but does not ship.
+- **Phase 3 follow-ups (qkvza split routing + MMQ_Y=64)** ✅ DONE 2026-05-20 —
+  on `feat/mq3-gfx10-perf-phase-2`. Two diagnostic-driven wins:
+  - **qkvza split routing**: rocprof showed qkvza never routed to MMQ on
+    Qwen3.5 9B (beta_m=alpha_m=16, fail the all-aligned check). Added a
+    split-route path: qkv+z via `gemm_gate_up_hfq3g256_mmq` (the 2-way
+    kernel, semantically agnostic), beta+alpha via `_dot2`. **+22% prefill
+    on LRU 240** (545 → 668 tok/s).
+  - **MMQ_Y=64 residual variant**: PMC trace showed prefill is LDS-bound
+    (26 KB/WG → 2 WG/CU → 24% occupancy). Halving MMQ_Y to 64 cuts LDS to
+    15 KB/WG → 4 WG/CU → 48% predicted occupancy. Per-kernel microbench
+    shows -5 to -17% at N≥64. Daemon-level: +1.5% on LRU 240 with just
+    residual y64; bigger gain expected when extended to gate_up.
+  - **Cumulative since Phase 0: 56 → 678 tok/s = 12.11× on LRU 240.**
 - **Phase 3 (MMQ tile family)** ✅ DONE 2026-05-19 —
   LDS-tiled X reuse + sdot4 with auto-selecting tile size
   (mmq_x ∈ {16, 32}). Full family covers residual + qkv (3-way fused)
