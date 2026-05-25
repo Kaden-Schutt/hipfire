@@ -53,6 +53,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_ADAPTIVE_B_DOWN` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:981` |
 | `HIPFIRE_ADAPTIVE_B_UNSAFE` | DFLASH-ADAPT | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:444` |
 | `HIPFIRE_ADAPTIVE_B_UP` | DFLASH-ADAPT | — | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:979` |
+| `HIPFIRE_ALLOW_MIXED_ARCH` | MULTI-GPU | "" (set to "1" or "true" to enable) | `crates/hipfire-runtime/src/multi_gpu.rs:395` |
 | `HIPFIRE_ALLOW_MQ2` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2106` |
 | `HIPFIRE_ALLOW_MQ2_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2141` |
 | `HIPFIRE_ALLOW_MQ3_LLOYD` | MISC-USER | "" (set to "1" to enable) | `crates/hipfire-quantize/src/main.rs:2126` |
@@ -103,7 +104,7 @@ Categories are best-effort, derived from naming + source location. See the categ
 | `HIPFIRE_HAVE_2_GPU` | MULTI-GPU | "" (set to "1" to enable) | `crates/hipfire-arch-qwen35/tests/pp_parity.rs:159` |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | MISC-USER | — | `crates/rdna-compute/src/compiler.rs:298` |
 | `HIPFIRE_HOST_TIMING` | PERF-DIAG | "" (set to "1" to enable) | `crates/hipfire-runtime/examples/dflash_spec_demo.rs:934` |
-| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative) | `crates/rdna-compute/src/compiler.rs:89` |
+| `HIPFIRE_KERNEL_CACHE` | MISC-USER | `.hipfire_kernels` (cwd-relative; per-arch subdir) | `crates/rdna-compute/src/compiler.rs:100` |
 | `HIPFIRE_KV_MODE` | KV-CACHE | — | `cli/index.ts:400` |
 | `HIPFIRE_KV_PHYSICAL_CAP` | KV-CACHE | — | `crates/hipfire-runtime/examples/daemon.rs:1211` |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | KERNEL-SELECTOR | "" (set to "1" to enable) | `crates/rdna-compute/src/kernels.rs:76` |
@@ -218,16 +219,17 @@ Hot-path kernel choice levers. **All silent today.** Power users who tune for sp
 - `HIPFIRE_ROCBLAS_ALL_ARCHS`, `HIPFIRE_ROCBLAS_MIN_BATCH`, `HIPFIRE_ROCBLAS_OFF` — rocBLAS dispatch gates.
 - `HIPFIRE_WO_MMQ`, `HIPFIRE_WO_WMMA_VARIANT` — workaround flags for specific arch quirks.
 
-### `MULTI-GPU` (6)
+### `MULTI-GPU` (7)
 
 Pipeline-parallel and multi-device orchestration. Tied to `crates/hipfire-runtime/src/multi_gpu.rs` + Stage 7 of issue #58.
 
+- `HIPFIRE_ALLOW_MIXED_ARCH=1` — opt into mixed-architecture device pairs after the default arch-mismatch guard.
 - `HIPFIRE_DEVICES` — explicit device selection (alternate to `ROCR_VISIBLE_DEVICES`).
 - `HIPFIRE_PP_LAYERS="a,b,..."` — explicit asymmetric layer split (PR #190).
 - `HIPFIRE_PP_PFLASH=1` — opt into experimental PFlash + pp>1 compose (PR #190).
 - `HIPFIRE_HAVE_2_GPU=1` — pp_parity test gate; required for the 2-GPU parity battery.
 - `HIPFIRE_PP_PARITY_MODEL` — model path override for the pp_parity test.
-- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — VRAM-tolerance threshold above which mixed-arch warning fires under `HIPFIRE_ALLOW_MIXED_ARCH=1`.
+- `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` — free-VRAM delta tolerance for `init_uniform`; `init_layers` skips this gate.
 
 ### `PFLASH` (13)
 
@@ -333,7 +335,7 @@ Miscellaneous user-facing flags.
 - `HIPFIRE_DETERMINISTIC=1` — byte-exact output mode. Disables non-deterministic optimizations.
 - `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT=1` — gate the `budget_alert_at_tok` / `budget_alert_text` daemon params. Maps to `cfg.experimental_budget_alert`.
 - `HIPFIRE_HIPCC_EXTRA_FLAGS` — extra flags appended to all hipcc invocations during JIT.
-- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache directory. Default `.hipfire_kernels` (cwd-relative). Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
+- `HIPFIRE_KERNEL_CACHE` — JIT'd `.hsaco` cache root. Default `.hipfire_kernels` (cwd-relative). Blobs land under `<root>/{arch}/` so cross-arch workflows (multiple GPUs in one process, parallel CI matrix arches) don't collide. Pin to `/tmp/hipfire_kernels` for tmpfs speed; default isolates parallel worktrees/agents from clobbering each other's blobs.
 - `HIPFIRE_ALLOW_MQ2=1`, `HIPFIRE_ALLOW_MQ2_LLOYD=1`, `HIPFIRE_ALLOW_MQ3_LLOYD=1` — opt-in research-grade quant formats during quantizer run.
 
 ### `DIAG-DUMP` (8)
@@ -541,7 +543,7 @@ grep -rE 'env::var(_os)?\("HIPFIRE_|process\.env\.HIPFIRE_' \
     | sort -u
 ```
 
-Note the `(_os)?` group — `compiler.rs:89` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
+Note the `(_os)?` group — `compiler.rs:100` uses `std::env::var_os("HIPFIRE_KERNEL_CACHE")` rather than the more common `std::env::var(...)`. A regex that only matches `env::var(` will silently miss it; this was caught post-merge by Codex stop-gate review and is the reason this regex now covers both forms.
 
 A future pass should ship `scripts/regen-env-vars-doc.sh` that mechanically rebuilds the quick-reference table while preserving the prose category guide.
 
