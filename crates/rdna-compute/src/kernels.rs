@@ -852,6 +852,25 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X40_SRC: &str = include_str!("../../
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X48_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x48.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X56_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x56.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_gfx906_x64.hip");
+// gfx906 QKV 3-way fused MMQ — sibling to residual_mmq_gfx906 above.
+// Shared body + per-mmq_x wrappers. See
+// kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh for the design.
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x8.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x16.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x32.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_x64.hip");
+// gfx906 gate_up 2-way fused MMQ — used for BOTH FFN gate_up AND LinearAttention
+// QKVZA-head (qkv+z). Same kernel shape, two dispatch sites.
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X8_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x8.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x16.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x32.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x64.hip");
+// MMQ_Y=64 occupancy variants — halves LDS X-tile + accumulator regs,
+// 2× WGs/grid. Probe via HIPFIRE_HFQ4_MMQ_GFX906_Y64=1. See plan §6.5.
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X16_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x16_y64.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_GFX906_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_x32_y64.hip");
 pub const GEMM_MW16_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mw16_residual_wmma.hip");
 pub const DEQUANT_HFQ4G256_TO_F16_SRC: &str = include_str!("../../../kernels/src/dequant_hfq4g256_to_f16.hip");
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma.hip");
@@ -1020,6 +1039,11 @@ pub const GEMM_HFQ3G256_RESIDUAL_MMQ_BODY_CUH: &str = include_str!("../../../ker
 pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X8_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x8.gfx1030.hip");
 pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x16.gfx1030.hip");
 pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x32.gfx1030.hip");
+// Experimental MMQ_Y=64 variant of residual mmq_x=32. Halves the row tile to
+// reduce LDS budget (26 KB → ~15 KB per WG) and improve occupancy. Issue #300.
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x32_y64.gfx1030.hip");
+// Further push: MMQ_Y=32, ~10 KB LDS per WG (theoretical 6 WG/CU ≈ 72%).
+pub const GEMM_HFQ3G256_RESIDUAL_MMQ_X32_Y32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq3g256_residual_mmq_x32_y32.gfx1030.hip");
 
 // HFQ3 qkv (3-way fused: Q + K + V) MMQ family. Same body template,
 // different output routing.
@@ -1041,6 +1065,30 @@ pub const GEMM_QKVZA_HFQ3G256_MMQ_X8_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_QKVZA_HFQ3G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x16.gfx1030.hip");
 pub const GEMM_QKVZA_HFQ3G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq3g256_mmq_x32.gfx1030.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_RDNA2_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq.gfx1030.hip");
+
+// HFQ4 RDNA2 MMQ residual family (issue #299). Templated body + thin
+// tile wrappers. Mirrors the HFQ3 Phase 3 layout (mmq_x ∈ {16, 32},
+// MMQ_Y default 128; y64 variant applies the MQ3 phase-2 finding).
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_body.cuh");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x16.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x32.gfx1030.hip");
+pub const GEMM_HFQ4G256_RESIDUAL_MMQ_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_mmq_x32_y64.gfx1030.hip");
+
+// HFQ4 RDNA2 qkv MMQ family (issue #299 Phase 2). 3-way fused (Q+K+V).
+pub const GEMM_QKV_HFQ4G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_body.cuh");
+pub const GEMM_QKV_HFQ4G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_x16.gfx1030.hip");
+pub const GEMM_QKV_HFQ4G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq4g256_mmq_x32.gfx1030.hip");
+
+// HFQ4 RDNA2 gate_up MMQ family (issue #299 Phase 3). 2-way fused.
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_body.cuh");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_x16.gfx1030.hip");
+pub const GEMM_GATE_UP_HFQ4G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_mmq_x32.gfx1030.hip");
+
+// HFQ4 RDNA2 qkvza MMQ family (issue #299 Phase 4). 4-way fused
+// (LA preamble: wqkv + wz + w_beta + w_alpha).
+pub const GEMM_QKVZA_HFQ4G256_MMQ_BODY_CUH: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_mmq_body.cuh");
+pub const GEMM_QKVZA_HFQ4G256_MMQ_X16_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_mmq_x16.gfx1030.hip");
+pub const GEMM_QKVZA_HFQ4G256_MMQ_X32_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_mmq_x32.gfx1030.hip");
 
 // Batched 2-way fused HFQ4-G256 GEMM (FFN preamble: w_gate + w_up).
 // Batched counterpart of fused_gate_up_hfq4g256 — byte-exact vs running that kernel
@@ -1066,6 +1114,10 @@ pub const GEMM_GATE_UP_HFQ3G256_DOT2_SRC: &str = include_str!("../../../kernels/
 pub const GEMM_GATE_UP_HFQ3G256_FP16_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_fp16.hip");
 // Wave32+dp4a (v_dot4_i32_i8) variant — gfx1030+ experimental path (Phase 2).
 pub const GEMM_GATE_UP_HFQ3G256_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_dp4a.gfx1030.hip");
+// MMQ_Y=64 variant of gate_up mmq_x32. Higher-occupancy probe (issue #300).
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y64_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32_y64.gfx1030.hip");
+// MMQ_Y=96 variant — sweet-spot probe between y=64 (loses) and y=128 (wins).
+pub const GEMM_GATE_UP_HFQ3G256_MMQ_X32_Y96_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq3g256_mmq_x32_y96.gfx1030.hip");
 
 // ── HFQ6-G256 batched GEMM (for MQ6 prefill) ──
 pub const GEMM_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual.hip");

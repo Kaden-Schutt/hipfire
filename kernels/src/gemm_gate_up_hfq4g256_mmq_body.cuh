@@ -1,6 +1,6 @@
-// Shared body for HFQ3-G256 wave32 MMQ 2-way fused (gate + up) GEMM.
+// Shared body for HFQ4-G256 wave32 MMQ 2-way fused (gate + up) GEMM.
 //
-// HFQ3 gate_up sibling of `gemm_hfq3g256_residual_mmq_body.cuh`. Same
+// HFQ4 gate_up sibling of `gemm_hfq4g256_residual_mmq_body.cuh`. Same
 // LDS-tiled X reuse + sdot4 inner loop; differs in:
 //   - 2-way output routing per workgroup (gate vs up)
 //   - Overwrite write-back (Y[col][row] = acc)
@@ -12,9 +12,6 @@
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-// MMQ_Y is the row tile (output rows per workgroup). Default 128.
-// Lowering to 64 trades per-WG compute for higher CU occupancy via
-// reduced LDS budget (issue #300 follow-up).
 #ifndef MMQ_Y
 #define MMQ_Y 128
 #endif
@@ -23,7 +20,6 @@
 #define QK8_1 32
 #define X_STRIDE 40
 #define Y_STRIDE 36
-// X-tile loader task count: scales with MMQ_Y.
 #define X_LOADER_TASKS_PER_THREAD ((MMQ_Y * 16) / 128)
 
 #ifndef MMQ_X
@@ -92,18 +88,16 @@ extern "C" __global__ void KERNEL_NAME(
                 tile_y[u] = valid ? src[slot] : 0;
             }
 
-            // ── Load X tile (HFQ3 unpack) ─────────────────────────────────
+            // ── Load X tile (HFQ4 4-bit nibble unpack) ────────────────────
             if (window == 0 && tid < 128) {
                 const int i = tid;
                 const int row = (row0 + i < out_m) ? (row0 + i) : (out_m - 1);
-                const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
+                const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
                 const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
                 const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-                x_dm[i] = make_float2(sc, zp + 4.0f * sc);
+                x_dm[i] = make_float2(sc, zp + 8.0f * sc);
             }
 
-            // X-tile loader: scales with MMQ_Y. At MMQ_Y=128 → 16 loops/thread
-            // (the original); MMQ_Y=64 → 8 loops/thread.
             #pragma unroll
             for (int loop = 0; loop < X_LOADER_TASKS_PER_THREAD; ++loop) {
                 const int task_id = tid * X_LOADER_TASKS_PER_THREAD + loop;
@@ -111,25 +105,21 @@ extern "C" __global__ void KERNEL_NAME(
                 const int chunk = task_id % 16;
 
                 const int row = (row0 + i < out_m) ? (row0 + i) : (out_m - 1);
-                const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
+                const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
+                const unsigned int qs0 = *(const unsigned int*)(gp + 8 + window * 64 + chunk * 4);
 
-                const unsigned char* d = (const unsigned char*)(gp + 8 + window * 48 + chunk * 3);
-                const unsigned int pk = (unsigned int)d[0]
-                                      | ((unsigned int)d[1] << 8)
-                                      | ((unsigned int)d[2] << 16);
-
-                const unsigned int n0 = (pk      ) & 7u;
-                const unsigned int n1 = (pk >>  3) & 7u;
-                const unsigned int n2 = (pk >>  6) & 7u;
-                const unsigned int n3 = (pk >>  9) & 7u;
-                const unsigned int n4 = (pk >> 12) & 7u;
-                const unsigned int n5 = (pk >> 15) & 7u;
-                const unsigned int n6 = (pk >> 18) & 7u;
-                const unsigned int n7 = (pk >> 21) & 7u;
-                const int int_a = (int)(((n0 - 4) & 0xFF) | (((n1 - 4) & 0xFF) << 8)
-                                      | (((n2 - 4) & 0xFF) << 16) | (((n3 - 4) & 0xFF) << 24));
-                const int int_b = (int)(((n4 - 4) & 0xFF) | (((n5 - 4) & 0xFF) << 8)
-                                      | (((n6 - 4) & 0xFF) << 16) | (((n7 - 4) & 0xFF) << 24));
+                const unsigned int n0 = (qs0      ) & 0xFu;
+                const unsigned int n1 = (qs0 >>  4) & 0xFu;
+                const unsigned int n2 = (qs0 >>  8) & 0xFu;
+                const unsigned int n3 = (qs0 >> 12) & 0xFu;
+                const unsigned int n4 = (qs0 >> 16) & 0xFu;
+                const unsigned int n5 = (qs0 >> 20) & 0xFu;
+                const unsigned int n6 = (qs0 >> 24) & 0xFu;
+                const unsigned int n7 = (qs0 >> 28) & 0xFu;
+                const int int_a = (int)(((n0 - 8) & 0xFF) | (((n1 - 8) & 0xFF) << 8)
+                                      | (((n2 - 8) & 0xFF) << 16) | (((n3 - 8) & 0xFF) << 24));
+                const int int_b = (int)(((n4 - 8) & 0xFF) | (((n5 - 8) & 0xFF) << 8)
+                                      | (((n6 - 8) & 0xFF) << 16) | (((n7 - 8) & 0xFF) << 24));
 
                 x_qs[i * X_STRIDE + 2 * chunk + 0] = int_a;
                 x_qs[i * X_STRIDE + 2 * chunk + 1] = int_b;

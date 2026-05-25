@@ -1,20 +1,26 @@
-// Shared body for HFQ3-G256 wave32 MMQ 2-way fused (gate + up) GEMM.
+// Shared body for HFQ4-G256 wave32 MMQ residual kernels.
 //
-// HFQ3 gate_up sibling of `gemm_hfq3g256_residual_mmq_body.cuh`. Same
-// LDS-tiled X reuse + sdot4 inner loop; differs in:
-//   - 2-way output routing per workgroup (gate vs up)
-//   - Overwrite write-back (Y[col][row] = acc)
+// Direct sibling of `gemm_hfq3g256_residual_mmq_body.cuh`. Same topology
+// (LDS-tiled X reuse + sdot4 inner loop + Q8_1 X quantization); differs
+// only in the HFQ4-specific unpack:
 //
-// CALLER INVARIANT: gate_m and up_m must each be a multiple of MMQ_Y=128.
-// Qwen3.5 family satisfies this.
+//   group stride = 136 B  (vs 104 B for HFQ3)
+//   body         = 128 B  (4-bit nibbles in 4-byte uints, vs 3-bit trits in 3-byte words)
+//   zp eff       = zp + 8*sc  (4-bit center = 8, vs 4 for 3-bit)
+//   window stride = window * 64 + chunk * 4  (vs window * 48 + chunk * 3)
+//   nibble extract = (qs0 >> (i*4)) & 0xF   (vs 3-bit shifts)
+//   signed bias = n - 8   (vs n - 4)
+//
+// Each tile-size instantiation defines MMQ_X (kernel-side batch tile)
+// and KERNEL_NAME before #including this header. MMQ_Y defaults to 128;
+// override with `#define MMQ_Y N` BEFORE the include to cut LDS budget
+// and raise CU occupancy (MQ3 phase-2 finding: y=64 wins for narrow
+// output kernels, y=32 regresses).
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <stdint.h>
 
-// MMQ_Y is the row tile (output rows per workgroup). Default 128.
-// Lowering to 64 trades per-WG compute for higher CU occupancy via
-// reduced LDS budget (issue #300 follow-up).
 #ifndef MMQ_Y
 #define MMQ_Y 128
 #endif
@@ -23,7 +29,6 @@
 #define QK8_1 32
 #define X_STRIDE 40
 #define Y_STRIDE 36
-// X-tile loader task count: scales with MMQ_Y.
 #define X_LOADER_TASKS_PER_THREAD ((MMQ_Y * 16) / 128)
 
 #ifndef MMQ_X
@@ -41,30 +46,14 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 
 __launch_bounds__(128, 2)
 extern "C" __global__ void KERNEL_NAME(
-    const char* __restrict__ A_gate,
-    const char* __restrict__ A_up,
+    const char* __restrict__ A,
     const block_q8_1_mmq* __restrict__ Xq,
-    float* __restrict__ Y_gate,
-    float* __restrict__ Y_up,
-    int gate_m, int up_m,
-    int K, int N
+    float* __restrict__ Y,
+    int M, int K, int N
 ) {
-    const int total_row = blockIdx.x * MMQ_Y;
-    const int total_m = gate_m + up_m;
-    if (total_row >= total_m) return;
-
-    const char* A;
-    float* Y;
-    int row0;
-    int out_m;
-    if (total_row < gate_m) {
-        A = A_gate; Y = Y_gate; row0 = total_row;             out_m = gate_m;
-    } else {
-        A = A_up;   Y = Y_up;   row0 = total_row - gate_m;    out_m = up_m;
-    }
-
+    const int row0 = blockIdx.x * MMQ_Y;
     const int col0 = blockIdx.y * MMQ_X;
-    if (col0 >= N) return;
+    if (row0 >= M || col0 >= N) return;
 
     const int groups_per_row = K / 256;
     const int tid = threadIdx.y * WAVE_SIZE + threadIdx.x;
@@ -92,44 +81,47 @@ extern "C" __global__ void KERNEL_NAME(
                 tile_y[u] = valid ? src[slot] : 0;
             }
 
-            // ── Load X tile (HFQ3 unpack) ─────────────────────────────────
-            if (window == 0 && tid < 128) {
+            // ── Load X tile metadata (HFQ4 header) ────────────────────────
+            // One thread per output row writes one float2 to x_dm[i] (sized
+            // MMQ_Y). Gating on `tid < MMQ_Y` (NOT the workgroup width 128)
+            // is required: when MMQ_Y=64, threads 64..127 must NOT write,
+            // since `x_dm[64..127]` overlaps the adjacent `tile_y` LDS
+            // region (see allocator at line 64). Without this gate, the
+            // y64 variant corrupts the Q8_1 Y tile and emits NaN.
+            if (window == 0 && tid < MMQ_Y) {
                 const int i = tid;
-                const int row = (row0 + i < out_m) ? (row0 + i) : (out_m - 1);
-                const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
+                const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
+                const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
                 const float sc = __builtin_bit_cast(float, *(const unsigned int*)gp);
                 const float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
-                x_dm[i] = make_float2(sc, zp + 4.0f * sc);
+                x_dm[i] = make_float2(sc, zp + 8.0f * sc);
             }
 
-            // X-tile loader: scales with MMQ_Y. At MMQ_Y=128 → 16 loops/thread
-            // (the original); MMQ_Y=64 → 8 loops/thread.
+            // X-tile loader (HFQ4 unpack: 4-bit nibbles → INT8 packed).
+            // Scales with MMQ_Y; at MMQ_Y=128 → 16 loops/thread,
+            // MMQ_Y=64 → 8 loops/thread.
             #pragma unroll
             for (int loop = 0; loop < X_LOADER_TASKS_PER_THREAD; ++loop) {
                 const int task_id = tid * X_LOADER_TASKS_PER_THREAD + loop;
                 const int i = task_id / 16;
                 const int chunk = task_id % 16;
 
-                const int row = (row0 + i < out_m) ? (row0 + i) : (out_m - 1);
-                const char* gp = A + ((long long)row * groups_per_row + kg) * 104;
+                const int row = (row0 + i < M) ? (row0 + i) : (M - 1);
+                const char* gp = A + ((long long)row * groups_per_row + kg) * 136;
+                const unsigned int qs0 = *(const unsigned int*)(gp + 8 + window * 64 + chunk * 4);
 
-                const unsigned char* d = (const unsigned char*)(gp + 8 + window * 48 + chunk * 3);
-                const unsigned int pk = (unsigned int)d[0]
-                                      | ((unsigned int)d[1] << 8)
-                                      | ((unsigned int)d[2] << 16);
-
-                const unsigned int n0 = (pk      ) & 7u;
-                const unsigned int n1 = (pk >>  3) & 7u;
-                const unsigned int n2 = (pk >>  6) & 7u;
-                const unsigned int n3 = (pk >>  9) & 7u;
-                const unsigned int n4 = (pk >> 12) & 7u;
-                const unsigned int n5 = (pk >> 15) & 7u;
-                const unsigned int n6 = (pk >> 18) & 7u;
-                const unsigned int n7 = (pk >> 21) & 7u;
-                const int int_a = (int)(((n0 - 4) & 0xFF) | (((n1 - 4) & 0xFF) << 8)
-                                      | (((n2 - 4) & 0xFF) << 16) | (((n3 - 4) & 0xFF) << 24));
-                const int int_b = (int)(((n4 - 4) & 0xFF) | (((n5 - 4) & 0xFF) << 8)
-                                      | (((n6 - 4) & 0xFF) << 16) | (((n7 - 4) & 0xFF) << 24));
+                const unsigned int n0 = (qs0      ) & 0xFu;
+                const unsigned int n1 = (qs0 >>  4) & 0xFu;
+                const unsigned int n2 = (qs0 >>  8) & 0xFu;
+                const unsigned int n3 = (qs0 >> 12) & 0xFu;
+                const unsigned int n4 = (qs0 >> 16) & 0xFu;
+                const unsigned int n5 = (qs0 >> 20) & 0xFu;
+                const unsigned int n6 = (qs0 >> 24) & 0xFu;
+                const unsigned int n7 = (qs0 >> 28) & 0xFu;
+                const int int_a = (int)(((n0 - 8) & 0xFF) | (((n1 - 8) & 0xFF) << 8)
+                                      | (((n2 - 8) & 0xFF) << 16) | (((n3 - 8) & 0xFF) << 24));
+                const int int_b = (int)(((n4 - 8) & 0xFF) | (((n5 - 8) & 0xFF) << 8)
+                                      | (((n6 - 8) & 0xFF) << 16) | (((n7 - 8) & 0xFF) << 24));
 
                 x_qs[i * X_STRIDE + 2 * chunk + 0] = int_a;
                 x_qs[i * X_STRIDE + 2 * chunk + 1] = int_b;
@@ -186,7 +178,7 @@ extern "C" __global__ void KERNEL_NAME(
         }
     }
 
-    // Write-back — OVERWRITE.
+    // ── Write-back with residual add ──────────────────────────────────────
     #pragma unroll
     for (int j0 = 0; j0 < MMQ_X; j0 += MMQ_NWARPS) {
         const int j = j0 + threadIdx.y;
@@ -197,11 +189,11 @@ extern "C" __global__ void KERNEL_NAME(
         for (int i0 = 0; i0 < MMQ_Y; i0 += WAVE_SIZE) {
             const int i = i0 + threadIdx.x;
             const int row = row0 + i;
-            if (row >= out_m) continue;
+            if (row >= M) continue;
 
             const int idx = (j0 / MMQ_NWARPS) * (MMQ_Y / WAVE_SIZE) + (i0 / WAVE_SIZE);
-            const long long out_idx = (long long)col * out_m + row;
-            Y[out_idx] = sum[idx];
+            const long long out_idx = (long long)col * M + row;
+            Y[out_idx] += sum[idx];
         }
     }
 }

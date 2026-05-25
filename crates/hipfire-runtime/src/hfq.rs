@@ -529,51 +529,60 @@ fn load_f16_tensor(hfq: &HfqFile, gpu: &mut Gpu, st_name: &str, shape: &[usize])
     gpu.upload_f32(&f32_data, shape)
 }
 
+/// Load an AWQ scale sidecar tensor from an HFQ file onto GPU.
+///
+/// Phase A Stage A — AWQ sidecar lookup. The quantizer emits per-tensor
+/// sidecars named `<weight_name>.awq_scale.weight` (1D F16, length K)
+/// alongside MQ4-quantized weights. The forward path uses these to apply
+/// `x /= awq_scale` before the rotation kernel, completing the AWQ
+/// math `(W·s) · (x/s) = W·x`. Backward-compatible: when no sidecar
+/// exists (the common case for pre-Stage-A .hfq files), this returns
+/// None and the runtime behaves identically to before.
+///
+/// Naming convention: replace trailing `.weight` with `.awq_scale.weight`.
+/// Matches hipfire-quantize's emit pattern.
+///
+/// Internally uses `tensor_data_vec`, which on Unix routes through pread
+/// + fadvise_dontneed (avoids page cache buildup on unified-memory APUs)
+/// and on non-Unix falls back to mmap. Sidecars are small (K ≤ ~12288
+/// elements, ~48 KB peak), so the owned-Vec copy is negligible.
+pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> Option<GpuTensor> {
+    let sidecar_name = match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    };
+    let (sc_info, sc_data) = hfq.tensor_data_vec(&sidecar_name)?;
+    // Must be 1D F16, length K. quant_type 1 = F16 per the existing
+    // load_f16_tensor path.
+    if sc_info.quant_type != 1 {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
+            sc_info.quant_type
+        );
+        return None;
+    }
+    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
+        eprintln!(
+            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
+            sc_info.shape, k
+        );
+        return None;
+    }
+    // Convert F16 → F32 on host before upload, so the kernel receives
+    // a `const float*` and doesn't need <hip/hip_fp16.h>. The 2× VRAM
+    // cost vs raw F16 is negligible at these sizes.
+    let f32_data: Vec<f32> = sc_data
+        .chunks_exact(2)
+        .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+}
+
 /// Load a weight tensor (quantized or F16) onto GPU.
 fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
     let (info, data) = hfq.tensor_data(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
-
-    // Phase A Stage A — AWQ sidecar lookup. The quantizer emits per-tensor
-    // sidecars named `<weight_name>.awq_scale.weight` (1D F16, length K)
-    // alongside MQ4-quantized weights. The forward path uses these to apply
-    // `x /= awq_scale` before the rotation kernel, completing the AWQ
-    // math `(W·s) · (x/s) = W·x`. Backward-compatible: when no sidecar
-    // exists (the common case for pre-Stage-A .hfq files), `awq_scale`
-    // stays None and the runtime behaves identically to before.
-    //
-    // Naming convention: replace `.weight` with `.awq_scale.weight` so the
-    // sidecar gets stored as an F16 1D tensor that the loader can detect
-    // by name. Matches hipfire-quantize's emit pattern.
-    let load_awq_scale = || -> Option<GpuTensor> {
-        let sidecar_name = match st_name.strip_suffix(".weight") {
-            Some(stem) => format!("{stem}.awq_scale.weight"),
-            None => format!("{st_name}.awq_scale.weight"),
-        };
-        let (sc_info, sc_data) = hfq.tensor_data(&sidecar_name)?;
-        // Must be 1D F16, length K. Quant type 1 = F16 per the existing
-        // load_f16_tensor path (quant_type field documented at line ~31).
-        if sc_info.quant_type != 1 {
-            eprintln!("warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping", sc_info.quant_type);
-            return None;
-        }
-        if sc_info.shape.len() != 1 || sc_info.shape[0] != k as u32 {
-            eprintln!("warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping", sc_info.shape, k);
-            return None;
-        }
-        // Convert F16 → F32 on host before upload, so the kernel receives
-        // a `const float*` and doesn't need <hip/hip_fp16.h>. The scale
-        // vector is small (K ≤ ~12288 elements, ~48 KB peak), so the
-        // 2× memory cost on GPU vs raw F16 is negligible.
-        let f32_data: Vec<f32> = sc_data
-            .chunks_exact(2)
-            .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let f32_bytes: Vec<u8> = f32_data.iter()
-            .flat_map(|&v| v.to_le_bytes())
-            .collect();
-        gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
-    };
 
     let mut wt = match info.quant_type {
         0 => { // Q4F16G64
@@ -683,7 +692,7 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usiz
     // so future widening is a single helper edit, not a scattered
     // per-loader hunt. See dispatch.rs for the allow-list rationale.
     if wt.gpu_dtype.supports_awq_sidecar() {
-        wt.awq_scale = load_awq_scale();
+        wt.awq_scale = load_awq_scale(hfq, gpu, st_name, k);
     }
     Ok(wt)
 }

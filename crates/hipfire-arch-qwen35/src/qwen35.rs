@@ -5,7 +5,7 @@
 //! Qwen3.5 model: hybrid DeltaNet (linear attention) + standard attention.
 //! Feature-gated behind `deltanet`.
 
-use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::hfq::{load_awq_scale, HfqFile};
 use hipfire_runtime::llama::{self, f16_to_f32, EmbeddingFormat, ParoRotation, WeightTensor,
                               weight_gemv, weight_gemv_prerotated, fused_rmsnorm_rotate_for_mq,
                               fused_rmsnorm_rotate_mq_batched_for,
@@ -932,52 +932,6 @@ fn load_weight_tensor_raw(gpu: &Gpu, quant_type: u8, data: &[u8], m: usize, k: u
     }
 }
 
-/// Phase A Stage A — AWQ sidecar loader for the Qwen3.5 forward path.
-///
-/// The .hfq quantizer emits `<weight>.awq_scale.weight` (1D F16, length K)
-/// alongside MQ4G256 weights that were AWQ pre-scaled. The dispatcher in
-/// `fused_rmsnorm_rotate_for_mq` / `fused_rmsnorm_rotate_mq_batched_for`
-/// looks at `WeightTensor.awq_scale.is_some()` to pick the AWQ-aware
-/// kernel variant. WITHOUT this loader populating the field, every MQ4
-/// weight ends up with `awq_scale: None`, the dispatcher falls through
-/// to the non-AWQ kernel, and the math `(W·s) · (x/s) = W·x` breaks
-/// because the runtime never divides by `s` — observed KLD blowup
-/// 0.6721 → 13.4893 on 0.8B Qwen3.5 before this landed.
-///
-/// Lookup pattern matches `hipfire_runtime::hfq::load_awq_scale`:
-/// strip trailing `.weight`, append `.awq_scale.weight`. Try both the
-/// `model.language_model.`-prefixed name and the bare name (the qwen35
-/// crate uses prefixed names; older sidecars or tests may use either).
-fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<GpuTensor> {
-    let sidecar_name = match name.strip_suffix(".weight") {
-        Some(stem) => format!("{stem}.awq_scale.weight"),
-        None => format!("{name}.awq_scale.weight"),
-    };
-    let (sc_info, sc_data) = hfq.tensor_data_pread(&sidecar_name)?;
-    // Must be 1D F16, length K. quant_type 1 = F16.
-    if sc_info.quant_type != 1 {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} has quant_type={} (expected 1=F16); skipping",
-            sc_info.quant_type
-        );
-        return None;
-    }
-    if sc_info.shape.len() != 1 || sc_info.shape[0] as usize != k {
-        eprintln!(
-            "warning: AWQ sidecar {sidecar_name} shape mismatch ({:?} vs expected [{}]); skipping",
-            sc_info.shape, k
-        );
-        return None;
-    }
-    // F16 → F32 on host so the kernel takes a plain `const float*`.
-    let f32_data: Vec<f32> = sc_data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
-    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
-}
-
 /// TODO(transformer-extraction): cross-arch duplicate of
 /// `hipfire-arch-qwen2::qwen2::load_weight_tensor` — same name-lookup +
 /// pread + AWQ-sidecar pattern, but qwen35 uses the
@@ -1001,12 +955,14 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
         };
         // Phase A Stage A — populate awq_scale when the dtype is on
         // the AWQ allow-list (centralized at `DType::supports_awq_sidecar`).
-        // The pread call invalidates the prior pread_buf borrow, but
-        // the weight bytes have already been uploaded to GPU (owned by
-        // `wt.buf`) so the borrow no longer matters.
+        // `load_awq_scale` reads the sidecar via `tensor_data_vec` (fresh
+        // owned Vec), so it doesn't touch `self.pread_buf` — the prior
+        // pread_buf Ref guard from the weight load above was already
+        // dropped at the end of the `if let` block, and even if it weren't,
+        // the helper wouldn't invalidate it.
         if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
-                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+            wt.awq_scale = load_awq_scale(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale(hfq, gpu, name, k));
         }
         return Ok(wt);
     }
@@ -1017,8 +973,8 @@ fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize) 
             .unwrap_or_else(|| panic!("tensor not found: {name} or {full_name}"));
         let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
         if wt.gpu_dtype.supports_awq_sidecar() {
-            wt.awq_scale = load_awq_scale_for(hfq, gpu, &full_name, k)
-                .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+            wt.awq_scale = load_awq_scale(hfq, gpu, &full_name, k)
+                .or_else(|| load_awq_scale(hfq, gpu, name, k));
         }
         Ok(wt)
     }
@@ -1917,13 +1873,13 @@ pub fn load_weights(hfq: &mut HfqFile, config: &Qwen35Config, gpu: &mut Gpu) -> 
     // attaching a sidecar here would have driven the 0.67 → 13.5 KLD
     // corruption documented at `docs/plans/awq_fix_claude.md` because
     // the spec-verify path used the non-AWQ `rotate_x_mq_batched`.
-    // Try each plausible tensor name; `load_awq_scale_for` returns
+    // Try each plausible tensor name; `load_awq_scale` returns
     // None when no sidecar exists, so this is a no-op for current
     // pre-CUDA-pipeline files.
     if output.gpu_dtype.supports_awq_sidecar() {
-        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
-            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
-            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        output.awq_scale = load_awq_scale(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
         eprintln!("  lm_head AWQ sidecar: {}",
             if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
@@ -2349,9 +2305,9 @@ fn load_output_into(
     // (spec-verify) route through AWQ-aware rotations on
     // `output.awq_scale.is_some()`. No-op on current files.
     if output.gpu_dtype.supports_awq_sidecar() {
-        output.awq_scale = load_awq_scale_for(hfq, gpu, "lm_head.weight", config.dim)
-            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
-            .or_else(|| load_awq_scale_for(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
+        output.awq_scale = load_awq_scale(hfq, gpu, "lm_head.weight", config.dim)
+            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.lm_head.weight", config.dim))
+            .or_else(|| load_awq_scale(hfq, gpu, "model.language_model.embed_tokens.weight", config.dim));
         eprintln!("  lm_head AWQ sidecar: {}",
             if output.awq_scale.is_some() { "attached" } else { "absent (no-op)" });
     }
@@ -5717,6 +5673,10 @@ fn forward_prefill_chunk(
     let mut fa_layer_idx = band.map(|b| b.fa_layer_offset).unwrap_or(0);
 
     for layer_idx in layer_start..layer_end {
+        // Set the MMQ layer counter for per-layer KLD attribution sweeps
+        // (issue #302). No-op outside the sweep — the layer gate is open
+        // by default. Cheap atomic store, runs once per layer.
+        rdna_compute::MMQ_CURRENT_LAYER.store(layer_idx, std::sync::atomic::Ordering::Relaxed);
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
                 // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
