@@ -19,5 +19,5 @@ pub use dispatch::{
     gen_fwht_signs, gemv_dp4a_enabled, has_wmma_f16, DType, Gpu, GpuTensor, LLOYD_MQ4_GROUP_BYTES,
     MMQ_CURRENT_LAYER,
 };
-pub use feature_flags::FeatureFlags;
+pub use feature_flags::{FeatureFlags, Mb4Mode};
 pub use kernels::GEMV_SRC;
