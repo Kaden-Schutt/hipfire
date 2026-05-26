@@ -93,12 +93,15 @@ pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB2_SRC: &str = include_str!("../../.
 /// MQ4G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.hip");
 pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma.gfx1151.hip");
 /// MQ4G256Lloyd WMMA fused QKV (FA preamble: q + k + v, 3-way).
 pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma.hip");
 pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma.gfx1151.hip");
 /// MQ4G256Lloyd WMMA fused gate+up (FFN, 2-way).
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.hip");
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx1151.hip");
 
 /// Phase D-B: 16×64 output tile per WG (4 batch sub-tiles share A_reg decode).
 /// Same shape as `_wmma`; only the per-WG output fanout and grid differ.
@@ -167,7 +170,9 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX1151_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA qkvza: unsupported arch {arch}. The is_batchable_la upstream gate \
@@ -180,7 +185,9 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX1151_SRC, "gemm_qkv_mq4g256_lloyd_wmma_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA qkv: unsupported arch {arch}. The is_batchable_la upstream gate \
@@ -193,7 +200,9 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna4"),
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA gate_up: unsupported arch {arch}. The is_batchable_la upstream gate \
