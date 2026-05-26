@@ -213,7 +213,7 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, 
         ),
     }
 }
-pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq4g256_lloyd_wmma_mb4_rdna3"),
@@ -222,7 +222,7 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'
         ),
     }
 }
-pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_rdna3"),
@@ -238,10 +238,10 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str
 /// chip-agnostic baseline switch-dispatch path. gfx1151 is included for
 /// on-host conformance testing — definitive MQ4-Lloyd perf comparisons happen
 /// on gfx1100 (the format's calibrated target arch).
-pub fn gemv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_mq4g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
     // Same HIPFIRE_LLOYD_FORCE_BASELINE escape hatch as MQ3-Lloyd, so the fast
     // variant can be A/B'd against the baseline on the same model file.
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+    if force_baseline {
         return (GEMV_MQ4G256_LLOYD_SRC, "gemv_mq4g256_lloyd");
     }
     match arch {
@@ -254,8 +254,8 @@ pub fn gemv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
 
 /// Same arch dispatch as `gemv_mq4g256_lloyd_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x).
-pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (GEMV_MQ4G256_LLOYD_RESIDUAL_SRC, "gemv_mq4g256_lloyd_residual");
     }
     match arch {
@@ -267,8 +267,8 @@ pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
 }
 
 /// Arch dispatch for fused gate+up MQ4-Lloyd. Mirrors MQ3-Lloyd's selector.
-pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_GATE_UP_MQ4G256_LLOYD_SRC, "fused_gate_up_mq4g256_lloyd");
     }
     match arch {
@@ -280,8 +280,8 @@ pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
 }
 
 /// Arch dispatch for fused QKVZA MQ4-Lloyd (4-way demux: qkv/z/beta/alpha).
-pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_QKVZA_MQ4G256_LLOYD_SRC, "fused_qkvza_mq4g256_lloyd");
     }
     match arch {
@@ -293,8 +293,8 @@ pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
 }
 
 /// Arch dispatch for fused QKV MQ4-Lloyd (3-way demux: q/k/v).
-pub fn fused_qkv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkv_mq4g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd");
     }
     match arch {
@@ -441,13 +441,13 @@ pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../ker
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
 /// that closes the per-launch perf gap from the divergent-execution switch.
 /// Other archs use the baseline (slower but correct switch-dispatch path).
-pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_mq3g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
     // Debug escape hatch: HIPFIRE_LLOYD_FORCE_BASELINE=1 forces the slow generic
     // switch-dispatch kernel even on RDNA3, so the K4+LDS variant can be
     // logits-Δ'd against the baseline on the same model file. No perf cost when
     // unset (one missed-getenv per dispatch arm), and ensure_kernel short-
     // circuits after the first call regardless.
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+    if force_baseline {
         return (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd");
     }
     match arch {
@@ -469,8 +469,8 @@ pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
 /// Same arch dispatch as `gemv_mq3g256_lloyd_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x). HIPFIRE_LLOYD_FORCE_BASELINE=1 also routes
 /// here to the baseline (for parity-test purposes).
-pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual");
     }
     match arch {
@@ -484,8 +484,8 @@ pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
 /// Arch dispatch for fused gate+up MQ3-Lloyd. Same arch matrix as the GEMV
 /// variants. Used by `qwen35.rs` FFN forward when both `w_gate` and `w_up`
 /// are MQ3G256Lloyd to collapse 2 GEMV launches into 1.
-pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd");
     }
     match arch {
@@ -499,8 +499,8 @@ pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
 /// Arch dispatch for fused QKVZA MQ3-Lloyd. Used by `qwen35.rs` LA decode
 /// when all four projections (wqkv, wz, w_beta, w_alpha) are MQ3G256Lloyd
 /// to collapse 4 GEMV launches into 1.
-pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
     }
     match arch {
@@ -513,8 +513,8 @@ pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
 
 /// Arch dispatch for fused QKV MQ3-Lloyd. Used by `qwen35.rs` FA decode
 /// when wq, wk, wv are all MQ3G256Lloyd to collapse 3 GEMV launches into 1.
-pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str, force_baseline: bool) -> (&'static str, &'static str) {
+    if force_baseline {
         return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
     }
     match arch {
@@ -1473,13 +1473,10 @@ pub const GEMV_HFQ4G256_GFX1030_V5_SRC: &str = include_str!("../../../kernels/sr
 /// On gfx1030/gfx1031 (RDNA2), selects variant via HIPFIRE_RDNA2_VARIANT env var.
 /// Module name is variant-specific so each variant gets its own precompiled .hsaco blob.
 /// The function name inside the .hsaco is always "gemv_hfq4g256" (the extern "C" symbol).
-pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfq4g256_for_arch(arch: &str, rdna2_variant: Option<u32>) -> (&'static str, &'static str) {
     match arch {
         "gfx1030" | "gfx1031" => {
-            let variant: u32 = std::env::var("HIPFIRE_RDNA2_VARIANT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
+            let variant: u32 = rdna2_variant.unwrap_or(1);
             let names = ["", "baseline-rdna2", "high-occupancy", "wide-unroll", "dp4a-packed", "cache-aggressive"];
             let name = names.get(variant as usize).unwrap_or(&"baseline-rdna2");
             eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
