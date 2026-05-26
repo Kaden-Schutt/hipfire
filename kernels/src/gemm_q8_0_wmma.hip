@@ -33,7 +33,13 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
 
-__launch_bounds__(32, 2)
+// Occupancy bump 2026-05-26: was launch_bounds(32, 2) — at 2 waves/CU
+// the kernel was DRAM-latency-bound (profiler measured 7.3 GiB/s vs
+// 211 GB/s peak, 30× below DRAM cap). gfx1151 has 3 SIMDs × 32 waves/SIMD
+// = 96 max waves/CU; this kernel measures 70 VGPRs no spills, fits
+// 8 waves/CU comfortably (72 VGPR allocated, 8 waves × 72 / 3 SIMDs
+// = 192 VGPR/SIMD, well under 1536 cap).
+__launch_bounds__(32, 8)
 extern "C" __global__ void gemm_q8_0_wmma(
     const char*     __restrict__ A_q8,    // [M, K/32 * 34] packed Q8_0
     const _Float16* __restrict__ X,       // [N, K] FP16

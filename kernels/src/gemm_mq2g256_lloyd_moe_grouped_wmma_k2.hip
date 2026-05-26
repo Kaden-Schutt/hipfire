@@ -37,6 +37,11 @@ typedef float __attribute__((ext_vector_type(8))) float8_t;
 // `x_row_div` controls how sorted_slot_index maps to X_src rows:
 //   gate_up: X_src = x_rot_batch[N × K], x_row_div = K_TOP → x_row = flat / K_TOP
 //   down:    X_src = rot_batch[total_slots × K], x_row_div = 1 → x_row = flat
+// Bumping to (32, 8) was measured neutral / slightly worse for this
+// kernel at PP_BATCH=1024 — the Lloyd codebook decode loop is ALU-bound
+// enough that more concurrent waves don't help (vs Q8's simpler dequant
+// where (32, 8) wins +1%). Kept at (32, 2) — see gemm_q8_0_wmma.hip
+// for the contrasting case.
 __launch_bounds__(32, 2)
 extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
     const unsigned long long* __restrict__ expert_weight_ptrs, // [E]
