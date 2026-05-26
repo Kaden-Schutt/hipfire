@@ -106,28 +106,45 @@ extern "C" __global__ __launch_bounds__(512, 1) void deepseek4_attn_swa_batched(
     __syncthreads();
     max_score = warp_scratch[0];
 
-    // Phase 4: parallel exp + DETERMINISTIC serial sum.
+    // Phase 4a: parallel exp into scores_lds.
     //
-    // Earlier this kernel used a __shfl_down warp-reduction (matching the
-    // Phase 3 max-reduce structure). The MAX path is determinstic because
-    // fmaxf returns one of its args exactly; the SUM path is not, because
-    // FP + is order-sensitive. In-kernel bisect (commit 734e371) confirmed
-    // Phase 3 max is bit-exact across twin-runs while Phase 4 sum_exp
-    // differs in ~0.05 % of (h, b) pairs — enough to flip greedy decode
-    // after a couple of sentences.
-    //
-    // Fix: each thread writes its exp into scores_lds; thread 0 then
-    // sums scores_lds[0..n_valid] in serial deterministic order, plus
-    // the attn_sink contribution. Cost is ~n_valid FP adds on lane 0
-    // (~150 ns at n_valid=128), block-level — negligible at GPU scale.
+    // Phase 4 history (determinism + perf, mirrors deepseek4_attn_swa_topk_batched):
+    //   v1: __shfl_down butterfly reduce — non-deterministic FP order (commit 734e371).
+    //   v2: thread-0 serial sum — deterministic, but serializes ~n_valid FP adds.
+    //   v3 (THIS): per-thread slice sum → per-warp __shfl broadcast sum (literal
+    //   src, deterministic — NOT __shfl_down) → cross-warp serial sum on thread 0.
     for (int p = t; p < n_valid; p += blockDim.x) {
         scores_lds[p] = expf(scores_lds[p] - max_score);
     }
     __syncthreads();
+
+    // Phase 4b: per-thread partial sum in fixed stride order.
+    float thread_sum = 0.0f;
+    for (int p = t; p < n_valid; p += blockDim.x) {
+        thread_sum += scores_lds[p];
+    }
+
+    // Phase 4c: warp-wide deterministic sum via __shfl broadcasts in fixed
+    // lane order 0..31. All wave lanes must participate; top-of-kernel
+    // early-return is block-uniform so this holds.
+    const int warp_id4 = t >> 5;
+    const int lane_id4 = t & 31;
+    float ws = 0.0f;
+    #pragma unroll
+    for (int src = 0; src < 32; ++src) {
+        ws += __shfl(thread_sum, src);
+    }
+    if (lane_id4 == 0) {
+        warp_scratch[warp_id4] = ws;
+    }
+    __syncthreads();
+
+    // Phase 4d: thread 0 sums warp partials in fixed warp order + attn_sink.
     if (t == 0) {
         float s = expf(attn_sink[h] - max_score);
-        for (int p = 0; p < n_valid; ++p) {
-            s += scores_lds[p];
+        const int n_warps_p4 = (blockDim.x + 31) >> 5;
+        for (int w = 0; w < n_warps_p4; ++w) {
+            s += warp_scratch[w];
         }
         warp_scratch[0] = s;
     }
