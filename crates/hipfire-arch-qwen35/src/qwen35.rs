@@ -5197,8 +5197,10 @@ pub fn forward_prefill_batch_with_pbs(
 //
 // As of this PR (issue #116 Phase 5): MQ3G256Lloyd is wired through
 // the gemm_*_mq3g256_lloyd_wmma family on gfx11 (always-on) and on
-// gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd / MQ4G256Lloyd
-// remain unwired here — MQ4-Lloyd lands separately in issue #182.
+// gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ4G256Lloyd is wired
+// through the gemm_*_mq4g256_lloyd_wmma family on gfx11 (always-on)
+// and gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd remains
+// unwired — MQ2-Lloyd lands separately.
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(dt,
         DType::MQ4G256 | DType::HFQ4G256
@@ -5281,8 +5283,24 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
+    // Lloyd-MQ4 (MQ4G256Lloyd) on gfx11: shipped as part of issue #182.
+    // Uses the gemm_*_mq4g256_lloyd_wmma family; group stride differs
+    // (160 B Lloyd vs 136 B HFQ4) so dispatch routes through the
+    // Lloyd-specific arms in forward_prefill_chunk.
+    let lloyd_mq4_with_gfx11_wmma = matches!(dt, DType::MQ4G256Lloyd)
+        && matches!(arch,
+            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+        );
+
+    // Lloyd-MQ4 on gfx12 (RDNA4): same opt-in gate as Lloyd-MQ3.
+    let lloyd_mq4_with_gfx12_wmma = matches!(dt, DType::MQ4G256Lloyd)
+        && matches!(arch, "gfx1200" | "gfx1201")
+        && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+
     mq3_uniform_with_wmma || mq3_uniform_with_gfx10_scalar
-        || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma || fp4_with_wmma
+        || lloyd_mq3_with_gfx11_wmma || lloyd_mq3_with_gfx12_wmma
+        || lloyd_mq4_with_gfx11_wmma || lloyd_mq4_with_gfx12_wmma
+        || fp4_with_wmma
 }
 
 fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
