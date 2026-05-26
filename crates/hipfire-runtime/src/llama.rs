@@ -5,6 +5,7 @@
 //! LLaMA model implementation using RDNA GPU compute.
 //! Supports loading from GGUF files and running inference.
 
+use crate::config::RuntimeConfig;
 use crate::gguf::{GgmlType, GgufFile, TensorInfo};
 use crate::multi_gpu::Gpus;
 use hip_bridge::HipResult;
@@ -603,12 +604,11 @@ impl LlamaWeights {
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
 fn paro_small_direct_limit() -> Option<usize> {
-    let raw = std::env::var_os("HIPFIRE_PARO_SMALL_DIRECT")?;
-    let text = raw.to_string_lossy();
-    if text.is_empty() || text == "1" {
+    let raw = RuntimeConfig::get().paro_small_direct?;
+    if raw.is_empty() || raw == "1" {
         return Some(64);
     }
-    text.parse::<usize>().ok()
+    raw.parse::<usize>().ok()
 }
 
 pub fn weight_gemv(
@@ -626,7 +626,7 @@ pub fn weight_gemv(
         DType::Q8HFQ => gpu.gemv_q8hfq(&w.buf, x, y, w.m, w.k, w.row_stride),
         DType::HFQ4G256 => gpu.gemv_hfq4g256(&w.buf, x, y, w.m, w.k),
         DType::HFQ4G128 => gpu.gemv_hfq4g128(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::PARO4G128 if RuntimeConfig::get().paro_prerotate => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -886,9 +886,7 @@ pub fn fused_rmsnorm_rotate_for_paro<'a>(
     // gets for free. Saves ~10µs launch overhead but adds ~30-70µs serial rotate
     // time per call. Net loss on every site. Default OFF; explicit opt-in for
     // research / future-redesign comparison.
-    let opt_in = std::env::var("HIPFIRE_PARO_FUSE_RMSNORM")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let opt_in = RuntimeConfig::get().paro_fuse_rmsnorm;
     if !opt_in {
         return Ok(None);
     }
@@ -1215,7 +1213,7 @@ pub fn weight_gemv_residual(
 ) -> HipResult<()> {
     match w.gpu_dtype {
         DType::HFQ4G256 => gpu.gemv_hfq4g256_residual(&w.buf, x, y, w.m, w.k),
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::PARO4G128 if RuntimeConfig::get().paro_prerotate => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1422,7 +1420,7 @@ pub fn weight_gemv_swiglu_residual(
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
         }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
+        DType::PARO4G128 if RuntimeConfig::get().paro_prerotate => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
                 buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
@@ -1439,7 +1437,7 @@ pub fn weight_gemv_swiglu_residual(
                 w_down.k,
             )
         }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
+        DType::PARO4G128 if RuntimeConfig::get().paro_swiglu_fused => {
             gpu.gemv_paro4g128_swiglu_residual(&w_down.buf, gate, up, x, w_down.m, w_down.k)
         }
         DType::PARO4G128T => {
@@ -1763,9 +1761,8 @@ impl PrefillBatchScratch {
 
         let tile_size = 128usize;
         let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-        let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let batch_mult = RuntimeConfig::get()
+            .flash_partials_batch
             .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
             .unwrap_or(16);
         let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
@@ -1856,7 +1853,7 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback = !RuntimeConfig::get().prefill_batched;
     const MIN_BATCH: usize = 4;
     let arch = gpu.arch.as_str();
     let kv_ok = kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;

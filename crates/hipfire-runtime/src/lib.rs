@@ -15,6 +15,7 @@
 
 pub mod arch;
 pub mod bf16_loader;
+pub mod config;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;

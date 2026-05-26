@@ -18,6 +18,7 @@
 //! `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 8, 0 = disabled) and
 //! `HIPFIRE_NGRAM_WINDOW` (default 256). The threshold is `>=`, not `>`.
 
+use crate::config::RuntimeConfig;
 use std::collections::HashMap;
 
 /// Why the guard signalled a stop.
@@ -40,7 +41,7 @@ pub struct LoopGuard {
 }
 
 impl LoopGuard {
-    /// Construct a guard from environment variables.
+    /// Construct a guard from environment variables (via [`RuntimeConfig`]).
     ///
     /// - `HIPFIRE_NGRAM_LOOP_THRESHOLD` (default 8): a 4-gram count of this
     ///   value or higher inside the window triggers the guard. Set to 0 to
@@ -48,11 +49,8 @@ impl LoopGuard {
     /// - `HIPFIRE_NGRAM_WINDOW` (default 256): how many trailing tokens to
     ///   inspect on each `check` call.
     pub fn from_env() -> Self {
-        let ngram_threshold: usize = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
-        let ngram_window: usize = std::env::var("HIPFIRE_NGRAM_WINDOW")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
-        Self::new(ngram_threshold, ngram_window)
+        let cfg = RuntimeConfig::get();
+        Self::new(cfg.ngram_loop_threshold, cfg.ngram_window)
     }
 
     /// Construct with explicit threshold and window. `threshold = 0` disables

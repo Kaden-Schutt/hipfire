@@ -26,6 +26,7 @@
 //!   equivalent to the reference's cropped draft-KV cache and avoids
 //!   one whole layer of persistence bookkeeping.
 
+use crate::config::RuntimeConfig;
 use crate::hfq::{load_awq_scale, HfqFile};
 use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
@@ -208,7 +209,7 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             //
             // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
             // A/B comparison.
-            let use_f16 = std::env::var("HIPFIRE_DRAFT_F16").ok().as_deref() != Some("0");
+            let use_f16 = RuntimeConfig::get().draft_f16;
             if use_f16 {
                 assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");
                 let buf = gpu.upload_raw(data, &[m * k])?;
@@ -606,12 +607,8 @@ fn gemm_dispatch(
     // Qwen3.5 doesn't call `gpu.gemm_hfq4g256` directly — it uses the
     // fused qkvza / gate_up / residual WMMA variants instead).
     // HIPFIRE_DRAFT_GEMM_DUMP=1: per-call (dtype, M, K, B, us, GB/s) dump for
-    // draft GEMM triage. Cached via OnceLock so the fast path pays a single
-    // atomic load per call rather than an env lookup.
-    static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let dump = *DUMP.get_or_init(|| {
-        std::env::var("HIPFIRE_DRAFT_GEMM_DUMP").ok().as_deref() == Some("1")
-    });
+    // draft GEMM triage.
+    let dump = RuntimeConfig::get().draft_gemm_dump;
     if dump { gpu.hip.device_synchronize()?; }
     let t0 = if dump { Some(std::time::Instant::now()) } else { None };
     let result = match w.gpu_dtype {
@@ -897,7 +894,7 @@ pub fn draft_forward(
     // gemm_gate_up_hfq4g256_wmma kernel (measured 73 µs/call on the same
     // shape in target; vs ksplit's 288 µs/call on a different shape). Or
     // find the real cause of the ksplit slowdown on draft shapes.
-    let dbg = std::env::var("HIPFIRE_DRAFT_SUBPHASE").ok().as_deref() == Some("1");
+    let dbg = RuntimeConfig::get().draft_subphase;
     let mut us_attn_gemm: u128 = 0;
     let mut us_attn_kernel: u128 = 0;
     let mut us_ffn_gemm: u128 = 0;
