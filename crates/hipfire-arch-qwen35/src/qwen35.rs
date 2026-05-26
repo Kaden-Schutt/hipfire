@@ -6166,7 +6166,7 @@ fn forward_prefill_chunk(
     // (silicon-validated on R9700, 2026-05-14, 4/4 unit tests PASS). Each
     // call site below selects the right variant via an `arch.starts_with`
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = rdna_compute::has_wmma_f16(fa_arch) || fa_arch.starts_with("gfx12");
+    let q8_wmma_arch = gpu.flags.has_wmma_f16() || fa_arch.starts_with("gfx12");
     // MQ3 dispatch arch gate (same predicate, separate name for clarity at
     // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
     // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
@@ -7353,7 +7353,7 @@ fn forward_prefill_chunk(
                 // outputs as the Q8/MQ4 paths (dn_qkv_batch, dn_z_batch,
                 // dn_alpha_batch, dn_beta_batch).
                 let is_paro = matches!(layer.wqkv.gpu_dtype, DType::ParoQ4G128);
-                let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
+                let q8_wmma_arch = gpu.flags.has_wmma_f16()
                     || gpu.arch.starts_with("gfx12");
 
                 if is_mq {
@@ -7663,7 +7663,7 @@ fn forward_prefill_chunk(
                 // rotation. Unfused 3-way dispatch (rotate + gemm_hfq4g128
                 // per projection) matches the LA QKVZA Phase 1.5 pattern.
                 let qkv_is_paro = matches!(layer.wq.gpu_dtype, DType::ParoQ4G128);
-                let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str())
+                let q8_wmma_arch = gpu.flags.has_wmma_f16()
                     || gpu.arch.starts_with("gfx12");
                 // Fused QKV requires uniform dtype — see issue #249 for
                 // the dense FA variant. Gate the same way here.
@@ -8182,7 +8182,7 @@ fn run_fa_layer_body(
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_fa3_hfq6 = fa3_same_dtype
         && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+        && gpu.flags.gemv_dp4a_enabled();
     if fused_fa3_mq4 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_qkv_hfq4g256(
@@ -8398,7 +8398,7 @@ fn run_fa_layer_body(
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
         && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-        && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+        && gpu.flags.gemv_dp4a_enabled();
     if fused_gu_mq4 {
         let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_hfq4g256(
@@ -8665,7 +8665,7 @@ fn forward_scratch_layers(
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_la4_hfq6 = la4_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+                    && gpu.flags.gemv_dp4a_enabled();
                 if fused_la4_mq4 {
                     // MQ4: x_rot is Some(rotated x); HF4: x_rot is None and
                     // s.tmp holds the plain rmsnormed x from the fallback path.
@@ -8881,7 +8881,7 @@ fn forward_scratch_layers(
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+                    && gpu.flags.gemv_dp4a_enabled();
                 if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -8997,7 +8997,7 @@ fn forward_scratch_layers(
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+                    && gpu.flags.gemv_dp4a_enabled();
                 if fused_fa3_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -9242,7 +9242,7 @@ fn forward_scratch_layers(
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_gu_hfq6 = same_dtype
                     && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+                    && gpu.flags.gemv_dp4a_enabled();
                 if fused_gu_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
@@ -9516,7 +9516,7 @@ fn forward_scratch_layers(
                 // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
                 let fused_fa3_hfq6 = fa3_same_dtype
                     && (dt == DType::MQ6G256 || dt == DType::HFQ6G256)
-                    && rdna_compute::gemv_dp4a_enabled(&gpu.arch);
+                    && gpu.flags.gemv_dp4a_enabled();
                 if fused_fa3_mq4 {
                     let eff_x = match x_rot {
                         Some(xr) => xr,
