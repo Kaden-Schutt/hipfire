@@ -1058,6 +1058,12 @@ pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
 pub const MOE_UNSCATTER_SILU_CLAMP_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_unscatter_silu_clamp_k8.hip");
 
+/// 4-warp 64×64 Q8 WMMA GEMM for gfx1151 (RDNA3.5). LDS-staged X.
+/// Follows the llama.cpp MMQ pattern (pedapudi #21284) for 4× weight
+/// reuse per block vs the single-warp 16×16 kernel.
+pub const GEMM_Q8_0_WMMA_4W_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma_4w.hip");
+
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
 /// x_residual. No atomic contention (each token's m column is owned by
@@ -2664,6 +2670,15 @@ pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
 /// 64-head reduction in LDS.
 pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
+
+/// Wider-N Q8 WMMA: 16×64 output tile instead of 16×16, 4× weight
+/// reuse per block. Same single-warp wave32 structure as
+/// `gemm_q8_0_wmma`, but each K-step issues 4 back-to-back WMMA tiles
+/// sharing one A (weight) fragment. Lands the structural lever
+/// identified in llama.cpp issue 21284 (pedapudi) — the "wider tile"
+/// gfx1151 prefill optimisation.
+pub const GEMM_Q8_0_WMMA_X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma_x64.hip");
 
 /// SWA ring write — BATCHED (Phase B2, 2026-05-18). Advances the ring
 /// at chunk end to include all B positions. Slot = (start_pos+b) % win.

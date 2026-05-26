@@ -19790,6 +19790,41 @@ impl Gpu {
         let use_legacy = *USE_LEGACY.get_or_init(|| {
             std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1")
         });
+        // 2026-05-26: 4-warp 64×64 WMMA path (gemm_q8_0_wmma_4w). Matches
+        // llama.cpp's gfx1151 MMQ pattern from issue #21284 (mmq_x=48,
+        // mmq_y=64, nwarps=4). LDS-staged X, 4× weight reuse per block
+        // vs the single-warp 16×16 baseline.
+        //
+        // Microbench (bench_q8_wmma_4w, 30 trials, gfx1151):
+        //   M=32768 K=1536 B=1024 (wq_b shape): 30.8ms → 9.3ms = 3.30× faster
+        //   M=4096  K=4096 B=1024:               7.5ms → 3.6ms = 2.09×
+        //   M=4096  K=4096 B=256:                2.1ms → 1.1ms = 1.95×
+        //   M=4096  K=4096 B=64:                 374µs → 450µs = 0.83× (slower)
+        //   M≤1024  B=64:                                       0.27-0.48× (slower)
+        //
+        // Gate: route through 4w when batch_size is large enough to amortize
+        // the 64×64 block tile. Threshold B≥128 keeps the small-batch path
+        // on the single-warp kernel. M%64==0 strictly required by 4w
+        // (kernel ASSERT). When M doesn't divide 64, fall through to the
+        // single-warp variant.
+        //
+        // Set HIPFIRE_Q8_WMMA_4W=0 to opt out (sanity check).
+        let use_4w_default = self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12");
+        let use_4w = match std::env::var("HIPFIRE_Q8_WMMA_4W").as_deref() {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => use_4w_default,
+        };
+        if !use_legacy && use_4w && k % 32 == 0
+            && m % 64 == 0 && n % 64 == 0 && n >= 128
+        {
+            return self.gemm_q8_0_wmma_4w(a_raw, x, y, m, k, n);
+        }
+        if !use_legacy && k % 32 == 0 && n >= 64 && (n % 64 == 0)
+            && std::env::var("HIPFIRE_Q8_WMMA_X64").as_deref() == Ok("1")
+        {
+            return self.gemm_q8_0_wmma_x64(a_raw, x, y, m, k, n);
+        }
         if !use_legacy && self.arch.starts_with("gfx12") && k % 32 == 0 && n > 0 {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
@@ -19804,6 +19839,127 @@ impl Gpu {
             off += take;
         }
         Ok(())
+    }
+
+    /// Wider-N Q8_0 WMMA: 16×64 output tile instead of 16×16. Same
+    /// single-warp wave32 structure as `gemm_q8_0_wmma` but each K-step
+    /// issues 4 back-to-back WMMAs sharing one A fragment against 4
+    /// different B fragments — 4× weight reuse per block.
+    ///
+    /// Caller-checked: K % 32 == 0 AND N % 64 == 0.
+    pub fn gemm_q8_0_wmma_x64(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma_x64: K must be %32");
+        debug_assert_eq!(batch_size % 64, 0, "gemm_q8_0_wmma_x64: N must be %64");
+        self.ensure_kernel(
+            "gemm_q8_0_wmma_x64",
+            kernels::GEMM_Q8_0_WMMA_X64_SRC,
+            "gemm_q8_0_wmma_x64",
+        )?;
+        let xp_owned = x.buf.as_ptr();
+        let mut xp = if matches!(x.dtype, DType::F16) {
+            xp_owned
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+        let mut a_p = a.buf.as_ptr();
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles   = (m + 15) / 16;
+        let batch_tiles = (batch_size + 63) / 64;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_q8_0_wmma_x64", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_wmma_x64",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// 4-warp 64×64 Q8_0 GEMM for gfx1151. Drop-in alternate for
+    /// `gemm_q8_0_wmma`. Requires M % 64 == 0 and N % 64 == 0 (caller
+    /// pads if needed). LDS-staged X cooperative load amortizes weight
+    /// reads across 64 batch positions (vs 16 in the single-warp variant).
+    pub fn gemm_q8_0_wmma_4w(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma_4w: K must be a multiple of 32");
+        debug_assert_eq!(m % 64, 0, "gemm_q8_0_wmma_4w: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(batch_size % 64, 0, "gemm_q8_0_wmma_4w: N must be a multiple of 64 (got {batch_size})");
+        self.ensure_kernel(
+            "gemm_q8_0_wmma_4w",
+            kernels::GEMM_Q8_0_WMMA_4W_SRC,
+            "gemm_q8_0_wmma_4w",
+        )?;
+        // Stage F32 → F16 input if needed.
+        let xp_owned = x.buf.as_ptr();
+        let mut xp = if matches!(x.dtype, DType::F16) {
+            xp_owned
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+
+        let mut a_p = a.buf.as_ptr();
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+        let func = &self.functions["gemm_q8_0_wmma_4w"];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [row_tiles as u32, batch_tiles as u32, 1],
+                [128, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
     }
 
     /// WMMA Q8_0 GEMM (no residual). Y[N, M] = X[N, K] @ A_q8[M, K]^T.
@@ -19824,6 +19980,22 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma: K must be a multiple of 32 (got K={k})");
+
+        // 4-warp 64×64 fast path for gfx1151 (RDNA3.5). Microbench shows
+        // 2.0-3.3× speedup at the actual deepseek4 prefill shapes (M ∈
+        // {1536, 4096, 32768}, B ∈ {256, 1024}) — bench_q8_wmma_4w.
+        // OPT-IN via HIPFIRE_Q8_WMMA_4W=1 — end-to-end auto-enable on
+        // gfx1151 measured a ~15% prefill TPS regression in one bench
+        // run; suspected thermal/cache-pollution interaction with the
+        // surrounding kernels, but unconfirmed.  Default off until the
+        // end-to-end gap is understood (see project_llamacpp_21284
+        // execution memory for the open thread).
+        if m % 64 == 0
+            && batch_size % 64 == 0
+            && std::env::var("HIPFIRE_Q8_WMMA_4W").as_deref() == Ok("1")
+        {
+            return self.gemm_q8_0_wmma_4w(a, x, y, m, k, batch_size);
+        }
 
         // Arch-aware kernel selection. The gfx12-specific intrinsic
         // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` is RDNA4-only;
