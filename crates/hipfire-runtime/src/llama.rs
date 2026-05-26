@@ -2027,31 +2027,17 @@ fn forward_prefill_chunk(
                 kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
             )?;
         } else if max_ctx_len > LDS_CTX_LIMIT {
-            // Long-context Q8 fallback: per-position flash.
-            //
-            // `pbs.positions` was uploaded as raw i32 bits but the dtype is
-            // F32 (slot-cosmetic, see PrefillBatchScratch::new). `download_f32`
-            // would reinterpret those bytes as floats, so positions like 15000
-            // would surface as ~1e-3 subnormals that cast to 0. Reconstruct
-            // from `start_pos + b` directly — the buffer layout is exactly
-            // [start_pos .. start_pos + n] in linear order.
-            let q_dim = config.n_heads * config.head_dim;
-            let pos_buf_tmp = gpu.hip.malloc(4)?;
-            for b in 0..n {
-                let pos_b = start_pos + b;
-                let seq_len_b = pos_b + 1;
-                let pos_i32 = pos_b as i32;
-                gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                gpu.attention_flash_q8_0(
-                    &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                    &out_b, &pos_buf_tmp, seq_len_b,
-                    config.n_heads, config.n_kv_heads, config.head_dim,
-                    kv_cache.physical_cap, &pbs.flash_partials,
-                )?;
-            }
-            let _ = gpu.hip.free(pos_buf_tmp);
+            // Long-context Q8: batched tiled-partials flash, no LDS cap. Was a
+            // per-position loop (one kernel per query) — the batched-masked
+            // kernel stages scores[max_ctx_len] in LDS and overflows ~64 KB
+            // above 16k. This variant keeps LDS at tile_size.
+            gpu.attention_flash_q8_0_batched_masked(
+                &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch, &pbs.positions,
+                config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, max_ctx_len, n, &pbs.flash_partials,
+                None, 0, 0,
+            )?;
         } else {
             gpu.attention_q8_0_kv_batched_masked(
                 &pbs.fa_q_batch,

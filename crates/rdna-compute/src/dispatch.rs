@@ -22718,6 +22718,33 @@ impl Gpu {
         )
     }
 
+    /// Batched, masked, tiled-partials flash attention for Q8_0 KV. No LDS
+    /// cap: replaces the per-position fallback `attention_q8_0_kv_batched_masked`
+    /// degenerated to above 15000 ctx (it staged scores[max_ctx_len] in LDS).
+    /// cos/sin are unused (Q8 K is unrotated) but the shared launcher takes
+    /// them, so q is passed twice as dummies — the kernel never reads them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_batched_masked(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.launch_asym_flash_batched(
+            "attention_flash_q8_0_tile_batched",
+            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            "attention_flash_q8_0_tile_batched",
+            q, k_cache, v_cache, out, positions, q, q,
+            n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+            tree_bias, block_start, block_cols,
+        )
+    }
+
     /// Batched flash attention for fwht3 (K FWHT-rotated 3-bit + V Q8_0).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fwht3_batched(

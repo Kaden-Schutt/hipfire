@@ -6758,31 +6758,16 @@ fn forward_prefill_chunk(
                          at max_ctx_len={} > {}; tree blocks should stay small",
                         max_ctx_len, LDS_CTX_LIMIT,
                     );
-                    // Per-position flash Q8 attention for long-context prefill.
-                    //
-                    // `pbs.positions` is raw i32 bits in an F32 slot
-                    // (slot-cosmetic, see PrefillBatchScratch::new).
-                    // `download_f32` would reinterpret those bytes as floats —
-                    // i32 15000 = 0x3A98 round-trips through f32 as ~1e-3
-                    // subnormal, which casts to 0. Reconstruct from
-                    // start_pos + b directly; the buffer is always linear.
-                    let q_dim = config.n_heads * config.head_dim;
-                    let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = start_pos + b;
-                        let seq_len_b = pos_b + 1;
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim, q_dim);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim, q_dim);
-                        gpu.attention_flash_q8_0(
-                            &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &out_b, &pos_buf_tmp, seq_len_b,
-                            config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.physical_cap, &s.flash_partials,
-                        )?;
-                    }
-                    let _ = gpu.hip.free(pos_buf_tmp);
+                    // Long-context Q8: batched tiled-partials flash, no LDS cap.
+                    // Replaces the per-position loop that ran one kernel per
+                    // query above 15k (scores[max_ctx_len] overflowed LDS).
+                    gpu.attention_flash_q8_0_batched_masked(
+                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch, &pbs.positions,
+                        config.n_heads, config.n_kv_heads, config.head_dim,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        tree_bias, block_start, block_cols,
+                    )?;
                 } else {
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
@@ -7569,25 +7554,15 @@ fn forward_prefill_chunk(
                          at max_ctx_len={} > {}; tree blocks should stay small",
                         max_ctx_len, LDS_CTX_LIMIT,
                     );
-                    // See dense FullAttn branch above for the i32-vs-f32 slot
-                    // rationale; reconstruct positions from start_pos + b.
-                    let q_dim_local = config.n_heads * config.head_dim;
-                    let pos_buf_tmp = gpu.hip.malloc(4)?;
-                    for b in 0..n {
-                        let pos_b = start_pos + b;
-                        let seq_len_b = pos_b + 1;
-                        let pos_i32 = pos_b as i32;
-                        gpu.hip.memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())?;
-                        let q_b = pbs.fa_q_batch.sub_offset(b * q_dim_local, q_dim_local);
-                        let out_b = pbs.fa_attn_out_batch.sub_offset(b * q_dim_local, q_dim_local);
-                        gpu.attention_flash_q8_0(
-                            &q_b, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
-                            &out_b, &pos_buf_tmp, seq_len_b,
-                            config.n_heads, config.n_kv_heads, config.head_dim,
-                            kv_cache.physical_cap, &s.flash_partials,
-                        )?;
-                    }
-                    let _ = gpu.hip.free(pos_buf_tmp);
+                    // Long-context Q8: batched tiled-partials flash, no LDS cap
+                    // (see dense FullAttn branch above).
+                    gpu.attention_flash_q8_0_batched_masked(
+                        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                        &pbs.fa_attn_out_batch, &pbs.positions,
+                        config.n_heads, config.n_kv_heads, config.head_dim,
+                        kv_cache.physical_cap, max_ctx_len, n, &s.flash_partials,
+                        tree_bias, block_start, block_cols,
+                    )?;
                 } else {
                     gpu.attention_q8_0_kv_batched_masked(
                         &pbs.fa_q_batch,
