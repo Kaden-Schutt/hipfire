@@ -1,8 +1,10 @@
 # Decode HIP Graph Capture Design
 
-**Status:** Design (not yet implemented)
-**Date:** 2026-05-26
+**Status:** Phase 1 shipped (2026-05-26). Phases 2-5 deferred.
+**Date:** 2026-05-26 (rev 2026-05-26)
 **Context:** dots.ocr decode profiling on gfx1151 (Strix Halo)
+**Reviews:** gemini (`decode_hip_graph_plan_rev_gemini.md`),
+claude (`decode_hip_graph_plan_rev_claude.md`)
 
 ## Problem
 
@@ -50,14 +52,15 @@ functions per token. Functions marked ❌ use direct `hip.launch_kernel`
 
 | Function | Launches/step | Status | Notes |
 |---|---|---|---|
-| `rmsnorm_f32` | 57 | ✅ | Already uses `launch_maybe_blob` |
-| `gemv_q8_0` | 197 | ✅ | Already uses `launch_maybe_blob` (both wide + narrow) |
-| `add_inplace_f32` | 56 | ✅ | Already uses `launch_maybe_blob` |
-| `silu_mul_f32` | 28 | ✅ | Already uses `launch_maybe_blob` |
-| `attention_flash_gqa` | 56 | ❌ | 2 direct launches (partial + reduce) |
-| `rope_f32` | 28 | ❌ | 1 direct launch |
-| `kv_cache_write` | 56 | ❌ | 1 direct launch |
-| `bias_add_f32` | 84 | ❌ | 1 direct launch |
+| `rmsnorm_f32` | 57 | ✅ | Already used `launch_maybe_blob` |
+| `gemv_q8_0` | 197 | ✅ | Already used `launch_maybe_blob` (both wide + narrow) |
+| `add_inplace_f32` | 56 | ✅ | Already used `launch_maybe_blob` |
+| `silu_mul_f32` | 28 | ✅ | Already used `launch_maybe_blob` |
+| `attention_flash_gqa` | 56 | ✅ **Phase 1** | Converted: partial + reduce |
+| `attention_flash` | 56 | ✅ **Phase 1** | Converted: partial + reduce |
+| `rope_f32` | 28 | ✅ **Phase 1** | Converted |
+| `kv_cache_write` | 56 | ✅ **Phase 1** | Converted |
+| `bias_add_f32` | 84 | ✅ **Phase 1** | Converted |
 | `argmax_f32` | 1 | ❌ | Special: allocs temp buf + sync D2H copy |
 
 **225 launches need conversion** (40% of total). The remaining 342 launches
@@ -172,39 +175,47 @@ via a device buffer (like `pos_buf`), not a scalar kernarg. The kernel
 reads seq_len from the device buffer at launch time. The graph records
 the device buffer pointer; we update the contents before each replay.
 This requires modifying `attention_flash_gqa_partial` to read seq_len
-from a pointer instead of a kernarg.
+from a pointer instead of a kernarg. Effort: ~1 attention kernel arg
+change + a new device buffer in `Qwen2State`.
 
 **Option B: hipGraphExecKernelNodeSetParams.** ROCm supports updating
 individual node parameters on an instantiated graph exec without
 re-capture. This lets us update the seq_len scalar in the attention
-node between replays. Requires node handle tracking.
+node between replays. Requires new FFI bindings in hip-bridge + node
+handle tracking in Gpu. **Not currently bound** in hip-bridge FFI.
 
 **Option C: Re-capture every token.** Defeats the purpose — capture
 overhead would exceed dispatch savings.
 
-**Option D: Re-capture every n_chunks boundary + accept approximate
-seq_len.** The kernel loops to seq_len, but if we capture with a
-slightly larger seq_len (the bucket's maximum), the kernel reads a
-few extra positions from the KV cache. The extra positions contain
-zeros (unwritten cache entries), which contribute near-zero attention
-weight. Quality impact: negligible (zeros → zero attention). This is
-the simplest option.
+**Option D (REJECTED): Over-seq capture.** Capture with `seq_len =
+bucket_end`, rely on zeroed KV cache rows for positions beyond actual
+seq_len. **Mathematically flawed:** zero K rows give dot=0, score=0,
+exp(0-m) ≠ 0. The softmax denominator is inflated by `n_extra ×
+exp(-m)` per extra position, attenuating the output. At typical m ≈ 4
+(standard-normal scaled attention scores over 5000 positions), 127
+extra rows add 127 × exp(-4) ≈ 2.3 to the denominator, corrupting
+the output by ~40-60%. This is not a numerical approximation — it
+produces wrong results that can trigger token attractors within ~10
+tokens. See §Review Assessment for details.
 
-### Recommended approach: Option D (over-seq capture)
+### Recommended approach: Option A (device-side seq_len)
 
-Capture with `seq_len = bucket_end` (e.g., n_chunks × chunk_size) for
-each bucket. The kernel scans a few extra positions (at most chunk_size-1)
-which contain zeroed KV cache rows. Those contribute zero attention weight,
-so output is numerically identical to exact-seq.
+Add a `seq_len_buf: DeviceBuffer` to `Qwen2State` (single i32). Modify
+the attention kernels (`attention_flash_gqa_partial`, `attention_flash`)
+to read `seq_len` from a device pointer instead of a kernarg scalar.
+The graph captures the device pointer; we update `seq_len_buf` contents
+via `memcpy_htod_auto` before each replay.
 
 Advantages:
-- No kernel changes needed
-- Re-use existing capture infrastructure exactly
-- Only ~37 re-captures over 4633 tokens
+- Exact seq_len — no numerical compromise
+- Captures once per n_chunks bucket, replays many times
+- Small kernel change (one arg: `int seq_len` → `const int* seq_len_ptr`)
+- Re-use existing capture infrastructure
 
-Disadvantages:
-- ~3-6% attention compute overhead from scanning extra positions
-  (up to 127 extra out of 5000+ = negligible)
+Cost:
+- One new device buffer (4 bytes) in `Qwen2State`
+- Two attention kernels need a 1-arg signature change
+- Dispatch wrappers pass `seq_len_buf.as_ptr()` instead of `seq_len as i32`
 
 ### Additional mutable arguments
 
@@ -218,16 +229,22 @@ Other kernel arguments that change per token:
 
 ## Implementation Plan
 
-### Phase 1: Convert dispatch functions to launch_maybe_blob
+### Phase 1: Convert dispatch functions to launch_maybe_blob ✅ SHIPPED
 
-Five functions need conversion. Each follows the same pattern as the
-existing `rmsnorm_f32` conversion:
+Converted 5 dispatch functions from direct `hip.launch_kernel` to
+`launch_maybe_blob`. Each follows the same pattern as the existing
+`rmsnorm_f32` conversion.
 
-1. **`rope_f32`** (`dispatch.rs:21046`) — 1 launch, 7 kernargs
-2. **`kv_cache_write`** (`dispatch.rs:24137`) — 1 launch, 4 kernargs
-3. **`bias_add_f32`** (`dispatch.rs:26317`) — 1 launch, 4 kernargs
-4. **`attention_flash_gqa`** (`dispatch.rs:21294`) — 2 launches (partial + reduce)
-5. **`attention_flash`** (`dispatch.rs:21195`) — 2 launches (flash + reduce)
+Functions converted:
+1. **`rope_f32`** — 1 launch, 7 kernargs
+2. **`kv_cache_write`** — 1 launch, 4 kernargs
+3. **`bias_add_f32`** — 1 launch, 4 kernargs
+4. **`attention_flash_gqa`** — 2 launches (partial + reduce)
+5. **`attention_flash`** — 2 launches (partial + reduce)
+
+Validated: identical OCR output and timing on ocr_e2e (2.2 tok/s) with
+both normal path and `HIPFIRE_FORCE_BLOB_PATH=1`. Zero behavior change
+when `capture_mode` is false.
 
 Pattern (example for `bias_add_f32`):
 
@@ -294,23 +311,28 @@ if gpu.decode_has_graph(n_chunks) {
 The argmax stays outside the graph (1 launch, ~100 µs, not worth the
 complexity of pre-allocating a staging buffer).
 
-### Phase 4: Handle seq_len in attention
+### Phase 4: Device-side seq_len for attention
 
-For Option D (over-seq capture), the attention kernels receive
-`seq_len = bucket_end` during capture. On replay, the extra positions
-are zeroed KV cache → zero attention weight → numerically identical.
+Modify the attention kernels to read `seq_len` from a device buffer
+instead of a scalar kernarg:
 
-Need to check: is the KV cache zero-initialized? If not, we need to
-`memset` new cache rows after allocation. Current code in
-`Qwen2State::new` should already zero-init via `gpu.alloc_zeroed_tensor`
-or similar — verify this.
+1. Add `seq_len_buf: DeviceBuffer` (4 bytes) to `Qwen2State::new`
+2. Change `attention_flash_gqa_partial` kernel signature:
+   `int seq_len` → `const int* seq_len_ptr`, kernel reads `*seq_len_ptr`
+3. Same change for `attention_flash` kernel (reduce kernel doesn't use
+   seq_len, no change needed)
+4. Update dispatch wrappers to pass `seq_len_buf.as_ptr()` instead of
+   `seq_len as i32`
+5. Before each graph replay, update via `gpu.memcpy_htod_auto(&state.seq_len_buf, ...)`
 
 ### Phase 5: Correctness + perf validation
 
 1. Run `ocr_e2e` with graph capture enabled, verify identical F1 score
-2. Run coherence-gate on qwen3.5 (existing models) to ensure no regression
+2. Run token-attractor detection on graph-captured decode output
+   (not just F1 — coherence-gate runs qwen35, not qwen2)
 3. Measure decode tok/s: expect ~4× improvement
-4. Benchmark re-capture overhead: should be <1% of total decode time
+4. Benchmark re-capture overhead: ~150ms per bucket (warmup + capture +
+   instantiate), ~37 buckets ≈ 5.5s total over a 260s decode
 
 ## Risks
 
@@ -319,7 +341,95 @@ or similar — verify this.
    configurations. The existing DFlash verify/replay paths have already
    shaken out most of these, but the decode path uses different kernels.
 
-2. **KV cache zero-init assumption.** If the cache isn't zeroed, scanning
+2. **Re-capture stutter.** Each re-capture costs ~150ms (warmup pass +
+   capture pass + instantiate). Over a 4633-token decode, ~37 re-captures
+   produce ~5.5s overhead and visible ~150ms stutters every 128 tokens.
+   Still a massive net win (5.5s vs 260s saved). Background pre-capture
+   of the next bucket could hide this in a future iteration.
+
+3. **Argmax sync bottleneck.** Leaving argmax outside the graph introduces
+   a host-side sync point every token (~0.1ms). This prevents CPU/GPU
+   pipelining but costs only ~4% of the theoretical throughput. Pre-alloc
+   async argmax is a follow-up optimization.
+
+4. **Paged KV cache incompatibility.** This design assumes contiguous KV
+   cache buffers with stable device pointers. A future vLLM-style paged
+   KV cache would break captured graphs (physical addresses change per
+   block allocation). Explicitly out of scope.
+
+## Review Assessment
+
+Two external reviews were solicited. Key findings validated or rejected
+below.
+
+### Claude review — BLOCKER accepted
+
+**Claim:** Option D "zeros → zero attention weight" is mathematically
+false. Zero K rows give dot=0 → score=0 → exp(0-m) ≠ 0, inflating the
+softmax denominator by `n_extra × exp(-m)` per extra position. At
+typical m ≈ 4 (standard-normal scaled scores over 5000 positions),
+127 extra rows add ~2.3 to the denominator — ~40-60% output corruption.
+
+**Verdict: CORRECT.** Verified against the kernel code
+(`attention_flash_gqa.hip:47-48`): `dot += q_head[d] * k_t[d]` with
+zero K gives score=0, and `expf(scores[t] - max_val)` at line 58 gives
+`exp(-m) ≠ 0`. The KV cache IS zero-initialized (`qwen2.rs:612`:
+`gpu.zeros()`), but that's what makes it dangerous — zero K ≠ zero
+attention contribution. **Option D rejected. Design updated to Option A
+(device-side seq_len buffer).**
+
+### Claude review — re-capture cost underestimate accepted
+
+**Claim:** "~5ms/capture, 185ms total" is wrong. Warmup is a full
+forward_step (~75ms) + capture pass (~75ms) + instantiate (~5-50ms).
+Per re-capture: ~155-200ms. Over 37 buckets: ~5.7-7.4s.
+
+**Verdict: CORRECT.** Verified against existing DFlash capture pattern
+in `speculative.rs:692-706`: warmup runs a full forward pass, then
+capture runs another, then instantiate. The plan's "~5ms" was off by
+~30×. Updated estimates in §Risks and §Phase 5. Conclusion still holds
+(5.5s << 260s saved).
+
+### Claude review — coherence gate coverage gap accepted
+
+**Claim:** coherence-gate runs qwen35, not qwen2. Only ocr_e2e (F1)
+exercises the qwen2 forward_step. Need token-attractor detection, not
+just F1.
+
+**Verdict: CORRECT.** Updated §Phase 5 to mandate attractor detection
+on graph output.
+
+### Gemini review — kernarg blob fragmentation rejected
+
+**Claim:** 37 re-captures × 567 blobs per capture creates "thousands of
+small heap allocations" causing memory fragmentation.
+
+**Verdict: OVERBLOWN.** The decode graph cache retains blobs per bucket
+(HashMap entry). Total live memory: 37 entries × 567 blobs × ~100 bytes
+≈ 2 MB of stable, non-churning allocations. jemalloc handles this
+trivially. A `KernargArena` is unnecessary complexity for this scale.
+
+### Gemini review — argmax async recommended
+
+**Claim:** argmax forces host-side sync, preventing pipelining of token
+N's graph replay with token N-1's argmax retrieval.
+
+**Verdict: VALID but not a blocker.** The impact is ~4% of theoretical
+throughput. The existing DFlash paths have the same issue and work fine.
+Recommended as a follow-up, not a prerequisite.
+
+### Gemini review — Option B recommended over re-capture
+
+**Claim:** `hipGraphExecKernelNodeSetParams` is the "production-grade"
+approach; re-capturing 37 times is "infrastructure weakness."
+
+**Verdict: NOT FEASIBLE.** Claude confirmed and I verified:
+`hipGraphExecKernelNodeSetParams` is NOT bound in hip-bridge FFI.
+Implementing it requires new FFI bindings + node handle tracking in Gpu.
+Option A (device-side seq_len) achieves the same goal (no re-capture
+for seq_len changes) with far less infrastructure work — a single
+device buffer and a minor kernel arg change. Option B can be evaluated
+as a follow-up if Option A proves insufficient.
    past the current position reads garbage → corrupted attention. Easy to
    verify and fix (memset on alloc).
 
@@ -355,35 +465,30 @@ Avoids re-capture at n_chunks boundaries but requires:
 - Per-node param updates between replays
 - More complex code for marginal benefit (~37 re-captures)
 
-Deferred. Option D (over-seq) is simpler and sufficient.
+Deferred. Not bound in hip-bridge FFI; Option A (device-side seq_len)
+achieves the same goal with less infrastructure work. Can be revisited
+if per-node updates are needed for other arguments.
 
-### Device-side seq_len buffer
+### Device-side seq_len buffer (now recommended — Option A)
 
-Modify attention kernels to read seq_len from a device pointer instead
-of a kernarg scalar. The device buffer is updated before each replay.
-This gives exact-seq without re-capture. Requires kernel changes to
-all attention variants (flash, gqa, partial, reduce).
-
-Deferred. Option D is simpler and the compute overhead is negligible.
-Could be done as a follow-up if the over-seq approximation ever matters.
+**Adopted.** See §"Recommended approach: Option A" above. The Claude
+review's BLOCKER on Option D (over-seq) made this the simplest correct
+path. Minor kernel change (1 arg: `int seq_len` → `const int* seq_len_ptr`),
+one new device buffer in `Qwen2State`.
 
 ## Estimated Effort
 
-| Phase | Lines changed | Effort |
-|---|---|---|
-| Phase 1: Convert 5 dispatch functions | ~150 | 1-2 hours |
-| Phase 2: Decode graph cache on Gpu | ~100 | 1 hour |
-| Phase 3: forward_step capture/replay | ~80 | 1-2 hours |
-| Phase 4: seq_len handling (Option D) | ~20 | 30 min |
-| Phase 5: Validation | — | 1-2 hours |
-| **Total** | **~350** | **5-8 hours** |
+| Phase | Lines changed | Effort | Status |
+|---|---|---|---|
+| Phase 1: Convert 5 dispatch functions | ~150 | 1-2 hours | ✅ Shipped |
+| Phase 2: Decode graph cache on Gpu | ~100 | 1 hour | Pending |
+| Phase 3: forward_step capture/replay | ~80 | 1-2 hours | Pending |
+| Phase 4: Device-side seq_len (Option A) | ~40 | 1 hour | Pending |
+| Phase 5: Validation | — | 1-2 hours | Pending |
+| **Remaining** | **~220** | **4-7 hours** | |
 
-## Blocked On
+## Next Steps
 
-This work is deferred from the dots.ocr PR to avoid scope creep. It should
-land as a standalone follow-up PR after the OCR text prefill kernel and
-e2e validation are merged.
-
-Prerequisite: the dots.ocr PR must be merged first so that this work can
-be validated against a stable baseline without merge conflicts from the
-prefill kernel wiring.
+Phase 1 shipped in this PR. Phases 2-5 remain for a follow-up PR that
+adds the actual decode graph capture/replay cycle. The prerequisite
+(all dispatch functions using `launch_maybe_blob`) is now complete.
