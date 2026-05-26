@@ -1,4 +1,4 @@
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Mb4Mode {
     Pack1,
     Pack2,
@@ -32,7 +32,7 @@ pub struct FeatureFlags {
     pub mq3_mb4: Option<Mb4Mode>,
     pub hfq4g128_mmq: bool,
     pub gate_up_variant: Option<String>,
-    pub gfx942_gemv_v2: Option<bool>,
+    pub gfx942_gemv_v2: bool,
     pub gfx942_gemv_v3: bool,
     pub gfx942_rmsnorm_split: bool,
     pub gfx942_mfma_prefill: Option<String>,
@@ -140,7 +140,12 @@ impl FeatureFlags {
             mq3_mb4: parse_mb4("HIPFIRE_MQ3_MB4"),
             hfq4g128_mmq: std::env::var("HIPFIRE_HFQ4G128_MMQ").as_deref() != Ok("0"),
             gate_up_variant: std::env::var("HIPFIRE_GATE_UP_VARIANT").ok(),
-            gfx942_gemv_v2: parse_bool("HIPFIRE_GFX942_GEMV_V2"),
+            gfx942_gemv_v2: {
+                let on_gfx942 = matches!(arch, "gfx940" | "gfx941" | "gfx942");
+                if !on_gfx942 { false }
+                else if std::env::var("HIPFIRE_GFX942_GEMV_V2").as_deref() == Ok("0") { false }
+                else { true }
+            },
             gfx942_gemv_v3: std::env::var("HIPFIRE_GFX942_GEMV_V3").map_or(false, |v| v == "1"),
             gfx942_rmsnorm_split: is_gfx942_family
                 && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT").as_deref() != Ok("0"),
