@@ -404,13 +404,15 @@ semantically load-bearing. See:
 
 **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
 ```
-max=120 --no-chatml --kv-mode asym3
+max=256 --no-chatml --kv-mode q8
 PEP-8 strict prompt (\n\n\n between top-level defs)
 prompt_normalize=true (default)
 ```
-Expected: **199 tok/s τ=10.36** on 7900 XTX. ±2% deterministic. Drift >5% from
-this is a regression — start with `git bisect` against this rule, not against
-session-recalled "peak" numbers.
+DFlash perf gates must use `q8` or an FWHT KV mode. Do not use `asym*` KV modes
+for DFlash perf/gate claims; older pre-q8 DFlash perf numbers are historical
+only. Drift >5% from the current q8/max256 baseline is a regression
+— start with `git bisect` against this rule, not against session-recalled
+"peak" numbers.
 
 ## GPU Lock Protocol (Multi-Agent)
 

@@ -27,7 +27,7 @@ OUTPUT_DIR=""
 GPUS=4
 MAX_TOKENS=300
 CTX_CAPACITY=4096
-KV_MODE="asym3"
+KV_MODE="q8"
 DRY_RUN=0
 
 while [[ $# -gt 0 ]]; do

@@ -1,0 +1,432 @@
+warning: variant `SolutionIndex` is never constructed
+  --> crates/hip-bridge/src/rocblas.rs:63:5
+   |
+61 | pub enum RocblasGemmAlgo {
+   |          --------------- variant in this enum
+62 |     Standard = 160,
+63 |     SolutionIndex = 161,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `RocblasGemmAlgo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `fn_create_handle` is never read
+  --> crates/hip-bridge/src/rocblas.rs:73:5
+   |
+69 | pub struct Rocblas {
+   |            ------- field in this struct
+...
+73 |     fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: `hip-bridge` (lib) generated 2 warnings
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:22444:13
+      |
+22444 |         let func = &self.functions["rope_f32"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:25551:13
+      |
+25551 |         let func = &self.functions["kv_cache_write"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:27782:13
+      |
+27782 |         let func = &self.functions["bias_add_f32"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `head_dim`
+     --> crates/rdna-compute/src/dispatch.rs:28780:76
+      |
+28780 |     pub fn precompile_qwen35(&mut self, weight_quant: &str, kv_type: &str, head_dim: usize) -> HipResult<()> {
+      |                                                                            ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_head_dim`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:268:66
+    |
+268 | pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    |                                                                  ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:280:70
+    |
+280 | pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    |                                                                      ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:317:9
+    |
+317 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:332:9
+    |
+332 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:347:9
+    |
+347 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:362:9
+    |
+362 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:549:9
+    |
+549 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:566:9
+    |
+566 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:583:9
+    |
+583 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:599:9
+    |
+599 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:352:5
+    |
+350 | struct RawKernelMeta {
+    |        ------------- field in this struct
+351 |     pgm_rsrc1: u32,
+352 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rdna-compute` (lib) generated 15 warnings (run `cargo fix --lib -p rdna-compute` to apply 14 suggestions)
+warning: unused import: `std::path::Path`
+  --> crates/hipfire-runtime/src/llama.rs:12:5
+   |
+12 | use std::path::Path;
+   |     ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::HashMap`
+ --> crates/hipfire-runtime/src/model_source.rs:8:5
+  |
+8 | use std::collections::HashMap;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `DType`
+  --> crates/hipfire-runtime/src/weight_pager.rs:46:20
+   |
+46 | use rdna_compute::{DType, Gpu, GpuTensor};
+   |                    ^^^^^
+
+warning: unused variable: `index_start`
+   --> crates/hipfire-runtime/src/hfq.rs:120:13
+    |
+120 |         let index_start = metadata_offset;
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_index_start`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:451:27
+    |
+451 |     fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:460:27
+    |
+460 |     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `i`
+    --> crates/hipfire-runtime/src/llama.rs:1561:13
+     |
+1561 |         for i in 0..batch {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:3003:9
+     |
+3003 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:3172:9
+     |
+3172 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `qd`
+   --> crates/hipfire-runtime/src/dflash.rs:775:9
+    |
+775 |     let qd = cfg.q_dim();
+    |         ^^ help: if this is intentional, prefix it with an underscore: `_qd`
+
+warning: field `header_size` is never read
+  --> crates/hipfire-runtime/src/safetensors_source.rs:17:5
+   |
+14 | struct SafetensorsFile {
+   |        --------------- field in this struct
+...
+17 |     header_size: usize,
+   |     ^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-runtime` (lib) generated 11 warnings (run `cargo fix --lib -p hipfire-runtime` to apply 10 suggestions)
+warning: unused import: `Qwen35Config`
+  --> crates/hipfire-arch-qwen35/src/mtp_head.rs:62:21
+   |
+62 | use crate::qwen35::{Qwen35Config, Qwen35Weights};
+   |                     ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `q_dim`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:6835:21
+     |
+6835 |                 let q_dim = config.n_heads * config.head_dim;
+     |                     ^^^^^ help: if this is intentional, prefix it with an underscore: `_q_dim`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8305:9
+     |
+8305 |     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+     |         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: unused variable: `dim`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8738:9
+     |
+8738 |     let dim = config.dim;
+     |         ^^^ help: if this is intentional, prefix it with an underscore: `_dim`
+
+warning: unused variable: `qkv_dim`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8741:9
+     |
+8741 |     let qkv_dim = k_dim * 2 + v_dim;
+     |         ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_qkv_dim`
+
+warning: variable `kv_layer_idx` is assigned to, but never used
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:8746:9
+     |
+8746 |     let mut kv_layer_idx = 0usize;
+     |         ^^^^^^^^^^^^^^^^
+     |
+     = note: consider using `_kv_layer_idx` instead
+
+warning: unused variable: `fused_la4_lloyd_mq4`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:9484:21
+     |
+9484 |                 let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+     |                     ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_la4_lloyd_mq4`
+
+warning: value assigned to `kv_layer_idx` is never read
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:9452:17
+     |
+9452 |                 kv_layer_idx += 1;
+     |                 ^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `kv_layer_idx` is never read
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:9878:17
+     |
+9878 |                 kv_layer_idx += 1;
+     |                 ^^^^^^^^^^^^^^^^^
+     |
+     = help: maybe it is overwritten before being read?
+
+warning: unused variable: `fused_la4_lloyd_mq4`
+    --> crates/hipfire-arch-qwen35/src/qwen35.rs:9977:25
+     |
+9977 |                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+     |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_la4_lloyd_mq4`
+
+warning: unused variable: `fused_gu_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:10101:25
+      |
+10101 |                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_gu_lloyd_mq4`
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:10171:25
+      |
+10171 |                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: unused variable: `fused_gu_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:10351:25
+      |
+10351 |                     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_gu_lloyd_mq4`
+
+warning: unused variable: `fused_la4_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:10422:25
+      |
+10422 |                     let fused_la4_lloyd_mq4 = la4_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_la4_lloyd_mq4`
+
+warning: unused variable: `fused_fa3_lloyd_mq4`
+     --> crates/hipfire-arch-qwen35/src/qwen35.rs:10561:25
+      |
+10561 |                     let fused_fa3_lloyd_mq4 = fa3_same_dtype && dt == DType::MQ4G256Lloyd;
+      |                         ^^^^^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_fused_fa3_lloyd_mq4`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-arch-qwen35/src/speculative.rs:2551:9
+     |
+2551 |     let mut t_phase = t_spec_start;
+     |         ----^^^^^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `kv_dim`
+   --> crates/hipfire-arch-qwen35/src/mtp_head.rs:957:9
+    |
+957 |     let kv_dim = cfg.head_dim * cfg.n_head_kv;
+    |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_kv_dim`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-arch-qwen35/src/mtp_spec.rs:1395:9
+     |
+1395 |     let mut draft_logits_host: Vec<f32> = if use_sampling {
+     |         ----^^^^^^^^^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: function `load_norm_weight_raw` is never used
+   --> crates/hipfire-arch-qwen35/src/qwen35.rs:942:4
+    |
+942 | fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    |    ^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-arch-qwen35` (lib) generated 19 warnings (run `cargo fix --lib -p hipfire-arch-qwen35` to apply 15 suggestions)
+warning: unused macro definition: `probe`
+    --> crates/hipfire-arch-dots-ocr/src/dots_ocr.rs:1000:18
+     |
+1000 |     macro_rules! probe {
+     |                  ^^^^^
+     |
+     = note: `#[warn(unused_macros)]` (part of `#[warn(unused)]`) on by default
+
+warning: `hipfire-arch-dots-ocr` (lib) generated 1 warning
+   Compiling hipfire-runtime v0.2.0 (/home/kaden/hipfire/.worktrees/pr319-forward-train-6126d41d/crates/hipfire-runtime)
+    Finished `release` profile [optimized] target(s) in 0.66s
+     Running `target/release/examples/mtp_only_demo --target /home/kaden/.hipfire/models/qwen3.5-9b.mq4 --mtp-head /home/kaden/.hipfire/models/qwen3.5-9b.mtp --prompt-file benchmarks/prompts/lru_cache_pep8_strict.txt --max 64 --ctx 1024 --kv-mode q8 --no-chatml`
+=== mtp_only_demo ===
+target:     /home/kaden/.hipfire/models/qwen3.5-9b.mq4
+mtp-head:   /home/kaden/.hipfire/models/qwen3.5-9b.mtp
+prompt md5: 1e74f17934fe759468dbe1471b732067
+max=64 ctx=1024 max_n=4 chatml=false
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+gpu: gfx1151
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+    (Q8_0 raw, 1080 MB)
+  loading output_norm...
+  loading output (separate lm_head, qt=13)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/32 (LinearAttention)...
+  loading layer 1/32 (LinearAttention)...
+  loading layer 2/32 (LinearAttention)...
+  loading layer 3/32 (FullAttention)...
+  loading layer 4/32 (LinearAttention)...
+  loading layer 5/32 (LinearAttention)...
+  loading layer 6/32 (LinearAttention)...
+  loading layer 7/32 (FullAttention)...
+  loading layer 8/32 (LinearAttention)...
+  loading layer 9/32 (LinearAttention)...
+  loading layer 10/32 (LinearAttention)...
+  loading layer 11/32 (FullAttention)...
+  loading layer 12/32 (LinearAttention)...
+  loading layer 13/32 (LinearAttention)...
+  loading layer 14/32 (LinearAttention)...
+  loading layer 15/32 (FullAttention)...
+  loading layer 16/32 (LinearAttention)...
+  loading layer 17/32 (LinearAttention)...
+  loading layer 18/32 (LinearAttention)...
+  loading layer 19/32 (FullAttention)...
+  loading layer 20/32 (LinearAttention)...
+  loading layer 21/32 (LinearAttention)...
+  loading layer 22/32 (LinearAttention)...
+  loading layer 23/32 (FullAttention)...
+  loading layer 24/32 (LinearAttention)...
+  loading layer 25/32 (LinearAttention)...
+  loading layer 26/32 (LinearAttention)...
+  loading layer 27/32 (FullAttention)...
+  loading layer 28/32 (LinearAttention)...
+  loading layer 29/32 (LinearAttention)...
+  loading layer 30/32 (LinearAttention)...
+  loading layer 31/32 (FullAttention)...
+KV cache: q8 (8/32 layers carry KV, others placeholder)
+trunk loaded in 4.88s
+mtp head loaded in 0.10s (standalone .mtp) — n_embd=4096 vocab=248320 n_rot=64 rope_theta=10000000 compressed_lm_head_draft=false
+prompt: 232 tokens (no chatml)
+mtp-head kv-mode: Q8
+prefilling 232 tokens (batched)...
+prefill: 0.01s (28025.2 tok/s)
+seed token (greedy after prefill): 260 ('        ')
+
+=== output ===
+         if key in self.cache:
+             node = self.cache[key]
+             self._remove(node)
+             self._add_to_front(node)
+             return node.value
+         return -1
+
+     def put(self, key: int, value: int) -> None:
+         if key in self
+=== end ===
+
+prompt_md5:           1e74f17934fe759468dbe1471b732067
+prompt_tokens:        232
+max_n:                4
+cycles:               31
+replay_skipped:       0 cycles (0.0%)
+committed_total:      64
+committed_seed:       1
+committed_per_cycle_avg: 2.0323
+accepted_mtp_total:   32
+bonus_total:          31
+tau:                  2.0323
+prefill_secs:         0.008
+prefill_tok_s:        28025.23
+decode_secs:          2.507
+tok_s:                25.53
+eos_hit:              n
+preview_200:          "         if key in self.cache:\n             node = self.cache[key]\n             self._remove(node)\n             self._add_to_front(node)\n             return node.value\n         return -1\n\n     def put"

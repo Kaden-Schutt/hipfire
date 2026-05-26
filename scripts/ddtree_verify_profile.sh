@@ -56,7 +56,7 @@ run_one() {
         HIPFIRE_HOST_TIMING=1 "$EXE" \
             --target "$TARGET_27B" --draft "$DRAFT_27B" \
             --prompt "$CODE_PROMPT" --max "$MAX_TOKENS" --ctx 2048 \
-            --kv-mode asym3 --no-chatml \
+            --kv-mode q8 --no-chatml \
             --ddtree-batched --ddtree-budget "$budget" --ddtree-topk "$topk" 2>&1 | \
             grep -aE '^(emitted:|cycles:|host timing|  launch=|  ssync=|τ=|accept_rate)'
     done

@@ -1,0 +1,131 @@
+bun test v1.3.5 (1e86cebd)
+
+cli/parse_tool_calls.test.ts:
+(pass) strict OpenAI form parses without repair flag [1.00ms]
+(pass) zero-arg tool call passes through with empty args
+(pass) flat form (sibling args, no `arguments` wrapper) is repaired
+(pass) flat form with extra metadata keys (id, type) drops them
+(pass) XML-corruption form <plain>NAME</param> {ARGS} is repaired
+(pass) XML <function=NAME> variant is repaired
+(pass) XML form with unparseable JSON tail emits empty args, preserves name
+(pass) totally unparseable garbage returns null
+(pass) nested arguments object survives extraction with strings containing braces
+(pass) escaped quotes inside JSON strings are handled
+(pass) nested <tool_call> opener is stripped, payload still parses (#111) [1.00ms]
+(pass) multiple nested <tool_call> openers all get stripped (#111)
+(pass) no nested opener leaves payload unmodified (#111)
+(pass) nested openers with empty body returns null (no false-positive call)
+(pass) Qwen3.6 native <function=NAME>...<parameter=K>V</parameter>...</function> shape
+(pass) Qwen3.6 XML coerces typed parameter values (numbers / bool / null / json)
+(pass) Qwen3.6 XML with zero parameters (no-arg call)
+(pass) <function=NAME>{JSON} (MQ4 corruption shape) still parses via probe-(2)
+
+cli/chat_pure.test.ts:
+(pass) graphemes > empty string returns empty array
+(pass) graphemes > ASCII splits one char per grapheme
+(pass) graphemes > non-BMP emoji is one grapheme, not two surrogates
+(pass) graphemes > CJK characters are one grapheme each
+(pass) graphemes > ZWJ-joined family emoji is a single grapheme (Intl.Segmenter only)
+(pass) graphemes > combining marks attach to base character
+(pass) sanitizePaste > pure ASCII passes through
+(pass) sanitizePaste > preserves \n and \t
+(pass) sanitizePaste > strips NUL byte
+(pass) sanitizePaste > strips BEL
+(pass) sanitizePaste > strips embedded ANSI escape sequences (the actual bug it fixes)
+(pass) sanitizePaste > preserves Unicode (multi-byte chars are >= 0x20)
+(pass) estimateTokens > empty string returns 0
+(pass) estimateTokens > short string rounds up
+(pass) estimateTokens > scales linearly with length
+(pass) computeTokPerSec > empty array returns 0
+(pass) computeTokPerSec > single sample returns 0 (no time span)
+(pass) computeTokPerSec > two samples 1s apart yields 2 tok/s
+(pass) computeTokPerSec > ten samples over 1s yields 10 tok/s
+(pass) computeTokPerSec > zero-span samples (all at same time) return 0
+(pass) trimTokenWindow > removes entries older than windowMs
+(pass) trimTokenWindow > keeps everything if all in window
+(pass) trimTokenWindow > handles empty array
+(pass) trimTokenWindow > default window is 2000ms
+(pass) trimTokenWindow > per-turn reset use case: stale entries from previous turn cleared
+(pass) trimMessages > no trim needed when under target
+(pass) trimMessages > preserves leading system message (regression: original /trim ate it) [1.00ms]
+(pass) trimMessages > system message NOT at index 0 is treated like a normal message
+(pass) trimMessages > always keeps at least one message after the system slot
+(pass) trimMessages > custom targetPct trims more aggressively
+(pass) trimMessages > invalid targetPct (NaN) falls back to 0.5
+(pass) stripAnsi > plain text passes through unchanged
+(pass) stripAnsi > empty string
+(pass) stripAnsi > strips simple SGR (bold)
+(pass) stripAnsi > strips compound SGR (bold+cyan)
+(pass) stripAnsi > strips reverse video
+(pass) stripAnsi > strips dim + italic
+(pass) stripAnsi > strips OSC 8 hyperlink (ST = ESC \)
+(pass) stripAnsi > strips OSC 8 hyperlink with BEL terminator
+(pass) stripAnsi > strips clear-to-EOL CSI
+(pass) stripAnsi > strips cursor positioning CSI [1.00ms]
+(pass) stripAnsi > strips private-mode set/reset (e.g. cursor hide)
+(pass) stripAnsi > preserves Unicode and tabs/newlines
+(pass) stripAnsi > strips full markdown-rendered output (real-world fragment)
+(pass) stripAnsi > strips a complete markdown link (OSC 8 + underline + dim parens)
+(pass) renderMarkdown > plain text passes through unchanged
+(pass) renderMarkdown > inline code is wrapped in inverse-video SGR
+(pass) renderMarkdown > bold is wrapped in bold SGR
+(pass) renderMarkdown > italic single-asterisk wrapped in italic SGR
+(pass) renderMarkdown > double asterisk does NOT match italic (must stay bold)
+(pass) renderMarkdown > fenced code block with language label
+(pass) renderMarkdown > fenced code block without language label
+(pass) renderMarkdown > fenceWidth controls border length
+(pass) renderMarkdown > incomplete fence (no closing) is left raw — important for streaming
+(pass) renderMarkdown > incomplete inline code is left raw
+(pass) renderMarkdown > multiple inline codes on one line
+(pass) renderMarkdown > # heading is bold + cyan
+(pass) renderMarkdown > ## heading is bold
+(pass) renderMarkdown > ### heading is dim-bold
+(pass) renderMarkdown > heading regex anchored to start of line — '#' mid-text untouched
+(pass) renderMarkdown > heading without space after # is not transformed
+(pass) renderMarkdown > heading with inline code styles both
+(pass) renderMarkdown > bullet list with - dims the bullet, replaces with •
+(pass) renderMarkdown > bullet list with * dims the bullet
+(pass) renderMarkdown > bullet list preserves indentation (nested lists)
+(pass) renderMarkdown > dash mid-text is NOT a bullet
+(pass) renderMarkdown > numbered list dims the number + period
+(pass) renderMarkdown > numbered list with multi-digit number
+(pass) renderMarkdown > numbered list preserves indentation
+(pass) renderMarkdown > digit + period mid-text is NOT a numbered list
+(pass) renderMarkdown > block quote dims the > and italicizes the body
+(pass) renderMarkdown > > mid-text is NOT a block quote
+(pass) renderMarkdown > markdown link emits OSC 8 hyperlink + underline + dim raw URL
+(pass) renderMarkdown > bare URL gets OSC 8 + underline
+(pass) renderMarkdown > bare URL stops at trailing whitespace, not at fragment chars
+(pass) renderMarkdown > URL inside markdown link is NOT double-wrapped as bare URL
+(pass) renderMarkdown > file:// URL is supported
+(pass) detectFenceLine > plain text outside fence is not detected
+(pass) detectFenceLine > ```python opens a fence with language [1.00ms]
+(pass) detectFenceLine > ``` (no lang) opens with empty lang
+(pass) detectFenceLine > ``` while inside fence closes it
+(pass) detectFenceLine > ```rust while inside fence still treated as close (no nesting)
+(pass) detectFenceLine > indented ``` opens a fence (LLMs sometimes indent)
+(pass) detectFenceLine > body line that starts with backtick but not ``` is not a fence
+(pass) renderFenceOpen / renderFenceClose > renderFenceOpen with language emits border + label
+(pass) renderFenceOpen / renderFenceClose > renderFenceOpen without language uses [code]
+(pass) renderFenceOpen / renderFenceClose > renderFenceClose emits just the dim border
+(pass) renderFenceOpen / renderFenceClose > fenceWidth controls border length
+(pass) feedPasteParser (bracketed paste state machine) > non-paste input passes through
+(pass) feedPasteParser (bracketed paste state machine) > complete paste in single chunk extracts content
+(pass) feedPasteParser (bracketed paste state machine) > paste split across two chunks: start-only
+(pass) feedPasteParser (bracketed paste state machine) > paste split across three chunks (mid-content)
+(pass) feedPasteParser (bracketed paste state machine) > CRLF is normalized to LF
+(pass) feedPasteParser (bracketed paste state machine) > embedded control bytes are sanitized
+(pass) feedPasteParser (bracketed paste state machine) > non-paste chunk while in-paste is buffered, not passed through
+(pass) feedPasteParser (bracketed paste state machine) > paste containing tabs preserves them
+(pass) history navigation with draft preservation > up-arrow on empty history is a no-op
+(pass) history navigation with draft preservation > up-arrow recalls last entry, saves draft
+(pass) history navigation with draft preservation > down-arrow back to bottom restores the draft (regression: original lost it)
+(pass) history navigation with draft preservation > up-arrow at oldest entry stays put
+(pass) history navigation with draft preservation > down-arrow at bottom is a no-op
+(pass) history navigation with draft preservation > submit appends to history and resets navigation
+(pass) history navigation with draft preservation > draft is preserved across multiple ups but cleared on submit
+
+ 121 pass
+ 0 fail
+ 211 expect() calls
+Ran 121 tests across 2 files. [37.00ms]

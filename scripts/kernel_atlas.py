@@ -261,6 +261,13 @@ def infer_attention_route(kv_mode, env):
             "flash_requested": flash_requested,
             "route_confidence": "static_kv_policy",
         }
+    if kv in ("fwht2", "fwht3", "fwht4"):
+        return {
+            "attention_impl": f"attention_flash_{kv}",
+            "flash_active": True,
+            "flash_requested": flash_requested,
+            "route_confidence": "static_kv_policy",
+        }
     if kv == "q8":
         if flash_requested == "always":
             return {
@@ -3138,6 +3145,10 @@ def collect_ar(args):
 
 
 def collect_dflash(args):
+    kv_mode = str(args.kv_mode).strip().lower()
+    if kv_mode not in ("q8", "fwht2", "fwht3", "fwht4"):
+        print("collect-dflash: DFlash perf collection requires --kv-mode q8|fwht2|fwht3|fwht4", file=sys.stderr)
+        return 2
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     diff_text = git_diff_text()
     dirty = git_is_dirty(diff_text)
@@ -3500,7 +3511,7 @@ def build_parser():
     df.add_argument("--max-tokens", type=int, default=256)
     df.add_argument("--ctx", type=int, default=2048)
     df.add_argument("--runs", type=int, default=1)
-    df.add_argument("--kv-mode", default="asym3")
+    df.add_argument("--kv-mode", default="q8", help="DFlash KV mode; use q8 or fwht*, not asym* for perf gates")
     df.add_argument("--dpm-warmup-secs", default="10")
     df.add_argument("--no-chatml", action="store_true", default=True)
     df.add_argument("--chatml", action="store_false", dest="no_chatml")

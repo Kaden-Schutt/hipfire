@@ -31,13 +31,16 @@ def main():
     ap.add_argument("--max", type=int, default=128, help="max tokens per prompt")
     ap.add_argument("--ctx", type=int, default=2048)
     ap.add_argument("--n", type=int, default=33, help="sample size (0..164)")
-    ap.add_argument("--kv-mode", default="q8", help="q8 | asym3 | asym4 | asym2")
+    ap.add_argument("--kv-mode", default="q8", help="q8 | fwht4 | fwht3 | fwht2")
     ap.add_argument("--ar", action="store_true", help="AR baseline mode (passes --ar-baseline; no spec decode)")
     ap.add_argument("--ddtree-batched", action="store_true", help="enable --ddtree-batched")
     ap.add_argument("--ddtree-budget", type=int, default=None)
     ap.add_argument("--ddtree-topk", type=int, default=None)
-    ap.add_argument("--label", default="", help="label printed in the summary (e.g. 'linear-asym3')")
+    ap.add_argument("--label", default="", help="label printed in the summary (e.g. 'linear-q8')")
     args = ap.parse_args()
+    if args.kv_mode.lower() not in ("q8", "fwht4", "fwht3", "fwht2"):
+        print("--kv-mode must be q8, fwht4, fwht3, or fwht2 for DFlash perf runs", file=sys.stderr)
+        sys.exit(2)
     if args.ar and (args.ddtree_batched or args.ddtree_budget is not None or args.ddtree_topk is not None):
         print("--ar is incompatible with --ddtree-* flags", file=sys.stderr); sys.exit(2)
 
