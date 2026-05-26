@@ -8,6 +8,7 @@ mod compiler;
 mod dispatch;
 mod kernels;
 pub mod arch_caps;
+pub mod feature_flags;
 pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
@@ -18,4 +19,5 @@ pub use dispatch::{
     gen_fwht_signs, gemv_dp4a_enabled, has_wmma_f16, DType, Gpu, GpuTensor, LLOYD_MQ4_GROUP_BYTES,
     MMQ_CURRENT_LAYER,
 };
+pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;
