@@ -246,10 +246,16 @@ fn hfq3_mmq_layer_gate_pass() -> bool {
     true
 }
 
-/// Whether to route HFQ3 residual through the experimental wave32 MMQ
-/// kernel (`gemm_hfq3g256_residual_mmq`). Phase 3 minimal probe. Same
-/// gfx10 sdot4 arch set as `hfq3_dp4a_enabled`. Gated by
-/// `HIPFIRE_HFQ3_MMQ=1`.
+/// Whether to route HFQ3 prefill projections through the wave32 MMQ
+/// family on gfx10 sdot4 archs. **Default-ON** as of the issue-#300 MQ3
+/// gate removal — mirrors the HFQ4 sibling [`hfq4_mmq_rdna2_enabled`].
+///
+/// Was gated behind `HIPFIRE_HFQ3_MMQ=1` over the issue-#302 +19% KLD
+/// concern, but that was on a raw/uncalibrated MQ3. On the production
+/// AWQ+GPTQ recipe the kernel-precision delta is absorbed: gfx1031 9B
+/// MQ3 eval_hipfire n=50 Q8-KV prefill, MMQ vs dot2 = KLD 0.2226 vs
+/// 0.2227 (−0.06%), PPL +0.09% — dead in the noise. +213% prefill
+/// (214→669 tok/s pp128). `HIPFIRE_HFQ3_MMQ=0` keeps the dot2 fallback.
 fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -259,7 +265,8 @@ fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
             _ => None,
         })
     });
-    if !override_.unwrap_or(false) {
+    // Default-on: env unset → enabled on the allowlist; explicit =0 disables.
+    if !override_.unwrap_or(true) {
         return false;
     }
     hfq3_sdot4_gfx10_enabled(arch)
@@ -7138,7 +7145,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1.
+        // Phase 3 MMQ (auto-tile-selecting). Default-on for gfx10 sdot4 archs
+        // (issue #300 MQ3 gate removal; escape hatch HIPFIRE_HFQ3_MMQ=0).
         // Auto-selector falls back to dot2 at small batch. Layer-gate
         // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
         // per-layer KLD attribution sweeps (#302).
@@ -7875,8 +7883,9 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 experimental: MMQ family (auto-tile-selecting). Fires only
-        // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
+        // Phase 3 MMQ family (auto-tile-selecting). Default-on for gfx10
+        // sdot4 archs (issue #300, escape hatch HIPFIRE_HFQ3_MMQ=0) when
+        // q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
         // safe at any batch_size. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
