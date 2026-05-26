@@ -6,6 +6,7 @@
 //! Manages compiled kernels, provides typed tensor operations.
 
 use crate::compiler::KernelCompiler;
+use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::cell::Cell;
@@ -760,6 +761,7 @@ pub trait ActivationCapture: Send + Sync {
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
+    pub flags: Arc<FeatureFlags>,
     pub device_id: i32,
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
@@ -834,14 +836,6 @@ pub struct Gpu {
     /// Diagnostic: when true, `launch_maybe_blob` takes the blob path even when
     /// `capture_mode=false`. Isolates "blob-vs-kernelParams path" bugs without
     /// the rest of the graph-capture machinery (stream capture, staging, etc).
-    /// Set via `HIPFIRE_BLOB_FORCE=1` at init. Blobs accumulate unbounded in
-    /// `capture_blobs` while set — only intended for short diagnostic runs.
-    pub force_blob_path: bool,
-    /// Diagnostic: when true, gfx906 MMQ residual quantizes X to Q8_1 then
-    /// returns FP16 wave64 instead of running dp4a — isolates the cost of
-    /// the activation pre-quantize pass. Read once via `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1`
-    /// at init so the per-call hot path doesn't hit `env::var`'s global lock.
-    pub mmq_diag_quantize_only: bool,
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
@@ -1058,33 +1052,19 @@ impl Gpu {
         }
         eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
 
+        let flags = Arc::new(FeatureFlags::from_env(&arch));
+
         let compiler = KernelCompiler::new(&arch)?;
 
         LAST_BOUND_DEVICE.with(|c| c.set(id));
 
-        // Per-arch defaults for MMQ screening. See the mmq_screen and
-        // mmq_screen_threshold fields below for rationale.
-        //
-        // gfx906 was previously default-on out of caution because the MMQ
-        // kernels were ported from the gfx11xx i8-WMMA path that motivated
-        // #87, but gfx906 uses dp4a (`__builtin_amdgcn_sdot4`), not WMMA,
-        // and empirically tolerates the row-3994 weight outliers within the
-        // 0.50 threshold. Audit on 2026-05-18 across qwen3.5-{0.8B, 9B} mq4
-        // (AWQ + non-AWQ) showed 0/248 weights flagged at threshold 0.50 —
-        // the screen reference dispatch (~700 µs/weight via
-        // `gemm_hfq4g256_residual_fp16_wave64`) was pure overhead, costing
-        // ~145 ms on the first prefill. Users on new quant formats can
-        // re-enable defensively via `HIPFIRE_MMQ_SCREEN=1`.
-        //
-        // RDNA3/3.5: unchanged behavior. Already default-off here; clients
-        // that need #87 protection (daemon callers loading on i8-WMMA archs)
-        // explicitly pass `mmq_screen: true` at load time.
-        let mmq_screen_default: bool = false;
-        let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
+        let mmq_screen = flags.mmq_screen;
+        let mmq_screen_threshold = flags.mmq_screen_threshold;
 
         Ok(Self {
             hip,
             arch,
+            flags,
             device_id: id,
             compiler,
             modules: HashMap::new(),
@@ -1110,34 +1090,9 @@ impl Gpu {
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
-            // Per-arch default for MMQ per-weight screening:
-            //   gfx906: on (paired with the 0.50 threshold default below).
-            //     Acts as a regression safety net; expected to reject 0
-            //     weights at 0.50 threshold but catches future distribution
-            //     issues. Cached per weight pointer, so cost is amortized.
-            //   other archs: off — preserves prior behavior; flip only after
-            //     similar validation.
-            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
-                .map(|v| v == "1")
-                .unwrap_or(mmq_screen_default),
-            // Default screening threshold: 0.10 absolute error per row,
-            // measured against synthetic uniform [-2, 2] activations.
-            // The 0.10 default was set when the gfx906 dp4a kernel was
-            // buggy (commit 8081822); the post-redesign kernel (commit
-            // c022682) is structurally cleaner and the same prompts pass
-            // coherence at 0.50. Bumping the gfx906 default to 0.50
-            // recovers the 30/72 weights that get rejected per Qwen 9B
-            // load (mostly row 3994 of m=4096 matrices, a known
-            // degenerate quant group). pp128 lifts 355 → 462 tok/s
-            // (1.30×) at threshold=0.50 with no coherence regression
-            // across all 4 mq4 rows of the gate. Other archs keep the
-            // conservative 0.10 default until similar validation.
-            mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
-                .ok().and_then(|s| s.parse().ok())
-                .unwrap_or(mmq_screen_threshold_default),
+            mmq_screen,
+            mmq_screen_threshold,
             capture_mode: false,
-            force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
-            mmq_diag_quantize_only: std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
@@ -1154,7 +1109,7 @@ impl Gpu {
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
         }).map(|mut gpu| {
-            if gpu.force_blob_path {
+            if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
@@ -1175,7 +1130,7 @@ impl Gpu {
         self.bind_thread_or_warn();
         if self.rocblas.is_some() { return; }
         let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let all_archs = std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1");
+        let all_archs = self.flags.rocblas_all_archs;
         if !cdna3 && !all_archs { return; }
         match Rocblas::load() {
             Ok(rb) => {
@@ -1576,7 +1531,7 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.capture_mode || self.force_blob_path {
+        if self.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
             // Pad tail to 16-byte alignment — some kernel struct layouts that
             // HIP's loader expects have an implicit final pad to the struct's
@@ -15962,7 +15917,7 @@ impl Gpu {
         // *after* paying the quantize cost. The flag is read once at init
         // (see `Gpu::new`) so this check is a single bool load, not a
         // per-call env::var lookup.
-        if self.mmq_diag_quantize_only {
+        if self.flags.mmq_diag_quantize_only {
             let _ = x_q8_ptr;
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
