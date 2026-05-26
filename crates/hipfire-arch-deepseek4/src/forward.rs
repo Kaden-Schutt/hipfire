@@ -6491,19 +6491,29 @@ fn ffn_batched(
             .map_err(|e| format!("dump_topk write data: {e:?}"))?;
     }
 
-    // Grouped MoE dispatch: DEFAULT-ON when chunk_size ≥ 256 (Gate 1
-    // tile-fill threshold per docs/plans/deepseek4-grouped-wmma-validation.md).
-    // Below that, scatter overhead exceeds the WMMA win — scalar K4
-    // path is used. Opt-out with HIPFIRE_DEEPSEEK4_MOE_GROUPED=0 to force the
-    // scalar path even at large batch (e.g., for A/B perf comparison or
-    // if a regression surfaces).
+    // Grouped MoE dispatch: DEFAULT-ON when chunk_size ≥ 128 (validated
+    // crossover on gfx1151, 2026-05-26 — see
+    // project_v4f_l2_bottleneck_2026_05_26 memory).
     //
-    // Measured 2026-05-22: +25–28% prefill at B=512 on deepseek-v4-flash.mq2lloyd
-    // (1240-token prompt, 3 trials, fresh process). Decoded output
-    // remains coherent (side-by-side argmax check); divergence from the
-    // scalar path is at FMA-order-noise level. See commit a9f2e54.
+    // Original gate at 256 was set 2026-05-22 (commit 29984e2) based on
+    // theoretical "Gate 1 tile-fill" reasoning, never empirically swept
+    // at lower batch sizes. 2026-05-26 PP_BATCH×gate sweep on
+    // deepseek-v4-flash.mq2lloyd (2100-token prompt, B=16..256, 3 trials
+    // per cell, fresh process) shows the actual crossover is between
+    // B=64 (tied: 40.84 scalar vs 40.29 grouped) and B=128 (grouped wins
+    // 46.02 vs 39.28 = +17.2%). Setting threshold at 128 captures the
+    // win without paying the small-batch padding-overhead cost (-22% at
+    // B=16, -11% at B=32).
+    //
+    // HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE overrides the threshold for
+    // future sweeps. HIPFIRE_DEEPSEEK4_MOE_GROUPED=0 forces the scalar
+    // path at any batch (used for A/B regression debugging).
+    let gate_threshold: usize = std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED_GATE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(128);
     let use_grouped =
-        batch_size >= 256 && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
+        batch_size >= gate_threshold && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
     if use_grouped {
         const BLOCK_M: usize = 16;
