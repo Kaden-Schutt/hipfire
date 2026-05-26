@@ -6,6 +6,7 @@
 
 mod compiler;
 mod dispatch;
+pub mod feature_flags;
 mod kernels;
 pub mod pool;
 pub mod profile;
@@ -17,4 +18,5 @@ pub use dispatch::{
     gemv_dp4a_enabled, has_wmma_f16, DType, Gpu, GpuTensor, LLOYD_MQ4_GROUP_BYTES,
     MMQ_CURRENT_LAYER,
 };
+pub use feature_flags::FeatureFlags;
 pub use kernels::GEMV_SRC;
