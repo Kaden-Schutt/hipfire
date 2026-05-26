@@ -1816,7 +1816,7 @@ fn forward_prefill_chunk(
     // Q8 WMMA arch gate — see qwen35.rs q8_wmma_arch for the matching capture
     // and rationale (gfx11-only; gfx12 needs a `_w32_gfx12` builtin variant
     // that has not been authored yet, so routing gfx12 here would crash at JIT).
-    let q8_wmma_arch = gpu.flags.has_wmma_f16();
+    let q8_wmma_arch = gpu.arch_caps.has_wmma_f16();
 
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
