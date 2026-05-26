@@ -757,6 +757,24 @@ pub fn forward_step_with_embed(
     forward_step_after_x(gpu, weights, cfg, state, pos)
 }
 
+/// Embed one token to a host F32 row (`hidden_size`) for batched-prefill
+/// splice: lets a VLM example build a [batch, dim] embeds matrix with vision
+/// rows interleaved at IMGPAD slots and text rows here. Uses `state.x` scratch.
+pub fn embed_token_row(
+    gpu: &mut Gpu, weights: &Qwen2Weights, cfg: &Qwen2Config,
+    state: &mut Qwen2State, token: u32,
+) -> HipResult<Vec<f32>> {
+    let dim = cfg.hidden_size;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+    }
+    gpu.download_f32(&state.x)
+}
+
 /// Common prefix: bounds-check, upload pos. Returns the position used.
 fn forward_step_prelude(gpu: &mut Gpu, state: &Qwen2State) -> HipResult<usize> {
     let pos = state.next_pos;
@@ -959,6 +977,15 @@ pub fn forward_prefill_batch_embeds(
     let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
     let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
+    let use_wmma_causal = head_dim == 128 && batch >= 64;
+    let (k_f16_batch, v_f16_batch) = if use_wmma_causal {
+        let k16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
+        let v16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
+        (Some(k16), Some(v16))
+    } else {
+        (None, None)
+    };
+
     // Absolute positions [base .. base+batch) for batched RoPE.
     let pos_bytes: Vec<u8> = (0..batch as i32)
         .flat_map(|i| (i + base as i32).to_ne_bytes())
@@ -988,8 +1015,21 @@ pub fn forward_prefill_batch_embeds(
         gpu.kv_cache_write_f32_batched(&state.k_cache[layer_idx], &k_batch, &pos_array, kv_dim, batch)?;
         gpu.kv_cache_write_f32_batched(&state.v_cache[layer_idx], &v_batch, &pos_array, kv_dim, batch)?;
 
-        gpu.attention_causal_batched(&q_batch, &k_batch, &v_batch, &attn_out_batch,
-            batch, n_heads, n_kv_heads, head_dim)?;
+        // Attention — WMMA causal flash when head_dim=128 and batch is
+        // large enough (≥64 query rows to fill the M=64 tile). Uses f16
+        // K/V to halve DRAM traffic (the same pattern as the vision
+        // encoder). Falls back to the scalar causal kernel otherwise.
+        if let (Some(k16), Some(v16)) = (&k_f16_batch, &v_f16_batch) {
+            gpu.cast_f32_to_f16(&k_batch, k16)?;
+            gpu.cast_f32_to_f16(&v_batch, v16)?;
+            gpu.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
+                &q_batch, k16, v16, &attn_out_batch,
+                batch, batch, n_heads, n_kv_heads, head_dim,
+            )?;
+        } else {
+            gpu.attention_causal_batched(&q_batch, &k_batch, &v_batch, &attn_out_batch,
+                batch, n_heads, n_kv_heads, head_dim)?;
+        }
 
         proj(gpu, &layer.wo, &attn_out_batch, &o_batch, batch)?;
         gpu.add_inplace_f32(&x_batch, &o_batch)?;
@@ -1016,6 +1056,8 @@ pub fn forward_prefill_batch_embeds(
               pos_array] {
         gpu.free_tensor(t)?;
     }
+    if let Some(k16) = k_f16_batch { gpu.free_tensor(k16)?; }
+    if let Some(v16) = v_f16_batch { gpu.free_tensor(v16)?; }
     Ok(())
 }
 
