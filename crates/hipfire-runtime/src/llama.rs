@@ -5020,11 +5020,15 @@ mod tests {
 
     #[test]
     fn is_batchable_la_mq3_wmma_only() {
-        // MQ3 only batchable on archs that have a WMMA family ported.
+        // MQ3 batchable on WMMA archs (gfx11/gfx12) via the WMMA path, and on
+        // gfx10 RDNA1/2 via the scalar path (PR #298, commit 4840f0b).
         for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
-            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch}");
+            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch} (WMMA)");
         }
-        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx942"] {
+        for arch in ["gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032"] {
+            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch} (gfx10 scalar)");
+        }
+        for arch in ["gfx900", "gfx906", "gfx942"] {
             assert!(!is_batchable_la(DType::MQ3G256, arch), "MQ3 must fall back on {arch}");
         }
     }
