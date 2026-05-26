@@ -994,7 +994,10 @@ pub fn forward_prefill_batch_embeds(
     let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
     let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
-    let use_wmma_causal = gpu.arch_caps.has_wmma_w32() && head_dim == 128 && batch >= 64;
+    let use_wmma_causal =
+        (gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12())
+            && head_dim == 128
+            && batch >= 64;
     let (k_f16_batch, v_f16_batch) = if use_wmma_causal {
         let k16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
         let v16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
@@ -1032,10 +1035,9 @@ pub fn forward_prefill_batch_embeds(
         gpu.kv_cache_write_f32_batched(&state.k_cache[layer_idx], &k_batch, &pos_array, kv_dim, batch)?;
         gpu.kv_cache_write_f32_batched(&state.v_cache[layer_idx], &v_batch, &pos_array, kv_dim, batch)?;
 
-        // Attention — WMMA causal flash when head_dim=128 and batch is
-        // large enough (≥64 query rows to fill the M=64 tile). Uses f16
-        // K/V to halve DRAM traffic (the same pattern as the vision
-        // encoder). Falls back to the scalar causal kernel otherwise.
+        // Attention: WMMA causal flash when head_dim=128 and batch is
+        // large enough to fill the M=64 tile. gfx11 and gfx12 use separate
+        // kernel siblings because their WMMA operand layouts differ.
         if let (Some(k16), Some(v16)) = (&k_f16_batch, &v_f16_batch) {
             gpu.cast_f32_to_f16(&k_batch, k16)?;
             gpu.cast_f32_to_f16(&v_batch, v16)?;
