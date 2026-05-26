@@ -298,7 +298,7 @@ pub fn mtp_probe_step(
         DType::MQ4G256 => {
             // MQ4 needs FWHT-rotated x first; reuse `state.rot` as scratch.
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            gpu.rotate_x_mq_batched(&final_hidden_view, &rot_view, w_out.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf, &rot_view, &logits_batch,
                 w_out.m, w_out.k, n,
@@ -306,7 +306,7 @@ pub fn mtp_probe_step(
         }
         DType::MQ3G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            gpu.rotate_x_mq_batched(&final_hidden_view, &rot_view, w_out.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf, &rot_view, &logits_batch,
                 w_out.m, w_out.k, n,
@@ -320,7 +320,7 @@ pub fn mtp_probe_step(
         }
         DType::MQ6G256 => {
             let rot_view = state.rot.sub_offset(0, n * w_out.k);
-            gpu.rotate_x_mq_batched(&final_hidden_view, &rot_view, w_out.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden_view, &rot_view, w_out.k, n)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf, &rot_view, &logits_batch,
                 w_out.m, w_out.k, n,

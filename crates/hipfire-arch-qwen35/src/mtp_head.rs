@@ -62,7 +62,7 @@
 use crate::qwen35::{Qwen35Config, Qwen35Weights};
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
-use hipfire_runtime::llama::{f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
+use hipfire_runtime::llama::{self, f16_to_f32, weight_gemv, EmbeddingFormat, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
@@ -1192,7 +1192,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ4G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, lm_head_weights, tmp_batched, &rot_view, lm_head_weights.k, n)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &lm_head_weights.buf, &rot_view, &logits_view,
                 lm_head_weights.m, lm_head_weights.k, n,
@@ -1200,7 +1200,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ3G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, lm_head_weights, tmp_batched, &rot_view, lm_head_weights.k, n)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &lm_head_weights.buf, &rot_view, &logits_view,
                 lm_head_weights.m, lm_head_weights.k, n,
@@ -1214,7 +1214,7 @@ pub fn mtp_head_apply_lm_head_batched(
         }
         DType::MQ6G256 => {
             let rot_view = rot_batched.sub_offset(0, n * lm_head_weights.k);
-            gpu.rotate_x_mq_batched(tmp_batched, &rot_view, lm_head_weights.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, lm_head_weights, tmp_batched, &rot_view, lm_head_weights.k, n)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &lm_head_weights.buf, &rot_view, &logits_view,
                 lm_head_weights.m, lm_head_weights.k, n,
@@ -1375,7 +1375,7 @@ fn weight_gemm_batched(
             // MQ4 needs an FWHT-rotated x first (matches trunk lm_head + dflash patterns).
             let rot = rotated_x_scratch
                 .expect("MQ4 batched gemm requires rotated_x_scratch");
-            gpu.rotate_x_mq_batched(x_batched, rot, w.k, n)?;
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
         }
         DType::F32 => {

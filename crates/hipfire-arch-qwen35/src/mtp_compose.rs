@@ -297,14 +297,14 @@ pub fn spec_step_dflash_mtp(
             }
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
@@ -316,7 +316,7 @@ pub fn spec_step_dflash_mtp(
             }
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
@@ -823,13 +823,13 @@ pub fn spec_step_dflash_mtp_tree(
                 &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
             DType::MQ4G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq4g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }
             DType::MQ3G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq3g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }
@@ -837,7 +837,7 @@ pub fn spec_step_dflash_mtp_tree(
                 &w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?,
             DType::MQ6G256 => {
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch)?;
             }

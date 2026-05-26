@@ -803,14 +803,14 @@ pub fn spec_step_mtp(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
@@ -823,7 +823,7 @@ pub fn spec_step_mtp(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
@@ -1149,14 +1149,14 @@ pub fn spec_step_mtp_compressed(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
@@ -1169,7 +1169,7 @@ pub fn spec_step_mtp_compressed(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
@@ -1610,14 +1610,14 @@ pub fn spec_step_mtp_compressed_serial(
         }
         DType::MQ4G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq4g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
         }
         DType::MQ3G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq3g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;
@@ -1630,7 +1630,7 @@ pub fn spec_step_mtp_compressed_serial(
         }
         DType::MQ6G256 => {
             let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
-            gpu.rotate_x_mq_batched(&state.verify_hidden, &rot, w_out.k, n_verify)?;
+            llama::rotate_x_mq_batched_for(gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
             gpu.gemm_hfq6g256_batched_lmhead(
                 &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
             )?;

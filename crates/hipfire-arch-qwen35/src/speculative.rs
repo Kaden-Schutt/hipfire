@@ -2219,7 +2219,7 @@ fn verify_dflash_block_inner(
                     "verify_scratch.rot undersized for MQ6 lm_head: b*k={} > max_n*hidden_k={}",
                     b * w_out.k, verify_scratch.max_n * verify_scratch.hidden_k);
                 let rot = verify_scratch.rot.sub_offset(0, b * w_out.k);
-                gpu.rotate_x_mq_batched(&final_hidden, &rot, w_out.k, b)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &final_hidden, &rot, w_out.k, b)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rot, &logits_batch, w_out.m, w_out.k, b,
                 )?;
@@ -2775,7 +2775,7 @@ pub fn spec_step_dflash(
                 assert!(batch * h <= verify_scratch.max_n * verify_scratch.hidden_k,
                     "verify_scratch.rot undersized for MQ6 draft lm_head");
                 let rotated = verify_scratch.rot.sub_offset(0, batch * h);
-                gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch)?;
+                llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch)?;
                 gpu.gemm_hfq6g256_batched_lmhead(
                     &w_out.buf, &rotated, &logits_batch, w_out.m, w_out.k, batch,
                 )?;
@@ -3421,7 +3421,7 @@ fn run_dflash_draft_for_logits(
         }
         rdna_compute::DType::MQ6G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);
@@ -3580,7 +3580,7 @@ fn run_dflash_draft_for_topk_gpu(
         }
         rdna_compute::DType::MQ6G256 => {
             let rotated = gpu.alloc_tensor(&[batch * h], rdna_compute::DType::F32)?;
-            let r1 = gpu.rotate_x_mq_batched(&hidden_rows, &rotated, h, batch);
+            let r1 = llama::rotate_x_mq_batched_for(gpu, w_out, &hidden_rows, &rotated, h, batch);
             if let Err(e) = r1 {
                 let _ = gpu.free_tensor(rotated);
                 let _ = gpu.free_tensor(logits_batch);
