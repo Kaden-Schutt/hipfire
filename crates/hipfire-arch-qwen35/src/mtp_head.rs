@@ -538,7 +538,10 @@ pub fn load_mtp_head_bundled(
     let mtp_offset = match detect_bundled_mtp_offset(path) {
         Ok(Some(off)) => off,
         Ok(None) => return Ok(None),
-        Err(e) => panic!("read bundle trailer from {}: {e}", path.display()),
+        // Return Err (not panic): the daemon auto-probes every .mq4 trunk for a
+        // bundled trailer on load; an IO error here must not crash the process.
+        Err(e) => return Err(hip_bridge::HipError::new(0, &format!(
+            "read bundle trailer from {}: {e}", path.display()))),
     };
     let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
     Ok(Some(head))
@@ -568,16 +571,22 @@ pub fn load_mtp_head_at_offset(
     max_seq: usize,
     base_offset: u64,
 ) -> HipResult<Qwen35MtpHead> {
-    let hfq = HfqFile::open_at_offset(path, base_offset)
-        .unwrap_or_else(|e| panic!("open .mtp file {} @ offset {base_offset}: {e}", path.display()));
-    assert_eq!(
-        hfq.arch_id, 21,
-        ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
-         is this actually an MTP head extracted by mtp_extract?",
-        path.display(), hfq.arch_id
-    );
-    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
-        .expect(".mtp metadata JSON parse failed");
+    // Return Err (not panic) on operator-facing failures (bad path, wrong
+    // arch, corrupt metadata) so callers like the daemon can degrade to AR
+    // instead of crashing the process.
+    let hfq = HfqFile::open_at_offset(path, base_offset).map_err(|e| {
+        hip_bridge::HipError::new(0, &format!(
+            "open .mtp file {} @ offset {base_offset}: {e}", path.display()))
+    })?;
+    if hfq.arch_id != 21 {
+        return Err(hip_bridge::HipError::new(0, &format!(
+            ".mtp file at {} has arch_id={} (expected 21 = QWEN35_MTP_HEAD); \
+             is this actually an MTP head extracted by mtp_extract?",
+            path.display(), hfq.arch_id)));
+    }
+    let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).map_err(|e| {
+        hip_bridge::HipError::new(0, &format!(".mtp metadata JSON parse failed: {e}"))
+    })?;
     let config = Qwen35MtpHeadConfig::from_metadata(&meta, max_seq);
 
     // ── Norms (F32, 1D) ─────────────────────────────────────────────────

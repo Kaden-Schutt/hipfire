@@ -34,6 +34,8 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::{DeltaNetState, LayerType, Qwen35ScratchSet};
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_runtime::sampler::{self, SamplerConfig};
+use hipfire_arch_qwen35::mtp_head::{self, Qwen35MtpHead, MtpKvMode};
+use hipfire_arch_qwen35::mtp_spec::{self, MtpSpecState, MtpSamplingConfig};
 use hipfire_arch_qwen35::speculative::{
     self, DdtreeScratch, DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, VerifyScratch,
 };
@@ -359,6 +361,19 @@ struct DdtreeState {
     path_c_main_end_snap: DeltaNetSnapshot,
 }
 
+/// Optional MTP (multi-token prediction) speculative-decoding state.
+/// Populated when `load` supplies an MTP head (sidecar `.mtp` or bundled
+/// `.mq4-mtp` trailer). Used by `generate_mtp` for both greedy and sampling
+/// decode — unlike DFlash, MTP supports temperature > 0 via residual
+/// acceptance.
+struct MtpState {
+    head: Qwen35MtpHead,
+    spec_state: MtpSpecState,
+    max_n: usize,
+    p_min: f32,
+    compressed: bool,
+}
+
 struct LoadedModel {
     arch_id: u32,
     /// Pipeline-parallel degree. 1 = single-GPU (all existing fields below in
@@ -432,6 +447,10 @@ struct LoadedModel {
     model_path: String,
     // DFlash speculative decoding state (populated when load supplied a draft).
     dflash: Option<DflashState>,
+    // MTP speculative decoding state (populated when load supplied an MTP head
+    // sidecar or bundled trailer). Mutually exclusive with DFlash — the load
+    // handler errors if both are requested.
+    mtp: Option<MtpState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
     // model didn't ship one (rare for instruct models). Only consumed when
@@ -760,8 +779,58 @@ fn main() {
                 let state_quant_override = msg.get("params").and_then(|p| p.get("state_quant")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
-                    Ok(m) => {
+                // MTP speculative decode params. Mutually exclusive with DFlash
+                // draft — the load handler errors if both are requested.
+                let mtp_mode = msg.get("params").and_then(|p| p.get("mtp_mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("auto");
+                let raw_mtp_head = msg.get("params").and_then(|p| p.get("mtp_head")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
+                let mtp_head_path = if mtp_mode == "off" {
+                    if raw_mtp_head.is_some() {
+                        eprintln!("[hipfire-daemon] mtp_mode=off — skipping MTP head load ({})", raw_mtp_head.unwrap());
+                    }
+                    None
+                } else {
+                    raw_mtp_head.map(|s| s.to_string())
+                };
+                let mtp_k = msg.get("params").and_then(|p| p.get("mtp_k"))
+                    .and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+                let mtp_p_min = msg.get("params").and_then(|p| p.get("mtp_p_min"))
+                    .and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
+                let mtp_kv_mode_str = msg.get("params").and_then(|p| p.get("mtp_kv_mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("q8");
+
+                // Mutual exclusion: MTP + DFlash are both spec paths.
+                if mtp_head_path.is_some() && draft_path.is_some() {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"MTP head and DFlash draft are mutually exclusive speculative decode paths. Remove one (set mtp_mode=off or dflash_mode=off) and retry."}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
+                // MTP + cask/eviction: the MTP verify-then-rollback KV write
+                // pattern isn't reconciled with the eviction position
+                // accounting (the generate_mtp eviction branch is defensive
+                // only). Refuse the combination rather than silently corrupt
+                // long-context output.
+                if mtp_head_path.is_some() && cask_enabled {
+                    let _ = writeln!(stdout, r#"{{"type":"error","message":"MTP head and cask/eviction are not yet compatible (KV rollback vs eviction repositioning). Disable one (set mtp_mode=off or cask=false) and retry."}}"#);
+                    let _ = stdout.flush();
+                    continue;
+                }
+
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, mtp_head_path.as_deref(), mtp_k, mtp_p_min, mtp_kv_mode_str, &mut gpu) {
+                    Ok(mut m) => {
+                        // glm5 D2: the pre-load mtp+cask guard only catches an
+                        // EXPLICIT mtp_head param. A bundled .mq4-mtp (trailer
+                        // auto-detected in load_model, mtp_head_path=None) slips
+                        // through. Degrade MTP off (free its GPU state) when cask
+                        // is active, rather than run the unreconciled combo.
+                        if cask_enabled && m.mtp.is_some() {
+                            eprintln!("[hipfire-daemon] bundled MTP head detected but cask/eviction is active — disabling MTP (incompatible); using AR/cask");
+                            if let Some(mtp) = m.mtp.take() {
+                                mtp.spec_state.free_gpu(&mut gpu);
+                                mtp.head.free_gpu(&mut gpu);
+                            }
+                        }
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -1544,7 +1613,7 @@ fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQua
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, mtp_head_path: Option<&str>, mtp_k: usize, mtp_p_min: f32, mtp_kv_mode_str: &str, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
@@ -1774,6 +1843,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -1946,7 +2016,10 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         } else { None };
 
         let chat_template = resolve_chat_template(&hfq, path);
-        Ok(LoadedModel {
+
+        // Build LoadedModel without MTP first, then optionally load the MTP
+        // head by temporarily constructing a ModelSlot from the model's fields.
+        let mut loaded = LoadedModel {
             arch_id: hfq.arch_id,
             pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
             q35_config: Some(config), q35_weights: Some(weights), q35_scratch: Some(scratch),
@@ -1960,8 +2033,128 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash,
+            mtp: None,
             chat_template,
-        })
+        };
+
+        // Optional MTP head: load from sidecar or bundled trailer.
+        // Only for Qwen3.5/3.6 (arch_id 5/6). Compat guard checks
+        // n_embd/vocab_size/rope_theta against the trunk config.
+        // On mismatch or load failure, degrade to AR with a warning.
+        if (loaded.arch_id == 5 || loaded.arch_id == 6) && loaded.dflash.is_none() {
+            let mtp_result: Result<Option<MtpState>, String> = (|| {
+                let head: Qwen35MtpHead = if let Some(mp) = mtp_head_path {
+                    mtp_head::load_mtp_head(Path::new(mp), gpu, physical_cap)
+                        .map_err(|e| format!("load mtp sidecar '{}': {e}", mp))?
+                } else {
+                    match mtp_head::load_mtp_head_bundled(Path::new(path), gpu, physical_cap) {
+                        Ok(Some(h)) => h,
+                        Ok(None) => return Ok(None),
+                        Err(e) => return Err(format!("load bundled mtp: {e}")),
+                    }
+                };
+
+                let trunk_config = loaded.q35_config.as_ref().unwrap();
+
+                if head.config.n_embd != trunk_config.dim {
+                    return Err(format!(
+                        "MTP head n_embd={} != trunk dim={}", head.config.n_embd, trunk_config.dim,
+                    ));
+                }
+                if head.config.vocab_size != trunk_config.vocab_size {
+                    return Err(format!(
+                        "MTP head vocab_size={} != trunk vocab={}", head.config.vocab_size, trunk_config.vocab_size,
+                    ));
+                }
+                let trunk_rope_theta = trunk_config.rope_theta as f32;
+                // Relative tolerance: rope_theta can be 1e7+ where f32 ulp
+                // alone exceeds an absolute 1.0, falsely rejecting a matching
+                // head.
+                if (head.config.rope_theta - trunk_rope_theta).abs()
+                    > trunk_rope_theta.abs() * 1e-3 + 1.0 {
+                    return Err(format!(
+                        "MTP head rope_theta={} != trunk rope_theta={}", head.config.rope_theta, trunk_rope_theta,
+                    ));
+                }
+
+                let compressed = head.weights.lm_head_draft.is_some();
+                let kv_mode = MtpKvMode::parse(mtp_kv_mode_str)
+                    .map_err(|e| format!("{e}"))?;
+
+                // Temporarily build a ModelSlot to satisfy
+                // new_for_slot_with_kv_mode's signature. It only reads
+                // config/dn_state for sizing — the slot is discarded after
+                // allocation.
+                let slot_config = speculative::ModelSlotConfig::default();
+                let tmp_hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+                let tmp_weights = loaded.q35_weights.take().expect("q35 weights");
+                let tmp_kv = loaded.kv_cache.take().expect("kv cache");
+                let tmp_dn = loaded.dn_state.take().expect("dn state");
+                let tmp_scratch = loaded.q35_scratch.take().expect("q35 scratch");
+                let mut target = speculative::ModelSlot {
+                    name: String::from("target"),
+                    hfq: tmp_hfq,
+                    config: trunk_config.clone(),
+                    weights: tmp_weights,
+                    kv_cache: tmp_kv,
+                    dn_state: tmp_dn,
+                    scratch: tmp_scratch,
+                    slot_config,
+                };
+
+                let spec_state = MtpSpecState::new_for_slot_with_kv_mode(
+                    gpu, &target, &head, mtp_k, kv_mode,
+                ).map_err(|e| format!("alloc MtpSpecState: {e}"))?;
+
+                // Put model fields back.
+                loaded.q35_weights = Some(target.weights);
+                loaded.kv_cache = Some(target.kv_cache);
+                loaded.dn_state = Some(target.dn_state);
+                loaded.q35_scratch = Some(target.scratch);
+
+                let mut spec_state = spec_state;
+                if mtp_p_min > 0.0 {
+                    spec_state.set_p_min(mtp_p_min);
+                }
+
+                // Compressed (cvs sidecar) heads need the compressed-logits
+                // scratch allocated before the first spec_step, or it panics
+                // ("logits_compressed not allocated"). Mirrors mtp_only_demo.
+                // Bundled full-vocab heads (compressed_vocab_size=None) skip
+                // this — spec_step_mtp_compressed_serial uses the trunk lm_head.
+                if let Some(cvs) = head.weights.compressed_vocab_size {
+                    spec_state.mtp_scratch.ensure_compressed_logits(gpu, cvs)
+                        .map_err(|e| format!("alloc logits_compressed: {e}"))?;
+                    spec_state.ensure_compressed_lm_logits(gpu, cvs)
+                        .map_err(|e| format!("alloc mtp_lm_logits_compressed: {e}"))?;
+                }
+
+                eprintln!(
+                    "  MTP head loaded: {} (n_embd={}, vocab={}, compressed={}, k={}, p_min={:.2})",
+                    mtp_head_path.unwrap_or("(bundled)"),
+                    head.config.n_embd, head.config.vocab_size,
+                    compressed, mtp_k, mtp_p_min,
+                );
+
+                Ok(Some(MtpState {
+                    head,
+                    spec_state,
+                    max_n: mtp_k,
+                    p_min: mtp_p_min,
+                    compressed,
+                }))
+            })();
+
+            match mtp_result {
+                Ok(Some(state)) => loaded.mtp = Some(state),
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("  MTP head load failed ({}) — falling back to AR/DFlash only", e);
+                }
+            }
+        }
+
+        Ok(loaded)
     } else {
         // Qwen3 / LLaMA — no eviction supported on this path (TriAttention needs
         // the FA/LA hybrid wiring from arch_id 5/6). physical_cap == max_seq.
@@ -1991,6 +2184,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         })
     }
@@ -2081,6 +2275,7 @@ fn load_model_safetensors(
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -2141,6 +2336,7 @@ fn load_model_safetensors(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        mtp: None,
         chat_template,
     })
 }
@@ -2271,6 +2467,7 @@ fn load_model_pp(
         conversation_tokens: Vec::new(),
         model_path: path.to_string(),
         dflash: None,
+        mtp: None,
         chat_template: resolve_chat_template(&hfq, path),
     })
 }
@@ -2357,6 +2554,12 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     if let Some(df) = m.dflash {
         df.draft_weights.free_gpu(gpu);
         df.draft_scratch.free_gpu(gpu);
+    }
+    // MTP state: head weights + spec state (verify hidden/logits, KV cache,
+    // DN snapshot, scratch buffers).
+    if let Some(mtp) = m.mtp {
+        mtp.spec_state.free_gpu(gpu);
+        mtp.head.free_gpu(gpu);
     }
     // Free eviction context (centers + scratch tensors) if active.
     if let Some(ev) = m.eviction { ev.free_gpu(gpu); }
@@ -3091,6 +3294,463 @@ fn generate_dflash(
     let _ = stdout.flush();
 }
 
+#[allow(clippy::too_many_arguments)]
+fn generate_mtp(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    temp: f32,
+    top_p: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+
+    // Multi-turn: prefill only the NEW turn's tokens on top of the cumulative
+    // KV + DeltaNet state (mirrors the AR `generate` path). The conversation is
+    // reset (seq_pos=0, clear tokens, zero DN below) ONLY when it would overflow
+    // the KV budget — never unconditionally — so KV/DN are reused across turns.
+    let raw_q_tokens = tokenizer.encode(prompt);
+    let prompt_est = raw_q_tokens.len() + 8; // small chatml-framing margin
+    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+        eprintln!("[hipfire-daemon] mtp: context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    // Jinja full-render fires only on the first turn (seq_pos==0); continuations
+    // use the hand-rolled incremental frame (system only on turn 0) — identical
+    // to the AR path's multi-turn handling.
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
+    let new_tokens: Vec<u32> = if try_jinja {
+        let template = m.chat_template.as_ref().unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(msgs) => msgs,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => tokenizer.encode(&rendered),
+            Err(e) => {
+                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer,
+                    system: system_prompt,
+                    user: "",
+                    assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(&raw_q_tokens)
+            }
+        }
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: if m.seq_pos == 0 { system_prompt } else { None },
+            user: "", // tokens passed directly via build_with_user_tokens
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&raw_q_tokens)
+    };
+
+    let im_end = tokenizer.encode("<|im_end|>");
+    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+
+    // Fresh start (turn 0 or post-reset): zero the recurrent DeltaNet state.
+    // Continuations (seq_pos>0) keep it — DN is cumulative across turns.
+    if m.seq_pos == 0 {
+        {
+            let dn = m.dn_state.as_ref().unwrap();
+            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
+        // Also reset the MTP head's private KV cache (glm5 C1): it holds stale
+        // K/V rows from the prior conversation otherwise, contaminating the
+        // head's attention on the first post-reset spec cycle.
+        if let Some(mtp) = m.mtp.as_mut() {
+            let _ = mtp.spec_state.mtp_kv.reset(gpu);
+        }
+    }
+    let start_pos = m.seq_pos;
+
+    // Assemble transient ModelSlot — same pattern as generate_dflash.
+    let target_config = m.q35_config.as_ref().unwrap().clone();
+    let weights = m.q35_weights.take().expect("q35 weights");
+    let kv_cache = m.kv_cache.take().expect("kv cache");
+    let dn_state = m.dn_state.take().expect("dn state");
+    let scratch = m.q35_scratch.take().expect("q35 scratch");
+    let hfq = match HfqFile::open(Path::new(&m.model_path)) {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"reopen model: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.q35_weights = Some(weights); m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state); m.q35_scratch = Some(scratch);
+            return;
+        }
+    };
+    let slot_config = ModelSlotConfig::default();
+    let mut target = ModelSlot {
+        name: String::from("target"),
+        hfq,
+        config: target_config,
+        weights,
+        kv_cache,
+        dn_state,
+        scratch,
+        slot_config,
+    };
+
+    let mtp_state = m.mtp.as_mut().unwrap();
+
+    let t0 = Instant::now();
+
+    // Capacity check (seq_pos-aware: prefill continues from start_pos).
+    if start_pos + new_tokens.len() + mtp_state.max_n + 1 > m.physical_cap {
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"error","id":"{}","message":"seq_pos+prompt+max_n+1 exceeds physical_cap {}"}}"#,
+            id, m.physical_cap,
+        );
+        let _ = stdout.flush();
+        m.q35_weights = Some(target.weights);
+        m.kv_cache = Some(target.kv_cache);
+        m.dn_state = Some(target.dn_state);
+        m.q35_scratch = Some(target.scratch);
+        return;
+    }
+
+    // Configure sampling vs greedy per request. Sampling (residual accept) and
+    // p_min early-exit do NOT compose — spec_step panics if both are active
+    // (mtp_spec.rs ~1374) — so clear p_min when sampling and restore the
+    // load-configured p_min when greedy. Sampling is only wired on the
+    // compressed-serial path; full heads stay greedy. Seed per-request so
+    // temp>0 actually varies output across requests (was hardcoded 42).
+    // NOTE: repeat_penalty != 1.0 is gated to the AR path in `generate` (the
+    // lossless MTP verify can't honor a penalty), so it never reaches here.
+    // TODO: plumb request top_k / min_p (currently hardcoded 20 / 0.0).
+    let use_sampling = temp > 1e-6 && mtp_state.compressed;
+    if use_sampling {
+        mtp_state.spec_state.set_p_min(0.0);
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(42);
+        mtp_state.spec_state.set_sampling(
+            MtpSamplingConfig { temp, top_k: 20, top_p, min_p: 0.0 },
+            seed,
+        );
+    } else {
+        // Greedy: ensure the load-configured p_min is the active value (a prior
+        // sampling request on this slot may have zeroed it).
+        mtp_state.spec_state.set_p_min(mtp_state.p_min);
+    }
+
+    // Prefill: batched forward over the prompt. After return,
+    // target.scratch.tmp holds the post-output-norm hidden at the
+    // last prompt position.
+    // Graceful failure: on any prefill/seed error we must restore the taken
+    // model fields into `m` (they were `.take()`n into `target`) and return,
+    // not panic — a panic here crashes the whole serial daemon and leaves the
+    // model half-disassembled.
+    macro_rules! mtp_bail {
+        ($msg:expr) => {{
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":{}}}"#, id, serde_json::to_string(&$msg).unwrap_or_default());
+            let _ = stdout.flush();
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            return;
+        }};
+    }
+
+    if let Err(e) = qwen35::forward_prefill_batch(
+        gpu,
+        &target.weights,
+        &target.config,
+        &new_tokens,
+        start_pos,
+        &mut target.kv_cache,
+        &mut target.dn_state,
+        &target.scratch,
+        None,   // hidden_rb
+        None,   // per_token_hidden_out
+        None,   // gdn_tape
+        None,   // tree_verify
+    ) {
+        mtp_bail!(format!("mtp prefill: {e}"));
+    }
+    // Record this turn's prefill frame into the cumulative conversation (the
+    // generated tokens are appended during decode below). seq_pos advances to
+    // the end of the loop; we set m.seq_pos = position at the end.
+    m.conversation_tokens.extend_from_slice(&new_tokens);
+
+    // Seed prev_hidden from scratch.tmp (one d2d copy).
+    if let Err(e) = mtp_state.spec_state.capture_prev_hidden_from_scratch_tmp(
+        gpu, &target.scratch.tmp, target.config.dim,
+    ) {
+        mtp_bail!(format!("mtp capture prev_hidden: {e}"));
+    }
+
+    // First token via argmax of the trunk's post-prefill logits.
+    let first_logits = match gpu.download_f32(&target.scratch.logits) {
+        Ok(l) => l,
+        Err(e) => mtp_bail!(format!("mtp download seed logits: {e}")),
+    };
+    let first_token = first_logits.iter().enumerate()
+        .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+            if v > bv { (i as u32, v) } else { (best, bv) }
+        }).0;
+
+    let t_prefill = Instant::now();
+
+    // Decode loop.
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = EosFilter::new(EosFilterConfig::default());
+    let mut position = start_pos + new_tokens.len();
+    let mut seed_token = first_token;
+    let mut generated = 0usize;
+    let mut total_cycles = 0usize;
+    let mut total_accepted = 0usize;
+    // Tokens committed by verify cycles (excludes the seed). Reported τ =
+    // committed/cycle (matches mtp_only_demo's committed_per_cycle_avg), not
+    // the draft-accept rate.
+    let mut committed_from_cycles = 0usize;
+    let eos_token = target.config.eos_token;
+
+    let mut think_count: usize = 0;
+    let mut prev_in_think = false;
+    // N-gram attractor guard (same detector as the AR path). MTP has a
+    // documented attractor history (mtp_bug.md); without this a degenerate
+    // loop in production would run to max_tokens uncaught.
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+
+    // Stream the seed/first token. It is the genuine first output token (the
+    // input seed to the first spec_step, which only commits *subsequent*
+    // tokens). It was previously placed in `emitted` but never streamed, so
+    // every MTP response was missing its first token.
+    {
+        streamed_tokens.push(first_token);
+        emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(text).unwrap_or_default());
+                let _ = stdout.flush();
+            }
+        }
+        generated = 1;
+    }
+    let first_token_terminal = first_token == eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
+
+    while generated < max_tokens && !first_token_terminal {
+        if position + mtp_state.max_n + 1 >= m.physical_cap { break; }
+
+        // Always use the compressed-serial path: it handles BOTH cvs-sidecar
+        // heads (lm_head_draft present) AND full-vocab heads (branches
+        // internally on lm_head_draft.is_none() to use the trunk's lm_head for
+        // the discrete-token draft chain). The plain spec_step_mtp K-step chain
+        // is the older lossy path with worse τ, so we never use it here.
+        let step_result = mtp_spec::spec_step_mtp_compressed_serial(
+            gpu,
+            &mut target,
+            &mtp_state.head,
+            &mut mtp_state.spec_state,
+            position,
+            seed_token,
+            eos_token,
+        );
+
+        let step = match step_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"mtp spec_step: {}"}}"#, id, e);
+                let _ = stdout.flush();
+                break;
+            }
+        };
+
+        total_cycles += 1;
+        total_accepted += step.accept_count;
+
+        let mut hit_eos = false;
+        let mut think_cap_hit = false;
+        for &tok in &step.committed {
+            if generated >= max_tokens { break; }
+            emitted.push(tok);
+            streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                let text = std::str::from_utf8(&text_bytes).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+            }
+            generated += 1;
+            committed_from_cycles += 1;
+            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) { hit_eos = true; break; }
+
+            if max_think_tokens > 0 {
+                let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
+                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+                let open_idx = raw_str.rfind("<think");
+                let close_idx = raw_str.rfind("</think");
+                let in_think = match (open_idx, close_idx) {
+                    (Some(o), Some(c)) => o > c,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if in_think && !prev_in_think { think_count = 0; }
+                if in_think { think_count += 1; }
+                prev_in_think = in_think;
+
+                if in_think && think_count >= max_think_tokens {
+                    let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":"</think>\n"}}"#, id);
+                    let _ = stdout.flush();
+                    think_cap_hit = true;
+                    break;
+                }
+            }
+        }
+        position += step.advance;
+        seed_token = *step.committed.last().expect("non-empty commit");
+
+        // Per-cycle eviction. MTP + cask/eviction is refused at load (the
+        // verify-then-rollback KV write pattern isn't reconciled with the
+        // eviction position accounting), so this is defensive: never `.unwrap()`
+        // (a panic kills the serial daemon) and never silently ignore a
+        // repositioning that the MTP path can't yet honor.
+        if let Some(ref ev) = m.eviction {
+            match ev.maybe_evict(gpu, &mut target.kv_cache, position) {
+                Ok(None) => {}
+                Ok(Some(_res)) => {
+                    eprintln!("[hipfire-daemon] WARNING: eviction fired under MTP — position accounting not reconciled; output may degrade (MTP+cask should be refused at load)");
+                }
+                Err(e) => eprintln!("[hipfire-daemon] mtp eviction error (ignored): {e}"),
+            }
+        }
+
+        // N-gram attractor guard (checked once per committed batch).
+        if let Some(hipfire_runtime::loop_guard::StopReason::NgramRepeat { count, .. }) =
+            loop_guard.check(&streamed_tokens)
+        {
+            let window_len = loop_guard.window_len(streamed_tokens.len());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"info","id":"{}","message":"ngram loop detected (4gram repeated {}× in last {} tokens) — forcing EOS"}}"#,
+                id, count, window_len
+            );
+            let _ = stdout.flush();
+            break;
+        }
+
+        if hit_eos || think_cap_hit { break; }
+    }
+
+    // F1: write the final committed token's KV + DN. spec_step leaves the last
+    // committed token (typically the bonus) at slot `position` UNWRITTEN — it
+    // would have been written as the next cycle's seed, but there is no next
+    // cycle at loop exit. Without this, turn N+1 attends over a stale/hole slot
+    // there and loses turn N's last token (often the <|im_end|> separator).
+    // Mirrors the AR path's "write this token's K/V FIRST" guard. This also
+    // reconciles seq_pos with conversation_tokens.len() (the +1 seed offset).
+    if generated > 0 {
+        match qwen35::forward_scratch(
+            gpu, &target.weights, &target.config, seed_token, position,
+            &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+        ) {
+            Ok(()) => position += 1,
+            Err(e) => eprintln!("[hipfire-daemon] mtp final-token KV write failed (ignored): {e}"),
+        }
+    }
+
+    // Put target state back.
+    m.q35_weights = Some(target.weights);
+    m.kv_cache = Some(target.kv_cache);
+    m.dn_state = Some(target.dn_state);
+    m.q35_scratch = Some(target.scratch);
+    // Append this turn's generated tokens (seed + committed) to the cumulative
+    // conversation; the prefill frame (new_tokens) was already appended above.
+    // seq_pos is the KV-authoritative next position the next turn continues from.
+    m.conversation_tokens.extend_from_slice(&emitted);
+    m.seq_pos = position;
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { new_tokens.len() as f64 / prefill_s } else { 0.0 };
+    // τ = committed tokens per verify cycle (matches mtp_only_demo's
+    // committed_per_cycle_avg), not the draft-accept rate. total_accepted is
+    // still surfaced separately for diagnostics.
+    let tau = if total_cycles > 0 { committed_from_cycles as f64 / total_cycles as f64 } else { 0.0 };
+    let accept_rate = if total_cycles > 0 { total_accepted as f64 / total_cycles as f64 } else { 0.0 };
+    let mtp_sampling = temp > 1e-6;
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"spec_path":"mtp","mtp_k":{},"tau":{:.2},"accept_rate":{:.2},"cycles":{},"mtp_sampling":{}}}"#,
+        id, generated, tok_s, new_tokens.len(),
+        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+        mtp_state.max_n, tau, accept_rate, total_cycles, mtp_sampling,
+    );
+    let _ = stdout.flush();
+}
+
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -3667,6 +4327,26 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // pflash_state is bypassed on the DFlash decode path).
         let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
+    }
+
+    // MTP spec-decode path. Supports greedy AND sampling (temp>0) via the
+    // compressed-serial residual-accept path. Routes to AR when: a repeat
+    // penalty is set (the lossless verify argmaxes raw, not penalized, logits,
+    // so it can't honor a penalty without diverging), or budgeted thinking
+    // needs AR (think-continuation not yet wired — same as DFlash).
+    let mtp_blocked_by_penalty = repeat_penalty > 1.0 + 1e-3;
+    if m.mtp.is_some() && (m.arch_id == 5 || m.arch_id == 6)
+        && !budgeted_thinking_needs_ar && !mtp_blocked_by_penalty {
+        generate_mtp(
+            m, gpu, stdout, id, prompt, system_prompt, max_tokens,
+            max_think_tokens, assistant_prefix, temp, top_p,
+            repeat_penalty, repeat_window, tools, messages_history,
+        );
+        let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
+        return;
+    }
+    if m.mtp.is_some() && mtp_blocked_by_penalty {
+        eprintln!("[hipfire-daemon] MTP bypassed (AR fallback): repeat_penalty={repeat_penalty:.3} != 1.0 is not supported by the lossless MTP verify");
     }
 
     // Auto-reset on multi-turn rollover. When eviction is active (operator
