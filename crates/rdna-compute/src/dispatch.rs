@@ -3059,7 +3059,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
+        // bind_thread: skip — path selector; concrete launch path binds before HIP use
         // Phase D-A path selector: route to `_mb4` (16×64 output tile, 4× weight
         // reuse per WG) when shape clears the size gate. Bench (gfx1151,
         // benchmarks/results/devlog_20260509_mq4_lloyd_gfx1151_bench.md):
@@ -3256,7 +3256,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
+        // bind_thread: skip — path selector; concrete launch path binds before HIP use
         // Phase D-B path selector — same gate as residual_mb4.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
@@ -3350,7 +3350,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
+        // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
@@ -3436,7 +3436,7 @@ impl Gpu {
         gate_m: usize, up_m: usize,
         k: usize, n: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
+        // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = matches!(self.arch.as_str(),
             "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
@@ -24459,6 +24459,288 @@ impl Gpu {
         result
     }
 
+    /// 2-D spatial RoPE with precomputed per-patch cos/sin tables.
+    ///
+    /// Used by the dots.ocr (Qwen2-VL family) vision tower. Applies a
+    /// halfsplit rotation in-place to Q and K — pairs `(d, d + head_dim/2)`
+    /// of each head are rotated by `cos[patch, d] / sin[patch, d]` from
+    /// the precomputed tables.
+    ///
+    /// # Arguments
+    ///
+    /// - `q`: `[n_patches, n_heads_q, head_dim]` row-major, f32.
+    /// - `k`: `[n_patches, n_heads_k, head_dim]` row-major, f32. For
+    ///   vision attention `n_heads_q == n_heads_k` (no GQA in
+    ///   `DotsVisionTransformer`).
+    /// - `cos_table` / `sin_table`: `[n_patches, head_dim]` f32 each.
+    ///   Built by `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`
+    ///   on the host and uploaded once per image. The second half of
+    ///   each row is a copy of the first half (the quarter-repeat
+    ///   invariant from `apply_rotary_pos_emb_vision`), but the kernel
+    ///   reads `cos[patch, e]` / `sin[patch, e]` independently so the
+    ///   same kernel works for any "halfsplit + per-position tables"
+    ///   case.
+    /// - `head_dim`: must be even (halfsplit requires `head_dim/2`
+    ///   pairs).
+    ///
+    /// # See also
+    ///
+    /// - `kernels/src/rope_2d_halfsplit.hip` — kernel source.
+    /// - `crates/hipfire-arch-dots-ocr/src/rope.rs::build_rope_2d_tables`
+    ///   — host-side cos/sin builder.
+    /// - docs/plans/dots-ocr-prd.md §1.6 — algorithm spec.
+    pub fn rope_2d_halfsplit_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        cos_table: &GpuTensor,
+        sin_table: &GpuTensor,
+        n_patches: usize,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // The dots.ocr 2-D RoPE layout (`[hc, wc, hc, wc]` quarter-
+        // repeat) requires head_dim to split into four equal quarters;
+        // `head_dim % 4 == 0` is the load-bearing constraint, not just
+        // evenness. Match the `rope::build_rope_2d_tables` panic.
+        assert!(
+            head_dim % 4 == 0,
+            "rope_2d_halfsplit_f32: head_dim={head_dim} must be a multiple of 4 \
+             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
+        );
+        assert!(n_patches > 0, "rope_2d_halfsplit_f32: n_patches must be > 0");
+        assert!(n_heads_q > 0 || n_heads_k > 0, "rope_2d_halfsplit_f32: must rotate at least one of Q/K");
+        self.ensure_kernel("rope_2d_halfsplit", kernels::ROPE_2D_HALFSPLIT_SRC, "rope_2d_halfsplit_f32")?;
+
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let cp = cos_table.buf.as_ptr();
+        let sp = sin_table.buf.as_ptr();
+        let np = n_patches as i32;
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+
+        let half = (head_dim / 2) as u32;
+        let max_heads = n_heads_q.max(n_heads_k) as u32;
+        // Grid: (n_patches, max_heads, 1), block: (head_dim/2, 1, 1).
+        // For dots.ocr's 19520 patches × 12 heads × 64 threads per
+        // block this is ~234k blocks of 64 threads — large but fine
+        // on RDNA.
+        let grid = [n_patches as u32, max_heads, 1];
+        let block = [half, 1, 1];
+        // Bytes-touched estimate for the profile timer: Q+K reads/writes
+        // + cos/sin reads. Each thread touches 2 q/k entries and 2
+        // cos/sin entries (cd, ce, sd, se).
+        let max_heads_us = n_heads_q.max(n_heads_k);
+        let bytes = (n_patches * max_heads_us * head_dim * 4 * 2)  // Q+K RMW
+                  + (n_patches * head_dim * 4 * 2);                // cos+sin reads
+        let timer = crate::profile::begin_timer(&self.hip, "rope_2d", "rope_2d_halfsplit_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "rope_2d_halfsplit_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(cp); b.push_ptr(sp);
+                b.push_i32(np); b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a
+    /// fused interleaved `[n_patches, 3 * hidden]` QKV buffer. V is
+    /// left untouched. Companion to [`Self::rope_2d_halfsplit_f32`].
+    ///
+    /// The fused-QKV variant matches the natural output layout of a
+    /// single QKV GEMM (one row per patch, `[Q-all-heads, K-all-heads,
+    /// V-all-heads]` along the second axis) — same layout
+    /// `vit_attention_opt` expects — so the encoder block becomes:
+    ///
+    /// ```text
+    /// single QKV GEMM  →  rope_2d_halfsplit_qkv_interleaved_f32  →  vit_attention_opt
+    /// ```
+    ///
+    /// without intermediate split/merge copies.
+    ///
+    /// `cos_table` and `sin_table` are the precomputed per-patch tables
+    /// of shape `[n_patches, head_dim]` produced by
+    /// `hipfire_arch_dots_ocr::rope::build_rope_2d_tables`.
+    pub fn rope_2d_halfsplit_qkv_interleaved_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        cos_table: &GpuTensor,
+        sin_table: &GpuTensor,
+        n_patches: usize,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim % 4 == 0,
+            "rope_2d_halfsplit_qkv_interleaved_f32: head_dim={head_dim} must be a multiple of 4 \
+             (the dots.ocr quarter-repeat layout splits head_dim into [hc, wc, hc, wc])",
+        );
+        assert!(n_patches > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_patches must be > 0");
+        assert!(n_heads > 0, "rope_2d_halfsplit_qkv_interleaved_f32: n_heads must be > 0");
+        self.ensure_kernel(
+            "rope_2d_halfsplit_qkv_interleaved",
+            kernels::ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC,
+            "rope_2d_halfsplit_qkv_interleaved_f32",
+        )?;
+
+        let qkvp = qkv.buf.as_ptr();
+        let cp = cos_table.buf.as_ptr();
+        let sp = sin_table.buf.as_ptr();
+        let np = n_patches as i32;
+        let nh = n_heads as i32;
+        let hd = head_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &qkvp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+
+        let half = (head_dim / 2) as u32;
+        let grid = [n_patches as u32, n_heads as u32, 1];
+        let block = [half, 1, 1];
+        // Bytes-touched estimate: per thread we RMW two Q entries + two
+        // K entries (= 4 × 2 × 4 = 32 bytes) plus 4 cos/sin reads (= 16
+        // bytes). Threads per kernel = n_patches * n_heads * head_dim/2.
+        let bytes = (n_patches * n_heads * head_dim * 4 * 4)             // Q+K RMW (read+write each)
+                  + (n_patches * head_dim * 4 * 2);                       // cos+sin reads
+        let timer = crate::profile::begin_timer(
+            &self.hip, "rope_2d", "rope_2d_halfsplit_qkv_interleaved_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "rope_2d_halfsplit_qkv_interleaved_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qkvp); b.push_ptr(cp); b.push_ptr(sp);
+                b.push_i32(np); b.push_i32(nh); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// Split a fused interleaved `[n_patches, 3 * hidden]` QKV buffer
+    /// into three separate `[n_patches, hidden]` Q, K, V buffers.
+    /// Used by the dots.ocr vision encoder when feeding the
+    /// non-causal `attention_dflash_f32` kernel (which expects Q/K/V
+    /// as separate flat buffers).
+    ///
+    /// `hidden` here is `n_heads * head_dim` — the second axis of each
+    /// of Q, K, V within the fused buffer.
+    pub fn qkv_split_interleaved_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_patches: usize,
+        hidden: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(n_patches > 0, "qkv_split_interleaved_f32: n_patches must be > 0");
+        assert!(hidden > 0, "qkv_split_interleaved_f32: hidden must be > 0");
+        self.ensure_kernel(
+            "qkv_split_interleaved",
+            kernels::QKV_SPLIT_INTERLEAVED_SRC,
+            "qkv_split_interleaved_f32",
+        )?;
+
+        let qkvp = qkv.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let np = n_patches as i32;
+        let hd = hidden as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &qkvp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let grid_y = ((hidden as u32) + block_size - 1) / block_size;
+        let grid = [n_patches as u32, grid_y, 1];
+        let block = [block_size, 1, 1];
+        // Bytes-touched estimate: 3 reads + 3 writes per (patch, j) thread.
+        let bytes = n_patches * hidden * 4 * 6;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "qkv_split", "qkv_split_interleaved_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "qkv_split_interleaved_f32", grid, block, 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qkvp); b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(vp);
+                b.push_i32(np); b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// In-place F32 → bf16 → F32 round-trip on `x`. Used by the
+    /// dots.ocr vision encoder for HF-bf16-precision emulation
+    /// (see `kernels/src/bf16_round_trip.hip`).
+    pub fn bf16_round_trip_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "bf16_round_trip",
+            kernels::BF16_ROUND_TRIP_SRC,
+            "bf16_round_trip_f32",
+        )?;
+        let xp = x.buf.as_ptr();
+        let n = x.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let grid = (((n as u32) + block_size - 1) / block_size).max(1);
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "bf16_round_trip", "bf16_round_trip_f32", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "bf16_round_trip_f32", [grid, 1, 1], [block_size, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Sigmoid activation, in-place.
     #[cfg(feature = "deltanet")]
     /// Repeat-interleave Q and K key heads up to value heads count.
@@ -26299,6 +26581,691 @@ impl Gpu {
                 func,
                 [n_heads as u32, b as u32, 1],
                 [block_size, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// WMMA-accelerated FlashAttention-style non-causal attention for
+    /// the **large-B / large-L** case. Same Q/K/V layout and contract as
+    /// [`Self::attention_dflash_f32`] — drop-in replacement.
+    ///
+    /// Grid:  `[n_heads, ceil(B / 16), 1]` (one block per (head, 16-Q-tile))
+    /// Block: 32 threads (1 wave32 warp)
+    /// LDS:   `(32 * head_dim + 256 + 48) * 4` bytes
+    ///        — ≈ 17 KB for `head_dim=128`, fits comfortably under the
+    ///        64 KB RDNA3 budget.
+    ///
+    /// Intended for `B >= 16` and `head_dim` a multiple of 16. The
+    /// caller is responsible for picking between this and the scalar
+    /// `attention_dflash_f32` based on workload shape.
+    pub fn attention_dflash_wmma_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim % 16 == 0,
+            "attention_dflash_wmma_f32: head_dim={head_dim} must be a multiple of 16 \
+             (WMMA tiles K-axis in 16-element chunks)",
+        );
+        assert!(
+            head_dim <= 256,
+            "attention_dflash_wmma_f32: head_dim={head_dim} exceeds the 256 cap \
+             — LDS budget is `3 * 16 * head_dim + 304` f32 slots, which overflows \
+             the 64 KB RDNA3 wave32 limit above head_dim=256. Use \
+             attention_dflash_f32 (scalar) for larger head_dim, or split this \
+             kernel's LDS layout (drop Q_lds or O_lds) in a future variant.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_f32",
+            kernels::ATTENTION_DFLASH_WMMA_SRC,
+            "attention_dflash_wmma_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32 slots):
+        //   Q_lds[16 * head_dim] + V_lds[16 * head_dim] + O_lds[16 * head_dim]
+        //   + S_lds[16 * 16]
+        //   + m_lds[16] + l_lds[16] + alpha_lds[16]
+        let lds_f32 = 3 * 16 * head_dim + 16 * 16 + 16 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 15) / 16;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [32, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention-style WMMA with M=32 query tile (vs M=16 in
+    /// `attention_dflash_wmma_f32`). Two waves per block; doubles the
+    /// queries served per K-tile load, halving global-memory K
+    /// traffic at vision-encoder shapes (large B, large L, head_dim ≤
+    /// 128). Same head_dim ≤ 128 ceiling here — LDS budget is
+    /// `(2*32 + 16) * head_dim + 32*16 + 96` f32 slots = 43 KB at
+    /// hd=128, which is the largest tile that fits the 64 KB RDNA3
+    /// wave32 SLM cap with full Q_lds + O_lds + V_lds.
+    ///
+    /// Caller responsibility: dispatch this when `B >= 32` AND
+    /// `head_dim ≤ 128`; fall back to the M=16 variant or the scalar
+    /// `attention_dflash_f32` otherwise.
+    pub fn attention_dflash_wmma_m32_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim % 16 == 0,
+            "attention_dflash_wmma_m32_f32: head_dim={head_dim} must be a multiple of 16",
+        );
+        assert!(
+            head_dim <= 128,
+            "attention_dflash_wmma_m32_f32: head_dim={head_dim} exceeds the 128 cap — \
+             LDS budget at head_dim=160 is 53.4 KB and at head_dim=256 is 84 KB which \
+             exceeds the 64 KB RDNA3 wave32 limit. Fall back to attention_dflash_wmma_f32 \
+             (M=16) for larger head_dim.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m32_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m32_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M32_SRC,
+            "attention_dflash_wmma_m32_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m32_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32 slots):
+        //   Q_lds[32 * head_dim] + V_lds[16 * head_dim] + O_lds[32 * head_dim]
+        //   + S_lds[32 * 16]
+        //   + m_lds[32] + l_lds[32] + alpha_lds[32]
+        let lds_f32 = (2 * 32 + 16) * head_dim + 32 * 16 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention-style WMMA with M=32 query tile and **N=64 K-tile
+    /// width** (vs N=16 in `attention_dflash_wmma_m32_f32`). Q lives in
+    /// registers across all K-tiles within a block; phase C fuses the
+    /// alpha-scale of O with the SV epilogue.
+    ///
+    /// Targets the vision-encoder regime (large B, large L,
+    /// head_dim ≤ 128) where rocprof shows the M=32 baseline is
+    /// per-tile-fixed-cost bound (1220 K-tile visits at N=16 → 305 at
+    /// N=64 means 4× fewer syncs / softmax passes / O-scaling passes).
+    ///
+    /// LDS at hd=128: V_lds[64*128] + O_lds[32*128] + S_lds[32*64] +
+    /// scalars = 57.7 KB (under 64 KB RDNA3 wave32 cap). VGPR per lane
+    /// ≈ 130 (Q_frags + s_acc + scratch).
+    ///
+    /// Caller responsibility: dispatch when `head_dim % 32 == 0`,
+    /// `head_dim ≤ 128`. Falls back to M=32 or M=16 otherwise.
+    pub fn attention_dflash_wmma_n64_f32(
+        &mut self,
+        q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_n64_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128. The dc loop is fully unrolled with d_chunks=8 \
+             so Q_frags[] gets register-promoted instead of spilled to scratch — making \
+             it variable would re-introduce the 544 B/lane private segment that defeats \
+             the Q-in-registers optimization (the v1 attempt regressed +19%). Fall back \
+             to attention_dflash_wmma_m32_f32 (head_dim <= 128) or attention_dflash_wmma_f32 \
+             (head_dim <= 256) for other head dims.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_n64_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_n64_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N64_SRC,
+            "attention_dflash_wmma_n64_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_n64_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32 slots):
+        //   V_lds[64 * head_dim] + O_lds[32 * head_dim]
+        //   + S_lds[32 * 64]
+        //   + m_lds[32] + l_lds[32] + alpha_lds[32]
+        let lds_f32 = (64 + 32) * head_dim + 32 * 64 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// f32 → f16 elementwise cast. `src` must be `DType::F32`, `dst`
+    /// must be `DType::F16`, both with the same logical length. Single
+    /// pass over the buffer; block [256], grid `ceil(n / 256)`.
+    pub fn cast_f32_to_f16(&mut self, src: &GpuTensor, dst: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(src.dtype, DType::F32, "cast_f32_to_f16: src must be F32");
+        assert_eq!(dst.dtype, DType::F16, "cast_f32_to_f16: dst must be F16");
+        let n_src: usize = src.shape.iter().product();
+        let n_dst: usize = dst.shape.iter().product();
+        assert_eq!(
+            n_src, n_dst,
+            "cast_f32_to_f16: src and dst element counts must match (src={n_src}, dst={n_dst})",
+        );
+        self.ensure_kernel(
+            "cast_f32_to_f16",
+            kernels::CAST_F32_TO_F16_SRC,
+            "cast_f32_to_f16",
+        )?;
+        let func = &self.functions["cast_f32_to_f16"];
+        let mut in_ptr = src.buf.as_ptr();
+        let mut out_ptr = dst.buf.as_ptr();
+        let mut n_val = n_src as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut in_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_src + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention-style WMMA, M=32 query tile and N=64 K-tile,
+    /// with **K and V already stored as f16 in DRAM** (Q and output
+    /// stay f32). Halves the attention kernel's DRAM traffic for K and
+    /// V — the dominant cost on memory-bound vision-encoder shapes.
+    /// Caller must cast K and V to f16 once (via `cast_f32_to_f16`)
+    /// before invoking this kernel.
+    ///
+    /// Same head_dim==128 restriction as `attention_dflash_wmma_n64_f32`
+    /// (Q_frags register-promotion requires the dc loop fully unrolled).
+    pub fn attention_dflash_wmma_n64_f16kv_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_n64_f16kv_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_n64_f16kv_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_n64_f16kv_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_n64_f16kv_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_n64_f16kv_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (same constraint as the f32-K/V sibling — the dc \
+             loop is fully unrolled with d_chunks=8 so Q_frags register-promotes).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_n64_f16kv_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_n64_f16kv_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N64_F16KV_SRC,
+            "attention_dflash_wmma_n64_f16kv_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_n64_f16kv_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout same as the f32-K/V sibling: V_lds stays f32 so
+        // phase C is byte-identical between the two kernels.
+        let lds_f32 = (64 + 32) * head_dim + 32 * 64 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention WMMA, M=32 query tile and **N=128 K-tile**, K and
+    /// V f16 in DRAM, V_lds and S_lds in f16. Same shape as
+    /// `attention_dflash_wmma_n64_f16kv_f32` but twice the K-tile width.
+    /// Halves outer-loop iterations → halves __syncthreads / softmax /
+    /// alpha-scale overhead per attention call.
+    ///
+    /// LDS at hd=128 ≈ 56.4 KB: V_lds[128*128] f16 (32 KB) +
+    /// O_lds[32*128] f32 (16 KB) + S_lds[32*128] f16 (8 KB) + scalars.
+    pub fn attention_dflash_wmma_n128_f16kv_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_n128_f16kv_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_n128_f16kv_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_n128_f16kv_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_n128_f16kv_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_n128_f16kv_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (d_chunks=8 unroll for register-promoted Q_frags).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_n128_f16kv_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_n128_f16kv_f32",
+            kernels::ATTENTION_DFLASH_WMMA_N128_F16KV_SRC,
+            "attention_dflash_wmma_n128_f16kv_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_n128_f16kv_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32-equivalent slots — V_lds and S_lds are f16
+        // so they take half the slot count of their nominal element
+        // count):
+        //   V_lds[128 * head_dim] f16     = 128 * head_dim / 2 f32 slots
+        //   O_lds[32  * head_dim] f32     =  32 * head_dim     f32 slots
+        //   S_lds[32  * 128]      f16     =  32 * 128 / 2      f32 slots
+        //   m_lds + l_lds + alpha_lds     =  96                f32 slots
+        let lds_f32 = (128 * head_dim) / 2 + 32 * head_dim + (32 * 128) / 2 + 32 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 31) / 32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [64, 1, 1],   // 2 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// FlashAttention WMMA, **M=64** query tile + N=128 K-tile, K/V f16
+    /// in DRAM, V_lds and S_lds in f16, **O register-resident**.
+    /// 4-wave block (128 threads). Halves the query-block count vs
+    /// M=32, which halves K and V DRAM traffic per attention call —
+    /// the dominant cost on this DRAM-bound workload.
+    ///
+    /// LDS at hd=128 ≈ 48.8 KB: V_lds[128*128] f16 + S_lds[64*128] f16
+    /// + scalars. No O_lds — O lives in per-lane register arrays
+    /// (8 float8_t = 64 VGPRs/lane in WMMA frag_c layout).
+    pub fn attention_dflash_wmma_m64_n128_f16kv_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (d_chunks=8 unroll, O_frags[8] register array).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (in f32-equivalent slots; V_lds and S_lds are f16
+        // so they take half their nominal element count):
+        //   V_lds[128 * head_dim]  f16   = 128 * head_dim / 2 f32 slots
+        //   S_lds[64  * 128]       f16   =  64 * 128 / 2      f32 slots
+        //   m + l + alpha (64 each)      = 192                f32 slots
+        let lds_f32 = (128 * head_dim) / 2 + (64 * 128) / 2 + 64 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],   // 4 waves
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V3 of `attention_dflash_wmma_m64_n128_f16kv_f32`. Same shape
+    /// as v2 (M=64, N=128, 4-wave block, f16 K/V, O in registers,
+    /// padded S_lds, cooperative softmax) but with phase C reordered
+    /// to outer c / inner dc so each `a_reg_sm` row chunk is read
+    /// once per c instead of once per (dc, c). 8× reduction in phase
+    /// C S_lds reads.
+    pub fn attention_dflash_wmma_m64_n128_f16kv_v3_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_v3_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v3_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // Same LDS layout as v2 (padded S_lds stride 130).
+        let lds_f32 = (128 * head_dim) / 2 + (64 * 130) / 2 + 64 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// V2 of `attention_dflash_wmma_m64_n128_f16kv_f32`. Same shape
+    /// (M=64, N=128, 4-wave block, f16 K/V, O in registers) but adds
+    /// (a) S_lds row stride 130 (was 128) to break a 16-way LDS bank
+    /// conflict in phase C's S_lds reads, and (b) cooperative wave-32
+    /// softmax via __shfl_xor butterfly.
+    pub fn attention_dflash_wmma_m64_n128_f16kv_v2_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v2_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v2_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v2_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v2_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_v2_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128 (d_chunks=8 unroll, O_frags[8] register array).",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_v2_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_v2_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_v2_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v2_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // LDS layout (f32-equivalent slots):
+        //   V_lds[128 * head_dim] f16  = 128 * head_dim / 2 f32 slots
+        //   S_lds[64  * 130]      f16  = 64 * 130 / 2       f32 slots (padded stride)
+        //   m + l + alpha (64 each f32) = 192               f32 slots
+        let lds_f32 = (128 * head_dim) / 2 + (64 * 130) / 2 + 64 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],   // 4 waves
                 shared_mem,
                 self.stream_ref(),
                 &mut params,

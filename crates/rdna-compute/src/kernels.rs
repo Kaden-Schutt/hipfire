@@ -2004,6 +2004,110 @@ pub const ROPE_PARTIAL_INTERLEAVED_SRC: &str = include_str!("../../../kernels/sr
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_partial_halfsplit.hip");
 
+/// 2-D spatial RoPE with precomputed per-patch cos/sin tables. Used by
+/// the dots.ocr (Qwen2-VL family) `DotsVisionTransformer` for vision
+/// attention. See `kernels/src/rope_2d_halfsplit.hip` for the layout
+/// + algorithm and `crates/hipfire-arch-dots-ocr/src/rope.rs` for the
+/// host-side cos/sin table builder.
+pub const ROPE_2D_HALFSPLIT_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit.hip");
+
+/// 2-D spatial RoPE applied IN-PLACE to the Q and K slices of a fused
+/// interleaved `[N, 3*hidden]` QKV buffer. Companion to the separate-
+/// buffer variant above. Initially intended for the dots.ocr vision
+/// encoder's single-GEMM → attention path, but `vit_attention_opt`
+/// turned out to overflow RDNA3 LDS at the smoke image's N≈19520; the
+/// dots.ocr forward pass therefore splits QKV into separate Q/K/V
+/// buffers (see `QKV_SPLIT_INTERLEAVED_SRC`) and routes through
+/// `attention_dflash_f32` instead. Kernel kept for future fast-path
+/// when a non-overflowing fused vision attention exists.
+pub const ROPE_2D_HALFSPLIT_QKV_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/rope_2d_halfsplit_qkv_interleaved.hip");
+
+/// Split a fused interleaved `[N, 3*hidden]` QKV buffer into three
+/// separate `[N, hidden]` Q, K, V buffers. Used by the dots.ocr vision
+/// encoder to feed `attention_dflash_f32` (FlashAttention-style with
+/// online softmax — supports L > 16128 without SLM overflow, unlike
+/// `vit_attention_opt` which materialises a `scores[N]` LDS buffer).
+/// See `kernels/src/qkv_split_interleaved.hip`.
+pub const QKV_SPLIT_INTERLEAVED_SRC: &str = include_str!("../../../kernels/src/qkv_split_interleaved.hip");
+
+/// WMMA-accelerated FlashAttention-style non-causal attention (gfx1100+).
+/// Companion to `ATTENTION_DFLASH_SRC` for the large-B / large-L case
+/// where one block tiles 16 queries via WMMA. Grid `[n_heads, ceil(B/16)]`,
+/// block `[32]`. See `kernels/src/attention_dflash_wmma.hip`.
+pub const ATTENTION_DFLASH_WMMA_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma.hip");
+
+/// M=32 variant of `ATTENTION_DFLASH_WMMA_SRC` — two-wave block (64
+/// threads), processes 32 queries per block instead of 16. Halves the
+/// number of query-tile blocks at large B, which halves global K-tile
+/// fetches and gives ~2× wall-time speedup at vision-encoder shapes
+/// where the M=16 kernel is memory-bound. LDS-capped at head_dim ≤ 128.
+/// See `kernels/src/attention_dflash_wmma_m32.hip`.
+pub const ATTENTION_DFLASH_WMMA_M32_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m32.hip");
+
+/// N=64 K-tile variant — M=32 queries per block, **64 keys per outer
+/// loop iteration** (vs 16 in M32_SRC). Q lives in registers across all
+/// K-tiles; phase C fuses the alpha-scale and SV epilogue. Designed to
+/// amortise per-K-tile fixed costs (syncs, softmax, O-scaling) over 4×
+/// more keys per visit. LDS at hd=128 ≈ 57.7 KB (under 64 KB cap).
+/// See `kernels/src/attention_dflash_wmma_n64.hip` and the rocprof
+/// investigation in `docs/plans/dots-ocr.perf-investigation.md`.
+pub const ATTENTION_DFLASH_WMMA_N64_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64.hip");
+
+/// N=64 variant that consumes K and V already stored as **f16 in DRAM**
+/// (Q and output stay f32). Halves the attention DRAM traffic for K and
+/// V — the dominant cost on memory-bound vision-encoder shapes per the
+/// rocprof analysis. Caller is responsible for casting K and V from f32
+/// to f16 once (see `cast_f32_to_f16`) before calling this kernel; the
+/// cast cost (~120 MB) is trivial against the ~73 GB K+V DRAM traffic
+/// per attention call at vision shape.
+/// See `kernels/src/attention_dflash_wmma_n64_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_N64_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n64_f16kv.hip");
+
+/// N=128 variant — K-tile 128, K/V f16 in DRAM, V_lds and S_lds in
+/// f16. Same shape as the N=64 f16-K/V sibling but with twice the
+/// K-tile width, halving the outer-loop trip count (and therefore
+/// __syncthreads / softmax / alpha-scale overhead per attention call).
+/// Only feasible because moving V_lds and S_lds to f16 reclaimed
+/// enough LDS budget to fit a 128-row V_lds.
+/// See `kernels/src/attention_dflash_wmma_n128_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_n128_f16kv.hip");
+
+/// M=64 N=128 variant — 4-wave block, 64 queries per block (vs 32 in
+/// the N128 sibling). Halves the query-block count B/M from 610 to
+/// 305 at vision shape, which halves K and V DRAM traffic per
+/// attention call (~73 GB → ~36.5 GB at f16). O moves from O_lds to
+/// per-lane O_frags register arrays (8 float8_t in WMMA frag_c
+/// layout = 64 VGPRs/lane) to free the LDS budget that the doubled
+/// query rows would have eaten.
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv.hip");
+
+/// V2 of M=64 N=128 — adds (a) S_lds row padding 128 → 130 to break
+/// a 16-way LDS bank conflict in phase C's S_lds reads, and (b)
+/// cooperative wave-32 softmax (each row uses all 32 lanes via
+/// __shfl_xor butterfly, vs 1 lane sequential over 128 vals).
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v2.hip");
+
+/// V3 of M=64 N=128 — keeps v2's S_lds padding + cooperative softmax
+/// and adds hoisted S_lds reads in phase C (outer c, inner dc) so
+/// each a_reg_sm row chunk is read once per c instead of once per
+/// (dc, c). Reduces phase C S_lds reads from 1024/lane/iter to
+/// 128/lane/iter. O alpha-folded at start of phase C so SV
+/// accumulates directly into the running output.
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
+
+/// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
+/// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
+pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");
+
+/// In-place F32 → bf16 → F32 round-trip. Truncates each F32 to bf16's
+/// 7-bit mantissa with round-to-nearest-even. Used by the dots.ocr
+/// vision encoder to match HF's bf16 forward path at residual-stream
+/// points. See `kernels/src/bf16_round_trip.hip`.
+pub const BF16_ROUND_TRIP_SRC: &str = include_str!("../../../kernels/src/bf16_round_trip.hip");
+
 /// Batched partial-interleaved RoPE — per-row positions read from a
 /// positions[] array. Used by the batched prefill FA path.
 #[cfg(feature = "deltanet")]
