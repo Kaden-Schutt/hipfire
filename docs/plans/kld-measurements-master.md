@@ -1,7 +1,7 @@
 # KLD Measurements — Master Table
 
 **Status:** Living document. Append new measurements; do not delete.
-**Last updated:** 2026-05-20 (27B mixed-bits row landed in §3.2: `mq3-body-mq4-lmhead-kvq8-c256` KLD 0.3082 PPL 9.86 on gfx1100 KV=q8 n=256, file 11.943 GB at 3.55 bpw — first true mixed-format Stage D build via per-tensor n_bits dispatch (commit 7915ed6f). +136% KLD vs all-MQ4 A100 row (0.1307) for −1.0 bpw saving; the body's 3-bit precision floor dominates the size win. Coherence eyeball clean. Prior: 2026-05-18 — canonical 9B 4-bit headline landed §1.1j: mq4-awq-gptq-f2-q8head KLD 0.1727 PPL 8.42 on gfx1100 KV=q8 n=256, superseding §1.1f's 0.1842 by 6% KLD / 12% PPL. AWQ+GPTQ Δ vs plain-q8head at clean A/B = −20% KLD / −3.8% PPL, CIs essentially non-overlapping. Cross-engine gap to llama.cpp UD-Q3_K_XL holds at +24% Δ at matched bpw. Earlier today: cleanup pass — removed self-flagged rows (§1.1 q8f16 Tier-2, §1.1d FWHT n=20, §1.1f n=20 smokes, §2.2 q8f16 0.0806, §2.4.1 FLIPPED). 27B first-light cohort §3.2 — AWQ+GPTQ −38% KLD. 9B MQ3 cohort §1.4 — AWQ+GPTQ 2.77× KLD at 3-bit. Prior: 2026-05-15 PM — 4B Stage B GPTQ §3.1 KLD 0.0662; F2 AWQ whitelist; §1.1h K-map AWQ; §1.1i F2 α=0.55.)
+**Last updated:** 2026-05-26 — restructured into two summary tables (**Winning quants** + **Experiments**, immediately below). The dated narrative log is preserved unchanged in §0–§6 (see §5 for the chronological findings catalog). Most recent data: 27B mixed-bits `mq3-body-mq4-lmhead` (§3.2, 2026-05-20), 9B `lmhead-a100` 4-bit KLD headline + MQ3 inverse-direction result (§1.1k / §1.4a, 2026-05-19).
 
 **Provenance note (2026-05-18 import):** rows §1.1 through §4A were carried over from `feat/mq-v2-quant-format` (which was split into multiple PRs, not merged whole). Some of those measurements pre-date subsequent code fixes on master (e.g. May-16 Q8 attention NaN #264, F16 lm_head shim #265, hipGraph H2D capture fix #7790ac6a). Heuristic: better KLD numbers are more likely to be representative of current code. Re-measurement on master is welcome for any specific row; if the new number is materially lower, replace and note the SHA delta.
 **Owner:** hipfire eval
@@ -9,6 +9,100 @@
 **Cross-engine framework:** Δ-above-own-Q8 (TL;DR + §2.4.1 + [engine-drift memory](../../memory/project_engine_drift_floor_decomposition.md)). Absolute `KLD(engine || HF-bf16)` is NOT a cross-engine output-quality metric — see §6 rule 8.
 
 This doc is the single place to look for every KLD/PPL number we've measured against the BF16 reference. Pull-out tables in other docs (`qwen35-mq4-quality-gap.md` §1.5, `awq_hipfire.md`, individual cohort `result-table.md` files) are derived views; this is the source-of-truth catalog.
+
+The two tables below are the summary view; **§0–§6 are the detailed research log** (mechanism, CIs, working-artifact paths, dated findings). Every row links back to its log section.
+
+---
+
+## Winning quants
+
+Best measured **hipfire** recipe per **model × size × bpw band**, ranked by **KLD ↓** —
+the primary quality metric per [issue-113 §2](issue-113-quant-quality-eval.md): KLD
+scores full-distribution fidelity to the BF16 reference, not just argmax confidence.
+All rows are `prefill` scoring against the BF16 `kldref`. Where a *different* recipe
+wins **PPL** (argmax / greedy quality) the split is footnoted — the two objectives
+diverge often enough (the recurring **KLD-vs-PPL inversion**, see §1.1e.i / §1.1h /
+§1.4a) that the right pick depends on the workload: **KLD** for sampling, spec-decode
+draft/target acceptance, and RL reward modeling; **PPL** for greedy decode.
+
+| Model · size | bpw band | Best recipe (by KLD) | bpw | KLD ↓ | PPL | KV | n | Arch | Detail |
+|---|---|---|---:|---:|---:|---|---:|---|---|
+| Q3.5-9B | 8-bit | `q8f16` (Tier-3 fused WMMA) | 8.50 | **0.0173** | 9.189 | q8 | 256 | gfx1151 | §1.1b |
+| Q3.5-9B | 6-bit | `mq6 + Q8 conv1d` | ~6.50 | **0.0510** | 9.186 | q8 | 512 | gfx1151 | §1.1e |
+| Q3.5-9B | 5-bit | `mq4-kmd2 + Q8 conv1d` | ~5.04 | **0.1613** | 9.172 | q8 | 512 | gfx1151 | §1.1g |
+| Q3.5-9B | 4-bit | `mq4-awq-gptq-f2-lmhead-a100` ¹ | 4.74 | **0.0863** | 9.374 | q8 | 256 | gfx1100 | §1.1k |
+| Q3.5-9B | 3-bit | `mq3-awq-gptq` (Q8 lm_head) | ~3.80 | **0.1967** | 11.645 | q8 | 256 | gfx1151 | §1.4 |
+| Q3.5-4B | 4-bit | `mq4-awq+gptq+Q8conv1d` | ~4.25 | **0.0662** | 10.712 | q8 | 512 | gfx1151 | §3.1 |
+| Q3.5-0.8B ⚠ | 8-bit | `q8f16` (Tier-3) | 8.50 | 0.0041 | — | q8 | 512 | gfx1100 | §4.1 |
+| Q3.5-0.8B ⚠ | 4-bit | `mq4-awq+gptq+Q8conv1d` (post-OBS-fix) | ~4.25 | 0.0478 | 18.24 | q8 | 512 | gfx1100 | §5 |
+| Q3.6-27B | 4-bit | `mq4-awq-gptq-f2-q8head` (V100) ² | ~4.50 | **0.1257** | 8.697 | q8 | 256 | gfx1100 | §3.2 |
+| Q3.6-27B | 3.5-bit (mixed) | `mq3-body-mq4-lmhead` | 3.552 | 0.3082 | 9.856 | q8 | 256 | gfx1100 | §3.2 |
+
+**Notes:**
+
+¹ **9B 4-bit is a dual headline.** `lmhead-a100` is **KLD-optimal** (0.0863). The
+PPL-optimal sibling is `mq4-awq-gptq-f2-q8head` (~4.4 bpw → KLD 0.1727 / **PPL 8.417**,
+§1.1j): it wins PPL by ~10% but loses KLD by 2×. Note also that this 4-bit `lmhead-a100`
+row (0.0863) beats the 5-bit `mq4-kmd2` row (0.1613) on KLD — the band-vs-KLD progression
+is **not monotonic** because `lmhead-a100` is an exceptionally tuned recipe the 5-bit row
+hasn't received. This 4-bit row is also hipfire's first to land inside the llama.cpp
+K-quants Pareto frontier on absolute KLD (beats Q4_K_M despite −0.33 bpw; see §1.1k).
+
+² **27B 4-bit V100 vs A100 is a statistical tie.** The A100-calibrated sibling
+`mq4-awq-gptq-f2-lmhead-a100` (4.458 bpw) measures KLD 0.1307 / PPL 8.663 — V100 wins
+KLD by 4%, A100 wins PPL + tail. Calibration host is ~noise at 27B (the opposite of 9B,
+where `lmhead-a100` cut KLD ~50% — see §3.2 for why the recipe didn't transfer by size).
+
+⚠ **Q3.5-0.8B is intrinsically incoherent on hipfire at every precision** — even the Q8
+floor babbles (DeltaNet depth × recurrence pedestal, §5 2026-05-14 retraction). Its
+KLD/PPL numbers are valid **only for ranking recipes against each other**, never as ship
+signals. The smallest coherence-valid model is **4B**.
+
+## Experiments
+
+Every other measured row: baselines (no calibration), single-lever ablations, α-sweeps,
+cross-arch reproductions, dropped / falsified recipes, and llama.cpp cross-engine
+reference anchors. Headline KLD/PPL only — CIs, mechanism, and artifact paths live in
+the linked detail section. `—` = not recorded in this summary (see detail).
+
+| Model · size | Recipe / probe | Category | bpw | KLD | PPL | KV | n | Detail |
+|---|---|---|---:|---:|---:|---|---:|---|
+| Q3.5-9B | `mq4-base` | baseline | 4.25 | 0.3376 | 9.116 | asym3 | 512 | §1.1 |
+| Q3.5-9B | `mq4-awq` | lever: AWQ only | 4.25 | 0.2800 | 9.271 | asym3 | 512 | §1.1 |
+| Q3.5-9B | `hfp4` / `mfp4` / `*-l4-l5c` (FP4 family) | format (all worse) | ~4.5–5.0 | 0.46–0.78 | — | asym3 | 512 | §1.1 |
+| Q3.5-9B | `mq4-plain-q8head` | baseline (A/B partner) | ~4.4 | 0.2149 | 8.746 | q8 | 256 | §1.1j |
+| Q3.5-9B | `mq4-awq-gptq-f2-q8head` | **PPL-best 4-bit** (alt headline) | ~4.4 | 0.1727 | 8.417 | q8 | 256 | §1.1j |
+| Q3.5-9B | `mq4-q8conv1d` | lever: Q8 conv1d only | 4.25 | 0.2501 | 8.789 | q8 | 512 | §1.1f |
+| Q3.5-9B | `mq4-awq + Q8 conv1d` | stack (superseded by §1.1j/k) | 4.25 | 0.1842 | 9.575 | q8 | 512 | §1.1f |
+| Q3.5-9B | `mq4-lloyd` | **dropped** — Lloyd null at 4-bit | ~4.91 | 0.3114 | 9.085 | q8 | 512 | §1.1c |
+| Q3.5-9B | `mq4-kmd2` (no AWQ) | lever: mixed MQ4/MQ6 | ~4.81 | 0.1859 | 9.661 | asym3 | 256 | §1.1h |
+| Q3.5-9B | `mq4-kmd2-awq` | stack (asym3; ~0.11 q8-equiv est.) | ~5.75 | 0.1485 | 9.844 | asym3 | 256 | §1.1h |
+| Q3.5-9B | F1 α=0.5 (184 sidecars) | AWQ whitelist | 4.25 | 0.1725 | 9.54 | q8 | 256 | §1.1h |
+| Q3.5-9B | F2 α=0.5 (248 sidecars) | AWQ whitelist — KLD-flat, PPL −6.6% | 4.25 | 0.1724 | 8.91 | q8 | 256 | §1.1h |
+| Q3.5-9B | F2 α=0.55 (gfx906) | α-sweep — PPL optimum | 4.25 | 0.1830 | 8.79 | q8 | 100 | §1.1h |
+| Q3.5-9B | F2 α=0.55 (gfx1151) | α-sweep — cross-arch repro | 4.25 | 0.1855 | 8.785 | q8 | 100 | §1.1i |
+| Q3.5-9B | `mq3-rtn` | baseline: naked MQ3 | 3.25 | 0.5449 | 13.45 | q8 | 256 | §1.4 |
+| Q3.5-9B | `mq3-awq-gptq-f2-lmhead-a100` | **dropped** — inverse-direction at 3-bit | ~4.0 | 0.2613 | 10.440 | q8 | 256 | §1.4a |
+| Q3.5-0.8B | `q8f16` (Tier-2, asym3) | floor | 8.50 | 0.1256 | 19.633 | asym3 | 512 | §2.1 |
+| Q3.5-0.8B | `mq4-base` | baseline | 4.25 | 0.2675 | 22.088 | q8 | 512 | §2.2 |
+| Q3.5-0.8B | `mq4-awq` | lever: AWQ only | 4.25 | 0.2531 | 22.149 | q8 | 512 | §2.2 |
+| Q3.5-0.8B | `mq4-awq + Q8 conv1d` | stack — no-GPTQ best | 4.25 | 0.1366 | 19.61 | q8 | 512 | §5 |
+| Q3.5-0.8B | `mq4-gptq` (alone) | **dropped** — GPTQ alone hurts | 4.25 | 0.3908 | — | q8 | 512 | §5 |
+| Q3.5-0.8B | `mq4-awq+gptq` (no conv1d) | **dropped** — GPTQ regresses at 0.8B | 4.25 | 0.3371 | — | q8 | 512 | §5 |
+| Q3.6-27B | `mq4-plain-q8head` | baseline (A/B partner) | ~4.5 | 0.2034 | 8.584 | q8 | 256 | §3.2 |
+| Q3.6-27B | `mq4-awq-gptq-f2-lmhead-a100` | A100 sibling (tied with V100) | 4.458 | 0.1307 | 8.663 | q8 | 256 | §3.2 |
+| llama.cpp 9B | Q8_0 | anchor (floor) | 8.50 | 0.0163 | 9.31 | f16 | — | §1.2 |
+| llama.cpp 9B | UD-Q6_K_XL | anchor | ~6.7 | 0.0213 | 9.14 | f16 | — | §1.2 |
+| llama.cpp 9B | Q6_K | anchor | 6.56 | 0.0250 | 9.31 | f16 | — | §1.2 |
+| llama.cpp 9B | UD-Q5_K_XL | anchor | ~5.5 | 0.0408 | 9.27 | f16 | — | §1.2 |
+| llama.cpp 9B | UD-Q4_K_XL | anchor | 5.32 | 0.0670 | 9.34 | f16 | — | §1.2 |
+| llama.cpp 9B | Q4_K_M | anchor | 5.07 | 0.1249 | 8.70 | f16 | — | §1.2 |
+| llama.cpp 9B | UD-Q3_K_XL | anchor (bpw-matched 4-bit) | ~4.50 | 0.1411 | 8.67 | f16 | — | §1.2 |
+| llama.cpp 0.8B | Q4_K_M | anchor | 5.07 | 0.0351 | 17.33 | q8 | 1175 | §2.3 |
+
+**Unmeasured / queued** (no row yet): MQ3-Lloyd, MQ4-Lloyd (gated on PR #197), MQ2-Lloyd
+(§4A.1); Qwen3.5-A3B (task #8); 27B llama.cpp anchors (§3.2 next priority); MQ3 + lm_head-MQ4
++ AWQ at sub-9B (§1.4a #2). Open KV-mode floor measurements in §4.3.
 
 ---
 
