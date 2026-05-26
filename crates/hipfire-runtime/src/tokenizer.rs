@@ -1202,7 +1202,7 @@ impl Tokenizer {
         for &id in &ids {
             counts[HeatClass::from_rank(self.rank_of(id, &table)) as usize] += 1;
         }
-        if std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1") {
+        if crate::config::get().prompt_heat_json {
             let mut s = String::with_capacity(2048);
             s.push_str("{\"bytes\":");
             s.push_str(&text.len().to_string());

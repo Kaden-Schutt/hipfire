@@ -358,7 +358,7 @@ fn uniform_split_counts(n_devices: usize, n_layers: usize) -> Vec<usize> {
 /// `HIPFIRE_DEVICES=0,1` selects the first two HIP-visible devices. When
 /// unset, takes the first `n_devices` visible IDs.
 fn resolve_device_ids(n_devices: usize) -> HipResult<Vec<i32>> {
-    if let Ok(s) = std::env::var("HIPFIRE_DEVICES") {
+    if let Some(ref s) = crate::config::get().devices {
         let ids: Vec<i32> = s
             .split(',')
             .map(|p| p.trim())
@@ -393,7 +393,7 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
-    let allow_mixed = std::env::var("HIPFIRE_ALLOW_MIXED_ARCH")
+    let allow_mixed = if crate::config::get().allow_mixed_arch { Ok("1".to_string()) } else { Err(std::env::VarError::NotPresent) }
         .ok()
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -430,7 +430,7 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
+    let tol_gb = match crate::config::get().uniform_vram_tolerance_gb { Some(t) => Ok(t.to_string()), None => Err(std::env::VarError::NotPresent) }
         .ok()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);

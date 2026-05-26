@@ -1579,9 +1579,7 @@ impl PrefillBatchScratch {
 
         let tile_size = 128usize;
         let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-        let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let batch_mult = crate::config::get().flash_partials_batch
             .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
             .unwrap_or(16);
         let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
@@ -1672,7 +1670,7 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback = !crate::config::get().prefill_batched;
     const MIN_BATCH: usize = 4;
     let arch = gpu.arch.as_str();
     let kv_ok = kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
