@@ -130,9 +130,9 @@ impl ArchCaps {
         // Env-gated capabilities
         let has_hfq3_dp4a  = flags.hfq3_dp4a.unwrap_or(false) && has_hfq3_sdot4;
         // Issue #300: production HFQ3/HFQ4 MMQ prefill is default-on for
-        // the supported RDNA allowlists; env flags remain escape hatches.
+        // the supported sdot4 gfx10 allowlist; env flags remain escape hatches.
         let has_hfq3_mmq   = flags.hfq3_mmq.unwrap_or(true) && has_hfq3_sdot4;
-        let has_hfq4_mmq   = flags.hfq4_mmq_rdna2.unwrap_or(true) && has_dot2_f32_f16;
+        let has_hfq4_mmq   = flags.hfq4_mmq_rdna2.unwrap_or(true) && has_hfq3_sdot4;
         let has_cdna3_lds_gemv = flags.gfx942_lds_gemv.unwrap_or(false);
 
         // Tuning parameters
@@ -395,6 +395,19 @@ mod tests {
         }
         assert!(!make_caps("gfx906").has_dot2_f32_f16());
         assert!(!make_caps("gfx1010").has_dot2_f32_f16());
+    }
+
+    #[test]
+    fn hfq4_mmq_coverage_stays_on_sdot4_archs() {
+        for arch in &["gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032"] {
+            assert!(make_caps(arch).has_hfq4_mmq(), "hfq4 mmq missing for {arch}");
+        }
+        for arch in &[
+            "gfx906", "gfx1010", "gfx1100", "gfx1101", "gfx1102", "gfx1103",
+            "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201",
+        ] {
+            assert!(!make_caps(arch).has_hfq4_mmq(), "hfq4 mmq should not compile on {arch}");
+        }
     }
 
     #[test]
