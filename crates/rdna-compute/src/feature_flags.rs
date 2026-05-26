@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 #[derive(Debug, Clone)]
 pub enum Mb4Mode {
     Pack1,
