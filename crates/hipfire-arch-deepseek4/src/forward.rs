@@ -6578,29 +6578,54 @@ fn ffn_batched(
         )
         .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped gate_up l{layer_idx}: {e:?}"))?;
 
-        // Unscatter [m_total × 2*im] → [B, k_top, im] gate + up. Padded
-        // slots are dropped (sorted_slot_index == -1 lanes).
-        gpu.moe_gate_up_unscatter_k8(
-            &pbs.moe_y_gate_up_grouped,
-            &pbs.moe_sorted_slot_index,
-            &pbs.moe_gate_batch,
-            &pbs.moe_up_batch,
-            im,
-            k_top,
-            m_total_max,
+        // Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric
+        // clamp. One launch instead of two; eliminates `moe_up_batch`
+        // write traffic. Byte-identical output (verified A/B at temp=0).
+        // Measured perf at PP_BATCH=512 / 2.1k-tok prompt: -0.4% prefill —
+        // launch-overhead savings cancelled by per-thread overhead, per
+        // feedback_kernel_fusion. Default OFF; opt in via
+        // HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU=1.
+        let use_fused_unscatter_silu = std::env::var(
+            "HIPFIRE_DEEPSEEK4_FUSED_UNSCATTER_SILU",
         )
-        .map_err(|e| format!("moe_gate_up_unscatter_k8 l{layer_idx}: {e:?}"))?;
+        .map(|s| s != "0")
+        .unwrap_or(false);
+        if use_fused_unscatter_silu {
+            gpu.moe_unscatter_silu_clamp_k8(
+                &pbs.moe_y_gate_up_grouped,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_gate_batch,
+                im,
+                k_top,
+                m_total_max,
+                cfg.swiglu_limit,
+            )
+            .map_err(|e| format!("moe_unscatter_silu_clamp_k8 l{layer_idx}: {e:?}"))?;
+        } else {
+            // Unscatter [m_total × 2*im] → [B, k_top, im] gate + up. Padded
+            // slots are dropped (sorted_slot_index == -1 lanes).
+            gpu.moe_gate_up_unscatter_k8(
+                &pbs.moe_y_gate_up_grouped,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_gate_batch,
+                &pbs.moe_up_batch,
+                im,
+                k_top,
+                m_total_max,
+            )
+            .map_err(|e| format!("moe_gate_up_unscatter_k8 l{layer_idx}: {e:?}"))?;
 
-        // SwiGLU + clamp (unchanged from scalar path; reads gate,up writes gate).
-        gpu.deepseek4_silu_mul_clamp_f32_batched(
-            &pbs.moe_gate_batch,
-            &pbs.moe_up_batch,
-            &pbs.moe_gate_batch,
-            im,
-            batch_size * k_top,
-            cfg.swiglu_limit,
-        )
-        .map_err(|e| format!("silu_mul_clamp grouped routed l{layer_idx}: {e:?}"))?;
+            // SwiGLU + clamp (unchanged from scalar path; reads gate,up writes gate).
+            gpu.deepseek4_silu_mul_clamp_f32_batched(
+                &pbs.moe_gate_batch,
+                &pbs.moe_up_batch,
+                &pbs.moe_gate_batch,
+                im,
+                batch_size * k_top,
+                cfg.swiglu_limit,
+            )
+            .map_err(|e| format!("silu_mul_clamp grouped routed l{layer_idx}: {e:?}"))?;
+        }
 
         // FWHT rotate (unchanged).
         gpu.rotate_x_mq_batched(

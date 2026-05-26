@@ -15131,6 +15131,68 @@ impl Gpu {
         result
     }
 
+    /// Phase D1 fused unscatter + SwiGLU + asymmetric clamp.
+    /// Combines `moe_gate_up_unscatter_k8` + `deepseek4_silu_mul_clamp_f32_batched`
+    /// into one launch. Writes silu(clamp(gate)) * clamp(up) directly to
+    /// `moe_gate_batch`. The `moe_up_batch` intermediate is no longer
+    /// produced — caller stops allocating it on the fused path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_unscatter_silu_clamp_k8(
+        &mut self,
+        y_grouped: &GpuTensor,         // [m_total × (2*mi)] f32
+        sorted_slot_index: &GpuTensor, // [m_total] i32
+        moe_gate_batch: &GpuTensor,    // [N × K_TOP × mi] f32, written
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_unscatter_silu_clamp_k8",
+            kernels::MOE_UNSCATTER_SILU_CLAMP_K8_SRC,
+            "moe_unscatter_silu_clamp_k8",
+        )?;
+        let yp = y_grouped.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = moe_gate_batch.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = k_top as i32;
+        let mt_val = m_total as i32;
+        let mut swiglu_lim = swiglu_limit;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &mut swiglu_lim as *mut _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (mi as u32 + block - 1) / block;
+        // BW: Y_grouped read (m_total*2*mi*4) + moe_gate_batch write
+        // (m_total*mi*4) + sorted_slot_index (m_total*4).  Half the
+        // write traffic vs the unfused path (no y_up output).
+        let bytes = (m_total * 2 * mi + m_total * mi + m_total) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_unscatter_silu_clamp_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_unscatter_silu_clamp_k8",
+            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp);
+                b.push_i32(mi_val); b.push_i32(kt_val); b.push_i32(mt_val);
+                b.push_f32(swiglu_lim);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// Batched HFQ4-G256 GEMM with fused residual add:
     ///   for b in 0..batch_size: y[b][row] += A[row] · x[b]
     ///

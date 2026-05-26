@@ -2011,13 +2011,19 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
         let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
         let state = deepseek4::DeepseekV4State::new(&config)?;
-        // Pre-allocate PrefillBatchScratch. Default B=64 — same as
-        // deepseek4_chat. Override via HIPFIRE_DEEPSEEK4_PP_BATCH. PBS sits in GPU
-        // memory for the model's lifetime; reused across every turn.
+        // Pre-allocate PrefillBatchScratch. Default B=1024 (bumped from 64
+        // on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):
+        //   PP=256: 46.4 tps   PP=512: 48.3 tps
+        //   PP=1024: 49.3 tps  PP=2048: 49.0 tps
+        // 1024 captures the L2-amortization peak; 2048 plateaus from PBS
+        // memory footprint exceeding effective L2/Inf-cache reuse window.
+        // PBS sits in (UMA) GPU memory for the model's lifetime — ~600 MB
+        // at B=1024 on V4-Flash, well within 128 GB. Override via
+        // HIPFIRE_DEEPSEEK4_PP_BATCH.
         let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(64);
+            .unwrap_or(1024);
         let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
         // Cache EOS token id. DeepSeek family uses `<｜end▁of▁sentence｜>`;
         // fall back to 1 if tokenizer lacks the entry.

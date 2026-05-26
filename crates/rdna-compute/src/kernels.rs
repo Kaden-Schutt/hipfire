@@ -1051,6 +1051,13 @@ pub const GEMM_Q8_0_WMMA_SRC: &str =
 pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
 
+/// Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric clamp.
+/// Replaces `MOE_GATE_UP_UNSCATTER_K8_SRC` followed by
+/// `DEEPSEEK4_SILU_MUL_CLAMP_F32_SRC` (batched) — eliminates the
+/// `moe_up_batch` intermediate buffer and saves 1 launch per layer.
+pub const MOE_UNSCATTER_SILU_CLAMP_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_unscatter_silu_clamp_k8.hip");
+
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
 /// x_residual. No atomic contention (each token's m column is owned by

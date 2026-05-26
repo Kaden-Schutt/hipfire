@@ -212,14 +212,13 @@ fn main() -> Result<(), String> {
     let mut state = DeepseekV4State::new(&cfg)?;
 
     // Batched prefill scratch — allocated once, reused for every turn.
-    // B=16 chosen 2026-05-21 from a 3-trials/cell sweep at prompt=706:
-    // B=8=39.2, B=16=44.5, B=32=44.2, B=64=43.3, B=128=43.0, B=512=42.3 tok/s.
-    // Plateau B=16..128 with gradual decline past 128 from L2/InfCache spill
-    // on activations. Override via HIPFIRE_DEEPSEEK4_PP_BATCH.
+    // B=1024 default (bumped from 16 on 2026-05-26). Sweep at 2.1k tokens:
+    // PP=256: 46.4, PP=512: 48.3, PP=1024: 49.3, PP=2048: 49.0 tps.
+    // Override via HIPFIRE_DEEPSEEK4_PP_BATCH.
     let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(16);
+        .unwrap_or(1024);
     let pbs = PrefillBatchScratch::new(&mut gpu, &cfg, pbs_max_batch)?;
 
     eprintln!("DeepSeek V4 ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
