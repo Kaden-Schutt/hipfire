@@ -346,4 +346,77 @@ impl FeatureFlags {
     pub fn hfq4_mmq_gfx906_y64_enabled(&self) -> bool {
         self.hfq4_mmq_gfx906_y64
     }
+
+    /// Test-only constructor: reads no env vars, uses defaults for the given arch.
+    /// Provides deterministic FeatureFlags for unit tests regardless of the
+    /// developer's env-var configuration.
+    #[doc(hidden)]
+    pub fn from_env_for_test(arch: &str) -> Self {
+        let is_gfx906 = arch == "gfx906";
+
+        let gemv_rows_default: u32 = match arch {
+            "gfx1100" | "gfx1101" | "gfx1102" => 1,
+            "gfx1030" | "gfx1031" => 1,
+            "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
+            _ => 2,
+        };
+
+        Self {
+            arch: arch.to_string(),
+            gemv_rows: None,
+            gemv_dp4a_default_on: is_gfx906,
+            gemv_dp4a: None,
+            gemv_prefetch: None,
+            gemv_prefetch_default_on: is_gfx906,
+            gfx942_lds_gemv: None,
+            gfx942_lds_gemv_default_on: false,
+            gemv_rows_default,
+            hfq3_dp4a: None,
+            hfq3_mmq: None,
+            hfq4_mmq_rdna2: None,
+            fp8_wmma: false,
+            dot2_gemv: false,
+            gcn5_wave64_hybrid: None,
+            mmq_override: None,
+            mmq_min_batch: None,
+            fp16_disabled: false,
+            fp16_layer_min: None,
+            fp16_layer_max: None,
+            wo_mmq: false,
+            lm_head_wmma_disabled: false,
+            mmq_screen: false,
+            mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
+            mmq_diag_quantize_only: false,
+            lloyd_mb4: None,
+            mq3_mb4: None,
+            hfq4g128_mmq: true,
+            hfq3_mmq_layer_min: None,
+            hfq3_mmq_layer_max: None,
+            hfq4_mmq_gfx906_y64: false,
+            gate_up_variant: None,
+            gfx942_gemv_v2: None,
+            gfx942_gemv_v3: false,
+            gfx942_rmsnorm_split: matches!(arch, "gfx940" | "gfx941" | "gfx942"),
+            gfx942_mfma_prefill: None,
+            moe_grouped_i8: None,
+            moe_grouped_i8_k8: false,
+            moe_grouped_i8_k4: false,
+            moe_grouped_i8_k4_gfx12: false,
+            moe_grouped_m2: false,
+            moe_hfq6_v2: false,
+            force_blob_path: false,
+            gemm_dump: false,
+            deterministic: false,
+            mw16: false,
+            q8_batched_legacy: false,
+            rope_interleaved_legacy: false,
+            wo_wmma_variant: None,
+            rocblas_all_archs: false,
+            rocblas_off: false,
+            rocblas_min_batch: None,
+            lloyd_force_baseline: false,
+            rdna2_variant: None,
+            hipcc_extra_flags: String::new(),
+        }
+    }
 }
