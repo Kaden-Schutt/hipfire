@@ -5814,7 +5814,7 @@ fn forward_prefill_chunk(
     // (silicon-validated on R9700, 2026-05-14, 4/4 unit tests PASS). Each
     // call site below selects the right variant via an `arch.starts_with`
     // branch. On non-WMMA archs we keep the Tier 2 chunked-substrate path.
-    let q8_wmma_arch = gpu.arch_caps.has_wmma_f16() || gpu.arch_caps.has_wmma_f16_gfx12();
+    let q8_wmma_arch = gpu.arch_caps.has_wmma();
     // MQ3 dispatch arch gate (same predicate, separate name for clarity at
     // each matcher). Phase 1 gfx10 MQ3 prefill (`docs/plans/gfx10_mq3_prefill.md`)
     // routes the 8 `is_mq3*` matchers below to scalar HFQ3 kernels on
@@ -7090,8 +7090,7 @@ fn forward_prefill_chunk(
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
-                let q8_wmma_arch = gpu.arch_caps.has_wmma_f16()
-                    || gpu.arch_caps.has_wmma_f16_gfx12();
+                let q8_wmma_arch = gpu.arch_caps.has_wmma();
 
                 if is_mq {
                     // AWQ-aware: next linear is LA's fused wqkv.
@@ -7319,8 +7318,7 @@ fn forward_prefill_chunk(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
-                 let q8_wmma_arch = gpu.arch_caps.has_wmma_f16()
-                     || gpu.arch_caps.has_wmma_f16_gfx12();
+                 let q8_wmma_arch = gpu.arch_caps.has_wmma();
                  // Fused QKV requires uniform dtype — see issue #249 for
                  // the dense FA variant. Gate the same way here.
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype

@@ -2459,7 +2459,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // small shapes regress (4× WG reduction + 106 VGPR leaves CUs idle).
         // Threshold tuning open — see Phase D plan §"Open questions" #3.
         // Env override: HIPFIRE_LLOYD_MB4=1 force-on, =0 force-off.
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_dgpu_1151();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
         let use_mb4 = match self.flags.lloyd_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
@@ -2649,7 +2649,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         // Phase D-B path selector — same gate as residual_mb4.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_dgpu_1151();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -2740,7 +2740,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_dgpu_1151();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -2824,7 +2824,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_dgpu_1151();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
         let use_mb4 = match self.flags.lloyd_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -3367,7 +3367,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         // mb4 path selector — same gate as MQ4-Lloyd's mb4 family.
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
@@ -3491,7 +3491,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -3656,7 +3656,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -3808,7 +3808,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -4182,7 +4182,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // Shape-gated: FP8 dot4 only when M is large enough that it
         // actually wins (FFN shapes). At M < 4096 the fallback wins or
         // ties; uniform-FP8 was net-negative in 9B Qwen 3.5 decode.
-        if self.arch_caps.has_wmma_fp8_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
             return self.gemv_hfp4g32_fp8_gfx12(a_raw, x, y, m, k);
         }
         // gfx11 (RDNA3) v_dot2_f32_f16 trickle-down: replaces the
@@ -4190,7 +4190,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // No new scratch (reuses ensure_fp16_x), no cross-kernel
         // context cost like the FP8 path had. Default-on for gfx11.
         // Kill switch HIPFIRE_DOT2_GEMV=0 for A/B benching.
-        if self.arch_caps.has_wmma_f16() && self.flags.dot2_gemv {
+        if self.arch_caps.has_wmma_w32() && self.flags.dot2_gemv {
             return self.gemv_hfp4g32_dot2_gfx11(a_raw, x, y, m, k);
         }
         self.gemv_hfp4g32_fallback(a_raw, x, y, m, k)
@@ -5153,7 +5153,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // when M ≥ FP8_GEMV_MIN_M does FP8 dot4 win measurably on this
         // path. Below threshold (e.g. wo M=2048), the FP8 fused-rotation
         // costs more than the dot4 ALU savings — keep the F32 fallback.
-        if self.arch_caps.has_wmma_fp8_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
             let x_fp8_ptr = self.rotate_x_mq_dual_fp8(x, x_rot, k)?;
             return self.gemv_hfp4g32_fp8_gfx12_with_fp8_ptr(a_raw, x_fp8_ptr, y, m, k);
         }
@@ -6422,7 +6422,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             //       (w_beta, w_alpha). Mirrors MQ3 phase-2 finding that
             //       gave +22% prefill on Qwen3.5 LA layers.
             //   (c) something else not aligned → fall through to dot2/wmma.
-            if self.arch_caps.hfq4_mmq_rdna2_enabled() {
+            if self.arch_caps.has_hfq4_mmq() {
                 let all_aligned = qkv_m % 128 == 0 && z_m % 128 == 0
                                && beta_m % 128 == 0 && alpha_m % 128 == 0;
                 if all_aligned {
@@ -6447,10 +6447,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 }
                 // else fall through to dot2/wmma
             }
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -6558,7 +6558,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // Auto-selector falls back to dot2 at small batch. Layer-gate
         // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
         // per-layer KLD attribution sweeps (#302).
-        if batch_size > 1 && self.arch_caps.hfq3_mmq_rdna2_enabled()
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
             && self.flags.hfq3_mmq_layer_gate_pass()
         {
             // Best case: all four output strides MMQ_Y-aligned → 4-way fused MMQ.
@@ -7187,13 +7187,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
             // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
             // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
-            if self.arch_caps.hfq4_mmq_rdna2_enabled() && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+            if self.arch_caps.has_hfq4_mmq() && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
                 return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -7293,7 +7293,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
         // safe at any batch_size. Layer-gate is a no-op when unset (#302).
-        if batch_size > 1 && self.arch_caps.hfq3_mmq_rdna2_enabled()
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
             && self.flags.hfq3_mmq_layer_gate_pass()
             && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0
         {
@@ -7302,7 +7302,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
-        if batch_size > 1 && self.arch_caps.hfq3_dp4a_enabled() {
+        if batch_size > 1 && self.arch_caps.has_hfq3_dp4a() {
             return self.gemm_qkv_hfq3g256_dp4a(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
@@ -7540,7 +7540,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq3g256_dot2(
                     a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -7933,15 +7933,15 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 }
             }
             // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 3).
-            if self.arch_caps.hfq4_mmq_rdna2_enabled() && gate_m % 128 == 0 && up_m % 128 == 0 {
+            if self.arch_caps.has_hfq4_mmq() && gate_m % 128 == 0 && up_m % 128 == 0 {
                 return self.gemm_gate_up_hfq4g256_mmq(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx12 (RDNA4)
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx11 (RDNA3)
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -8074,7 +8074,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
         // AND gate_m/up_m are MMQ_Y-aligned. Auto-selector falls back to dot2
         // at small batch. Layer-gate is a no-op when unset (#302).
-        if batch_size > 1 && self.arch_caps.hfq3_mmq_rdna2_enabled()
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
             && self.flags.hfq3_mmq_layer_gate_pass()
             && gate_m % 128 == 0 && up_m % 128 == 0
         {
@@ -8083,7 +8083,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
-        if batch_size > 1 && self.arch_caps.hfq3_dp4a_enabled() {
+        if batch_size > 1 && self.arch_caps.has_hfq3_dp4a() {
             return self.gemm_gate_up_hfq3g256_dp4a(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
@@ -8285,7 +8285,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -8373,7 +8373,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_hfq3g256_residual_{dot2,mmq_xN} which bind.
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
             }
@@ -8579,7 +8579,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkv_hfq3g256_{dot2,mmq_xN} which bind.
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq3g256_dot2(
                     a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
@@ -8747,7 +8747,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_gate_up_hfq3g256_{dot2,mmq_xN} which bind.
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
@@ -8971,7 +8971,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkvza_hfq3g256_{dot2,mmq_xN} which bind.
-        if !self.arch_caps.hfq3_sdot4_gfx10_enabled() {
+        if !self.arch_caps.has_hfq3_sdot4() {
             if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkvza_hfq3g256_dot2(
                     a_qkv, a_z, a_beta, a_alpha, x,
@@ -9965,7 +9965,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfp4g32_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
                 y_qkv, y_z, y_beta, y_alpha,
@@ -10160,7 +10160,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // HFQ3 mb4 path selector. Only triggers on gfx11; gfx12 keeps its
         // existing fast path (line below) since mb4 sibling not ported.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -10171,7 +10171,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 y_qkv, y_z, y_beta, y_alpha,
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfq3g256_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
                 y_qkv, y_z, y_beta, y_alpha,
@@ -10612,7 +10612,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -10621,7 +10621,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             return self.gemm_qkv_hfq3g256_wmma_mb4(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfq3g256_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
@@ -10859,11 +10859,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // conservative — see project_fp8_wmma_hfp4g32_2026_05_10.md
         // for the full N sweep. The decode-path FP8 win is on the
         // GEMV side (gemv_hfp4g32_fp8_gfx12), not WMMA.
-        if self.arch_caps.has_wmma_fp8_gfx12() && self.flags.fp8_wmma && batch_size >= FP8_WMMA_MIN_BATCH {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && batch_size >= FP8_WMMA_MIN_BATCH {
             return self.gemm_qkv_hfp4g32_wmma_fp8_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfp4g32_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
@@ -11119,7 +11119,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfp4g32_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
         self.gemm_hfp4g32_residual_wmma(a, x, y, m, k, batch_size)
@@ -11245,7 +11245,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfp4g32_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
@@ -11547,7 +11547,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
@@ -11556,7 +11556,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             return self.gemm_gate_up_hfq3g256_wmma_mb4(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq3g256_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
@@ -11986,7 +11986,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                         b
                     },
                 )
-            } else if self.arch_caps.gfx942_lds_gemv_enabled() && !self.arch_caps.gemv_prefetch_enabled() && (k as u32) * 4 <= 32768 {
+            } else if self.arch_caps.has_cdna3_lds_gemv() && !self.arch_caps.gemv_prefetch_enabled() && (k as u32) * 4 <= 32768 {
                 let kname = "gemv_hfq4g256_residual_gfx942";
                 self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_GFX942_SRC, kname)?;
                 let grid = ((m as u32) + 7) / 8;
@@ -13452,7 +13452,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // gfx1151 (Strix Halo iGPU) i8 MMQ port: lift the compute ceiling
         // from ~71 (FP16 WMMA) to ~140 TFLOPS (i8 WMMA). Opt-out via
         // HIPFIRE_MOE_GROUPED_I8=0; default ON for gfx1151 only.
-        let use_i8_gfx1151 = self.arch_caps.is_strix_halo()
+        let use_i8_gfx1151 = self.arch_caps.is_gfx1151()
             && self.flags.moe_grouped_i8.unwrap_or(true);
         if use_i8_gfx1151 {
             // Optional deeper-pipeline variants (opt-IN, default OFF).
@@ -14633,7 +14633,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // so narrow-batch calls pick mmq_x=16 and long-prefill picks
         // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
         // internally, so no alignment check needed.
-        if batch_size > 1 && self.arch_caps.hfq4_mmq_rdna2_enabled() {
+        if batch_size > 1 && self.arch_caps.has_hfq4_mmq() {
             return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
 
@@ -14702,12 +14702,12 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
 
             // WMMA on gfx12 (RDNA4): K2-unroll port
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
 
             // WMMA on gfx11+ (RDNA3): 16×16 tiled, ~8-10× over scalar
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
 
@@ -14793,7 +14793,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // OnceLock-cached so the env read is one-shot per process; the arch
         // match is a handful of cycles per dispatch call (not in any inner
         // loop). Default off. Layer-gate is a no-op when unset (#302).
-        if batch_size > 1 && self.arch_caps.hfq3_mmq_rdna2_enabled() && self.flags.hfq3_mmq_layer_gate_pass() {
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq() && self.flags.hfq3_mmq_layer_gate_pass() {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
@@ -16109,7 +16109,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         //            plans/k4_plan.md.
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let is_gfx115x = self.arch_caps.is_strix_halo_igpu();
+        let is_gfx115x = self.arch_caps.is_rdna3p5();
         // ksplit's atomicAdd reduction across K_SPLITS partials is fp-non-
         // associative — order varies with warp scheduling, so output bytes
         // drift between processes and between cold/hot runs. The drift is
@@ -16228,7 +16228,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let arch_supports_mb4 = self.arch_caps.is_rdna3_full();
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
             None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
@@ -16236,7 +16236,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if use_mb4 {
             return self.gemm_hfq3g256_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        if self.arch_caps.has_wmma_f16_gfx12() {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq3g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
         }
         self.ensure_kernel("gemm_hfq3g256_residual_wmma", kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_SRC, "gemm_hfq3g256_residual_wmma")?;
@@ -17076,7 +17076,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.has_wmma_f16() {
+        if !self.arch_caps.has_wmma_w32() {
             // No mw16 WMMA on non-RDNA3. The generic F16 GEMM writes [M,N],
             // while lm_head consumers expect [N,M], so preserve layout by
             // launching one row at a time.
@@ -17165,7 +17165,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         let wmma_eligible = batch_size > 1
-            && self.arch_caps.has_wmma_f16()
+            && self.arch_caps.has_wmma_w32()
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
@@ -17209,7 +17209,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         }
         // gfx11+: WMMA residual + zero-init.
         let wmma_eligible = batch_size > 1
-            && self.arch_caps.has_wmma_f16()
+            && self.arch_caps.has_wmma_w32()
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
@@ -17254,7 +17254,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // the correct variant per arch. Other archs (gfx10/906/94x) fall
         // through to the per-row GEMV path.
         let wmma_eligible = batch_size > 1
-            && (self.arch_caps.has_wmma_f16() || self.arch_caps.has_wmma_f16_gfx12())
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
@@ -17358,11 +17358,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if batch_size > 1 && !self.flags.fp16_disabled {
             // WMMA on gfx12 (RDNA4): _w32_gfx12 builtin (gfx11 builtin
             // does NOT pattern-match on gfx12 — see has_wmma_f16 comment).
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
             // gfx906: dp4a + wave64 batched residual (Phase A.2, plan v3.2.3
@@ -17604,10 +17604,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !self.flags.fp16_disabled {
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkvza_hfq6g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkvza_hfq6g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3, plan v3.2.3 §5.1
@@ -18090,10 +18090,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !self.flags.fp16_disabled {
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkv_hfq6g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
@@ -18531,10 +18531,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
         if batch_size > 1 && !self.flags.fp16_disabled {
-            if self.arch_caps.has_wmma_f16_gfx12() {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_gate_up_hfq6g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
-            if self.arch_caps.has_wmma_f16() {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
