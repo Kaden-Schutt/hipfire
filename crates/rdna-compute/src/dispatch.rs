@@ -2318,7 +2318,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// variant; other archs fall back to the baseline switch-dispatch path.
     pub fn gemv_mq3g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq3g256_lloyd")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -2363,7 +2363,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// fall back to the chip-agnostic baseline switch-dispatch path.
     pub fn gemv_mq4g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq4g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemv_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq4g256_lloyd")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -2468,7 +2468,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             return self.gemm_mq4g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -2530,7 +2530,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -2588,7 +2588,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb2")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -2662,7 +2662,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2752,7 +2752,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2836,7 +2836,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2900,7 +2900,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -2976,7 +2976,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemm_qkv_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3046,7 +3046,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemm_gate_up_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3104,7 +3104,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// gemv_mq3g256_lloyd_residual; same single-acc bug fix applies.
     pub fn gemv_mq4g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq4g256_lloyd_residual_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemv_mq4g256_lloyd_residual_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq4g256_lloyd_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -3152,7 +3152,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_gate_up_mq4g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_gate_up_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_gate_up_mq4g256_lloyd")?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
@@ -3197,7 +3197,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkvza_mq4g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_qkvza_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkvza_mq4g256_lloyd")?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -3256,7 +3256,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkv_mq4g256_lloyd")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
@@ -3307,7 +3307,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// 9B Lloyd-MQ3, gfx1100, per the 2026-05-06 decode profile).
     pub fn gemv_mq3g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq3g256_lloyd_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -3375,7 +3375,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -3433,7 +3433,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -3503,7 +3503,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 qkv_m, z_m, beta_m, alpha_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3580,7 +3580,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3667,7 +3667,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 q_m, k_m, v_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3738,7 +3738,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3818,7 +3818,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3882,7 +3882,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -3948,7 +3948,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_gate_up_mq3g256_lloyd")?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
@@ -3999,7 +3999,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkvza_mq3g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_qkvza_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkvza_mq3g256_lloyd")?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -4063,7 +4063,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch, self.flags.lloyd_force_baseline);
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
@@ -4207,7 +4207,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfp4g32")?;
         let func = &self.functions["gemv_hfp4g32"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -5422,7 +5422,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Uses `launch_maybe_blob` for HIPFIRE_GRAPH=1 capture safety.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq3g256")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -5461,7 +5461,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq3g256_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -5640,7 +5640,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch, self.flags.rdna2_variant);
+        let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
         self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
 
         let a_ptr = a_raw.buf.as_ptr();
@@ -11920,7 +11920,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
 
         let a_ptr = a_raw.buf.as_ptr();
@@ -26587,7 +26587,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
             }
             "hfq4" => {
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch, self.flags.rdna2_variant);
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
                 // Multi-projection fused kernels (LA 4-way, FA 3-way, FFN
@@ -26647,7 +26647,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
                 // Shares the HFQ4 fused kernels (same blob, different dispatch key)
                 // plus MQ-specific rotation kernels.
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch, self.flags.rdna2_variant);
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
                 specs.push(("fused_qkvza_hfq4g256",
