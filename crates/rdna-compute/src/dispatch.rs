@@ -60,6 +60,25 @@ pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 /// FP16 WMMA on the production prefill bench can lower it later.
 const FP8_WMMA_MIN_BATCH: usize = 1024;
 
+// AR-forward hipGraph policy (2026-05-15, after `<think>\n!!!!!` attractor
+// debug on Qwen3.5-27B mq4 gfx1100):
+//
+//   - `ar_forward_kernel_dirty`: true on init / after kernel module change.
+//     Forces direct dispatch on the very first call so any inline JIT or
+//     lazy hipMalloc happens outside a captured region.
+//   - `ar_forward_replay_enabled`: true only after the caller has signalled
+//     `end_decode_turn()` AND a capture exists AND kernels are not dirty.
+//     Until then, every forward call captures a fresh graph and launches it
+//     (correct output per call; cheaper than full direct on amortization).
+//
+// Why caller-driven commit instead of auto-enable: empirically, captured
+// graphs on this codebase + ROCm 7.2.2 sometimes snapshot stale kernarg
+// state mid-decode, producing a token-0 attractor on every replay. Gating
+// replay until a FULL decode turn completes via the captured-launch path
+// gives the captured graph the longest possible runway to be invalidated
+// by JIT recompilation; if a turn finishes coherently with capture+launch,
+// the same graph is more likely to replay coherently on the next turn.
+
 /// Minimum output dimension M at which the FP8-dot4 decode GEMV path
 /// is enabled. Below this, the fallback wins or ties on gfx1201
 /// (measured 0.92-1.03× on wo M=2048 K=2048 vs 1.17-1.21× on FFN
@@ -369,12 +388,16 @@ pub struct Gpu {
 
     /// AR `forward_scratch` (single-token decode) capture warmup flag.
     /// First call with `HIPFIRE_GRAPH=1` runs direct so kernel JIT and lazy
-    /// scratch allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel modules)
-    /// happen outside any captured region. Capturing the first call hits
-    /// `hipMalloc not permitted under stream capture`. Set after the first
-    /// direct run; the next call captures the graph for replay. Mirrors
-    /// `verify_warmed_up` but uses a scalar flag (no per-B keying).
-    pub ar_forward_warmed_up: bool,
+    /// AR-forward hipGraph capture/replay state. See block comment near
+    /// AR_FORWARD_WARMUP_CALLS in this file for policy.
+    /// True on init / after any kernel-module change. The next AR forward
+    /// runs direct (no capture) so inline JIT / lazy hipMalloc don't trip
+    /// `hipMalloc not permitted under stream capture`.
+    pub ar_forward_kernel_dirty: bool,
+    /// True after `end_decode_turn()` commits a capture (kernels clean,
+    /// graph_exec exists). Replay path enabled for next decode turn until
+    /// reset by kernel reload.
+    pub ar_forward_replay_enabled: bool,
 
     /// Per-B cache of captured verify-forward graphs. Each entry owns its
     /// graph + exec + the kernarg blobs that graph captured pointers into.
@@ -618,7 +641,8 @@ impl Gpu {
             captured_graph: None,
             graph_verify_n: None,
             graph_verify_warmup: 0,
-            ar_forward_warmed_up: false,
+            ar_forward_kernel_dirty: true,
+            ar_forward_replay_enabled: false,
             verify_graph_cache: HashMap::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
@@ -807,6 +831,44 @@ impl Gpu {
         self.hip.graph_launch(exec, stream)
     }
 
+    /// Caller signals end of a decode turn (EOS or max_tokens reached). If a
+    /// captured graph exists and kernels are clean, replay is enabled for the
+    /// next decode turn. Per the AR-forward hipGraph policy: "at least one
+    /// captured full turn must run before replay can be enabled."
+    /// No-op if no capture exists (e.g., turn ran fully direct because kernels
+    /// were dirty or graph was disabled by the caller).
+    pub fn end_decode_turn(&mut self) {
+        // bind_thread: skip - pure state (flips replay-enable bool, no GPU calls)
+        if !self.ar_forward_kernel_dirty && self.graph_exec.is_some() {
+            self.ar_forward_replay_enabled = true;
+        }
+    }
+
+    /// Drop the currently captured graph (if any) without touching kernel /
+    /// replay state. Used by the capture+launch hot-path to free the previous
+    /// per-call capture before recording a fresh one — bare `graph_destroy()`
+    /// would also mark kernels dirty + disable replay, which is wrong here.
+    pub fn drop_captured_graph(&mut self) {
+        self.bind_thread_or_warn();
+        if let Some(exec) = self.graph_exec.take() {
+            let _ = self.hip.graph_exec_destroy(exec);
+        }
+        if let Some(graph) = self.captured_graph.take() {
+            let _ = self.hip.graph_destroy(graph);
+        }
+        self.capture_blobs.clear();
+    }
+
+    /// Caller signals a kernel-module change (model load, dtype switch, etc).
+    /// Forces the next AR forward call to dispatch direct (no capture) so any
+    /// inline JIT / lazy hipMalloc happens outside a captured region. Replay
+    /// stays disabled until a fresh full turn completes via `end_decode_turn`.
+    pub fn mark_kernels_dirty(&mut self) {
+        // bind_thread: skip - pure state (flips dirty/replay bools, no GPU calls)
+        self.ar_forward_kernel_dirty = true;
+        self.ar_forward_replay_enabled = false;
+    }
+
     /// Destroy the captured graph and free all retained kernarg blobs.
     pub fn graph_destroy(&mut self) {
         self.bind_thread_or_warn();
@@ -819,14 +881,13 @@ impl Gpu {
         self.capture_blobs.clear();
         self.graph_verify_n = None;
         self.graph_verify_warmup = 0;
-        // Without this, model swap leaves the flag stuck on `true`. The
-        // forward path in qwen35::forward_scratch then jumps straight from
-        // graph_exec.is_none() into capture mode on the new model's first
-        // AR forward call, before kernel JIT / scratch allocations have
-        // happened against the new tensors. That trips
-        // "hipMalloc not permitted under stream capture" the same way
-        // verify_warmed_up does for the DFlash verify path.
-        self.ar_forward_warmed_up = false;
+        // Without this, model swap leaves replay enabled, so forward_scratch
+        // jumps straight to graph_launch on the new model's stale captured
+        // graph (whose kernel pointers reference the OLD model's weights).
+        // Mark kernels dirty so the next call goes direct and skips capture
+        // until JIT/scratch settles for the new model.
+        self.ar_forward_kernel_dirty = true;
+        self.ar_forward_replay_enabled = false;
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -12921,12 +12982,35 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // (Gate 1 microbench, opt-in only, default off). See
         // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
         let variant_override = self.flags.gate_up_variant.clone();
-        let (kernel_name, kernel_src) = match variant_override.as_deref() {
-            Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
-            _            => ("gemm_gate_up_hfq4g256_wmma",
-                             kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC),
-        };
+        // (kernel_name, kernel_src, m_tile, block_threads). m_tile is the
+        // per-block row count; block_threads is the wave/block size.
+        let (kernel_name, kernel_src, m_tile, block_threads) =
+            match variant_override.as_deref() {
+                Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC,
+                                 16, 32),
+                // k4 = 4-tile pipeline (more in-flight B loads for better BW
+                // utilization). Opt-in default-off; bench-measured 2026-05-21.
+                Some("k4")   => ("gemm_gate_up_hfq4g256_wmma_k4",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC,
+                                 16, 32),
+                // ldscoop = cooperative LDS weight staging for coalesced DRAM
+                // loads. All 32 threads load one row's weights at a time
+                // (128-byte coalesced cache lines), staged in LDS for the
+                // WMMA loop. Targets the 32% peak BW seen in base kernel.
+                Some("ldscoop") => ("gemm_gate_up_hfq4g256_wmma_ldscoop",
+                                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                                    16, 32),
+                // 2tile = 32 rows × 16 cols per block, 2 wave32 waves.
+                // Halves grid in M; both waves share the same X tile so
+                // L0/L1 cache absorbs the second wave's loads cheaply.
+                Some("2tile") => ("gemm_gate_up_hfq4g256_wmma_2tile",
+                                  kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
+                                  32, 64),
+                _            => ("gemm_gate_up_hfq4g256_wmma",
+                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                                 16, 32),
+            };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -12953,7 +13037,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         ];
 
         let total_m = gate_m + up_m;
-        let row_tiles = (total_m + 15) / 16;
+        let row_tiles = (total_m + m_tile - 1) / m_tile;
         let batch_tiles = (batch_size + 15) / 16;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
@@ -12964,7 +13048,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let result = self.launch_maybe_blob(
             kernel_name,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block_threads as u32, 1, 1],
             0,
             &mut params,
             || {
@@ -19020,6 +19104,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Gate covers gfx11 (RDNA3) AND gfx12 (RDNA4). The gfx12 family
+        // ships its own residual_wmma kernel sibling
+        // (gemm_hfq4g256_residual_wmma_gfx12); without this dispatch,
+        // gfx12 falls through to the scalar `gemm_hfq4g256` and pays the
+        // 8-10× per-call penalty (rocprof on R9700 / gfx1201 measured
+        // ~26.68% of composition cycle wall in this scalar path).
+        let arch = self.arch.as_str();
         let wmma_eligible = batch_size > 1
             && self.arch_caps.has_wmma_w32()
             && !self.flags.fp16_disabled
@@ -19030,7 +19121,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+            return if arch.starts_with("gfx12") {
+                self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            } else {
+                self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+            };
         }
         self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
@@ -19063,7 +19158,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
             return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
         }
-        // gfx11+: WMMA residual + zero-init.
+        // gfx11+ AND gfx12: WMMA residual + zero-init. Symmetric to the
+        // HFQ4 fix (commit 48dd8ba4) — gfx12 sibling kernel already ships
+        // (gemm_hfq6g256_residual_wmma_gfx12, see line ~15431 dispatch);
+        // this wrapper just needed the gate widened.
+        let arch_str = self.arch.as_str();
         let wmma_eligible = batch_size > 1
             && self.arch_caps.has_wmma_w32()
             && !self.flags.fp16_disabled
@@ -19074,7 +19173,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
             }
-            return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
+            return if arch_str.starts_with("gfx12") {
+                self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            } else {
+                self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+            };
         }
         // Fallback: use the residual dispatcher with zero-init Y. This
         // routes to fp16-packed or scalar depending on arch.
@@ -26278,6 +26381,64 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             )
         };
         result
+    }
+
+    /// Per-row temperature-scaled softmax probability gather. For each row
+    /// `r` in `[0, n_rows)`, returns `probs_out[r] = softmax(logits[r] / temp)[indices[r]]`
+    /// — i.e., the softmax probability of the specified token id in that
+    /// row's temperature-scaled distribution.
+    ///
+    /// Used by MTP residual-acceptance sampling spec-decode:
+    ///   - n_rows = 1: gather `p_draft(c_k)` after each draft sample
+    ///   - n_rows = K: batched gather of `p_target(c_k)` over K verify
+    ///     positions, avoiding the 6 MB D2H of full verify logits
+    ///
+    /// Launch: `n_rows` blocks × 256 threads. Numerically stable via
+    /// max-subtraction inside the kernel. `temp` must be > 0.
+    ///
+    /// Output D2H: `n_rows × 4` bytes (typically ≤ 24 B for K ≤ 6).
+    pub fn softmax_prob_gather_batched_f32(
+        &mut self,
+        logits: &GpuTensor,   // [n_rows × vocab] f32
+        indices: &GpuTensor,  // [n_rows] i32 (we use F32 storage; caller reinterprets)
+        probs_out: &GpuTensor,// [n_rows] f32
+        vocab: usize,
+        temperature: f32,
+        n_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(temperature > 0.0, "softmax_prob_gather_batched: temperature must be > 0");
+        assert!(n_rows >= 1, "softmax_prob_gather_batched: n_rows must be >= 1");
+        self.ensure_kernel(
+            "softmax_prob_gather_batched",
+            kernels::SOFTMAX_PROB_GATHER_BATCHED_SRC,
+            "softmax_prob_gather_batched",
+        )?;
+        let func = &self.functions["softmax_prob_gather_batched"];
+        let mut lp = logits.buf.as_ptr();
+        let mut ip = indices.buf.as_ptr();
+        let mut pp = probs_out.buf.as_ptr();
+        let mut vs = vocab as i32;
+        let mut tp = temperature;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut lp as *mut _ as *mut c_void,
+            &mut ip as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+        ];
+        let nth: u32 = 256;
+        let lds: u32 = nth * 4 + 4;  // scratch[256] + s_target slot
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_rows as u32, 1, 1],
+                [nth, 1, 1],
+                lds,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
     }
 
     /// Fused sigmoid(dn_beta) + alpha_gate(dn_alpha). Both ops are element-wise

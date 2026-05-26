@@ -74,6 +74,31 @@ fn f16_lm_head_mode_from_env() -> F16LmHeadMode {
 /// is `None`, LA layers fall back to the linear path (byte-exact with
 /// DFlash at topk=1; approximation at topk>1 — used by pre-Phase-3
 /// callers that haven't been rewritten).
+
+/// Override the embedding for a single batch slot after the embedding-lookup
+/// kernel runs but before the layer loop. Used by the Qualcomm-style MTP
+/// probe (mtp_probe.rs) to inject mask-token embeddings whose values come
+/// from prompt-mean rather than the embedding table.
+///
+/// Default callers pass `None`; passing `Some(_)` triggers a single
+/// host-to-device memcpy into `pbs.x_batch.buf` at byte offset
+/// `slot * config.dim * 4` AFTER the embedding-lookup kernel populates
+/// the batched-x scratch and BEFORE the first layer reads it.
+///
+/// Constraints:
+///   - `slot < tokens.len()` of the call (asserted)
+///   - `embed.len() == config.dim` (asserted)
+///   - The override is applied unconditionally to whichever chunk's range
+///     contains `slot`. Multi-chunk callers MUST size the prefill batch
+///     scratch to keep their target slot in chunk 0, or pass the override
+///     only on the chunk where `slot < chunk_n`. (For the MTP probe the
+///     entire mask block fits in one chunk by construction.)
+#[derive(Clone, Copy)]
+pub struct MaskEmbedOverride<'a> {
+    pub slot: usize,
+    pub embed: &'a [f32],
+}
+
 #[derive(Clone, Copy)]
 pub struct TreeVerifyCtx<'a> {
     pub positions: &'a [i32],
@@ -4279,7 +4304,25 @@ pub fn forward_scratch(
     let graph_arch_default =
         gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
     let graph_enabled = graph_override.unwrap_or(graph_arch_default);
-    let use_graph = graph_enabled && (config.num_experts == 0 || allow_moe);
+    // AR-forward hipGraph DISABLED (2026-05-15) — this disable SUPERSEDES the
+    // arch-default re-enable merged from master (`graph_enabled` above is kept
+    // live so the HIPFIRE_GRAPH parse and kill switch stay wired for when the
+    // path is flipped back on). Empirically on ROCm 7.2.2 + gfx11 +
+    // Qwen3.5-27B mq4, both replay AND capture+launch produce a token-0
+    // attractor outside very narrow conditions:
+    //   - Capture+launch at position 2 (after 1 direct warmup) → `!!!!!`
+    //   - Capture+launch at position 4 (after 3 direct warmups) → correct
+    //   - Replay of a working capture (any position) → `!!!!!` from pos+1 on
+    // The kernarg-snapshot bug isn't fixable by warmup tuning OR caller-driven
+    // commit gating (`end_decode_turn()`); both fail empirically. Master's
+    // task-#100 fix targets MoE drift, NOT this AR-forward attractor, so the
+    // merge does not clear the disable. Until the capture/replay attractor is
+    // re-verified gone on current ROCm (7.13) via the coherence gate, AR
+    // forward is direct-only. Policy infra (`ar_forward_kernel_dirty`,
+    // `ar_forward_replay_enabled`, `end_decode_turn()`, `drop_captured_graph()`)
+    // is preserved on Gpu so the path can be flipped on once the bug is fixed.
+    let use_graph = false;
+    let _ = (graph_enabled, allow_moe, gpu.ar_forward_replay_enabled);  // suppress unused warnings
 
     // Embedding lookup into scratch.x (always direct, changes per token)
     match weights.embd_format {
@@ -4290,54 +4333,37 @@ pub fn forward_scratch(
         _ => panic!("unsupported embedding format"),
     }
 
-    // Compact offset (TriAttention eviction) breaks graph capture/replay:
-    // during replay, stream_write_value32 updates pos_buf but the captured
-    // H2D copy of (pos + compact_offset) inside FA layers overwrites it,
-    // causing RoPE to read stale positions. Fall back to direct execution.
-    let no_compact = kv_cache.compact_offset == 0;
-
-    if use_graph && gpu.graph_exec.is_some() && no_compact {
-        // ── Graph replay path ──
-        // Update pos_buf on the device via stream write (no host→device copy).
-        let stream = gpu.active_stream.as_ref().unwrap();
-        gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
+    let pos_i32 = pos as i32;
+    if use_graph && gpu.ar_forward_replay_enabled && gpu.graph_exec.is_some() {
+        // ── Replay path: caller has signalled end_decode_turn() since the
+        // last capture AND kernels are not dirty. Cheapest path. ──
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         gpu.graph_launch()?;
-    } else if use_graph && gpu.graph_exec.is_none() && no_compact {
-        let pos_i32 = pos as i32;
-        if !gpu.ar_forward_warmed_up {
-            // ── Warmup: run direct so kernel JIT and lazy scratch
-            // allocations (MQ signs/x_rot/x_q8, FP16 shadow, kernel module
-            // load) happen outside any captured region. Capturing the first
-            // call hits "hipMalloc not permitted under stream capture" — the
-            // same trap `verify_warmed_up` solves for the verify path. The
-            // next call will capture. (See bench_qwen35_mq4 / forward_prefill_batch
-            // for the production warmup path.)
-            gpu.ar_forward_warmed_up = true;
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-        } else {
-            // ── First post-warmup call: capture the forward pass as a graph ──
-            // Ensure we have an explicit stream for capture.
-            if gpu.active_stream.is_none() {
-                gpu.active_stream = Some(gpu.hip.stream_create()?);
-            }
-            // Write pos_buf before capture (this write is NOT in the graph)
-            gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
-            gpu.begin_graph_capture()?;
-            forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
-            gpu.end_graph_capture()?;
-            // hipStreamCaptureModeGlobal RECORDS kernels — they do not execute
-            // during capture. Launch the freshly-instantiated graph once so
-            // this pos's forward actually runs (KV write, state advance,
-            // logits update). Same pattern as the verify path's
-            // begin_verify_graph_capture / end_verify_graph_capture /
-            // verify_graph_launch sequence.
-            gpu.graph_launch()?;
-            eprintln!("[hipGraph] captured {} blobs, instantiated", gpu.capture_blobs.len());
+    } else if use_graph && gpu.ar_forward_kernel_dirty {
+        // ── Direct path (kernel-dirty): kernels are dirty (init or post-
+        // model-load). Capture would trip "hipMalloc not permitted under
+        // stream capture" on the first inline JIT. Mark clean after a
+        // successful direct dispatch so subsequent calls can capture. ──
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.ar_forward_kernel_dirty = false;
+    } else if use_graph {
+        // ── Capture + launch: kernels are clean but caller has not committed
+        // a replay yet (or graph_exec is None). Drop any prior captured graph,
+        // record a fresh one, and launch it for this forward's output. After
+        // the caller signals end_decode_turn(), the most recent capture is
+        // promoted to the replay graph for the next decode turn. ──
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
+        gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
+        gpu.drop_captured_graph();
+        gpu.begin_graph_capture()?;
+        forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
+        gpu.end_graph_capture()?;
+        gpu.graph_launch()?;
     } else {
-        // ── Direct path (no graph) ──
-        let pos_i32 = pos as i32;
+        // ── Direct path (graph not eligible: arch / MoE config) ──
         gpu.hip.memcpy_htod(&scratch.pos_buf, &pos_i32.to_ne_bytes())?;
         forward_scratch_layers(gpu, weights, config, pos, kv_cache, dn_state, scratch, None)?;
     }
@@ -4877,6 +4903,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         gdn_tape, 0, tree_verify,
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
+        None, // mask_override: captured-prefill caller does not use the MTP probe hook
         None, // max_layer: single-chunk captured path always runs the full stack
     )
 }
@@ -4898,7 +4925,8 @@ pub fn forward_prefill_batch(
     forward_prefill_batch_with_pbs(
         gpu, weights, config, tokens, start_pos, kv_cache, dn_state, scratch,
         hidden_rb, per_token_hidden_out, gdn_tape, tree_verify, scratch.prefill_batch.as_ref(),
-        None,
+        None, // mask_override: MTP probe is the only consumer; default callers don't override
+        None, // max_layer: pflash uses this; non-pflash default is full stack
     )
 }
 
@@ -4925,12 +4953,9 @@ pub fn forward_prefill_batch_with_pbs(
     mut gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
-    // Threshold below which the batching overhead isn't worth the alloc +
-    // per-layer dispatch. Single-token prefill obviously should not take
-    // the batched path.
-    const MIN_BATCH: usize = 2;
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
     //
@@ -5019,67 +5044,33 @@ pub fn forward_prefill_batch_with_pbs(
     // preamble's rmsnorm+rotate and SwiGLU+rotate kernels differ per dtype),
     // and (b) Q8 S-state for the GDN recurrence. Mixed-dtype layers are
     // allowed; each layer is routed to its own path. HFQ6/others fall back.
-    // `HIPFIRE_PREFILL_BATCHED=0` forces the per-token fallback (escape
-    // hatch for regression bisecting or diagnosing hardware-specific issues).
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
-    // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels)
-    // and num_experts ≤ 1024 (bound of the batched top-K shared mem). When
-    // either constraint is violated, reject all MoE layers so the whole
-    // chunk falls through to per-token.
-    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
     let arch = gpu.arch.as_str();
-    let eligible = !force_fallback
-        && n >= MIN_BATCH
-        && dn_state.quant == StateQuant::Q8
-        && weights.layers.iter().any(|lw| matches!(
-            lw,
-            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
-        ))
-        && weights.layers.iter().all(|lw| match lw {
-            LayerWeights::DeltaNet(l) =>
-                is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
-                    && is_batchable_la(l.w_up.gpu_dtype, arch)
-                    && is_batchable_la(l.w_down.gpu_dtype, arch),
-            LayerWeights::FullAttn(_) => true, // FA layer will take the gather/scatter path
-            // MoE batched path: LA/FA projections + routed/shared MoE
-            // weights must be batchable per their respective dispatches.
-            // Q8_0 is now admitted alongside MQ4G256 for LA/FA — the
-            // MoE-layer qkvza + wo dispatches handle Q8 via the same
-            // `gemm_qkvza_q8_0_wmma` / `gemm_q8_0_batched_chunked` family
-            // already wired into the dense LA/FA branches (qwen35.rs:4500
-            // + 5404). Engine policy quantizes A3B's attention weights
-            // as Q8 (alongside its Q8 router + shared_expert_gate) so
-            // pre-Q8-admit the batched path was unreachable for every
-            // A3B variant — see commit log.
-            LayerWeights::DeltaNetMoe(l) =>
-                moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
-                    && is_batchable_la(l.wz.gpu_dtype, arch)
-                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
-                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
-            LayerWeights::FullAttnMoe(l) =>
-                moe_topk_ok
-                    && pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true)
-                    && is_batchable_la(l.wq.gpu_dtype, arch)
-                    && is_batchable_la(l.wk.gpu_dtype, arch)
-                    && is_batchable_la(l.wv.gpu_dtype, arch)
-                    && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
-        });
+    // Whether the tape-capturing batched (PBS) path runs for this call — the
+    // single source of truth shared with spec-decode callers that later replay a
+    // captured GDN tape. On `false` the forward drops to the tape-less per-token
+    // loop below, leaving any passed tape stale (see `prefill_batch_pbs_eligible`).
+    let moe_router_logits_present =
+        pbs_in.map(|p| p.moe_router_logits_batch.is_some()).unwrap_or(true);
+    let eligible =
+        prefill_batch_pbs_eligible(weights, config, dn_state, n, arch, moe_router_logits_present);
 
     if !eligible {
         assert!(
             tree_verify.is_none(),
             "tree-verify mode requires the batched-FA-eligible prefill path; \
              kv quant + FA weight dtypes do not match on this model",
+        );
+        // mask_override has nowhere to land on the per-token forward_scratch
+        // fallback (it operates on `scratch.x`, not the batched `pbs.x_batch`,
+        // and there's no shared "post-embed, pre-layer" hook). The MTP probe
+        // is the only consumer today and runs on MQ4-quantized models that
+        // always satisfy `eligible`, so hard-error rather than silently
+        // ignoring the override.
+        assert!(
+            mask_override.is_none(),
+            "MaskEmbedOverride requires the batched prefill path, but this \
+             model fell through to the per-token fallback (likely non-MQ4 \
+             weights, dn_state quant != Q8, or HIPFIRE_PREFILL_BATCHED=0).",
         );
         // Fallback: per-token loop, byte-identical to decode. If hidden
         // extraction is requested, use the with_hidden variant so the ring
@@ -5155,12 +5146,36 @@ pub fn forward_prefill_batch_with_pbs(
             // Tree-verify was asserted to fit in one chunk above, so passing
             // the whole ctx through unconditionally is safe.
             let tv_for_chunk = tree_verify.as_ref().copied();
+            // Apply mask_override only to the chunk that actually contains
+            // its target slot, and rebase the slot index to chunk-local
+            // coordinates. Out-of-range slots panic (caller error).
+            let mo_for_chunk = mask_override.and_then(|ovr| {
+                if ovr.slot >= chunk_start && ovr.slot < chunk_end {
+                    Some(MaskEmbedOverride {
+                        slot: ovr.slot - chunk_start,
+                        embed: ovr.embed,
+                    })
+                } else {
+                    None
+                }
+            });
+            // Sanity: if caller provided an override, it MUST land in some
+            // chunk. Detect "fell off the end" at the last chunk boundary.
+            if mask_override.is_some() && chunk_end == n {
+                let landed_anywhere = mask_override.unwrap().slot < n;
+                assert!(
+                    landed_anywhere,
+                    "MaskEmbedOverride.slot ({}) is out of range for tokens.len() ({})",
+                    mask_override.unwrap().slot, n,
+                );
+            }
             forward_prefill_chunk(
                 gpu, weights, config, chunk, start_pos + chunk_start,
                 kv_cache, dn_state, scratch, pbs, hidden_rb.as_deref(),
                 pth_slot, tape_for_chunk, chunk_start, tv_for_chunk,
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
+                mo_for_chunk,
                 max_layer,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
@@ -5391,6 +5406,73 @@ fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
 /// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
 /// pass synthetic channel tests at FP16 ULP precision but produce
 /// garbage activations in production. Bisection of the offending
+/// Threshold below which batching overhead isn't worth the alloc + per-layer
+/// dispatch — single-token prefill must not take the batched path.
+const MIN_BATCH: usize = 2;
+
+/// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
+/// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
+/// handed to that forward will actually be populated. When this is false the
+/// forward silently drops to a tape-less per-token loop, so spec-decode callers
+/// that later replay the GDN tape MUST gate that cheap replay on this predicate;
+/// otherwise they replay a stale/zero tape and corrupt DeltaNet state. This is
+/// the single source of truth for the eligibility decision — called by the
+/// forward itself and by those callers, so the two can never drift. (The
+/// tree-verify forward keeps its own, deliberately simpler, eligibility check.)
+pub fn prefill_batch_pbs_eligible(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    n: usize,
+    arch: &str,
+    moe_router_logits_present: bool,
+) -> bool {
+    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback (escape hatch).
+    let force_fallback =
+        std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
+    // num_experts ≤ 1024 (bound of the batched top-K shared mem).
+    let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    !force_fallback
+        && n >= MIN_BATCH
+        && dn_state.quant == StateQuant::Q8
+        && weights.layers.iter().any(|lw| matches!(
+            lw,
+            LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),
+        ))
+        // LA/FA/MoE projection + MoE-FFN weight dtypes must all be batchable;
+        // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
+        && weights.layers.iter().all(|lw| match lw {
+            LayerWeights::DeltaNet(l) =>
+                is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && is_batchable_la(l.w_gate.gpu_dtype, arch)
+                    && is_batchable_la(l.w_up.gpu_dtype, arch)
+                    && is_batchable_la(l.w_down.gpu_dtype, arch),
+            LayerWeights::FullAttn(_) => true,
+            LayerWeights::DeltaNetMoe(l) =>
+                moe_topk_ok
+                    && moe_router_logits_present
+                    && is_batchable_la(l.wqkv.gpu_dtype, arch)
+                    && is_batchable_la(l.wz.gpu_dtype, arch)
+                    && is_batchable_la(l.w_beta.gpu_dtype, arch)
+                    && is_batchable_la(l.w_alpha.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && moe_ffn_batched_admissible(&l.ffn),
+            LayerWeights::FullAttnMoe(l) =>
+                moe_topk_ok
+                    && moe_router_logits_present
+                    && is_batchable_la(l.wq.gpu_dtype, arch)
+                    && is_batchable_la(l.wk.gpu_dtype, arch)
+                    && is_batchable_la(l.wv.gpu_dtype, arch)
+                    && is_batchable_la(l.wo.gpu_dtype, arch)
+                    && moe_ffn_batched_admissible(&l.ffn),
+        })
+}
+
 /// dispatch site is pending. Default-off preserves the pre-fan-out
 /// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
 fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
@@ -6054,6 +6136,7 @@ fn forward_prefill_chunk(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
     let n = tokens.len();
@@ -6141,6 +6224,39 @@ fn forward_prefill_chunk(
                 _ => panic!("unsupported embedding format"),
             }
             gpu.hip.memcpy_dtod_at(&pbs.x_batch.buf, i * dim_row_bytes, &s.x.buf, 0, dim_row_bytes)?;
+        }
+    }
+
+    // ── 1a. Apply MaskEmbedOverride (MTP probe hook) ─────────────────────
+    //
+    // Overwrite a single batch slot's embedding row in `pbs.x_batch` after
+    // the embedding-lookup kernel populated it but BEFORE the layer loop
+    // (or any subsequent kernel) reads it. The Qualcomm MTP probe uses this
+    // to replace the embedding-table value at a "mask token" position with
+    // a prompt-mean vector. Default callers pass `None` → zero overhead.
+    //
+    // Multi-GPU band-mode: skip on non-first bands; pbs.x_batch already
+    // holds the peer-copied activation from the previous band, so an
+    // override applied at band 0 has already propagated through the layer
+    // stack on that device — re-applying here would clobber the partial
+    // forward state.
+    if do_embed {
+        if let Some(ovr) = mask_override {
+            assert!(
+                ovr.slot < n,
+                "MaskEmbedOverride.slot ({}) must be < n ({})",
+                ovr.slot, n,
+            );
+            assert_eq!(
+                ovr.embed.len(), dim,
+                "MaskEmbedOverride.embed.len() ({}) must equal config.dim ({})",
+                ovr.embed.len(), dim,
+            );
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(ovr.embed.as_ptr() as *const u8, dim * 4)
+            };
+            let offset = ovr.slot * dim_row_bytes;
+            gpu.hip.memcpy_htod_offset(&pbs.x_batch.buf, offset, bytes)?;
         }
     }
 
@@ -10873,6 +10989,7 @@ pub fn forward_prefill_batch_multi(
                         None, // tree_verify: pp=1 only
                         false, // pre_uploaded
                         Some(&band_ctx),
+                        None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
                         None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }

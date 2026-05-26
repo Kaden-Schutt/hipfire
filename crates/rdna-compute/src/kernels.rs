@@ -1248,6 +1248,24 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_SRC: &str = include_str!("../../../kernels/
 // Gate 1 microbench measurement. See
 // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldsx.hip");
+// K4 4-tile pipeline variant. Opt-in via HIPFIRE_GATE_UP_VARIANT=k4 to
+// test deeper memory-load pipelining (3-4 in-flight B loads vs k2's 2).
+// Target: lift gate_up_wmma from 305 GB/s (32% peak on gfx1100) toward
+// 60-70% peak. See feedback_v3_gate_up_k4_2026_05_21.md.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_k4.hip");
+// LDSCOOP variant: cooperative LDS weight staging. 32 threads load
+// each row's 136 bytes in 1-2 coalesced cache lines (128B per warp
+// instruction), vs the base k2 kernel's scattered 16-thread loads
+// (16 different cache lines per warp). Targets the 32% peak BW
+// observed in the base kernel — coalesced DRAM loads should get
+// closer to 60-70%. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldscoop.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop.hip");
+// 2tile variant: 32 rows × 16 cols output tile per block, 64 threads
+// (2 wave32). Halves grid in M-dim (1728 → 864 blocks at M=27648),
+// amortizing per-block X-tile (FP16 batch matrix) loads across both
+// waves via L0/L1 cache. Targets the 32% peak BW seen in base kernel.
+// Opt-in via HIPFIRE_GATE_UP_VARIANT=2tile.
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_2tile.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
@@ -2280,6 +2298,14 @@ pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache
 /// Phase 2: Threshold filter — collect candidates within 30*temp of max (atomic shared counter).
 /// Phase 3: Thread 0 softmax + sort + top-p + sample on the small candidate set.
 pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top_p.hip");
+
+/// Per-row temperature-scaled softmax probability gather. For each row r,
+/// returns the softmax prob of `indices[r]` under temp-scaled row logits.
+/// Used by MTP residual-acceptance sampling: gathers p_draft(c_k) and
+/// p_target(c_k) without D2H-ing the full vocab logit row. Saves ~6 MB
+/// D2H + ~4 ms host softmax per spec-decode cycle.
+pub const SOFTMAX_PROB_GATHER_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/softmax_prob_gather_batched.hip");
 
 
 /// GEMV Q4_F16_G64: matrix-vector multiply with on-the-fly Q4_F16 dequantization.
