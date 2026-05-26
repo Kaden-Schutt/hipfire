@@ -107,6 +107,14 @@ pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../k
 pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.hip");
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.hip");
 
+/// gfx1151 (Strix Halo) K4 variants of the Phase D-B mb4 family.
+/// K4 unroll front-loads 8 nibble-pack reads per inner iteration (vs K2's 4)
+/// to better hide LPDDR5x unified-memory latency on the APU.
+pub const GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_mq4g256_lloyd_residual_wmma_mb4.gfx1151.hip");
+pub const GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
+pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
+
 /// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch.
 ///
@@ -144,7 +152,9 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
 /// the kernel's tile shape is gfx11/wave32 specific.
 pub fn gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_GFX1151_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb4_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb4_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA mb4 residual: unsupported arch {arch}. Phase D-A is gfx11-only; \
@@ -206,7 +216,9 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(arch: &str) -> (&'static st
 /// `_mb4` selector (gfx11 only — gfx12 sibling deferred per Phase D plan).
 pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_mb4_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_mb4_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA mb4 qkvza: unsupported arch {arch}. Phase D-B is gfx11-only."
@@ -215,7 +227,9 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, 
 }
 pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC, "gemm_qkv_mq4g256_lloyd_wmma_mb4_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq4g256_lloyd_wmma_mb4_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA mb4 qkv: unsupported arch {arch}. Phase D-B is gfx11-only."
@@ -224,7 +238,9 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'
 }
 pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
+        "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_rdna3"),
         _ => panic!(
             "MQ4-Lloyd WMMA mb4 gate_up: unsupported arch {arch}. Phase D-B is gfx11-only."
