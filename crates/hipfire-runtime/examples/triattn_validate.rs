@@ -23,20 +23,18 @@ fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
+    
     use hipfire_runtime::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
     use std::path::Path;
     use std::time::Instant;
 
-    // Per-chunk CSV timing breakdown for calibration optimization sessions.
-    // Enable with HIPFIRE_CALIB_PROFILE=1; emits to stderr.
-    let calib_profile = std::env::var("HIPFIRE_CALIB_PROFILE")
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let rc = RuntimeConfig::from_env();
+    let calib_profile = rc.calib_profile;
 
     // ── Parse args ─────────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();

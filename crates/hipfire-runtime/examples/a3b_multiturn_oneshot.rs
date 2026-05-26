@@ -12,6 +12,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::llama::{self, KvCache};
@@ -19,8 +20,8 @@ fn main() {
 
     let model_path = std::env::args().nth(1)
         .unwrap_or_else(|| "/home/kaden/.hipfire/models/qwen3.5-35b-a3b.mq4".to_string());
-    let n_gen: usize = std::env::var("HIPFIRE_GEN")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(80);
+    let rc = hipfire_runtime::config::RuntimeConfig::from_env();
+    let n_gen: usize = rc.gen.unwrap_or(80);
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");

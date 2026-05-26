@@ -17,9 +17,13 @@ fn main() { eprintln!("build with --features deltanet"); }
 fn main() {
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::llama::{self, KvCache};
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::Instant;
+
+    static BENCH_CFG: OnceLock<RuntimeConfig> = OnceLock::new();
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -56,6 +60,8 @@ fn main() {
     let model_path_buf = Path::new(model_path);
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
+    let _ = BENCH_CFG.set(RuntimeConfig::from_env());
+    let bcfg = BENCH_CFG.get().unwrap();
 
     // Auto-route safetensors directories (ParoQuant / AWQ / HF native) —
     // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
@@ -101,7 +107,7 @@ fn main() {
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via HIPFIRE_KV_MODE env var:
     //   q8 (default) | asym4 | asym3 | asym2
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = bcfg.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
     eprintln!("KV mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
@@ -130,11 +136,10 @@ fn main() {
     // prefill measurement when the GPU is in DPM step 0/1 from idle. This
     // mirrors that hook for the prefill phase: stabilizes clocks before the
     // timed forward_prefill_batch.
-    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+    if let Some(secs) = bcfg.dpm_warmup_secs {
         if secs > 0.0 {
             eprintln!("\n=== DPM warmup ({secs:.1}s, pre-prefill) ===");
-            gpu.dpm_warmup(secs).expect("dpm warmup");
+            gpu.dpm_warmup(secs as f32).expect("dpm warmup");
         }
     }
 
@@ -143,7 +148,7 @@ fn main() {
     // prefill path (daemon + greedy_dump both go through it). Inside, this
     // takes the batched LA kernel path for MQ4 models and the FA gather/scatter
     // fallback for FA layers.
-    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    let do_profile = bcfg.profile;
     // When HIPFIRE_ROCPROF_CSV=<path> is set AND profiling is active,
     // cross-check internal profile against rocprofv3 _kernel_stats.csv.
     // Stored here so the report is visible in both the logging block and
@@ -179,8 +184,7 @@ fn main() {
     // run 1 captures + launches, runs 2+ replay. dn_state + kv_cache
     // are NOT re-created between runs (would invalidate baked-in
     // tensor pointers); state drift is accepted for perf measurement.
-    let use_graph_prefill = std::env::var("HIPFIRE_GRAPH_PREFILL")
-        .ok().as_deref() == Some("1");
+    let use_graph_prefill = bcfg.graph_prefill.as_deref() == Some("1");
 
     if use_graph_prefill {
         let pbs = scratch.prefill_batch.as_ref()
@@ -268,7 +272,7 @@ fn main() {
     // None when profiling is disabled (HIPFIRE_PROFILE != 1).
     let mut prefill_kernel_ms: Option<f64> = None;
     if do_profile {
-        let rocprof_csv_env = std::env::var("HIPFIRE_ROCPROF_CSV").ok();
+        let rocprof_csv_env = bcfg.rocprof_csv.clone();
         let report = if let Some(ref csv_path_str) = rocprof_csv_env {
             let csv_path = std::path::Path::new(csv_path_str.as_str());
             let r = rdna_compute::profile_rocprof::stop_with_rocprof(csv_path);
@@ -434,10 +438,9 @@ fn main() {
 
     // HIPFIRE_DPM_WARMUP_SECS: optional DPM-stabilization pass before the
     // timed decode. See crates/rdna-compute/src/dispatch.rs `dpm_warmup`.
-    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+    if let Some(secs) = bcfg.dpm_warmup_secs {
         if secs > 0.0 {
-            gpu.dpm_warmup(secs).expect("dpm warmup");
+            gpu.dpm_warmup(secs as f32).expect("dpm warmup");
         }
     }
 
@@ -446,7 +449,7 @@ fn main() {
     // profiler. Distinct from HIPFIRE_PROFILE=1 (which profiles prefill).
     // Decode is the steady-state hot path — this is the right surface to
     // attack for tok/s improvements.
-    let do_profile_decode = std::env::var("HIPFIRE_PROFILE_DECODE").ok().as_deref() == Some("1");
+    let do_profile_decode = bcfg.profile_decode;
     eprintln!("\n=== gen ({gen_len} tokens — timed) ===");
     let mut per_token_ms: Vec<f64> = Vec::with_capacity(gen_len);
     if do_profile_decode {

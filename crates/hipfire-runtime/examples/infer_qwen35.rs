@@ -14,6 +14,7 @@
 //! semantics so kernel/loading sanity probes are unchanged byte-for-byte.
 
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::config::RuntimeConfig;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
@@ -133,11 +134,12 @@ fn main() {
     eprintln!("Prompt: \"{}\" ({} tokens)", prompt_text, prompt_tokens.len());
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let rc = RuntimeConfig::from_env();
     eprintln!("Loading weights...");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = rc.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
     let mut kv_cache = match kv_mode.as_str() {
         "givens4" => { eprintln!("KV cache: givens4"); llama::KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
         "givens2" => { eprintln!("KV cache: givens2"); llama::KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
@@ -168,8 +170,8 @@ fn main() {
     // Note: --guards on takes precedence over these env knobs because
     // the production sampler module does its own GPU top-p kernel call
     // and the env-flag paths below assume the bare CPU sampler shape.
-    let use_gpu_topk = std::env::var("HIPFIRE_GPU_TOPK").ok().as_deref() == Some("1");
-    let sample_compare = std::env::var("HIPFIRE_SAMPLE_COMPARE").ok().as_deref() == Some("1");
+    let use_gpu_topk = rc.gpu_topk;
+    let sample_compare = rc.sample_compare;
     if (use_gpu_topk || sample_compare) && !use_guards {
         eprintln!("sampler: gpu_topk={} compare={}", use_gpu_topk, sample_compare);
     }
@@ -230,7 +232,7 @@ fn main() {
         // policy. `repeat_window` is bounded by the GPU repeat_buf
         // capacity so we don't outrun the on-device buffer.
         let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
-        let cfg = SamplerConfig {
+        let rc = SamplerConfig {
             temperature: sc.think_temp,
             top_p: sc.top_p,
             repeat_penalty: sc.repeat_penalty,
@@ -244,7 +246,7 @@ fn main() {
             &scratch.repeat_buf,
             config.vocab_size,
             &token_history,
-            &cfg,
+            &rc,
             &mut rng_state_u32,
         )
     } else {
@@ -322,7 +324,7 @@ fn main() {
             // Route through the production sampler module. Mirrors the
             // daemon's per-step sampler call exactly.
             let repeat_buf_cap = scratch.repeat_buf.buf.size() / 4;
-            let cfg = SamplerConfig {
+            let rc = SamplerConfig {
                 temperature: temp,
                 top_p: sc.top_p,
                 repeat_penalty: sc.repeat_penalty,
@@ -336,7 +338,7 @@ fn main() {
                 &scratch.repeat_buf,
                 config.vocab_size,
                 &token_history,
-                &cfg,
+                &rc,
                 &mut rng_state_u32,
             )
         } else if use_gpu_topk || sample_compare {

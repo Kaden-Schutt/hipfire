@@ -10,6 +10,7 @@ fn main() { eprintln!("Build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35;
     use hipfire_runtime::llama;
@@ -83,6 +84,7 @@ fn main() {
 
     // Load model
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let rc = RuntimeConfig::from_env();
     eprintln!("Loading {}...", model_path);
 
     use hipfire_arch_qwen35::speculative::{KvMode, ModelSlot, ModelSlotConfig};
@@ -209,7 +211,7 @@ fn main() {
         if input.is_empty() { continue; }
         let input_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(input);
         let input: &str = &input_norm;
-        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        if rc.prompt_token_heat {
             tokenizer.dump_prompt_heat(input);
         }
 

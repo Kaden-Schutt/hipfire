@@ -22,6 +22,7 @@
 //!   probe_argmax_agreement <small.mq4> <large.mq4> "<prompt>" [N=128]
 
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::config::RuntimeConfig;
 use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
 use hipfire_runtime::tokenizer::Tokenizer;
@@ -44,7 +45,8 @@ fn main() {
     let large_path = &args[2];
     let prompt_text = &args[3];
     let n_steps: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(128);
-    let use_chatml = std::env::var("HIPFIRE_CHATML").ok().as_deref() == Some("1");
+    let rc = hipfire_runtime::config::RuntimeConfig::from_env();
+    let use_chatml = rc.chatml;
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
 
@@ -89,7 +91,7 @@ fn main() {
 
     // KV caches sized for prompt + n_steps + headroom.
     let kv_seq = prompt_tokens.len() + n_steps + 16;
-    let kv_mode_str = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "asym3".into());
+    let kv_mode_str = rc.kv_mode.clone().unwrap_or_else(|| "asym3".into());
     let mk_kv = |gpu: &mut rdna_compute::Gpu, cfg: &qwen35::Qwen35Config| -> llama::KvCache {
         match kv_mode_str.as_str() {
             "asym3" => llama::KvCache::new_gpu_asym3(gpu, cfg.n_layers, cfg.n_kv_heads, cfg.head_dim, kv_seq).unwrap(),

@@ -22,6 +22,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
@@ -54,12 +55,13 @@ fn main() {
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let rc = RuntimeConfig::from_env();
     eprintln!("dump_logits_qwen35: arch={} prefill_len={}", gpu.arch, prefill_len);
 
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = (prefill_len + 16).max(512);
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = rc.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
     let mut kv_cache = match kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,

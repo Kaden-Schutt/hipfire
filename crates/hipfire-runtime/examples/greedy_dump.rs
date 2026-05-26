@@ -9,6 +9,7 @@ fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::llama::{self, KvCache};
@@ -64,10 +65,11 @@ fn main() {
     eprintln!("prompt: {} tokens", prompt_tokens.len());
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
+    let rc = RuntimeConfig::from_env();
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     let kv_seq = 2048usize;
-    let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = rc.kv_mode.clone().unwrap_or_else(|| "q8".to_string());
     eprintln!("greedy_dump: kv_mode={kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),

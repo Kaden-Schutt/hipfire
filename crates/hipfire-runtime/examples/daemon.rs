@@ -40,9 +40,14 @@ use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use hipfire_arch_qwen35_vl::image;
 use base64::Engine;
 use hip_bridge::HipResult;
+use hipfire_runtime::config::RuntimeConfig;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::Instant;
+
+/// Process-wide RuntimeConfig snapshot, initialized once in `main()`.
+static DAEMON_CFG: OnceLock<RuntimeConfig> = OnceLock::new();
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
@@ -181,12 +186,7 @@ fn emit_committed_event(
     pos: usize,
     t_ms: u64,
 ) {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    let on = *ENABLED.get_or_init(|| {
-        std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1")
-    });
-    if !on {
+    if !DAEMON_CFG.get().is_some_and(|c| c.emit_token_ids) {
         return;
     }
     let _ = writeln!(
@@ -467,6 +467,8 @@ fn report_gpu_init_failure(err: &hip_bridge::HipError) {
 }
 
 fn main() {
+    let _ = DAEMON_CFG.set(RuntimeConfig::from_env());
+    let cfg = DAEMON_CFG.get().unwrap();
     let args: Vec<String> = std::env::args().collect();
 
     // --precompile: compile all kernels for this GPU, write hash files, exit.
@@ -713,7 +715,7 @@ fn main() {
                     .and_then(|v| v.as_u64()).unwrap_or(1) as usize;
                 if pp > 1 {
                     if draft_path.is_some()
-                        && std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() != Some("1")
+                        && !DAEMON_CFG.get().is_some_and(|c| c.pp_dflash)
                     {
                         let _ = writeln!(stdout, r#"{{"type":"error","message":"DFlash speculative decode requires pp=1 in v1 (set HIPFIRE_PP_DFLASH=1 to opt into the experimental pp>1 PRD path; note PR2-4 of docs/plans/hetero-pflash-dflash.prd are not yet implemented — the load message will accept but generate will not run cross-card spec-decode). See issue #58 v1.1 roadmap."}}"#);
                         let _ = stdout.flush();
@@ -725,7 +727,7 @@ fn main() {
                         continue;
                     }
                     if (pflash_drafter.is_some() || pflash_mode_str != "off")
-                        && std::env::var("HIPFIRE_PP_PFLASH").ok().as_deref() != Some("1")
+                        && !DAEMON_CFG.get().is_some_and(|c| c.pp_pflash)
                     {
                         let _ = writeln!(stdout, r#"{{"type":"error","message":"PFlash prefill compression requires pp=1 in v1 (set HIPFIRE_PP_PFLASH=1 to opt into the experimental pp>1 PoC); see issue #58 v1.1 roadmap"}}"#);
                         let _ = stdout.flush();
@@ -775,12 +777,10 @@ fn main() {
                         // truly ready, and TTFT measures real prefill alone.
                         //
                         // Default OFF (production daemon load latency unchanged).
-                        if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-                            if let Ok(secs) = secs_str.parse::<f32>() {
-                                if secs > 0.0 {
-                                    if let Err(e) = gpu.dpm_warmup(secs) {
-                                        eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
-                                    }
+                        if let Some(secs) = cfg.dpm_warmup_secs {
+                            if secs > 0.0 {
+                                if let Err(e) = gpu.dpm_warmup(secs as f32) {
+                                    eprintln!("[daemon] dpm_warmup failed (non-fatal): {e:?}");
                                 }
                             }
                         }
@@ -879,7 +879,7 @@ fn main() {
                 let prompt = msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello");
                 let prompt_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(prompt);
                 let prompt: &str = &prompt_norm;
-                if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+                if cfg.prompt_token_heat {
                     if let Some(tok) = m.tokenizer.as_ref() { tok.dump_prompt_heat(prompt); }
                 }
                 let system = msg.get("system").and_then(|v| v.as_str());
@@ -960,7 +960,7 @@ fn main() {
                 // (`experimental_budget_alert: true` → HIPFIRE_EXPERIMENTAL_
                 // BUDGET_ALERT=1 set by the CLI). Research use only; not a
                 // stable contract.
-                let experimental_ok = std::env::var("HIPFIRE_EXPERIMENTAL_BUDGET_ALERT").ok().as_deref() == Some("1");
+                let experimental_ok = cfg.experimental_budget_alert;
                 let budget_alert_at_tok = if experimental_ok {
                     msg.get("budget_alert_at_tok").and_then(|v| v.as_u64()).unwrap_or(0) as usize
                 } else { 0 };
@@ -1393,9 +1393,9 @@ fn resolve_chat_template(
     model_path: &str,
 ) -> Option<String> {
     // 1. Env-var override.
-    if let Ok(env_path) = std::env::var("HIPFIRE_CHAT_TEMPLATE_FILE") {
+    if let Some(env_path) = DAEMON_CFG.get().and_then(|c| c.chat_template_file.as_ref()) {
         if !env_path.is_empty() {
-            match std::fs::read_to_string(&env_path) {
+            match std::fs::read_to_string(env_path) {
                 Ok(s) => {
                     eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={}", env_path);
                     return Some(s);
@@ -1496,7 +1496,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     let kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+        .unwrap_or_else(|| DAEMON_CFG.get().and_then(|c| c.kv_mode.clone()).unwrap_or_default());
     // ─── ParoQuant / safetensors directory path ────────────────────────────
     // If the path is a directory with config.json, try loading as a
     // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
@@ -1621,8 +1621,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
     // The `HIPFIRE_KV_PHYSICAL_CAP` env var is an explicit operator override —
     // useful for ablations or reproducing dflash_spec_demo settings.
     let physical_cap = if cask.sidecar.is_some() {
-        let env_override = std::env::var("HIPFIRE_KV_PHYSICAL_CAP").ok()
-            .and_then(|s| s.parse::<usize>().ok());
+        let env_override = DAEMON_CFG.get().and_then(|c| c.kv_physical_cap);
         let safety = 256usize;
         let floor = cask.budget + cask.beta + 4;
         let derived = cask.budget + cask.beta + safety;
@@ -2037,7 +2036,7 @@ fn load_model_pp(
     let kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+        .unwrap_or_else(|| DAEMON_CFG.get().and_then(|c| c.kv_mode.clone()).unwrap_or_default());
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("tokenizer not found: {e}"))?;
@@ -2061,7 +2060,7 @@ fn load_model_pp(
     // HIPFIRE_PP_LAYERS="a,b,..." overrides uniform split. Length must equal
     // pp; sum must equal n_layers; each entry >= 1. Used to shift layers off
     // dev 0 when token_embd asymmetry caps max_seq under uniform split.
-    let mut gpus = match std::env::var("HIPFIRE_PP_LAYERS").ok().filter(|s| !s.is_empty()) {
+    let mut gpus = match DAEMON_CFG.get().and_then(|c| c.pp_layers.clone()).filter(|s| !s.is_empty()) {
         Some(spec) => {
             let counts: Result<Vec<usize>, _> = spec
                 .split(',')
@@ -2308,29 +2307,18 @@ fn load_dflash_state(
     // GPUs). Invalid / out-of-range values warn loudly and disable
     // DDTree rather than silently falling through.
     const DDTREE_BUDGET_MAX: usize = 256;
-    let ddtree_budget_env: usize = match std::env::var("HIPFIRE_DDTREE_BUDGET").ok() {
+    let ddtree_budget_env: usize = match DAEMON_CFG.get().and_then(|c| c.ddtree_budget) {
         None => 0,
-        Some(s) if s.is_empty() => 0,
-        Some(s) => match s.parse::<usize>() {
-            Ok(0) => 0,
-            Ok(n) if n <= DDTREE_BUDGET_MAX => n,
-            Ok(n) => {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={} exceeds cap {DDTREE_BUDGET_MAX} \
-                     (attn_bias is O(budget²); typical values are 12-22). Disabling DDTree.",
-                    n
-                );
-                0
-            }
-            Err(_) => {
-                eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={:?} is not a non-negative integer. \
-                     Disabling DDTree.",
-                    s
-                );
-                0
-            }
-        },
+        Some(0) => 0,
+        Some(n) if n <= DDTREE_BUDGET_MAX => n,
+        Some(n) => {
+            eprintln!(
+                "[hipfire-daemon] HIPFIRE_DDTREE_BUDGET={} exceeds cap {DDTREE_BUDGET_MAX} \
+                 (attn_bias is O(budget²); typical values are 12-22). Disabling DDTree.",
+                n
+            );
+            0
+        }
     };
     let scratch_max_n = if ddtree_budget_env > 0 {
         std::cmp::max(draft_config.block_size, 1 + ddtree_budget_env)
@@ -2380,27 +2368,16 @@ fn load_dflash_state(
             let vocab = target_config.vocab_size;
             let effective_topk_max = std::cmp::min(DDTREE_TOPK_KERNEL_MAX, vocab);
             let default_topk = std::cmp::min(4usize, vocab.max(1));
-            let topk = match std::env::var("HIPFIRE_DDTREE_TOPK").ok() {
+            let topk = match DAEMON_CFG.get().and_then(|c| c.ddtree_topk) {
                 None => default_topk,
-                Some(s) if s.is_empty() => default_topk,
-                Some(s) => match s.parse::<usize>() {
-                    Ok(k) if k >= 1 && k <= effective_topk_max => k,
-                    Ok(k) => {
-                        eprintln!(
-                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {effective_topk_max}] \
-                             (vocab_size={vocab}). Falling back to default topk={default_topk}."
-                        );
-                        default_topk
-                    }
-                    Err(_) => {
-                        eprintln!(
-                            "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={:?} is not a positive integer. \
-                             Falling back to default topk={default_topk}.",
-                            s
-                        );
-                        default_topk
-                    }
-                },
+                Some(k) if k >= 1 && k <= effective_topk_max => k,
+                Some(k) => {
+                    eprintln!(
+                        "[hipfire-daemon] HIPFIRE_DDTREE_TOPK={k} out of range [1, {effective_topk_max}] \
+                         (vocab_size={vocab}). Falling back to default topk={default_topk}."
+                    );
+                    default_topk
+                }
             };
             let post_seed_snap = DeltaNetSnapshot::new_for(gpu, target_dn)
                 .map_err(|e| format!("ddtree post_seed_snap: {e}"))?;
@@ -2502,7 +2479,7 @@ fn generate_dflash(
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = DAEMON_CFG.get().is_some_and(|c| c.jinja_chat);
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -2769,17 +2746,15 @@ fn generate_dflash(
     // `phase1` runs Step 1 only (linear main-path verify); `phase2` adds
     // the lazy branch FA-only re-verify (Steps 2+3). See
     // `docs/plans/ddtree-path-c-main-path-first-from-lucebox.prd`.
-    let path_c_mode_owned: Option<&'static str> = match std::env::var("HIPFIRE_DDTREE_PATH_C").ok() {
-        None => None,
-        Some(s) if s.is_empty() => None,
-        Some(s) if s == "phase1" => Some("phase1"),
-        Some(s) if s == "phase2" => Some("phase2"),
-        Some(s) => {
+    let path_c_mode_owned: Option<&'static str> = match DAEMON_CFG.get().and_then(|c| c.ddtree_path_c.as_deref()) {
+        None | Some("") => None,
+        Some("phase1") => Some("phase1"),
+        Some("phase2") => Some("phase2"),
+        Some(val) => {
             if df.ddtree.is_some() {
                 eprintln!(
-                    "[hipfire-daemon] HIPFIRE_DDTREE_PATH_C={:?} is not 'phase1' or 'phase2'. \
+                    "[hipfire-daemon] HIPFIRE_DDTREE_PATH_C={val:?} is not 'phase1' or 'phase2'. \
                      Falling back to spec_step_ddtree_batched.",
-                    s
                 );
             }
             None
@@ -3104,7 +3079,7 @@ fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = DAEMON_CFG.get().is_some_and(|c| c.jinja_chat);
     let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -3734,7 +3709,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = DAEMON_CFG.get().is_some_and(|c| c.jinja_chat);
     let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();

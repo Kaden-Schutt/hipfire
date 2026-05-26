@@ -64,10 +64,14 @@ fn main() {
     use hipfire_arch_qwen35::speculative::{
         self, DeltaNetSnapshot, HiddenStateRingBuffer, ModelSlot, ModelSlotConfig, SpecStats,
     };
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::triattn::{EvictionCtx, EvictionResult, TriAttnCenters};
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::Instant;
+
+    static DFLASH_CFG: OnceLock<RuntimeConfig> = OnceLock::new();
 
     enum CaskPolicy { Plain(EvictionCtx), Cask(CaskCtx) }
     impl CaskPolicy {
@@ -582,6 +586,9 @@ fn main() {
     eprintln!("draft loaded in {:.2}s", t0.elapsed().as_secs_f64());
     vram_report(&gpu.hip, "after draft load");
 
+    let _ = DFLASH_CFG.set(RuntimeConfig::from_env());
+    let dcfg = DFLASH_CFG.get().unwrap();
+
     // Adaptive-B scratch sizing: the draft was trained at a specific
     // block_size; going past it is out-of-distribution for its positional
     // encoding. Measured on 27B MQ4 (2026-04-24, 3-run median) with range
@@ -593,7 +600,7 @@ fn main() {
     // → clamp adaptive_b_max to draft_cfg.block_size with a warning when
     // the user explicitly widens. Opt out via HIPFIRE_ADAPTIVE_B_UNSAFE=1
     // for experiments on a refit draft.
-    let unsafe_adaptive = std::env::var("HIPFIRE_ADAPTIVE_B_UNSAFE").ok().as_deref() == Some("1");
+    let unsafe_adaptive = dcfg.adaptive_b_unsafe;
     if adaptive_b && adaptive_b_max > draft_cfg.block_size && !unsafe_adaptive {
         eprintln!(
             "adaptive-b: WARN requested MAX={} > draft trained block_size={}; clamping to {} (past-trained B regresses code by ~30 %; set HIPFIRE_ADAPTIVE_B_UNSAFE=1 to override)",
@@ -796,7 +803,7 @@ fn main() {
         // ── Per-row tokenize + ChatML wrap ─────────────────────────
         let prompt_normalized =
             hipfire_runtime::tokenizer::maybe_normalize_prompt(row_raw_prompt).into_owned();
-        if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
+        if dcfg.prompt_token_heat {
             tokenizer.dump_prompt_heat(&prompt_normalized);
         }
         let mut prompt_tokens = tokenizer.encode(&prompt_normalized);
@@ -1014,26 +1021,20 @@ fn main() {
     //
     // Detection cost: one DefaultHasher pass over 32 u32s per cycle (~ns).
     // Memory: HashSet<u64>, ≤ max_tokens / 12 entries (~125 for max=1500).
-    let loop_break_raw = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK").ok();
-    let loop_break_mode: &str = match loop_break_raw.as_deref() {
+    let loop_break_raw = dcfg.dflash_loop_break.as_deref();
+    let loop_break_mode: &str = match loop_break_raw {
         Some("temp") => "temp",
         Some("escalate") | Some("recover") => "escalate",
         Some("stop") | Some("1") | Some("on") | Some("true") => "stop",
         _ => "off",
     };
     let loop_break_on = loop_break_mode != "off";
-    let loop_break_temp: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_TEMP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-    let loop_break_stop_after: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_STOP_AFTER")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(3);
-    let loop_break_rp_step: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_STEP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.10);
-    let loop_break_rp_max: f32 = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RP_MAX")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.30);
-    let loop_break_recovery: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_RECOVERY")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(32);
-    let loop_break_max_escalations: usize = std::env::var("HIPFIRE_DFLASH_LOOP_BREAK_MAX_ESCALATIONS")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let loop_break_temp: f32 = dcfg.dflash_loop_break_temp;
+    let loop_break_stop_after: usize = dcfg.dflash_loop_break_stop_after;
+    let loop_break_rp_step: f32 = dcfg.dflash_loop_break_rp_step;
+    let loop_break_rp_max: f32 = dcfg.dflash_loop_break_rp_max;
+    let loop_break_recovery: usize = dcfg.dflash_loop_break_recovery;
+    let loop_break_max_escalations: usize = dcfg.dflash_loop_break_max_escalations;
     const LOOP_BREAK_WINDOW: usize = 32;
     let mut runtime_temp: f32 = temp;
     let mut runtime_repeat_penalty: f32 = repeat_penalty;
@@ -1151,11 +1152,8 @@ fn main() {
     // HIPFIRE_PROFILE=1: enable per-kernel profiling for `--profile-cycles N`
     // worth of cycles (default 5) starting at cycle 1 (after a warm-up cycle
     // 0 to settle the JIT). Prints kernel breakdown after the limit.
-    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
-    let profile_cycles_target: usize = std::env::var("HIPFIRE_PROFILE_CYCLES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+    let do_profile = dcfg.profile;
+    let profile_cycles_target: usize = dcfg.profile_cycles;
     let mut profile_cycle_count: usize = 0;
     let mut profile_armed = false;
 
@@ -1247,7 +1245,7 @@ fn main() {
     // HIPFIRE_HOST_TIMING=1: dump per-cycle host-side wall-clock breakdown
     // (launch overhead vs D2D/D2H/H2D vs other host work) by diffing the
     // hip-bridge launch_counters around each cycle.
-    let host_timing = std::env::var("HIPFIRE_HOST_TIMING").ok().as_deref() == Some("1");
+    let host_timing = dcfg.host_timing;
     let mut per_cycle_wall_us: Vec<u64> = Vec::new();
     let mut per_cycle_api_us: Vec<(u64, u64, u64, u64, u64, u64, u64, u64, u64)> = Vec::new();
     // columns: launch, h2d, d2h, d2d, memset, stream_sync, event_sync, device_sync, graph_launch
@@ -1258,10 +1256,9 @@ fn main() {
     // observed at 7× wall-clock (52 ms vs 358 ms/cycle on the same bench),
     // which is orders of magnitude more than the ±10-15% noise band our
     // methodology doc calls out. Default 0 (disabled) for backward compat.
-    if let Ok(secs_str) = std::env::var("HIPFIRE_DPM_WARMUP_SECS") {
-        let secs: f32 = secs_str.parse().unwrap_or(0.0);
+    if let Some(secs) = dcfg.dpm_warmup_secs {
         if secs > 0.0 {
-            gpu.dpm_warmup(secs).expect("dpm warmup");
+            gpu.dpm_warmup(secs as f32).expect("dpm warmup");
         }
     }
 
@@ -1290,10 +1287,8 @@ fn main() {
     // code's high-confidence stretches without firing on prose/instr, where
     // shrinking is the right move. Env override for tuning:
     //   HIPFIRE_ADAPTIVE_B_UP=0.XX / HIPFIRE_ADAPTIVE_B_DOWN=0.XX
-    let adaptive_b_up: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_UP")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.45);
-    let adaptive_b_down: f64 = std::env::var("HIPFIRE_ADAPTIVE_B_DOWN")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
+    let adaptive_b_up: f64 = dcfg.adaptive_b_up.unwrap_or(0.45);
+    let adaptive_b_down: f64 = dcfg.adaptive_b_down.unwrap_or(0.25);
 
     let t_decode = Instant::now();
     // TTFT capture: production-realistic measure excluding DPM warmup
@@ -1865,7 +1860,7 @@ fn main() {
         eprintln!(
             "ddtree-meta: cycles={} mean_nodes={:.2} min={} max={} (cutoff={:?})",
             meta.cycles, mean_nodes, meta.min_nodes, meta.max_nodes,
-            std::env::var("HIPFIRE_DDTREE_LOGW_CUTOFF").unwrap_or_else(|_| "off".to_string()),
+            dcfg.ddtree_logw_cutoff.as_deref().unwrap_or("off"),
         );
     }
     // Adaptive-B usage report — only meaningful when --adaptive-b is on.

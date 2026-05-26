@@ -22,19 +22,21 @@ fn main() { eprintln!("build with --features deltanet"); }
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    
+    use hipfire_runtime::config::RuntimeConfig;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::llama::{self, KvCache};
     use std::path::Path;
 
+    let rc = RuntimeConfig::from_env();
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
         eprintln!("Usage: a3b_smoke_forward <model.mq4 | safetensors-dir>");
         std::process::exit(1);
     }
     let model_path = Path::new(&args[1]);
-    let n_steps: usize = std::env::var("HIPFIRE_SMOKE_STEPS")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+    let n_steps: usize = rc.smoke_steps;
 
     eprintln!("Opening: {}", model_path.display());
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
@@ -75,12 +77,11 @@ fn main() {
     };
     eprintln!("Loaded {} layers.", weights.layers.len());
 
-    let kv_seq = std::env::var("HIPFIRE_SMOKE_KV_SEQ")
-        .ok().and_then(|v| v.parse().ok()).unwrap_or(256usize);
+    let kv_seq = rc.smoke_kv_seq;
     // Select KV cache quant via HIPFIRE_SMOKE_KV (default q8, matches the
     // production CLI default). asym3/asym4 engage the Givens-rotated 3/4-bit
     // KV path and always-on flash; f32 falls back to plain attention_f32.
-    let kv_mode = std::env::var("HIPFIRE_SMOKE_KV").unwrap_or_else(|_| "q8".to_string());
+    let kv_mode = rc.smoke_kv.clone().unwrap_or_else(|| "q8".to_string());
     eprintln!("KV cache mode: {kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
         "asym4" => KvCache::new_gpu_asym4(
@@ -108,9 +109,8 @@ fn main() {
     //     (<|im_start|>user ... <|im_end|> <|im_start|>assistant ...) and
     //     prefill the full prompt before greedy decoding. Use this to
     //     sanity-check assistant-style coherence.
-    let prompt_mode = std::env::var("HIPFIRE_SMOKE_MODE").unwrap_or_else(|_| "raw".to_string());
-    let user_prompt = std::env::var("HIPFIRE_SMOKE_PROMPT")
-        .unwrap_or_else(|_| "Hello".to_string());
+    let prompt_mode = rc.smoke_mode.clone().unwrap_or_else(|| "raw".to_string());
+    let user_prompt = rc.smoke_prompt.clone().unwrap_or_else(|| "Hello".to_string());
 
     let prompt_tokens: Vec<u32> = if prompt_mode == "chat" {
         let im_start = tokenizer.encode("<|im_start|>");

@@ -9,6 +9,7 @@
 //!   infer <model.hfq> --no-think [prompt...]               # skip thinking
 
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::config::RuntimeConfig;
 use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
@@ -81,6 +82,7 @@ fn main() {
         .expect("tokenizer not found in HFQ metadata");
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
+    let rc = RuntimeConfig::from_env();
 
     // VL: load vision weights + encode image (only if --image given)
     let visual_tokens: Option<Vec<f32>>;
@@ -108,7 +110,7 @@ fn main() {
 
         // Optional debug dump for HF-reference numerical diff. Writes raw
         // little-endian f32 blobs + JSON sidecars to $HIPFIRE_VL_DUMP_DIR.
-        if let Ok(dump_dir) = std::env::var("HIPFIRE_VL_DUMP_DIR") {
+        if let Some(dump_dir) = rc.vl_dump_dir.as_ref() {
             use std::io::Write;
             let dir = std::path::Path::new(&dump_dir);
             std::fs::create_dir_all(dir).ok();
