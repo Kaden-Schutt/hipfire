@@ -20,6 +20,11 @@ mkShell {
     rocmPackages.clr
     rocmPackages.rocm-smi
     rocmPackages.rocminfo
+    # rocprofv3 CLI — needed for kernel-time attribution via
+    # scripts/rocprof-wrap.sh. Internal `begin_timer` wrappers miss
+    # uninstrumented kernels (see crates/rdna-compute/src/profile_rocprof.rs
+    # — the "hidden lever bug" comment). rocprof is the ground truth.
+    rocmPackages.rocprofiler-sdk
   ];
 
   # Match package.nix + module.nix runtime closure: clr alone is not
