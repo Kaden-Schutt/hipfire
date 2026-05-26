@@ -28633,17 +28633,27 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.has_wmma_w32() {
+        let (kernel_module, kernel_src) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32_rdna4",
+                kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_GFX12_SRC,
+            )
+        } else if self.arch_caps.has_wmma_w32() {
+            (
+                "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32_rdna3",
+                kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC,
+            )
+        } else {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32 is gfx11/RDNA3-only; \
-                     arch={} lacks has_wmma_w32. Use attention_causal_batched or add a gfx12 \
-                     _w32_gfx12 sibling before routing this path.",
+                    "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32 requires wave32 WMMA; \
+                     arch={} has neither gfx11 has_wmma_w32 nor gfx12 has_wmma_w32_gfx12. \
+                     Use attention_causal_batched for this arch.",
                     self.arch
                 ),
             ));
-        }
+        };
         assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: q must be F32");
         assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: k must be F16");
         assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: v must be F16");
@@ -28659,8 +28669,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
         );
         self.ensure_kernel(
-            "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
-            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC,
+            kernel_module,
+            kernel_src,
             "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
         )?;
         let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32"];

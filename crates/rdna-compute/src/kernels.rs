@@ -2214,6 +2214,9 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../.
 /// `[n_heads, ceil(B/64)]`, block `[128]`.
 /// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.hip");
+/// gfx12/RDNA4 sibling of the causal v3 kernel. Same C symbol, separate module
+/// because gfx12 WMMA uses half8 operands and the `_w32_gfx12` builtin.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_GFX12_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.gfx12.hip");
 
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
