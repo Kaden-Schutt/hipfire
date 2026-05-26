@@ -4,6 +4,8 @@
 
 //! Built-in HIP kernel sources for inference operations.
 
+use crate::arch_caps::ArchCaps;
+
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
@@ -147,7 +149,8 @@ pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../..
 /// The C symbol is unsuffixed on both gfx11 and gfx12 (the gfx12 `.hip` files drop
 /// the `_gfx12` suffix from the C symbol so the unsuffixed dispatch lookup
 /// resolves under both per-arch hsaco caches).
-pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq4g256_lloyd_residual_wmma_rdna4"),
@@ -164,7 +167,8 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
 /// Phase D-A selector — same arch matrix as `_wmma_for_arch` (gfx1100/1101/1102/1151
 /// only; gfx12 sibling deferred per the Phase D plan). Single-arch source since
 /// the kernel's tile shape is gfx11/wave32 specific.
-pub fn gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB4_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb4_rdna3"),
@@ -175,7 +179,8 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static st
         ),
     }
 }
-pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_rdna4"),
@@ -188,7 +193,8 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
         ),
     }
 }
-pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq4g256_lloyd_wmma_rdna4"),
@@ -201,7 +207,8 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
         ),
     }
 }
-pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_rdna4"),
@@ -216,7 +223,8 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
 }
 
 /// Phase D experiment selector for residual mb2 (16×32 output tile).
-pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_MQ4G256_LLOYD_RESIDUAL_WMMA_MB2_SRC, "gemm_mq4g256_lloyd_residual_wmma_mb2_rdna3"),
@@ -226,7 +234,8 @@ pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(arch: &str) -> (&'static st
 
 /// Phase D-B selectors for fused siblings. Same arch matrix as the residual
 /// `_mb4` selector (gfx11 only — gfx12 sibling deferred per Phase D plan).
-pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKVZA_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkvza_mq4g256_lloyd_wmma_mb4_rdna3"),
@@ -235,7 +244,8 @@ pub fn gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, 
         ),
     }
 }
-pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq4g256_lloyd_wmma_mb4_rdna3"),
@@ -244,7 +254,8 @@ pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'
         ),
     }
 }
-pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" =>
             (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_rdna3"),
@@ -260,12 +271,13 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str
 /// chip-agnostic baseline switch-dispatch path. gfx1151 is included for
 /// on-host conformance testing — definitive MQ4-Lloyd perf comparisons happen
 /// on gfx1100 (the format's calibrated target arch).
-pub fn gemv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_mq4g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
     // Same HIPFIRE_LLOYD_FORCE_BASELINE escape hatch as MQ3-Lloyd, so the fast
     // variant can be A/B'd against the baseline on the same model file.
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+    if force_baseline {
         return (GEMV_MQ4G256_LLOYD_SRC, "gemv_mq4g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (GEMV_MQ4G256_LLOYD_GFX1100_SRC, "gemv_mq4g256_lloyd_rdna3")
@@ -276,10 +288,12 @@ pub fn gemv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
 
 /// Same arch dispatch as `gemv_mq4g256_lloyd_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x).
-pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn gemv_mq4g256_lloyd_residual_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (GEMV_MQ4G256_LLOYD_RESIDUAL_SRC, "gemv_mq4g256_lloyd_residual");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (GEMV_MQ4G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq4g256_lloyd_residual_rdna3")
@@ -289,10 +303,12 @@ pub fn gemv_mq4g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
 }
 
 /// Arch dispatch for fused gate+up MQ4-Lloyd. Mirrors MQ3-Lloyd's selector.
-pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_gate_up_mq4g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_GATE_UP_MQ4G256_LLOYD_SRC, "fused_gate_up_mq4g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_GATE_UP_MQ4G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq4g256_lloyd_rdna3")
@@ -302,10 +318,12 @@ pub fn fused_gate_up_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
 }
 
 /// Arch dispatch for fused QKVZA MQ4-Lloyd (4-way demux: qkv/z/beta/alpha).
-pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkvza_mq4g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_QKVZA_MQ4G256_LLOYD_SRC, "fused_qkvza_mq4g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKVZA_MQ4G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq4g256_lloyd_rdna3")
@@ -315,10 +333,12 @@ pub fn fused_qkvza_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
 }
 
 /// Arch dispatch for fused QKV MQ4-Lloyd (3-way demux: q/k/v).
-pub fn fused_qkv_mq4g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkv_mq4g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_QKV_MQ4G256_LLOYD_SRC, "fused_qkv_mq4g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKV_MQ4G256_LLOYD_GFX1100_SRC, "fused_qkv_mq4g256_lloyd_rdna3")
@@ -358,7 +378,8 @@ pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_SRC: &str = include_str!("../../..
 
 /// Returns the MQ3G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch. Mirrors `gemm_hfq3g256_residual_wmma_for_arch`'s arch matrix.
-pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq3g256_lloyd_residual_wmma_rdna4"),
@@ -373,7 +394,8 @@ pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &
     }
 }
 /// MQ3-Lloyd mb4 residual selector. gfx11 only — gfx12 sibling deferred.
-pub fn gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_MB4_SRC, "gemm_mq3g256_lloyd_residual_wmma_mb4_rdna3"),
@@ -381,7 +403,8 @@ pub fn gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(arch: &str) -> (&'static st
     }
 }
 
-pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_rdna4"),
@@ -394,7 +417,8 @@ pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'st
         ),
     }
 }
-pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_QKV_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq3g256_lloyd_wmma_rdna4"),
@@ -407,7 +431,8 @@ pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'stat
         ),
     }
 }
-pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1200" | "gfx1201" =>
             (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna4"),
@@ -422,21 +447,24 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'
 }
 
 /// MQ3-Lloyd fused mb4 selectors (gfx11 only).
-pub fn gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_mb4_rdna3"),
         _ => panic!("MQ3-Lloyd WMMA mb4 qkvza: unsupported arch {arch}. gfx11-only."),
     }
 }
-pub fn gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_QKV_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_qkv_mq3g256_lloyd_wmma_mb4_rdna3"),
         _ => panic!("MQ3-Lloyd WMMA mb4 qkv: unsupported arch {arch}. gfx11-only."),
     }
 }
-pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
             (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_mb4_rdna3"),
@@ -463,15 +491,16 @@ pub const FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../ker
 /// arch. gfx1100/1101/1102 (RDNA3) gets the K4-unrolled + LDS-codebook variant
 /// that closes the per-launch perf gap from the divergent-execution switch.
 /// Other archs use the baseline (slower but correct switch-dispatch path).
-pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_mq3g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
     // Debug escape hatch: HIPFIRE_LLOYD_FORCE_BASELINE=1 forces the slow generic
     // switch-dispatch kernel even on RDNA3, so the K4+LDS variant can be
     // logits-Δ'd against the baseline on the same model file. No perf cost when
     // unset (one missed-getenv per dispatch arm), and ensure_kernel short-
     // circuits after the first call regardless.
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+    if force_baseline {
         return (GEMV_MQ3G256_LLOYD_SRC, "gemv_mq3g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         // gfx1151 (Strix Halo APU, RDNA3.5) added 2026-05-07 after empirical
         // validation: K4 + LDS-codebook GEMV produces byte-equal PPL on
@@ -491,10 +520,12 @@ pub fn gemv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
 /// Same arch dispatch as `gemv_mq3g256_lloyd_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x). HIPFIRE_LLOYD_FORCE_BASELINE=1 also routes
 /// here to the baseline (for parity-test purposes).
-pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn gemv_mq3g256_lloyd_residual_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (GEMV_MQ3G256_LLOYD_RESIDUAL_SRC, "gemv_mq3g256_lloyd_residual");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC, "gemv_mq3g256_lloyd_residual_rdna3")
@@ -506,10 +537,12 @@ pub fn gemv_mq3g256_lloyd_residual_for_arch(arch: &str) -> (&'static str, &'stat
 /// Arch dispatch for fused gate+up MQ3-Lloyd. Same arch matrix as the GEMV
 /// variants. Used by `qwen35.rs` FFN forward when both `w_gate` and `w_up`
 /// are MQ3G256Lloyd to collapse 2 GEMV launches into 1.
-pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_gate_up_mq3g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_GATE_UP_MQ3G256_LLOYD_SRC, "fused_gate_up_mq3g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_GATE_UP_MQ3G256_LLOYD_GFX1100_SRC, "fused_gate_up_mq3g256_lloyd_rdna3")
@@ -521,10 +554,12 @@ pub fn fused_gate_up_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'stat
 /// Arch dispatch for fused QKVZA MQ3-Lloyd. Used by `qwen35.rs` LA decode
 /// when all four projections (wqkv, wz, w_beta, w_alpha) are MQ3G256Lloyd
 /// to collapse 4 GEMV launches into 1.
-pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkvza_mq3g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_QKVZA_MQ3G256_LLOYD_SRC, "fused_qkvza_mq3g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKVZA_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkvza_mq3g256_lloyd_rdna3")
@@ -535,10 +570,12 @@ pub fn fused_qkvza_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static
 
 /// Arch dispatch for fused QKV MQ3-Lloyd. Used by `qwen35.rs` FA decode
 /// when wq, wk, wv are all MQ3G256Lloyd to collapse 3 GEMV launches into 1.
-pub fn fused_qkv_mq3g256_lloyd_for_arch(arch: &str) -> (&'static str, &'static str) {
-    if std::env::var("HIPFIRE_LLOYD_FORCE_BASELINE").ok().as_deref() == Some("1") {
+pub fn fused_qkv_mq3g256_lloyd_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    if force_baseline {
         return (FUSED_QKV_MQ3G256_LLOYD_SRC, "fused_qkv_mq3g256_lloyd");
     }
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151" => {
             (FUSED_QKV_MQ3G256_LLOYD_GFX1100_SRC, "fused_qkv_mq3g256_lloyd_rdna3")
@@ -1514,13 +1551,11 @@ pub const GEMV_HFQ4G256_GFX1030_V5_SRC: &str = include_str!("../../../kernels/sr
 /// On gfx1030/gfx1031 (RDNA2), selects variant via HIPFIRE_RDNA2_VARIANT env var.
 /// Module name is variant-specific so each variant gets its own precompiled .hsaco blob.
 /// The function name inside the .hsaco is always "gemv_hfq4g256" (the extern "C" symbol).
-pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfq4g256_for_arch(caps: &ArchCaps, rdna2_variant: Option<u32>) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1030" | "gfx1031" => {
-            let variant: u32 = std::env::var("HIPFIRE_RDNA2_VARIANT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
+            let variant: u32 = rdna2_variant.unwrap_or(1);
             let names = ["", "baseline-rdna2", "high-occupancy", "wide-unroll", "dp4a-packed", "cache-aggressive"];
             let name = names.get(variant as usize).unwrap_or(&"baseline-rdna2");
             eprintln!("  RDNA2 GEMV variant: v{variant} ({name})");
@@ -1548,7 +1583,8 @@ pub fn gemv_hfq4g256_for_arch(arch: &str) -> (&'static str, &'static str) {
 /// route to the default source — same FP add ordering and accumulator structure
 /// guarantees byte-exact output across gfx1010, gfx1030, gfx1151, gfx1201, gfx906.
 /// gfx1201 WMMA-FP8 hero kernel ships in v2. See `docs/quant-formats/hfp4.md`.
-pub fn gemv_hfp4g32_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfp4g32_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" => {
             (GEMV_HFP4G32_GFX1100_SRC, "gemv_hfp4g32_rdna3")
@@ -1560,7 +1596,8 @@ pub fn gemv_hfp4g32_for_arch(arch: &str) -> (&'static str, &'static str) {
 /// Same arch dispatch as `gemv_hfq4g256_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x instead of y[row] = ...). RDNA2 variants
 /// fall back to the baseline residual kernel for now.
-pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfq4g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => {
             (GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC, "gemv_hfq4g256_residual_rdna3")
@@ -1572,7 +1609,8 @@ pub fn gemv_hfq4g256_residual_for_arch(arch: &str) -> (&'static str, &'static st
 /// Returns the HFQ3-G256 GEMV kernel source AND module name for the given arch.
 /// gfx1100/1101/1102 (RDNA3) gets the K4-unrolled 4-accumulator variant that
 /// closes the per-launch perf gap with MQ4. Other archs use the baseline.
-pub fn gemv_hfq3g256_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfq3g256_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => {
             (GEMV_HFQ3G256_GFX1100_SRC, "gemv_hfq3g256_rdna3")
@@ -1584,7 +1622,8 @@ pub fn gemv_hfq3g256_for_arch(arch: &str) -> (&'static str, &'static str) {
 /// Same arch dispatch as `gemv_hfq3g256_for_arch` but returns the residual
 /// variant (y[row] += A[row] · x). Used by `weight_gemv_residual` MQ3 arm
 /// to eliminate the alloc+gemv+add+free fallback chain.
-pub fn gemv_hfq3g256_residual_for_arch(arch: &str) -> (&'static str, &'static str) {
+pub fn gemv_hfq3g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
     match arch {
         "gfx1100" | "gfx1101" | "gfx1102" => {
             (GEMV_HFQ3G256_RESIDUAL_GFX1100_SRC, "gemv_hfq3g256_residual_rdna3")

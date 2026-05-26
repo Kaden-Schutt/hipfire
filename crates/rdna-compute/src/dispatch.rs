@@ -6,6 +6,7 @@
 //! Manages compiled kernels, provides typed tensor operations.
 
 use crate::compiler::KernelCompiler;
+use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
 use std::cell::Cell;
@@ -44,270 +45,12 @@ thread_local! {
     static LAST_BOUND_DEVICE: Cell<i32> = const { Cell::new(-1) };
 }
 
-/// gfx1100 multi-row GEMV tile selector.
-/// HIPFIRE_GEMV_ROWS ∈ {1, 2, 4, 8}. Default 1 = single-row kernel (legacy).
-/// Cached in a OnceLock — the env var is read exactly once per process.
-/// Returns the runtime HIPFIRE_GEMV_ROWS override if set, otherwise None.
-/// Valid values: 1, 2, 4, 8. Anything else is clamped to 1.
-fn gemv_rows_override() -> Option<u32> {
-    static CACHE: OnceLock<Option<u32>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_GEMV_ROWS")
-            .ok()
-            .and_then(|v| v.parse::<u32>().ok())
-            .map(|r| match r { 1 | 2 | 4 | 8 => r, _ => 1 })
-    })
-}
-
-/// gfx906 dp4a-port toggle for memory-bound fused GEMVs.
-///
-/// `fused_gate_up_hfq4g256_dp4a` pre-quantizes x to Q8_1 and uses
-/// v_dot4_i32_i8 for the inner-loop multiply. Per the per-kernel PMC
-/// pass at 2026-05-05, this kernel was memory-bound (3.86 % MemUnit
-/// stall, 41 % VALUBusy) — dp4a's 75 % x-traffic reduction lands on
-/// the actual bottleneck.
-///
-/// Measured on MI50 / qwen3.5-9b.mq4 AR decode: +7.1 % tok/s
-/// (54.6 → 58.5 median, 3-run; BW 270 → 290 GiB/s) on top of the
-/// prefetch win on gemv_residual. Coherence gate clean.
-///
-/// Default-on for gfx906 only. Override with HIPFIRE_GEMV_DP4A={0,1}.
-/// fused_qkv / fused_qkvza ports for HFQ4 (PR #167) and HFQ6 (PR #187)
-/// have shipped; this lever now toggles every fused dp4a path together.
-pub fn gemv_dp4a_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_GEMV_DP4A").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    override_.unwrap_or(arch == "gfx906")
-}
-
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
 /// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
 /// support per-layer MMQ-on/off experiments (see issue #302 — KLD
 /// attribution sweep). Default 0; no semantic meaning outside an
 /// instrumented sweep.
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
-
-/// Weight-prefetch variant of the wave64 residual-GEMV.
-///
-/// The prefetch kernel does software-pipelined across-quad weight loads —
-/// quad q+1's 12 dwords are issued before quad q's compute chain runs, so
-/// L2 fills overlap with the FMA chain instead of stalling the load unit.
-///
-/// Measured on gfx906 (MI50) AR decode of qwen3.5-9b.mq4: +4.8% tok/s
-/// (51.9 → 54.4 median, 3-run; BW 256.7 → 269.1 GiB/s). PMC L2CacheHit
-/// pass showed ~40 % L2 hit on the non-prefetched kernel — this lever
-/// shifts a fraction of those misses into the L2-hit regime while
-/// compute is in flight. Coherence gate clean (b37068c).
-///
-/// **Default-on for gfx906 only.** Other wave64-native archs
-/// (gfx908/MI100, gfx940-942/MI300x) take the original kernel until
-/// measured. Override with HIPFIRE_GEMV_PREFETCH={0,1}.
-///
-/// See docs/perf-checkpoints/2026-05-05-gfx906-decode-investigation.md.
-fn gemv_prefetch_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_GEMV_PREFETCH").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    override_.unwrap_or(arch == "gfx906")
-}
-
-/// gfx94x (MI300X CDNA3) LDS-cached, 8-rows-per-WG HFQ4 GEMV variant.
-///
-/// The prior `*_wave64` kernels were tuned for CDNA1/2 (80 CUs, modest
-/// HBM). gfx942 has 304 CUs + 5.3 TB/s HBM; the 2-rows-per-WG geometry
-/// leaves the GPU starved (2560 WGs / 304 CUs = 8 launch rounds, each
-/// reading x[K] from L1 with no explicit sharing).
-///
-/// gfx942 variant: 256 threads/WG × 8 rows/WG × cooperative LDS load
-/// of x → 4× fewer WGs, 4× less x-HBM traffic. Same inner-loop math.
-///
-/// Default ON for gfx94x. Override with HIPFIRE_GFX942_LDS_GEMV={0,1}.
-fn gfx942_lds_gemv_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_GFX942_LDS_GEMV").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    override_.unwrap_or(false)  // gfx942 LDS GEMV: +1.9% on K=5120 attn_out alone
-    // but neutral overall on 27B-3.6 AR; opt-in for research
-}
-
-/// Per-arch default R for the multi-row HFQ4 GEMV kernel family.
-///
-/// - RDNA3 (gfx1100/1101/1102): R=1. Measured negative on 7900 XTX —
-///   single-row is already near-BW-saturated (577 GiB/s on 9B ≈ 60% of
-///   the 960 GiB/s peak) and multi-row under-subscribes the wave scheduler.
-/// - RDNA2 (gfx1030/1031): R=1. These have their own arch-optimized narrow
-///   kernels via gemv_hfq4g256_for_arch; the multi-row path is bypassed.
-/// - Default (gfx1010 baseline, gfx1013 Cyan Skillfish / BC-250, others):
-///   R=2. Measured +2.75% on BC-250 Qwen3.5 0.8B MQ4 in the session 1
-///   perf work — the x-hoist amortization across 2 rows pays for the
-///   minor occupancy drop from 20 → 18 waves/SIMD.
-fn gemv_rows_default(arch: &str) -> u32 {
-    match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => 1,
-        "gfx1030" | "gfx1031" => 1,
-        // Vega 20 / GCN5 (gfx906), CDNA1 (MI100, gfx908), and CDNA3
-        // (MI300X): wave64 native.
-        // `gemv_hfq4g256_wide` uses block=[64,1,1] = exactly one wave —
-        // zero lane waste. The 32-thread multirow variants run on half a
-        // wave, so the wide kernel is the natural fit. Return rows=1 to
-        // trigger use_wide.
-        "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942" => 1,
-        _ => 2,
-    }
-}
-
-/// Whether this GPU architecture supports the `v_dot2_f32_f16` instruction
-/// (dot10-insts feature in LLVM). This is required for the FP16 "dot2" GEMM fast path.
-///
-/// Notably:
-/// - gfx1010 (Navi 10 / RX 5700 XT) lacks this instruction despite being RDNA1.
-/// - gfx1011 (Navi 12) and gfx1012 (Navi 14) have it, also despite being RDNA1.
-/// - gfx1013 (Van Gogh / BC-250 APU) lacks it despite being RDNA2-ish.
-/// - gfx1030+ (standard RDNA2) and gfx1100+ (RDNA3/4) have it.
-fn has_dot2_f32_f16(arch: &str) -> bool {
-    matches!(arch,
-        "gfx1011" | "gfx1012"
-        | "gfx1030" | "gfx1031" | "gfx1032"
-        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151" | "gfx1152"
-        | "gfx1200" | "gfx1201")
-}
-
-/// Whether this architecture can compile the gfx10 HFQ3 sdot4 kernels.
-///
-/// These sources use `__builtin_amdgcn_sdot4`, which ROCm rejects on gfx11
-/// targets without the `dot1-insts` feature even though they have the dot2
-/// FP16 path.
-fn hfq3_sdot4_gfx10_enabled(arch: &str) -> bool {
-    matches!(arch, "gfx1011" | "gfx1012" | "gfx1030" | "gfx1031" | "gfx1032")
-}
-
-/// Whether to route HFQ3 batched-prefill through the experimental
-/// wave32 dp4a path (`gemm_qkv_hfq3g256_dp4a` / `gemm_gate_up_hfq3g256_dp4a`)
-/// instead of the default dot2 family on gfx10.
-///
-/// Phase 2 of `docs/plans/gfx10_mq3_prefill.md` — an experiment to see
-/// whether the sdot4 4×-ALU lift that helped gfx906 transfers to wave32.
-/// Default off (dot2 ships); flip on with `HIPFIRE_HFQ3_DP4A=1` to bench.
-/// Available only on the gfx10 sdot4 subset (gfx1011/1012/1030-1032) —
-/// NOT gfx1010/gfx1013/gfx11/gfx12.
-fn hfq3_dp4a_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_HFQ3_DP4A").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    if !override_.unwrap_or(false) {
-        return false;
-    }
-    hfq3_sdot4_gfx10_enabled(arch)
-}
-
-/// Whether to route HFQ3 residual through the experimental wave32 MMQ
-/// kernel (`gemm_hfq3g256_residual_mmq`). Phase 3 minimal probe. Same
-/// gfx10 sdot4 arch set as `hfq3_dp4a_enabled`. Gated by
-/// `HIPFIRE_HFQ3_MMQ=1`.
-fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_HFQ3_MMQ").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    if !override_.unwrap_or(false) {
-        return false;
-    }
-    hfq3_sdot4_gfx10_enabled(arch)
-}
-
-/// Whether to route HFQ4 residual through the experimental wave32 MMQ
-/// kernel on RDNA2+. Phase 3 side-win probe — tests whether HFQ4's
-/// cheaper nibble unpack lets MMQ beat the current fp16 fallback on
-/// gfx1030/1031. Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
-fn hfq4_mmq_rdna2_enabled(arch: &str) -> bool {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    let override_ = *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_HFQ4_MMQ_RDNA2").ok().and_then(|v| match v.as_str() {
-            "1" | "true" | "TRUE" | "on" | "ON" => Some(true),
-            "0" | "false" | "FALSE" | "off" | "OFF" => Some(false),
-            _ => None,
-        })
-    });
-    if !override_.unwrap_or(false) {
-        return false;
-    }
-    matches!(arch,
-        "gfx1011" | "gfx1012"
-        | "gfx1030" | "gfx1031" | "gfx1032"
-        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151" | "gfx1152"
-        | "gfx1200" | "gfx1201")
-}
-
-/// Whether this arch has WMMA kernels that compile + run on the user's
-/// ROCm toolchain right now.
-///
-/// gfx11 (RDNA3, Navi 31/32/33) ships with the
-/// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` builtin and has been
-/// the WMMA workhorse since 0.1.4. gfx12 (RDNA4, Navi 48/RX 9070
-/// series) has WMMA in hardware too, but the existing kernels use the
-/// gfx11 builtin which AMD clang 22.x in ROCm 7.x does NOT pattern-
-/// match on gfx12 — it errors with `Cannot select: intrinsic
-/// %llvm.amdgcn.wmma.f32.16x16x16.f16` at codegen time. The gfx12 sister
-/// path uses `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` and is
-/// gated by `has_wmma_f16_gfx12` below.
-pub fn has_wmma_f16(arch: &str) -> bool {
-    arch.starts_with("gfx11")
-}
-
-/// gfx12 (RDNA4) WMMA fp16. Kernels live at
-/// `kernels/src/gemm_*_wmma.gfx12.hip` and are validated by the
-/// `test_wmma_*_gfx12` channel-test examples (issue #54, PR #56).
-fn has_wmma_f16_gfx12(arch: &str) -> bool {
-    arch.starts_with("gfx12")
-}
-
-/// gfx12 (RDNA4) WMMA fp8. Same gating as fp16 (both are gfx12-only
-/// builtins); separate helper to allow finer-grained future gating
-/// (e.g. if a future RDNA arch lands fp16 WMMA without fp8). The
-/// fp8 prefill kernels are opt-in via HIPFIRE_FP8_WMMA=1 until they
-/// are perf-validated and made default on gfx12.
-fn has_wmma_fp8_gfx12(arch: &str) -> bool {
-    arch.starts_with("gfx12")
-}
-
-/// Opt-in gate for the fp8 prefill WMMA and decode dot4 kernels.
-/// Cached in a OnceLock — reading HIPFIRE_FP8_WMMA via `std::env::var`
-/// on every dispatch costs a syscall + String alloc which was visible
-/// as ~4 µs/call overhead in tight bench loops, swamping the FP8 win.
-fn is_fp8_wmma_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_FP8_WMMA").map_or(false, |v| v == "1")
-    })
-}
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
 /// Below this, the FP16 WMMA path wins on gfx1201 (measured 0.71-0.94×
@@ -326,189 +69,7 @@ const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// than uniformly applying FP8 everywhere.
 const FP8_GEMV_MIN_M: usize = 4096;
 
-/// Opt-in (default-OFF) gate for the gfx11 v_dot2_f32_f16 GEMV
-/// trickle-down. Synthetic bench measures 1.13-2.08× wins on FFN
-/// shapes on 7900 XTX, but production decode on 9B HFP4G32 lost 0.90×
-/// across two kernel variants (single-carry chain + 4 independent
-/// partials), same trap as the gfx12 FP8 paths — kernel-level ALU
-/// wins don't survive cross-kernel context costs in real decode.
-/// Kept opt-in via HIPFIRE_DOT2_GEMV=1 as research scaffold (the
-/// bench tools are still useful for future kernels). Default-off
-/// preserves the fallback that wins production.
-fn is_dot2_gemv_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_DOT2_GEMV").map_or(false, |v| v == "1")
-    })
-}
 
-/// Opt-in for the MMQ_Y=64 occupancy variants of the fused-projection
-/// kernels (plan §6 step 5 / §4.2). Halves the per-WG LDS X-tile and
-/// the accumulator register footprint; doubles the WG count per grid.
-/// Default OFF (Y=128).
-pub fn hfq4_mmq_gfx906_y64_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        std::env::var("HIPFIRE_HFQ4_MMQ_GFX906_Y64").map_or(false, |v| v == "1")
-    })
-}
-
-/// Gates the wave64 FP16 hybrid prefill path. gfx906 (Vega 20, MI50) is the
-/// only arch with measured data: +90% prefill on Qwen 3.5 9B (74 → 141 tk/s).
-/// gfx908 (CDNA1, MI100) shares __hfma2 + wave64 and would code-correctly
-/// run the same kernels, but we have no perf data and MFMA likely wants a
-/// different optimum. MI100 owners can opt in for A/B testing via
-/// `HIPFIRE_GCN5_WAVE64_HYBRID=1`. CDNA3 (gfx94x) uses rocBLAS MFMA.
-fn is_gcn5_wave64(arch: &str) -> bool {
-    if arch == "gfx906" {
-        return true;
-    }
-    if arch == "gfx908"
-        && std::env::var("HIPFIRE_GCN5_WAVE64_HYBRID")
-            .map_or(false, |v| v == "1")
-    {
-        return true;
-    }
-    false
-}
-
-/// Wave64-native arches: Vega 20 / GCN5 (gfx906), CDNA1 (gfx908, MI100),
-/// and CDNA3 (gfx94x, MI300X). On these, wave32 kernels (block=[32,1,1])
-/// waste the upper 32 lanes of every wave slot. The `*_wave64.hip` kernel
-/// variants pack two rows per block (one per warp) with block=[64,1,1] and
-/// halve the grid count. Adding gfx90a (CDNA2, MI200) here is a one-line
-/// change once it has been bring-up validated.
-fn has_wave64_native(arch: &str) -> bool {
-    matches!(arch, "gfx906" | "gfx908" | "gfx940" | "gfx941" | "gfx942")
-}
-
-/// Architectures that have an integer-MMQ prefill path:
-/// - RDNA3/3.5 (gfx1100..gfx1152): i8 WMMA via `__builtin_amdgcn_wmma_i32_16x16x16_iu8`
-/// - gfx906 (Vega 20, MI50/MI60): dp4a via `__builtin_amdgcn_sdot4`
-///
-/// The two dispatch through different Rust routines because the launch
-/// shape and LDS budget differ — see `gemm_hfq4g256_residual_mmq` (RDNA3,
-/// 32×8 block, 128×128 tile, WMMA) vs the gfx906 redesign
-/// (`gemm_hfq4g256_residual_mmq_gfx906_x{N}` for N ∈ {8..64}, 64×4 block,
-/// 128×mmq_x tile, dp4a, per-mmq_x X_STRIDE; see
-/// `kernels/src/gemm_hfq4g256_residual_mmq_gfx906_body.cuh`).
-fn has_mmq_dp4a_or_wmma(arch: &str) -> bool {
-    matches!(arch,
-        "gfx906"
-        | "gfx1100" | "gfx1101" | "gfx1102" | "gfx1103"
-        | "gfx1150" | "gfx1151" | "gfx1152")
-}
-
-/// Decide whether an integer-MMQ prefill path should be used for a given
-/// GEMM call. Combines the arch gate, the env override, and an empirical
-/// batch-size threshold.
-///
-/// **RDNA3 i8-WMMA MMQ:** uses a 128×128 batch tile (vs the fp16 WMMA path's
-/// 16×16), so it amortizes its high per-launch fixed cost only when
-/// batch_size is large enough to fill multiple tiles. Empirical sweep on
-/// Qwen 3.5 9B (gfx1100, ROCm 7.2, residual at m=4096) across pp ∈ {32..512}:
-///   pp32-pp192: MMQ regresses 23-69% (per-launch overhead dominates).
-///   pp224:      within noise (-8%).
-///   pp256+:     MMQ wins at multiples of 128 (+12% to +29%).
-/// Default RDNA3 threshold is 256.
-///
-/// **gfx906 dp4a MMQ:** uses runtime-dispatched mmq_x ∈ {8,16,24,32,40,48,56,64}
-/// per the post-redesign kernel (plans/gfx906_mmq_redesign.md, commit
-/// c022682). Default-on at batch_size ≥ 16 — pp128 hits 462 tok/s on
-/// Qwen 9B mq4 (3.28× over FP16 wave64); below pp16 the Q8_1 quantize +
-/// per-output launch overhead dominates so FP16 wave64 wins.
-///
-/// `HIPFIRE_MMQ` env override:
-///   `0` / `off`            — force MMQ off (debug / regression bisect)
-///   `1` / `on`             — force MMQ on at every batch (legacy behavior)
-///   `auto` / unset / other — auto-route by batch_size threshold (default)
-///
-/// Both env reads (`HIPFIRE_MMQ`, `HIPFIRE_MMQ_MIN_BATCH`) cache via
-/// `OnceLock` — no per-dispatch syscalls on the hot path (called from
-/// 9+ dispatch sites, ~288+ syscalls/chunk on 27B prefill otherwise).
-fn should_use_mmq(arch: &str, batch_size: usize) -> bool {
-    if !has_mmq_dp4a_or_wmma(arch) {
-        return false;
-    }
-    match mmq_env_override() {
-        Some(false) => false,
-        Some(true) => true,
-        None => {
-            // Per-arch default min_batch:
-            //   gfx906: 8 — empirically validated for both prefill (pp512
-            //     within noise of min_batch=16) and DFlash 27B verify
-            //     (B ∈ [12, 14] previously fell to FP16 wave64; lifting
-            //     them to MMQ gives +64.8% tok/s on humaneval-0 prompt,
-            //     +39% on lru_cache prose, 3-run deterministic). Earlier
-            //     min_batch=16 was set on the prefill `gemm_hfq4g256`
-            //     non-residual sweep; the *residual* batched GEMM
-            //     (used by DFlash verify) crosses below that and wins
-            //     down to B=8. AR decode at B=1 stays unchanged
-            //     (well below cutover). PMC pass at 2026-05-06:
-            //     `gemm_hfq4g256_residual_fp16_wave64` was 23.5% of
-            //     DFlash time at min_batch=16 — root cause of the gap.
-            //   other archs: 256 — RDNA3+ has WMMA which is genuinely faster
-            //     than MMQ at small batches; flip only when MMQ amortization
-            //     dominates.
-            let arch_min_batch: usize = if arch == "gfx906" { 8 } else { 256 };
-            let min_batch = mmq_min_batch_override().unwrap_or(arch_min_batch);
-            batch_size >= min_batch
-        }
-    }
-}
-
-/// Cached env-var read for `HIPFIRE_MMQ`. `Some(true)` = force on,
-/// `Some(false)` = force off, `None` = auto.
-fn mmq_env_override() -> Option<bool> {
-    static CACHE: OnceLock<Option<bool>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        match std::env::var("HIPFIRE_MMQ").ok().as_deref() {
-            Some("0") | Some("off") => Some(false),
-            Some("1") | Some("on") => Some(true),
-            _ => None,
-        }
-    })
-}
-
-/// Cached env-var read for `HIPFIRE_MMQ_MIN_BATCH` (per-arch min-batch override).
-fn mmq_min_batch_override() -> Option<usize> {
-    static CACHE: OnceLock<Option<usize>> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_MMQ_MIN_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-    })
-}
-
-/// Cached env-var read for `HIPFIRE_FP16=0` (disable FP16 fast paths).
-/// Called from 12+ dispatch sites on the prefill hot path; uncached read
-/// is one syscall + String alloc per dispatch.
-fn fp16_disabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_FP16").map_or(false, |v| v == "0")
-    })
-}
-
-/// Cached env-var read for `HIPFIRE_WO_MMQ=1` (opt-in MMQ for the wo path
-/// on RDNA3+/RDNA3.5 while the tiled path is validated).
-fn wo_mmq_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1")
-    })
-}
-
-/// Cached env-var read for `HIPFIRE_LM_HEAD_WMMA=0` (disable the gfx11
-/// LM-head WMMA fast path).
-fn lm_head_wmma_disabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0")
-    })
-}
 
 /// Tensor stored on the GPU. Tracks shape and element type.
 pub struct GpuTensor {
@@ -701,6 +262,8 @@ pub trait ActivationCapture: Send + Sync {
 pub struct Gpu {
     pub hip: HipRuntime,
     pub arch: String,
+    pub flags: Arc<FeatureFlags>,
+    pub arch_caps: crate::arch_caps::ArchCaps,
     pub device_id: i32,
     compiler: KernelCompiler,
     modules: HashMap<String, hip_bridge::Module>,
@@ -778,14 +341,6 @@ pub struct Gpu {
     /// Diagnostic: when true, `launch_maybe_blob` takes the blob path even when
     /// `capture_mode=false`. Isolates "blob-vs-kernelParams path" bugs without
     /// the rest of the graph-capture machinery (stream capture, staging, etc).
-    /// Set via `HIPFIRE_BLOB_FORCE=1` at init. Blobs accumulate unbounded in
-    /// `capture_blobs` while set — only intended for short diagnostic runs.
-    pub force_blob_path: bool,
-    /// Diagnostic: when true, gfx906 MMQ residual quantizes X to Q8_1 then
-    /// returns FP16 wave64 instead of running dp4a — isolates the cost of
-    /// the activation pre-quantize pass. Read once via `HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY=1`
-    /// at init so the per-call hot path doesn't hit `env::var`'s global lock.
-    pub mmq_diag_quantize_only: bool,
     /// Heap-stored kernarg blobs for the current capture session. The blob
     /// pointers are baked into the graph at capture time — do NOT clear this
     /// vec until after `graph_exec_destroy`.
@@ -1013,33 +568,21 @@ impl Gpu {
         }
         eprintln!("GPU dev {}: {} ({:.1} GB VRAM, HIP {}.{})", id, arch, vram_total as f64 / 1e9, hip_major, hip_minor);
 
-        let compiler = KernelCompiler::new(&arch)?;
+        let flags = Arc::new(FeatureFlags::from_env(&arch));
+        let arch_caps = crate::arch_caps::ArchCaps::new(&arch, flags.clone());
+
+        let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
 
         LAST_BOUND_DEVICE.with(|c| c.set(id));
 
-        // Per-arch defaults for MMQ screening. See the mmq_screen and
-        // mmq_screen_threshold fields below for rationale.
-        //
-        // gfx906 was previously default-on out of caution because the MMQ
-        // kernels were ported from the gfx11xx i8-WMMA path that motivated
-        // #87, but gfx906 uses dp4a (`__builtin_amdgcn_sdot4`), not WMMA,
-        // and empirically tolerates the row-3994 weight outliers within the
-        // 0.50 threshold. Audit on 2026-05-18 across qwen3.5-{0.8B, 9B} mq4
-        // (AWQ + non-AWQ) showed 0/248 weights flagged at threshold 0.50 —
-        // the screen reference dispatch (~700 µs/weight via
-        // `gemm_hfq4g256_residual_fp16_wave64`) was pure overhead, costing
-        // ~145 ms on the first prefill. Users on new quant formats can
-        // re-enable defensively via `HIPFIRE_MMQ_SCREEN=1`.
-        //
-        // RDNA3/3.5: unchanged behavior. Already default-off here; clients
-        // that need #87 protection (daemon callers loading on i8-WMMA archs)
-        // explicitly pass `mmq_screen: true` at load time.
-        let mmq_screen_default: bool = false;
-        let mmq_screen_threshold_default: f32 = if arch == "gfx906" { 0.50 } else { 0.10 };
+        let mmq_screen = flags.mmq_screen;
+        let mmq_screen_threshold = flags.mmq_screen_threshold;
 
         Ok(Self {
             hip,
             arch,
+            flags,
+            arch_caps,
             device_id: id,
             compiler,
             modules: HashMap::new(),
@@ -1067,34 +610,9 @@ impl Gpu {
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
-            // Per-arch default for MMQ per-weight screening:
-            //   gfx906: on (paired with the 0.50 threshold default below).
-            //     Acts as a regression safety net; expected to reject 0
-            //     weights at 0.50 threshold but catches future distribution
-            //     issues. Cached per weight pointer, so cost is amortized.
-            //   other archs: off — preserves prior behavior; flip only after
-            //     similar validation.
-            mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN").ok()
-                .map(|v| v == "1")
-                .unwrap_or(mmq_screen_default),
-            // Default screening threshold: 0.10 absolute error per row,
-            // measured against synthetic uniform [-2, 2] activations.
-            // The 0.10 default was set when the gfx906 dp4a kernel was
-            // buggy (commit 8081822); the post-redesign kernel (commit
-            // c022682) is structurally cleaner and the same prompts pass
-            // coherence at 0.50. Bumping the gfx906 default to 0.50
-            // recovers the 30/72 weights that get rejected per Qwen 9B
-            // load (mostly row 3994 of m=4096 matrices, a known
-            // degenerate quant group). pp128 lifts 355 → 462 tok/s
-            // (1.30×) at threshold=0.50 with no coherence regression
-            // across all 4 mq4 rows of the gate. Other archs keep the
-            // conservative 0.10 default until similar validation.
-            mmq_screen_threshold: std::env::var("HIPFIRE_MMQ_SCREEN_THRESHOLD")
-                .ok().and_then(|s| s.parse().ok())
-                .unwrap_or(mmq_screen_threshold_default),
+            mmq_screen,
+            mmq_screen_threshold,
             capture_mode: false,
-            force_blob_path: std::env::var("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
-            mmq_diag_quantize_only: std::env::var("HIPFIRE_MMQ_DIAG_QUANTIZE_ONLY").ok().as_deref() == Some("1"),
             capture_blobs: Vec::new(),
             graph_exec: None,
             captured_graph: None,
@@ -1111,7 +629,7 @@ impl Gpu {
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
         }).map(|mut gpu| {
-            if gpu.force_blob_path {
+            if gpu.flags.force_blob_path {
                 eprintln!("[diag] HIPFIRE_BLOB_FORCE=1: all kernel launches will use the blob path (kernelParams bypassed). Diagnostic only.");
             }
             // Auto-init rocBLAS on CDNA3 so the batched-prefill MFMA path is
@@ -1131,8 +649,8 @@ impl Gpu {
     pub fn try_init_rocblas(&mut self) {
         self.bind_thread_or_warn();
         if self.rocblas.is_some() { return; }
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
-        let all_archs = std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1");
+        let cdna3 = self.arch_caps.is_cdna3();
+        let all_archs = self.flags.rocblas_all_archs;
         if !cdna3 && !all_archs { return; }
         match Rocblas::load() {
             Ok(rb) => {
@@ -1533,7 +1051,7 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.capture_mode || self.force_blob_path {
+        if self.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
             // Pad tail to 16-byte alignment — some kernel struct layouts that
             // HIP's loader expects have an implicit final pad to the struct's
@@ -1807,7 +1325,7 @@ impl Gpu {
             self.capture_mode = true;
 
             // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
-            if self.arch == "gfx906" {
+            if self.arch_caps.is_gfx906() {
                 self.gemm_hfq4g256_residual_fp16_wave64(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
             } else {
                 self.gemm_hfq4g256_residual_wmma(a_raw, &x_gpu, &y_wmma, m, k, screen_batch)?;
@@ -1815,7 +1333,7 @@ impl Gpu {
 
             // MMQ path
             let xq = self.ensure_q8_1_mmq_x(&x_gpu, screen_batch, k)?;
-            if self.arch == "gfx906" {
+            if self.arch_caps.is_gfx906() {
                 self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, &x_gpu, &y_mmq, m, k, screen_batch)?;
             } else {
                 self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
@@ -1903,10 +1421,10 @@ impl Gpu {
     fn rocblas_arch_eligible(&self) -> bool {
         static CACHE: OnceLock<bool> = OnceLock::new();
         let all_archs = *CACHE.get_or_init(|| {
-            std::env::var("HIPFIRE_ROCBLAS_ALL_ARCHS").ok().as_deref() == Some("1")
+            self.flags.rocblas_all_archs
         });
         if all_archs { return self.rocblas.is_some(); }
-        matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+        self.arch_caps.is_cdna3()
     }
 
     /// Configurable batch threshold for MFMA dispatch. Below this we stay on
@@ -1919,13 +1437,10 @@ impl Gpu {
     fn rocblas_min_batch(&self) -> usize {
         static CACHE: OnceLock<usize> = OnceLock::new();
         *CACHE.get_or_init(|| {
-            if std::env::var("HIPFIRE_ROCBLAS_OFF").ok().as_deref() == Some("1") {
+            if self.flags.rocblas_off {
                 return usize::MAX;
             }
-            std::env::var("HIPFIRE_ROCBLAS_MIN_BATCH")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4)
+self.flags.rocblas_min_batch.unwrap_or(4)
         })
     }
 
@@ -4376,7 +3891,7 @@ impl Gpu {
     /// variant; other archs fall back to the baseline switch-dispatch path.
     pub fn gemv_mq3g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq3g256_lloyd")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -4421,7 +3936,7 @@ impl Gpu {
     /// fall back to the chip-agnostic baseline switch-dispatch path.
     pub fn gemv_mq4g256_lloyd(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq4g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq4g256_lloyd")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -4517,18 +4032,16 @@ impl Gpu {
         // small shapes regress (4× WG reduction + 106 VGPR leaves CUs idle).
         // Threshold tuning open — see Phase D plan §"Open questions" #3.
         // Env override: HIPFIRE_LLOYD_MB4=1 force-on, =0 force-off.
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_LLOYD_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
+        let use_mb4 = match self.flags.lloyd_mb4 {
+            Some(_) => arch_supports_mb4,
+            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
         };
         if use_mb4 {
             return self.gemm_mq4g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4590,7 +4103,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4648,7 +4161,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq4g256_lloyd_residual_wmma_mb2")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -4709,12 +4222,10 @@ impl Gpu {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         // Phase D-B path selector — same gate as residual_mb4.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_LLOYD_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
+        let use_mb4 = match self.flags.lloyd_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkvza_mq4g256_lloyd_wmma_mb4(
@@ -4724,7 +4235,7 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -4802,12 +4313,10 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_LLOYD_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
+        let use_mb4 = match self.flags.lloyd_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkv_mq4g256_lloyd_wmma_mb4(
@@ -4816,7 +4325,7 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -4888,12 +4397,10 @@ impl Gpu {
     ) -> HipResult<()> {
         // bind_thread: skip — path selector; concrete launch path binds before HIP use
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_LLOYD_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102" | "gfx1151");
+        let use_mb4 = match self.flags.lloyd_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_gate_up_mq4g256_lloyd_wmma_mb4(
@@ -4902,7 +4409,7 @@ impl Gpu {
             );
         }
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq4g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -4966,7 +4473,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5042,7 +4549,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemm_qkv_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5112,7 +4619,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemm_gate_up_mq4g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5170,7 +4677,7 @@ impl Gpu {
     /// gemv_mq3g256_lloyd_residual; same single-acc bug fix applies.
     pub fn gemv_mq4g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq4g256_lloyd_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_mq4g256_lloyd_residual_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq4g256_lloyd_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -5218,7 +4725,7 @@ impl Gpu {
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_gate_up_mq4g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_gate_up_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_gate_up_mq4g256_lloyd")?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
@@ -5263,7 +4770,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkvza_mq4g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_qkvza_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkvza_mq4g256_lloyd")?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -5322,7 +4829,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_qkv_mq4g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkv_mq4g256_lloyd")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
@@ -5373,7 +4880,7 @@ impl Gpu {
     /// 9B Lloyd-MQ3, gfx1100, per the 2026-05-06 decode profile).
     pub fn gemv_mq3g256_lloyd_residual(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_mq3g256_lloyd_residual_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "gemv_mq3g256_lloyd_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -5433,17 +4940,15 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // mb4 path selector — same gate as MQ4-Lloyd's mb4 family.
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            Some(_) => arch_supports_mb4,
+            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
         };
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -5501,7 +5006,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_mq3g256_lloyd_residual_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_mq3g256_lloyd_residual_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
@@ -5559,12 +5064,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkvza_mq3g256_lloyd_wmma_mb4(
@@ -5573,7 +5076,7 @@ impl Gpu {
                 qkv_m, z_m, beta_m, alpha_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5650,7 +5153,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkvza_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5726,12 +5229,10 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkv_mq3g256_lloyd_wmma_mb4(
@@ -5739,7 +5240,7 @@ impl Gpu {
                 q_m, k_m, v_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5810,7 +5311,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_qkv_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_qkv_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5880,19 +5381,17 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_gate_up_mq3g256_lloyd_wmma_mb4(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, n,
             );
         }
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -5956,7 +5455,7 @@ impl Gpu {
         k: usize, n: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch);
+        let (src, module) = kernels::gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemm_gate_up_mq3g256_lloyd_wmma_mb4")?;
         let x_f16_ptr = self.ensure_fp16_x(x, n * k)?;
 
@@ -6022,7 +5521,7 @@ impl Gpu {
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_gate_up_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_gate_up_mq3g256_lloyd")?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
@@ -6073,7 +5572,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkvza_mq3g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_qkvza_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkvza_mq3g256_lloyd")?;
         let aq = a_qkv.buf.as_ptr();
         let az = a_z.buf.as_ptr();
@@ -6137,7 +5636,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch);
+        let (src, module) = kernels::fused_qkv_mq3g256_lloyd_for_arch(&self.arch_caps, self.flags.lloyd_force_baseline);
         self.ensure_kernel(module, src, "fused_qkv_mq3g256_lloyd")?;
         let aq = a_q.buf.as_ptr();
         let ak = a_k.buf.as_ptr();
@@ -6277,7 +5776,7 @@ impl Gpu {
         // Shape-gated: FP8 dot4 only when M is large enough that it
         // actually wins (FFN shapes). At M < 4096 the fallback wins or
         // ties; uniform-FP8 was net-negative in 9B Qwen 3.5 decode.
-        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && m >= FP8_GEMV_MIN_M {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
             return self.gemv_hfp4g32_fp8_gfx12(a_raw, x, y, m, k);
         }
         // gfx11 (RDNA3) v_dot2_f32_f16 trickle-down: replaces the
@@ -6285,7 +5784,7 @@ impl Gpu {
         // No new scratch (reuses ensure_fp16_x), no cross-kernel
         // context cost like the FP8 path had. Default-on for gfx11.
         // Kill switch HIPFIRE_DOT2_GEMV=0 for A/B benching.
-        if has_wmma_f16(&self.arch) && is_dot2_gemv_enabled() {
+        if self.arch_caps.has_wmma_w32() && self.flags.dot2_gemv {
             return self.gemv_hfp4g32_dot2_gfx11(a_raw, x, y, m, k);
         }
         self.gemv_hfp4g32_fallback(a_raw, x, y, m, k)
@@ -6302,7 +5801,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfp4g32_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfp4g32")?;
         let func = &self.functions["gemv_hfp4g32"];
         let mut a_ptr = a_raw.buf.as_ptr();
@@ -6369,9 +5868,7 @@ impl Gpu {
         // gfx94x split: opt-in via HIPFIRE_GFX942_RMSNORM_SPLIT=1.
         // Two-kernel path (reduce + rotate) gives 5× more in-flight wave64s
         // on prefill scale; modest decode change. Math byte-identical.
-        if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
-            && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT")
-                .map(|v| v != "0").unwrap_or(true)
+        if self.flags.gfx942_rmsnorm_split
         {
             return self.fused_rmsnorm_rotate_mq_split_gfx942(x, weight, x_rot, k, eps, 1);
         }
@@ -6712,9 +6209,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // gfx94x split — see fused_rmsnorm_rotate_mq docstring.
-        if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
-            && std::env::var("HIPFIRE_GFX942_RMSNORM_SPLIT")
-                .map(|v| v != "0").unwrap_or(true)
+        if self.flags.gfx942_rmsnorm_split
         {
             return self.fused_rmsnorm_rotate_mq_split_gfx942(x, weight, x_rot, k, eps, batch_size);
         }
@@ -7298,7 +6793,7 @@ impl Gpu {
         // when M ≥ FP8_GEMV_MIN_M does FP8 dot4 win measurably on this
         // path. Below threshold (e.g. wo M=2048), the FP8 fused-rotation
         // costs more than the dot4 ALU savings — keep the F32 fallback.
-        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && m >= FP8_GEMV_MIN_M {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && m >= FP8_GEMV_MIN_M {
             let x_fp8_ptr = self.rotate_x_mq_dual_fp8(x, x_rot, k)?;
             return self.gemv_hfp4g32_fp8_gfx12_with_fp8_ptr(a_raw, x_fp8_ptr, y, m, k);
         }
@@ -7567,7 +7062,7 @@ impl Gpu {
     /// Uses `launch_maybe_blob` for HIPFIRE_GRAPH=1 capture safety.
     pub fn gemv_hfq3g256(&mut self, a_raw: &GpuTensor, x: &GpuTensor, y: &GpuTensor, m: usize, k: usize) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq3g256_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq3g256")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -7606,7 +7101,7 @@ impl Gpu {
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq3g256_residual_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq3g256_residual")?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
@@ -7692,8 +7187,8 @@ impl Gpu {
         // wave32 base since each warp's 32-lane reduction stays in-warp.
         // ILP-prefetch variant gates on gemv_prefetch_enabled(arch) — default
         // on for gfx906 (Phase A.1b, mirror of HFQ4 +4.8% lever from `3ef127d`).
-        if has_wave64_native(&self.arch) {
-            let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+        if self.arch_caps.is_wave64_native() {
+            let (kname, ksrc): (&str, &str) = if self.arch_caps.gemv_prefetch_enabled() {
                 (
                     "gemv_hfq6g256_residual_wave64_prefetch",
                     kernels::GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC,
@@ -7785,7 +7280,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+        let (hfq4g256_src, hfq4g256_module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
         self.ensure_kernel(hfq4g256_module, hfq4g256_src, "gemv_hfq4g256")?;
 
         let a_ptr = a_raw.buf.as_ptr();
@@ -7816,15 +7311,15 @@ impl Gpu {
         //
         // See gemv_rows_default() for the measurement data that motivates
         // the per-arch defaults.
-        let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
-        let rows = gemv_rows_override().unwrap_or_else(|| gemv_rows_default(self.arch.as_str()));
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = self.arch_caps.gemv_rows_default();
         let use_multirow = rows > 1;
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
         let use_wide = !use_multirow
             && m >= 64
-            && !matches!(self.arch.as_str(), "gfx1030" | "gfx1031" | "gfx1100" | "gfx1101" | "gfx1102");
+            && !(self.arch_caps.is_rdna2() || self.arch_caps.is_rdna3_dgpu());
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256", bytes);
@@ -8130,21 +7625,19 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if gemv_dp4a_enabled(&self.arch) {
+        if self.arch_caps.gemv_dp4a_enabled() {
             return self.fused_qkv_hfq4g256_dp4a(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k,
             );
         }
 
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
-            let is_gfx94x = matches!(self.arch.as_str(),
-                "gfx940" | "gfx941" | "gfx942");
-            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
-                .map(|v| v != "0").unwrap_or(true);
+            let is_gfx94x = self.arch_caps.is_cdna3();
+            let v2_on = self.flags.gfx942_gemv_v2.unwrap_or(true);
             if is_gfx94x && v2_on {
                 self.ensure_kernel(
                     "fused_qkv_hfq4g256_v2_gfx942",
@@ -8237,7 +7730,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if gemv_dp4a_enabled(&self.arch) {
+        if self.arch_caps.gemv_dp4a_enabled() {
             return self.fused_qkvza_hfq4g256_dp4a(
                 a_qkv, a_z, a_beta, a_alpha, x,
                 y_qkv, y_z, y_beta, y_alpha,
@@ -8248,15 +7741,13 @@ impl Gpu {
         // 2 rows per block, halves grid count vs wave32 kernel which wastes half
         // the wave slot. This kernel uses no MFMA, just FMA + shfl_down within
         // wave64, so it is safe for Vega 20 as well as CDNA.
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
-            let is_gfx94x = matches!(self.arch.as_str(),
-                "gfx940" | "gfx941" | "gfx942");
-            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
-                .map(|v| v != "0").unwrap_or(true);
+            let is_gfx94x = self.arch_caps.is_cdna3();
+            let v2_on = self.flags.gfx942_gemv_v2.unwrap_or(true);
             if is_gfx94x && v2_on {
                 self.ensure_kernel(
                     "fused_qkvza_hfq4g256_v2_gfx942",
@@ -8456,9 +7947,9 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
+        if batch_size > 1 && !self.flags.fp16_disabled {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
-            if is_gcn5_wave64(&self.arch) {
+            if self.arch_caps.is_gcn5_wave64() {
                 // gfx906 dp4a MMQ split: qkv + z route through the new MMQ
                 // kernel (large-M outputs); beta + alpha keep the fused
                 // wave64 kernel because their M (=linear_num_value_heads,
@@ -8482,7 +7973,7 @@ impl Gpu {
                 //       (screen-reject path preserves higher-precision intent;
                 //       dp4a shares Q8_1 quant step that MMQ failed on).
                 let mut mmq_screen_rejected = false;
-                if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
                     let qz_safe = if self.mmq_screen {
                         self.mmq_screen_weight(a_qkv, qkv_m, k)
                             && self.mmq_screen_weight(a_z, z_m, k)
@@ -8507,7 +7998,7 @@ impl Gpu {
                         // capture; the dp4a kernel may not be compiled yet on
                         // a fresh process).
                         let r3 = if r2.is_ok() {
-                            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+                            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                                 self.gemm_qkvza_hfq4g256_wave64_dp4a_prequant(
                                     a_qkv, a_z, a_beta, a_alpha,
                                     xq,
@@ -8532,7 +8023,7 @@ impl Gpu {
                 // batch_size > 1 below the MMQ cutover or when capture mode
                 // prevents MMQ. Skipped on screen-reject to preserve the
                 // higher-precision fallback intent.
-                if !mmq_screen_rejected && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                     return self.gemm_qkvza_hfq4g256_wave64_dp4a(
                         a_qkv, a_z, a_beta, a_alpha, x,
                         y_qkv, y_z, y_beta, y_alpha,
@@ -8541,7 +8032,7 @@ impl Gpu {
                 }
                 return self.gemm_qkvza_hfq4g256_fp16_wave64(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if should_use_mmq(&self.arch, batch_size) {
+            if self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
                         && self.mmq_screen_weight(a_z, z_m, k)
@@ -8557,7 +8048,15 @@ impl Gpu {
                     return r1.and(r2).and(r3).and(r4);
                 }
             }
-            if hfq4_mmq_rdna2_enabled(&self.arch) {
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 4). Three modes:
+            //   (a) all 4 Ms aligned to MMQ_Y=128 → single 4-way fused MMQ kernel
+            //   (b) qkv_m and z_m aligned but beta_m/alpha_m not (LinearAttention
+            //       β+α are typically tiny, well below 128) → split routing:
+            //       2-way gate_up MMQ on (wqkv, wz) + 2-way gate_up dot2 on
+            //       (w_beta, w_alpha). Mirrors MQ3 phase-2 finding that
+            //       gave +22% prefill on Qwen3.5 LA layers.
+            //   (c) something else not aligned → fall through to dot2/wmma.
+            if self.arch_caps.has_hfq4_mmq() {
                 let all_aligned = qkv_m % 128 == 0 && z_m % 128 == 0
                                && beta_m % 128 == 0 && alpha_m % 128 == 0;
                 if all_aligned {
@@ -8580,21 +8079,21 @@ impl Gpu {
                     return r1.and(r2);
                 }
             }
-            if has_wmma_f16_gfx12(&self.arch) {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkvza_hfq4g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkvza_hfq4g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkvza_hfq4g256_dot2(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkvza_hfq4g256_fp16(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkvza_hfq4g256_wave64",
@@ -8687,12 +8186,12 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
-        // AND all four output strides are MMQ_Y-aligned. Auto-selector falls
-        // back to dot2 at small batch.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
-            && qkv_m % 128 == 0 && z_m % 128 == 0
-            && beta_m % 128 == 0 && alpha_m % 128 == 0
+        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1.
+        // Auto-selector falls back to dot2 at small batch. Layer-gate
+        // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
+        // per-layer KLD attribution sweeps (#302).
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
+            && self.flags.hfq3_mmq_layer_gate_pass()
         {
             return self.gemm_qkvza_hfq3g256_mmq(
                 a_qkv, a_z, a_beta, a_alpha, x,
@@ -8701,8 +8200,11 @@ impl Gpu {
             );
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
-            if has_dot2_f32_f16(&self.arch) {
+        // Layer-aware FP16 gate (#302): falls through to scalar when the
+        // current layer falls in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when
+        // those env vars are unset.
+        if batch_size > 1 && !self.flags.fp16_disabled_for_current_layer() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkvza_hfq3g256_dot2(
                     a_qkv, a_z, a_beta, a_alpha, x,
                     y_qkv, y_z, y_beta, y_alpha,
@@ -9213,9 +8715,9 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
+        if batch_size > 1 && !self.flags.fp16_disabled {
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
-            if is_gcn5_wave64(&self.arch) {
+            if self.arch_caps.is_gcn5_wave64() {
                 // gfx906 dp4a MMQ: route q+k+v through the new MMQ kernel.
                 // Unlike qkvza, all three qkv outputs have M well above
                 // MMQ_Y=128 (Qwen 9B full-attn: q_m=4096, k_m=v_m=1024),
@@ -9225,7 +8727,7 @@ impl Gpu {
                 // should_use_mmq's gfx906 default). Falls through to the
                 // fused wave64 if any of q/k/v screening rejects.
                 let mut mmq_screen_rejected = false;
-                if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+                if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
                     let qkv_safe = if self.mmq_screen {
                         self.mmq_screen_weight(a_q, q_m, k)
                             && self.mmq_screen_weight(a_k, k_m, k)
@@ -9257,14 +8759,14 @@ impl Gpu {
                 // batch_size > 1 below the MMQ cutover or in capture mode.
                 // Skipped on screen-reject (dp4a shares Q8_1 quant step with
                 // MMQ; routing rejected weights here would defeat the screen).
-                if !mmq_screen_rejected && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                     return self.gemm_qkv_hfq4g256_wave64_dp4a(
                         a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
                     );
                 }
                 return self.gemm_qkv_hfq4g256_fp16_wave64(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if should_use_mmq(&self.arch, batch_size) {
+            if self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_q, q_m, k)
                         && self.mmq_screen_weight(a_k, k_m, k)
@@ -9278,24 +8780,27 @@ impl Gpu {
                     return r1.and(r2).and(r3);
                 }
             }
-            if hfq4_mmq_rdna2_enabled(&self.arch) && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
+            // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
+            // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
+            if self.arch_caps.has_hfq4_mmq() && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
                 return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16_gfx12(&self.arch) {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkv_hfq4g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkv_hfq4g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq4g256_dot2(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
             return self.gemm_qkv_hfq4g256_fp16(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_qkv_hfq4g256_wave64",
@@ -9383,8 +8888,9 @@ impl Gpu {
         // Phase 3 experimental: MMQ family (auto-tile-selecting). Fires only
         // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
-        // safe at any batch_size.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+        // safe at any batch_size. Layer-gate is a no-op when unset (#302).
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
+            && self.flags.hfq3_mmq_layer_gate_pass()
             && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0
         {
             return self.gemm_qkv_hfq3g256_mmq(
@@ -9392,17 +8898,19 @@ impl Gpu {
             );
         }
         // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
-        if batch_size > 1 && hfq3_dp4a_enabled(&self.arch) {
+        if batch_size > 1 && self.arch_caps.has_hfq3_dp4a() {
             return self.gemm_qkv_hfq3g256_dp4a(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
         }
         // FP16 fast paths — gfx10xx admits MQ3 via is_batchable_la, all of
         // these archs support FP16 ISA. Phase 2b (dot2) + Phase 2c (fp16).
-        if batch_size > 1 && !fp16_disabled() {
+        // Layer-aware FP16 gate (#302) falls through to scalar when layer
+        // in HIPFIRE_FP16_LAYER_MIN..=MAX. No-op when those vars are unset.
+        if batch_size > 1 && !self.flags.fp16_disabled_for_current_layer() {
             // v_dot2_f32_f16 on archs with the dot extension
             // (gfx1011/1012/1030-1032, gfx11/12).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq3g256_dot2(
                     a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
                 );
@@ -9628,8 +9136,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq3g256_dot2(
                     a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
                 );
@@ -9933,7 +9441,7 @@ impl Gpu {
         // the gate/up FP16 shadows. rocBLAS launch overhead is small compared
         // to the GEMM work at prefill batches, so fusing into a single
         // concatenated matrix isn't worth the extra kernel code tonight.
-        let cdna3 = matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942");
+        let cdna3 = self.arch_caps.is_cdna3();
         if cdna3
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
@@ -9961,13 +9469,13 @@ impl Gpu {
             }
         }
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
+        if batch_size > 1 && !self.flags.fp16_disabled {
             // gfx906 dp4a MMQ — default-on at batch_size ≥ 8 (per
             // should_use_mmq's gfx906 default). Quantize X once, screen
             // both weights, dispatch MMQ for each in set mode (add=0).
             // See docs/plans/gfx906-mmq-prd.md for context.
             let mut mmq_screen_rejected = false;
-            if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+            if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
@@ -9994,16 +9502,16 @@ impl Gpu {
             // gfx906 dp4a 2-way fused (issue #276 Gap 2). Fires for B>1
             // below the MMQ cutover or in capture mode. Skipped on
             // screen-reject.
-            if !mmq_screen_rejected && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_gate_up_hfq4g256_wave64_dp4a(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
             }
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
-            if is_gcn5_wave64(&self.arch) {
+            if self.arch_caps.is_gcn5_wave64() {
                 return self.gemm_gate_up_hfq4g256_fp16_wave64(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
-            if should_use_mmq(&self.arch, batch_size) {
+            if self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
@@ -10015,20 +9523,21 @@ impl Gpu {
                     return r1.and(r2);
                 }
             }
-            if hfq4_mmq_rdna2_enabled(&self.arch) && gate_m % 128 == 0 && up_m % 128 == 0 {
+            // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 3).
+            if self.arch_caps.has_hfq4_mmq() && gate_m % 128 == 0 && up_m % 128 == 0 {
                 return self.gemm_gate_up_hfq4g256_mmq(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx12 (RDNA4)
-            if has_wmma_f16_gfx12(&self.arch) {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_gate_up_hfq4g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // WMMA on gfx11 (RDNA3)
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_gate_up_hfq4g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq4g256_dot2(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
@@ -10155,8 +9664,9 @@ impl Gpu {
         self.bind_thread()?;
         // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
         // AND gate_m/up_m are MMQ_Y-aligned. Auto-selector falls back to dot2
-        // at small batch.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch)
+        // at small batch. Layer-gate is a no-op when unset (#302).
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
+            && self.flags.hfq3_mmq_layer_gate_pass()
             && gate_m % 128 == 0 && up_m % 128 == 0
         {
             return self.gemm_gate_up_hfq3g256_mmq(
@@ -10164,14 +9674,15 @@ impl Gpu {
             );
         }
         // Phase 2 experimental: wave32 dp4a if HIPFIRE_HFQ3_DP4A=1.
-        if batch_size > 1 && hfq3_dp4a_enabled(&self.arch) {
+        if batch_size > 1 && self.arch_caps.has_hfq3_dp4a() {
             return self.gemm_gate_up_hfq3g256_dp4a(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
-            if has_dot2_f32_f16(&self.arch) {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !self.flags.fp16_disabled_for_current_layer() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
@@ -10365,8 +9876,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
@@ -10453,8 +9964,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_hfq3g256_residual_{dot2,mmq_xN} which bind.
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
             }
             return self.gemm_hfq3g256_residual_fp16(a_raw, x, y, m, k, batch_size);
@@ -10646,8 +10157,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkv_hfq3g256_{dot2,mmq_xN} which bind.
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq3g256_dot2(
                     a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
                 );
@@ -10814,8 +10325,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_gate_up_hfq3g256_{dot2,mmq_xN} which bind.
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq3g256_dot2(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
@@ -11027,8 +10538,8 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         // bind_thread: skip — delegates to gemm_qkvza_hfq3g256_{dot2,mmq_xN} which bind.
-        if !hfq3_sdot4_gfx10_enabled(&self.arch) {
-            if has_dot2_f32_f16(&self.arch) {
+        if !self.arch_caps.has_hfq3_sdot4() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkvza_hfq3g256_dot2(
                     a_qkv, a_z, a_beta, a_alpha, x,
                     y_qkv, y_z, y_beta, y_alpha,
@@ -11975,7 +11486,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfp4g32_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
                 y_qkv, y_z, y_beta, y_alpha,
@@ -12170,12 +11681,10 @@ impl Gpu {
         // HFQ3 mb4 path selector. Only triggers on gfx11; gfx12 keeps its
         // existing fast path (line below) since mb4 sibling not ported.
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkvza_hfq3g256_wmma_mb4(
@@ -12183,7 +11692,7 @@ impl Gpu {
                 y_qkv, y_z, y_beta, y_alpha,
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size);
         }
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkvza_hfq3g256_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x,
                 y_qkv, y_z, y_beta, y_alpha,
@@ -12624,18 +12133,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = q_m + k_m + v_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_qkv_hfq3g256_wmma_mb4(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfq3g256_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
@@ -12873,11 +12380,11 @@ impl Gpu {
         // conservative — see project_fp8_wmma_hfp4g32_2026_05_10.md
         // for the full N sweep. The decode-path FP8 win is on the
         // GEMV side (gemv_hfp4g32_fp8_gfx12), not WMMA.
-        if has_wmma_fp8_gfx12(&self.arch) && is_fp8_wmma_enabled() && batch_size >= FP8_WMMA_MIN_BATCH {
+        if self.arch_caps.has_wmma_w32_gfx12() && self.flags.fp8_wmma && batch_size >= FP8_WMMA_MIN_BATCH {
             return self.gemm_qkv_hfp4g32_wmma_fp8_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_qkv_hfp4g32_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
         }
@@ -13133,7 +12640,7 @@ impl Gpu {
         m: usize, k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfp4g32_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
         self.gemm_hfp4g32_residual_wmma(a, x, y, m, k, batch_size)
@@ -13259,7 +12766,7 @@ impl Gpu {
         k: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfp4g32_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
@@ -13413,7 +12920,7 @@ impl Gpu {
         // HIPFIRE_GATE_UP_VARIANT=ldsx routes to the LDS-staged X variant
         // (Gate 1 microbench, opt-in only, default off). See
         // docs/perf-checkpoints/2026-05-01-gate-up-lds-x-share-plan.md.
-        let variant_override = std::env::var("HIPFIRE_GATE_UP_VARIANT").ok();
+        let variant_override = self.flags.gate_up_variant.clone();
         let (kernel_name, kernel_src) = match variant_override.as_deref() {
             Some("ldsx") => ("gemm_gate_up_hfq4g256_wmma_ldsx",
                              kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSX_SRC),
@@ -13561,18 +13068,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let total_m = gate_m + up_m;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            None => arch_supports_mb4 && batch_size >= 128 && total_m >= 4096,
+            Some(_) => arch_supports_mb4,
         };
         if use_mb4 {
             return self.gemm_gate_up_hfq3g256_wmma_mb4(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_gate_up_hfq3g256_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
         }
@@ -13936,7 +13441,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch);
+        let (src, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
         self.ensure_kernel(module, src, "gemv_hfq4g256_residual")?;
 
         let a_ptr = a_raw.buf.as_ptr();
@@ -13956,7 +13461,7 @@ impl Gpu {
         // CDNA3 wave64 fast path: 2 rows per block, halves grid.x. The base
         // kernel runs at half throughput on a wave64-native arch because
         // half the wave masks out per `__shfl_down`. Byte-exact with base.
-        let cdna3 = has_wave64_native(&self.arch);
+        let cdna3 = self.arch_caps.is_wave64_native();
 
         // RDNA3 multi-row override path. Same selector as the non-residual
         // variant but there's currently no gfx1010-default multi-row residual
@@ -13964,8 +13469,8 @@ impl Gpu {
         // regardless of HIPFIRE_GEMV_ROWS. (TODO: port the multi-row residual
         // kernel to the default path if/when the non-residual multi-row wins
         // scale to justify residual too.)
-        let rdna3 = matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102");
-        let rows = if rdna3 { gemv_rows_override().unwrap_or(1) } else { 1 };
+        let rdna3 = self.arch_caps.is_rdna3_dgpu();
+        let rows = if rdna3 { self.flags.gemv_rows.unwrap_or(1) } else { 1 };
         let use_multirow = rdna3 && rows > 1;
 
         // Bandwidth: weight + x + y_read (for residual) + y_write.
@@ -13974,7 +13479,7 @@ impl Gpu {
         let result = if cdna3 {
             // gfx94x (CDNA3 / MI300X) takes the LDS-cached 8-rows-per-WG path
             // when enabled; gfx906/908 (or env override) keep wave64 base.
-            if std::env::var("HIPFIRE_GFX942_GEMV_V3").map(|v| v == "1").unwrap_or(false) {
+            if self.flags.gfx942_gemv_v3 {
                 let kname = "gemv_hfq4g256_residual_v3_gfx942";
                 self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V3_GFX942_SRC, kname)?;
                 let grid = ((m as u32) + 7) / 8;
@@ -13988,7 +13493,7 @@ impl Gpu {
                         b
                     },
                 )
-            } else if matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942") && std::env::var("HIPFIRE_GFX942_GEMV_V2").map(|v| v != "0").unwrap_or(true) {
+            } else if self.arch_caps.is_cdna3() && self.flags.gfx942_gemv_v2.unwrap_or(true) {
                 let kname = "gemv_hfq4g256_residual_v2_gfx942";
                 self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_V2_GFX942_SRC, kname)?;
                 let grid = ((m as u32) + 3) / 4;
@@ -14002,7 +13507,7 @@ impl Gpu {
                         b
                     },
                 )
-            } else if gfx942_lds_gemv_enabled(&self.arch) && !gemv_prefetch_enabled(&self.arch) && (k as u32) * 4 <= 32768 {
+            } else if self.arch_caps.has_cdna3_lds_gemv() && !self.arch_caps.gemv_prefetch_enabled() && (k as u32) * 4 <= 32768 {
                 let kname = "gemv_hfq4g256_residual_gfx942";
                 self.ensure_kernel(kname, kernels::GEMV_HFQ4G256_RESIDUAL_GFX942_SRC, kname)?;
                 let grid = ((m as u32) + 7) / 8;
@@ -14018,7 +13523,7 @@ impl Gpu {
                     },
                 )
             } else {
-                let (kname, ksrc): (&str, &str) = if gemv_prefetch_enabled(&self.arch) {
+                let (kname, ksrc): (&str, &str) = if self.arch_caps.gemv_prefetch_enabled() {
                     (
                         "gemv_hfq4g256_residual_wave64_prefetch",
                         kernels::GEMV_HFQ4G256_RESIDUAL_WAVE64_PREFETCH_SRC,
@@ -14655,7 +14160,7 @@ impl Gpu {
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_wave64",
@@ -14773,7 +14278,7 @@ impl Gpu {
         m: usize, k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_wave64",
@@ -14936,7 +14441,7 @@ impl Gpu {
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed_batched_wave64",
@@ -15005,7 +14510,7 @@ impl Gpu {
         m: usize, k: usize, k_top: usize, batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_down_indexed_batched_wave64",
@@ -15584,8 +15089,8 @@ impl Gpu {
         // gfx1151 (Strix Halo iGPU) i8 MMQ port: lift the compute ceiling
         // from ~71 (FP16 WMMA) to ~140 TFLOPS (i8 WMMA). Opt-out via
         // HIPFIRE_MOE_GROUPED_I8=0; default ON for gfx1151 only.
-        let use_i8_gfx1151 = self.arch.starts_with("gfx1151")
-            && std::env::var("HIPFIRE_MOE_GROUPED_I8").as_deref() != Ok("0");
+        let use_i8_gfx1151 = self.arch_caps.is_gfx1151()
+            && self.flags.moe_grouped_i8.unwrap_or(true);
         if use_i8_gfx1151 {
             // Optional deeper-pipeline variants (opt-IN, default OFF).
             // Same kernarg layout + scatter contract as the k2 default.
@@ -15593,8 +15098,8 @@ impl Gpu {
             //   iteration (8 WMMAs into 4 independent int32 accumulators).
             // - k4: pairs adjacent Q8_1 sub-blocks (4 WMMAs into 2 accumulators).
             // - k2 (default): one sub-block per inner iteration.
-            let use_k8 = std::env::var("HIPFIRE_MOE_GROUPED_I8_K8").as_deref() == Ok("1");
-            let use_k4 = std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() == Ok("1");
+            let use_k8 = self.flags.moe_grouped_i8_k8;
+            let use_k4 = self.flags.moe_grouped_i8_k4;
             if use_k8 {
                 return self.gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151(
                     expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
@@ -15620,14 +15125,14 @@ impl Gpu {
             || self.arch.starts_with("gfx1101")
             || self.arch.starts_with("gfx1102")
             || self.arch.starts_with("gfx1103"))
-            && std::env::var("HIPFIRE_MOE_GROUPED_I8").as_deref() != Ok("0");
+            && self.flags.moe_grouped_i8.unwrap_or(true);
         if use_i8_gfx11_dgpu {
             // k4 default ON: deeper K-tile pipeline gives +2.8% over k2 on
             // gfx1100 (A/B confirmed 2026-05-19 k9lin 7900 XTX); same
             // structural pattern as gfx1151's +4.6%. k2 alone was a wash vs
             // FP16, so k4 is what makes the dGPU i8 path actually worth
             // shipping. Opt out with HIPFIRE_MOE_GROUPED_I8_K4=0.
-            let use_k4 = std::env::var("HIPFIRE_MOE_GROUPED_I8_K4").as_deref() != Ok("0");
+            let use_k4 = self.flags.moe_grouped_i8_k4;
             if use_k4 {
                 return self.gemm_hfq4g256_moe_grouped_mmq_k4_gfx11_dgpu(
                     expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
@@ -15650,15 +15155,15 @@ impl Gpu {
         // (FP8 WMMA HFQ4G32 2026-05-10, gfx11 dot2 trickle-down 2026-05-11).
         // Shipped as opt-in research artifact; default OFF for gfx12.
         // Opt-in via HIPFIRE_MOE_GROUPED_I8=1 to evaluate on other shapes.
-        let use_i8_gfx12 = self.arch.starts_with("gfx12")
-            && std::env::var("HIPFIRE_MOE_GROUPED_I8").as_deref() == Ok("1");
+        let use_i8_gfx12 = self.arch_caps.is_rdna4()
+            && self.flags.moe_grouped_i8.unwrap_or(false);
         if use_i8_gfx12 {
             // k4 variant: 4 sub-blocks paired per inner iteration, 8 WMMAs
             // into 4 independent int32 accumulators before scale-FMA chain
             // resolves. Experimental — separate gate from the gfx11_dgpu k4
             // (which is default-on) because the gfx12 i8 path itself is
             // default-off pending recovery from the -11.6% regression vs FP16.
-            let use_k4 = std::env::var("HIPFIRE_MOE_GROUPED_I8_K4_GFX12").as_deref() == Ok("1");
+            let use_k4 = self.flags.moe_grouped_i8_k4_gfx12;
             if use_k4 {
                 return self.gemm_hfq4g256_moe_grouped_mmq_k4_gfx12(
                     expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
@@ -15672,10 +15177,10 @@ impl Gpu {
         }
         // gfx12 (RDNA4) needs the _gfx12 WMMA intrinsic; gfx11 (RDNA3) and
         // older RDNA archs use the base _w32 intrinsic from the k2 sibling.
-        let is_gfx12 = self.arch.starts_with("gfx12");
+        let is_gfx12 = self.arch_caps.is_rdna4();
         // 2×1 M-direction reg-blocked variant (gfx12 only for now). Env-gated.
         let use_m2 = is_gfx12
-            && std::env::var("HIPFIRE_MOE_GROUPED_M2").as_deref() == Ok("1");
+            && self.flags.moe_grouped_m2;
         let (kernel_name, kernel_src) = if use_m2 {
             (
                 "gemm_hfq4g256_moe_grouped_wmma_m2_gfx12",
@@ -16563,7 +16068,7 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch.starts_with("gfx12") {
+        if !self.arch_caps.is_rdna4() {
             panic!(
                 "gemm_hfq6g256_moe_grouped_wmma: gfx12-only kernel (current arch = {}). \
                  The gfx11 sister is not yet implemented; add a _k2 variant if needed.",
@@ -16576,7 +16081,7 @@ impl Gpu {
         // existing BLOCK_M=16 scatter — only the M (row) dimension is
         // restrided. The slot tile stride stays at 16 so expert-boundary
         // safety is unchanged from v1.
-        let use_v2 = std::env::var("HIPFIRE_MOE_HFQ6_V2").as_deref() == Ok("1");
+        let use_v2 = self.flags.moe_hfq6_v2;
         let (kernel_name, kernel_src, row_tile_stride) = if use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
@@ -16668,7 +16173,7 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch.starts_with("gfx12") {
+        if !self.arch_caps.is_rdna4() {
             panic!(
                 "gemm_hfq3g256_moe_grouped_wmma: only gfx12 (RDNA4) is supported; \
                  caller must gate on arch.starts_with(\"gfx12\"). Arch: {}",
@@ -16931,10 +16436,10 @@ impl Gpu {
         // fires BEFORE the rocBLAS branch on purpose (rocBLAS goes through
         // FP16 dequant shadow, which is the cost we want to avoid).
         {
-            let mfma_v = std::env::var("HIPFIRE_GFX942_MFMA_PREFILL").ok();
+            let mfma_v = self.flags.gfx942_mfma_prefill.clone();
             let want = mfma_v.as_deref();
             if (want == Some("1") || want == Some("2") || want == Some("3") || want == Some("4"))
-                && matches!(self.arch.as_str(), "gfx940" | "gfx941" | "gfx942")
+                && self.arch_caps.is_cdna3()
                 && batch_size >= 16
                 && m % 16 == 0
                 && k % 256 == 0
@@ -16979,12 +16484,17 @@ impl Gpu {
         // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
         // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
         // gate is OnceLock-cached. Default off.
-        if batch_size > 1 && hfq4_mmq_rdna2_enabled(&self.arch) {
+        //
+        // Issue #299 follow-up: route through the tile-size auto-selector
+        // so narrow-batch calls pick mmq_x=16 and long-prefill picks
+        // mmq_x=32_y64 (MQ3 phase-2 finding). All variants clamp M-tail
+        // internally, so no alignment check needed.
+        if batch_size > 1 && self.arch_caps.has_hfq4_mmq() {
             return self.gemm_hfq4g256_residual_mmq_rdna2_auto(a_raw, x, y, m, k, batch_size);
         }
 
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
+        if batch_size > 1 && !self.flags.fp16_disabled {
             // gfx906 dp4a MMQ residual path — default-on at batch ≥ 8 per
             // should_use_mmq's gfx906 default. Distinguishes two reasons
             // MMQ might NOT fire:
@@ -16994,7 +16504,7 @@ impl Gpu {
             //       to a higher-precision fallback, NOT to dp4a which has
             //       the same Q8_1 quantization step that MMQ failed on).
             let mut mmq_screen_rejected = false;
-            if self.arch == "gfx906" && should_use_mmq(&self.arch, batch_size) {
+            if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
                 } else {
@@ -17024,18 +16534,18 @@ impl Gpu {
             // The internal Q8_1 quantize launch itself goes through
             // `launch_maybe_blob` and IS recorded into the captured graph;
             // the guard protects only first-use-only side effects.
-            if !mmq_screen_rejected && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_hfq4g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
 
             // Wave64 FP16 hybrid — best of both worlds for gfx906 (MI50).
             // Also the safe fallback when MMQ screen rejected the weight.
-            if is_gcn5_wave64(&self.arch) {
+            if self.arch_caps.is_gcn5_wave64() {
                 return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
             }
 
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
-            if wo_mmq_enabled() || should_use_mmq(&self.arch, batch_size)
+            if self.flags.wo_mmq || self.arch_caps.should_use_mmq(batch_size)
             {
                 let use_mmq = if self.mmq_screen {
                     self.mmq_screen_weight(a_raw, m, k)
@@ -17048,12 +16558,12 @@ impl Gpu {
             }
 
             // WMMA on gfx12 (RDNA4): K2-unroll port
-            if has_wmma_f16_gfx12(&self.arch) {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
 
             // WMMA on gfx11+ (RDNA3): 16×16 tiled, ~8-10× over scalar
-            if self.arch.starts_with("gfx11") {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
 
@@ -17061,7 +16571,7 @@ impl Gpu {
             return self.gemm_hfq4g256_residual_fp16(a_raw, x, y, m, k, batch_size);
         }
 
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_residual_wave64",
@@ -17138,13 +16648,14 @@ impl Gpu {
         // Phase 3 experimental: wave32 MMQ if HIPFIRE_HFQ3_MMQ=1. Env gate is
         // OnceLock-cached so the env read is one-shot per process; the arch
         // match is a handful of cycles per dispatch call (not in any inner
-        // loop). Default off.
-        if batch_size > 1 && hfq3_mmq_rdna2_enabled(&self.arch) {
+        // loop). Default off. Layer-gate is a no-op when unset (#302).
+        if batch_size > 1 && self.arch_caps.has_hfq3_mmq() && self.flags.hfq3_mmq_layer_gate_pass() {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
         // FP16 fast paths — Phase 2b (dot2) + Phase 2c (fp16 fallback).
-        if batch_size > 1 && !fp16_disabled() {
-            if has_dot2_f32_f16(&self.arch) {
+        // Layer-aware FP16 gate (#302).
+        if batch_size > 1 && !self.flags.fp16_disabled_for_current_layer() {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_hfq3g256_residual_dot2(a_raw, x, y, m, k, batch_size);
             }
             return self.gemm_hfq3g256_residual_fp16(a_raw, x, y, m, k, batch_size);
@@ -17730,7 +17241,7 @@ impl Gpu {
         // *after* paying the quantize cost. The flag is read once at init
         // (see `Gpu::new`) so this check is a single bool load, not a
         // per-call env::var lookup.
-        if self.mmq_diag_quantize_only {
+        if self.flags.mmq_diag_quantize_only {
             let _ = x_q8_ptr;
             return self.gemm_hfq4g256_residual_fp16_wave64(a_raw, x, y, m, k, batch_size);
         }
@@ -17834,8 +17345,21 @@ impl Gpu {
         result
     }
 
-    /// HFQ4 QKV MMQ fused-projection kernel — gfx906 wave64. 3-way fused
-    /// {Q, K, V} on a single launch.
+    /// HFQ4 qkv MMQ fused-projection kernel — gfx906 wave64. 3-way fused
+    /// {Q, K, V} on a single launch, eliminating 2 of 3 launch overheads
+    /// and amortizing L2 hits on the Q8_1 batch tile across the three
+    /// outputs. See `kernels/src/gemm_qkv_hfq4g256_mmq_gfx906_body.cuh`
+    /// for the kernel design and
+    /// `experiments/gfx906-fused-mmq/probe-results.md` for the §6.1
+    /// probe that motivated this work.
+    ///
+    /// Caller invariants:
+    ///   - q_m, k_m, v_m must each be multiples of MMQ_Y(=128). Qwen3.5
+    ///     family satisfies (9B: q_m=4096, k_m=v_m=1024; 4B: q_m=2048,
+    ///     k_m=v_m=512).
+    ///   - batch_size ≥ should_use_mmq cutover (gfx906 default: 8).
+    ///   - x is the same activation tensor as the residual sibling
+    ///     expects (raw fp16, ensure_q8_1_mmq_x is called internally).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkv_hfq4g256_mmq_gfx906(
         &mut self,
@@ -17847,7 +17371,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
             "qkv_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
             batch_size, self.capture_mode,
         );
@@ -17856,6 +17380,10 @@ impl Gpu {
             "qkv_hfq4g256_mmq_gfx906 requires q_m/k_m/v_m multiples of MMQ_Y=128 (got q={q_m} k={k_m} v={v_m})",
         );
 
+        // Same mmq_x sweep as the gfx906 single-output mmq_set path so
+        // future MMQ_X tuning translates 1:1. Note: only the {8,16,32,64}
+        // quartet is wired up initially (the most common batch buckets);
+        // the in-between values fall up to the next available mmq_x.
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 32 { 32 }
@@ -17912,6 +17440,9 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
+        // Option C streaming topology — KEEP IN SYNC WITH body.cuh.
+        // X_STRIDE varies with mmq_x (see body.cuh x_stride_for<>):
+        //   mmq_x ≥ 32 → stride 40 (b128 path), mmq_x < 32 → stride 33 (b32).
         const MMQ_Y: usize = 128;
         let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
@@ -17920,11 +17451,14 @@ impl Gpu {
         let row_tiles = (total_m + MMQ_Y - 1) / MMQ_Y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
         let shared_mem = (
-            (MMQ_Y * x_stride * 4) + (X_DM_FLOAT2 * 8) + (mmq_x * Y_STRIDE * 4)
+            (MMQ_Y * x_stride * 4)
+            + (X_DM_FLOAT2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
         ) as u32;
         debug_assert!(shared_mem as usize <= 32 * 1024,
             "gfx906 qkv MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
 
+        // Total bytes = weight read (Q+K+V) + X read (Q8_1) + Y writes (3 outputs).
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(k_m, k)
                   + crate::profile::gemv_hfq4g256_bytes(v_m, k)
@@ -17934,7 +17468,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             &kernel_name,
             [row_tiles as u32, col_tiles as u32, 1],
-            [64, 4, 1],
+            [64, 4, 1], // wave64 native: 4 wave64s = 256 threads
             shared_mem,
             &mut params,
             || {
@@ -17951,7 +17485,19 @@ impl Gpu {
         result
     }
 
-    /// HFQ4 gate_up MMQ fused-projection kernel — gfx906 wave64. 2-way fused.
+    /// HFQ4 gate_up MMQ fused-projection kernel — gfx906 wave64. 2-way
+    /// fused {a, b} on a single launch. Generic naming so the same
+    /// entry serves BOTH gate_up (a=gate, b=up) and LA QKVZA-head
+    /// (a=qkv, b=z) dispatch sites. See
+    /// `kernels/src/gemm_gate_up_hfq4g256_mmq_gfx906_body.cuh`.
+    ///
+    /// Caller invariants:
+    ///   - m_a, m_b multiples of MMQ_Y(=128).
+    ///   - batch_size ≥ should_use_mmq cutover (gfx906 default: 8).
+    ///   - x is the raw fp16 activation (ensure_q8_1_mmq_x is called
+    ///     internally; caller MAY pre-quantize via the prequant
+    ///     sibling below if Xq is already on hand from another call
+    ///     on the same x).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_gate_up_hfq4g256_mmq_gfx906(
         &mut self,
@@ -17968,7 +17514,11 @@ impl Gpu {
         )
     }
 
-    /// Pre-quantized X variant of the gfx906 gate_up MMQ fused kernel.
+    /// Pre-quantized X variant — caller passes the Q8_1 scratch pointer
+    /// produced by an earlier `ensure_q8_1_mmq_x(x, batch_size, k)` call.
+    /// Used by the LA QKVZA-head site, which has already quantized X
+    /// when it computed the qkv/z 2-way and then continues to the
+    /// β+α tail. Mirrors the `_prequant` sibling on the dp4a path.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_gate_up_hfq4g256_mmq_gfx906_prequant(
         &mut self,
@@ -17980,12 +17530,16 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
             "gate_up_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
             batch_size, self.capture_mode,
         );
 
-        let y64 = hfq4_mmq_gfx906_y64_enabled();
+        // MMQ_Y selection. Y=64 is the higher-occupancy variant (plan §6.5);
+        // wrappers only exist for {x16, x32}, so larger mmq_x at y64 falls
+        // back to y128. Y=128 is the established default (matches the
+        // residual sibling).
+        let y64 = self.flags.hfq4_mmq_gfx906_y64_enabled();
         let mmq_y: usize = if y64 { 64 } else { 128 };
 
         debug_assert!(
@@ -17997,6 +17551,9 @@ impl Gpu {
             else if batch_size <= 16 { 16 }
             else if batch_size <= 32 { 32 }
             else { 64 };
+        // Y=64 only has wrappers for x16 and x32; cap mmq_x at 32 when
+        // y64 is requested. Falls through to the y128 path for tiny
+        // batches (x8) since no x8_y64 wrapper exists.
         let use_y64 = y64 && mmq_x >= 16;
         if use_y64 && mmq_x > 32 { mmq_x = 32; }
 
@@ -18045,6 +17602,9 @@ impl Gpu {
             &mut bs_val as *mut _ as *mut c_void,
         ];
 
+        // KEEP IN SYNC WITH body.cuh: MMQ_Y is chosen by the wrapper
+        // (`use_y64` above gates which wrapper is included). x_dm sizing
+        // is MMQ_Y float2s. row_tiles uses the same MMQ_Y.
         let x_stride: usize = if mmq_x >= 32 { 40 } else { 33 };
         const Y_STRIDE: usize = 36;
         let x_dm_float2: usize = mmq_y;
@@ -18052,7 +17612,9 @@ impl Gpu {
         let row_tiles = (total_m + mmq_y - 1) / mmq_y;
         let col_tiles = (batch_size + mmq_x - 1) / mmq_x;
         let shared_mem = (
-            (mmq_y * x_stride * 4) + (x_dm_float2 * 8) + (mmq_x * Y_STRIDE * 4)
+            (mmq_y * x_stride * 4)
+            + (x_dm_float2 * 8)
+            + (mmq_x * Y_STRIDE * 4)
         ) as u32;
         debug_assert!(shared_mem as usize <= 32 * 1024,
             "gfx906 gate_up MMQ LDS budget exceeded: {} B > 32 KiB", shared_mem);
@@ -18061,6 +17623,7 @@ impl Gpu {
                   + crate::profile::gemv_hfq4g256_bytes(m_b, k)
                   + batch_size * k
                   + batch_size * (m_a + m_b) * 4;
+        // Distinct timer label per Y variant so attribution shows the split.
         let timer_label: &'static str = if use_y64 {
             "gemm_gate_up_hfq4g256_mmq_gfx906_y64"
         } else {
@@ -18103,7 +17666,7 @@ impl Gpu {
         // silently route a non-winning batch through MMQ. Mirrors the MQ6
         // sibling's `hfq6_mmq_route` assert added in 5ea9050.
         debug_assert!(
-            should_use_mmq(&self.arch, batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
             "_mmq_set_gfx906 called at non-winning B={} (capture={}) — \
              caller must gate via should_use_mmq first",
             batch_size, self.capture_mode,
@@ -18283,7 +17846,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch == "gfx906" {
+        if self.arch_caps.is_gfx906() {
             // gfx906 has its own dispatcher (`gemm_hfq4g256_residual_mmq_gfx906`)
             // that handles its own quantize internally, called directly from
             // mmq_screen_weight on gfx906. _set_prequant is RDNA3-only.
@@ -18368,7 +17931,7 @@ impl Gpu {
         // Compile both kernels (convert + WMMA GEMM share the FP16 convert)
         // Kernel variant selection
         // MW16 path: dequant weights to FP16 per-call, then run no-dequant WMMA
-        if std::env::var("HIPFIRE_MW16").map_or(false, |v| v == "1") {
+        if self.flags.mw16 {
             return self.gemm_mw16_residual_wmma_via_dequant(a_raw, x, y, m, k, batch_size);
         }
         // Shape-aware default: ksplit only pays for itself when the un-split
@@ -18402,7 +17965,7 @@ impl Gpu {
         //            plans/k4_plan.md.
         //   wmma   — base WMMA         (output-mapping bug — debug only)
         //   wmma2  — 2-wave block, 32 rows × 16 batch (output-mapping bug — debug only)
-        let is_gfx115x = matches!(self.arch.as_str(), "gfx1150" | "gfx1151" | "gfx1152");
+        let is_gfx115x = self.arch_caps.is_rdna3p5();
         // ksplit's atomicAdd reduction across K_SPLITS partials is fp-non-
         // associative — order varies with warp scheduling, so output bytes
         // drift between processes and between cold/hot runs. The drift is
@@ -18416,7 +17979,7 @@ impl Gpu {
         // × N layers per step. Read once at first dispatch.
         static FORCE_DET: OnceLock<bool> = OnceLock::new();
         let force_det = *FORCE_DET.get_or_init(|| {
-            std::env::var("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1")
+            self.flags.deterministic
         });
         let auto_variant = if force_det {
             "k2"
@@ -18429,7 +17992,7 @@ impl Gpu {
         } else {
             "ksplit"
         };
-        let variant_override = std::env::var("HIPFIRE_WO_WMMA_VARIANT").ok();
+        let variant_override = self.flags.wo_wmma_variant.clone();
         let variant = variant_override.as_deref().unwrap_or(auto_variant);
         let (kernel_name, kernel_src, block_size, row_step, k_splits) = match variant {
             "k2"     => ("gemm_hfq4g256_residual_wmma_k2",
@@ -18477,7 +18040,7 @@ impl Gpu {
         // costs latency vs async pipelining but gives shape-accurate µs.
         static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let dump = *DUMP.get_or_init(|| {
-            std::env::var("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1")
+            self.flags.gemm_dump
         });
         if dump { self.hip.device_synchronize()?; }
         let dump_start = if dump { Some(std::time::Instant::now()) } else { None };
@@ -18521,17 +18084,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let arch_supports_mb4 = matches!(self.arch.as_str(),
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151");
-        let use_mb4 = match std::env::var("HIPFIRE_MQ3_MB4").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => arch_supports_mb4,
-            _ => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+        let arch_supports_mb4 = self.arch_caps.is_rdna3() && !self.arch_caps.is_gfx1152() && !self.arch_caps.is_gfx1103();
+        let use_mb4 = match self.flags.mq3_mb4 {
+            Some(_) => arch_supports_mb4,
+            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
         };
         if use_mb4 {
             return self.gemm_hfq3g256_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
         }
-        if has_wmma_f16_gfx12(&self.arch) {
+        if self.arch_caps.has_wmma_w32_gfx12() {
             return self.gemm_hfq3g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
         }
         self.ensure_kernel("gemm_hfq3g256_residual_wmma", kernels::GEMM_HFQ3G256_RESIDUAL_WMMA_SRC, "gemm_hfq3g256_residual_wmma")?;
@@ -18786,7 +18347,7 @@ impl Gpu {
         // capture mode (matches the rocBLAS branch's caveat — Q8_1
         // quantize launch must be reachable from the captured graph or
         // pre-baked).
-        if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+        if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
             return self.gemm_hfq4g256_dp4a(a_raw, x, y, m, k, batch_size);
         }
 
@@ -18828,7 +18389,7 @@ impl Gpu {
             // Shadow allocation failed — fall through to the GEMV path.
         }
 
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_div): (&str, [u32; 3], u32) = if cdna_wave64 {
             self.ensure_kernel(
                 "gemm_hfq4g256_wave64",
@@ -19371,7 +18932,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch.starts_with("gfx11") {
+        if !self.arch_caps.has_wmma_w32() {
             // No mw16 WMMA on non-RDNA3. The generic F16 GEMM writes [M,N],
             // while lm_head consumers expect [N,M], so preserve layout by
             // launching one row at a time.
@@ -19460,9 +19021,9 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let wmma_eligible = batch_size > 1
-            && self.arch.starts_with("gfx11")
-            && !fp16_disabled()
-            && !lm_head_wmma_disabled();
+            && self.arch_caps.has_wmma_w32()
+            && !self.flags.fp16_disabled
+            && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -19495,7 +19056,7 @@ impl Gpu {
         // gfx906: dp4a residual + zero-init Y for `=` semantics.
         // Skip in capture mode (the residual kernel calls ensure_q8_1_mmq_x
         // which launches an internal quantize kernel — matches HFQ4 sibling).
-        if batch_size > 1 && gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+        if batch_size > 1 && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -19504,9 +19065,9 @@ impl Gpu {
         }
         // gfx11+: WMMA residual + zero-init.
         let wmma_eligible = batch_size > 1
-            && self.arch.starts_with("gfx11")
-            && !fp16_disabled()
-            && !lm_head_wmma_disabled();
+            && self.arch_caps.has_wmma_w32()
+            && !self.flags.fp16_disabled
+            && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -19549,9 +19110,9 @@ impl Gpu {
         // the correct variant per arch. Other archs (gfx10/906/94x) fall
         // through to the per-row GEMV path.
         let wmma_eligible = batch_size > 1
-            && (has_wmma_f16(&self.arch) || has_wmma_f16_gfx12(&self.arch))
-            && !fp16_disabled()
-            && !lm_head_wmma_disabled();
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
+            && !self.flags.fp16_disabled
+            && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
@@ -19650,14 +19211,14 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
+        if batch_size > 1 && !self.flags.fp16_disabled {
             // WMMA on gfx12 (RDNA4): _w32_gfx12 builtin (gfx11 builtin
             // does NOT pattern-match on gfx12 — see has_wmma_f16 comment).
-            if has_wmma_f16_gfx12(&self.arch) {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_hfq6g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size);
             }
             // WMMA on gfx11+ (RDNA3): 16x16 tiled
-            if self.arch.starts_with("gfx11") {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_hfq6g256_residual_wmma(a_raw, x, y, m, k, batch_size);
             }
             // gfx906: dp4a + wave64 batched residual (Phase A.2, plan v3.2.3
@@ -19666,7 +19227,7 @@ impl Gpu {
             // Skip in capture mode: ensure_q8_1_mmq_x launches an internal
             // quantize kernel that the captured graph may not record (matches
             // gemm_hfq4g256_dp4a's `&& !self.capture_mode` guard at line ~7889).
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
             // FP16 packed on all other RDNA
@@ -19898,23 +19459,23 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
-            if has_wmma_f16_gfx12(&self.arch) {
+        if batch_size > 1 && !self.flags.fp16_disabled {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkvza_hfq6g256_wmma_gfx12(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkvza_hfq6g256_wmma(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3, plan v3.2.3 §5.1
             // item 3). Pre-quantize x to Q8_1 and dispatch the dp4a kernel.
             // Skip in capture mode (Q8_1 quantize launch must be reachable
             // from captured graph or pre-baked) — matches HFQ4 sibling pattern.
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_qkvza_hfq6g256_wave64_dp4a(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkvza_hfq6g256_dot2(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
@@ -20384,21 +19945,21 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
-            if has_wmma_f16_gfx12(&self.arch) {
+        if batch_size > 1 && !self.flags.fp16_disabled {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_qkv_hfq6g256_wmma_gfx12(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_qkv_hfq6g256_wmma(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_qkv_hfq6g256_wave64_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_qkv_hfq6g256_dot2(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
@@ -20825,21 +20386,21 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Fast paths for prefill (batch_size > 1). Disable with HIPFIRE_FP16=0.
-        if batch_size > 1 && !fp16_disabled() {
-            if has_wmma_f16_gfx12(&self.arch) {
+        if batch_size > 1 && !self.flags.fp16_disabled {
+            if self.arch_caps.has_wmma_w32_gfx12() {
                 return self.gemm_gate_up_hfq6g256_wmma_gfx12(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
-            if has_wmma_f16(&self.arch) {
+            if self.arch_caps.has_wmma_w32() {
                 return self.gemm_gate_up_hfq6g256_wmma(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
-            if gemv_dp4a_enabled(&self.arch) && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
                 return self.gemm_gate_up_hfq6g256_wave64_dp4a(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
             // Excludes gfx1010 (Navi 10, 5700 XT) and gfx1013 (Van Gogh/BC-250 APU).
-            if has_dot2_f32_f16(&self.arch) {
+            if self.arch_caps.has_dot2_f32_f16() {
                 return self.gemm_gate_up_hfq6g256_dot2(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // FP16 packed (v_pk_fma_f16) for gfx1010/1013 — 2× scalar FP32.
@@ -21442,9 +21003,9 @@ impl Gpu {
         self.bind_thread()?;
         static USE_LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let use_legacy = *USE_LEGACY.get_or_init(|| {
-            std::env::var("HIPFIRE_Q8_BATCHED_LEGACY").as_deref() == Ok("1")
+            self.flags.q8_batched_legacy
         });
-        if !use_legacy && self.arch.starts_with("gfx12") && k % 32 == 0 && n > 0 {
+        if !use_legacy && self.arch_caps.is_rdna4() && k % 32 == 0 && n > 0 {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
 
@@ -21476,7 +21037,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma: K must be a multiple of 32 (got K={k})");
-        debug_assert!(self.arch.starts_with("gfx12"),
+        debug_assert!(self.arch_caps.is_rdna4(),
             "gemm_q8_0_wmma: gfx12 only (got arch {})", self.arch);
         self.bind_thread()?;
         self.ensure_kernel(
@@ -21537,7 +21098,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch.starts_with("gfx12") {
+        if self.arch_caps.is_rdna4() {
             return self.gemm_qkvza_q8_0_wmma_gfx12(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
                 qkv_m, z_m, beta_m, alpha_m, k, batch_size,
@@ -21629,7 +21190,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch.starts_with("gfx12") {
+        if self.arch_caps.is_rdna4() {
             return self.gemm_gate_up_q8_0_wmma_gfx12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
             );
@@ -21705,7 +21266,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch.starts_with("gfx12") {
+        if self.arch_caps.is_rdna4() {
             return self.gemm_q8_0_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
@@ -21769,7 +21330,7 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.arch.starts_with("gfx12") {
+        if self.arch_caps.is_rdna4() {
             return self.gemm_qkv_q8_0_wmma_gfx12(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
             );
@@ -23015,21 +22576,19 @@ impl Gpu {
         // v_dot4_i32_i8 path. PMC at 2026-05-05 showed this kernel
         // was memory-bound; dp4a's 75% x-traffic reduction lands on
         // the actual bottleneck.
-        if gemv_dp4a_enabled(&self.arch) {
+        if self.arch_caps.gemv_dp4a_enabled() {
             return self.fused_gate_up_hfq4g256_dp4a(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k,
             );
         }
 
-        let cdna_wave64 = has_wave64_native(&self.arch);
+        let cdna_wave64 = self.arch_caps.is_wave64_native();
         let (func_name, block, grid_x) = if cdna_wave64 {
             // gfx94x v2: 2 wave64s = 4 rows/WG, +1.9% on AR decode
             // (commit 5bd75a69 sibling). Default ON; opt out via
             // HIPFIRE_GFX942_GEMV_V2=0.
-            let is_gfx94x = matches!(self.arch.as_str(),
-                "gfx940" | "gfx941" | "gfx942");
-            let v2_on = std::env::var("HIPFIRE_GFX942_GEMV_V2")
-                .map(|v| v != "0").unwrap_or(true);
+            let is_gfx94x = self.arch_caps.is_cdna3();
+            let v2_on = self.flags.gfx942_gemv_v2.unwrap_or(true);
             if is_gfx94x && v2_on {
                 self.ensure_kernel(
                     "fused_gate_up_hfq4g256_v2_gfx942",
@@ -25962,7 +25521,7 @@ impl Gpu {
         // Function name kept as `rope_partial_interleaved_f32` to avoid a
         // workspace-wide rename in this commit; the dispatched kernel is now
         // `rope_partial_halfsplit_f32` by default.
-        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let legacy = self.flags.rope_interleaved_legacy;
         let (src, entry) = if legacy {
             (kernels::ROPE_PARTIAL_INTERLEAVED_SRC, "rope_partial_interleaved_f32")
         } else {
@@ -26016,7 +25575,7 @@ impl Gpu {
         // Function name retained for source-tree stability; the dispatched
         // kernel is halfsplit by default. See sibling
         // `rope_partial_interleaved_f32` for the rationale.
-        let legacy = std::env::var("HIPFIRE_ROPE_INTERLEAVED_LEGACY").ok().as_deref() == Some("1");
+        let legacy = self.flags.rope_interleaved_legacy;
         let (cache_key, src, entry) = if legacy {
             ("rope_partial_interleaved_batched",
              kernels::ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC,
@@ -28887,7 +28446,7 @@ impl Gpu {
                 specs.push(("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC.to_string()));
             }
             "hfq4" => {
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_hfq4g256_wide", kernels::GEMV_HFQ4G256_WIDE_SRC.to_string()));
                 // Multi-projection fused kernels (LA 4-way, FA 3-way, FFN
@@ -28904,7 +28463,7 @@ impl Gpu {
                 // wavefront pressure in half on the hottest kernels. Wave32
                 // block=[32,1,1] kernels otherwise waste the upper 32 lanes
                 // of every wave slot on these wave64-native arches.
-                if has_wave64_native(&self.arch) {
+                if self.arch_caps.is_wave64_native() {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
@@ -28934,8 +28493,8 @@ impl Gpu {
                 // Empirically slower than the single-row kernel on gfx1100 at all
                 // tested matrix sizes (see commit log / multi-row kernel header),
                 // so we only precompile when the env var explicitly requests it.
-                if matches!(self.arch.as_str(), "gfx1100" | "gfx1101" | "gfx1102")
-                    && gemv_rows_override().unwrap_or(1) > 1
+                if self.arch_caps.is_rdna3_dgpu()
+                    && self.flags.gemv_rows.unwrap_or(1) > 1
                 {
                     specs.push(("gemv_hfq4g256_multirow_rdna3",
                                 kernels::GEMV_HFQ4G256_MULTIROW_GFX1100_SRC.to_string()));
@@ -28947,7 +28506,7 @@ impl Gpu {
                 // MQ4 = FWHT-rotated HFQ4-G256 — default format for current registry.
                 // Shares the HFQ4 fused kernels (same blob, different dispatch key)
                 // plus MQ-specific rotation kernels.
-                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch);
+                let (src, module) = kernels::gemv_hfq4g256_for_arch(&self.arch_caps, self.flags.rdna2_variant);
                 specs.push((module, src.to_string()));
                 specs.push(("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC.to_string()));
                 specs.push(("fused_qkvza_hfq4g256",
@@ -28961,7 +28520,7 @@ impl Gpu {
                 specs.push(("fused_silu_mul_mq_rotate",
                             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC.to_string()));
                 // gfx906/gfx908/gfx94x wave64 variants — see hfq4 branch for rationale.
-                if has_wave64_native(&self.arch) {
+                if self.arch_caps.is_wave64_native() {
                     // Single-token (draft / single-layer paths).
                     specs.push(("fused_qkvza_hfq4g256_wave64",
                                 kernels::FUSED_QKVZA_HFQ4G256_WAVE64_SRC.to_string()));
@@ -29458,7 +29017,7 @@ impl Gpu {
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch.starts_with("gfx12") {
+        if !self.arch_caps.is_rdna4() {
             panic!(
                 "gemm_hfp4g32_moe_grouped_wmma: only gfx12 (RDNA4) is implemented; \
                  got arch={}. Add a wave32 sister kernel for non-gfx12 archs.",

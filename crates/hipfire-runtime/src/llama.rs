@@ -1763,9 +1763,7 @@ impl PrefillBatchScratch {
 
         let tile_size = 128usize;
         let max_tiles = (kv_max_seq + tile_size - 1) / tile_size;
-        let batch_mult = std::env::var("HIPFIRE_FLASH_PARTIALS_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
+        let batch_mult = crate::config::get().flash_partials_batch
             .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
             .unwrap_or(16);
         let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
@@ -1856,7 +1854,7 @@ pub fn forward_prefill_batch(
         return Ok(());
     }
 
-    let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
+    let force_fallback = !crate::config::get().prefill_batched;
     const MIN_BATCH: usize = 4;
     let arch = gpu.arch.as_str();
     let kv_ok = kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
@@ -2002,7 +2000,7 @@ fn forward_prefill_chunk(
     // Q8 WMMA arch gate — see qwen35.rs q8_wmma_arch for the matching capture
     // and rationale (gfx11-only; gfx12 needs a `_w32_gfx12` builtin variant
     // that has not been authored yet, so routing gfx12 here would crash at JIT).
-    let q8_wmma_arch = rdna_compute::has_wmma_f16(gpu.arch.as_str());
+    let q8_wmma_arch = gpu.arch_caps.has_wmma_w32();
 
     // 1. Embed N tokens into pbs.x_batch.
     if matches!(weights.embd_format, EmbeddingFormat::HFQ4G256 | EmbeddingFormat::Q8_0) {
