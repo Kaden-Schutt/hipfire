@@ -265,10 +265,22 @@ fn hfq3_mmq_rdna2_enabled(arch: &str) -> bool {
     hfq3_sdot4_gfx10_enabled(arch)
 }
 
-/// Whether to route HFQ4 residual through the experimental wave32 MMQ
-/// kernel on RDNA2+. Phase 3 side-win probe — tests whether HFQ4's
-/// cheaper nibble unpack lets MMQ beat the current fp16 fallback on
-/// gfx1030/1031. Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
+/// Whether to route HFQ4 prefill projections (qkv / qkvza / gate_up /
+/// residual) through the wave32 MMQ family on RDNA2+. **Default-ON** for
+/// the supported arch allowlist as of the issue-#300 gate removal.
+///
+/// Originally an experimental Phase-3 side-win probe gated behind
+/// `HIPFIRE_HFQ4_MMQ_RDNA2=1`. Measured on gfx1031 (RX 6700 XT): the MMQ
+/// path is +210% prefill on 4B MQ4 pp128 (394 → 1223 tok/s) with no
+/// meaningful accuracy cost — eval_hipfire n=50 Q8-KV prefill scoring on
+/// 9B MQ4 gives KLD 0.0769 (MMQ on) vs 0.0755 (dot2 fallback), Δ +1.9%
+/// inside slice-mean noise; PPL 9.3674 vs 9.3679 (−0.005%). HFQ4's exact
+/// 4-bit nibble unpack does NOT carry the +19% KLD drift the HFQ3 MMQ
+/// family showed (issue #302) — same conclusion as the gfx906 HFQ4
+/// fused-MMQ default-on (commit 1be85899). Mirrors that precedent.
+///
+/// `HIPFIRE_HFQ4_MMQ_RDNA2=0` remains as an escape hatch to force the
+/// legacy dot2/wmma fallback for regression bisects.
 fn hfq4_mmq_rdna2_enabled(arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
@@ -278,7 +290,8 @@ fn hfq4_mmq_rdna2_enabled(arch: &str) -> bool {
             _ => None,
         })
     });
-    if !override_.unwrap_or(false) {
+    // Default-on: env unset → enabled on the allowlist; explicit =0 disables.
+    if !override_.unwrap_or(true) {
         return false;
     }
     matches!(arch,
@@ -7756,8 +7769,10 @@ impl Gpu {
                 }
             }
             // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
-            // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
-            // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
+            // ahead of dot2/wmma fallbacks; default-on for the allowlist
+            // arch set (issue #300 gate removal, escape hatch
+            // HIPFIRE_HFQ4_MMQ_RDNA2=0). All q_m/k_m/v_m for the Qwen3.5
+            // family are MMQ_Y(128)-aligned.
             if hfq4_mmq_rdna2_enabled(&self.arch) && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
                 return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -15201,10 +15216,11 @@ impl Gpu {
             }
         }
 
-        // Phase 3 experimental: HFQ4 wave32 MMQ on RDNA2+ if
-        // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
-        // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
-        // gate is OnceLock-cached. Default off.
+        // HFQ4 wave32 MMQ residual on RDNA2+. Default-on for the allowlist
+        // arch set (issue #300 gate removal — +210% prefill on gfx1031 4B
+        // MQ4 pp128, KLD-neutral; escape hatch HIPFIRE_HFQ4_MMQ_RDNA2=0).
+        // HFQ4's cheaper 4-bit nibble unpack lets MMQ beat the fp16
+        // fallback. Env gate is OnceLock-cached.
         //
         // Issue #299 follow-up: route through the tile-size auto-selector
         // so narrow-batch calls pick mmq_x=16 and long-prefill picks
