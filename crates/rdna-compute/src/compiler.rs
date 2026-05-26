@@ -76,13 +76,14 @@ fn seed_hot_from_cold(cold: &Path, hot: &Path) -> std::io::Result<()> {
 pub struct KernelCompiler {
     cache_dir: PathBuf,
     arch: String,
+    hipcc_extra_flags: String,
     compiled: HashMap<String, PathBuf>,
     precompiled_dir: Option<PathBuf>,
     has_hipcc: bool,
 }
 
 impl KernelCompiler {
-    pub fn new(arch: &str) -> HipResult<Self> {
+    pub fn new(arch: &str, hipcc_extra_flags: &str) -> HipResult<Self> {
         // Cache (hot path) defaults to $CWD/.hipfire_kernels so parallel
         // worktrees/agents on the same machine don't clobber each other's
         // JIT'd .hsaco blobs. /tmp was shared state: two daemons from
@@ -160,6 +161,7 @@ impl KernelCompiler {
         Ok(Self {
             cache_dir,
             arch: arch.to_string(),
+            hipcc_extra_flags: hipcc_extra_flags.to_string(),
             compiled: HashMap::new(),
             precompiled_dir,
             has_hipcc,
@@ -220,7 +222,7 @@ impl KernelCompiler {
             && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
 
         if !cache_valid {
-            Self::hipcc_compile(&self.arch, &src_path, &obj_path, name, source)?;
+            Self::hipcc_compile(&self.arch, &src_path, &obj_path, name, source, &self.hipcc_extra_flags)?;
             let _ = std::fs::write(&hash_path, &src_hash);
         }
 
@@ -299,16 +301,11 @@ impl KernelCompiler {
     fn win_short_path_if_needed(p: &str) -> String { p.to_string() }
 
     /// Run hipcc for a single kernel. Shared by compile() and compile_batch().
-    fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str) -> HipResult<()> {
+    fn hipcc_compile(arch: &str, src_path: &Path, obj_path: &Path, name: &str, source: &str, extra_flags: &str) -> HipResult<()> {
         std::fs::write(src_path, source).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("failed to write kernel source: {e}"))
         })?;
         let _ = std::fs::remove_file(obj_path);
-
-        // Optional extra hipcc flags via HIPFIRE_HIPCC_EXTRA_FLAGS. Used for
-        // one-off experiments like `-mcumode` vs `-mno-cumode` on RDNA1
-        // without having to rebuild every call site.
-        let extra = std::env::var("HIPFIRE_HIPCC_EXTRA_FLAGS").unwrap_or_default();
         let per_kernel = Self::per_kernel_flags(source);
         let mut args: Vec<String> = vec![
             "--genco".into(),
@@ -337,7 +334,7 @@ impl KernelCompiler {
                 break;
             }
         }
-        for flag in extra.split_whitespace() {
+        for flag in extra_flags.split_whitespace() {
             args.push(flag.to_string());
         }
         for flag in &per_kernel {
@@ -442,6 +439,7 @@ impl KernelCompiler {
         let n = to_compile.len();
         eprintln!("  compiling {n} kernels in parallel...");
         let arch = self.arch.clone();
+        let extra_flags = self.hipcc_extra_flags.clone();
         let precompiled_dir = self.precompiled_dir.clone();
 
         // Shared counter so parallel threads can report "[i/N] name" as each one
@@ -452,10 +450,11 @@ impl KernelCompiler {
         // Spawn hipcc in parallel threads
         let results: Vec<_> = to_compile.into_iter().map(|(name, source, src_hash, src_path, obj_path, hash_path)| {
             let arch = arch.clone();
+            let extra_flags = extra_flags.clone();
             let precompiled_dir = precompiled_dir.clone();
             let done = std::sync::Arc::clone(&done);
             let handle = thread::spawn(move || {
-                let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source);
+                let result = Self::hipcc_compile(&arch, &src_path, &obj_path, &name, &source, &extra_flags);
                 if result.is_ok() {
                     let _ = std::fs::write(&hash_path, &src_hash);
                     // Write back to precompiled dir
