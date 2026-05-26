@@ -866,16 +866,33 @@ fn forward_step_after_x(
         // context is long enough to fill the grid (n_kv_heads×n_chunks); else
         // the per-head flash. Both bit-identical; gqa is ~15-23% faster at
         // OCR decode lengths (5k-11k). Falls to flash for short/non-GQA.
-        let attn = if n_kv_heads < n_heads && pos + 1 >= 4096 {
-            Gpu::attention_flash_gqa
+        //
+        // Fused variant (opt-in via HIPFIRE_GQA_FUSED=1): single launch
+        // per layer, no partials buffer, no reduce. Grid = n_kv_heads only
+        // (2 for dots.ocr), so lower occupancy but eliminates the partials
+        // DRAM round-trip + reduce dispatch. Probe of launch-overhead vs
+        // occupancy tradeoff.
+        let use_fused = std::env::var("HIPFIRE_GQA_FUSED")
+            .map(|v| v == "1").unwrap_or(false);
+        if use_fused && n_kv_heads < n_heads {
+            gpu.attention_flash_gqa_fused(
+                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.attn_out,
+                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            )?;
+        } else if n_kv_heads < n_heads && pos + 1 >= 4096 {
+            Gpu::attention_flash_gqa(gpu,
+                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.attn_out, &state.attn_partials,
+                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            )?;
         } else {
-            Gpu::attention_flash
-        };
-        attn(gpu,
-            &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
-            &state.attn_out, &state.attn_partials,
-            pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
-        )?;
+            Gpu::attention_flash(gpu,
+                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.attn_out, &state.attn_partials,
+                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            )?;
+        }
 
         // (7) o_proj (no bias) + (8) residual.
         weight_gemv(gpu, &layer.wo, &state.attn_out, &state.o)?;
