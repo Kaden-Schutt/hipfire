@@ -1,14 +1,16 @@
 # hipx PR319 Forward-Train Validation — 2026-05-26
 
 Validation artifacts for local integration branch
-`integration/pr319-forward-train` at commit `6126d41d`.
+`integration/pr319-forward-train` through this WMMA-gate fix-forward commit.
 
 The branch contains sequential merges of PRs 319, 337, 338, 330, 335,
 336, 333, and 331, plus fix-forward commits:
 
 - `441924f6` — restore HFQ3 MMQ y-variant dispatch after PR319
 - `46368fdc` — keep HFQ4 MMQ off unsupported sdot4 archs
-- `6126d41d` — use q8 for DFlash perf gates
+- `19fe9bff` — use q8 for DFlash perf gates
+- `028d1138` — update Qwen2 infer smoke tokenizer error path
+- this commit — gate dots.ocr / Qwen2 WMMA paths to RDNA3
 
 Host: `hipx`
 
@@ -38,6 +40,9 @@ Detected GPUs:
 | MTP head smoke, 9B | gfx1151 | PASS: finite logits, KV readback signal | `raw/hipx-pr319-gfx1151_mtp_head_smoke_9b-20260526-214341.log` |
 | MTP-only decode, 9B, q8 KV | gfx1151 | PASS: `tok_s=25.53`, `tau=2.0323` | `raw/hipx-pr319-gfx1151_mtp_only_9b-20260526-214351.log` |
 | CLI unit tests after Bun install | hipx CPU | PASS: 121 tests | `raw/hipx-pr319-cli-bun-tests-20260526-214651.log` |
+| dots.ocr real model, Q8 HFQ | local gfx1100 | PASS: full OCR output graded 13/13, F1 1.000 | `../dots-ocr-real-2026-05-26/` |
+| dots.ocr WMMA gate smoke | gfx1030 | PASS: selected `scalar-fallback`, cleared all 42 vision blocks; timed out after vision stack, no gfx11 WMMA compile failure | `../dots-ocr-real-2026-05-26/hipx_gfx1030_ocr_e2e_gated2_timeout_stderr.log` |
+| dots.ocr WMMA gate smoke | gfx1151 | PASS: selected `rdna3-wmma`, completed vision/text/prefill with `--max-tokens 0` | `../dots-ocr-real-2026-05-26/hipx_gfx1151_ocr_e2e_gated_short_stderr.log` |
 
 An earlier hipx CLI attempt before installing Bun is kept as
 `raw/hipx-pr319-cli-bun-tests-20260526-214504.log` and records the
@@ -57,10 +62,28 @@ environment gap (`bun not found`).
 | PR336 | causal/flash attention kernels and decode attention work | causal WMMA parity and decode-attention microbench |
 | PR333 | KLD baseline data/docs | data-only; covered by repository inclusion and build sanity |
 | PR331 | CLI/serve config, pflash logging, cask error surfaces | Bun CLI tests; daemon build only for serve compile surface |
-| `6126d41d` | q8 DFlash perf/gate script update | all DFlash perf/gate runs use q8; no asym KV perf runs |
+| `19fe9bff` | q8 DFlash perf/gate script update | all DFlash perf/gate runs use q8; no asym KV perf runs |
+| `028d1138` | Qwen2 standalone smoke error-path cleanup | Qwen2 real dots.ocr artifact parsed and loaded in OCR E2E validation |
+| this commit | dots.ocr / Qwen2 WMMA arch gate fix-forward | gfx1030 scalar-fallback smoke plus gfx1151 RDNA3.5 WMMA smoke |
 
 ## KV Policy
 
 For DFlash perf and coherence gates in this validation, `asym*` KV modes
 were not used. Runs used `--kv-mode q8`. FWHT KV modes remain valid
 fallbacks for future validation when appropriate.
+
+## dots.ocr / RDNA2 Note
+
+The dots.ocr real-model pass uses `/mnt/nas/kaden/models/dots-ocr.q8.hfq`,
+quantized from `rednote-hilab/dots.ocr` with `--format q8 --arch-id 8
+--include-vision`. The vision tower stores dense F16 GPU weights after
+load/dequant, so the RDNA2 HFQ3/HFQ4 sdot4 MMQ family does not accelerate
+that vision path yet. gfx1030 still has `has_hfq4_mmq()` / `has_hfq3_mmq()`
+coverage for text/quantized projection routes, but it does not have WMMA.
+
+The pre-fix gfx1030 OCR attempt failed compiling `gemm_f16_wmma` for
+`gfx1030` because the gfx11 `_w32` WMMA builtin requires
+`gfx11-insts,wavefrontsize32`. This commit gates dots.ocr vision
+GEMM/attention WMMA and Qwen2 batched causal WMMA prefill on
+`ArchCaps::has_wmma_w32()`: gfx1030 now routes to scalar fallback, while
+gfx1151 keeps the RDNA3 WMMA path.

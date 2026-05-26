@@ -994,7 +994,7 @@ pub fn forward_prefill_batch_embeds(
     let ffn_hidden_batch = gpu.alloc_tensor(&[batch, hidden_dim], DType::F32)?;
     let ffn_out_batch = gpu.alloc_tensor(&[batch, dim], DType::F32)?;
 
-    let use_wmma_causal = head_dim == 128 && batch >= 64;
+    let use_wmma_causal = gpu.arch_caps.has_wmma_w32() && head_dim == 128 && batch >= 64;
     let (k_f16_batch, v_f16_batch) = if use_wmma_causal {
         let k16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;
         let v16 = gpu.alloc_tensor(&[batch, kv_dim], DType::F16)?;

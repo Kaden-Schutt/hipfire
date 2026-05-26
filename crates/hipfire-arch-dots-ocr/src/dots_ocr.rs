@@ -736,7 +736,11 @@ pub(crate) fn linear_f16(
     // half16_t vector → NaN output on dots.ocr's specific shapes). The
     // 2c-5b investigation traced and fixed it — see the kernel file's
     // header for the lane-cooperative WMMA layout details.
-    gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    } else {
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+    }
     // Output as 2-D `[n, out_dim]`. The 2-D shape is load-bearing for
     // downstream `rmsnorm_f32`, which infers `batch = shape[0]` and
     // `n = shape.last()`. With a 1-D shape, rmsnorm interprets the
@@ -769,7 +773,11 @@ pub(crate) fn linear_f16_no_bias(
     // See [`linear_f16`] for the gemm_f16_wmma rationale and the
     // 2-D output-shape requirement (the latter is load-bearing for
     // downstream rmsnorm_f32 batch inference).
-    gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
+    } else {
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+    }
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
     gpu.transpose_f32(&yt, &y, out_dim, n)?;
     gpu.free_tensor(yt)?;
@@ -888,9 +896,14 @@ pub fn vision_forward(
     assert_eq!(n_heads * head_dim, h, "dots-ocr: n_heads * head_dim must equal embed_dim");
 
     let t0 = std::time::Instant::now();
+    let use_wmma = gpu.arch_caps.has_wmma_w32();
     eprintln!(
         "  vision forward (dots-ocr GPU): {n_patches} patches, {grid_h}×{grid_w} grid, {} blocks",
         cfg.num_hidden_layers,
+    );
+    eprintln!(
+        "  vision kernels: {}",
+        if use_wmma { "rdna3-wmma" } else { "scalar-fallback" },
     );
 
     // HIPFIRE_DOTS_OCR_DUMP_DIR=<path>: dump full per-stage tensor
@@ -1116,7 +1129,7 @@ pub fn vision_forward(
         // traffic. O lives in per-lane registers (8 float8_t = 64
         // VGPRs/lane in WMMA frag_c layout) to free the LDS budget the
         // doubled query rows would have eaten.
-        if head_dim == 128 && n_patches >= 64 {
+        if use_wmma && head_dim == 128 && n_patches >= 64 {
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
@@ -1127,7 +1140,7 @@ pub fn vision_forward(
             )?;
             gpu.free_tensor(k_f16)?;
             gpu.free_tensor(v_f16)?;
-        } else if head_dim == 128 && n_patches >= 32 {
+        } else if use_wmma && head_dim == 128 && n_patches >= 32 {
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
@@ -1138,12 +1151,12 @@ pub fn vision_forward(
             )?;
             gpu.free_tensor(k_f16)?;
             gpu.free_tensor(v_f16)?;
-        } else if head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
+        } else if use_wmma && head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
             gpu.attention_dflash_wmma_m32_f32(
                 &q_buf, &k_buf, &v_buf, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
-        } else if head_dim % 16 == 0 {
+        } else if use_wmma && head_dim % 16 == 0 {
             gpu.attention_dflash_wmma_f32(
                 &q_buf, &k_buf, &v_buf, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
@@ -1189,7 +1202,11 @@ pub fn vision_forward(
         // transpose — keep head-major so sub_offset can slice cleanly
         // into separate gate/up `[interm, n]` halves.
         let fc13_yt = gpu.alloc_tensor(&[two_interm * n_patches], DType::F32)?;
-        gpu.gemm_f16_wmma(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+        if use_wmma {
+            gpu.gemm_f16_wmma(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+        } else {
+            gpu.gemm_f16(&lw.fc13_proj, &xn2, &fc13_yt, two_interm, h, n_patches)?;
+        }
         gpu.free_tensor(xn2)?;
         toc!(gpu, "fc13 GEMM");
 
