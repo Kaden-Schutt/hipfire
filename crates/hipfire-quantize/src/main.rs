@@ -4747,20 +4747,21 @@ fn main() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
-    // DeepSeek V4 (arch_id=7) is also MoE but ships per-expert separate 2D
-    // tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`) instead of
-    // Qwen3.5's stacked 3D `mlp.experts.gate_up_proj`. Phase 1 ingest
-    // handles DeepSeek V4's per-expert tensors individually through the
-    // standard 2D quant path; the routing fan-out into top-k experts
+    // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
+    // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
+    // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
+    // instead of Qwen3.5's stacked 3D `mlp.experts.gate_up_proj`. Phase 1
+    // ingest handles DeepSeek V4's per-expert tensors individually through
+    // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
-    let is_v4f = arch_id == 7;
-    let is_moe_like = is_moe || is_v4f;
+    let is_deepseek4 = arch_id == 9;
+    let is_moe_like = is_moe || is_deepseek4;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
         eprintln!("  MoE detected — will split 3D expert tensors per-expert before quantization.");
     }
-    if is_v4f {
+    if is_deepseek4 {
         eprintln!("  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
     }
 
@@ -5075,7 +5076,7 @@ fn main() {
         // weights so the underlying Lloyd codebook fit is uniform; the
         // GPTQ sequential error-feedback assignment still applies and is
         // worth +1-2 % coherence (project_gptq_lloyd_mq2_win.md).
-        if is_v4f
+        if is_deepseek4
             && name.contains(".ffn.experts.")
             && name.ends_with(".weight")
             && meta.shape.len() == 2
