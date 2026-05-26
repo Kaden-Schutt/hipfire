@@ -21298,7 +21298,8 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let chunk_size = if seq_len <= 128 { seq_len } else { 128 };
+        let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let chunk_size = if seq_len <= cs_cap { seq_len } else { cs_cap };
         let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
 
         self.ensure_kernel("attention_flash_gqa_partial", kernels::ATTENTION_FLASH_GQA_SRC, "attention_flash_gqa_partial")?;
@@ -21326,6 +21327,34 @@ impl Gpu {
             &mut nh2 as *mut _ as *mut c_void, &mut nc as *mut _ as *mut c_void, &mut hd2 as *mut _ as *mut c_void,
         ];
         unsafe { self.hip.launch_kernel(f2, [n_heads as u32, 1, 1], [head_dim.min(256) as u32, 1, 1], 0, self.stream_ref(), &mut p2) }
+    }
+
+    /// Single-launch GQA decode: one block per kv_head streams all KV once,
+    /// accumulates online-softmax for the group in LDS, writes O. No partials,
+    /// no reduce. Grid = n_kv_heads. Probe of launch-vs-occupancy floor.
+    pub fn attention_flash_gqa_fused(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, seq_len: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        self.ensure_kernel("attention_flash_gqa_fused", kernels::ATTENTION_FLASH_GQA_FUSED_SRC, "attention_flash_gqa_fused")?;
+        let f = &self.functions["attention_flash_gqa_fused"];
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr(); let mut o_ptr = out.buf.as_ptr();
+        let mut sl = seq_len as i32; let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let kv_group = n_heads / n_kv_heads;
+        let block = 128u32;
+        let shmem = ((kv_group * head_dim + block as usize) * 4) as u32;
+        let mut p: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(f, [n_kv_heads as u32, 1, 1], [block, 1, 1], shmem, self.stream_ref(), &mut p) }
     }
 
     /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch.

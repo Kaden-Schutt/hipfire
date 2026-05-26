@@ -1725,6 +1725,7 @@ pub const ATTENTION_FLASH_SRC: &str = include_str!("../../../kernels/src/attenti
 /// reuses one K/V load across its query-head group. Reduce phase reuses
 /// `attention_flash_reduce` (ATTENTION_FLASH_SRC).
 pub const ATTENTION_FLASH_GQA_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa.hip");
+pub const ATTENTION_FLASH_GQA_FUSED_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa_fused.hip");
 
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).

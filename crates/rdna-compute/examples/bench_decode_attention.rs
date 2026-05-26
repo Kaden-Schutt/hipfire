@@ -107,4 +107,17 @@ fn main() {
     }
     gpu.hip.device_synchronize().unwrap();
     eprintln!("attention_flash_gqa:{:.1} us/call (vs flash maxdiff={maxdiff:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // attention_flash_gqa_fused (single launch, no partials/reduce)
+    let d_out3 = gpu.zeros(&[q_dim], DType::F32).unwrap();
+    gpu.attention_flash_gqa_fused(&d_q, &d_k, &d_v, &d_out3, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let c = gpu.download_f32(&d_out3).unwrap();
+    let maxdiff3 = a.iter().zip(&c).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        gpu.attention_flash_gqa_fused(&d_q, &d_k, &d_v, &d_out3, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    eprintln!("attention_flash_gqa_fused:{:.1} us/call (vs flash maxdiff={maxdiff3:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
 }
