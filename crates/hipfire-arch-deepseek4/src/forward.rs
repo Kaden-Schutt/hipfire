@@ -5976,18 +5976,43 @@ fn attention_block_batched_mixed(
                 .indexer_kv_cache
                 .as_ref()
                 .ok_or_else(|| "indexer_kv_cache missing".to_string())?;
-            gpu.indexer_relu_score_batched_f32(
-                &pbs.idx_q_batch,
-                kv_cache,
-                &pbs.idx_w_batch,
-                &pbs.n_active_topk_arr, // reuse buffer: holds n_per_batch right now
-                &pbs.idx_scores_batch,
-                h_idx as i32,
-                d_idx as i32,
-                max_compressed as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("indexer_relu_score_batched l{layer_idx}: {e:?}"))?;
+            // WMMA fast path: gated on gfx1100+ (RDNA3+) and the canonical
+            // DeepSeek V4 indexer shape (H=64, D=128). 8-9% of prefill
+            // PMC vs the F32 scalar baseline — Phase C1 of the prefill
+            // catch-up plan. Opt out via HIPFIRE_DEEPSEEK4_INDEXER_WMMA=0.
+            let use_indexer_wmma = h_idx == 64
+                && d_idx == 128
+                && (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+                && std::env::var("HIPFIRE_DEEPSEEK4_INDEXER_WMMA")
+                    .map(|s| s != "0")
+                    .unwrap_or(true);
+            if use_indexer_wmma {
+                gpu.indexer_relu_score_wmma_batched_f32(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    &pbs.n_active_topk_arr,
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_wmma_batched l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.indexer_relu_score_batched_f32(
+                    &pbs.idx_q_batch,
+                    kv_cache,
+                    &pbs.idx_w_batch,
+                    &pbs.n_active_topk_arr, // reuse buffer: holds n_per_batch right now
+                    &pbs.idx_scores_batch,
+                    h_idx as i32,
+                    d_idx as i32,
+                    max_compressed as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("indexer_relu_score_batched l{layer_idx}: {e:?}"))?;
+            }
 
             // Batched top-K. n_stride = max_compressed (storage),
             // n_iter = n_max_chunk (actual range with valid scores),

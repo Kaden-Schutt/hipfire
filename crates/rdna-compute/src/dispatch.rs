@@ -29429,6 +29429,73 @@ impl Gpu {
         }
     }
 
+    /// WMMA-accelerated BATCHED indexer scoring (Phase C1 of the
+    /// deepseek4 prefill catch-up plan). Same math as
+    /// `indexer_relu_score_batched_f32` but with a 16×16×16 WMMA tile
+    /// of Q·K^T per warp + LDS reduction across heads.
+    ///
+    /// Requires H = 64 and idx_head_dim = 128 (DeepSeek V4 indexer
+    /// shape — caller asserts before dispatch). gfx1100+ WMMA only.
+    ///
+    /// Grid:  [batch_size, ceil(N_max / 16), 1]
+    /// Block: [128, 1, 1] (4 warps × 32 threads)
+    #[allow(clippy::too_many_arguments)]
+    pub fn indexer_relu_score_wmma_batched_f32(
+        &mut self,
+        q: &GpuTensor,             // [B, H, D]
+        k_cache: &GpuTensor,       // [N_max, D] shared
+        weights: &GpuTensor,       // [B, H]
+        n_per_batch: &GpuTensor,   // [B] i32
+        scores: &GpuTensor,        // [B, N_max] output
+        n_idx_heads: i32,
+        idx_head_dim: i32,
+        n_max: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(n_idx_heads, 64,
+            "indexer_relu_score_wmma: requires H=64 (got {n_idx_heads})");
+        assert_eq!(idx_head_dim, 128,
+            "indexer_relu_score_wmma: requires idx_head_dim=128 (got {idx_head_dim})");
+        self.ensure_kernel(
+            "indexer_relu_score_wmma_batched",
+            kernels::INDEXER_RELU_SCORE_WMMA_BATCHED_SRC,
+            "indexer_relu_score_wmma_batched_f32",
+        )?;
+        let func = &self.functions["indexer_relu_score_wmma_batched_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = k_cache.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let np = n_per_batch.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let mut h  = n_idx_heads;
+        let mut d  = idx_head_dim;
+        let mut nc = n_max;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &np as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_n = (n_max as u32 + 15) / 16;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, grid_n, 1],
+                [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// DeepSeek V4 indexer scoring — combined across heads with relu gating.
     /// `scores[n] = sum_h relu(q[h, :] · k_cache[n, :]) * weights[h]`.
     /// Block per slot N, threads-per-block = H (one head per thread),

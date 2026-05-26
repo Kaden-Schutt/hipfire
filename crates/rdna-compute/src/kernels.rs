@@ -2651,6 +2651,13 @@ pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
 pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/indexer_relu_score_batched.hip");
 
+/// DeepSeek V4 indexer score — WMMA-accelerated BATCHED (Phase C1,
+/// 2026-05-26). Replaces the F32 scalar one-thread-per-head baseline
+/// with a 16×16×16 WMMA tile of Q·K^T per warp; 4 warps cover the
+/// 64-head reduction in LDS.
+pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
+
 /// SWA ring write — BATCHED (Phase B2, 2026-05-18). Advances the ring
 /// at chunk end to include all B positions. Slot = (start_pos+b) % win.
 pub const SWA_RING_WRITE_BATCHED_SRC: &str =
