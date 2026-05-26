@@ -19808,13 +19808,12 @@ impl Gpu {
         // (kernel ASSERT). When M doesn't divide 64, fall through to the
         // single-warp variant.
         //
-        // Set HIPFIRE_Q8_WMMA_4W=0 to opt out (sanity check).
-        let use_4w_default = self.arch.starts_with("gfx11") || self.arch.starts_with("gfx12");
-        let use_4w = match std::env::var("HIPFIRE_Q8_WMMA_4W").as_deref() {
-            Ok("0") => false,
-            Ok("1") => true,
-            _ => use_4w_default,
-        };
+        // Opt-in via HIPFIRE_Q8_WMMA_4W=1. Default OFF: commit be57d8d
+        // originally shipped default-ON on gfx11/gfx12, but the auto-enable
+        // measured ~15% prefill TPS regression (49.3 → 41.7) per the
+        // commit message itself. Restore documented behavior; the kernel
+        // needs a tighter shape gate before the default can flip on.
+        let use_4w = std::env::var("HIPFIRE_Q8_WMMA_4W").as_deref() == Ok("1");
         if !use_legacy && use_4w && k % 32 == 0
             && m % 64 == 0 && n % 64 == 0 && n >= 128
         {
