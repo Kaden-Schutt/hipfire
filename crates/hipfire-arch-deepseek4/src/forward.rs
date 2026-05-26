@@ -256,6 +256,30 @@ fn gemv_auto_batched_wmma(
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
                         .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
+                    // Shape-gated 4-warp 64×64 WMMA (gemm_q8_0_wmma_4w).
+                    // Routes only the cells `bench_q8_wmma_4w` proved as
+                    // wins on gfx1151 (be57d8d):
+                    //   M=4096  K=4096 B=256   → 1.95×
+                    //   M=4096  K=4096 B=1024  → 2.09×
+                    //   M=32768 K=1536 B=1024  → 3.30× (wq_b shape)
+                    // Any B=64 cell loses (0.27×–0.83×), so the gate
+                    // requires B≥256. Cells with B∈(64,256) or M<4096
+                    // are unmeasured and stay on the single-warp path.
+                    // Kernel hard requires M%64==0, K%32==0, B%64==0.
+                    // Opt out via HIPFIRE_DEEPSEEK4_Q8_4W=0 for diagnosis.
+                    let opt_out = std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W")
+                        .as_deref() == Ok("0");
+                    let use_4w = !opt_out
+                        && batch_size >= 256
+                        && m >= 4096
+                        && m % 64 == 0
+                        && k % 32 == 0
+                        && batch_size % 64 == 0;
+                    if use_4w {
+                        return gpu
+                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
+                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
+                    }
                     return gpu
                         .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
                         .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
