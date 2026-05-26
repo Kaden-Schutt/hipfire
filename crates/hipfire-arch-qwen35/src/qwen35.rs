@@ -7091,7 +7091,7 @@ fn forward_prefill_chunk(
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 let q8_wmma_arch = gpu.flags.has_wmma_f16()
-                    || gpu.arch.starts_with("gfx12");
+                    || gpu.flags.has_wmma_f16_gfx12();
 
                 if is_mq {
                     // AWQ-aware: next linear is LA's fused wqkv.
@@ -7319,10 +7319,10 @@ fn forward_prefill_chunk(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
-                let q8_wmma_arch = gpu.flags.has_wmma_f16()
-                    || gpu.arch.starts_with("gfx12");
-                // Fused QKV requires uniform dtype — see issue #249 for
-                // the dense FA variant. Gate the same way here.
+                 let q8_wmma_arch = gpu.flags.has_wmma_f16()
+                     || gpu.flags.has_wmma_f16_gfx12();
+                 // Fused QKV requires uniform dtype — see issue #249 for
+                 // the dense FA variant. Gate the same way here.
                 let qkv_same_dtype = layer.wk.gpu_dtype == layer.wq.gpu_dtype
                                   && layer.wv.gpu_dtype == layer.wq.gpu_dtype;
 

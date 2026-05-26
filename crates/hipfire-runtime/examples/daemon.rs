@@ -3267,7 +3267,7 @@ fn generate_multi(
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
-    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
         generated += 1;
@@ -4019,7 +4019,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::
         // Implementation lives in `hipfire_runtime::loop_guard`; defaults read from
         // HIPFIRE_NGRAM_LOOP_THRESHOLD (default 8, 0 = disabled) and
         // HIPFIRE_NGRAM_WINDOW (default 256). See loop_guard.rs.
-        let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+        let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
         // `while` instead of `for 0..max_tokens` so budget-alert injection
         // (which increments `generated` beyond the iteration count) can't
@@ -4841,7 +4841,7 @@ fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut st
 
     // N-gram loop detector — mirrors the text path. Catches answer-phase
     // attractor loops that the think cap and repeat penalty miss.
-    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
         generated += 1;

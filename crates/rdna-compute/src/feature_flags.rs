@@ -28,6 +28,7 @@ pub struct FeatureFlags {
     pub gfx942_lds_gemv: Option<bool>,
     pub gfx942_lds_gemv_default_on: bool,
     pub gemv_rows_default: u32,
+    pub gemv_dp4a: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -134,6 +135,7 @@ impl FeatureFlags {
                 .and_then(|v| v.parse::<u32>().ok())
                 .map(|r| match r { 1 | 2 | 4 | 8 => r, _ => 1 }),
             gemv_dp4a_default_on: is_gfx906,
+            gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -232,7 +234,7 @@ impl FeatureFlags {
     // ── Methods replacing free functions ─────────────────────────────
 
     pub fn gemv_dp4a_enabled(&self) -> bool {
-        self.hfq3_dp4a.unwrap_or(self.gemv_dp4a_default_on)
+        self.gemv_dp4a.unwrap_or(self.gemv_dp4a_default_on)
     }
 
     pub fn gemv_prefetch_enabled(&self) -> bool {

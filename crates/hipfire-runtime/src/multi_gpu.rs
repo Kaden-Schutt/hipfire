@@ -393,10 +393,7 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
         return Ok(());
     }
     let arch0 = devices[0].arch.clone();
-    let allow_mixed = if crate::config::get().allow_mixed_arch { Ok("1".to_string()) } else { Err(std::env::VarError::NotPresent) }
-        .ok()
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let allow_mixed = crate::config::get().allow_mixed_arch;
     let mut frees = Vec::with_capacity(devices.len());
     for d in devices {
         if d.arch != arch0 {
@@ -430,9 +427,8 @@ fn preflight_vram_with_opts(devices: &[Gpu], check_vram_delta: bool) -> HipResul
     let max_free = *frees.iter().max().unwrap();
     let min_free = *frees.iter().min().unwrap();
     let delta_gb = (max_free - min_free) as f64 / 1e9;
-    let tol_gb = match crate::config::get().uniform_vram_tolerance_gb { Some(t) => Ok(t.to_string()), None => Err(std::env::VarError::NotPresent) }
-        .ok()
-        .and_then(|s| s.parse::<f64>().ok())
+    let tol_gb = crate::config::get().uniform_vram_tolerance_gb
+        .map(|t| t as f64)
         .unwrap_or(DEFAULT_VRAM_TOLERANCE_GB);
     if delta_gb > tol_gb {
         return Err(HipError::new(
