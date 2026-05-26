@@ -8220,13 +8220,13 @@ fn run_fa_layer_body(
             layer.wq.k,
         )?;
     } else if fused_fa3_paro4t {
-        gpu.fused_decode_paro4g128t_qkv(
-            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-            &s.x, &layer.attn_norm,
-            &s.fa_q_full, &s.fa_k, &s.fa_v,
-            layer.wq.m, layer.wk.m, layer.wv.m,
+        gpu.fused_qkvza_paro4g128t(
+            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+            &s.tmp,
+            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+            layer.wq.m, layer.wk.m, layer.wv.m, 0,
             layer.wq.k,
-            config.norm_eps,
         )?;
     } else {
         // Lever 1 fast path: when fused_rmsnorm_rotate_for_paro produced x_rot_paro,
@@ -9040,13 +9040,13 @@ fn forward_scratch_layers(
                         layer.wq.k,
                     )?;
                 } else if fused_fa3_paro4t {
-                    gpu.fused_decode_paro4g128t_qkv(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                        &s.x, &layer.attn_norm,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                        &s.tmp,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
-                        config.norm_eps,
                     )?;
                 } else {
                     if let Some(xr_first) = x_rot_paro {
@@ -9559,13 +9559,13 @@ fn forward_scratch_layers(
                         layer.wq.k,
                     )?;
                 } else if fused_fa3_paro4t {
-                    gpu.fused_decode_paro4g128t_qkv(
-                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                        &s.x, &layer.attn_norm,
-                        &s.fa_q_full, &s.fa_k, &s.fa_v,
-                        layer.wq.m, layer.wk.m, layer.wv.m,
+                    gpu.fused_qkvza_paro4g128t(
+                        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                        &s.tmp,
+                        &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                        &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                        layer.wq.m, layer.wk.m, layer.wv.m, 0,
                         layer.wq.k,
-                        config.norm_eps,
                     )?;
                 } else {
                     if let Some(xr_first) = x_rot_paro {
@@ -10060,13 +10060,13 @@ fn forward_scratch_layers_multi(
                             layer.wq.k,
                         )?;
                     } else if fused_fa3_paro4t {
-                        gpu.fused_decode_paro4g128t_qkv(
-                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                            &s.x, &layer.attn_norm,
-                            &s.fa_q_full, &s.fa_k, &s.fa_v,
-                            layer.wq.m, layer.wk.m, layer.wv.m,
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                            &s.tmp,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
-                            config.norm_eps,
                         )?;
                     } else {
                         if let Some(xr_first) = x_rot_paro {
@@ -10450,13 +10450,13 @@ fn forward_scratch_layers_multi(
                             layer.wq.k,
                         )?;
                     } else if fused_fa3_paro4t {
-                        gpu.fused_decode_paro4g128t_qkv(
-                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf,
-                            &s.x, &layer.attn_norm,
-                            &s.fa_q_full, &s.fa_k, &s.fa_v,
-                            layer.wq.m, layer.wk.m, layer.wv.m,
+                        gpu.fused_qkvza_paro4g128t(
+                            &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &layer.wq.buf,
+                            &s.tmp,
+                            &s.fa_q_full, &s.fa_k, &s.fa_v, &s.o,
+                            &s.x_rot, &s.ffn_hidden, &s.ffn_out, &s.o,
+                            layer.wq.m, layer.wk.m, layer.wv.m, 0,
                             layer.wq.k,
-                            config.norm_eps,
                         )?;
                     } else {
                         if let Some(xr_first) = x_rot_paro {
