@@ -1844,6 +1844,12 @@ pub const ATTENTION_SRC: &str = include_str!("../../../kernels/src/attention.hip
 /// Partial results stored in partials buffer: [n_heads × n_chunks × (1 + 1 + head_dim)] floats.
 pub const ATTENTION_FLASH_SRC: &str = include_str!("../../../kernels/src/attention_flash.hip");
 
+/// GQA-aware flash decode partial: grid [n_kv_heads, n_chunks]; each block
+/// reuses one K/V load across its query-head group. Reduce phase reuses
+/// `attention_flash_reduce` (ATTENTION_FLASH_SRC).
+pub const ATTENTION_FLASH_GQA_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa.hip");
+pub const ATTENTION_FLASH_GQA_FUSED_SRC: &str = include_str!("../../../kernels/src/attention_flash_gqa_fused.hip");
+
 
 /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per layer).
 /// Grid: [gate_m + up_m, 1, 1]. Each block processes one row from gate or up weight.
@@ -2203,6 +2209,12 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V2_SRC: &str = include_str!("../.
 /// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip`.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3.hip");
 
+/// Causal variant of v3 (M=64, N=128, f16 K/V). Adds causal mask:
+/// S[q, k] = -inf when k > q. Skips entirely-masked tiles. Grid
+/// `[n_heads, ceil(B/64)]`, block `[128]`.
+/// See `kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.hip`.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.hip");
+
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");
@@ -2314,6 +2326,10 @@ pub const CONV1D_SILU_SPLIT_TREE_SRC: &str = include_str!("../../../kernels/src/
 /// GPU-side KV cache write using pos from a GPU buffer.
 /// Copies kv_dim floats from src to dst at offset pos_buf[0] * kv_dim.
 pub const KV_CACHE_WRITE_SRC: &str = include_str!("../../../kernels/src/kv_cache_write.hip");
+
+/// Batched F32 KV cache write: scatter `batch_size` rows into the cache at
+/// the absolute positions array, in one launch. Used by batched prefill.
+pub const KV_CACHE_WRITE_F32_BATCHED_SRC: &str = include_str!("../../../kernels/src/kv_cache_write_f32_batched.hip");
 
 
 /// GPU-side top-K + top-P sampling. Eliminates 600KB logits download per token.

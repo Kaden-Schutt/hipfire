@@ -22443,38 +22443,37 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.ensure_kernel("rope", kernels::ROPE_SRC, "rope_f32")?;
         let func = &self.functions["rope_f32"];
 
-        let mut q_ptr = q.buf.as_ptr();
-        let mut k_ptr = k.buf.as_ptr();
-        let mut pos_ptr = pos_buf.as_ptr();
-        let mut nhq = n_heads_q as i32;
-        let mut nhk = n_heads_k as i32;
-        let mut hd = head_dim as i32;
-        let mut fb = freq_base;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let fb = freq_base;
 
         let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut k_ptr as *mut _ as *mut c_void,
-            &mut pos_ptr as *mut _ as *mut c_void,
-            &mut nhq as *mut _ as *mut c_void,
-            &mut nhk as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut fb as *mut _ as *mut c_void,
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
         ];
 
         let half = (head_dim / 2) as u32;
         let block = 256u32.min(half);
         let grid = (half + block - 1) / block;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "rope_f32", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(pos_ptr);
+                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_f32(fb);
+                b
+            },
+        )
     }
 
     /// Batched RoPE: apply to [batch_size] positions in one launch.
@@ -22600,77 +22599,169 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
         // Phase 1: compute partial attention per chunk
         self.ensure_kernel("attention_flash_partial", kernels::ATTENTION_FLASH_SRC, "attention_flash_partial")?;
-        let func1 = &self.functions["attention_flash_partial"];
 
-        let mut q_ptr = q.buf.as_ptr();
-        let mut k_ptr = k_cache.buf.as_ptr();
-        let mut v_ptr = v_cache.buf.as_ptr();
-        let mut p_ptr = partials.buf.as_ptr();
-        let mut sl = seq_len as i32;
-        let mut nh = n_heads as i32;
-        let mut nkv = n_kv_heads as i32;
-        let mut hd = head_dim as i32;
-        let mut ms = max_seq as i32;
-        let mut sc = scale;
-        let mut cs = chunk_size as i32;
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let p_ptr = partials.buf.as_ptr();
+        let sl = seq_len as i32;
+        let nh = n_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let ms = max_seq as i32;
+        let sc = scale;
+        let cs = chunk_size as i32;
 
         let mut params1: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
-            &mut k_ptr as *mut _ as *mut c_void,
-            &mut v_ptr as *mut _ as *mut c_void,
-            &mut p_ptr as *mut _ as *mut c_void,
-            &mut sl as *mut _ as *mut c_void,
-            &mut nh as *mut _ as *mut c_void,
-            &mut nkv as *mut _ as *mut c_void,
-            &mut hd as *mut _ as *mut c_void,
-            &mut ms as *mut _ as *mut c_void,
-            &mut sc as *mut _ as *mut c_void,
-            &mut cs as *mut _ as *mut c_void,
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &p_ptr as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &cs as *const _ as *mut c_void,
         ];
 
         let block_size = 128u32.min(chunk_size as u32).next_power_of_two();
         let shared_mem = ((chunk_size + block_size as usize) * 4) as u32;
 
-        unsafe {
-            self.hip.launch_kernel(
-                func1,
-                [n_heads as u32, n_chunks as u32, 1],
-                [block_size, 1, 1],
-                shared_mem,
-                self.stream_ref(),
-                &mut params1,
-            )?;
-        }
+        self.launch_maybe_blob(
+            "attention_flash_partial",
+            [n_heads as u32, n_chunks as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params1,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr); b.push_ptr(p_ptr);
+                b.push_i32(sl); b.push_i32(nh); b.push_i32(nkv);
+                b.push_i32(hd); b.push_i32(ms); b.push_f32(sc); b.push_i32(cs);
+                b
+            },
+        )?;
 
         // Phase 2: reduce partials
         self.ensure_kernel("attention_flash_reduce", kernels::ATTENTION_FLASH_SRC, "attention_flash_reduce")?;
-        let func2 = &self.functions["attention_flash_reduce"];
 
-        let mut p_ptr2 = partials.buf.as_ptr();
-        let mut out_ptr = out.buf.as_ptr();
-        let mut nh2 = n_heads as i32;
-        let mut nc = n_chunks as i32;
-        let mut hd2 = head_dim as i32;
+        let p_ptr2 = partials.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let nh2 = n_heads as i32;
+        let nc = n_chunks as i32;
+        let hd2 = head_dim as i32;
 
         let mut params2: Vec<*mut c_void> = vec![
-            &mut p_ptr2 as *mut _ as *mut c_void,
-            &mut out_ptr as *mut _ as *mut c_void,
-            &mut nh2 as *mut _ as *mut c_void,
-            &mut nc as *mut _ as *mut c_void,
-            &mut hd2 as *mut _ as *mut c_void,
+            &p_ptr2 as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &nh2 as *const _ as *mut c_void,
+            &nc as *const _ as *mut c_void,
+            &hd2 as *const _ as *mut c_void,
         ];
 
         let reduce_block = head_dim.min(256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func2,
-                [n_heads as u32, 1, 1],
-                [reduce_block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params2,
-            )
-        }
+        self.launch_maybe_blob(
+            "attention_flash_reduce",
+            [n_heads as u32, 1, 1],
+            [reduce_block, 1, 1],
+            0,
+            &mut params2,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p_ptr2); b.push_ptr(out_ptr);
+                b.push_i32(nh2); b.push_i32(nc); b.push_i32(hd2);
+                b
+            },
+        )
+    }
+
+    /// GQA-aware split-K flash decode: one phase-1 block per (kv_head, chunk)
+    /// reuses a single K/V load across its query-head group (n_heads/n_kv_heads),
+    /// so the KV cache is traversed n_kv_heads× not n_heads×. Phase-2 reuses
+    /// `attention_flash_reduce`. Same partials buffer as `attention_flash`.
+    pub fn attention_flash_gqa(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, partials: &GpuTensor, seq_len: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let cs_cap = std::env::var("HIPFIRE_GQA_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(128);
+        let chunk_size = if seq_len <= cs_cap { seq_len } else { cs_cap };
+        let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+        self.ensure_kernel("attention_flash_gqa_partial", kernels::ATTENTION_FLASH_GQA_SRC, "attention_flash_gqa_partial")?;
+        let q_ptr = q.buf.as_ptr(); let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr(); let p_ptr = partials.buf.as_ptr();
+        let sl = seq_len as i32; let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32; let ms = max_seq as i32; let sc = scale; let cs = chunk_size as i32;
+        let mut p1: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void, &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void, &p_ptr as *const _ as *mut c_void,
+            &sl as *const _ as *mut c_void, &nh as *const _ as *mut c_void, &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void, &ms as *const _ as *mut c_void, &sc as *const _ as *mut c_void, &cs as *const _ as *mut c_void,
+        ];
+        let block = 128u32.min(chunk_size as u32).next_power_of_two();
+        let shmem = ((chunk_size + block as usize) * 4) as u32;
+        self.launch_maybe_blob(
+            "attention_flash_gqa_partial",
+            [n_kv_heads as u32, n_chunks as u32, 1], [block, 1, 1], shmem, &mut p1,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr); b.push_ptr(p_ptr);
+                b.push_i32(sl); b.push_i32(nh); b.push_i32(nkv);
+                b.push_i32(hd); b.push_i32(ms); b.push_f32(sc); b.push_i32(cs);
+                b
+            },
+        )?;
+
+        self.ensure_kernel("attention_flash_reduce", kernels::ATTENTION_FLASH_SRC, "attention_flash_reduce")?;
+        let p2_ptr = partials.buf.as_ptr(); let o_ptr = out.buf.as_ptr();
+        let nh2 = n_heads as i32; let nc = n_chunks as i32; let hd2 = head_dim as i32;
+        let mut p2: Vec<*mut c_void> = vec![
+            &p2_ptr as *const _ as *mut c_void, &o_ptr as *const _ as *mut c_void,
+            &nh2 as *const _ as *mut c_void, &nc as *const _ as *mut c_void, &hd2 as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "attention_flash_reduce",
+            [n_heads as u32, 1, 1], [head_dim.min(256) as u32, 1, 1], 0, &mut p2,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(p2_ptr); b.push_ptr(o_ptr);
+                b.push_i32(nh2); b.push_i32(nc); b.push_i32(hd2);
+                b
+            },
+        )
+    }
+
+    /// Single-launch GQA decode: one block per kv_head streams all KV once,
+    /// accumulates online-softmax for the group in LDS, writes O. No partials,
+    /// no reduce. Grid = n_kv_heads. Probe of launch-vs-occupancy floor.
+    pub fn attention_flash_gqa_fused(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, seq_len: usize,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        self.ensure_kernel("attention_flash_gqa_fused", kernels::ATTENTION_FLASH_GQA_FUSED_SRC, "attention_flash_gqa_fused")?;
+        let f = &self.functions["attention_flash_gqa_fused"];
+        let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr(); let mut o_ptr = out.buf.as_ptr();
+        let mut sl = seq_len as i32; let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32; let mut ms = max_seq as i32; let mut sc = scale;
+        let kv_group = n_heads / n_kv_heads;
+        let block = 128u32;
+        let shmem = ((kv_group * head_dim + block as usize) * 4) as u32;
+        let mut p: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void, &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void, &mut o_ptr as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        unsafe { self.hip.launch_kernel(f, [n_kv_heads as u32, 1, 1], [block, 1, 1], shmem, self.stream_ref(), &mut p) }
     }
 
     /// Fused Gate+Up HFQ4-G256: two GEMVs in one launch.
@@ -25459,25 +25550,69 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.ensure_kernel("kv_cache_write", kernels::KV_CACHE_WRITE_SRC, "kv_cache_write")?;
         let func = &self.functions["kv_cache_write"];
 
+        let dst_ptr = dst.buf.as_ptr();
+        let src_ptr = src.buf.as_ptr();
+        let pos_ptr = pos_buf.as_ptr();
+        let kd = kv_dim as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &dst_ptr as *const _ as *mut c_void,
+            &src_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = (kv_dim as u32 + block - 1) / block;
+
+        self.launch_maybe_blob(
+            "kv_cache_write", [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dst_ptr); b.push_ptr(src_ptr); b.push_ptr(pos_ptr);
+                b.push_i32(kd);
+                b
+            },
+        )
+    }
+
+    /// Batched F32 KV-cache write: scatter `batch_size` rows of `src`
+    /// (`[batch_size * kv_dim]`) into the F32 cache at the absolute
+    /// positions in `positions` (`[batch_size]` i32), in one launch.
+    /// Batched-prefill replacement for the per-position `kv_cache_write`.
+    pub fn kv_cache_write_f32_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        kv_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("kv_cache_write_f32_batched", kernels::KV_CACHE_WRITE_F32_BATCHED_SRC, "kv_cache_write_f32_batched")?;
+        let func = &self.functions["kv_cache_write_f32_batched"];
+
         let mut dst_ptr = dst.buf.as_ptr();
         let mut src_ptr = src.buf.as_ptr();
-        let mut pos_ptr = pos_buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
         let mut kd = kv_dim as i32;
+        let mut bs = batch_size as i32;
 
         let mut params: Vec<*mut c_void> = vec![
             &mut dst_ptr as *mut _ as *mut c_void,
             &mut src_ptr as *mut _ as *mut c_void,
             &mut pos_ptr as *mut _ as *mut c_void,
             &mut kd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
         ];
 
         let block = 256u32;
-        let grid = (kv_dim as u32 + block - 1) / block;
+        let grid_x = (kv_dim as u32 + block - 1) / block;
 
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [grid, 1, 1],
+                [grid_x, batch_size as u32, 1],
                 [block, 1, 1],
                 0,
                 self.stream_ref(),
@@ -27645,19 +27780,26 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         self.ensure_kernel("bias_add_f32", kernels::BIAS_ADD_SRC, "bias_add_f32")?;
         let func = &self.functions["bias_add_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut bp = bias.buf.as_ptr();
-        let mut ni = n as i32;
+        let xp = x.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let ni = n as i32;
         let total = (batch * n) as i32;
-        let mut ti = total;
+        let ti = total;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut bp as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
-            &mut ti as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+            &ti as *const _ as *mut c_void,
         ];
         let blocks = ((total as usize + 255) / 256) as u32;
-        unsafe { self.hip.launch_kernel(func, [blocks, 1, 1], [256, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.launch_maybe_blob(
+            "bias_add_f32", [blocks, 1, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(bp); b.push_i32(ni); b.push_i32(ti);
+                b
+            },
+        )
     }
 
     /// Transpose [rows, cols] → [cols, rows]
@@ -28462,6 +28604,82 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+        ];
+
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Causal variant of `attention_dflash_wmma_m64_n128_f16kv_v3_f32`.
+    /// Same tile shape (M=64, N=128, f16 K/V, 4-wave block, padded S_lds,
+    /// cooperative softmax, phase C hoisted) but applies a causal mask
+    /// during Phase A: S[q, k] = -inf when k > q. Tiles where all keys
+    /// are in the future (kt_start >= q_start + m_tile) are skipped
+    /// entirely.
+    ///
+    /// Intended for text-decoder prefill (causal self-attention with GQA).
+    pub fn attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let lds_f32 = (128 * head_dim) / 2 + (64 * 130) / 2 + 64 * 3;
+        let shared_mem = (lds_f32 * 4) as u32;
+
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut causal = 1i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut causal as *mut _ as *mut c_void,
         ];
 
         let q_tiles = (b + 63) / 64;
