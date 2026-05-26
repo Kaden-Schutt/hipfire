@@ -2,7 +2,7 @@
 """Capture Qwen2-1.5B-Instruct reference logits + token IDs for hipfire validation.
 
 Phase 0 / phase 1 of the dots.ocr + Qwen2 bring-up plan (see
-docs/plans/qwen_2.0_vlm_plus_dots_ocr.md).
+docs/plans/dots-ocr-prd.md).
 
 What this captures, for the prompt at benchmarks/prompts/qwen2_smoke.txt:
 

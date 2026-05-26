@@ -150,6 +150,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-dots-ocr"
+version = "0.2.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-arch-qwen2",
+ "hipfire-runtime",
+ "image",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.2.0"
 dependencies = [

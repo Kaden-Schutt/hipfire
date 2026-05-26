@@ -40,6 +40,11 @@ DFlash speedup is genre-conditional — see
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for the full per-genre table
 and the cross-arch matrix (RDNA1 / RDNA2 / APU / MI300X).
 
+CASK-based KV cache eviction lets you run long-context prompts without
+OOM: generate a sidecar with `hipfire sidecar-gen <model>` and enable
+eviction with `hipfire config cask-profile balanced`. See
+[CONFIG.md](docs/CONFIG.md) for details.
+
 ## Install
 
 Linux with ROCm 6+:
@@ -124,7 +129,7 @@ the prefill MMQ redesign log is at
 | [CLI.md](docs/CLI.md) | Every subcommand, flags, file locations |
 | [MODELS.md](docs/MODELS.md) | Curated tags, BYO models, file extensions |
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
-| [CONFIG.md](docs/CONFIG.md) | Every config key, env overrides |
+| [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |

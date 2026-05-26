@@ -115,6 +115,13 @@ SHORT_TESTS=(
     #   md5(coherence_lloyd_long.txt) = f20bbc4f5b88ab5f7b44fe7c7da0e2e3
     "qwen3.5-4b.mq3-lloyd|long-prefill-mq3-lloyd-4b|@coherence_lloyd_long.txt|220"
     "qwen3.5-9b.mq3-lloyd|long-prefill-mq3-lloyd-9b|@coherence_lloyd_long.txt|220"
+    # MQ4-Lloyd coverage (issue #182 Phase B3 — regression-prevention
+    # companion to B2's batched WMMA prefill wiring). Exercises
+    # gemm_*_mq4g256_lloyd_wmma family + nibble-pair decode + per-row LDS
+    # codebook (16 entries × 16 rows = 512 B/workgroup). 9B row catches
+    # any mid-layer corruption that would surface as token-loop attractor.
+    # gfx11 + gfx12 only (refused on other archs by is_batchable_la).
+    "qwen3.5-9b.mq4-lloyd|reason-mq4-lloyd-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     # Q8_0 batched-prefill coverage (companion to docs/plans/q8-fused-prefill-kernels.md
     # T3-0 prerequisite). Exercises the Tier 2 dispatch arms
     # (gemm_q8_0_batched_chunked at qkv/qkvza/gate_up/wo+residual/w_down+residual)

@@ -16,7 +16,7 @@
 //!   residual → FFN norm → SwiGLU → residual). End-to-end validated
 //!   16/16 top-1 match vs HF F32 reference at Q8F16 precision.
 //!
-//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the
+//! See `docs/plans/dots-ocr-prd.md` phase 1 for the
 //! bring-up plan and `lib.rs` for the rev-3 status summary.
 //!
 //! # TODO(transformer-extraction)
@@ -48,12 +48,12 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 ///   accessor); `eos_token_ids` carries the full set so the runtime
 ///   can build a multi-element stop-set (e.g. dots.ocr's
 ///   `[151643, 151673]` — without both, streaming EOS misses one).
-///   Note: dots.ocr's `config.json` doesn't carry `eos_token_id` at
-///   all — it lives in `generation_config.json`, which the quantiser
-///   does not pack today. Parser falls back to 151645 (`<|im_end|>`)
-///   in that case, which is wrong for dots.ocr; phase 3 must either
-///   teach the quantiser to merge `generation_config` or special-case
-///   via `eos_filter_overrides`. See R5 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md`.
+///   Lookup order: `config.eos_token_id` (scalar or array) →
+///   `generation_config.eos_token_id` → default `[151645]` (ChatML
+///   `<|im_end|>`). dots.ocr's `config.json` carries no EOS at all;
+///   the array lives only in `generation_config.json`, which the
+///   quantiser packs into HFQ metadata as of R5. See
+///   `docs/plans/dots-ocr-devlog.md` §7 (R5).
 #[derive(Debug, Clone)]
 pub struct Qwen2Config {
     pub hidden_size: usize,
@@ -116,15 +116,32 @@ pub fn config_from_metadata_json(metadata_json: &str) -> Option<Qwen2Config> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
     // Build the full EOS set first, then the scalar accessor is its
-    // first element. Both array and scalar config layouts are accepted;
-    // missing field falls back to [151645] (ChatML `<|im_end|>`).
-    let eos_token_ids: Vec<u32> = match tc.get("eos_token_id") {
-        Some(v) if v.is_array() => v.as_array().unwrap().iter()
-            .filter_map(|e| e.as_u64().map(|n| n as u32))
-            .collect(),
-        Some(v) if v.is_number() => v.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
-        _ => Vec::new(),
+    // first element. Both array and scalar config layouts are accepted.
+    //
+    // Lookup order:
+    //   1. text_config.eos_token_id / config.eos_token_id (Qwen2-1.5B carries this)
+    //   2. generation_config.eos_token_id (dots.ocr's [151643, 151673]
+    //      lives only here per R5 — the quantiser now packs this sibling
+    //      JSON into HFQ metadata so this fallback is reachable)
+    //   3. Default [151645] (ChatML `<|im_end|>`)
+    let parse_eos = |val: &serde_json::Value| -> Vec<u32> {
+        match val {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .filter_map(|e| e.as_u64().map(|n| n as u32))
+                .collect(),
+            serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+            _ => Vec::new(),
+        }
     };
+    let mut eos_token_ids: Vec<u32> = tc.get("eos_token_id")
+        .map(parse_eos)
+        .unwrap_or_default();
+    if eos_token_ids.is_empty() {
+        if let Some(gc_eos) = meta.get("generation_config").and_then(|gc| gc.get("eos_token_id")) {
+            eos_token_ids = parse_eos(gc_eos);
+        }
+    }
     let eos_token_ids = if eos_token_ids.is_empty() {
         vec![151645]
     } else {
@@ -311,7 +328,7 @@ fn load_embed_tokens(
 /// the host before upload; the tied-lm_head path here must do the
 /// same. Uploading raw F16 bytes while tagging `gpu_dtype = F32`
 /// produces a corrupted matmul (kernel reads F16 bytes as F32 values).
-/// See R4 in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` §6 for the catch history.
+/// See R4 in `docs/plans/dots-ocr-devlog.md` §7 for the catch history.
 ///
 /// TODO(transformer-extraction): the tied-embedding re-upload and the
 /// DType↔EmbeddingFormat mapping below are cross-arch primitives that
@@ -362,6 +379,7 @@ fn load_lm_head(
             m: cfg.vocab_size,
             k: cfg.hidden_size,
             row_stride: 0,
+            paro: None,
             awq_scale: None,
         };
         Ok((wt, true))
@@ -429,6 +447,15 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
         2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
         qt => panic!("qwen2: expected F16/F32 for norm {name}, got qt={qt}"),
     };
+    // Harmonised with `hipfire-arch-dots-ocr::dots_ocr::load_norm_weight_raw`.
+    // Catches a manifest-shape vs caller-arg mismatch (e.g. norm tensor on
+    // disk is `[hidden_size]` but caller passed `head_dim`) at upload
+    // time rather than letting a wrong-shape GpuTensor cascade through
+    // the forward pass.
+    assert_eq!(
+        f32_data.len(), n,
+        "qwen2: norm {name} has {} elements, expected {n}", f32_data.len(),
+    );
     gpu.upload_f32(&f32_data, &[n])
 }
 
@@ -471,11 +498,11 @@ fn load_weight_tensor(
     match info.quant_type {
         6 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         7 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         3 => {
             // Q8F16 (= GGML Q8_0 layout): [F16 scale ‖ 32× INT8]. The fused
@@ -485,11 +512,11 @@ fn load_weight_tensor(
             // the high-precision sweep (`--format q8`) to discriminate
             // forward-pass correctness from HFQ4 quant noise.
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         1 => {
             let buf = gpu.upload_raw(&data, &[data.len()])?;
-            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, awq_scale: None })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F16, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         qt => panic!("qwen2: unsupported weight quant_type {qt} for {name}. \
                      This loader handles qt ∈ {{1 (F16), 3 (Q8F16), 6 (HFQ4G256), 7 (HFQ4G128)}}. \
@@ -672,6 +699,57 @@ pub fn forward_step(
     state: &mut Qwen2State,
     token: u32,
 ) -> HipResult<()> {
+    let pos = forward_step_prelude(gpu, state)?;
+
+    // Embedding lookup → state.x.
+    let dim = cfg.hidden_size;
+    match weights.embd_format {
+        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+    }
+
+    forward_step_after_x(gpu, weights, cfg, state, pos)
+}
+
+/// Variant of [`forward_step`] that consumes a pre-built F32 embedding row
+/// instead of looking one up from `weights.token_embd`. Used by VLM splice
+/// paths (dots-ocr, qwen2-vl) to insert vision-tower merger outputs at
+/// `<|imgpad|>` positions during prefill.
+///
+/// `embedding` is a host-side slice of exactly `cfg.hidden_size` F32 values
+/// (one row of the merger output). It is uploaded directly into `state.x.buf`,
+/// after which the layer loop runs identically to [`forward_step`].
+pub fn forward_step_with_embed(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    embedding: &[f32],
+) -> HipResult<()> {
+    let dim = cfg.hidden_size;
+    if embedding.len() != dim {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen2: forward_step_with_embed expects {dim} F32s (hidden_size); \
+                 got {} — caller probably sliced the wrong row of merger output",
+                embedding.len(),
+            ),
+        ));
+    }
+    let pos = forward_step_prelude(gpu, state)?;
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(embedding.as_ptr() as *const u8, embedding.len() * 4)
+    };
+    gpu.hip.memcpy_htod(&state.x.buf, bytes)?;
+    forward_step_after_x(gpu, weights, cfg, state, pos)
+}
+
+/// Common prefix: bounds-check, upload pos. Returns the position used.
+fn forward_step_prelude(gpu: &mut Gpu, state: &Qwen2State) -> HipResult<usize> {
     let pos = state.next_pos;
     if pos >= state.max_seq {
         return Err(hip_bridge::HipError::new(
@@ -684,21 +762,21 @@ pub fn forward_step(
             ),
         ));
     }
-
-    // Upload pos to GPU buffer (single i32, used by rope/kv_write/attention).
     let pos_i32 = pos as i32;
     gpu.hip.memcpy_htod(&state.pos_buf, &pos_i32.to_ne_bytes())?;
+    Ok(pos)
+}
 
-    // Embedding lookup → x.
-    let dim = cfg.hidden_size;
-    match weights.embd_format {
-        EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::HFQ4G128 => gpu.embedding_lookup_hfq4g128(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?,
-        EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
-    }
-
+/// Common tail: 28-layer decoder + final RMSNorm + lm_head + bump next_pos.
+/// Assumes `state.x` already holds the embedding for `pos` and `state.pos_buf`
+/// has been uploaded.
+fn forward_step_after_x(
+    gpu: &mut Gpu,
+    weights: &Qwen2Weights,
+    cfg: &Qwen2Config,
+    state: &mut Qwen2State,
+    pos: usize,
+) -> HipResult<()> {
     let n_heads = cfg.num_attention_heads;
     let n_kv_heads = cfg.num_key_value_heads;
     let head_dim = cfg.head_dim;
@@ -930,5 +1008,56 @@ mod tests {
         let cfg = config_from_metadata_json(with_array).expect("array eos should parse");
         assert_eq!(cfg.eos_token_id, 151645);
         assert_eq!(cfg.eos_token_ids, vec![151645, 151643]);
+    }
+
+    #[test]
+    fn eos_falls_back_to_generation_config_when_absent_from_config() {
+        // dots.ocr's real shape: config.json carries NO eos_token_id at
+        // all; the [151643, 151673] array lives only in
+        // generation_config.json. The quantiser-side R5 fix packs
+        // generation_config into HFQ metadata so the parser can find
+        // it. Without this fallback the parser would default to the
+        // ChatML [151645] which never fires on a correct dots.ocr
+        // response (151645 `<|im_end|>` is not in the dots.ocr template).
+        let json = r#"{
+            "config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "intermediate_size": 8960,
+                "vocab_size": 151936
+            },
+            "generation_config": {
+                "eos_token_id": [151643, 151673],
+                "pad_token_id": 151643
+            }
+        }"#;
+        let cfg = config_from_metadata_json(json)
+            .expect("config + generation_config should parse");
+        assert_eq!(cfg.eos_token_id, 151643);
+        assert_eq!(cfg.eos_token_ids, vec![151643, 151673]);
+    }
+
+    #[test]
+    fn eos_in_config_takes_precedence_over_generation_config() {
+        // If config.eos_token_id IS set, it wins — generation_config
+        // is only consulted as a fallback. Guards against a future
+        // quantiser that packs both with conflicting values.
+        let json = r#"{
+            "config": {
+                "hidden_size": 1536,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "intermediate_size": 8960,
+                "vocab_size": 151936,
+                "eos_token_id": 151645
+            },
+            "generation_config": {
+                "eos_token_id": [151643, 151673]
+            }
+        }"#;
+        let cfg = config_from_metadata_json(json).expect("should parse");
+        assert_eq!(cfg.eos_token_id, 151645);
+        assert_eq!(cfg.eos_token_ids, vec![151645]);
     }
 }

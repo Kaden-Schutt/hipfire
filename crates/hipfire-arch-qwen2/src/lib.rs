@@ -52,7 +52,7 @@
 //! for serving-time memory budgets, and prefill batching for
 //! serving-time latency.
 //!
-//! See `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 for the bring-up plan
+//! See `docs/plans/dots-ocr-prd.md` phase 1 for the bring-up plan
 //! (the new R2–R5 risk entries in §6 capture the rev-2 review findings
 //! that drove this revision; the standalone review files were folded
 //! into the plan and then dropped).

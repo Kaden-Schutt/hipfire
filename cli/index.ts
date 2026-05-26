@@ -5,6 +5,7 @@
 //   hipfire run qwen3.5:9b [prompt]  → generate (auto-pulls if needed)
 //   hipfire serve                     → start daemon + HTTP server
 //   hipfire list                      → show local + available models
+//   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
 import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
@@ -2688,6 +2689,15 @@ function findQuantizeBinary(): string | null {
   return candidates.find(p => existsSync(p)) || null;
 }
 
+function findTriAttnValidateBinary(): string | null {
+  const exe = process.platform === "win32" ? ".exe" : "";
+  // Dev: workspace root/target/release/examples/
+  const devCandidates = [resolve(__dirname, `../target/release/examples/triattn_validate${exe}`)];
+  // Installed: ~/.hipfire/bin/ (no examples/ subdir — update copies directly)
+  const installedCandidates = [join(HIPFIRE_DIR, "bin", `triattn_validate${exe}`)];
+  return devCandidates.find(p => existsSync(p)) || installedCandidates.find(p => existsSync(p)) || null;
+}
+
 interface QuantizeOpts {
   formats: string[];                 // one or more of mq4/mq6/q8
   output?: string;                   // explicit path (only valid with single format)
@@ -4509,6 +4519,22 @@ function listConfig(cfg: HipfireConfig): void {
   console.log(`Reset:       hipfire config reset [key]`);
 }
 
+// ─── Shared helpers ─────────────────────────────────────
+
+/** Find a binary in PATH or known extra directories. Returns absolute path or null.**/
+function findDep(binary: string, extraDirs: string[]): string | null {
+  // 1. Already in PATH (use `which` to avoid shell interpolation)
+  const inPath = Bun.spawnSync(["which", binary], { stdout: "pipe", stderr: "pipe" });
+  const found = (inPath.stdout?.toString() ?? "").trim();
+  if (inPath.exitCode === 0 && found) return found;
+  // 2. Distro-specific known locations
+  for (const dir of extraDirs) {
+    const path = join(dir, binary);
+    if (existsSync(path)) return path;
+  }
+  return null;
+}
+
 // ─── Main ───────────────────────────────────────────────
 
 const [cmd, ...rest] = process.argv.slice(2);
@@ -4831,18 +4857,6 @@ switch (cmd) {
     // interactive shell loads those bindirs via profile snippets. We probe
     // well-known locations, augment process.env.PATH with any found dirs,
     // and error fast with an install hint if a required dep is missing.
-    const findDep = (binary: string, extraDirs: string[]): string | null => {
-      // 1. Already in PATH
-      const inPath = Bun.spawnSync(["sh", "-c", `command -v ${binary}`], { stdout: "pipe", stderr: "pipe" });
-      const found = (inPath.stdout?.toString() ?? "").trim();
-      if (inPath.exitCode === 0 && found) return found;
-      // 2. Distro-specific known locations
-      for (const dir of extraDirs) {
-        const path = join(dir, binary);
-        if (existsSync(path)) return path;
-      }
-      return null;
-    };
     const depsNeeded = [
       { name: "git",   dirs: ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"],
         hint: "Install git via your distro's package manager." },
@@ -4971,7 +4985,7 @@ switch (cmd) {
     // Rebuild
     console.error("Rebuilding daemon (this may take a few minutes)...");
     const build = Bun.spawnSync(
-      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "-p", "hipfire-runtime"],
+      [CARGO_BIN, "build", "--release", "--features", "deltanet", "--example", "daemon", "--example", "infer", "--example", "run", "--example", "triattn_validate", "-p", "hipfire-runtime"],
       { cwd: repoDir, stdio: ["inherit", "inherit", "inherit"], env: { ...process.env } }
     );
     if (build.exitCode !== 0) {
@@ -4994,7 +5008,7 @@ switch (cmd) {
     }
     // Recopy binaries
     // Example binaries live under target/release/examples/
-    for (const bin of ["daemon", "infer", "run"]) {
+    for (const bin of ["daemon", "infer", "run", "triattn_validate"]) {
       const src = join(repoDir, `target/release/examples/${bin}${exe}`);
       const dst = join(binDir, `${bin}${exe}`);
       if (existsSync(src)) { copyFileSync(src, dst); }
@@ -5456,6 +5470,182 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
     });
     break;
   }
+  case "sidecar-gen": {
+    const tag = rest[0];
+    if (!tag || tag === "-h" || tag === "--help") {
+      console.error(`Usage: hipfire sidecar-gen <model> [flags]
+
+Generate a TriAttention calibration sidecar (.triattn.bin) for the given model.
+The sidecar enables automatic KV-cache eviction and is required for CASK
+generation on large-context models (e.g. 27B with >16K max_position_embeddings).
+
+The sidecar file is saved next to the model file (same directory as the .mq4/.hf4)
+so the daemon auto-discovers it.
+
+Model:
+  hipfire sidecar-gen qwen3.5:9b              # use a local model by tag
+  hipfire sidecar-gen ~/.hipfire/models/...    # or pass a direct path
+
+Flags:
+  --corpus PATH          Path to a text file for calibration corpus (default: builtin seed prompts)
+  --max-tokens N         Max tokens to process during calibration (default: 4000)
+  --chunk-len N          Chunk length in tokens (default: 256)
+  --gpu-calib            Use GPU kernel triattn_accumulate (faster on MI300X / RDNA3+)
+  --cpu-calib            Force CPU calibration path
+  -o, --output PATH      Output sidecar file path (default: <model>.triattn.bin next to model)
+  --skip-validation      Skip Phase 2 validation — faster for sidecar generation only
+
+Examples:
+  hipfire sidecar-gen qwen3.5:9b
+  hipfire sidecar-gen ./my-model.mq4 --corpus wikipedia.txt --max-tokens 100000
+  hipfire sidecar-gen ~/.hipfire/models/qwen3.6-27b.mq4 -o /tmp/sidecar.bin`);
+      process.exit(tag ? 0 : 1);
+    }
+    let corpusPath: string | undefined;
+    let maxTokens = 4000;
+    let chunkLen = 256;
+    let gpuCalib = true; // GPU calibration is default (Phase 2, 2026-04-28)
+    let output: string | undefined;
+    let skipValidation = false; // sidecar generation doesn't need Phase 2 validation
+    for (let i = 1; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--corpus") {
+        corpusPath = rest[++i];
+        if (!corpusPath) { console.error("--corpus requires a value"); process.exit(1); }
+      } else if (a === "--max-tokens") {
+        maxTokens = parseInt(rest[++i]);
+        if (isNaN(maxTokens) || maxTokens < 1 || maxTokens > 1_000_000) { console.error("--max-tokens must be between 1 and 1,000,000"); process.exit(1); }
+      } else if (a === "--chunk-len") {
+        chunkLen = parseInt(rest[++i]);
+        if (isNaN(chunkLen) || chunkLen < 1 || chunkLen > 16384) { console.error("--chunk-len must be between 1 and 16,384"); process.exit(1); }
+      } else if (a === "--gpu-calib") {
+        gpuCalib = true;
+      } else if (a === "--cpu-calib") {
+        gpuCalib = false;
+      } else if (a === "-o" || a === "--output") {
+        output = rest[++i];
+        if (!output) { console.error("--output requires a value"); process.exit(1); }
+      } else if (a === "--skip-validation") {
+        skipValidation = true;
+      } else {
+        console.error(`Unknown argument: ${a}\nRun 'hipfire sidecar-gen --help' for usage.`);
+        process.exit(1);
+      }
+    }
+
+    // Resolve model — same resolution as other commands (tag → local path).
+    let resolved = findModel(tag);
+    if (!resolved) {
+      console.error(`Model not found: ${tag}`);
+      console.error("Run 'hipfire list' to see available models.");
+      process.exit(1);
+    }
+
+    // Determine output path — default is <model>.triattn.bin next to the model file.
+    const sidecarPath = output ?? `${resolved}.triattn.bin`;
+
+    console.error(`Generating TriAttention calibration sidecar for: ${tag}`);
+    console.error(`  Model:        ${resolved}`);
+    console.error(`  Output:       ${sidecarPath}`);
+    console.error(`  Max tokens:   ${maxTokens}`);
+    console.error(`  Chunk len:    ${chunkLen}`);
+    console.error(`  Calibration:  ${gpuCalib ? "GPU" : "CPU"}`);
+
+    // Find triattn_validate binary — from installed location or fall back to cargo run.
+    const bin = findTriAttnValidateBinary();
+    if (bin) {
+      // Binary is available directly (installed). Run it synchronously.
+      console.error(`  Using: ${bin}`);
+      const args = [resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync([bin, ...args], { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    } else {
+      // No installed binary — fall back to cargo run --example.
+      // This has cold-start overhead from compilation if not already built.
+      // Try the development source first, then ~/.hipfire/src (installed via update).
+      const devSrc = resolve(__dirname, "../crates/hipfire-runtime/examples/triattn_validate.rs");
+      const hipfireSrc = join(HIPFIRE_DIR, "src/crates/hipfire-runtime/examples/triattn_validate.rs");
+      const srcExists = existsSync(devSrc) || existsSync(hipfireSrc);
+
+      if (!srcExists) {
+        console.error("triattn_validate binary not found and source not available.");
+        console.error("  Build: cargo build --release --features deltanet -p hipfire-runtime --example triattn_validate");
+        console.error("  Or update: hipfire update (which builds the example during rebuild)");
+        process.exit(1);
+      }
+
+      // Determine if we should use the dev checkout or the installed source.
+      // Build from the workspace root so Cargo writes the example under
+      // <workspace>/target/release/examples/, matching the binPath below.
+      const workspaceRoot = existsSync(devSrc) ? resolve(__dirname, "..") : join(HIPFIRE_DIR, "src");
+      if (!existsSync(join(workspaceRoot, "Cargo.toml"))) {
+        console.error(`Could not find hipfire workspace root at ${workspaceRoot}`);
+        process.exit(1);
+      }
+      console.error("  Using cargo run --example (cold start — consider running 'hipfire update' to install the binary)");
+
+      // Parse deps for PATH augmentation (same as update command does).
+      // findDep is defined at module level above.
+      const depsNeeded = ["cargo", "hipcc"];
+      const augmentDirs = new Set<string>();
+      for (const dep of depsNeeded) {
+        const extraDirs = dep === "cargo"
+          ? [join(process.env.HOME || "", ".cargo/bin"), "/usr/bin"]
+          : ["/opt/rocm/bin", "/opt/rocm-6.0.0/bin", "/opt/rocm-5.7.0/bin", "/usr/bin"];
+        const p = findDep(dep, extraDirs);
+        if (p) augmentDirs.add(p.substring(0, p.lastIndexOf("/")));
+      }
+      // Also add bun dir for its subtree helpers.
+      const bunPath = findDep("bun", [join(process.env.HOME || "", ".bun/bin"), "/usr/bin"]);
+      if (bunPath) augmentDirs.add(bunPath.substring(0, bunPath.lastIndexOf("/")));
+      if (augmentDirs.size) {
+        const curr = (process.env.PATH || "").split(":").filter(Boolean);
+        const fresh = [...augmentDirs].filter(d => !curr.includes(d));
+        if (fresh.length) process.env.PATH = [...fresh, ...curr].join(":");
+      }
+
+      // Build the example first.
+      console.error("Building triattn_validate...");
+      const build = Bun.spawnSync(
+        ["cargo", "build", "--release", "--features", "deltanet", "-p", "hipfire-runtime", "--example", "triattn_validate"],
+        { cwd: workspaceRoot, stdio: ["inherit", "inherit", "inherit"] },
+      );
+      if (build.exitCode !== 0) {
+        console.error("Failed to build triattn_validate. Check for ROCm/compilation errors above.");
+        process.exit(1);
+      }
+
+      // Run the built example — bin is at workspace_root/target/release/examples/triattn_validate
+      const exe = process.platform === "win32" ? ".exe" : "";
+      const binPath = join(workspaceRoot, `target/release/examples/triattn_validate${exe}`);
+      console.error("  Running triattn_validate...");
+      const args = [binPath, resolved, "--sidecar", sidecarPath, "--max-tokens", String(maxTokens), "--chunk-len", String(chunkLen)];
+      if (corpusPath) args.push("--corpus", corpusPath);
+      if (!gpuCalib) args.push("--cpu-calib");
+      if (skipValidation) args.push("--val-prompt", "");
+      const proc = Bun.spawnSync(args, { stdio: ["inherit", "inherit", "inherit"] });
+      if ((proc.exitCode ?? 1) !== 0) {
+        console.error(`triattn_validate failed (exit ${proc.exitCode})`);
+        process.exit(1);
+      }
+    }
+
+    // Verify the output file exists.
+    if (!existsSync(sidecarPath)) {
+      console.error(`Output file not found: ${sidecarPath}`);
+      process.exit(1);
+    }
+    const sz = (statSync(sidecarPath).size / 1e6).toFixed(1);
+    console.error("\nDone. Sidecar saved:");
+    console.error(`  ${sidecarPath} (${sz} MB)`);
+    break;
+  }
   case "config": {
     // `hipfire config`                                  → global TUI
     // `hipfire config list|get|set|reset [...]`          → global scripting
@@ -5736,6 +5926,7 @@ depending on model size. HF downloads cache at ~/.hipfire/hf-cache/.`);
   diag                  Diagnostics — GPU, VRAM, HIP version, kernels, models
   ps                    Show running hipfire processes (serve, quantize, uploads)
   rm <model>            Delete model
+  sidecar-gen <model>   Generate TriAttention calibration sidecar (.triattn.bin)
   update                Pull latest code, rebuild, update kernels
 
 Models (MQ4 default: FWHT-rotated 4-bit, quality-gated):

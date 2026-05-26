@@ -60,6 +60,8 @@ fn run_kernel(
         "mmq8"   => gpu.gemm_hfq3g256_residual_mmq_x8(d_w, d_x, d_y, m, k, n).unwrap(),
         "mmq16"  => gpu.gemm_hfq3g256_residual_mmq_x16(d_w, d_x, d_y, m, k, n).unwrap(),
         "mmq32"  => gpu.gemm_hfq3g256_residual_mmq_x32(d_w, d_x, d_y, m, k, n).unwrap(),
+        "mmq32_y64" => gpu.gemm_hfq3g256_residual_mmq_x32_y64(d_w, d_x, d_y, m, k, n).unwrap(),
+        "mmq32_y32" => gpu.gemm_hfq3g256_residual_mmq_x32_y32(d_w, d_x, d_y, m, k, n).unwrap(),
         _ => unreachable!(),
     };
 }
@@ -99,9 +101,10 @@ fn main() {
     let batches: &[usize] = &[1, 4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128, 240, 512, 1024];
 
     println!("# m={m} k={k}  (times in microseconds)");
-    println!("{:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>10}  {:>10}",
-             "N", "scalar", "dot2", "mmq_x8", "mmq_x16", "mmq_x32", "best", "best/dot2");
-    println!("{}", "-".repeat(90));
+    println!("{:>6}  {:>8}  {:>8}  {:>8}  {:>8}  {:>11}  {:>11}  {:>10}  {:>10}  {:>10}",
+             "N", "scalar", "dot2", "mmq_x16", "mmq_x32", "mmq_x32_y64", "mmq_x32_y32",
+             "best", "y64/y128", "y32/y128");
+    println!("{}", "-".repeat(125));
 
     for &n in batches {
         let x = synth_x(n, k, 17);
@@ -112,34 +115,116 @@ fn main() {
 
         let t_scal  = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "scalar", iters);
         let t_dot2  = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "dot2",   iters);
-        let t_mmq8  = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq8",   iters);
         let t_mmq16 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq16",  iters);
         let t_mmq32 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32",  iters);
+        let t_mmq32_y64 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32_y64", iters);
+        let t_mmq32_y32 = time_one(&mut gpu, &d_w, &d_x, &d_y, m, k, n, "mmq32_y32", iters);
 
         let methods = [
             ("scalar", t_scal),
             ("dot2",   t_dot2),
-            ("mmq8",   t_mmq8),
             ("mmq16",  t_mmq16),
             ("mmq32",  t_mmq32),
+            ("mmq32_y64", t_mmq32_y64),
+            ("mmq32_y32", t_mmq32_y32),
         ];
-        let (best_name, best_t) = methods.iter()
+        let (best_name, _best_t) = methods.iter()
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
             .copied().unwrap();
-        let speedup = t_dot2 / best_t;
+        let r64 = t_mmq32_y64 / t_mmq32;
+        let r32 = t_mmq32_y32 / t_mmq32;
 
-        println!("{:>6}  {:>8.1}  {:>8.1}  {:>8.1}  {:>8.1}  {:>8.1}  {:>10}  {:>9.2}x",
+        println!("{:>6}  {:>8.1}  {:>8.1}  {:>8.1}  {:>8.1}  {:>11.1}  {:>11.1}  {:>10}  {:>9.3}x  {:>9.3}x",
                  n,
                  t_scal * 1e6,
                  t_dot2 * 1e6,
-                 t_mmq8 * 1e6,
                  t_mmq16 * 1e6,
                  t_mmq32 * 1e6,
+                 t_mmq32_y64 * 1e6,
+                 t_mmq32_y32 * 1e6,
                  best_name,
-                 speedup);
+                 r64,
+                 r32);
 
         gpu.free_tensor(d_x).unwrap();
         gpu.free_tensor(d_y).unwrap();
     }
     gpu.free_tensor(d_w).unwrap();
+
+    // ─── Gate_up sweep: y128 vs y64 across batch sizes ───────────────────
+    // The daemon-level test at N=240 showed gate_up y64 regresses (-4%) but
+    // the residual sweep showed y64 wins more at moderate N (128-512) than
+    // very large N (1024 tied). Need to find if there's any gate_up batch
+    // size where y64 wins.
+    eprintln!("\n=== gate_up sweep: y128 vs y64 ===");
+    let weight_bytes_gu = synth_hfq3_bytes(m, k, 43);
+    let d_w_gate = gpu.upload_raw(&weight_bytes_gu, &[weight_bytes_gu.len()]).unwrap();
+    let weight_bytes_gu2 = synth_hfq3_bytes(m, k, 44);
+    let d_w_up = gpu.upload_raw(&weight_bytes_gu2, &[weight_bytes_gu2.len()]).unwrap();
+
+    println!("# gate_up: m={m}+{m}, k={k}");
+    println!("{:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+             "N", "y128_us", "y96_us", "y64_us", "y96/y128", "y64/y128");
+    println!("{}", "-".repeat(70));
+
+    for &n in &[64usize, 96, 128, 192, 240, 384, 512, 768, 1024] {
+        let x = synth_x(n, k, 17);
+        let d_x = gpu.upload_f32(&x, &[n * k]).unwrap();
+        let d_yg = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+        let d_yu = gpu.alloc_tensor(&[n * m], DType::F32).unwrap();
+
+        let iters = if n <= 64 { 50 } else if n <= 256 { 20 } else { 10 };
+
+        // Warmup
+        for _ in 0..3 {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y96(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y128 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y96(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y96 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_gate_up_hfq3g256_mmq_x32_y64(
+                &d_w_gate, &d_w_up, &d_x, &d_yg, &d_yu, m, m, k, n,
+            ).unwrap();
+        }
+        let _ = gpu.download_f32(&d_yg).unwrap();
+        let t_y64 = t0.elapsed().as_secs_f64() / iters as f64;
+
+        let r96 = t_y96 / t_y128;
+        let r64 = t_y64 / t_y128;
+        println!("{:>6}  {:>10.1}  {:>10.1}  {:>10.1}  {:>10.3}  {:>10.3}",
+                 n, t_y128 * 1e6, t_y96 * 1e6, t_y64 * 1e6, r96, r64);
+
+        gpu.free_tensor(d_x).unwrap();
+        gpu.free_tensor(d_yg).unwrap();
+        gpu.free_tensor(d_yu).unwrap();
+    }
+    gpu.free_tensor(d_w_gate).unwrap();
+    gpu.free_tensor(d_w_up).unwrap();
 }

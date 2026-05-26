@@ -11,8 +11,8 @@ file ids it actually loads.
 | 1 | plain Qwen3 / Qwen2 | `hipfire-arch-llama` | covered by llama's `config_from_hfq` branch |
 | 5 | Qwen3.5 dense | `hipfire-arch-qwen35` | hybrid DeltaNet + dense FFN |
 | 6 | Qwen3.5 / 3.6 MoE / A3B | `hipfire-arch-qwen35` | MoE expert routing |
-| 7 | Qwen2 dense (standalone) | `hipfire-arch-qwen2` | rev 0 skeleton; full bring-up in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 1 |
-| 8 | Qwen2-VL family (dots.ocr) | `hipfire-arch-dots-ocr` | reserved; bring-up in `docs/plans/qwen_2.0_vlm_plus_dots_ocr.md` phase 2-3 |
+| 7 | Qwen2 dense (standalone) | `hipfire-arch-qwen2` | rev 0 skeleton; full bring-up in `docs/plans/dots-ocr-prd.md` phase 1 |
+| 8 | Qwen2-VL family (dots.ocr) | `hipfire-arch-dots-ocr` | vision tower + Strategy A E2E OCR validated 2026-05-21; daemon plumbing pending in `docs/plans/dots-ocr-prd.md` phase 3 |
 | 9 | DeepSeek V4 Flash | `hipfire-arch-deepseek4` | Hyper-Connections, compressed-KV indexer, tail-only RoPE, raw SWA; optional `mtp.0.*` MTP layer. |
 | 0xFF | toy / template | `hipfire-arch-toy` | never shipped; daemon refuses to dispatch |
 
