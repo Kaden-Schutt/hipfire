@@ -28633,6 +28633,17 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32 is gfx11/RDNA3-only; \
+                     arch={} lacks has_wmma_w32. Use attention_causal_batched or add a gfx12 \
+                     _w32_gfx12 sibling before routing this path.",
+                    self.arch
+                ),
+            ));
+        }
         assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: q must be F32");
         assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: k must be F16");
         assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32: v must be F16");

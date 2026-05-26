@@ -13,6 +13,13 @@ fn lcg(seed: u32, n: usize) -> Vec<f32> {
 fn main() {
     let b: usize = std::env::args().nth(1).and_then(|s|s.parse().ok()).unwrap_or(128); let nh = 12; let nkv = 2; let hd = 128;
     let mut gpu = Gpu::init().unwrap();
+    if !gpu.arch_caps.has_wmma_w32() {
+        println!(
+            "SKIP causal WMMA parity: {} lacks gfx11 has_wmma_w32; production should use attention_causal_batched or a gfx12 sibling",
+            gpu.arch
+        );
+        return;
+    }
     let q = gpu.upload_f32(&lcg(1, b*nh*hd), &[b*nh*hd]).unwrap();
     let k = gpu.upload_f32(&lcg(2, b*nkv*hd), &[b*nkv*hd]).unwrap();
     let v = gpu.upload_f32(&lcg(3, b*nkv*hd), &[b*nkv*hd]).unwrap();
