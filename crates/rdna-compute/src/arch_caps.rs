@@ -129,8 +129,10 @@ impl ArchCaps {
 
         // Env-gated capabilities
         let has_hfq3_dp4a  = flags.hfq3_dp4a.unwrap_or(false) && has_hfq3_sdot4;
-        let has_hfq3_mmq   = flags.hfq3_mmq.unwrap_or(false) && has_hfq3_sdot4;
-        let has_hfq4_mmq   = flags.hfq4_mmq_rdna2.unwrap_or(false) && has_dot2_f32_f16;
+        // Issue #300: production HFQ3/HFQ4 MMQ prefill is default-on for
+        // the supported RDNA allowlists; env flags remain escape hatches.
+        let has_hfq3_mmq   = flags.hfq3_mmq.unwrap_or(true) && has_hfq3_sdot4;
+        let has_hfq4_mmq   = flags.hfq4_mmq_rdna2.unwrap_or(true) && has_dot2_f32_f16;
         let has_cdna3_lds_gemv = flags.gfx942_lds_gemv.unwrap_or(false);
 
         // Tuning parameters

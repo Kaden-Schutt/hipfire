@@ -8247,7 +8247,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1.
+        // Phase 3 MMQ (auto-tile-selecting). Default-on for gfx10 sdot4 archs
+        // (issue #300 MQ3 gate removal; escape hatch HIPFIRE_HFQ3_MMQ=0).
         // Auto-selector falls back to dot2 at small batch. Layer-gate
         // (HIPFIRE_HFQ3_MMQ_LAYER_{MIN,MAX}) is a no-op when unset; supports
         // per-layer KLD attribution sweeps (#302).
@@ -8842,8 +8843,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 }
             }
             // HFQ4 wave32 MMQ RDNA2 path (issue #299 Phase 2). Routes
-            // ahead of dot2/wmma fallbacks when HIPFIRE_HFQ4_MMQ_RDNA2=1.
-            // All q_m/k_m/v_m for Qwen3.5 family are MMQ_Y(128)-aligned.
+            // ahead of dot2/wmma fallbacks; default-on for the allowlist
+            // arch set (issue #300 gate removal, escape hatch
+            // HIPFIRE_HFQ4_MMQ_RDNA2=0). All q_m/k_m/v_m for the Qwen3.5
+            // family are MMQ_Y(128)-aligned.
             if self.arch_caps.has_hfq4_mmq() && q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0 {
                 return self.gemm_qkv_hfq4g256_mmq(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
@@ -8946,8 +8949,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 experimental: MMQ family (auto-tile-selecting). Fires only
-        // when HIPFIRE_HFQ3_MMQ=1 AND q_m/k_m/v_m are MMQ_Y-aligned. The
+        // Phase 3 MMQ family (auto-tile-selecting). Default-on for gfx10
+        // sdot4 archs (issue #300, escape hatch HIPFIRE_HFQ3_MMQ=0) when
+        // q_m/k_m/v_m are MMQ_Y-aligned. The
         // auto-selector itself falls back to dot2 at batch ≤ 12, so it's
         // safe at any batch_size. Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
@@ -9723,9 +9727,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 MMQ (auto-tile-selecting). Fires only when HIPFIRE_HFQ3_MMQ=1
-        // AND gate_m/up_m are MMQ_Y-aligned. Auto-selector falls back to dot2
-        // at small batch. Layer-gate is a no-op when unset (#302).
+        // Phase 3 MMQ (auto-tile-selecting). Default-on for the supported
+        // allowlist unless HIPFIRE_HFQ3_MMQ=0, and gate_m/up_m must be
+        // MMQ_Y-aligned. Auto-selector falls back to dot2 at small batch.
+        // Layer-gate is a no-op when unset (#302).
         if batch_size > 1 && self.arch_caps.has_hfq3_mmq()
             && self.flags.hfq3_mmq_layer_gate_pass()
             && gate_m % 128 == 0 && up_m % 128 == 0
@@ -10011,7 +10016,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ///   13 ≤ batch ≤ 127 → mmq_x=16 (best across this whole range,
     ///                       within ~5% of mmq_x=32 even at N=96)
     ///   batch ≥ 128      → mmq_x=32 (b128 LDS path pulls ahead +4-10%)
-    /// Gated by `HIPFIRE_HFQ3_MMQ=1`. mmq_x=8 is never best in the
+    /// Default-on on the supported allowlist unless `HIPFIRE_HFQ3_MMQ=0`.
+    /// mmq_x=8 is never best in the
     /// sweep (lost to scalar/dot2 at small N, lost to mmq_x=16 at large
     /// N) so it's not in the auto-selector — kept available as
     /// `gemm_hfq3g256_residual_mmq_x8` for further experimentation.
@@ -10205,7 +10211,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     // small N. Same gate boundaries as the residual family from the
     // bench_hfq3_mmq_sweep microbench.
 
-    /// HFQ3 qkv MMQ auto-selector. Gated by `HIPFIRE_HFQ3_MMQ=1`.
+    /// HFQ3 qkv MMQ auto-selector. Default-on unless `HIPFIRE_HFQ3_MMQ=0`.
     /// CALLER INVARIANT: q_m, k_m, v_m must each be multiples of 128.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkv_hfq3g256_mmq(
@@ -10374,7 +10380,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
     // ── HFQ3 gate_up MMQ family — 2-way fused ─────────────────────────────
 
-    /// HFQ3 gate_up MMQ auto-selector. Gated by `HIPFIRE_HFQ3_MMQ=1`.
+    /// HFQ3 gate_up MMQ auto-selector. Default-on unless `HIPFIRE_HFQ3_MMQ=0`.
     /// CALLER INVARIANT: gate_m and up_m must each be multiples of 128.
     pub fn gemm_gate_up_hfq3g256_mmq(
         &mut self,
@@ -10585,8 +10591,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
     // ── HFQ3 qkvza MMQ family — 4-way fused LinearAttention preamble ─────
 
-    /// HFQ3 qkvza MMQ auto-selector (wqkv + wz + w_beta + w_alpha). Gated
-    /// by `HIPFIRE_HFQ3_MMQ=1`. CALLER INVARIANT: qkv_m, z_m, beta_m,
+    /// HFQ3 qkvza MMQ auto-selector (wqkv + wz + w_beta + w_alpha). Default-on
+    /// unless `HIPFIRE_HFQ3_MMQ=0`. CALLER INVARIANT: qkv_m, z_m, beta_m,
     /// alpha_m must each be multiples of 128.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkvza_hfq3g256_mmq(
@@ -11257,7 +11263,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
     /// Wave32 MMQ residual kernel for HFQ4 on RDNA2+ — Phase 3 side-win probe.
     /// Same topology as the HFQ3 sibling; differs only in 4-bit nibble unpack
-    /// (vs 3-bit trit). Gated by `HIPFIRE_HFQ4_MMQ_RDNA2=1`.
+    /// (vs 3-bit trit). Default-on unless `HIPFIRE_HFQ4_MMQ_RDNA2=0`.
     pub fn gemm_hfq4g256_residual_mmq_rdna2(
         &mut self,
         a_raw: &GpuTensor,
@@ -16564,10 +16570,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
         }
 
-        // Phase 3 experimental: HFQ4 wave32 MMQ on RDNA2+ if
-        // HIPFIRE_HFQ4_MMQ_RDNA2=1. Side-win probe — tests whether HFQ4's
-        // cheaper 4-bit nibble unpack lets MMQ beat the fp16 fallback. Env
-        // gate is OnceLock-cached. Default off.
+        // HFQ4 wave32 MMQ residual on RDNA2+. Default-on for the allowlist
+        // arch set (issue #300 gate removal — +210% prefill on gfx1031 4B
+        // MQ4 pp128, KLD-neutral; escape hatch HIPFIRE_HFQ4_MMQ_RDNA2=0).
+        // HFQ4's cheaper 4-bit nibble unpack lets MMQ beat the fp16
+        // fallback. Env gate is OnceLock-cached.
         //
         // Issue #299 follow-up: route through the tile-size auto-selector
         // so narrow-batch calls pick mmq_x=16 and long-prefill picks
@@ -16729,10 +16736,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Phase 3 experimental: wave32 MMQ if HIPFIRE_HFQ3_MMQ=1. Env gate is
-        // OnceLock-cached so the env read is one-shot per process; the arch
-        // match is a handful of cycles per dispatch call (not in any inner
-        // loop). Default off. Layer-gate is a no-op when unset (#302).
+        // Phase 3 experimental: wave32 MMQ is default-on for the supported
+        // allowlist unless HIPFIRE_HFQ3_MMQ=0. Layer-gate is a no-op when
+        // unset (#302).
         if batch_size > 1 && self.arch_caps.has_hfq3_mmq() && self.flags.hfq3_mmq_layer_gate_pass() {
             return self.gemm_hfq3g256_residual_mmq(a_raw, x, y, m, k, batch_size);
         }
