@@ -1800,6 +1800,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             conversation_tokens: Vec::new(),
             model_path: path.to_string(),
             dflash: None,
+            mtp: None,
             chat_template,
         });
     }
@@ -3570,7 +3571,7 @@ fn generate_mtp(
     // N-gram attractor guard (same detector as the AR path). MTP has a
     // documented attractor history (mtp_bug.md); without this a degenerate
     // loop in production would run to max_tokens uncaught.
-    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_env();
+    let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     // Stream the seed/first token. It is the genuine first output token (the
     // input seed to the first spec_step, which only commits *subsequent*
