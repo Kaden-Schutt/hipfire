@@ -154,9 +154,107 @@ If pursued, must A/B it against the current wave64 with rocprofv2 proving
 MemUnitBusy drops AND wall-time improves despite the occupancy hit.
 The cheap probe (1 counter pass) saved the speculative rewrite.
 
+### 6. Out-of-box thinking: chunk-size sweep rules out scheduling levers
+
+profile_prefill_qwen35 showed attention = 832 calls = 16 FA layers × 52
+chunks of 256 (prefill chunks the batch at 256). Tested whether bigger
+chunks help (amortize launch/restream overhead). Chunk-size (N) sweep,
+tile_batched, CTX=16000:
+
+| N (chunk) | wall | wall/query |
+|---|---|---|
+| 64 | 18.68 | 0.292 |
+| 256 | 75.13 | 0.293 |
+| 512 | 149.35 | 0.292 |
+| 1024 | 294.96 | 0.288 |
+
+**wall/query is FLAT (~0.29 ms) — bigger chunks do NOTHING.** No
+launch/fragmentation overhead to recover; cost is purely
+queries × KV-streamed, each query does independent O(ctx) work. This
+rules out the "bigger prefill chunks" lever.
+
+The only remaining levers reduce one of the two factors or cheapen the
+per-element work:
+- **dot8 (v_dot8_i32_i4): 2× dot4 throughput** (85 vs 44 TOPS measured).
+  The Q·K SCORE pass is precision-tolerant (feeds softmax, not output) —
+  pack K to 4-bit, dot8 the score; keep V at Q8 for the output-bearing
+  accumulation. Attacks the VALU side (tile_batched is 92% VALUBusy).
+  Highest-confidence kernel lever. NIAH + coherence gate the 4-bit K.
+- **sparse/windowed prefill attention**: reduce the KV-streamed factor
+  (each query attends a window + sinks, or reuse PFlash's kept-mask).
+  Biggest algorithmic win, changes the math → highest correctness risk.
+
+### 7. Sparse/windowed prefill — investigated; NOT free for Qwen3.6
+
+Checked existing sparse-attention precedent before designing:
+- **hipfire has NO sparse/windowed/SWA attention kernel.** The
+  batched-masked kernel's `tree_bias`/`block_start`/`block_cols` is a
+  generic additive-bias mask hook (DDTree spec-decode) — a reusable
+  insertion point for a window mask, but no windowing exists today.
+- **llama.cpp** (/home/kread/git/llama.cpp): gfx906 is GCN5 — neither
+  RDNA4 (WMMA) nor CDNA/MI100+ (MFMA), so it falls through to the
+  generic `fattn-tile` path (same tiled online-softmax shape we built —
+  independent validation). Gotcha noted there: "ROCm compiler cannot
+  handle templating in __launch_bounds__".
+- **Key architectural finding (llama-kv-cache-iswa.cpp):** SWA is a
+  per-layer MODEL property (`hparams.is_swa(il)`), implemented as a
+  physically SMALLER KV cache (`size_swa = n_swa + n_ubatch`) for layers
+  the model was TRAINED with sliding-window. It reduces real
+  compute/memory (O(N·n_swa)), not just masking. **Qwen3.6-27B is NOT an
+  SWA model** — its full-attention layers are trained to see the whole
+  context. Forcing a window on it is the "changes the math" risk that
+  drops mid-context facts → NIAH would fail. llama.cpp never windows
+  non-SWA models. So blind windowing is OFF the table for Qwen3.6.
+
+**Content-aware sparsity (PFlash keep-ratio) is the safe analogue** — it
+LEARNS which tokens matter (vs a blind window), already needle-validated.
+PFlash also already DENSIFIES: emit_compressed gathers kept tokens
+contiguously + reindexes positions 0..kept, so the target does a dense
+O(kept²) prefill. Lowering keep_ratio cuts the dominant quadratic term
+(attention 80%, ~quadratic in kept) harder than any kernel constant —
+sweep in progress.
+
+### Levers summary (data-driven)
+
+| lever | attacks | risk | who benefits |
+|---|---|---|---|
+| wave64 dp4a (DONE, 1.5×) | per-elem VALU | low (NIAH✓) | all Q8 long-ctx, incl. PFlash-OPT-OUT |
+| dot8 4-bit-K score | per-elem VALU (2×) | med (4-bit argmax) | all Q8 long-ctx |
+| PFlash keep_ratio↓ | kept² (quadratic) | low (content-aware) | PFlash users only |
+| blind windowing | KV-length | HIGH (non-SWA model) | — ruled out for Qwen3.6 |
+| LDS batch-stage | mem (L2 78%) | uncertain | — not built |
+
+**Both kernel AND keep-ratio are worth it** — orthogonal, and the kernel
+also helps users who opt out of PFlash (full O(N²) raw long-ctx). dot8 is
+the next kernel lever (VALU-bound, 2× ISA); keep-ratio is the next config
+lever (quadratic, safe). Not either/or.
+
+### 8. keep-ratio sweep — the biggest PFlash-user lever (quadratic, safe-ish)
+
+9B target + 0.8b drafter (fwht3), 64k NIAH fixture (43296 src tokens):
+
+| keep_ratio | kept | needle | est. attn cost (~quadratic) |
+|---|---|---|---|
+| 0.30 (default) | 13024 | PASS | 1.0× |
+| 0.15 | 6496 | PASS | ~0.30× |
+| 0.10 | 4384 | PASS | ~0.18× |
+
+**All three recover the needle.** keep 0.30→0.15 ≈ **3× prefill speedup**,
+needle preserved — bigger & safer than any kernel constant, and it's a
+config knob (HIPFIRE_PREFILL_KEEP_RATIO / per-model prefill_keep_ratio).
+CAVEAT: single-needle NIAH is a weak quality probe — lower keep risks
+subtler multi-fact/reasoning loss a needle won't catch. 0.15 is a
+PROMISING default to validate with broader quality tests (multi-needle,
+real tasks); do NOT ship 0.10 on one needle. The 0.10 PASS is encouraging
+headroom, not a certification.
+
 ### Next
 
 - NIAH-gate wave64 at long ctx (DONE — PASS), committed 8c48c089.
+- keep-ratio sweep (DONE — 0.15 PASS, ~3× est.). Validate 0.15 with
+  multi-needle + real-task quality before flipping the default.
+- dot8 4-bit-K score pass (kernel lever, helps PFlash-opt-out too) — the
+  remaining kernel-side VALU win for the raw long-ctx path.
 - Next ceiling is MEMORY (91% MemUnitBusy). Per the gfx906 KV-read study
   (skyne98): HSD layout (we're already HSD-ish) + x4 (dwordx4/128-bit)
   vectorized K/V loads ≈ 7% mem win. The wave64 kernel reads 4 i8 + fp16
