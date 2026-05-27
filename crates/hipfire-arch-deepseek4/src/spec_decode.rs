@@ -31,6 +31,7 @@
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward::{self};
+use crate::grammar;
 use rdna_compute::Gpu;
 
 /// One acceptance window of speculative decoding.
@@ -45,6 +46,18 @@ pub struct SpecStepResult {
     pub n_accepted: usize,
     /// How many draft tokens were proposed (= K).
     pub n_proposed: usize,
+}
+
+/// Caller-owned grammar state for tool-call constrained speculative decode.
+///
+/// The daemon owns the tokenizer/decoded-vocab cache and DSML matcher. Passing
+/// them here lets the MTP draft path and the verifier path apply the same
+/// structural mask used by plain DeepSeek4 decoding, without making this module
+/// depend on the daemon's request machinery.
+pub struct SpecGrammar<'a> {
+    pub matcher: &'a mut grammar::Matcher,
+    pub decoded_vocab: &'a [String],
+    pub mask: &'a mut Vec<bool>,
 }
 
 /// Run one speculative-decode acceptance window.
@@ -87,6 +100,40 @@ pub fn speculative_decode_step_with_pbs(
         last_position,
         last_hidden,
         k,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn speculative_decode_step_with_pbs_grammar(
+    cfg: &DeepseekV4Config,
+    weights: &DeepseekV4Weights,
+    state: &mut DeepseekV4State,
+    gpu: &mut Gpu,
+    pbs: &forward::PrefillBatchScratch,
+    last_token: u32,
+    last_position: u32,
+    last_hidden: Option<&rdna_compute::GpuTensor>,
+    k: usize,
+    matcher: &mut grammar::Matcher,
+    decoded_vocab: &[String],
+    grammar_mask: &mut Vec<bool>,
+) -> Result<SpecStepResult, String> {
+    speculative_decode_impl(
+        cfg,
+        weights,
+        state,
+        gpu,
+        Some(pbs),
+        last_token,
+        last_position,
+        last_hidden,
+        k,
+        Some(SpecGrammar {
+            matcher,
+            decoded_vocab,
+            mask: grammar_mask,
+        }),
     )
 }
 
@@ -111,6 +158,7 @@ pub fn speculative_decode_step(
         last_position,
         last_hidden,
         k,
+        None,
     )
 }
 
@@ -125,6 +173,7 @@ fn speculative_decode_impl(
     last_position: u32,
     last_hidden: Option<&rdna_compute::GpuTensor>,
     k: usize,
+    mut grammar: Option<SpecGrammar<'_>>,
 ) -> Result<SpecStepResult, String> {
     if k == 0 {
         return Err("speculative_decode_step: k must be > 0".to_string());
@@ -177,6 +226,7 @@ fn speculative_decode_impl(
     // and doesn't touch state.n_tokens — verified.)
     let initial_n_tokens = state.n_tokens;
     let mut draft_tokens: Vec<u32> = Vec::with_capacity(k);
+    let mut draft_matcher = grammar.as_ref().map(|g| (*g.matcher).clone());
     for step in 0..k {
         let next_token = if step == 0 {
             last_token
@@ -212,9 +262,16 @@ fn speculative_decode_impl(
             })? as *const _
         };
         let hidden: &rdna_compute::GpuTensor = unsafe { &*hidden_ptr };
-        let logits = forward::mtp_forward(cfg, weights, state, gpu, hidden, next_token, position)?;
+        let mut logits =
+            forward::mtp_forward(cfg, weights, state, gpu, hidden, next_token, position)?;
+        if let (Some(g), Some(matcher)) = (grammar.as_mut(), draft_matcher.as_ref()) {
+            apply_grammar_mask(matcher, g.decoded_vocab, g.mask, &mut logits);
+        }
         let argmax = logits_argmax(&logits) as u32;
         draft_tokens.push(argmax);
+        if let (Some(g), Some(matcher)) = (grammar.as_ref(), draft_matcher.as_mut()) {
+            advance_matcher_token(matcher, g.decoded_vocab, argmax);
+        }
     }
 
     // ── 3. Single B=K main verify pass ────────────────────────────────
@@ -260,23 +317,45 @@ fn speculative_decode_impl(
 
     // ── 4. Per-position top-1 from the verifier ───────────────────────
     let all_logits = forward::final_norm_and_head_all_batched(cfg, weights, state, pbs, gpu, k)?;
-    let main_top1: Vec<u32> = all_logits
-        .iter()
-        .map(|logits| logits_argmax(logits) as u32)
-        .collect();
+    let mut verify_matcher = grammar.as_ref().map(|g| (*g.matcher).clone());
 
     // ── 5. Longest matching prefix → acceptance ────────────────────────
-    let n_accept = draft_tokens
-        .iter()
-        .zip(main_top1.iter())
-        .take_while(|(d, m)| **d == **m)
-        .count();
+    //
+    // In tool-call mode the verifier's preferred token is chosen after the
+    // same DSML grammar mask as the non-spec decode path. The verifier matcher
+    // advances only along the actually accepted prefix; at divergence, the
+    // appended verifier token is legal for the grammar state reached by that
+    // prefix.
+    let mut accepted_tokens: Vec<u32> = Vec::with_capacity(k);
+    let mut n_accept = 0usize;
+    for (idx, &draft) in draft_tokens.iter().enumerate() {
+        let main = match (grammar.as_mut(), verify_matcher.as_ref()) {
+            (Some(g), Some(matcher)) => {
+                let mut logits = all_logits[idx].clone();
+                apply_grammar_mask(matcher, g.decoded_vocab, g.mask, &mut logits);
+                logits_argmax(&logits) as u32
+            }
+            _ => logits_argmax(&all_logits[idx]) as u32,
+        };
+        if draft == main {
+            accepted_tokens.push(draft);
+            n_accept += 1;
+            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
+                advance_matcher_token(matcher, g.decoded_vocab, draft);
+            }
+        } else {
+            accepted_tokens.push(main);
+            if let (Some(g), Some(matcher)) = (grammar.as_ref(), verify_matcher.as_mut()) {
+                advance_matcher_token(matcher, g.decoded_vocab, main);
+            }
+            break;
+        }
+    }
 
-    let mut accepted_tokens = draft_tokens[..n_accept].to_vec();
-    if n_accept < k {
-        // Append verifier's preferred token at the divergence point so
-        // generation always moves forward by at least one token.
-        accepted_tokens.push(main_top1[n_accept]);
+    if let Some(g) = grammar.as_mut() {
+        for &tok in &accepted_tokens {
+            advance_matcher_token(g.matcher, g.decoded_vocab, tok);
+        }
     }
 
     // ── 6. Refresh state.mtp_last_hidden from the verify pass ──────────
@@ -350,4 +429,26 @@ pub fn logits_argmax(logits: &[f32]) -> usize {
         }
     }
     best
+}
+
+fn apply_grammar_mask(
+    matcher: &grammar::Matcher,
+    decoded_vocab: &[String],
+    mask: &mut Vec<bool>,
+    logits: &mut [f32],
+) {
+    if matcher.is_free() || decoded_vocab.is_empty() {
+        return;
+    }
+    if mask.len() < decoded_vocab.len() {
+        mask.resize(decoded_vocab.len(), true);
+    }
+    matcher.token_mask(decoded_vocab, mask);
+    grammar::Matcher::apply_mask_to_logits(mask, logits);
+}
+
+fn advance_matcher_token(matcher: &mut grammar::Matcher, decoded_vocab: &[String], token: u32) {
+    if let Some(text) = decoded_vocab.get(token as usize) {
+        matcher.advance(text);
+    }
 }
