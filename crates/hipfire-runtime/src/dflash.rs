@@ -31,7 +31,7 @@ use crate::llama::WeightTensor;
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Max rows per call into `gemm_dispatch` for the MQ4/MQ3 (FWHT-rotated)
+/// Max rows per call into `gemm_dispatch` for the MQ (FWHT-rotated)
 /// path. The activation rotation scratch (`DflashScratch.mq_x_rot`) is
 /// sized to this many rows × `max(inter, q_dim, num_extract * hidden)`,
 /// regardless of context length. Calls with `batch > MQ_X_ROT_CHUNK_ROWS`
@@ -190,9 +190,11 @@ fn hfq_tensor_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: Vec<usize>) -
 ///   1  (F16)      → lifted to F32 on GPU (legacy path).
 ///   2  (F32)      → uploaded as F32.
 ///   13 (MQ4-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
+///   15 (MQ6-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
+///   17 (MQ3-G256) → uploaded raw, kernel dispatch will FWHT-rotate x at use.
 ///
 /// `shape = [m, k]` so m=output_dim and k=input_dim. The HFQ index stores
-/// the unaligned byte length; for MQ4 we skip shape verification (the
+/// the unaligned byte length; for MQ formats we skip shape verification (the
 /// quantized bytes are not a function of m*k alone — group padding can add
 /// up to 255 trailing bytes per row group).
 fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
@@ -237,6 +239,12 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             // the engine; the gemm_hfq4g256 kernel reads it directly.
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        15 => {
+            // MQ6-G256: 200 bytes per 256 weights. Same opaque-buffer pattern
+            // as MQ4/MQ3; dispatch rotates activations and calls HFQ6 GEMM.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ6G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
         17 => {
             // MQ3-G256: 104 bytes per 256 weights. Same opaque-buffer pattern
@@ -287,9 +295,9 @@ impl DflashWeights {
             .chain(layers.iter().flat_map(|l| {
                 [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down].into_iter()
             }))
-            .any(|w| matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ3G256));
+            .any(|w| matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256));
         if has_mq {
-            // The MQ4 dispatch needs the engine's FWHT sign tables uploaded
+            // MQ dispatch needs the engine's FWHT sign tables uploaded
             // (matches `gemv_mq4g256_with_rotate`'s setup).
             gpu.ensure_mq_signs()?;
         }
@@ -587,7 +595,7 @@ impl DflashScratch {
 ///   w.buf [m × k]  weight, format depends on w.gpu_dtype
 ///   y [batch × m]  F32 output
 ///
-/// For MQ4-G256, the kernel needs the input FWHT-rotated. We do that into
+/// For MQ-G256, the kernel needs the input FWHT-rotated. We do that into
 /// `mq_x_rot` (sized to the per-call max in `DflashScratch`), then call the
 /// HFQ4-G256 GEMM kernel against the pre-rotated weights.
 fn gemm_dispatch(
@@ -690,6 +698,32 @@ fn gemm_dispatch(
             }
             chunked
         }
+        DType::MQ6G256 => {
+            // Mirrors the MQ4/MQ3 path: pre-rotate x via FWHT, then dispatch
+            // the HFQ6 batched lm_head WMMA kernel. Chunked symmetrically with
+            // the other MQ formats.
+            let scratch = mq_x_rot.expect("MQ6 dispatch requires mq_x_rot scratch");
+            let max_chunk = (scratch.shape[0] / w.k).max(1);
+            gpu.fp16_x_source_ptr = std::ptr::null_mut();
+            let mut chunked: HipResult<()> = Ok(());
+            let mut row = 0;
+            while row < batch {
+                let n = std::cmp::min(max_chunk, batch - row);
+                let x_chunk = x.sub_offset(row * w.k, n * w.k);
+                let y_chunk = y.sub_offset(row * w.m, n * w.m);
+                let rot_view = scratch.sub_offset(0, n * w.k);
+                if let Err(e) = crate::llama::rotate_x_mq_batched_for(gpu, w, &x_chunk, &rot_view, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                if let Err(e) = gpu.gemm_hfq6g256_batched_lmhead(&w.buf, &rot_view, &y_chunk, w.m, w.k, n) {
+                    chunked = Err(e);
+                    break;
+                }
+                row += n;
+            }
+            chunked
+        }
         other => panic!("dflash gemm_dispatch: unsupported weight dtype {:?}", other),
     };
     if let Some(t) = t0 {
@@ -698,8 +732,10 @@ fn gemm_dispatch(
         let weight_bytes = match w.gpu_dtype {
             DType::F32 => w.m * w.k * 4,
             DType::F16 => w.m * w.k * 2,
-            // HFQ4/MQ4: 136B per group of 256
-            _ => w.m * (w.k / 256).max(1) * 136,
+            DType::MQ3G256 => w.m * (w.k / 256).max(1) * 104,
+            DType::HFQ4G256 | DType::MQ4G256 => w.m * (w.k / 256).max(1) * 136,
+            DType::MQ6G256 => w.m * (w.k / 256).max(1) * 200,
+            _ => w.m * w.k,
         };
         let bytes = weight_bytes + batch * w.k * 4 + batch * w.m * 4 * 2;
         let gbs = (bytes as f64) / (us.max(1) as f64) / 1000.0;
