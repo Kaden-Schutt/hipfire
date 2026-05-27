@@ -665,7 +665,7 @@ fn gemm_dispatch(
             // `ceil(batch / max_chunk)` times for no extra correctness.
             let scratch = mq_x_rot.expect("MQ3 dispatch requires mq_x_rot scratch");
             let max_chunk = (scratch.shape[0] / w.k).max(1);
-            gpu.fp16_x_source_ptr = std::ptr::null_mut();
+            gpu.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             let mut chunked: HipResult<()> = Ok(());
             let mut row = 0;
             while row < batch {

@@ -3135,7 +3135,7 @@ fn moe_ffn_decode_impl(
     } else {
         // Mixed-dtype fallback: four separate `weight_gemv` calls. Each
         // weight_gemv handles its own rotation for MQ4 weights internally
-        // (via `gpu.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
+        // (via `gpu.scratch.mq_x_rot`, a distinct scratch from `s.x_rot_local`),
         // so the externally-computed `x_rot_local` is preserved for the
         // downstream indexed gate_up GEMV when routed_gate_up_mq4 is true.
         weight_gemv(gpu, &ffn.router, x_norm, router_logits)?;
@@ -3190,8 +3190,8 @@ fn moe_ffn_decode_impl(
     if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
         gpu.ensure_mq_signs()?;
         let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
         // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
@@ -3375,8 +3375,8 @@ fn moe_ffn_decode_impl(
                 let up_view   = slice_f32_view(gate_up_buf, mi, mi);
                 if routed_mq4 {
                     let x_rot_alias = GpuTensor {
-                        buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                        shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                        buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                        shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                         dtype: DType::F32,
                     };
                     // F2: AWQ-aware silu_mul+rotate for this expert's down input.

@@ -629,8 +629,8 @@ pub fn weight_gemv(
         DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
@@ -642,8 +642,8 @@ pub fn weight_gemv(
             }
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128t_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
@@ -669,8 +669,8 @@ pub fn weight_gemv(
         DType::MFP4G32 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // Preserve the gfx12 dual-FP8 fast path inside
@@ -689,8 +689,8 @@ pub fn weight_gemv(
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -699,8 +699,8 @@ pub fn weight_gemv(
         DType::MQ4G128 => {
             gpu.ensure_mq_signs_128()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_128_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -709,8 +709,8 @@ pub fn weight_gemv(
         DType::MQ6G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -719,8 +719,8 @@ pub fn weight_gemv(
         DType::MQ3G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -729,8 +729,8 @@ pub fn weight_gemv(
         DType::MQ2G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -739,8 +739,8 @@ pub fn weight_gemv(
         DType::MQ2G256Lloyd => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -749,8 +749,8 @@ pub fn weight_gemv(
         DType::MQ3G256Lloyd => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -759,8 +759,8 @@ pub fn weight_gemv(
         DType::MQ4G256Lloyd => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -787,7 +787,7 @@ pub fn weight_gemv(
             gpu.ensure_paro_scratch(w.k)?;
             // Alias the scratch buffer to avoid borrow conflicts with gpu methods
             let scratch_alias = GpuTensor {
-                buf: unsafe { gpu.paro_x_scratch.as_ref().unwrap().buf.alias() },
+                buf: unsafe { gpu.scratch.paro_x_scratch.as_ref().unwrap().buf.alias() },
                 shape: vec![w.k],
                 dtype: DType::F32,
             };
@@ -1218,8 +1218,8 @@ pub fn weight_gemv_residual(
         DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
@@ -1231,8 +1231,8 @@ pub fn weight_gemv_residual(
             }
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128t_residual_with_prerotate(&w.buf, x, y, &x_rot_alias, w.m, w.k)
@@ -1245,8 +1245,8 @@ pub fn weight_gemv_residual(
             // add_inplace_f32 launch per layer per token vs the generic path.
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing. `w` is the downstream linear that
@@ -1258,8 +1258,8 @@ pub fn weight_gemv_residual(
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing. `w` is the downstream linear that
@@ -1276,8 +1276,8 @@ pub fn weight_gemv_residual(
             // 0003103, 9B MQ3 decode 114 to 141 tok/s).
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing. `w` is the downstream linear that
@@ -1294,8 +1294,8 @@ pub fn weight_gemv_residual(
             // picks the K4 + LDS-codebook chip variant.
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing. `w` is the downstream linear that
@@ -1309,8 +1309,8 @@ pub fn weight_gemv_residual(
             // single-acc fast variant (see kernel header for why single-acc).
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             rotate_x_mq_for(gpu, w, x, &x_rot_alias, w.k)?;
@@ -1354,8 +1354,8 @@ pub fn weight_gemv_swiglu_residual(
         DType::MQ4G256 => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing for the down_proj input stage.
@@ -1371,8 +1371,8 @@ pub fn weight_gemv_swiglu_residual(
             // the four-step generic path.
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing for the down_proj input stage.
@@ -1387,8 +1387,8 @@ pub fn weight_gemv_swiglu_residual(
             // the generic three-step path (silu_mul + rotate + gemv_residual).
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing for the down_proj input stage.
@@ -1401,8 +1401,8 @@ pub fn weight_gemv_swiglu_residual(
             // single-acc fast variant of the residual GEMV.
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
@@ -1413,8 +1413,8 @@ pub fn weight_gemv_swiglu_residual(
             // pattern as MQ3 / MQ4, dispatched against the HFQ6 kernel.
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             // F2: AWQ-aware routing for the down_proj input stage.
@@ -1425,8 +1425,8 @@ pub fn weight_gemv_swiglu_residual(
         DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_PREROTATE").is_some() => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128_swiglu_residual_with_prerotate(
@@ -1445,8 +1445,8 @@ pub fn weight_gemv_swiglu_residual(
         DType::PARO4G128T => {
             gpu.ensure_mq_signs()?;
             let x_rot_alias = GpuTensor {
-                buf: unsafe { gpu.mq_x_rot.as_ref().unwrap().buf.alias() },
-                shape: vec![gpu.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
                 dtype: DType::F32,
             };
             gpu.gemv_paro4g128t_swiglu_residual_with_prerotate(

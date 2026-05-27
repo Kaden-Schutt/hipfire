@@ -291,38 +291,8 @@ pub struct Gpu {
     /// — Phase A is a non-behavioral scaffold.
     pub draft_stream: Option<hip_bridge::Stream>,
     pub verify_stream: Option<hip_bridge::Stream>,
-    /// MagnumQuant FWHT signs (256 floats each) + rotation scratch buffer.
-    pub mq_signs1: Option<GpuTensor>,
-    pub mq_signs2: Option<GpuTensor>,
-    /// MagnumQuant FWHT signs for G128 (128 floats each, seeds 43 and 1043).
-    pub mq_signs1_128: Option<GpuTensor>,
-    pub mq_signs2_128: Option<GpuTensor>,
-    pub mq_x_rot: Option<GpuTensor>,  // scratch for rotated x, sized to max K
-    pub paro_x_scratch: Option<GpuTensor>, // ParoQuant: scratch for rotated activation copy
-    pub mq_x_q8: Option<hip_bridge::DeviceBuffer>,   // INT8 quantized rotated x for dp4a
-    pub mq_x_scales: Option<hip_bridge::DeviceBuffer>, // per-group f32 scales for x quantization
-    /// FP16 scratch buffer for prefill X conversion. Sized to max(batch_size × K) × 2 bytes.
-    fp16_x_scratch: Option<hip_bridge::DeviceBuffer>,
-    fp16_x_scratch_bytes: usize,
-    /// Pointer to the last FP32 source that was converted to fp16_x_scratch.
-    /// If the next GEMM uses the same X, skip the conversion.
-    pub fp16_x_source_ptr: *mut c_void,
-    /// FP8 (E4M3) scratch buffer for the gfx12 FP8-WMMA prefill path.
-    /// Sized to max(batch_size × K) × 1 byte. Cached by src_ptr like
-    /// `fp16_x_scratch`.
-    fp8_x_scratch: Option<hip_bridge::DeviceBuffer>,
-    fp8_x_scratch_bytes: usize,
-    fp8_x_source_ptr: *mut c_void,
-    /// FP8 (E4M3) sibling of `mq_x_rot`. Filled by
-    /// `mq_rotate_x_dual_fp8` so the FP8 decode GEMV can read FP8
-    /// activations without a separate pack launch. Lifetime is tied
-    /// to mq_x_rot; reallocated together.
-    pub mq_x_rot_fp8: Option<hip_bridge::DeviceBuffer>,
-    pub mq_x_rot_fp8_bytes: usize,
-    /// Q8_1/MMQ scratch for prefill activations. Layout matches llama.cpp's
-    /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
-    q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
-    q8_1_mmq_x_scratch_bytes: usize,
+    /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
+    pub scratch: crate::scratch::ScratchState,
 
     // ── MMQ per-weight screening (#87) ──────────────────────────────────
     // When enabled, each weight matrix is screened on first MMQ use: a
@@ -515,24 +485,26 @@ impl Gpu {
             active_stream: None,
             draft_stream: None,
             verify_stream: None,
-            mq_signs1: None,
-            mq_signs2: None,
-            mq_signs1_128: None,
-            mq_signs2_128: None,
-            mq_x_rot: None,
-            paro_x_scratch: None,
-            mq_x_q8: None,
-            mq_x_scales: None,
-            fp16_x_scratch: None,
-            fp16_x_scratch_bytes: 0,
-            fp16_x_source_ptr: std::ptr::null_mut(),
-            fp8_x_scratch: None,
-            fp8_x_scratch_bytes: 0,
-            fp8_x_source_ptr: std::ptr::null_mut(),
-            mq_x_rot_fp8: None,
-            mq_x_rot_fp8_bytes: 0,
-            q8_1_mmq_x_scratch: None,
-            q8_1_mmq_x_scratch_bytes: 0,
+            scratch: crate::scratch::ScratchState {
+                mq_signs1: None,
+                mq_signs2: None,
+                mq_signs1_128: None,
+                mq_signs2_128: None,
+                mq_x_rot: None,
+                mq_x_rot_fp8: None,
+                mq_x_rot_fp8_bytes: 0,
+                mq_x_q8: None,
+                mq_x_scales: None,
+                paro_x_scratch: None,
+                fp16_x_scratch: None,
+                fp16_x_scratch_bytes: 0,
+                fp16_x_source_ptr: std::ptr::null_mut(),
+                fp8_x_scratch: None,
+                fp8_x_scratch_bytes: 0,
+                fp8_x_source_ptr: std::ptr::null_mut(),
+                q8_1_mmq_x_scratch: None,
+                q8_1_mmq_x_scratch_bytes: 0,
+            },
             mmq_screen_cache: HashMap::new(),
             mmq_screen,
             mmq_screen_threshold,
@@ -772,29 +744,20 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.graphs.capture_mode || self.flags.force_blob_path {
-            let mut blob = blob_builder();
-            // Pad tail to 16-byte alignment — some kernel struct layouts that
-            // HIP's loader expects have an implicit final pad to the struct's
-            // alignment. gfx1100 typically doesn't care, but under graph
-            // capture on ROCm 7.x the loader is stricter and unpadded tails
-            // have been observed to cause silent argument corruption.
-            blob.pad_to(16);
-            self.graphs.capture_blobs.push(blob.into_vec());
-            // Re-borrow fields separately to avoid conflicting borrows on self
-            let buf = self.graphs.capture_blobs.last_mut().unwrap();
-            let func = &self.functions[func_name];
-            let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
-            unsafe {
-                self.hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
-            }
-        } else {
-            let func = &self.functions[func_name];
-            let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
-            unsafe {
-                self.hip.launch_kernel(func, grid, block, shared_mem, stream, params)
-            }
-        }
+        crate::scratch::launch_maybe_blob(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            func_name,
+            grid,
+            block,
+            shared_mem,
+            params,
+            blob_builder,
+        )
     }
 
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
@@ -840,72 +803,33 @@ impl Gpu {
 
     /// Compile and load a kernel, caching the result.
     fn ensure_kernel(&mut self, module_name: &str, source: &str, func_name: &str) -> HipResult<()> {
-        if self.functions.contains_key(func_name) {
-            return Ok(());
-        }
-
-        let obj_path = self.compiler.compile(module_name, source)?;
-        let obj_path_str = obj_path.to_str().unwrap().to_string();
-
-        if !self.modules.contains_key(module_name) {
-            let module = self.hip.module_load(&obj_path_str)?;
-            self.modules.insert(module_name.to_string(), module);
-        }
-
-        let module = &self.modules[module_name];
-        let func = self.hip.module_get_function(module, func_name)?;
-        self.functions.insert(func_name.to_string(), func);
-        Ok(())
+        crate::scratch::compile_and_load_kernel(
+            &mut self.compiler,
+            &self.hip,
+            &mut self.modules,
+            &mut self.functions,
+            module_name,
+            source,
+            func_name,
+        )
     }
 
     /// Ensure the FP16 X scratch contains the conversion of `x`. Skips the
     /// convert kernel if `x.buf.as_ptr()` matches the last converted source.
     /// Returns the FP16 device pointer.
     fn ensure_fp16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
-        self.ensure_kernel("convert_f32_to_f16", kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC, "convert_f32_to_f16")?;
-
-        let src_ptr = x.buf.as_ptr();
-        let needed = n_elems * 2;
-
-        // Grow scratch if needed (never shrinks)
-        if self.fp16_x_scratch_bytes < needed {
-            self.fp16_x_scratch = Some(self.hip.malloc(needed)?);
-            self.fp16_x_scratch_bytes = needed;
-            self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
-        }
-
-        // Under graph capture, convert EVERY call: the src/dst pointers are
-        // stable (PrefillBatchScratch + persistent FP16 scratch), but the
-        // DATA at src changes every replay, so the captured convert-node
-        // needs to re-run. The pointer-equality cache would wrongly skip
-        // the node and read stale FP16 on replay. During normal dispatch
-        // the skip is still correct.
-        let must_convert = self.graphs.capture_mode || self.fp16_x_source_ptr != src_ptr;
-        if must_convert {
-            let in_ptr = src_ptr;
-            let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
-            let n_val = n_elems as i32;
-            let mut in_ptr_m = in_ptr;
-            let mut out_ptr_m = out_ptr;
-            let mut n_val_m = n_val;
-            let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr_m as *mut _ as *mut c_void,
-                &mut out_ptr_m as *mut _ as *mut c_void,
-                &mut n_val_m as *mut _ as *mut c_void,
-            ];
-            let grid = ((n_elems + 255) / 256) as u32;
-            self.launch_maybe_blob(
-                "convert_f32_to_f16", [grid, 1, 1], [256, 1, 1], 0, &mut conv_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
-                    b
-                },
-            )?;
-            self.fp16_x_source_ptr = src_ptr;
-        }
-
-        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+        self.scratch.ensure_fp16_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            x,
+            n_elems,
+        )
     }
 
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
@@ -913,103 +837,39 @@ impl Gpu {
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
     /// sibling so back-to-back same-X GEMM dispatches skip reconversion.
     fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
-        self.ensure_kernel("pack_f32_to_fp8_gfx12", kernels::PACK_F32_TO_FP8_GFX12_SRC, "pack_f32_to_fp8_gfx12")?;
-
-        let src_ptr = x.buf.as_ptr();
-        let needed = n_elems; // 1 byte per element
-
-        if self.fp8_x_scratch_bytes < needed {
-            self.fp8_x_scratch = Some(self.hip.malloc(needed)?);
-            self.fp8_x_scratch_bytes = needed;
-            self.fp8_x_source_ptr = std::ptr::null_mut();
-        }
-
-        let must_convert = self.graphs.capture_mode || self.fp8_x_source_ptr != src_ptr;
-        if must_convert {
-            let in_ptr = src_ptr;
-            let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
-            let n_val = n_elems as i32;
-            let mut in_ptr_m = in_ptr;
-            let mut out_ptr_m = out_ptr;
-            let mut n_val_m = n_val;
-            let mut conv_params: Vec<*mut c_void> = vec![
-                &mut in_ptr_m as *mut _ as *mut c_void,
-                &mut out_ptr_m as *mut _ as *mut c_void,
-                &mut n_val_m as *mut _ as *mut c_void,
-            ];
-            // 16 elements per thread, 256 threads per block = 4096 elements/block.
-            let grid = ((n_elems + 4095) / 4096) as u32;
-            self.launch_maybe_blob(
-                "pack_f32_to_fp8_gfx12", [grid, 1, 1], [256, 1, 1], 0, &mut conv_params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(in_ptr); b.push_ptr(out_ptr); b.push_i32(n_val);
-                    b
-                },
-            )?;
-            self.fp8_x_source_ptr = src_ptr;
-        }
-
-        Ok(self.fp8_x_scratch.as_ref().unwrap().as_ptr())
+        self.scratch.ensure_fp8_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            x,
+            n_elems,
+        )
     }
 
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]
     /// so a 128-column batch tile is contiguous for each K tile.
     pub fn ensure_q8_1_mmq_x(&mut self, x: &GpuTensor, batch_size: usize, k: usize) -> HipResult<*mut c_void> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_hfq4g256_residual_mmq",
-            kernels::GEMM_HFQ4G256_RESIDUAL_MMQ_SRC,
-            "quantize_q8_1_mmq_ds4",
-        )?;
-
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
-        if self.q8_1_mmq_x_scratch_bytes < needed {
-            self.q8_1_mmq_x_scratch = Some(self.hip.malloc(needed)?);
-            self.q8_1_mmq_x_scratch_bytes = needed;
-        }
-
-        let src_ptr = x.buf.as_ptr();
-        // Unlike the FP16 helper, the same scratch pointer is reused for many
-        // different hidden states during prefill. Pointer equality is therefore
-        // not a safe freshness test. Higher-level fused MMQ callers quantize
-        // once and reuse the returned pointer across sibling projections.
-        let must_convert = true;
-        if must_convert {
-            let out_ptr = self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr();
-            let mut xp = src_ptr;
-            let mut yp = out_ptr;
-            let mut k_val = k as i32;
-            let mut n_val = batch_size as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut yp as *mut _ as *mut c_void,
-                &mut k_val as *mut _ as *mut c_void,
-                &mut n_val as *mut _ as *mut c_void,
-            ];
-            let grid_x = ((k + 1023) / 1024) as u32;
-            let grid_y = batch_size as u32;
-            self.launch_maybe_blob(
-                "quantize_q8_1_mmq_ds4",
-                [grid_x, grid_y, 1],
-                [256, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(src_ptr);
-                    b.push_ptr(out_ptr);
-                    b.push_i32(k_val);
-                    b.push_i32(n_val);
-                    b
-                },
-            )?;
-        }
-
-        Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+        // bind_thread: skip — delegated to scratch.rs
+        self.scratch.ensure_q8_1_mmq_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            self.device_id,
+            x,
+            batch_size,
+            k,
+        )
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -1972,13 +1832,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
     /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
     pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        if let Some(ref s) = self.paro_x_scratch {
-            if s.buf.size() >= dim * 4 { return Ok(()); }
-        }
-        let buf = self.hip.malloc(dim * 4)?; // F32
-        self.paro_x_scratch = Some(GpuTensor { buf, shape: vec![dim], dtype: DType::F32 });
-        Ok(())
+        // bind_thread: skip — delegated to scratch.rs
+        self.scratch.ensure_paro_scratch(&self.hip, self.device_id, dim)
     }
 
     /// Device-to-device copy.
@@ -3195,8 +3050,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         );
         self.ensure_mq_signs()?;
         let x_rot_up = GpuTensor {
-            buf: unsafe { self.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![self.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+            buf: unsafe { self.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+            shape: vec![self.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
             dtype: DType::F32,
         };
         assert!(
@@ -5405,26 +5260,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
 
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        if self.mq_signs1.is_some() { return Ok(()); }
-        let s1 = gen_fwht_signs(42, 256);
-        let s2 = gen_fwht_signs(1042, 256);
-        let s1b: Vec<u8> = s1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let s1t = self.alloc_tensor(&[256], DType::F32)?;
-        let s2t = self.alloc_tensor(&[256], DType::F32)?;
-        self.hip.memcpy_htod(&s1t.buf, &s1b)?;
-        self.hip.memcpy_htod(&s2t.buf, &s2b)?;
-        // Allocate scratch buffers — 32K elements covers K up to 32768
-        let x_rot = self.alloc_tensor(&[32768], DType::F32)?;
-        let x_q8 = self.hip.malloc(32768)?;  // INT8 buffer for dp4a
-        let x_scales = self.hip.malloc(128 * 4)?; // up to 128 groups × f32
-        self.mq_signs1 = Some(s1t);
-        self.mq_signs2 = Some(s2t);
-        self.mq_x_rot = Some(x_rot);
-        self.mq_x_q8 = Some(x_q8);
-        self.mq_x_scales = Some(x_scales);
-        Ok(())
+        // bind_thread: skip — delegated to scratch.rs
+        self.scratch.ensure_mq_signs(&self.hip, &mut self.pool, self.device_id)
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables for G128 (128 floats each, seeds 43 and 1043).
@@ -5432,27 +5269,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// (`ensure_mq_signs`) normally owns that allocation, but the G128 path must be
     /// self-sufficient so models that carry only MQ4G128 weights still get the scratch buffer.
     pub fn ensure_mq_signs_128(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        if self.mq_signs1_128.is_some() && self.mq_x_rot.is_some() { return Ok(()); }
-        if self.mq_signs1_128.is_none() {
-            let signs1 = gen_fwht_signs(43, 128);
-            let signs2 = gen_fwht_signs(1043, 128);
-            let s1b: Vec<u8> = signs1.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let s1t = self.alloc_tensor(&[128], DType::F32)?;
-            let s2t = self.alloc_tensor(&[128], DType::F32)?;
-            self.hip.memcpy_htod(&s1t.buf, &s1b)?;
-            self.hip.memcpy_htod(&s2t.buf, &s2b)?;
-            self.mq_signs1_128 = Some(s1t);
-            self.mq_signs2_128 = Some(s2t);
-        }
-        // Allocate shared rotation scratch if ensure_mq_signs (G256 path) has not run yet.
-        // 32K elements covers K up to 32768, matching ensure_mq_signs's allocation.
-        if self.mq_x_rot.is_none() {
-            let x_rot = self.alloc_tensor(&[32768], DType::F32)?;
-            self.mq_x_rot = Some(x_rot);
-        }
-        Ok(())
+        // bind_thread: skip — delegated to scratch.rs
+        self.scratch.ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
     }
 
     /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256. Rotates x per group via ds_swizzle,
@@ -5600,8 +5418,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
             "fused_rmsnorm_mq_rotate",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
         let xp = x.buf.as_ptr();
         let wp = weight.buf.as_ptr();
@@ -5679,8 +5497,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
             "fused_rmsnorm_mq_rotate_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
         let xp = x.buf.as_ptr();
         let wp = weight.buf.as_ptr();
@@ -5754,8 +5572,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
             "fused_rmsnorm_mq_rotate_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
         let mut xp = x.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
@@ -5831,8 +5649,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::ROTATE_WITH_RMS_GFX942_SRC,
             "rotate_with_rms_gfx942",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
         // Allocate scratch tensor for rms_out (batch_size f32s).
         let rms_tensor = self.alloc_tensor(&[batch_size], DType::F32)?;
@@ -5941,8 +5759,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_RMSNORM_MQ_ROTATE_SRC,
             "fused_rmsnorm_mq_rotate",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
 
         let mut xp = x.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
@@ -6002,8 +5820,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC,
             "fused_silu_mul_mq_rotate",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
         let gp = gate.buf.as_ptr();
         let up_p = up.buf.as_ptr();
@@ -6054,8 +5872,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_SILU_MUL_MQ_ROTATE_SRC,
             "fused_silu_mul_mq_rotate",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
         let mut gp = gate.buf.as_ptr();
         let mut up_p = up.buf.as_ptr();
@@ -6119,8 +5937,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
             "fused_silu_mul_mq_rotate_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
         let gp = gate.buf.as_ptr();
         let up_p = up.buf.as_ptr();
@@ -6174,8 +5992,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC,
             "fused_silu_mul_mq_rotate_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
         let mut gp = gate.buf.as_ptr();
         let mut up_p = up.buf.as_ptr();
@@ -6217,59 +6035,28 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Invalidate any `ensure_*_x` caches whose source pointer matches
     /// `dst_ptr`. Must be called by any kernel that overwrites data at
     /// `dst_ptr` since the caches key on raw pointer equality and have
-    /// no way to detect data changes otherwise. The `mq_x_rot` scratch
-    /// buffer used by the MagnumQuant rotation wrappers is the canonical
-    /// case — its pointer is stable across all gemv calls but its data
-    /// changes per rotation; without this invalidation, the FP8/FP16
-    /// activation scratch returns stale data on every call after the
-    /// first within a forward pass (silent correctness bug — coherence
-    /// detectors miss it because output stays vaguely on-topic).
+    /// no way to detect data changes otherwise.
     fn invalidate_x_caches_for(&mut self, dst_ptr: *mut c_void) {
-        if self.fp16_x_source_ptr == dst_ptr {
-            self.fp16_x_source_ptr = std::ptr::null_mut();
-        }
-        if self.fp8_x_source_ptr == dst_ptr {
-            self.fp8_x_source_ptr = std::ptr::null_mut();
-        }
+        self.scratch.invalidate_x_caches_for(dst_ptr)
     }
 
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
-    /// Exposed so callers can batch one rotation across multiple GEMVs that share x
-    /// (e.g., Q/K/V projections all consume the same post-RMSNorm x).
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
-        // `mq_rotate_x` lives inside the `gemv_mq4g256` module — precompile
-        // writes the .hsaco/.hash sidecar under that module name, so the
-        // runtime cache key here MUST match or we silently JIT on first use.
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-        let xp = x.buf.as_ptr();
-        let xrp = x_rot.buf.as_ptr();
-        let kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void, &xrp as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void, &s2_ptr as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-        ];
-        let bytes = crate::profile::mq_rotate_bytes(k);
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x", bytes);
-        let result = self.launch_maybe_blob(
-            "mq_rotate_x",
-            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp);
-                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        self.invalidate_x_caches_for(xrp);
-        result
+        self.scratch.rotate_x_mq(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.pool,
+            self.device_id,
+            x,
+            x_rot,
+            k,
+        )
     }
 
     /// Batched `rotate_x_mq`. Grid.y is the batch dim.
@@ -6280,44 +6067,22 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
-        // Same cache-key contract as `rotate_x_mq` — see comment there.
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g256", kernels::GEMV_MQ4G256_SRC, "mq_rotate_x")?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-        let mut xp = x.buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut xrp as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-        ];
-        let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_batched", bytes);
-        let result = self.launch_maybe_blob(
-            "mq_rotate_x",
-            [n_groups, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp);
-                b.push_ptr(s1); b.push_ptr(s2);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        self.invalidate_x_caches_for(xrp);
-        result
+        self.scratch.rotate_x_mq_batched(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.pool,
+            self.device_id,
+            x,
+            x_rot,
+            k,
+            batch_size,
+        )
     }
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
@@ -6325,45 +6090,26 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Mirrors `rotate_x_mq` but targets G128 groups (32 threads × 4 elems).
     /// Grid: [k/128, 1, 1]. Block: [32, 1, 1].
     pub fn rotate_x_mq_128(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs_128()?;
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("gemv_mq4g128", kernels::GEMV_MQ4G128_SRC, "mq_rotate_x_128")?;
-        let s1_ptr = self.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 128) as u32;
-        let xp = x.buf.as_ptr();
-        let xrp = x_rot.buf.as_ptr();
-        let kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void, &xrp as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void, &s2_ptr as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-        ];
-        let bytes = crate::profile::mq_rotate_bytes(k);
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_128", bytes);
-        let result = self.launch_maybe_blob(
-            "mq_rotate_x_128",
-            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp);
-                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        self.invalidate_x_caches_for(xrp);
-        result
+        self.scratch.rotate_x_mq_128(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.pool,
+            self.device_id,
+            x,
+            x_rot,
+            k,
+        )
     }
 
     /// Phase A Stage A — F2 AWQ-aware variant of `rotate_x_mq`.
     ///
-    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT,
-    /// completing the AWQ math `(W·s) · (x/s) = W·x` for the
-    /// post-projection input-rotate path (o_proj / out_proj). Use when
-    /// the upcoming linear carries `awq_scale = Some(...)`; otherwise call
-    /// the non-AWQ `rotate_x_mq`.
+    /// Divides each input element by `awq_scale[i]` BEFORE the FWHT.
     ///
     /// awq_scale: 1D FP32 GpuTensor of length K.
     pub fn rotate_x_mq_awq(
@@ -6373,45 +6119,26 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         x_rot: &GpuTensor,
         k: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel(
             "rotate_x_mq_awq",
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-        let xp = x.buf.as_ptr();
-        let awp = awq_scale.buf.as_ptr();
-        let xrp = x_rot.buf.as_ptr();
-        let kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &awp as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void,
-            &s2_ptr as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-        ];
-        // Bandwidth: read x + awq_scale, 2x256 signs, write x_rot.
-        let bytes = k * 4 * 3 + 2 * 256 * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_mq_awq", bytes);
-        let result = self.launch_maybe_blob(
-            "rotate_x_mq_awq",
-            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(awp);
-                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        self.invalidate_x_caches_for(xrp);
-        result
+        self.scratch.rotate_x_mq_awq(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.pool,
+            self.device_id,
+            x,
+            awq_scale,
+            x_rot,
+            k,
+        )
     }
 
     /// Phase A Stage A — F2 batched AWQ variant of `rotate_x_mq`.
@@ -6424,49 +6151,27 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel(
             "rotate_x_mq_awq",
             kernels::ROTATE_X_MQ_AWQ_SRC,
             "rotate_x_mq_awq",
         )?;
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-        let mut xp = x.buf.as_ptr();
-        let mut awp = awq_scale.buf.as_ptr();
-        let mut xrp = x_rot.buf.as_ptr();
-        let mut s1 = s1_ptr;
-        let mut s2 = s2_ptr;
-        let mut kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut xrp as *mut _ as *mut c_void,
-            &mut awp as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void,
-            &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-        ];
-        let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "rotate_x_mq_awq_batched", bytes);
-        let result = self.launch_maybe_blob(
-            "rotate_x_mq_awq",
-            [n_groups, batch_size as u32, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(awp);
-                b.push_ptr(s1); b.push_ptr(s2);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        self.invalidate_x_caches_for(xrp);
-        result
+        self.scratch.rotate_x_mq_awq_batched(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.pool,
+            self.device_id,
+            x,
+            awq_scale,
+            x_rot,
+            k,
+            batch_size,
+        )
     }
 
     /// MagnumQuant MQ4: rotate x once, then GEMV against rotated x.
@@ -6539,51 +6244,26 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     fn rotate_x_mq_dual_fp8(
         &mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize,
     ) -> HipResult<*mut c_void> {
-        self.ensure_mq_signs()?;
         self.ensure_kernel(
             "mq_rotate_x_dual_fp8_gfx12",
             kernels::MQ_ROTATE_X_DUAL_FP8_GFX12_SRC,
             "mq_rotate_x_dual_fp8_gfx12",
         )?;
-        // Lazily allocate the FP8 sibling scratch sized to match k bytes.
-        if self.mq_x_rot_fp8_bytes < k {
-            self.mq_x_rot_fp8 = Some(self.hip.malloc(k)?);
-            self.mq_x_rot_fp8_bytes = k;
-        }
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let xp = x.buf.as_ptr();
-        let xrp = x_rot.buf.as_ptr();
-        let xfp = self.mq_x_rot_fp8.as_ref().unwrap().as_ptr();
-        let n_groups = (k / 256) as u32;
-        let kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &xp as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &xfp as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void,
-            &s2_ptr as *const _ as *mut c_void,
-            &kv as *const _ as *mut c_void,
-        ];
-        let bytes = crate::profile::mq_rotate_bytes(k) + k; // +1 byte/elem fp8 write
-        let timer = crate::profile::begin_timer(&self.hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
-        let result = self.launch_maybe_blob(
-            "mq_rotate_x_dual_fp8_gfx12",
-            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_ptr(xrp); b.push_ptr(xfp);
-                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr);
-                b.push_i32(kv);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        // Same x_rot dst as the standalone rotation path → invalidate
-        // any ensure_*_x caches that were keyed by this pointer.
-        self.invalidate_x_caches_for(xrp);
-        result?;
-        Ok(xfp)
+        self.scratch.rotate_x_mq_dual_fp8(
+            &self.hip,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.pool,
+            self.device_id,
+            x,
+            x_rot,
+            k,
+        )
     }
 
     /// gfx11 (RDNA3) v_dot2_f32_f16 decode-path GEMV for HFP4G32.
@@ -6718,28 +6398,17 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Standalone MQ8 rotate + INT8 quantize of x into internal `mq_x_q8`/`mq_x_scales`.
     /// After this, `gemv_mq8g256_prerotated` can be called multiple times with the same x.
     pub fn rotate_quantize_x_mq8(&mut self, x: &GpuTensor, k: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
+        // bind_thread: skip — delegated to scratch.rs
         self.ensure_kernel("mq8_rotate_quantize_x", kernels::GEMV_MQ8G256_SRC, "mq8_rotate_quantize_x")?;
-
-        let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
-        let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
-        let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let n_groups = (k / 256) as u32;
-
-        let rot_func = &self.functions["mq8_rotate_quantize_x"];
-        let mut xp = x.buf.as_ptr();
-        let mut xq = xq_ptr; let mut xs = xs_ptr;
-        let mut s1 = s1_ptr; let mut s2 = s2_ptr;
-        let mut kv = k as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void, &mut xq as *mut _ as *mut c_void,
-            &mut xs as *mut _ as *mut c_void,
-            &mut s1 as *mut _ as *mut c_void, &mut s2 as *mut _ as *mut c_void,
-            &mut kv as *mut _ as *mut c_void,
-        ];
-        unsafe { self.hip.launch_kernel(rot_func, [n_groups, 1, 1], [32, 1, 1], 0, self.stream_ref(), &mut params) }
+        self.scratch.rotate_quantize_x_mq8(
+            &self.hip,
+            &self.functions,
+            self.active_stream.as_ref(),
+            &mut self.pool,
+            self.device_id,
+            x,
+            k,
+        )
     }
 
     /// MQ8 dp4a GEMV using pre-rotated+quantized x. Caller must have called
@@ -6750,8 +6419,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.bind_thread()?;
         self.ensure_kernel("gemv_mq8g256", kernels::GEMV_MQ8G256_SRC, "gemv_mq8g256")?;
 
-        let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
-        let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
+        let xq_ptr = self.scratch.mq_x_q8.as_ref().unwrap().as_ptr();
+        let xs_ptr = self.scratch.mq_x_scales.as_ref().unwrap().as_ptr();
 
         let func = &self.functions["gemv_mq8g256"];
         let mut ap = a_raw.buf.as_ptr();
@@ -11595,7 +11264,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // matching `fp16_x_source_ptr` and skip the f32→fp16 conversion,
         // and the kernel would read stale fp16 values from the previous
         // layer's rotation.
-        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_qkvza_hfq3g256_wmma(
             a_qkv, a_z, a_beta, a_alpha, x_rot,
             y_qkv, y_z, y_beta, y_alpha,
@@ -13030,7 +12699,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let x_rot_row = x_rot.sub_offset(b * k, k);
             self.rotate_x_mq(&x_row, &x_rot_row, k)?;
         }
-        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_gate_up_hfq3g256_wmma(
             a_gate, a_up, x_rot, y_gate, y_up, gate_m, up_m, k, batch_size,
         )
@@ -18016,7 +17685,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let x_rot_row = x_rot.sub_offset(b * k, k);
             self.rotate_x_mq(&x_row, &x_rot_row, k)?;
         }
-        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         self.gemm_hfq3g256_residual_wmma(a_raw, x_rot, y, m, k, batch_size)
     }
 
@@ -18700,7 +18369,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )?;
         // Pre-zero Y (residual WMMA does y += acc) and force FP16-X reconversion
         // (the draft reuses the same scratch pointer every cycle with new data).
-        self.fp16_x_source_ptr = std::ptr::null_mut();
+        self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
         match self.active_stream.as_ref() {
             Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
             None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -18782,7 +18451,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
-            self.fp16_x_source_ptr = std::ptr::null_mut();
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -18834,7 +18503,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
-            self.fp16_x_source_ptr = std::ptr::null_mut();
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -18883,7 +18552,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
-            self.fp16_x_source_ptr = std::ptr::null_mut();
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,

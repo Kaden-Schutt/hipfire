@@ -6,6 +6,7 @@
 
 pub mod arch_caps;
 pub mod graph;
+pub mod scratch;
 mod compiler;
 mod dispatch;
 pub mod feature_flags;
