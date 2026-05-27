@@ -18,11 +18,18 @@
 //! Usage:
 //!   cargo run --release --features deltanet --example pflash_niah_bench -- \
 //!     <model.hfq> <fixture.jsonl> [--maxgen N] [--q8kv|--asym3] \
-//!     [--pflash <drafter.hfq> [--keep-ratio K] [--block-size B] \
-//!      [--sink-tokens N] [--recent-tokens N]]
+//!     [--target-device N] \
+//!     [--pflash <drafter.hfq> [--drafter-device N] [--keep-ratio K] \
+//!      [--block-size B] [--sink-tokens N] [--recent-tokens N]]
 //!
 //! Defaults: --maxgen 64, --asym3 (best for long-ctx K), no PFlash.
 //! When --pflash is given: keep-ratio 0.30, block-size 64, sink 16, recent 32.
+//!
+//! Hetero PFlash: pass `--target-device 0 --drafter-device 1` to put the
+//! target on HIP device 0 and the compression-pass drafter on device 1.
+//! Defaults to both on device 0. The handoff is a host-side `Vec<u32>`
+//! of kept token IDs, so no peer-copy plumbing is required. ROCR_VISIBLE_DEVICES
+//! controls which physical GPUs the device indices resolve to.
 
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -275,6 +282,16 @@ fn main() {
     let block_size: usize = parse_arg(&args, "--block-size").unwrap_or(64);
     let sink_tokens: usize = parse_arg(&args, "--sink-tokens").unwrap_or(16);
     let recent_tokens: usize = parse_arg(&args, "--recent-tokens").unwrap_or(32);
+    // Device pinning. Both default to 0 = same HIP device (back-compat). When
+    // they differ, target runs on `target_device`, drafter runs on
+    // `drafter_device`; the compression handoff is a host-side Vec<u32>
+    // of kept token IDs so no peer-access plumbing is needed.
+    let target_device: i32 = parse_arg(&args, "--target-device").unwrap_or(0);
+    let drafter_device: i32 = parse_arg(&args, "--drafter-device").unwrap_or(target_device);
+    if drafter_device != target_device && drafter_path.is_none() {
+        eprintln!("FAIL: --drafter-device specified without --pflash <drafter.hfq>");
+        std::process::exit(2);
+    }
     let use_pretok = args.iter().any(|a| a == "--pretok");
     let write_pretok = args.iter().any(|a| a == "--write-pretok");
     if use_pretok && write_pretok {
@@ -290,8 +307,11 @@ fn main() {
     eprintln!("fixture: {fixture_path}");
     eprintln!("maxgen:  {max_gen}");
     eprintln!("kv mode: {kv_label}");
+    eprintln!("target dev: {target_device}");
     if let Some(d) = &drafter_path {
         eprintln!("drafter: {d}");
+        eprintln!("drafter dev: {drafter_device}{}",
+            if drafter_device != target_device { " (cross-device PFlash)" } else { "" });
         eprintln!("pflash:  keep_ratio={keep_ratio} block={block_size} sink={sink_tokens} recent={recent_tokens}");
     }
 
@@ -372,7 +392,7 @@ fn main() {
     let config = qwen35::config_from_hfq(&hfq).expect("qwen35 config");
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .expect("tokenizer");
-    let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
+    let mut gpu = rdna_compute::Gpu::init_with_device(target_device).expect("target GPU init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
     eprintln!("loaded in {:.1}s | dim={} layers={} heads={} kv_heads={}",
         t_load_start.elapsed().as_secs_f64(),
@@ -465,53 +485,89 @@ fn main() {
         };
         let mut state = PflashState::new(&pflash_cfg);
         let drafter_max_kv = source_tokens.len() + 64;
-        let t_load_drafter = Instant::now();
-        pflash::load_drafter(
-            &mut state, &mut gpu, Path::new(drafter_path_str), &tokenizer, drafter_max_kv,
-        ).expect("load_drafter");
-        eprintln!("drafter loaded: {:.1}s | tokenizer_compat={}",
-            t_load_drafter.elapsed().as_secs_f64(), state.tokenizer_compat);
-        if !state.tokenizer_compat {
-            eprintln!("FAIL: drafter tokenizer incompatible with target -- cannot compress safely");
-            state.unload_drafter(&mut gpu);
-            std::process::exit(2);
-        }
-
-        let t_compress = Instant::now();
-        let decision = pflash::maybe_compress_prompt(
-            &mut gpu, &mut state, &pflash_cfg, &source_tokens, RequestKind::Text, &[],
-        ).expect("maybe_compress_prompt");
-        compress_ms = t_compress.elapsed().as_millis();
-
-        let kept = match decision {
-            PflashDecision::Compressed(cp) => {
-                score_ms = cp.timings.score_ms as u128;
-                select_ms = cp.timings.select_ms as u128;
-                gather_ms = cp.timings.gather_ms as u128;
-                eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
-                eprintln!("compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",
-                    cp.source_tokens, cp.kept_tokens,
-                    cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
-                eprintln!("source_md5:    {}", cp.source_md5);
-                eprintln!("compressed_md5:{}", cp.compressed_md5);
-                eprintln!("kept_spans:  {} ranges (first={:?} last={:?})",
-                    cp.kept_spans.len(), cp.kept_spans.first(), cp.kept_spans.last());
-                cp.token_ids
-            }
-            PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens: st, threshold } } => {
-                eprintln!("bypass(BelowThreshold): {st} tokens, threshold {threshold}");
-                eprintln!("(compression would keep entire prompt -- running full prefill)");
-                source_tokens.clone()
-            }
-            PflashDecision::Bypass { reason } => {
-                eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
-                state.unload_drafter(&mut gpu);
+        // Cross-device drafter: allocate a separate Gpu handle bound to
+        // `drafter_device`. When drafter_device == target_device, we reuse
+        // the target `gpu` handle exactly as the original code did (the
+        // HIP heap on a single device is shared, so this is byte-identical
+        // to the pre-flag path). When they differ, drafter weights / KV /
+        // scratch live entirely on the secondary device; the compression
+        // output is just a `Vec<u32>` of kept token IDs returned to host.
+        let mut drafter_gpu_owned: Option<rdna_compute::Gpu> = if drafter_device != target_device {
+            Some(rdna_compute::Gpu::init_with_device(drafter_device).expect("drafter GPU init"))
+        } else {
+            None
+        };
+        // Borrow-checker: get a single `&mut Gpu` that refers to either
+        // the secondary handle or the existing target `gpu`. The inner
+        // scope keeps the borrow short so the target `gpu` is fully
+        // released back to the outer scope after the drafter is unloaded.
+        let kept = {
+            let drafter_gpu: &mut rdna_compute::Gpu = match &mut drafter_gpu_owned {
+                Some(g) => g,
+                None => &mut gpu,
+            };
+            let t_load_drafter = Instant::now();
+            pflash::load_drafter(
+                &mut state, drafter_gpu, Path::new(drafter_path_str), &tokenizer, drafter_max_kv,
+            ).expect("load_drafter");
+            eprintln!("drafter loaded: {:.1}s | tokenizer_compat={}",
+                t_load_drafter.elapsed().as_secs_f64(), state.tokenizer_compat);
+            if !state.tokenizer_compat {
+                eprintln!("FAIL: drafter tokenizer incompatible with target -- cannot compress safely");
+                state.unload_drafter(drafter_gpu);
                 std::process::exit(2);
             }
-        };
 
-        // Free drafter VRAM before allocating target KV.
-        state.unload_drafter(&mut gpu);
+            let t_compress = Instant::now();
+            let decision = pflash::maybe_compress_prompt(
+                drafter_gpu, &mut state, &pflash_cfg, &source_tokens, RequestKind::Text, &[],
+            ).expect("maybe_compress_prompt");
+            compress_ms = t_compress.elapsed().as_millis();
+
+            let kept = match decision {
+                PflashDecision::Compressed(cp) => {
+                    score_ms = cp.timings.score_ms as u128;
+                    select_ms = cp.timings.select_ms as u128;
+                    gather_ms = cp.timings.gather_ms as u128;
+                    eprintln!("compress:    {compress_ms} ms (score={score_ms}ms select={select_ms}ms gather={gather_ms}ms)");
+                    eprintln!("compressed:  {} -> {} tokens (ratio {:.3}, alpha implicit)",
+                        cp.source_tokens, cp.kept_tokens,
+                        cp.kept_tokens as f32 / cp.source_tokens.max(1) as f32);
+                    eprintln!("source_md5:    {}", cp.source_md5);
+                    eprintln!("compressed_md5:{}", cp.compressed_md5);
+                    eprintln!("kept_spans:  {} ranges (first={:?} last={:?})",
+                        cp.kept_spans.len(), cp.kept_spans.first(), cp.kept_spans.last());
+                    cp.token_ids
+                }
+                PflashDecision::Bypass { reason: BypassReason::BelowThreshold { source_tokens: st, threshold } } => {
+                    eprintln!("bypass(BelowThreshold): {st} tokens, threshold {threshold}");
+                    eprintln!("(compression would keep entire prompt -- running full prefill)");
+                    source_tokens.clone()
+                }
+                PflashDecision::Bypass { reason } => {
+                    eprintln!("FAIL: unexpected pflash bypass: {reason:?}");
+                    state.unload_drafter(drafter_gpu);
+                    std::process::exit(2);
+                }
+            };
+
+            // Free drafter VRAM before allocating target KV. When the
+            // drafter ran on a sibling device, this frees the secondary's
+            // VRAM and the outer-scope drop of drafter_gpu_owned destroys
+            // its HIP context; the target dev path is unaffected.
+            state.unload_drafter(drafter_gpu);
+            kept
+        };
+        // Drop the secondary `Gpu` handle now that the drafter is unloaded
+        // and we no longer need the cross-device handle. Important on the
+        // single-device path: `drafter_gpu_owned` is `None` so this is a
+        // no-op; on the cross-device path this releases the secondary HIP
+        // context cleanly before the target's KV alloc.
+        drop(drafter_gpu_owned);
+        // After drafter unload + outer-scope drop, re-bind the thread to
+        // the target device so the subsequent KV / scratch / forward calls
+        // land on the right context. bind_thread is cheap on the no-op path.
+        gpu.bind_thread().expect("rebind target");
         kept
     } else {
         source_tokens.clone()

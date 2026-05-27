@@ -281,7 +281,7 @@ for entry in "${TESTS[@]}"; do
     timeout 240 env "${graph_env[@]}" "$EXE" \
         --target "$TARGET" --draft "$DRAFT" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode asym3 --no-chatml \
+        --kv-mode q8 --no-chatml \
         --ddtree-path-c "$phase" --ddtree-budget 12 --ddtree-topk 2 \
         > "$out_file" 2>&1
     ec=$?

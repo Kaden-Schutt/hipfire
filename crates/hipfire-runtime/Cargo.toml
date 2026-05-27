@@ -40,12 +40,13 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
 arch-qwen2 = []
+arch-dots-ocr = []
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
@@ -93,6 +94,7 @@ hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 
@@ -107,7 +109,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-dots-ocr"]
 
 [[example]]
 name = "coherence_probe"
@@ -167,6 +169,14 @@ required-features = ["arch-qwen35"]
 
 [[example]]
 name = "dflash_spec_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_probe_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_only_demo"
 required-features = ["arch-qwen35"]
 
 [[example]]

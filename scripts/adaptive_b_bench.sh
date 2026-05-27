@@ -90,7 +90,7 @@ run_one() {
         out=$("$EXE" \
             --target "$TARGET_27B" --draft "$DRAFT_27B" \
             --prompt "$prompt" --max "$MAX_TOKENS" --ctx 2048 \
-            --kv-mode asym3 --no-chatml "${extra[@]}" 2>&1)
+            --kv-mode q8 --no-chatml "${extra[@]}" 2>&1)
         blob+="$out"$'\x1e'
     done
     printf '%s' "$blob" | python3 -c "$PARSE_PY" "$label" "$genre"

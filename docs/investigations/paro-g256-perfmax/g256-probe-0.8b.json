@@ -1,0 +1,633 @@
+{
+  "captured_at_utc": "2026-05-22T08:24:16Z",
+  "caveat": "Regroups/dequantizes existing G128 Paro weights; not a true G256 ParoQuant calibration run.",
+  "input_scale": 0.125,
+  "model": "/home/kaden/.cache/huggingface/hub/models--z-lab--Qwen3.5-0.8B-PARO/snapshots/da941f4fd3fa72763c398db6cb14b2bef1ee961f/",
+  "modules_available": 150,
+  "modules_probed": 12,
+  "results": [
+    {
+      "base": "model.language_model.layers.0.linear_attn.in_proj_qkv",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9971906542778015,
+          "cosine_min": 0.996371865272522,
+          "max_abs": 0.06296652555465698,
+          "mean_abs": 0.003895547240972519,
+          "nrmse": 0.0756437616004299,
+          "rmse": 0.00523335812613368
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9958043098449707,
+          "cosine_min": 0.9949567317962646,
+          "max_abs": 0.07168690860271454,
+          "mean_abs": 0.004585377871990204,
+          "nrmse": 0.08905079608497102,
+          "rmse": 0.0061609139665961266
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 3342336,
+        "paro4g256_awq": 3233792,
+        "paro4g256_mq_body_plus_side": 3368960,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 3295232
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9813548788067122,
+        "paro4g256_mq_body_plus_side": 1.0223741454319453
+      },
+      "shape": {
+        "k": 1024,
+        "m": 6144
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.0177001953125,
+          "mean_abs": 0.000882475811522454,
+          "nrmse": 0.07534692135136932,
+          "rmse": 0.0014061861438676715
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.0177001953125,
+          "mean_abs": 0.001124236616306007,
+          "nrmse": 0.08790841877150675,
+          "rmse": 0.001640619128011167
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.0.linear_attn.in_proj_z",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9974786043167114,
+          "cosine_min": 0.9970665574073792,
+          "max_abs": 0.031299516558647156,
+          "mean_abs": 0.003952161408960819,
+          "nrmse": 0.07420347693508844,
+          "rmse": 0.00520605081692338
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9961754083633423,
+          "cosine_min": 0.9954341650009155,
+          "max_abs": 0.03681828826665878,
+          "mean_abs": 0.004600288346409798,
+          "nrmse": 0.0873628074066664,
+          "rmse": 0.006129297893494368
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1114112,
+        "paro4g256_awq": 1095680,
+        "paro4g256_mq_body_plus_side": 1140736,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1116160
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.981651376146789,
+        "paro4g256_mq_body_plus_side": 1.0220183486238532
+      },
+      "shape": {
+        "k": 1024,
+        "m": 2048
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.01015472412109375,
+          "mean_abs": 0.0008727031527087092,
+          "nrmse": 0.07285708244242255,
+          "rmse": 0.0013702157884836197
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.01015472412109375,
+          "mean_abs": 0.0011184446047991514,
+          "nrmse": 0.08607226397825783,
+          "rmse": 0.0016187523724511266
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.0.linear_attn.out_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9938499927520752,
+          "cosine_min": 0.9922769069671631,
+          "max_abs": 0.07174751162528992,
+          "mean_abs": 0.006459461059421301,
+          "nrmse": 0.11166238588609607,
+          "rmse": 0.008154081180691719
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9935724139213562,
+          "cosine_min": 0.9922806024551392,
+          "max_abs": 0.07479244470596313,
+          "mean_abs": 0.006572528276592493,
+          "nrmse": 0.11382481860332622,
+          "rmse": 0.008311991579830647
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1114112,
+        "paro4g256_awq": 1122304,
+        "paro4g256_mq_body_plus_side": 1167360,
+        "shared_paro_side_metadata": 53248,
+        "source_paro4g128": 1142784
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.982078853046595,
+        "paro4g256_mq_body_plus_side": 1.021505376344086
+      },
+      "shape": {
+        "k": 2048,
+        "m": 1024
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.0064544677734375,
+          "mean_abs": 0.0002868318115361035,
+          "nrmse": 0.07621453456738127,
+          "rmse": 0.0005081164999864995
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.0064544677734375,
+          "mean_abs": 0.00030118782888166606,
+          "nrmse": 0.07802162063433193,
+          "rmse": 0.0005201642052270472
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.0.mlp.down_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.997835636138916,
+          "cosine_min": 0.9976130127906799,
+          "max_abs": 0.02213931828737259,
+          "mean_abs": 0.0035437645856291056,
+          "nrmse": 0.06871505695434967,
+          "rmse": 0.004456245340406895
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9967904090881348,
+          "cosine_min": 0.9964646100997925,
+          "max_abs": 0.028771907091140747,
+          "mean_abs": 0.004109763074666262,
+          "nrmse": 0.08031852628236325,
+          "rmse": 0.005208742804825306
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1964032,
+        "paro4g256_mq_body_plus_side": 2042880,
+        "shared_paro_side_metadata": 93184,
+        "source_paro4g128": 1999872
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.982078853046595,
+        "paro4g256_mq_body_plus_side": 1.021505376344086
+      },
+      "shape": {
+        "k": 3584,
+        "m": 1024
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.0074310302734375,
+          "mean_abs": 0.0003776086086872965,
+          "nrmse": 0.06697363622189416,
+          "rmse": 0.000572068674955517
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.007425948977470398,
+          "mean_abs": 0.00047466036630794406,
+          "nrmse": 0.07806333532499307,
+          "rmse": 0.0006667935522273183
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.0.mlp.gate_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9958703517913818,
+          "cosine_min": 0.9955978989601135,
+          "max_abs": 0.030109450221061707,
+          "mean_abs": 0.003592786146327853,
+          "nrmse": 0.09356703051470296,
+          "rmse": 0.004562096670269966
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9949787855148315,
+          "cosine_min": 0.9944966435432434,
+          "max_abs": 0.0293898805975914,
+          "mean_abs": 0.0038554396014660597,
+          "nrmse": 0.10063591016918384,
+          "rmse": 0.004906757734715939
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1897472,
+        "paro4g256_mq_body_plus_side": 1976320,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1933312
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9814618644067796,
+        "paro4g256_mq_body_plus_side": 1.0222457627118644
+      },
+      "shape": {
+        "k": 1024,
+        "m": 3584
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.00537872314453125,
+          "mean_abs": 0.0005708591779693961,
+          "nrmse": 0.07437926566074822,
+          "rmse": 0.0008972687646746635
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.00537872314453125,
+          "mean_abs": 0.000704933307133615,
+          "nrmse": 0.08543155622961622,
+          "rmse": 0.001030597253702581
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.0.mlp.up_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9958183169364929,
+          "cosine_min": 0.9952886700630188,
+          "max_abs": 0.01692737266421318,
+          "mean_abs": 0.0025756966788321733,
+          "nrmse": 0.09396625485584476,
+          "rmse": 0.0032630953937768936
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9948879480361938,
+          "cosine_min": 0.9943406581878662,
+          "max_abs": 0.016109421849250793,
+          "mean_abs": 0.0027852444909512997,
+          "nrmse": 0.10161108593702732,
+          "rmse": 0.0035285716876387596
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1897472,
+        "paro4g256_mq_body_plus_side": 1976320,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1933312
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9814618644067796,
+        "paro4g256_mq_body_plus_side": 1.0222457627118644
+      },
+      "shape": {
+        "k": 1024,
+        "m": 3584
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.00312042236328125,
+          "mean_abs": 0.0003974548599217087,
+          "nrmse": 0.07357329541651544,
+          "rmse": 0.00062037433963269
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.003209434449672699,
+          "mean_abs": 0.00048336145118810236,
+          "nrmse": 0.08372030712003971,
+          "rmse": 0.0007059345371089876
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.linear_attn.in_proj_qkv",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9967724680900574,
+          "cosine_min": 0.9962590932846069,
+          "max_abs": 0.04454696923494339,
+          "mean_abs": 0.004334835335612297,
+          "nrmse": 0.08309712486086263,
+          "rmse": 0.005658370442688465
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9955393075942993,
+          "cosine_min": 0.9949426651000977,
+          "max_abs": 0.04957525432109833,
+          "mean_abs": 0.004913859535008669,
+          "nrmse": 0.0945124961854504,
+          "rmse": 0.0064356825314462185
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 3342336,
+        "paro4g256_awq": 3233792,
+        "paro4g256_mq_body_plus_side": 3368960,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 3295232
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9813548788067122,
+        "paro4g256_mq_body_plus_side": 1.0223741454319453
+      },
+      "shape": {
+        "k": 1024,
+        "m": 6144
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.012969970703125,
+          "mean_abs": 0.0008541131974197924,
+          "nrmse": 0.07555456494909468,
+          "rmse": 0.0013741713482886553
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.01296590268611908,
+          "mean_abs": 0.001075110281817615,
+          "nrmse": 0.08794445819607166,
+          "rmse": 0.0015995162539184093
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.linear_attn.in_proj_z",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9969611167907715,
+          "cosine_min": 0.9964187145233154,
+          "max_abs": 0.032216086983680725,
+          "mean_abs": 0.0048230355605483055,
+          "nrmse": 0.08043262243506649,
+          "rmse": 0.006348335184156895
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9959433674812317,
+          "cosine_min": 0.9955028295516968,
+          "max_abs": 0.04590035229921341,
+          "mean_abs": 0.005352809559553862,
+          "nrmse": 0.08987694119914831,
+          "rmse": 0.0070937504060566425
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1114112,
+        "paro4g256_awq": 1095680,
+        "paro4g256_mq_body_plus_side": 1140736,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1116160
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.981651376146789,
+        "paro4g256_mq_body_plus_side": 1.0220183486238532
+      },
+      "shape": {
+        "k": 1024,
+        "m": 2048
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.00835418701171875,
+          "mean_abs": 0.0009704729891382158,
+          "nrmse": 0.07399100232698905,
+          "rmse": 0.0015337246004492044
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.008341476321220398,
+          "mean_abs": 0.001212326460517943,
+          "nrmse": 0.08554741078437575,
+          "rmse": 0.001773271942511201
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.linear_attn.out_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9959331750869751,
+          "cosine_min": 0.99528568983078,
+          "max_abs": 0.07439851760864258,
+          "mean_abs": 0.005126352421939373,
+          "nrmse": 0.09108296898400074,
+          "rmse": 0.006537416018545628
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9953497052192688,
+          "cosine_min": 0.9943872690200806,
+          "max_abs": 0.07747286558151245,
+          "mean_abs": 0.005397475324571133,
+          "nrmse": 0.09646165448835575,
+          "rmse": 0.0069234673865139484
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1114112,
+        "paro4g256_awq": 1122304,
+        "paro4g256_mq_body_plus_side": 1167360,
+        "shared_paro_side_metadata": 53248,
+        "source_paro4g128": 1142784
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.982078853046595,
+        "paro4g256_mq_body_plus_side": 1.021505376344086
+      },
+      "shape": {
+        "k": 2048,
+        "m": 1024
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.01363372802734375,
+          "mean_abs": 0.00043164551607333124,
+          "nrmse": 0.06973755623833772,
+          "rmse": 0.0006861102883704007
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.01363372802734375,
+          "mean_abs": 0.00048564508324489,
+          "nrmse": 0.07532827035257963,
+          "rmse": 0.0007411143160425127
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.mlp.down_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9979041814804077,
+          "cosine_min": 0.9976814985275269,
+          "max_abs": 0.04173344373703003,
+          "mean_abs": 0.003439802909269929,
+          "nrmse": 0.06679914440866577,
+          "rmse": 0.004366137553006411
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9972440600395203,
+          "cosine_min": 0.9970191717147827,
+          "max_abs": 0.02311280369758606,
+          "mean_abs": 0.0038089342415332794,
+          "nrmse": 0.07435805857288064,
+          "rmse": 0.004860204644501209
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1964032,
+        "paro4g256_mq_body_plus_side": 2042880,
+        "shared_paro_side_metadata": 93184,
+        "source_paro4g128": 1999872
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.982078853046595,
+        "paro4g256_mq_body_plus_side": 1.021505376344086
+      },
+      "shape": {
+        "k": 3584,
+        "m": 1024
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.0053558349609375,
+          "mean_abs": 0.0003668908029794693,
+          "nrmse": 0.06394956427062061,
+          "rmse": 0.00055439438438043
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.00556182861328125,
+          "mean_abs": 0.0004448851977940649,
+          "nrmse": 0.07285789216987,
+          "rmse": 0.0006316228536888957
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.mlp.gate_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.9966914057731628,
+          "cosine_min": 0.9964649677276611,
+          "max_abs": 0.02530542016029358,
+          "mean_abs": 0.0035546733997762203,
+          "nrmse": 0.0834619430869717,
+          "rmse": 0.004530984442681074
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9958138465881348,
+          "cosine_min": 0.9954271912574768,
+          "max_abs": 0.03359095752239227,
+          "mean_abs": 0.003874271409586072,
+          "nrmse": 0.09143529034027154,
+          "rmse": 0.004963841754943132
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1897472,
+        "paro4g256_mq_body_plus_side": 1976320,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1933312
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9814618644067796,
+        "paro4g256_mq_body_plus_side": 1.0222457627118644
+      },
+      "shape": {
+        "k": 1024,
+        "m": 3584
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.0055999755859375,
+          "mean_abs": 0.0006254883483052254,
+          "nrmse": 0.07165725692695747,
+          "rmse": 0.0009767416631802917
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.005581662058830261,
+          "mean_abs": 0.0007615552167408168,
+          "nrmse": 0.08176890944656014,
+          "rmse": 0.001114571001380682
+        }
+      }
+    },
+    {
+      "base": "model.language_model.layers.1.mlp.up_proj",
+      "output_vs_source": {
+        "paro4g256_awq": {
+          "cosine_mean": 0.996746838092804,
+          "cosine_min": 0.9965789318084717,
+          "max_abs": 0.012192780151963234,
+          "mean_abs": 0.0022843012120574713,
+          "nrmse": 0.0826435885722224,
+          "rmse": 0.002881029387935996
+        },
+        "paro4g256_mq_body": {
+          "cosine_mean": 0.9960424900054932,
+          "cosine_min": 0.9957664608955383,
+          "max_abs": 0.013756098225712776,
+          "mean_abs": 0.00246100383810699,
+          "nrmse": 0.08913122201562317,
+          "rmse": 0.0031071940902620554
+        }
+      },
+      "payload_bytes": {
+        "mq_body_only": 1949696,
+        "paro4g256_awq": 1897472,
+        "paro4g256_mq_body_plus_side": 1976320,
+        "shared_paro_side_metadata": 26624,
+        "source_paro4g128": 1933312
+      },
+      "payload_ratio_vs_source": {
+        "paro4g256_awq": 0.9814618644067796,
+        "paro4g256_mq_body_plus_side": 1.0222457627118644
+      },
+      "shape": {
+        "k": 1024,
+        "m": 3584
+      },
+      "weight_reconstruction": {
+        "paro4g256_awq": {
+          "max_abs": 0.002986907958984375,
+          "mean_abs": 0.00038865511305630207,
+          "nrmse": 0.07035217566433494,
+          "rmse": 0.0006021820590831339
+        },
+        "paro4g256_mq_body": {
+          "max_abs": 0.002986907958984375,
+          "mean_abs": 0.0004641558334697038,
+          "nrmse": 0.07913149446295524,
+          "rmse": 0.0006773289642296731
+        }
+      }
+    }
+  ],
+  "samples": 8,
+  "schema": "hipfire.astrea.paro_g256_probe.v0",
+  "seed": 1234,
+  "source": "/home/kaden/.cache/huggingface/hub/models--z-lab--Qwen3.5-0.8B-PARO/snapshots/da941f4fd3fa72763c398db6cb14b2bef1ee961f",
+  "summary": {
+    "avg_output_nrmse": {
+      "paro4g256_awq": 0.08377294659119179,
+      "paro4g256_mq_body": 0.09238163394043898
+    },
+    "avg_payload_ratio_vs_source": {
+      "paro4g256_awq": 0.981681281643375,
+      "paro4g256_mq_body_plus_side": 1.0219824620279498
+    },
+    "avg_weight_nrmse": {
+      "paro4g256_awq": 0.07204890466972212,
+      "paro4g256_mq_body": 0.0818163281225965
+    },
+    "modules": 12,
+    "worst_output_nrmse": {
+      "paro4g256_awq": 0.11166238588609607,
+      "paro4g256_mq_body": 0.11382481860332622
+    }
+  }
+}

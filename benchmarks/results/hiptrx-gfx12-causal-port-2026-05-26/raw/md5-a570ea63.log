@@ -1,0 +1,9 @@
+2026-05-26T23:22:30+00:00
+a570ea6306130bf325a3850f4733b7807e79aa7d
+36aca71d90d2c9175d0cae29cb08e922  target/release/examples/parity_causal_wmma
+ea8067bdb66df9380158c07055057b98  target/release/examples/infer_qwen2
+a5a5ec6d0a39f1e4c6e836a018e71ef9  target/release/examples/ocr_e2e
+4800a2ddde4312e40d692bd4d6ac193f  benchmarks/prompts/qwen2_smoke.txt
+7e17d061669be5cf30fff2c51af0c82f  benchmarks/references/qwen2_1p5b_instruct_smoke.json
+a434c567a2dfa0664ce75291508bad85  benchmarks/images/dots_ocr_smoke_001.jpg
+e5a20044734178dd35d36ef85461a281  benchmarks/references/dots_ocr_smoke_001.json

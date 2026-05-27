@@ -32,7 +32,7 @@ use hipfire_arch_dots_ocr::{dots_ocr, image as preprocess};
 use hipfire_arch_qwen2::qwen2::{self, Qwen2State, Qwen2Weights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
-use rdna_compute::Gpu;
+use rdna_compute::{profile, Gpu};
 
 struct Args {
     hfq: PathBuf,
@@ -40,6 +40,8 @@ struct Args {
     prompt_json: PathBuf,
     max_tokens: usize,
     max_seq: usize,
+    prefill: String,
+    profile_decode: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -48,6 +50,8 @@ fn parse_args() -> Result<Args, String> {
     let mut prompt_json: Option<PathBuf> = None;
     let mut max_tokens: usize = 16384;
     let mut max_seq: usize = 8192;
+    let mut prefill = "batch".to_string();
+    let mut profile_decode = false;
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -58,6 +62,8 @@ fn parse_args() -> Result<Args, String> {
                 .parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
             "--max-seq" => max_seq = it.next().ok_or("--max-seq needs value")?
                 .parse().map_err(|e: std::num::ParseIntError| e.to_string())?,
+            "--prefill" => prefill = it.next().ok_or("--prefill needs batch|seq")?,
+            "--profile-decode" => profile_decode = true,
             other => return Err(format!("unknown arg: {other}")),
         }
     }
@@ -65,7 +71,7 @@ fn parse_args() -> Result<Args, String> {
         hfq: hfq.ok_or("--hfq required")?,
         image: image.ok_or("--image required")?,
         prompt_json: prompt_json.ok_or("--prompt-json required")?,
-        max_tokens, max_seq,
+        max_tokens, max_seq, prefill, profile_decode,
     })
 }
 
@@ -157,21 +163,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let t = Instant::now();
     let dim = text_cfg.hidden_size;
     let mut visual_idx = 0usize;
-    for (pos, &token) in prompt_ids.iter().enumerate() {
-        if token == dots_ocr::IMGPAD_ID {
-            let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
-            qwen2::forward_step_with_embed(&mut gpu, &text_weights, &text_cfg, &mut text_state, emb)?;
-            visual_idx += 1;
-        } else {
-            qwen2::forward_step(&mut gpu, &text_weights, &text_cfg, &mut text_state, token)?;
+    if args.prefill == "batch" {
+        // One batched call: build [batch, dim] embeds (visual rows from merger,
+        // text rows from embed table), then forward_prefill_batch_embeds. Hits
+        // the WMMA causal+GQA path when hd==128 && batch>=64.
+        let mut embeds = vec![0.0f32; prompt_ids.len() * dim];
+        for (pos, &token) in prompt_ids.iter().enumerate() {
+            if token == dots_ocr::IMGPAD_ID {
+                embeds[pos*dim..(pos+1)*dim].copy_from_slice(&merged[visual_idx*dim..(visual_idx+1)*dim]);
+                visual_idx += 1;
+            } else {
+                let row = qwen2::embed_token_row(&mut gpu, &text_weights, &text_cfg, &mut text_state, token)?;
+                embeds[pos*dim..(pos+1)*dim].copy_from_slice(&row);
+            }
         }
-        if pos > 0 && pos % 500 == 0 {
-            let so_far = t.elapsed().as_secs_f32();
-            eprintln!("  [prefill] pos {}/{}  {:.1}s  ({:.1} tok/s)",
-                pos, prompt_ids.len(), so_far, (pos as f32) / so_far);
+        qwen2::forward_prefill_batch_embeds(&mut gpu, &text_weights, &text_cfg, &mut text_state, &embeds)?;
+    } else {
+        for (pos, &token) in prompt_ids.iter().enumerate() {
+            if token == dots_ocr::IMGPAD_ID {
+                let emb = &merged[visual_idx * dim..(visual_idx + 1) * dim];
+                qwen2::forward_step_with_embed(&mut gpu, &text_weights, &text_cfg, &mut text_state, emb)?;
+                visual_idx += 1;
+            } else {
+                qwen2::forward_step(&mut gpu, &text_weights, &text_cfg, &mut text_state, token)?;
+            }
+            if pos > 0 && pos % 500 == 0 {
+                let so_far = t.elapsed().as_secs_f32();
+                eprintln!("  [prefill] pos {}/{}  {:.1}s  ({:.1} tok/s)",
+                    pos, prompt_ids.len(), so_far, (pos as f32) / so_far);
+            }
         }
     }
     assert_eq!(visual_idx, n_visual_tokens, "spliced {visual_idx}/{n_visual_tokens} visual tokens");
+    eprintln!("[prefill] mode={}", args.prefill);
     let prefill_s = t.elapsed().as_secs_f32();
     eprintln!("[prefill] done in {:.1}s ({:.1} tok/s)",
         prefill_s, prompt_ids.len() as f32 / prefill_s);
@@ -192,6 +216,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
         output_ids.push(next);
+
+        if args.profile_decode && step == 50 {
+            profile::start();
+        }
+        if args.profile_decode && step == 55 {
+            let entries = profile::stop().unwrap();
+            let mut by_cat: std::collections::HashMap<&str, (f64, usize)> = std::collections::HashMap::new();
+            let mut total_us = 0.0f64;
+            for e in &entries {
+                let (t, n) = by_cat.entry(e.category).or_default();
+                *t += e.time_us;
+                *n += 1;
+                total_us += e.time_us;
+            }
+            let mut cats: Vec<_> = by_cat.into_iter().collect();
+            cats.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            eprintln!("\n=== DECODE PROFILE (5 steps, {} kernels) ===", entries.len());
+            eprintln!("{:<20} {:>10} {:>10} {:>8} {:>10}", "category", "time(ms)", "launches", "avg(us)", "share%");
+            for (cat, (time_us, n)) in &cats {
+                eprintln!("{:<20} {:>10.2} {:>10} {:>8.1} {:>9.1}%",
+                    cat, time_us / 1000.0, n, time_us / *n as f64, time_us / total_us * 100.0);
+            }
+            eprintln!("{:<20} {:>10.2} {:>10} {:>8.1}", "TOTAL", total_us / 1000.0, entries.len(), total_us / entries.len() as f64);
+            let per_step = total_us / 5.0;
+            eprintln!("Per decode step: {:.1} ms ({:.0} tok/s theoretical)",
+                per_step / 1000.0, 1_000_000.0 / per_step);
+        }
+
         next = qwen2::forward_step_greedy(&mut gpu, &text_weights, &text_cfg, &mut text_state, next)?;
         if step > 0 && step % 200 == 0 {
             let so_far = t.elapsed().as_secs_f32();

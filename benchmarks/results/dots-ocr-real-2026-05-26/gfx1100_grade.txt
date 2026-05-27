@@ -1,0 +1,11 @@
+reference: 13 regions (dots_ocr_smoke_001_vllm.json)
+our output: 9189 chars (gfx1100_ocr_e2e_stdout.txt)
+our output: 13 regions parsed (ok)
+
+=== grading ===
+regions: ref=13, ours=13 (extras=0)
+matched at IoU>=0.5: 13/13
+precision=1.000  recall=1.000  F1=1.000
+text distance (matched regions): mean=0.000, exact=13/13
+
+VERDICT: PASS

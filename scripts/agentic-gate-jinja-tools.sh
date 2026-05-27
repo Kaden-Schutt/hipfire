@@ -245,7 +245,7 @@ STDIN_FIFO="$(mktemp -u /tmp/agentic-gate-jinja-tools-fifo.XXXXXX)"
 mkfifo "$STDIN_FIFO"
 
 env HIPFIRE_JINJA_CHAT=1 \
-    HIPFIRE_KV_MODE=asym3 \
+    HIPFIRE_KV_MODE=q8 \
     HIPFIRE_GRAPH=1 \
     "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
 DAEMON_PID=$!
