@@ -685,32 +685,44 @@ impl GdnTape {
             std::env::var("HIPFIRE_REPLAY_GRAPH").ok().as_deref() == Some("1");
         let can_graph = graph_enabled && gpu.active_stream.is_some();
 
-        if can_graph && gpu.replay_has_graph(n_steps) {
-            return gpu.replay_graph_launch(n_steps);
+        if can_graph && gpu.graphs.replay_has_graph(n_steps) {
+            return gpu.graphs.replay_graph_launch(
+                &gpu.hip, gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(), n_steps,
+            );
         }
 
-        if can_graph && gpu.replay_needs_warmup(n_steps) {
+        if can_graph && gpu.graphs.replay_needs_warmup(n_steps) {
             self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps)?;
-            gpu.replay_mark_warmup_done(n_steps);
+            gpu.graphs.replay_mark_warmup_done(n_steps);
             return Ok(());
         }
 
         if can_graph {
-            gpu.begin_replay_graph_capture(n_steps)?;
+            gpu.graphs.begin_replay_graph_capture(
+                &gpu.hip, gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(), n_steps,
+            )?;
             let r = self.replay_gdn_inner(gpu, weights, config, dn_state, n_steps);
             if r.is_ok() {
-                gpu.end_replay_graph_capture()?;
+                gpu.graphs.end_replay_graph_capture(
+                    &gpu.hip, gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                )?;
                 // Same pattern as verify_graph: hipStreamBeginCapture records
                 // without executing, so launch once here to apply this cycle's
                 // state updates.
-                gpu.replay_graph_launch(n_steps)?;
+                gpu.graphs.replay_graph_launch(
+                    &gpu.hip, gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(), n_steps,
+                )?;
                 return Ok(());
             } else {
                 let _ = gpu.hip.stream_end_capture(
                     gpu.active_stream.as_ref().unwrap(),
                 );
-                gpu.capture_mode = false;
-                gpu.capture_blobs.clear();
+                gpu.graphs.capture_mode = false;
+                gpu.graphs.capture_blobs.clear();
                 return r;
             }
         }
@@ -2008,20 +2020,23 @@ fn verify_dflash_block_inner(
         if gpu.active_stream.is_none() {
             gpu.active_stream = Some(gpu.hip.stream_create()?);
         }
-        if gpu.verify_has_graph(b) {
+        if gpu.graphs.verify_has_graph(b) {
             vg_mode = "replay";
             // Replay path: kernels read pbs.tokens/pbs.positions/dn_state/
             // kv_cache contents that were freshly updated above + upstream.
-            gpu.verify_graph_launch(b)?;
+            gpu.graphs.verify_graph_launch(
+                &gpu.hip, gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(), b,
+            )?;
             Ok(())
-        } else if gpu.verify_needs_warmup(b) {
+        } else if gpu.graphs.verify_needs_warmup(b) {
             vg_mode = "warmup";
             // Warmup for this b: run direct so kernel JIT and any lazy scratch
             // allocations (e.g., MQ signs/x_rot/x_q8, FP16 shadow) happen
             // outside any captured region. Capturing a JIT + scratch-malloc
             // hits "hipMalloc not permitted under stream capture" the first
             // time any kernel is compiled inline. One warmup per distinct b.
-            gpu.verify_mark_warmup_done(b);
+            gpu.graphs.verify_mark_warmup_done(b);
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
                 gpu,
                 &target.weights,
@@ -2044,7 +2059,10 @@ fn verify_dflash_block_inner(
         } else {
             vg_mode = "capture";
             // Capture path: first call at this B after warmup.
-            gpu.begin_verify_graph_capture(b)?;
+            gpu.graphs.begin_verify_graph_capture(
+                &gpu.hip, gpu.device_id,
+                gpu.active_stream.as_ref().unwrap(), b,
+            )?;
             let r = qwen35::forward_prefill_batch_single_chunk_captured(
                 gpu,
                 &target.weights,
@@ -2061,8 +2079,11 @@ fn verify_dflash_block_inner(
                 tree_verify,
             );
             if r.is_ok() {
-                let blob_count = gpu.capture_blobs.len();
-                gpu.end_verify_graph_capture()?;
+                let blob_count = gpu.graphs.capture_blobs.len();
+                gpu.graphs.end_verify_graph_capture(
+                    &gpu.hip, gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(),
+                )?;
                 // Under `hipStreamBeginCapture`, kernels + memcpys on the
                 // captured stream are RECORDED, not executed. final_hidden
                 // and hidden_rb staging are left stale. Launching the graph
@@ -2071,17 +2092,20 @@ fn verify_dflash_block_inner(
                 // HIP version does execute during capture) is washed out by
                 // target_snap.restore_to after verify returns. KV cache
                 // double-write writes the same data to the same positions.
-                gpu.verify_graph_launch(b)?;
+                gpu.graphs.verify_graph_launch(
+                    &gpu.hip, gpu.device_id,
+                    gpu.active_stream.as_ref().unwrap(), b,
+                )?;
                 eprintln!(
                     "[verify-graph] captured for B={} with {} blobs (cache size: {})",
-                    b, blob_count, gpu.verify_graph_count(),
+                    b, blob_count, gpu.graphs.verify_graph_count(),
                 );
             } else {
                 // If capture failed, tear down the partial capture so we fall
                 // back to the direct path next cycle cleanly.
                 let _ = gpu.hip.stream_end_capture(gpu.active_stream.as_ref().unwrap());
-                gpu.capture_mode = false;
-                gpu.capture_blobs.clear();
+                gpu.graphs.capture_mode = false;
+                gpu.graphs.capture_blobs.clear();
             }
             r
         }

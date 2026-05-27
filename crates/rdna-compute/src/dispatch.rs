@@ -9,8 +9,7 @@ use crate::compiler::KernelCompiler;
 use crate::feature_flags::FeatureFlags;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult, HipRuntime, Rocblas};
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, OnceLock};
@@ -38,12 +37,6 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// stride-mismatch bugs (followup discipline from
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
-
-thread_local! {
-    /// Per-thread cache for `Gpu::bind_thread`. Sentinel `-1` forces the
-    /// first call to issue `hipSetDevice` even when the target id is 0.
-    static LAST_BOUND_DEVICE: Cell<i32> = const { Cell::new(-1) };
-}
 
 /// Current layer index, set by the qwen35 forward_prefill_chunk at the
 /// start of each layer iteration. Used by `hfq3_mmq_layer_gate_pass` to
@@ -352,80 +345,8 @@ pub struct Gpu {
     /// Override via env: `HIPFIRE_MMQ_SCREEN_THRESHOLD`.
     pub mmq_screen_threshold: f32,
 
-    // ── hipGraph capture state ────────────────────────────────────────────
-    /// When true, dispatch methods use the blob launch path (graph-capture-safe).
-    /// Kernarg blobs are stored in `capture_blobs` and must stay alive until the
-    /// captured graph is destroyed.
-    pub capture_mode: bool,
-    /// Diagnostic: when true, `launch_maybe_blob` takes the blob path even when
-    /// `capture_mode=false`. Isolates "blob-vs-kernelParams path" bugs without
-    /// the rest of the graph-capture machinery (stream capture, staging, etc).
-    /// Heap-stored kernarg blobs for the current capture session. The blob
-    /// pointers are baked into the graph at capture time — do NOT clear this
-    /// vec until after `graph_exec_destroy`.
-    pub capture_blobs: Vec<Vec<u8>>,
-    /// The captured graph exec, ready for replay.
-    pub graph_exec: Option<hip_bridge::GraphExec>,
-    /// The raw captured graph (kept alive for potential update operations).
-    captured_graph: Option<hip_bridge::Graph>,
-    /// When the captured graph belongs to a verify-forward, this is the batch
-    /// size it was captured for. `None` means no verify graph captured (the
-    /// graph slot may hold the AR forward graph instead, or be unused).
-    /// Used to invalidate + re-capture when the DFlash budget changes mid-run.
-    ///
-    /// DEPRECATED for verify: the verify path now uses `verify_graph_cache`
-    /// keyed by B, keeping separate graphs live for each B value PLD may
-    /// oscillate through. This field stays for any legacy single-slot usage.
-    pub graph_verify_n: Option<usize>,
-    /// Counter of verify forward calls seen since the last graph invalidate.
-    /// We run the first call direct (no capture) to let kernel JIT and any
-    /// lazy scratch allocations settle — then capture on the second call.
-    /// Capturing the first call itself hits "hipMalloc not permitted during
-    /// stream capture" the first time a kernel is JITted inside capture.
-    ///
-    /// DEPRECATED for verify: replaced by `verify_warmed_up` (per-B set).
-    pub graph_verify_warmup: u32,
-
-    /// AR `forward_scratch` (single-token decode) capture warmup flag.
-    /// First call with `HIPFIRE_GRAPH=1` runs direct so kernel JIT and lazy
-    /// AR-forward hipGraph capture/replay state. See block comment near
-    /// AR_FORWARD_WARMUP_CALLS in this file for policy.
-    /// True on init / after any kernel-module change. The next AR forward
-    /// runs direct (no capture) so inline JIT / lazy hipMalloc don't trip
-    /// `hipMalloc not permitted under stream capture`.
-    pub ar_forward_kernel_dirty: bool,
-    /// True after `end_decode_turn()` commits a capture (kernels clean,
-    /// graph_exec exists). Replay path enabled for next decode turn until
-    /// reset by kernel reload.
-    pub ar_forward_replay_enabled: bool,
-
-    /// Per-B cache of captured verify-forward graphs. Each entry owns its
-    /// graph + exec + the kernarg blobs that graph captured pointers into.
-    /// Blobs must stay alive for the life of the graph — they're baked into
-    /// the graph nodes by hipStreamEndCapture.
-    ///
-    /// Keyed by `b` (draft block size). DFlash's PLD intermittently shortens
-    /// b from 16 → 8 on short self-match spines; caching graphs per-B avoids
-    /// graph_destroy + re-capture every oscillation, which was wiping out the
-    /// hipGraph replay gain entirely.
-    pub verify_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
-    /// Set of B values that have completed the once-per-B JIT/scratch warmup.
-    /// Capture can safely begin only after warmup — see graph_verify_warmup doc.
-    pub verify_warmed_up: HashSet<usize>,
-    /// B being captured right now (between begin_verify_graph_capture and
-    /// end_verify_graph_capture). None outside that window.
-    verify_capturing_b: Option<usize>,
-
-    /// Per-n_steps cache of captured tape-replay graphs (DeltaNetTape::replay_gdn).
-    /// Keyed by n_steps = accept_len + 1 (per-cycle accepted count). On 27B
-    /// HumanEval, replay scales linearly with accept — e.g. accept=10 runs
-    /// 48 LA layers × 4 kernels = ~192 launches. Graphing collapses those
-    /// into one replay. Same shape as verify_graph_cache: graph + exec + blobs.
-    pub replay_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
-    /// n_steps values that have completed their once-per-n_steps JIT/scratch warmup.
-    pub replay_warmed_up: HashSet<usize>,
-    /// n_steps being captured right now. None outside the capture window.
-    replay_capturing_n: Option<usize>,
+    // ── hipGraph capture state (extracted to graph.rs) ─────────────────────
+    pub graphs: crate::graph::GraphState,
 
     // ── rocBLAS (CDNA3 MFMA-accelerated GEMM) ─────────────────────────────
     /// Optional rocBLAS handle. `None` on non-CDNA3 archs or when
@@ -473,38 +394,18 @@ impl Gpu {
         self.active_stream.as_ref()
     }
 
-    /// Bind this `Gpu`'s device on the calling thread. Cached via thread_local
-    /// — only issues `hipSetDevice` when the cached id changes.
+    /// Bind this `Gpu`'s device on the calling thread. Delegates to
+    /// `crate::graph::bind_thread`.
     #[inline]
     pub fn bind_thread(&self) -> HipResult<()> {
-        if LAST_BOUND_DEVICE.with(|c| c.get()) != self.device_id {
-            self.hip.set_device(self.device_id)?;
-            LAST_BOUND_DEVICE.with(|c| c.set(self.device_id));
-        }
-        debug_assert_eq!(
-            self.hip.current_device()?,
-            self.device_id,
-            "bind_thread invariant: current device must match self.device_id",
-        );
-        Ok(())
+        crate::graph::bind_thread(&self.hip, self.device_id)
     }
 
-    /// `bind_thread` for `&mut self -> ()` and `Drop` contexts. Logs to
-    /// stderr on hipSetDevice failure instead of swallowing it silently;
-    /// no debug_assert (would risk panic-in-Drop on top of an unwinding
-    /// panic).
+    /// `bind_thread` for `&mut self -> ()` and `Drop` contexts. Delegates to
+    /// `crate::graph::bind_thread_or_warn`.
     #[inline]
     pub fn bind_thread_or_warn(&self) {
-        if LAST_BOUND_DEVICE.with(|c| c.get()) != self.device_id {
-            match self.hip.set_device(self.device_id) {
-                Ok(()) => LAST_BOUND_DEVICE.with(|c| c.set(self.device_id)),
-                Err(e) => eprintln!(
-                    "WARN: bind_thread_or_warn(dev {}) failed: {} — \
-                     subsequent ops run on the currently-bound device",
-                    self.device_id, e,
-                ),
-            }
-        }
+        crate::graph::bind_thread_or_warn(&self.hip, self.device_id)
     }
 
     /// Drive the GPU to full DPM perf level before a perf-sensitive measurement.
@@ -596,7 +497,7 @@ impl Gpu {
 
         let compiler = KernelCompiler::new(&arch, flags.hipcc_extra_flags.clone())?;
 
-        LAST_BOUND_DEVICE.with(|c| c.set(id));
+        crate::graph::LAST_BOUND_DEVICE.with(|c| c.set(id));
 
         let mmq_screen = flags.mmq_screen;
         let mmq_screen_threshold = flags.mmq_screen_threshold;
@@ -635,20 +536,24 @@ impl Gpu {
             mmq_screen_cache: HashMap::new(),
             mmq_screen,
             mmq_screen_threshold,
-            capture_mode: false,
-            capture_blobs: Vec::new(),
-            graph_exec: None,
-            captured_graph: None,
-            graph_verify_n: None,
-            graph_verify_warmup: 0,
-            ar_forward_kernel_dirty: true,
-            ar_forward_replay_enabled: false,
-            verify_graph_cache: HashMap::new(),
-            verify_warmed_up: HashSet::new(),
-            verify_capturing_b: None,
-            replay_graph_cache: HashMap::new(),
-            replay_warmed_up: HashSet::new(),
-            replay_capturing_n: None,
+            graphs: crate::graph::GraphState {
+                capture_mode: false,
+                capture_blobs: Vec::new(),
+                graph_exec: None,
+                captured_graph: None,
+                ar_forward_kernel_dirty: true,
+                ar_forward_replay_enabled: false,
+                verify: crate::graph::PerBGraphCache {
+                    cache: std::collections::HashMap::new(),
+                    warmed_up: std::collections::HashSet::new(),
+                    capturing: None,
+                },
+                replay: crate::graph::PerBGraphCache {
+                    cache: std::collections::HashMap::new(),
+                    warmed_up: std::collections::HashSet::new(),
+                    capturing: None,
+                },
+            },
             rocblas: None,
             fp16_shadow_cache: HashMap::new(),
             capture_handler: None,
@@ -798,252 +703,7 @@ impl Gpu {
     }
 
     // ── hipGraph capture/replay ───────────────────────────────────────────
-
-    /// Begin capturing all kernel launches on the active stream into a graph.
-    /// While capturing, dispatch methods that support it will use the blob
-    /// launch path so that kernarg pointers survive until graph replay.
-    pub fn begin_graph_capture(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        self.capture_blobs.clear();
-        self.capture_mode = true;
-        let stream = self.active_stream.as_ref()
-            .expect("graph capture requires an explicit stream (not null stream)");
-        self.hip.stream_begin_capture(stream, 0) // 0 = hipStreamCaptureModeGlobal
-    }
-
-    /// End capture, instantiate the graph for replay.
-    pub fn end_graph_capture(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        self.capture_mode = false;
-        let stream = self.active_stream.as_ref().unwrap();
-        let graph = self.hip.stream_end_capture(stream)?;
-        let exec = self.hip.graph_instantiate(&graph)?;
-        self.captured_graph = Some(graph);
-        self.graph_exec = Some(exec);
-        Ok(())
-    }
-
-    /// Replay the captured graph.
-    pub fn graph_launch(&self) -> HipResult<()> {
-        self.bind_thread()?;
-        let exec = self.graph_exec.as_ref().expect("no captured graph to replay");
-        let stream = self.active_stream.as_ref().unwrap();
-        self.hip.graph_launch(exec, stream)
-    }
-
-    /// Caller signals end of a decode turn (EOS or max_tokens reached). If a
-    /// captured graph exists and kernels are clean, replay is enabled for the
-    /// next decode turn. Per the AR-forward hipGraph policy: "at least one
-    /// captured full turn must run before replay can be enabled."
-    /// No-op if no capture exists (e.g., turn ran fully direct because kernels
-    /// were dirty or graph was disabled by the caller).
-    pub fn end_decode_turn(&mut self) {
-        // bind_thread: skip - pure state (flips replay-enable bool, no GPU calls)
-        if !self.ar_forward_kernel_dirty && self.graph_exec.is_some() {
-            self.ar_forward_replay_enabled = true;
-        }
-    }
-
-    /// Drop the currently captured graph (if any) without touching kernel /
-    /// replay state. Used by the capture+launch hot-path to free the previous
-    /// per-call capture before recording a fresh one — bare `graph_destroy()`
-    /// would also mark kernels dirty + disable replay, which is wrong here.
-    pub fn drop_captured_graph(&mut self) {
-        self.bind_thread_or_warn();
-        if let Some(exec) = self.graph_exec.take() {
-            let _ = self.hip.graph_exec_destroy(exec);
-        }
-        if let Some(graph) = self.captured_graph.take() {
-            let _ = self.hip.graph_destroy(graph);
-        }
-        self.capture_blobs.clear();
-    }
-
-    /// Caller signals a kernel-module change (model load, dtype switch, etc).
-    /// Forces the next AR forward call to dispatch direct (no capture) so any
-    /// inline JIT / lazy hipMalloc happens outside a captured region. Replay
-    /// stays disabled until a fresh full turn completes via `end_decode_turn`.
-    pub fn mark_kernels_dirty(&mut self) {
-        // bind_thread: skip - pure state (flips dirty/replay bools, no GPU calls)
-        self.ar_forward_kernel_dirty = true;
-        self.ar_forward_replay_enabled = false;
-    }
-
-    /// Destroy the captured graph and free all retained kernarg blobs.
-    pub fn graph_destroy(&mut self) {
-        self.bind_thread_or_warn();
-        if let Some(exec) = self.graph_exec.take() {
-            let _ = self.hip.graph_exec_destroy(exec);
-        }
-        if let Some(graph) = self.captured_graph.take() {
-            let _ = self.hip.graph_destroy(graph);
-        }
-        self.capture_blobs.clear();
-        self.graph_verify_n = None;
-        self.graph_verify_warmup = 0;
-        // Without this, model swap leaves replay enabled, so forward_scratch
-        // jumps straight to graph_launch on the new model's stale captured
-        // graph (whose kernel pointers reference the OLD model's weights).
-        // Mark kernels dirty so the next call goes direct and skips capture
-        // until JIT/scratch settles for the new model.
-        self.ar_forward_kernel_dirty = true;
-        self.ar_forward_replay_enabled = false;
-    }
-
-    // ── Per-B verify-forward graph cache ─────────────────────────────────
-    //
-    // DFlash's PLD intermittently changes b (e.g. 16 → 8 on short self-match
-    // spines). With the old single-slot graph API, every b transition triggered
-    // `graph_destroy` + warmup + re-capture, wiping out the hipGraph replay
-    // gain. These methods cache one graph per distinct b value so oscillation
-    // becomes free.
-
-    pub fn verify_has_graph(&self, b: usize) -> bool {
-        // bind_thread: skip — pure state query
-        self.verify_graph_cache.contains_key(&b)
-    }
-
-    pub fn verify_needs_warmup(&self, b: usize) -> bool {
-        // bind_thread: skip — pure state query
-        !self.verify_warmed_up.contains(&b)
-    }
-
-    pub fn verify_mark_warmup_done(&mut self, b: usize) {
-        // bind_thread: skip — pure state query
-        self.verify_warmed_up.insert(b);
-    }
-
-    /// Begin capturing a verify-forward graph for batch size `b`. Subsequent
-    /// launch_maybe_blob calls will push their kernargs into `capture_blobs`,
-    /// which is drained into the per-B cache entry on end_verify_graph_capture.
-    pub fn begin_verify_graph_capture(&mut self, b: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        debug_assert!(self.verify_capturing_b.is_none(),
-            "begin_verify_graph_capture: already capturing for b={:?}",
-            self.verify_capturing_b);
-        debug_assert!(!self.capture_mode,
-            "begin_verify_graph_capture: capture_mode already set");
-        self.capture_blobs.clear();
-        self.verify_capturing_b = Some(b);
-        self.capture_mode = true;
-        let stream = self.active_stream.as_ref()
-            .expect("verify graph capture requires an explicit stream");
-        self.hip.stream_begin_capture(stream, 0) // hipStreamCaptureModeGlobal
-    }
-
-    /// End capture, instantiate, stash into the per-B cache (taking ownership
-    /// of the current capture_blobs).
-    pub fn end_verify_graph_capture(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        let b = self.verify_capturing_b.take()
-            .expect("end_verify_graph_capture without matching begin");
-        self.capture_mode = false;
-        let stream = self.active_stream.as_ref().unwrap();
-        let graph = self.hip.stream_end_capture(stream)?;
-        let exec = self.hip.graph_instantiate(&graph)?;
-        let blobs = std::mem::take(&mut self.capture_blobs);
-        self.verify_graph_cache.insert(b, (graph, exec, blobs));
-        Ok(())
-    }
-
-    /// Replay the cached verify graph for batch size `b`.
-    pub fn verify_graph_launch(&self, b: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        let entry = self.verify_graph_cache.get(&b)
-            .unwrap_or_else(|| panic!("no captured verify graph for b={}", b));
-        let stream = self.active_stream.as_ref().unwrap();
-        self.hip.graph_launch(&entry.1, stream)
-    }
-
-    /// How many captured verify graphs are in the cache (for debug logs).
-    pub fn verify_graph_count(&self) -> usize {
-        // bind_thread: skip — pure state query
-        self.verify_graph_cache.len()
-    }
-
-    /// Destroy all cached verify graphs and their blobs.
-    pub fn verify_graph_destroy_all(&mut self) {
-        self.bind_thread_or_warn();
-        for (_, (graph, exec, _blobs)) in self.verify_graph_cache.drain() {
-            let _ = self.hip.graph_exec_destroy(exec);
-            let _ = self.hip.graph_destroy(graph);
-        }
-        self.verify_warmed_up.clear();
-        self.verify_capturing_b = None;
-    }
-
-    // ── Replay-graph cache (tape replay after verify) ────────────────────
-    // Same pattern as verify graph, keyed by n_steps instead of B. Captured
-    // once per distinct accept_len + 1 seen in a run; reused across cycles.
-    // On 27B HumanEval where n_steps hovers around 8-11, this caches 3-4
-    // graphs. Per-cycle savings target: 1-3 ms of launch overhead over
-    // ~192 kernel dispatches per replay.
-
-    pub fn replay_has_graph(&self, n_steps: usize) -> bool {
-        // bind_thread: skip — pure state query
-        self.replay_graph_cache.contains_key(&n_steps)
-    }
-
-    pub fn replay_needs_warmup(&self, n_steps: usize) -> bool {
-        // bind_thread: skip — pure state query
-        !self.replay_warmed_up.contains(&n_steps)
-    }
-
-    pub fn replay_mark_warmup_done(&mut self, n_steps: usize) {
-        // bind_thread: skip — pure state query
-        self.replay_warmed_up.insert(n_steps);
-    }
-
-    pub fn begin_replay_graph_capture(&mut self, n_steps: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        debug_assert!(self.replay_capturing_n.is_none(),
-            "begin_replay_graph_capture: already capturing for n_steps={:?}",
-            self.replay_capturing_n);
-        debug_assert!(!self.capture_mode,
-            "begin_replay_graph_capture: capture_mode already set");
-        self.capture_blobs.clear();
-        self.replay_capturing_n = Some(n_steps);
-        self.capture_mode = true;
-        let stream = self.active_stream.as_ref()
-            .expect("replay graph capture requires an explicit stream");
-        self.hip.stream_begin_capture(stream, 0)
-    }
-
-    pub fn end_replay_graph_capture(&mut self) -> HipResult<()> {
-        self.bind_thread()?;
-        let n_steps = self.replay_capturing_n.take()
-            .expect("end_replay_graph_capture without matching begin");
-        self.capture_mode = false;
-        let stream = self.active_stream.as_ref().unwrap();
-        let graph = self.hip.stream_end_capture(stream)?;
-        let exec = self.hip.graph_instantiate(&graph)?;
-        let blobs = std::mem::take(&mut self.capture_blobs);
-        self.replay_graph_cache.insert(n_steps, (graph, exec, blobs));
-        Ok(())
-    }
-
-    pub fn replay_graph_launch(&self, n_steps: usize) -> HipResult<()> {
-        self.bind_thread()?;
-        let entry = self.replay_graph_cache.get(&n_steps)
-            .unwrap_or_else(|| panic!("no captured replay graph for n_steps={}", n_steps));
-        let stream = self.active_stream.as_ref().unwrap();
-        self.hip.graph_launch(&entry.1, stream)
-    }
-
-    pub fn replay_graph_count(&self) -> usize {
-        // bind_thread: skip — pure state query
-        self.replay_graph_cache.len()
-    }
-
-    pub fn replay_graph_destroy_all(&mut self) {
-        self.bind_thread_or_warn();
-        for (_, (graph, exec, _blobs)) in self.replay_graph_cache.drain() {
-            let _ = self.hip.graph_exec_destroy(exec);
-            let _ = self.hip.graph_destroy(graph);
-        }
-        self.replay_warmed_up.clear();
-        self.replay_capturing_n = None;
-    }
+    // Moved to crate::graph::GraphState.
 
     /// D→D copy with offsets that picks async (on the active stream) when
     /// a stream is set and sync otherwise. Captured graphs require async on
@@ -1091,7 +751,7 @@ impl Gpu {
         src: &[u8],
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if self.capture_mode {
+        if self.graphs.capture_mode {
             let stream = self.active_stream.as_ref()
                 .expect("capture mode requires an active stream");
             self.hip.memcpy_htod_async(dst, src, stream)
@@ -1112,7 +772,7 @@ impl Gpu {
         params: &mut Vec<*mut std::ffi::c_void>,
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
-        if self.capture_mode || self.flags.force_blob_path {
+        if self.graphs.capture_mode || self.flags.force_blob_path {
             let mut blob = blob_builder();
             // Pad tail to 16-byte alignment — some kernel struct layouts that
             // HIP's loader expects have an implicit final pad to the struct's
@@ -1120,9 +780,9 @@ impl Gpu {
             // capture on ROCm 7.x the loader is stricter and unpadded tails
             // have been observed to cause silent argument corruption.
             blob.pad_to(16);
-            self.capture_blobs.push(blob.into_vec());
+            self.graphs.capture_blobs.push(blob.into_vec());
             // Re-borrow fields separately to avoid conflicting borrows on self
-            let buf = self.capture_blobs.last_mut().unwrap();
+            let buf = self.graphs.capture_blobs.last_mut().unwrap();
             let func = &self.functions[func_name];
             let stream = self.active_stream.as_ref().map(|s| s as &hip_bridge::Stream);
             unsafe {
@@ -1220,7 +880,7 @@ impl Gpu {
         // needs to re-run. The pointer-equality cache would wrongly skip
         // the node and read stale FP16 on replay. During normal dispatch
         // the skip is still correct.
-        let must_convert = self.capture_mode || self.fp16_x_source_ptr != src_ptr;
+        let must_convert = self.graphs.capture_mode || self.fp16_x_source_ptr != src_ptr;
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
@@ -1264,7 +924,7 @@ impl Gpu {
             self.fp8_x_source_ptr = std::ptr::null_mut();
         }
 
-        let must_convert = self.capture_mode || self.fp8_x_source_ptr != src_ptr;
+        let must_convert = self.graphs.capture_mode || self.fp8_x_source_ptr != src_ptr;
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
@@ -1382,8 +1042,8 @@ impl Gpu {
             let y_wmma = self.zeros(&[screen_batch * m], DType::F32)?;
             let y_mmq = self.zeros(&[screen_batch * m], DType::F32)?;
 
-            let saved_capture = self.capture_mode;
-            self.capture_mode = true;
+            let saved_capture = self.graphs.capture_mode;
+            self.graphs.capture_mode = true;
 
             // Reference path: use FP16 wave64 on gfx906, WMMA otherwise
             if self.arch_caps.is_gfx906() {
@@ -1400,7 +1060,7 @@ impl Gpu {
                 self.gemm_hfq4g256_mmq_set_prequant(a_raw, xq, &y_mmq, m, k, screen_batch)?;
             }
 
-            self.capture_mode = saved_capture;
+            self.graphs.capture_mode = saved_capture;
             self.hip.device_synchronize()?;
 
             let ref_out = self.download_f32(&y_wmma)?;
@@ -1946,9 +1606,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ///     DFlash per-n_steps tape-replay graphs.
     pub fn invalidate_graph_state(&mut self) {
         self.bind_thread_or_warn();
-        self.graph_destroy();
-        self.verify_graph_destroy_all();
-        self.replay_graph_destroy_all();
+        self.graphs.graph_destroy(&self.hip, self.device_id);
+        self.graphs.verify_graph_destroy_all(&self.hip, self.device_id);
+        self.graphs.replay_graph_destroy_all(&self.hip, self.device_id);
     }
 
     // ── Kernel operations ───────────────────────────────────────
@@ -7978,7 +7638,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
-            && !self.capture_mode
+            && !self.graphs.capture_mode
         {
             let shadow_qkv = self.ensure_fp16_shadow(a_qkv, qkv_m, k)?;
             let shadow_z = self.ensure_fp16_shadow(a_z, z_m, k)?;
@@ -8059,7 +7719,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                         // capture; the dp4a kernel may not be compiled yet on
                         // a fresh process).
                         let r3 = if r2.is_ok() {
-                            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+                            if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                                 self.gemm_qkvza_hfq4g256_wave64_dp4a_prequant(
                                     a_qkv, a_z, a_beta, a_alpha,
                                     xq,
@@ -8084,7 +7744,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 // batch_size > 1 below the MMQ cutover or when capture mode
                 // prevents MMQ. Skipped on screen-reject to preserve the
                 // higher-precision fallback intent.
-                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                     return self.gemm_qkvza_hfq4g256_wave64_dp4a(
                         a_qkv, a_z, a_beta, a_alpha, x,
                         y_qkv, y_z, y_beta, y_alpha,
@@ -8753,7 +8413,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
-            && !self.capture_mode
+            && !self.graphs.capture_mode
         {
             let sq = self.ensure_fp16_shadow(a_q, q_m, k)?;
             let sk = self.ensure_fp16_shadow(a_k, k_m, k)?;
@@ -8821,7 +8481,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 // batch_size > 1 below the MMQ cutover or in capture mode.
                 // Skipped on screen-reject (dp4a shares Q8_1 quant step with
                 // MMQ; routing rejected weights here would defeat the screen).
-                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+                if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                     return self.gemm_qkv_hfq4g256_wave64_dp4a(
                         a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
                     );
@@ -9510,7 +9170,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if cdna3
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
-            && !self.capture_mode
+            && !self.graphs.capture_mode
         {
             if let Ok(Some(w_gate_ptr)) = self.ensure_fp16_shadow(a_gate, gate_m, k) {
                 if let Ok(Some(w_up_ptr)) = self.ensure_fp16_shadow(a_up, up_m, k) {
@@ -9567,7 +9227,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // gfx906 dp4a 2-way fused (issue #276 Gap 2). Fires for B>1
             // below the MMQ cutover or in capture mode. Skipped on
             // screen-reject.
-            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_gate_up_hfq4g256_wave64_dp4a(
                     a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size,
                 );
@@ -16533,7 +16193,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 && batch_size >= 16
                 && m % 16 == 0
                 && k % 256 == 0
-                && !self.capture_mode
+                && !self.graphs.capture_mode
             {
                 if want == Some("4") && batch_size % 64 == 0 && m % 16 == 0 {
                     return self.gemm_hfq4g256_residual_mfma_v4_gfx942(a_raw, x, y, m, k, batch_size);
@@ -16551,7 +16211,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
-            && !self.capture_mode
+            && !self.graphs.capture_mode
         {
             if let Ok(Some(shadow_ptr)) = self.ensure_fp16_shadow(a_raw, m, k) {
                 let x_fp16 = self.ensure_fp16_x(x, batch_size * k)?;
@@ -16619,13 +16279,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // quantization step that MMQ already failed on for this
             // weight).
             //
-            // The `!self.capture_mode` guard: `ensure_q8_1_mmq_x` (and the
+            // The `!self.graphs.capture_mode` guard: `ensure_q8_1_mmq_x` (and the
             // downstream `ensure_kernel` for this kernel) can fire `hipMalloc`
             // / JIT-compile on first use, both unsafe inside an active capture.
             // The internal Q8_1 quantize launch itself goes through
             // `launch_maybe_blob` and IS recorded into the captured graph;
             // the guard protects only first-use-only side effects.
-            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            if !mmq_screen_rejected && self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_hfq4g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
 
@@ -17461,9 +17121,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.graphs.capture_mode,
             "qkv_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
-            batch_size, self.capture_mode,
+            batch_size, self.graphs.capture_mode,
         );
         debug_assert!(
             q_m % 128 == 0 && k_m % 128 == 0 && v_m % 128 == 0,
@@ -17620,9 +17280,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         debug_assert!(
-            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.graphs.capture_mode,
             "gate_up_hfq4g256_mmq_gfx906 called at non-winning B={} (capture={})",
-            batch_size, self.capture_mode,
+            batch_size, self.graphs.capture_mode,
         );
 
         // MMQ_Y selection. Y=64 is the higher-occupancy variant (plan §6.5);
@@ -17756,10 +17416,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // silently route a non-winning batch through MMQ. Mirrors the MQ6
         // sibling's `hfq6_mmq_route` assert added in 5ea9050.
         debug_assert!(
-            self.arch_caps.should_use_mmq(batch_size) || self.capture_mode,
+            self.arch_caps.should_use_mmq(batch_size) || self.graphs.capture_mode,
             "_mmq_set_gfx906 called at non-winning B={} (capture={}) — \
              caller must gate via should_use_mmq first",
-            batch_size, self.capture_mode,
+            batch_size, self.graphs.capture_mode,
         );
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
@@ -18437,7 +18097,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // capture mode (matches the rocBLAS branch's caveat — Q8_1
         // quantize launch must be reachable from the captured graph or
         // pre-baked).
-        if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+        if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
             return self.gemm_hfq4g256_dp4a(a_raw, x, y, m, k, batch_size);
         }
 
@@ -18452,7 +18112,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         if self.rocblas_arch_eligible()
             && batch_size >= self.rocblas_min_batch()
             && self.rocblas.is_some()
-            && !self.capture_mode
+            && !self.graphs.capture_mode
         {
             if let Ok(Some(shadow_ptr)) = self.ensure_fp16_shadow(a_raw, m, k) {
                 // Convert X to FP16 via the existing ensure_fp16_x helper.
@@ -19157,7 +18817,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // gfx906: dp4a residual + zero-init Y for `=` semantics.
         // Skip in capture mode (the residual kernel calls ensure_q8_1_mmq_x
         // which launches an internal quantize kernel — matches HFQ4 sibling).
-        if batch_size > 1 && self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+        if batch_size > 1 && self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
             match self.active_stream.as_ref() {
                 Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
                 None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
@@ -19335,8 +18995,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // kernel. Mirror of the HFQ4 sibling pattern at gemm_hfq4g256_wave64_dp4a.
             // Skip in capture mode: ensure_q8_1_mmq_x launches an internal
             // quantize kernel that the captured graph may not record (matches
-            // gemm_hfq4g256_dp4a's `&& !self.capture_mode` guard at line ~7889).
-            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            // gemm_hfq4g256_dp4a's `&& !self.graphs.capture_mode` guard at line ~7889).
+            if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_hfq6g256_residual_wave64_dp4a(a_raw, x, y, m, k, batch_size);
             }
             // FP16 packed on all other RDNA
@@ -19579,7 +19239,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // item 3). Pre-quantize x to Q8_1 and dispatch the dp4a kernel.
             // Skip in capture mode (Q8_1 quantize launch must be reachable
             // from captured graph or pre-baked) — matches HFQ4 sibling pattern.
-            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_qkvza_hfq6g256_wave64_dp4a(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -20063,7 +19723,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
-            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_qkv_hfq6g256_wave64_dp4a(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -20504,7 +20164,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             }
             // gfx906: wave64+dp4a batched fused (Phase A.3).
             // Skip in capture mode (Q8_1 quantize) — matches HFQ4 sibling.
-            if self.arch_caps.gemv_dp4a_enabled() && !self.capture_mode {
+            if self.arch_caps.gemv_dp4a_enabled() && !self.graphs.capture_mode {
                 return self.gemm_gate_up_hfq6g256_wave64_dp4a(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             // v_dot2_f32_f16 on archs that have it (gfx1011/1012/1030-1032).
@@ -23370,7 +23030,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         // For profiling / non-graph code paths, the actual tile count:
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         // ── Tile kernel ──
         self.ensure_kernel(
@@ -24249,7 +23909,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht3_tile",
@@ -24342,7 +24002,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         self.ensure_givens4_kernel(
             "attention_flash_asym3_tile",
@@ -24521,7 +24181,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         // Tile kernel
         self.ensure_givens4_kernel(
@@ -24618,7 +24278,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht4_tile",
@@ -24714,7 +24374,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         self.ensure_givens4_kernel(
             "attention_flash_fwht2_tile",
@@ -24807,7 +24467,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
         let actual_tiles = (seq_len_hint + TILE_SIZE - 1) / TILE_SIZE;
-        let launch_tiles = if self.capture_mode { max_tiles } else { actual_tiles };
+        let launch_tiles = if self.graphs.capture_mode { max_tiles } else { actual_tiles };
 
         self.ensure_givens4_kernel(
             "attention_flash_asym2_tile",

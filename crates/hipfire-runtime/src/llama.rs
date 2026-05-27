@@ -2037,7 +2037,7 @@ fn forward_prefill_chunk(
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
     }
 
-    let max_ctx_len = if gpu.capture_mode {
+    let max_ctx_len = if gpu.graphs.capture_mode {
         kv_cache.physical_cap
     } else {
         start_pos + n
