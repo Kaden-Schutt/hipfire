@@ -9,6 +9,7 @@ pub mod attention;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
+pub mod norm;
 pub mod scratch;
 mod compiler;
 mod dispatch;
