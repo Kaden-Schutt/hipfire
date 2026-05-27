@@ -22718,11 +22718,16 @@ impl Gpu {
         )
     }
 
-    /// Batched, masked, tiled-partials flash attention for Q8_0 KV. No LDS
-    /// cap: replaces the per-position fallback `attention_q8_0_kv_batched_masked`
+    /// Batched, masked flash attention for Q8_0 KV. No LDS cap: replaces
+    /// the per-position fallback `attention_q8_0_kv_batched_masked`
     /// degenerated to above 15000 ctx (it staged scores[max_ctx_len] in LDS).
-    /// cos/sin are unused (Q8 K is unrotated) but the shared launcher takes
-    /// them, so q is passed twice as dummies — the kernel never reads them.
+    ///
+    /// Arch gate: gfx906/gfx1031 take the token-parallel `_tokpar` kernel
+    /// (each thread owns whole tokens — the original per-token-serial
+    /// Phase A was issue-bound at <1% of peak BW). Other archs and
+    /// tree-verify mode (small blocks) keep the portable `_tile_batched`
+    /// kernel. `partials` is used only by the tile_batched path; tokpar
+    /// writes output directly via register-resident online softmax.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_q8_0_batched_masked(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -22735,6 +22740,20 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Token-parallel path: EXPERIMENTAL, default OFF. Measured 0.63-0.70×
+        // (slower) vs tile_batched on gfx906 n=64-512/ctx=16k-32k — the
+        // whole-head_dim serial dot per thread lacks head-dim ILP that
+        // tile_batched's 32-lane split provides. Kept behind an opt-in flag
+        // for further experiments (e.g. MFMA variant). tile_batched is the
+        // correct, NIAH-PASS, fastest-scalar default.
+        let tokpar = std::env::var("HIPFIRE_Q8_TOKPAR").as_deref() == Ok("1");
+        if tokpar && tree_bias.is_none() {
+            return self.launch_q8_0_tokpar(
+                q, k_cache, v_cache, out, positions,
+                n_heads, n_kv_heads, head_dim, batch_size,
+                block_start, block_cols,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_q8_0_tile_batched",
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
@@ -22742,6 +22761,76 @@ impl Gpu {
             q, k_cache, v_cache, out, positions, q, q,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
             tree_bias, block_start, block_cols,
+        )
+    }
+
+    /// Token-parallel Q8_0 flash attention launcher. Grid [n_heads, batch],
+    /// block of BLOCK threads, register-resident online softmax → writes
+    /// `out` directly (no partials / no reduce kernel). LDS bounded at
+    /// (TILE + BLOCK + head_dim) f32.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_q8_0_tokpar(
+        &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        block_start: usize, block_cols: usize,
+    ) -> HipResult<()> {
+        const TILE: usize = 256; // must match Q8_TOKPAR_TILE in the kernel
+        // gfx906 is wave64-native → 256 threads (4 waves); RDNA → 128.
+        let block: u32 = if self.arch == "gfx906" { 256 } else { 128 };
+        self.ensure_kernel(
+            "attention_flash_q8_0_tokpar",
+            kernels::ATTENTION_FLASH_Q8_0_TOKPAR_SRC,
+            "attention_flash_q8_0_tokpar",
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let q_ptr = q.buf.as_ptr();
+        let k_ptr = k_cache.buf.as_ptr();
+        let v_ptr = v_cache.buf.as_ptr();
+        let o_ptr = out.buf.as_ptr();
+        let pos_ptr = positions.buf.as_ptr();
+        let dummy = q.buf.as_ptr(); // cos/sin unused
+        let bias_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let nh = n_heads as i32; let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32; let ms = 0i32; // max_seq unused by tokpar
+        let sc = scale; let bo = 0i32;
+        let bs = block_start as i32; let bc = block_cols as i32;
+        let shared_mem = ((TILE + block as usize + head_dim) * 4) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &q_ptr as *const _ as *mut c_void,
+            &k_ptr as *const _ as *mut c_void,
+            &v_ptr as *const _ as *mut c_void,
+            &o_ptr as *const _ as *mut c_void,
+            &pos_ptr as *const _ as *mut c_void,
+            &dummy as *const _ as *mut c_void,
+            &dummy as *const _ as *mut c_void,
+            &bias_ptr as *const _ as *mut c_void,
+            &nh as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &ms as *const _ as *mut c_void,
+            &sc as *const _ as *mut c_void,
+            &bo as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+            &bc as *const _ as *mut c_void,
+        ];
+        // Graph-capture-safe: blob path keeps kernarg pointers alive until
+        // replay. Arg order MUST match the kernel signature exactly.
+        self.launch_maybe_blob(
+            "attention_flash_q8_0_tokpar",
+            [n_heads as u32, batch_size as u32, 1],
+            [block, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr); b.push_ptr(k_ptr); b.push_ptr(v_ptr);
+                b.push_ptr(o_ptr); b.push_ptr(pos_ptr);
+                b.push_ptr(dummy); b.push_ptr(dummy); b.push_ptr(bias_ptr);
+                b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
+                b.push_f32(sc); b.push_i32(bo); b.push_i32(bs); b.push_i32(bc);
+                b
+            },
         )
     }
 
@@ -27401,6 +27490,15 @@ impl Gpu {
                             kernels::ATTENTION_FLASH_Q8_0_TILE_SRC.to_string()));
                 specs.push(("attention_flash_q8_0_reduce",
                             kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC.to_string()));
+                // Long-ctx (>15k) batched FA: portable tiled-partials
+                // fallback + token-parallel fast path. Precompiled so
+                // graph capture never JITs mid-capture.
+                specs.push(("attention_flash_q8_0_tile_batched",
+                            kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC.to_string()));
+                specs.push(("attention_flash_asym_reduce_batched",
+                            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC.to_string()));
+                specs.push(("attention_flash_q8_0_tokpar",
+                            kernels::ATTENTION_FLASH_Q8_0_TOKPAR_SRC.to_string()));
             }
         }
 
