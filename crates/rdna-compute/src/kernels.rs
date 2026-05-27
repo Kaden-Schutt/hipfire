@@ -2466,6 +2466,13 @@ pub const V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip");
 
+/// 4-warp MoE-grouped MQ2-Lloyd WMMA GEMM for gfx1151 (RDNA3.5). 64-row
+/// × 16-slot tile (vs 16×16 single-warp baseline), LDS-staged X shared
+/// across 4 warps for 4× less B-fragment memory traffic per FLOP. Slot
+/// dim stays at 16 due to expert-spanning constraint.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
+
 /// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
 /// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
 pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");

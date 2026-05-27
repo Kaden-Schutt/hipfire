@@ -6588,19 +6588,46 @@ fn ffn_batched(
 
         // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
         // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
-        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-            gate_up_ptrs,
-            &pbs.moe_expert_tile_ids,
-            &pbs.moe_sorted_slot_index,
-            &pbs.ffn_x_rot_batch,
-            &pbs.moe_y_gate_up_grouped,
-            2 * im,
-            hidden,
-            k_top,
-            m_total_max,
-            batch_size,
-        )
-        .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped gate_up l{layer_idx}: {e:?}"))?;
+        //
+        // Opt-in 4-warp 64×16 variant (HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1):
+        // bit-exact vs the single-warp baseline (`bench_mq2g256_lloyd_moe_4w`
+        // max_abs=0 across all V4F MoE cells). 1.04-1.13× microbench at
+        // PP_BATCH ∈ {128, 256, 1024}. Default OFF — the kernel is
+        // memory-latency / scheduling bound at ~6 GiB/s (well below DRAM
+        // peak), so the tile lever is small here; opt in for tuning.
+        let use_lloyd_4w = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref() == Ok("1")
+            && (2 * im) % 64 == 0
+            && hidden % 256 == 0;
+        if use_lloyd_4w {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w gate_up l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped gate_up l{layer_idx}: {e:?}"))?;
+        }
 
         // Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric
         // clamp. One launch instead of two; eliminates `moe_up_batch`
@@ -6663,19 +6690,40 @@ fn ffn_batched(
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
-        gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
-            w2_ptrs,
-            &pbs.moe_expert_tile_ids,
-            &pbs.moe_sorted_slot_index,
-            &pbs.moe_rot_batch,
-            &pbs.moe_y_down_grouped,
-            hidden,
-            im,
-            1,
-            m_total_max,
-            batch_size * k_top,
-        )
-        .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped down l{layer_idx}: {e:?}"))?;
+        // Same 4w shape-gated opt-in as the gate_up GEMM above.
+        let use_lloyd_4w_down = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref() == Ok("1")
+            && hidden % 64 == 0
+            && im % 256 == 0;
+        if use_lloyd_4w_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_4w down l{layer_idx}: {e:?}"))?;
+        } else {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped down l{layer_idx}: {e:?}"))?;
+        }
 
         // Down-combine: per-(token, m) sum K_TOP slots via inverse_perm,
         // weighted by topk_weights, accumulated into ffn_out_batch (the
