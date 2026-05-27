@@ -619,7 +619,7 @@ fn main() {
         &mut gpu, &draft_cfg, draft_scratch_b, ctx_capacity, draft_weights.has_mq,
     ).expect("alloc draft scratch");
     if draft_weights.has_mq {
-        eprintln!("draft: MQ4 weights detected, FWHT rotation scratch enabled");
+        eprintln!("draft: MQ weights detected, FWHT rotation scratch enabled");
     }
 
     // ── Check vocab compatibility ─────────────────────────────────────
