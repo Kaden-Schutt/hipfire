@@ -5,6 +5,7 @@
 //! rdna-compute: Kernel compilation, caching, and dispatch for RDNA GPUs.
 
 pub mod arch_caps;
+pub mod gemv;
 pub mod graph;
 pub mod scratch;
 mod compiler;
