@@ -5338,14 +5338,89 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         });
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
-    // Track whether the non-spec decode loop saw a complete
+    // Track whether the decode loop saw a complete
     // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
-    // `done` envelope below — spec_mode leaves this at 0 (it doesn't
-    // run the DSML parser).
+    // `done` envelope below.
     let mut tool_calls_parsed_count: usize = 0;
     if spec_mode {
         // Spec-decode loop. The verifier picks argmax (greedy) so accept
-        // semantics stay deterministic.
+        // semantics stay deterministic. When tools are present, thread
+        // the same DSML grammar matcher through the MTP draft and main
+        // verifier logits, then parse the emitted stream into tool_calls
+        // events just like the plain decode loop.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            if let StreamEvent::ToolCalls(calls) = ev {
+                for c in calls {
+                    emit_tool_calls_buf.push(
+                        hipfire_runtime::prompt_frame::ToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        }
+                    );
+                }
+            }
+        };
+
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
@@ -5353,10 +5428,34 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             let lh: Option<&rdna_compute::GpuTensor> = unsafe {
                 last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
             };
-            let r = match deepseek4::spec_decode::speculative_decode_step_with_pbs(
-                cfg, weights, state, gpu, pbs,
-                spec_last_token, spec_last_position, lh, spec_k,
-            ) {
+            let r = match if grammar_active {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs_grammar(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                    &mut matcher,
+                    decoded_vocab,
+                    &mut grammar_mask,
+                )
+            } else {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                )
+            } {
                 Ok(r) => r,
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("deepseek4spec-decode failed: {e:?}"));
@@ -5373,15 +5472,22 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     break 'outer;
                 }
                 let frag = tokenizer.decode(&[t]);
-                // Build through serde_json so `id` (user-supplied) and
-                // `frag` (model-generated UTF-8 with possible `"`/`\`)
-                // can't corrupt the JSONL line.
-                let envelope = serde_json::json!({
-                    "type": "token",
-                    "id": id,
-                    "text": frag,
-                });
-                let _ = writeln!(stdout, "{}", envelope);
+                if grammar_active {
+                    for ev in parser.feed(&frag) {
+                        absorb_event(&ev);
+                        emit_stream_event(stdout, id, ev);
+                    }
+                } else {
+                    // Build through serde_json so `id` (user-supplied) and
+                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
+                    // can't corrupt the JSONL line.
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                }
                 emit_committed_event(stdout, id, t, generated_count, decode_t0.elapsed().as_millis() as u64);
                 let _ = stdout.flush();
                 m.conversation_tokens.push(t);
@@ -5392,6 +5498,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 spec_last_token = t;
             }
             last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        }
+        if grammar_active {
+            for ev in parser.finish() {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            let _ = stdout.flush();
+            drop(absorb_event);
+            tool_calls_parsed_count = emit_tool_calls_buf.len();
         }
     } else {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
