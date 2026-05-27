@@ -286,30 +286,39 @@ ran it head-to-head with the MQ4 0.8B on the 3-needle fixture, all keep
 ratios (matrix script `scripts/pflash_drafter_quality_matrix.sh`,
 results in /local/hipfire/pfmatrix_20260527_151928/):
 
-| 0.8B drafter | keep 0.30/0.20/0.15/0.10 | recovered |
-|---|---|---|
-| **MQ4** (4-bit) | all | **2/3** — drops depth-0.25 every ratio |
-| **Q8** (near-lossless) | all | **3/3** — every needle, incl keep=0.10 |
+Full matrix (3-needle niah_multi_64k, 43121 src, 9B-q8 target, fwht3,
+all keep ratios 0.30/0.20/0.15/0.10; script
+`scripts/pflash_drafter_quality_matrix.sh`,
+/local/hipfire/pfmatrix_20260527_151928/):
 
-**Same model, same capacity, same speed class — only the weight quant
-differs. Q8 → 3/3, MQ4 → 2/3.** The 2/3 ceiling was DRAFTER QUANT, NOT
-capacity. MQ4 quantization noise corrupts the attention scores enough to
-drop the early needle's region. The paper's 4B/8B numbers are at full
-precision, so they didn't transfer to our 4-bit drafter.
+| drafter | capacity | quant | recovered (every keep ratio) |
+|---|---|---|---|
+| 0.8B MQ4 | 1× | 4-bit | **2/3** — drops depth-0.25 |
+| **0.8B Q8** | 1× | near-lossless | **3/3** ✅ incl keep=0.10 |
+| 4B MQ4 | **5×** | 4-bit | **2/3** — STILL drops depth-0.25 |
 
-**Actionable fix:** ship a Q8 drafter for PFlash scoring (not MQ4) — same
-size/speed, correct multi-fact recall. And keep-ratio is confirmed safe
-WITH a good drafter: Q8 holds 3/3 down to keep=0.10 (4337 tok) → the
-quadratic prefill lever is real and quality-preserving. (4B-MQ4 cells
-still running to check if capacity adds anything atop Q8 — but headline
-is settled.)
+**DECISIVE: it's QUANT, not capacity.** The 4B-MQ4 drafter has 5× the
+parameters of the 0.8B but STILL misses the depth-0.25 needle (2/3),
+while the near-lossless Q8 0.8B (1/5 the size) gets 3/3. A bigger 4-bit
+drafter does NOT help; a well-quantized small one does. MQ4 quantization
+noise corrupts the attention scores enough to drop the early needle's
+region — independent of model size. The paper's 4B/8B numbers are
+full-precision, so they didn't transfer to our 4-bit drafters.
+
+Single-needle (niah_32k, 21551 src, keep=0.15) is a no-op discriminator:
+all three drafters PASS 1/1 — confirming why single-needle missed this.
+
+**Actionable fix:** ship a Q8 drafter for PFlash scoring (not MQ4, not a
+bigger MQ4) — 1/5 the size of the 4B, near-lossless scoring, 3/3 recall.
+keep-ratio confirmed safe WITH a good drafter: Q8 holds 3/3 to keep=0.10
+(4337 tok) → the quadratic prefill lever is real and quality-preserving.
 
 ### Next
 
 - NIAH-gate wave64 at long ctx (DONE — PASS), committed 8c48c089.
 - keep-ratio multi-needle (DONE — flat 2/3 on MQ4 drafter, keep-ratio SAFE).
-- DRAFTER QUANT is the recall limiter (DONE — Q8 0.8B = 3/3, MQ4 0.8B =
-  2/3). Ship a Q8 drafter. 4B-MQ4 cells running to check capacity-on-top.
+- DRAFTER QUANT is the recall limiter (DONE & DECISIVE — Q8 0.8B = 3/3;
+  both MQ4 0.8B AND 4B-MQ4 = 2/3). Capacity ruled out. Ship a Q8 drafter.
 - dot8 4-bit-K score pass (kernel lever, helps PFlash-opt-out too).
 - Next ceiling is MEMORY (91% MemUnitBusy). Per the gfx906 KV-read study
   (skyne98): HSD layout (we're already HSD-ish) + x4 (dwordx4/128-bit)
