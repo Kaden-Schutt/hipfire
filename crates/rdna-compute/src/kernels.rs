@@ -1857,6 +1857,7 @@ pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str = include_str!("../../..
 pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TOKPAR_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_tokpar.hip");
 pub const ATTENTION_FLASH_Q8_0_DP4A_GFX906_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_dp4a.gfx906.hip");
+pub const ATTENTION_FLASH_Q8_0_DP4A_WAVE64_GFX906_SRC: &str = include_str!("../../../kernels/src/attention_flash_q8_0_dp4a_wave64.gfx906.hip");
 
 // Signed-FWHT K-write + FA tile variants — same byte layout as asym family,
 // rotation primitive swapped from Givens (per-quad cos/sin) to signed-FWHT

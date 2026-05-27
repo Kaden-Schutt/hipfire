@@ -22233,6 +22233,32 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        // Wave32 tile block (default for all asym/fwht/dp4a-wave32 kernels).
+        self.launch_asym_flash_batched_blk(
+            tile_key, tile_src, tile_func_name, q, k_cache, v_cache, out, positions,
+            cos_theta, sin_theta, n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len,
+            batch_size, partials, tree_bias, block_start, block_cols, 32,
+        )
+    }
+
+    /// As `launch_asym_flash_batched`, with an explicit tile-kernel block
+    /// width (32 = wave32 layout, 64 = wave64). The reduce kernel always
+    /// runs wave32 (dim-indexed, width-agnostic).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_asym_flash_batched_blk(
+        &mut self,
+        tile_key: &'static str, tile_src: &'static str, tile_func_name: &'static str,
+        q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
+        out: &GpuTensor, positions: &GpuTensor,
+        cos_theta: &GpuTensor, sin_theta: &GpuTensor,
+        n_heads: usize, n_kv_heads: usize, head_dim: usize,
+        max_seq: usize, max_ctx_len: usize, batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        tile_block: u32,
+    ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
@@ -22298,7 +22324,7 @@ impl Gpu {
                 self.launch_maybe_blob(
                     tile_func_name,
                     [n_heads as u32, max_tiles as u32, chunk as u32],
-                    [32, 1, 1],
+                    [tile_block, 1, 1],
                     (TILE_SIZE * 4) as u32,
                     &mut params,
                     || {
@@ -22759,6 +22785,22 @@ impl Gpu {
         // relieve the issue-bound scalar dot. Requires head_dim % 32 == 0.
         // HIPFIRE_Q8_DP4A={0,1} overrides the arch default. Default-on for
         // gfx906 only once NIAH-validated; until then keep behind the flag.
+        // gfx906 WAVE64 dp4a — rocprofv2 showed the wave32 dp4a/tile kernels
+        // run at VALUUtilization 48.6% (upper 32 lanes idle on wave64). This
+        // variant uses all 64 lanes (4 dims/lane, one sdot4/token, reduce
+        // over 64). HIPFIRE_Q8_DP4A_W64=1; head_dim must be 64-divisible
+        // (4 dims/lane × 64). EXPERIMENTAL until NIAH + A/B validated.
+        let dp4a_w64 = std::env::var("HIPFIRE_Q8_DP4A_W64").as_deref() == Ok("1");
+        if dp4a_w64 && self.arch == "gfx906" && head_dim % 64 == 0 {
+            return self.launch_asym_flash_batched_blk(
+                "attention_flash_q8_0_dp4a_wave64",
+                kernels::ATTENTION_FLASH_Q8_0_DP4A_WAVE64_GFX906_SRC,
+                "attention_flash_q8_0_dp4a_wave64",
+                q, k_cache, v_cache, out, positions, q, q,
+                n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+                tree_bias, block_start, block_cols, 64,
+            );
+        }
         let dp4a_default = false; // flip to (self.arch == "gfx906") after NIAH gate
         let dp4a = std::env::var("HIPFIRE_Q8_DP4A").ok()
             .and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None })

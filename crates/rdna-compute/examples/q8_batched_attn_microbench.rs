@@ -95,19 +95,24 @@ fn main() {
             &q, &k_cache, &v_cache, &out_ref, &positions,
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
         ).expect("ref");
-        // Force the candidate (tokpar by default, or dp4a if DP4A=1) into out_tp.
+        // Force the candidate into out_tp: W64=1 → dp4a wave64, DP4A=1 →
+        // dp4a wave32, else tokpar.
         let use_dp4a = std::env::var("DP4A").as_deref() == Ok("1");
+        let use_w64 = std::env::var("W64").as_deref() == Ok("1");
         std::env::set_var("HIPFIRE_Q8_TOKPAR", "0");
-        if use_dp4a {
-            std::env::set_var("HIPFIRE_Q8_DP4A", "1");
+        let cand = if use_w64 {
+            std::env::set_var("HIPFIRE_Q8_DP4A_W64", "1"); "dp4a_wave64"
+        } else if use_dp4a {
+            std::env::set_var("HIPFIRE_Q8_DP4A", "1"); "dp4a"
         } else {
-            std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
-        }
+            std::env::set_var("HIPFIRE_Q8_TOKPAR", "1"); "tokpar"
+        };
         gpu.attention_flash_q8_0_batched_masked(
             &q, &k_cache, &v_cache, &out_tp, &positions,
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
         ).expect("candidate");
         std::env::remove_var("HIPFIRE_Q8_DP4A");
+        std::env::remove_var("HIPFIRE_Q8_DP4A_W64");
         gpu.hip.device_synchronize().unwrap();
         let a = gpu.download_f32(&out_ref).unwrap();
         let b = gpu.download_f32(&out_tp).unwrap();
@@ -120,7 +125,7 @@ fn main() {
             max_rel = max_rel.max(d / den);
         }
         let ref_norm: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
-        println!("\n=== VERIFY tokpar vs tile_batched ===");
+        println!("\n=== VERIFY {cand} vs tile_batched ===");
         println!("max abs diff: {max_abs:.3e}   max rel diff: {max_rel:.3e}   ref L2 norm: {ref_norm:.3e}");
         println!("{}", if max_abs < 1e-2 { "PASS (within FP noise)" } else { "FAIL — math mismatch" });
         std::env::remove_var("HIPFIRE_Q8_TOKPAR");
@@ -159,7 +164,7 @@ fn main() {
     });
     std::env::remove_var("HIPFIRE_Q8_TOKPAR");
 
-    // (A2) dp4a (gfx906 v_dot4_i32_i8 Q·K).
+    // (A2) dp4a wave32 (gfx906 v_dot4_i32_i8 Q·K).
     std::env::set_var("HIPFIRE_Q8_DP4A", "1");
     let dp4a_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
@@ -168,6 +173,16 @@ fn main() {
         ).expect("dp4a");
     });
     std::env::remove_var("HIPFIRE_Q8_DP4A");
+
+    // (A3) dp4a WAVE64 (full 64-lane utilization).
+    std::env::set_var("HIPFIRE_Q8_DP4A_W64", "1");
+    let w64_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_flash_q8_0_batched_masked(
+            &q, &k_cache, &v_cache, &out, &positions,
+            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
+        ).expect("dp4a_wave64");
+    });
+    std::env::remove_var("HIPFIRE_Q8_DP4A_W64");
 
     // (B) OLD per-position loop — replicate the fallback this PR removed.
     let pos_single: Vec<Vec<u8>> = (0..n)
@@ -201,12 +216,14 @@ fn main() {
     const PEAK_GIBS: f64 = 954.0;
 
     println!("\n=== Q8 long-ctx attention ===");
-    println!("TILE    (scalar lane-split, default)     : {tile_ms:8.2} ms");
-    println!("DP4A    (gfx906 v_dot4_i32_i8 Q·K)       : {dp4a_ms:8.2} ms");
-    println!("TOKPAR  (token-parallel)                 : {new_ms:8.2} ms");
-    println!("OLD     per-position loop (n={n})         : {old_ms:8.2} ms");
-    println!("speedup DP4A vs TILE                      : {:.2}x", tile_ms / dp4a_ms);
-    println!("speedup DP4A vs OLD                       : {:.2}x", old_ms / dp4a_ms);
+    println!("TILE      (scalar lane-split, default)   : {tile_ms:8.2} ms");
+    println!("DP4A w32  (v_dot4, 32-lane)              : {dp4a_ms:8.2} ms");
+    println!("DP4A w64  (v_dot4, 64-lane full wave)    : {w64_ms:8.2} ms");
+    println!("TOKPAR    (token-parallel)               : {new_ms:8.2} ms");
+    println!("OLD       per-position loop (n={n})       : {old_ms:8.2} ms");
+    println!("speedup DP4A-w64 vs TILE                  : {:.2}x", tile_ms / w64_ms);
+    println!("speedup DP4A-w64 vs DP4A-w32              : {:.2}x", dp4a_ms / w64_ms);
+    println!("speedup DP4A-w64 vs OLD                   : {:.2}x", old_ms / w64_ms);
     println!("--- NEW kernel BW (upper-bound K/V reads) ---");
     println!("K/V DRAM read (n_heads×ctx, K+V)         : {:.1} MiB",
         new_kv_reads / 1048576.0);
