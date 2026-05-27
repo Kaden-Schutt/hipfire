@@ -261,6 +261,13 @@ def infer_attention_route(kv_mode, env):
             "flash_requested": flash_requested,
             "route_confidence": "static_kv_policy",
         }
+    if kv in ("fwht2", "fwht3", "fwht4"):
+        return {
+            "attention_impl": f"attention_flash_{kv}",
+            "flash_active": True,
+            "flash_requested": flash_requested,
+            "route_confidence": "static_kv_policy",
+        }
     if kv == "q8":
         if flash_requested == "always":
             return {
@@ -868,7 +875,7 @@ def find_dispatch_refs(root, variants, limit=8):
 def infer_env_controls(name, dispatch_refs=None):
     controls = set()
     lowered = (name or "").lower()
-    if "multirow" in lowered or "gemv" in lowered:
+    if "multirow" in lowered or "hfq4g256_residual" in lowered:
         controls.add("HIPFIRE_GEMV_ROWS")
     if "attention" in lowered or "flash" in lowered:
         controls.add("HIPFIRE_ATTN_FLASH")
@@ -1055,6 +1062,12 @@ QUANT_PROFILES = {
         "bytes_saved": "low",
         "unpack_tax": "low",
         "fit_question": "is cache/KV bandwidth or launch overhead dominant?",
+    },
+    "paro4": {
+        "label": "PARO4",
+        "bytes_saved": "medium",
+        "unpack_tax": "high",
+        "fit_question": "is pair-rotation repeated across output packs instead of amortized?",
     },
 }
 
@@ -1265,8 +1278,17 @@ def fit_interpretation(row, manifest_summary, arch_info, quant_info):
     vmem_frac = observed["vmem"] / total
     valu_frac = observed["valu"] / total
     phase = row.get("phase", "")
+    hot = row.get("artifacts", {}).get("profile_kernels", []) or []
+    paro_gemv_pct = sum(
+        profile_pct(item)
+        for item in hot
+        if "gemv_paro4g128" in ((item.get("name") if isinstance(item, dict) else str(item)) or "")
+    )
 
-    if arch_info["native_matrix"] and matrix == 0 and phase in ("decode_ar", "decode_dflash"):
+    if paro_gemv_pct >= 35.0 and phase in ("decode_ar", "decode_dflash"):
+        likely = "Paro rotated-GEMV dominates"
+        left = "amortize pair rotation / prerotate once per projection / improve packed-output tiling"
+    elif arch_info["native_matrix"] and matrix == 0 and phase in ("decode_ar", "decode_dflash"):
         likely = "memory/launch, not matrix throughput"
         left = "fusion / launch reduction / lower bytes moved"
     elif arch_info["native_matrix"] and matrix == 0 and phase == "prefill":
@@ -1743,6 +1765,46 @@ def build_suggestion_queue(
     seen = set()
 
     unmatched = joined.get("unmatched_profile_names", []) or []
+    paro_gemv_pct = sum(
+        profile_pct(item)
+        for item in hot[:hot_limit]
+        if "gemv_paro4g128" in ((item.get("name") if isinstance(item, dict) else str(item)) or "")
+    )
+    if paro_gemv_pct >= 35.0:
+        paro_files = []
+        for item in hot[:hot_limit]:
+            name = item.get("name") if isinstance(item, dict) else str(item)
+            if "gemv_paro4g128" not in name:
+                continue
+            entry = dispatch_by_name.get(name, {})
+            src = source_path_for_entry(entry)
+            if src:
+                paro_files.append(src)
+            paro_files.extend(dispatch_paths_for_entry(entry, limit=1))
+        add_suggestion(
+            suggestions,
+            seen,
+            suggestion_record(
+                title="Split Paro activation rotation from packed GEMV",
+                lever_type="format_kernel",
+                score=96 + min(8, paro_gemv_pct / 16.0),
+                risk="medium/high",
+                expected_impact="high",
+                allowed_files=paro_files or ["kernels/src/gemv_paro4g128.hip", "crates/rdna-compute/src/dispatch.rs"],
+                rationale=[
+                    f"Paro GEMV kernels account for {paro_gemv_pct:.1f}% of the captured profile.",
+                    "The current native kernel rotates each G128 activation group inside every packed-output block.",
+                    "A prerotate-once plus packed-GEMV path can amortize pairs/theta/channel-scale work across all output rows.",
+                ],
+                candidate_steps=[
+                    "Add a Paro G128 activation-rotation kernel that writes an x_rot scratch once per projection.",
+                    "Add a prerotated packed W4 GEMV/residual kernel that consumes x_rot without pair rotation.",
+                    "Gate the route, then compare against a clean Atlas baseline before making it default.",
+                ],
+                eval_contract=eval_contract,
+                correctness_commands=correctness_commands,
+            ),
+        )
     if unmatched:
         add_suggestion(
             suggestions,
@@ -1767,7 +1829,12 @@ def build_suggestion_queue(
             ),
         )
 
-    if arch_info.get("native_matrix") and phase in ("decode_ar", "decode_dflash") and observed["matrix/wmma"] == 0:
+    if (
+        arch_info.get("native_matrix")
+        and phase in ("decode_ar", "decode_dflash")
+        and observed["matrix/wmma"] == 0
+        and paro_gemv_pct < 35.0
+    ):
         low_byte_sources = []
         for item in hot[:hot_limit]:
             name = item.get("name") if isinstance(item, dict) else str(item)
@@ -2066,6 +2133,17 @@ def task_id_from_payload(prefix, payload):
     return f"{prefix}-{md5_text(text)[:12]}"
 
 
+def dedupe_preserve_order(items):
+    seen = set()
+    out = []
+    for item in items or []:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
 def tuning_eval_env(row_env):
     row_env = dict(row_env or {})
     stripped = sorted(key for key in row_env if key in TUNING_STRIP_ENV_KEYS)
@@ -2080,8 +2158,22 @@ def build_task_bundle_from_row(
     allowed_files=None,
     correctness_commands=None,
     task_id=None,
+    suggestion=None,
 ):
     kernel = first_profile_kernel(row) or {"name": "unknown", "op": classify_kernel_op("unknown")}
+    suggestion = copy.deepcopy(suggestion) if isinstance(suggestion, dict) else None
+    if suggestion and suggestion.get("hot_kernel"):
+        suggested_kernel = suggestion["hot_kernel"]
+        for item in row.get("artifacts", {}).get("profile_kernels", []) or []:
+            name = item.get("name") if isinstance(item, dict) else str(item)
+            if name == suggested_kernel:
+                kernel = item
+                break
+        else:
+            kernel = {
+                "name": suggested_kernel,
+                "op": suggestion.get("op") or classify_kernel_op(suggested_kernel),
+            }
     kernel_name = kernel.get("name", "unknown") if isinstance(kernel, dict) else str(kernel)
     dispatch_entry = matched_dispatch_entry(row, kernel_name)
     joined = join_profile_to_isa(row, manifest or {})
@@ -2096,7 +2188,17 @@ def build_task_bundle_from_row(
     ]
     source_files = copy.deepcopy(dispatch_entry.get("source_files", []) or [])
     if allowed_files is None:
-        allowed_files = [source_files[0]["path"]] if source_files and source_files[0].get("path") else []
+        if suggestion is not None:
+            allowed_files = suggestion.get("allowed_files", []) or []
+        elif source_files and source_files[0].get("path"):
+            allowed_files = [source_files[0]["path"]]
+        else:
+            allowed_files = []
+    allowed_files = dedupe_preserve_order(allowed_files)
+    suggestion_correctness = suggestion.get("correctness_commands", []) if suggestion else []
+    correctness_commands = list(correctness_commands or [])
+    if not correctness_commands and suggestion_correctness:
+        correctness_commands = copy.deepcopy(suggestion_correctness)
     metric = preferred_metric_for_row(row)
     row_env = copy.deepcopy(row.get("variant", {}).get("env", {}))
     eval_env, stripped_env_keys = tuning_eval_env(row_env)
@@ -2110,12 +2212,35 @@ def build_task_bundle_from_row(
         "kernel": kernel_name,
         "metric": metric,
     }
+    if suggestion:
+        payload["suggestion_id"] = suggestion.get("id")
+        payload["suggestion_title"] = suggestion.get("title")
     task_id = task_id or task_id_from_payload("atlas-task", payload)
+    producer = {"kind": "hipfire-atlas-row"}
+    if suggestion:
+        producer = {
+            "kind": "hipfire-atlas-suggestion",
+            "suggestion": {
+                "id": suggestion.get("id"),
+                "rank": suggestion.get("rank"),
+                "title": suggestion.get("title"),
+                "lever_type": suggestion.get("lever_type"),
+                "hot_kernel": suggestion.get("hot_kernel"),
+                "op": copy.deepcopy(suggestion.get("op") or {}),
+                "risk": suggestion.get("risk"),
+                "expected_impact": suggestion.get("expected_impact"),
+                "score": suggestion.get("score"),
+                "history_key": suggestion.get("history_key"),
+                "history": copy.deepcopy(suggestion.get("history") or {}),
+                "rationale": copy.deepcopy(suggestion.get("rationale") or []),
+                "candidate_steps": copy.deepcopy(suggestion.get("candidate_steps") or []),
+            },
+        }
     return {
         "schema": "hipfire.kernel_atlas.task.v0",
         "task_id": task_id,
         "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "producer": {"kind": "hipfire-atlas-row"},
+        "producer": producer,
         "target": {
             "host": row.get("hostname"),
             "arch": row.get("arch"),
@@ -2143,8 +2268,16 @@ def build_task_bundle_from_row(
             "requires_fresh_baseline": bool(stripped_env_keys),
             "provenance": copy.deepcopy(row.get("provenance", {})),
         },
+        "experiment": {
+            "title": suggestion.get("title") if suggestion else f"Optimize {kernel_name}",
+            "lever_type": suggestion.get("lever_type") if suggestion else "source_sweep",
+            "risk": suggestion.get("risk") if suggestion else "medium",
+            "expected_impact": suggestion.get("expected_impact") if suggestion else "unknown",
+            "rationale": copy.deepcopy(suggestion.get("rationale") or []) if suggestion else [],
+            "candidate_steps": copy.deepcopy(suggestion.get("candidate_steps") or []) if suggestion else [],
+        },
         "constraints": {
-            "allowed_files": list(allowed_files or []),
+            "allowed_files": allowed_files,
         },
         "eval": {
             "metric": metric,
@@ -2154,6 +2287,23 @@ def build_task_bundle_from_row(
             "requires_fresh_baseline": bool(stripped_env_keys),
         },
     }
+
+
+def select_suggestion(queue, *, rank=None, suggestion_id=None):
+    suggestions = queue.get("suggestions", []) or []
+    if rank is not None and suggestion_id:
+        raise ValueError("use either --suggestion-rank or --suggestion-id, not both")
+    if rank is not None:
+        for item in suggestions:
+            if item.get("rank") == rank:
+                return item
+        raise ValueError(f"suggestion rank {rank} not found in queue")
+    if suggestion_id:
+        for item in suggestions:
+            if item.get("id") == suggestion_id:
+                return item
+        raise ValueError(f"suggestion id {suggestion_id} not found in queue")
+    return None
 
 
 def build_pytorch_task_bundle(
@@ -2210,6 +2360,7 @@ def render_task_markdown(task):
     eval_cfg = task.get("eval", {})
     baseline = task.get("baseline", {})
     allowed = task.get("constraints", {}).get("allowed_files", []) or []
+    experiment = task.get("experiment", {}) or {}
     lines = [
         "# Atlas Optimization Task",
         "",
@@ -2221,8 +2372,26 @@ def render_task_markdown(task):
         f"- name: {hot.get('name', 'unknown')}",
         f"- op: {hot.get('op', {}).get('family', 'unknown')}.{hot.get('op', {}).get('role', 'unknown')}",
         "",
-        "## Allowed Files",
+        "## Suggested Experiment",
+        f"- title: {experiment.get('title', 'Optimize profiled kernel')}",
+        f"- lever: {experiment.get('lever_type', 'unknown')}",
+        f"- risk: {experiment.get('risk', 'unknown')}",
+        f"- expected impact: {experiment.get('expected_impact', 'unknown')}",
     ]
+    rationale = experiment.get("rationale", []) or []
+    if rationale:
+        lines.append("- rationale:")
+        lines.extend(f"  - {item}" for item in rationale)
+    steps = experiment.get("candidate_steps", []) or []
+    if steps:
+        lines.append("- candidate steps:")
+        lines.extend(f"  - {item}" for item in steps)
+    lines.extend(
+        [
+            "",
+        "## Allowed Files",
+        ]
+    )
     if allowed:
         lines.extend(f"- {path}" for path in allowed)
     else:
@@ -2277,6 +2446,21 @@ def normalize_command(command):
     return [str(part) for part in command]
 
 
+def command_needs_shell(command):
+    if isinstance(command, str):
+        return True
+    control = {"&&", "||", ";", "|", ">", ">>", "<"}
+    return any(str(part) in control for part in command or [])
+
+
+def command_for_subprocess(command):
+    if command_needs_shell(command):
+        if isinstance(command, str):
+            return command, True
+        return shlex.join(normalize_command(command)), True
+    return normalize_command(command), False
+
+
 def parse_metric_output(text, metric):
     parsers = (parse_bench_summary, parse_dflash_summary)
     for parser in parsers:
@@ -2296,16 +2480,20 @@ def parse_metric_output(text, metric):
 
 
 def run_task_command(command, env=None, timeout=None, cwd=None):
+    proc_command, use_shell = command_for_subprocess(command)
     proc = subprocess.run(
-        normalize_command(command),
+        proc_command,
         text=True,
         capture_output=True,
         env={**os.environ, **(env or {})},
         timeout=timeout,
         cwd=cwd,
+        shell=use_shell,
+        executable="/bin/bash" if use_shell else None,
     )
     return {
-        "command": normalize_command(command),
+        "command": proc_command,
+        "shell": use_shell,
         "returncode": proc.returncode,
         "output_tail": (proc.stdout + proc.stderr)[-4000:],
     }
@@ -2547,6 +2735,93 @@ def evaluate_task_bundle(
     with (output_path / "ledger.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(ledger_entry, sort_keys=True) + "\n")
     return result
+
+
+def graph_ab_delta(off_metrics, on_metrics, metric):
+    off_value = off_metrics.get(metric)
+    on_value = on_metrics.get(metric)
+    delta = {}
+    if isinstance(off_value, (int, float)) and isinstance(on_value, (int, float)):
+        delta["metric"] = metric
+        delta["graph_off"] = off_value
+        delta["graph_on"] = on_value
+        delta["absolute"] = on_value - off_value
+        delta["lift"] = (on_value / off_value) if off_value else None
+    for key in ("p50_ms", "avg_ms", "prefill_tok_s", "bw_gib_s"):
+        off = off_metrics.get(key)
+        on = on_metrics.get(key)
+        if isinstance(off, (int, float)) and isinstance(on, (int, float)):
+            delta[f"{key}_delta"] = on - off
+    return delta
+
+
+def run_graph_ab_for_row(row, *, correctness_commands=None, timeout=None, cwd=None):
+    metric = preferred_metric_for_row(row)
+    row_env = copy.deepcopy(row.get("variant", {}).get("env", {}))
+    base_env, stripped_env_keys = tuning_eval_env(row_env)
+    command = copy.deepcopy(row.get("command", []))
+    status = "pass"
+    modes = {}
+
+    for graph_value, label in (("0", "graph_off"), ("1", "graph_on")):
+        env = dict(base_env)
+        env["HIPFIRE_GRAPH"] = graph_value
+        passes = []
+        for pass_index in (1, 2):
+            result = run_metric_command(command, metric, env=env, timeout=timeout, cwd=cwd)
+            result["pass_index"] = pass_index
+            passes.append(result)
+            if result["returncode"] != 0 or metric not in result.get("metrics", {}):
+                status = "fail"
+        headline = passes[1] if len(passes) > 1 else passes[-1]
+        modes[label] = {
+            "env": env,
+            "passes": passes,
+            "headline_pass": 2,
+            "metrics": copy.deepcopy(headline.get("metrics", {})),
+            "route": build_route_manifest(
+                kv_mode=env.get("HIPFIRE_KV_MODE"),
+                env=env,
+                output=headline.get("output_tail", ""),
+                graph_enabled=(graph_value == "1"),
+            ),
+        }
+
+    correctness = []
+    graph_on_env = modes["graph_on"]["env"]
+    for command_item in correctness_commands or []:
+        result = run_task_command(command_item, env=graph_on_env, timeout=timeout, cwd=cwd)
+        correctness.append(result)
+        if result["returncode"] != 0:
+            status = "fail"
+
+    return {
+        "schema": "hipfire.kernel_atlas.graph_ab.v0",
+        "captured_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": status,
+        "metric": metric,
+        "target": {
+            "host": row.get("hostname"),
+            "arch": row.get("arch"),
+            "workload": row.get("workload"),
+            "phase": row.get("phase"),
+            "shape_bucket": row.get("shape_bucket"),
+            "quant": row.get("quant"),
+        },
+        "command": command,
+        "row_env": row_env,
+        "base_env": base_env,
+        "stripped_env_keys": stripped_env_keys,
+        "graph_off": modes["graph_off"],
+        "graph_on": modes["graph_on"],
+        "delta": graph_ab_delta(modes["graph_off"]["metrics"], modes["graph_on"]["metrics"], metric),
+        "correctness": correctness,
+        "provenance": {
+            "git_dirty": git_is_dirty(),
+            "diff_md5": md5_text(git_diff_text()),
+            "binary_md5": md5_file(command[0] if command else None),
+        },
+    }
 
 
 def load_json_or_jsonl(path, index=0):
@@ -2870,6 +3145,10 @@ def collect_ar(args):
 
 
 def collect_dflash(args):
+    kv_mode = str(args.kv_mode).strip().lower()
+    if kv_mode not in ("q8", "fwht2", "fwht3", "fwht4"):
+        print("collect-dflash: DFlash perf collection requires --kv-mode q8|fwht2|fwht3|fwht4", file=sys.stderr)
+        return 2
     prompt = Path(args.prompt_file).read_text(encoding="utf-8")
     diff_text = git_diff_text()
     dirty = git_is_dirty(diff_text)
@@ -2978,7 +3257,7 @@ def suggest_from_row(args):
     if dispatch:
         row = copy.deepcopy(row)
         row.setdefault("artifacts", {})["dispatch"] = dispatch
-    correctness = [normalize_command(item) for item in args.correctness_command or []]
+    correctness = list(args.correctness_command or [])
     history = load_suggestion_history(args.history, root=Path.cwd())
     queue = build_suggestion_queue(
         row,
@@ -3009,13 +3288,34 @@ def task_from_row(args):
     if dispatch:
         row = copy.deepcopy(row)
         row.setdefault("artifacts", {})["dispatch"] = dispatch
-    correctness = [normalize_command(item) for item in args.correctness_command or []]
+    correctness = list(args.correctness_command or [])
+    suggestion = None
+    if args.suggestion_rank is not None or args.suggestion_id:
+        history = load_suggestion_history(args.history, root=Path.cwd())
+        queue = build_suggestion_queue(
+            row,
+            manifest,
+            dispatch,
+            max_suggestions=args.max_suggestions,
+            hot_limit=args.hot_limit,
+            correctness_commands=correctness,
+            history=history,
+        )
+        try:
+            suggestion = select_suggestion(
+                queue,
+                rank=args.suggestion_rank,
+                suggestion_id=args.suggestion_id,
+            )
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     task = build_task_bundle_from_row(
         row,
         manifest,
         allowed_files=args.allowed_file or None,
         correctness_commands=correctness,
         task_id=args.task_id,
+        suggestion=suggestion,
     )
     output_dir = args.output_dir or str(
         Path(".codeinsight+research") / "kernel-atlas" / "tasks" / task["task_id"]
@@ -3058,6 +3358,25 @@ def eval_task(args):
     )
     print(json.dumps({"result_path": str(Path(args.output_dir) / "result.json"), "status": result["status"]}, sort_keys=True))
     return 0 if result["status"] in ("pass", "unstable") else 1
+
+
+def graph_ab_from_row(args):
+    row = load_json_or_jsonl(args.row, args.row_index)
+    correctness = list(args.correctness_command or [])
+    result = run_graph_ab_for_row(
+        row,
+        correctness_commands=correctness,
+        timeout=args.timeout,
+        cwd=args.cwd,
+    )
+    text = json.dumps(result, indent=2 if args.pretty else None, sort_keys=True) + "\n"
+    if args.output:
+        path = Path(args.output)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    else:
+        print(text, end="")
+    return 0 if result["status"] == "pass" else 1
 
 
 def build_parser():
@@ -3114,6 +3433,11 @@ def build_parser():
     task.add_argument("--dispatch", help="dispatch manifest JSON; defaults to row artifacts.dispatch.manifest_path")
     task.add_argument("--allowed-file", action="append", default=[], help="file an agent may edit")
     task.add_argument("--correctness-command", action="append", default=[], help="command string for correctness gate")
+    task.add_argument("--suggestion-rank", type=int, help="build the task from the ranked suggestion N")
+    task.add_argument("--suggestion-id", help="build the task from a specific suggestion id")
+    task.add_argument("--max-suggestions", type=int, default=12, help="suggestion queue size when using --suggestion-rank/id")
+    task.add_argument("--hot-limit", type=int, default=8, help="hot profile rows considered when using --suggestion-rank/id")
+    task.add_argument("--history", action="append", default=[], help="add Atlas history when selecting a suggestion")
     task.add_argument("--task-id")
     task.add_argument("--output-dir")
     task.set_defaults(func=task_from_row)
@@ -3140,6 +3464,16 @@ def build_parser():
     ev.add_argument("--refresh-baseline", action="store_true", help="write baseline.json from this run series and compare against it")
     ev.add_argument("--baseline", help="baseline.json to compare against instead of task baseline")
     ev.set_defaults(func=eval_task)
+
+    graph = sub.add_parser("graph-ab", help="run HIPFIRE_GRAPH=0/1 A/B from an Atlas row")
+    graph.add_argument("--row", required=True, help="Atlas JSONL/JSON row file")
+    graph.add_argument("--row-index", type=int, default=0, help="row index when --row is JSONL")
+    graph.add_argument("--correctness-command", action="append", default=[], help="graph-on correctness command string")
+    graph.add_argument("--timeout", type=float)
+    graph.add_argument("--cwd")
+    graph.add_argument("--pretty", action="store_true")
+    graph.add_argument("--output", help="write graph A/B JSON here instead of stdout")
+    graph.set_defaults(func=graph_ab_from_row)
 
     ar = sub.add_parser("collect-ar", help="collect AR prefill/decode rows")
     ar.add_argument("--bench", default="./target/release/examples/bench_qwen35_mq4")
@@ -3177,7 +3511,7 @@ def build_parser():
     df.add_argument("--max-tokens", type=int, default=256)
     df.add_argument("--ctx", type=int, default=2048)
     df.add_argument("--runs", type=int, default=1)
-    df.add_argument("--kv-mode", default="asym3")
+    df.add_argument("--kv-mode", default="q8", help="DFlash KV mode; use q8 or fwht*, not asym* for perf gates")
     df.add_argument("--dpm-warmup-secs", default="10")
     df.add_argument("--no-chatml", action="store_true", default=True)
     df.add_argument("--chatml", action="store_false", dest="no_chatml")

@@ -148,7 +148,7 @@ fn cpu_reference_gemm(
 /// `name` is just for the printf. Returns (max_abs, max_rel, rms, us/call).
 fn bench_variant(
     gpu: &mut Gpu,
-    m: usize, k: usize, n: usize,
+    m: usize, _k: usize, n: usize,
     d_a: &rdna_compute::GpuTensor,
     d_x: &rdna_compute::GpuTensor,
     y_init: &[f32],
@@ -193,8 +193,8 @@ fn bench_variant(
 
 fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
     (f32, f32, f32, f64),  // _wmma     (Phase A)
-    (f32, f32, f32, f64),  // _wmma_mb2 (Phase D experiment)
-    (f32, f32, f32, f64),  // _wmma_mb4 (Phase D-A)
+    Option<(f32, f32, f32, f64)>,  // _wmma_mb2 (Phase D experiment)
+    Option<(f32, f32, f32, f64)>,  // _wmma_mb4 (Phase D-A)
 ) {
     assert_eq!(k % 256, 0, "K must be a multiple of 256");
     let groups_per_row = k / 256;
@@ -252,19 +252,28 @@ fn run_one(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> (
         },
     );
 
-    let phase_d_mb2 = bench_variant(
-        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
-        |gpu, d_a, d_x, d_y| {
-            gpu.gemm_mq4g256_lloyd_residual_wmma_mb2(d_a, d_x, d_y, m, k, n).unwrap();
-        },
-    );
+    let supports_gfx11_fanout = gpu.arch_caps.has_wmma_w32();
+    let phase_d_mb2 = if supports_gfx11_fanout {
+        Some(bench_variant(
+            gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+            |gpu, d_a, d_x, d_y| {
+                gpu.gemm_mq4g256_lloyd_residual_wmma_mb2(d_a, d_x, d_y, m, k, n).unwrap();
+            },
+        ))
+    } else {
+        None
+    };
 
-    let phase_d_mb4 = bench_variant(
-        gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
-        |gpu, d_a, d_x, d_y| {
-            gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n).unwrap();
-        },
-    );
+    let phase_d_mb4 = if supports_gfx11_fanout {
+        Some(bench_variant(
+            gpu, m, k, n, &d_a, &d_x, &y_init, &y_ref,
+            |gpu, d_a, d_x, d_y| {
+                gpu.gemm_mq4g256_lloyd_residual_wmma_mb4(d_a, d_x, d_y, m, k, n).unwrap();
+            },
+        ))
+    } else {
+        None
+    };
 
     gpu.free_tensor(d_a).unwrap();
     gpu.free_tensor(d_x).unwrap();
@@ -308,8 +317,8 @@ fn main() {
     println!("{:>5} {:>6} {:>4}  {:>5}  {:>11}  {:>11}  {:>10}  {}",
              "M", "K", "N", "kern", "max_abs", "rms", "us/call", "verdict");
 
-    let mut emit_row = |label: &str, m: usize, k: usize, n: usize,
-                        result: (f32, f32, f32, f64), ref_us: f64| -> bool {
+    let emit_row = |label: &str, m: usize, k: usize, n: usize,
+                    result: (f32, f32, f32, f64), ref_us: f64| -> bool {
         let (max_abs, _max_rel, rms, us_per_call) = result;
         let pass = max_abs < phase_a_tolerance;
         let tag = if pass {
@@ -330,24 +339,46 @@ fn main() {
         );
         pass
     };
+    let emit_skip_row = |label: &str, m: usize, k: usize, n: usize| {
+        println!(
+            "{:>5} {:>6} {:>4}  {:>5}  {:>11}  {:>11}  {:>10}  SKIP  (gfx11-only)",
+            m, k, n, label, "-", "-", "-"
+        );
+    };
 
     for &(m, k, n) in cases {
         let (phase_a, phase_d_mb2, phase_d_mb4) = run_one(&mut gpu, m, k, n);
         let ref_us = phase_a.3;
         all_pass &= emit_row("_wmma", m, k, n, phase_a, ref_us);
-        all_pass &= emit_row("_mb2", m, k, n, phase_d_mb2, ref_us);
-        all_pass &= emit_row("_mb4", m, k, n, phase_d_mb4, ref_us);
+        if let Some(phase_d_mb2) = phase_d_mb2 {
+            all_pass &= emit_row("_mb2", m, k, n, phase_d_mb2, ref_us);
+            total_us_mb2 += phase_d_mb2.3;
+        } else {
+            emit_skip_row("_mb2", m, k, n);
+        }
+        if let Some(phase_d_mb4) = phase_d_mb4 {
+            all_pass &= emit_row("_mb4", m, k, n, phase_d_mb4, ref_us);
+            total_us_mb4 += phase_d_mb4.3;
+        } else {
+            emit_skip_row("_mb4", m, k, n);
+        }
         println!();
         total_us_a += phase_a.3;
-        total_us_mb2 += phase_d_mb2.3;
-        total_us_mb4 += phase_d_mb4.3;
     }
     println!("Phase A tolerance (initial)      : {:.3e}", phase_a_tolerance);
     println!("Aggregate us/call (_wmma)        : {:.1}", total_us_a);
-    println!("Aggregate us/call (_mb2)         : {:.1}  (vs _wmma: {:.2}×)",
-             total_us_mb2, total_us_a / total_us_mb2);
-    println!("Aggregate us/call (_mb4)         : {:.1}  (vs _wmma: {:.2}×)",
-             total_us_mb4, total_us_a / total_us_mb4);
+    if total_us_mb2 > 0.0 {
+        println!("Aggregate us/call (_mb2)         : {:.1}  (vs _wmma: {:.2}×)",
+                 total_us_mb2, total_us_a / total_us_mb2);
+    } else {
+        println!("Aggregate us/call (_mb2)         : SKIP  (gfx11-only)");
+    }
+    if total_us_mb4 > 0.0 {
+        println!("Aggregate us/call (_mb4)         : {:.1}  (vs _wmma: {:.2}×)",
+                 total_us_mb4, total_us_a / total_us_mb4);
+    } else {
+        println!("Aggregate us/call (_mb4)         : SKIP  (gfx11-only)");
+    }
 
     if !all_pass {
         eprintln!("\nFAIL: one or more shapes exceeded {:.3e} absolute", phase_a_tolerance);

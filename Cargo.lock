@@ -250,6 +250,7 @@ dependencies = [
  "byteorder",
  "hip-bridge",
  "hipfire-arch-deepseek4",
+ "hipfire-arch-dots-ocr",
  "hipfire-arch-llama",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",

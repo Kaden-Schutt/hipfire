@@ -135,7 +135,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[3/5] building tokenizer from HFQ metadata");
     let tok = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-        .map_err(|e| format!("qwen2: tokenizer load failed: {e}"))?;
+        .map_err(|e| format!("qwen2: tokenizer not found in HFQ metadata: {e}"))?;
     eprintln!("      vocab_size={}", tok.vocab_size());
 
     // Steps 4/5 — prompt tokenize + parity check.

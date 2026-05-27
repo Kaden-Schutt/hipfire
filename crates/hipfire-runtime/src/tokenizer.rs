@@ -1210,7 +1210,7 @@ impl Tokenizer {
         for &id in &ids {
             counts[HeatClass::from_rank(self.rank_of(id, &table)) as usize] += 1;
         }
-        if std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1") {
+        if crate::config::get().prompt_heat_json {
             let mut s = String::with_capacity(2048);
             s.push_str("{\"bytes\":");
             s.push_str(&text.len().to_string());
@@ -1232,8 +1232,7 @@ impl Tokenizer {
             println!("{s}");
             return;
         }
-        let limit: usize = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(64);
+        let limit: usize = crate::config::get().prompt_heat_limit;
         eprintln!("[token-heat] prompt={} bytes  tokens={}", text.len(), ids.len());
         eprintln!("[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}", "pos", "id", "rank", "class", "decoded");
         for (pos, &id) in ids.iter().take(limit).enumerate() {
@@ -1394,11 +1393,8 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
-    if let Ok(v) = std::env::var("HIPFIRE_NORMALIZE_PROMPT") {
-        let v = v.to_ascii_lowercase();
-        if v == "0" || v == "false" || v == "off" || v == "no" {
-            return Cow::Borrowed(s);
-        }
+    if !crate::config::get().normalize_prompt {
+        return Cow::Borrowed(s);
     }
 
     let mut cur: Cow<'_, str> = Cow::Borrowed(s);

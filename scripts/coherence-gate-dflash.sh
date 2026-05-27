@@ -156,6 +156,7 @@ hard_errors=0
     echo "- branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:   $(date -Iseconds)"
     echo "- mode:   $( [ "$FAST" -eq 1 ] && echo fast || ( [ "$FULL" -eq 1 ] && echo full || echo short ) )"
+    echo "- kv_mode: q8"
     echo "- target: $TARGET_27B"
     echo "- draft:  $DRAFT_27B"
     echo
@@ -269,7 +270,7 @@ for entry in "${tests[@]}"; do
     timeout "$CASE_TIMEOUT" "$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max_tok" --ctx 2048 \
-        --kv-mode asym3 --no-chatml \
+        --kv-mode q8 --no-chatml \
         "${extra[@]}" \
         > "$out_file" 2>&1
     ec=$?

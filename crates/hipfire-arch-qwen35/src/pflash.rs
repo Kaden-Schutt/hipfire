@@ -767,6 +767,7 @@ fn drafter_prefill(
                 gpu, weights, config, source_tokens, 0, kv, dn_state, scratch,
                 None, None, None, None,
                 scratch.prefill_batch.as_ref(),
+                None, // mask_override: pflash doesn't use MTP probe hook
                 max_layer,
             )?;
             Ok((config.n_layers, config.n_kv_heads, config.head_dim))

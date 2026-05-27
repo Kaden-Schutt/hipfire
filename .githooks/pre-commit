@@ -52,7 +52,7 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 # - `gemma4\.rs` covered for when the gemma branch forward-ports.
 # multi_gpu\.rs is listed here so that touching the PP dispatch path
 # triggers the coherence battery (same contract as single-GPU forward).
-HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs'
+HOTSPOT='\.hip$|gemv|forward|quant|rotate|dispatch|fwht|rmsnorm|fused|mq4|hfq|magnum|gemm|wmma|llama\.rs|qwen35\.rs|qwen35_vl\.rs|deepseek4\.rs|spec_decode\.rs|gemma4\.rs|sampler\.rs|loop_guard\.rs|prompt_frame\.rs|eos_filter\.rs|arch\.rs|multi_gpu\.rs|mtp_head\.rs|mtp_spec\.rs|mtp_compose\.rs|mtp_probe\.rs'
 
 # Multi-GPU PP hotspots — superset of the HOTSPOT entry above. pp-gate.sh
 # runs only when one of these is touched AND 2+ GPUs are visible; otherwise

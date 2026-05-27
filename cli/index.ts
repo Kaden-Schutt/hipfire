@@ -149,6 +149,7 @@ export interface HipfireConfig {
   prefill_recent: number;          // Always-keep tail. Default 1024.
   prefill_block: number;           // Scoring block size. Default 128.
   prefill_drafter: string;         // Path to drafter HFQ. "" disables.
+  prefill_drafter_device: number;  // HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device for hetero compress.
   prefill_profile: boolean;        // Per-stage timing logs.
   prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
 }
@@ -210,6 +211,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_recent: 1024,
   prefill_block: 128,
   prefill_drafter: "",
+  prefill_drafter_device: -1,
   prefill_profile: false,
   prefill_sparse_threshold: 32768,
 };
@@ -252,6 +254,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_recent": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "prefill_block": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4096;
     case "prefill_drafter": return typeof value === "string";
+    case "prefill_drafter_device": return typeof value === "number" && Number.isInteger(value) && value >= -1 && value <= 15;
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     default: return false;
@@ -310,7 +313,7 @@ const PER_MODEL_KEYS = [
   // changing other targets.
   "prefill_compression", "prefill_threshold", "prefill_keep_ratio",
   "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
-  "prefill_block", "prefill_drafter", "prefill_profile",
+  "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
@@ -364,9 +367,13 @@ function savePerModelConfigs(all: PerModelConfigs) {
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
   if (!tag) return base;
+  const all = loadPerModelConfigs();
   const resolved = resolveModelTag(tag);
-  const overrides = loadPerModelConfigs()[resolved] ?? loadPerModelConfigs()[tag] ?? {};
-  return { ...base, ...overrides };
+  // Layer both keys: a model can carry overrides under the canonical
+  // registry tag AND under the user alias. Alias wins where both set a
+  // key, but neither drops the other. Previous `resolved ?? tag` picked
+  // exactly one entry, so any key only present on the other vanished.
+  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -548,7 +555,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
+  // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
+  // regardless of per-model/global config, so a missing/dangling sidecar
+  // can never fatally crash serve load. Pairs with cask_auto_attach=false.
+  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1";
   if (
+    !caskForcedOff &&
     (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
     !isA3B &&
     resolved.cask_auto_attach !== false
@@ -625,6 +637,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     params.prefill_recent = resolved.prefill_recent;
     params.prefill_block = resolved.prefill_block;
     params.prefill_drafter = resolved.prefill_drafter;
+    params.prefill_drafter_device = resolved.prefill_drafter_device;
     params.prefill_profile = resolved.prefill_profile;
     params.prefill_sparse_threshold = resolved.prefill_sparse_threshold;
   } else if (resolved.prefill_compression !== "off") {

@@ -355,16 +355,16 @@ gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
   --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
   --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-  --max 120 --ctx 2048 --kv-mode asym3 --no-adaptive-b --no-chatml
+  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 
 # B: same prompt, normalize ON
 HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo ...
 ```
 
-**Expected delta on 27B-3.5:** ~161 → ~199 tok/s (+24-27%), τ 8.07 → 10.36.
-Run each ≥3 times in fresh processes. Median should land in the
-expected range. Anything more than ±10% from the published numbers
-is a regression — investigate before claiming a result.
+Run each ≥3 times in fresh processes. Record prompt md5, binary md5,
+tok/s, and τ, then compare against the current q8/max256 speed-gate
+baseline. Older pre-q8 DFlash perf numbers are not authoritative for
+current perf triage.
 
 ### 3.3 — HumanEval/53 single-prompt peak
 
@@ -377,13 +377,12 @@ HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
   --target ~/.hipfire/models/qwen3.5-27b.mq4 \
   --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
   --prompt "$PROMPT" \
-  --max 120 --ctx 2048 --kv-mode asym3 --no-adaptive-b --no-chatml
+  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
 ```
 
-**Expected:** 5-run median 212.4 tok/s τ=10.90, 4/5 runs above 207.
-If your median is below 200 or τ below 9.0, something has regressed
-— open an issue with: GPU model, ROCm version, full bench output,
-binary md5, prompt md5.
+Use this as a peak-case smoke under the same q8/max256 methodology as
+the rest of DFlash perf testing. Report 5-run median tok/s and τ with:
+GPU model, ROCm version, full bench output, binary md5, and prompt md5.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
 

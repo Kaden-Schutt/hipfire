@@ -4,43 +4,40 @@
 
 #include <hip/hip_runtime.h>
 
-// Index-aware fused MoE gate_up GEMV for the HFQ4G128 (ParoQuant) layout —
-// mechanical G128 port of `gemv_hfq4g256_moe_gate_up_indexed`. Reads expert
-// IDs from a device-side `topk_indices` buffer and the per-expert weight
-// base from a device-side `expert_ptrs` table; no CPU kernargs depend on
-// the routing result, so the whole kernel replays cleanly under hipGraph
-// capture (closes the residual `hipError 906` gap PR #317 left for
-// ParoQuant routed experts).
+// Atomic-free batched indexed MoE down GEMV for the HFQ4G128 (ParoQuant)
+// layout — mechanical G128 port of
+// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`. Each (token, krank,
+// row) workgroup writes a single output to its own slot in an expanded
+// [N × K_TOP × M] buffer; `moe_down_combine_k8_batched` (dtype-independent)
+// then folds K_TOP slots into the residual stream with topk_weights applied.
 //
 // Group layout (matches gemv_hfq4g128.hip): 72 B/group = 4 B scale
 // + 4 B zero + 64 B packed nibbles (128 4-bit weights). 32 threads per
 // block, 4 weights per thread per group, `byte_off = tid * 2`.
 //
-// Expert ptrs layout: `expert_ptrs` is a raw [n_exp] array of
-// `const char*` weight-base pointers (packed as `unsigned long long`
-// slots, 8 B each). Built once at load time from
-// `ExpertWeights.gate_up.buf.as_ptr()`.
-//
-// Output layout matches the non-indexed and HFQ4G256-indexed variants:
-// y_gate[K_TOP × MI] / y_up[K_TOP × MI] split at MI = M / 2.
+// Grid: (M, K_TOP, N). Block = 32 threads. No atomic ops — each output
+// address is written by exactly one workgroup.
 
 __launch_bounds__(32, 16)
-extern "C" __global__ void gemv_hfq4g128_moe_gate_up_k8_indexed(
-    const unsigned long long* __restrict__ expert_ptrs, // [n_exp] device pointers
-    const int* __restrict__ topk_indices,                // [k_top]
-    const float* __restrict__ x,                         // [K]
-    float* __restrict__ y_gate,                          // [K_TOP × MI]
-    float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+extern "C" __global__ void gemv_paro_q4g128_moe_down_k8_indexed_batched(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
+    const int*   __restrict__ topk_indices,              // [N × K_TOP]
+    const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
+    float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
+    int M, int K, int K_TOP
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
     const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
     const int tid = threadIdx.x;
 
-    const int expert_id = topk_indices[krank];
+    const int routing_base = bid * K_TOP;
+    const int expert_id = topk_indices[routing_base + krank];
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x =
+        rot_batch + ((long long)bid * K_TOP + krank) * K;
 
     const int groups_per_row = K / 128;
     const char* row_ptr = A + (long long)row * groups_per_row * 72;
@@ -141,11 +138,8 @@ extern "C" __global__ void gemv_hfq4g128_moe_gate_up_k8_indexed(
         acc += __shfl_down(acc, offset);
 
     if (tid == 0) {
-        const int mi = M >> 1;
-        if (row < mi) {
-            y_gate[krank * mi + row] = acc;
-        } else {
-            y_up[krank * mi + (row - mi)] = acc;
-        }
+        const long long out_offset =
+            ((long long)bid * K_TOP + krank) * (long long)M + row;
+        expert_outputs[out_offset] = acc;
     }
 }
