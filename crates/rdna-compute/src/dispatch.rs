@@ -15177,10 +15177,14 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         // gfx1151 (Strix Halo iGPU) i8 MMQ port: lift the compute ceiling
-        // from ~71 (FP16 WMMA) to ~140 TFLOPS (i8 WMMA). Opt-out via
-        // HIPFIRE_MOE_GROUPED_I8=0; default ON for gfx1151 only.
+        // from ~71 (FP16 WMMA) to ~140 TFLOPS (i8 WMMA). Opt-in via
+        // HIPFIRE_MOE_GROUPED_I8=1; default OFF for gfx1151 pending fix
+        // for the qwen3.6:35b-a3b CJK-output regression seen against
+        // commit 6cf455dc (kernel produces NRMSE-clean tile output in the
+        // channel test but corrupts the production MoE chain on real
+        // 35B-A3B prompts — model emits Chinese on English code prompts).
         let use_i8_gfx1151 = self.arch_caps.is_gfx1151()
-            && self.flags.moe_grouped_i8.unwrap_or(true);
+            && self.flags.moe_grouped_i8.unwrap_or(false);
         if use_i8_gfx1151 {
             // Optional deeper-pipeline variants (opt-IN, default OFF).
             // Same kernarg layout + scatter contract as the k2 default.
