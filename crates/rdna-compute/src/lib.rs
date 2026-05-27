@@ -6,10 +6,13 @@
 
 pub mod arch_caps;
 pub mod attention;
+pub mod embedding;
 pub mod gemm;
 pub mod gemv;
 pub mod graph;
+pub mod moe;
 pub mod norm;
+pub mod sampling;
 pub mod scratch;
 mod compiler;
 mod dispatch;
