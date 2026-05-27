@@ -503,26 +503,62 @@ pub enum DrafterKvMode {
 }
 
 impl DrafterKvMode {
-    /// Read `HIPFIRE_PFLASH_DRAFTER_KV` env var; defaults to Q8 (current
-    /// production behaviour). Unknown values panic loudly rather than
-    /// silently downgrading. asym3 is intentionally NOT accepted —
-    /// banned from drafter scoring per project policy (per-pair Givens
-    /// noise localizes error, biasing the head_dim-averaged cosine;
-    /// fwht's distributed-noise spectrum is the right shape).
-    pub fn from_env() -> Self {
+    /// Resolve the drafter KV mode for a load with `arch` and `max_kv_seq`
+    /// (the context cap). An explicit `HIPFIRE_PFLASH_DRAFTER_KV` env var
+    /// always wins. Otherwise the default is **fwht3 for long-context on
+    /// the LDS-cliff archs**, else Q8 (historical default).
+    ///
+    /// Why the long-ctx/arch default: q8 drafter KV runs
+    /// `attention_q8_0_kv_batched_masked`, which stages `scores[seq_len]`
+    /// in LDS and overflows the ~64 KB cap above ~15000 source tokens,
+    /// degenerating to a per-position fallback. Measured 2026-05-27 on
+    /// gfx1031 hetero compress of a 43286-tok source: q8 15257ms vs fwht3
+    /// 8484ms (1.80×), byte-identical prompt, same kept tokens, same
+    /// output. fwht3's tiled partials-buffer reduction has no LDS cap, so
+    /// it holds batched throughput across the full source. Only the wave32
+    /// RDNA cliff archs (gfx906 wave64 hits it too) get the auto-flip;
+    /// short context and other archs keep Q8 to avoid changing tuned
+    /// behaviour.
+    ///
+    /// asym3 is intentionally NOT accepted — banned from drafter scoring
+    /// per project policy (per-pair Givens noise localizes error, biasing
+    /// the head_dim-averaged cosine; fwht's distributed-noise spectrum is
+    /// the right shape).
+    pub fn resolve(arch: &str, max_kv_seq: usize) -> Self {
+        // LDS-cliff threshold mirrors LDS_CTX_LIMIT in qwen35.rs / llama.rs.
+        const LDS_CTX_LIMIT: usize = 15000;
+        // Archs whose Q8 batched-masked attention overflows the 64 KB LDS
+        // at long context: gfx906 (Vega/GCN5) + RDNA2 (gfx103x). RDNA3+
+        // has the same kernel but is not the deployment target here; leave
+        // its default unchanged until measured.
+        let cliff_arch = matches!(arch, "gfx906" | "gfx1030" | "gfx1031" | "gfx1032");
         match std::env::var("HIPFIRE_PFLASH_DRAFTER_KV").ok().as_deref() {
-            None | Some("") | Some("q8") | Some("Q8") => DrafterKvMode::Q8,
             Some("fwht4") | Some("FWHT4") => DrafterKvMode::Fwht4,
             Some("fwht3") | Some("FWHT3") => DrafterKvMode::Fwht3,
             Some("fwht2") | Some("FWHT2") => DrafterKvMode::Fwht2,
+            Some("q8") | Some("Q8") => DrafterKvMode::Q8,
             Some("asym3") | Some("ASYM3") => panic!(
                 "HIPFIRE_PFLASH_DRAFTER_KV=asym3 is banned for drafter scoring — \
                  use fwht3 (similar throughput, better scorer accuracy)"
             ),
-            Some(other) => panic!(
+            Some(other) if !other.is_empty() => panic!(
                 "HIPFIRE_PFLASH_DRAFTER_KV={other:?} not in {{q8, fwht4, fwht3, fwht2}}"
             ),
+            // No explicit override → arch/length-aware default.
+            _ => {
+                if cliff_arch && max_kv_seq > LDS_CTX_LIMIT {
+                    DrafterKvMode::Fwht3
+                } else {
+                    DrafterKvMode::Q8
+                }
+            }
         }
+    }
+
+    /// Legacy env-only resolver (Q8 default). Retained for callers without
+    /// arch/length context; prefer `resolve(arch, max_kv_seq)`.
+    pub fn from_env() -> Self {
+        Self::resolve("", usize::MAX) // unknown arch → never cliff-arch → Q8 unless env set
     }
 }
 
@@ -533,7 +569,11 @@ pub fn load_drafter(
     target_tokenizer: &Tokenizer,
     max_kv_seq: usize,
 ) -> HipResult<()> {
-    let kv_mode = DrafterKvMode::from_env();
+    let kv_mode = DrafterKvMode::resolve(&gpu.arch, max_kv_seq);
+    eprintln!(
+        "[pflash] drafter KV mode = {kv_mode:?} (arch={} max_kv_seq={max_kv_seq})",
+        gpu.arch,
+    );
     let mut hfq = HfqFile::open(path).map_err(|e| hip_bridge::HipError::new(0, &format!(
         "pflash: open drafter HFQ at {}: {e}", path.display(),
     )))?;
