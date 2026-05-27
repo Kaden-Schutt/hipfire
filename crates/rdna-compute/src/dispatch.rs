@@ -22754,6 +22754,25 @@ impl Gpu {
                 block_start, block_cols,
             );
         }
+        // gfx906 dp4a path: same tiled-partials shape as tile_batched (reuses
+        // the asym reduce) but Q·K via v_dot4_i32_i8 (4 i8 MACs/instr) to
+        // relieve the issue-bound scalar dot. Requires head_dim % 32 == 0.
+        // HIPFIRE_Q8_DP4A={0,1} overrides the arch default. Default-on for
+        // gfx906 only once NIAH-validated; until then keep behind the flag.
+        let dp4a_default = false; // flip to (self.arch == "gfx906") after NIAH gate
+        let dp4a = std::env::var("HIPFIRE_Q8_DP4A").ok()
+            .and_then(|v| match v.as_str() { "1" => Some(true), "0" => Some(false), _ => None })
+            .unwrap_or(dp4a_default);
+        if dp4a && self.arch == "gfx906" && head_dim % 32 == 0 {
+            return self.launch_asym_flash_batched(
+                "attention_flash_q8_0_dp4a",
+                kernels::ATTENTION_FLASH_Q8_0_DP4A_GFX906_SRC,
+                "attention_flash_q8_0_dp4a",
+                q, k_cache, v_cache, out, positions, q, q,
+                n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
+                tree_bias, block_start, block_cols,
+            );
+        }
         self.launch_asym_flash_batched(
             "attention_flash_q8_0_tile_batched",
             kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,

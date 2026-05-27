@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 //
 // Microbench for the no-LDS-cap batched Q8 flash attention introduced in
@@ -95,12 +95,19 @@ fn main() {
             &q, &k_cache, &v_cache, &out_ref, &positions,
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
         ).expect("ref");
-        // Force tokpar into out_tp.
-        std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
+        // Force the candidate (tokpar by default, or dp4a if DP4A=1) into out_tp.
+        let use_dp4a = std::env::var("DP4A").as_deref() == Ok("1");
+        std::env::set_var("HIPFIRE_Q8_TOKPAR", "0");
+        if use_dp4a {
+            std::env::set_var("HIPFIRE_Q8_DP4A", "1");
+        } else {
+            std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
+        }
         gpu.attention_flash_q8_0_batched_masked(
             &q, &k_cache, &v_cache, &out_tp, &positions,
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
-        ).expect("tokpar");
+        ).expect("candidate");
+        std::env::remove_var("HIPFIRE_Q8_DP4A");
         gpu.hip.device_synchronize().unwrap();
         let a = gpu.download_f32(&out_ref).unwrap();
         let b = gpu.download_f32(&out_tp).unwrap();
@@ -142,7 +149,7 @@ fn main() {
             nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
         ).expect("tile_batched");
     });
-    // (A) NEW token-parallel (default on gfx906/gfx1031).
+    // (A) NEW token-parallel.
     std::env::set_var("HIPFIRE_Q8_TOKPAR", "1");
     let new_ms = time(&mut gpu, &|g: &mut Gpu| {
         g.attention_flash_q8_0_batched_masked(
@@ -151,6 +158,16 @@ fn main() {
         ).expect("tokpar");
     });
     std::env::remove_var("HIPFIRE_Q8_TOKPAR");
+
+    // (A2) dp4a (gfx906 v_dot4_i32_i8 Q·K).
+    std::env::set_var("HIPFIRE_Q8_DP4A", "1");
+    let dp4a_ms = time(&mut gpu, &|g: &mut Gpu| {
+        g.attention_flash_q8_0_batched_masked(
+            &q, &k_cache, &v_cache, &out, &positions,
+            nh, nkv, hd, ctx, ctx, n, &partials, None, 0, 0,
+        ).expect("dp4a");
+    });
+    std::env::remove_var("HIPFIRE_Q8_DP4A");
 
     // (B) OLD per-position loop — replicate the fallback this PR removed.
     let pos_single: Vec<Vec<u8>> = (0..n)
@@ -184,11 +201,12 @@ fn main() {
     const PEAK_GIBS: f64 = 954.0;
 
     println!("\n=== Q8 long-ctx attention ===");
-    println!("TOKPAR  (token-parallel, new)            : {new_ms:8.2} ms");
-    println!("TILE    (scalar per-token-serial)        : {tile_ms:8.2} ms");
+    println!("TILE    (scalar lane-split, default)     : {tile_ms:8.2} ms");
+    println!("DP4A    (gfx906 v_dot4_i32_i8 Q·K)       : {dp4a_ms:8.2} ms");
+    println!("TOKPAR  (token-parallel)                 : {new_ms:8.2} ms");
     println!("OLD     per-position loop (n={n})         : {old_ms:8.2} ms");
-    println!("speedup TOKPAR vs TILE                    : {:.2}x", tile_ms / new_ms);
-    println!("speedup TOKPAR vs OLD                     : {:.2}x", old_ms / new_ms);
+    println!("speedup DP4A vs TILE                      : {:.2}x", tile_ms / dp4a_ms);
+    println!("speedup DP4A vs OLD                       : {:.2}x", old_ms / dp4a_ms);
     println!("--- NEW kernel BW (upper-bound K/V reads) ---");
     println!("K/V DRAM read (n_heads×ctx, K+V)         : {:.1} MiB",
         new_kv_reads / 1048576.0);

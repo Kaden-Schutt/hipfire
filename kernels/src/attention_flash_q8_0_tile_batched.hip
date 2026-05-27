@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Kevin Read
 // hipfire — see LICENSE and NOTICE in the project root.
 
 // Batched flash attention tile for Q8_0 KV (both K and V at Q8_0, 34-byte

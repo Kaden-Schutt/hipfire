@@ -78,6 +78,36 @@ over the per-position fallback). tokpar stays behind HIPFIRE_Q8_TOKPAR=1
 (default OFF — measured regression) as a scaffold for the dp4a rewrite
 (its per-thread whole-token dot is the natural place to drop in sdot4).
 
+## dp4a kernel — BUILT, CORRECT, MODEST WIN (2026-05-27)
+
+`attention_flash_q8_0_dp4a.gfx906.hip`: same tiled-partials shape (reuses
+asym reduce), Q quantized to i8 per-32-block once/head, Q·K via 2×
+`__builtin_amdgcn_sdot4` (ILP2). Per the skyne98 gfx906 studies (dot4/dot8,
+quant-dequant ISA, latency-hiding).
+
+- **VERIFY:** 3.7e-3 vs tile_batched (Q i8-quant error — acceptable).
+- **NIAH 32k (21551 tok): PASS** — needle recovered, correct at scale.
+- **Microbench: 1.24–1.27× over tile_batched, 2.6–2.8× over fallback.**
+  31 VGPR, 0 spills, 8 waves/SIMD (no occupancy cost), 2 v_dot4 emitted.
+- Gate: `HIPFIRE_Q8_DP4A=1`; `dp4a_default=false` until the e2e picture
+  justifies default-on. To enable: flip `dp4a_default` to `self.arch == "gfx906"`.
+
+**E2E reality check (important):** end-to-end NIAH prefill stayed ~10
+tok/s (2.22M ms) — UNCHANGED from tile_batched, despite the 1.25× kernel
+win. Attention is NOT the e2e prefill bottleneck at this scale; the
+projection GEMMs + per-chunk structure dominate wall time. So dp4a is a
+real win on the attention-kernel axis but does not move e2e prefill. The
+e2e lever is elsewhere (GEMM prefill path / PR #335-class gate work).
+
+## Remaining dp4a headroom (next, if pursued)
+- **Phase D (V accumulation) is still scalar f32** and is now the
+  dominant cost inside the attention kernel. dp4a doesn't apply (scores
+  are f32). Options: (a) quantize scores to i8 + sdot4 the V dot (accuracy
+  risk — NIAH-gate); (b) `v_dot2_f32_f16` if V staged as f16; (c) leave it.
+- ILP4 on Q·K is capped at ILP2 here (8 dims/lane = 2 dot4); a wider
+  per-lane tile (16 dims/lane, 16 lanes) would unlock ILP4 (study: 2×
+  on the dot) — but the dot is already not the sole cost.
+
 ## Commit 1 — optimized scalar kernel (gfx906 + gfx1031, testable here)
 
 **Basis: token-parallel structure from `attention_flash_gqa.hip`
