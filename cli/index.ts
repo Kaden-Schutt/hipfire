@@ -685,6 +685,13 @@ interface ModelEntry {
   /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
   /// eviction = confident-wrong hallucination on multi-turn).
   triattn?: { file: string };
+  /// Optional published MTP (Multi-Token Prediction) sidecar — currently
+  /// DeepSeek V4 only. When set, `hipfire pull` also fetches the file next
+  /// to the weights. The daemon's V4F arm auto-discovers the sidecar via
+  /// the `<stem>-mtp.<ext>` sibling convention at load time (see
+  /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
+  /// is required once the file is in MODELS_DIR.
+  mtp?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -1242,6 +1249,36 @@ async function pull(tag: string): Promise<string> {
     }
   }
 
+  // MTP sidecar: same pattern as TriAttention. Daemon auto-attaches via the
+  // `<stem>-mtp.<ext>` sibling convention (see arch-deepseek4/src/arch.rs);
+  // missing sidecar = plain decode only, no spec-decode.
+  if (entry.mtp?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.mtp.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  MTP sidecar already present: ${entry.mtp.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.mtp.file}`;
+      console.error(`  Fetching MTP sidecar: ${entry.mtp.file}`);
+      try {
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        if (!sres.ok) {
+          console.error(`  WARN: MTP sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; spec-decode unavailable until sidecar present.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
+          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
   return dest;
 }
 
@@ -1381,6 +1418,13 @@ async function serve(port: number, host: string) {
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
   let modelHasVL = false;
+  // Architecture tag from the most recent daemon `loaded` event (e.g.
+  // "qwen2", "qwen35", "deepseek4"). Used to gate format-specific
+  // serve-side prompt construction — V4F's daemon path renders tools
+  // via DSML and reads multi-turn history from structured `messages`,
+  // so the legacy Hermes `<tools>` block injection and ChatML
+  // conversation rebuild both turn into off-distribution noise.
+  let currentArch: string | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1447,6 +1491,7 @@ async function serve(port: number, host: string) {
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
         modelHasVL = loadResult.vl === true;
+        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1514,9 +1559,37 @@ async function serve(port: number, host: string) {
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
-        // OpenAI API is stateless: each request has the full conversation.
-        // Reset daemon state so prior requests don't bleed into this one.
-        await e.send({ type: "reset" }); await e.recv();
+        // Opt-in request-body dump. Lets an operator see the full
+        // prompt a client (e.g. Pi) is sending without having to attach
+        // a strace. Off by default — gigantic for typical agent prompts.
+        if (process.env.HIPFIRE_DUMP_REQUEST === "1") {
+          try {
+            const path = `/tmp/hipfire-request-${Date.now()}.json`;
+            require("fs").writeFileSync(path, JSON.stringify(body, null, 2));
+            console.error(`[hipfire] dumped request → ${path} (msgs=${messages.length} tools=${tools.length} stream=${body.stream})`);
+          } catch (e: any) {
+            console.error(`[hipfire] request dump failed: ${e?.message ?? e}`);
+          }
+        }
+
+        // OpenAI API is stateless: each request CARRIES the full
+        // conversation. For most archs we tell the daemon to reset
+        // here so prior turn KV doesn't bleed into this one.
+        //
+        // V4F is the exception. Its daemon arm runs LCP detection
+        // (Reasonix-style prefix caching): if the freshly-tokenized
+        // prompt fully extends `m.conversation_tokens` from the prior
+        // turn, the daemon skips prefill for the matching prefix and
+        // only prefills the suffix — exactly the cache-hit shape
+        // Reasonix engineers for upstream. Calling `reset` here clears
+        // `m.conversation_tokens` and forces lcp=0 every turn, which
+        // is correct stateless behavior but throws away the cache.
+        // Skip the reset for V4F and let the daemon's auto-LCP
+        // (with a strict "fully extends" guard for SWA-ring safety)
+        // decide whether this is a continuation or a fresh request.
+        if (currentArch !== "deepseek4") {
+          await e.send({ type: "reset" }); await e.recv();
+        }
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -1530,6 +1603,15 @@ async function serve(port: number, host: string) {
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
         const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          // OpenAI assistant messages carrying only `tool_calls` send
+          // `content: null`. Returning `String(null) === "null"` here
+          // (the legacy fallback below) leaked the literal text `null`
+          // into the rendered prompt — V4F prompt dumps showed this as
+          // `<｜Assistant｜>null<｜end▁of▁sentence｜>` for every prior
+          // tool-call turn, which the model reads as "the assistant
+          // previously said the word null", not as an empty turn.
+          // Treat null/undefined as empty content.
+          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
           if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
@@ -1637,15 +1719,14 @@ async function serve(port: number, host: string) {
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
-        // Format tools into system prompt (Hermes format)
-        if (tools.length > 0) {
-          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
-            + tools.map((t: any) => JSON.stringify(t)).join("\n")
-            + "\n</tools>\n\n"
-            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
-        }
+        // The legacy Hermes `<tools>` block injection happens LATER, after
+        // the model has actually been loaded/reloaded and `currentArch` is
+        // known to reflect the target model — not the pre-warmed one. See
+        // the post-reload site below for the actual append. We can't add
+        // it here because a request that triggers a reload to a different
+        // arch would flip the rule under our feet (e.g. pre-warmed V4F,
+        // requested Qwen35: at this point currentArch is still "deepseek4"
+        // and we'd skip the Hermes block — but Qwen35 needs it).
 
         // Build conversation as multi-turn ChatML prompt.
         // The daemon wraps the prompt as: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
@@ -1739,6 +1820,10 @@ async function serve(port: number, host: string) {
           }
         }
         userPrompt = convParts.join("");
+        // V4F-specific override of `userPrompt` (collapse to live user
+        // message only) ALSO happens after the reload check below —
+        // same reasoning as the Hermes block: `currentArch` may change
+        // if the request triggers a reload, so we can't gate on it yet.
 
         const rawPath = findModel(body.model || "default");
         if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
@@ -1777,6 +1862,49 @@ async function serve(port: number, host: string) {
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
+          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
+        }
+
+        // Now that currentArch reflects the model we're ACTUALLY sending
+        // to (post-reload), apply the arch-conditional prompt shaping.
+        //
+        // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
+        //    (Qwen2 generate) only see tools through prompt text and rely
+        //    on this block. V4F (`generate_deepseek4`) builds its own
+        //    DSML tools preamble from the structured `tools` field, so
+        //    injecting Hermes on top gives the model two conflicting
+        //    tool-call format contracts (observed verbatim in
+        //    /tmp/hipfire-prompt-*.txt). Skip for V4F.
+        if (tools.length > 0 && currentArch !== "deepseek4") {
+          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            + tools.map((t: any) => JSON.stringify(t)).join("\n")
+            + "\n</tools>\n\n"
+            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        }
+
+        // 2. `userPrompt` content: V4F's daemon path reads multi-turn
+        //    history from the structured `messages` field and treats
+        //    `prompt` as the live user input. Leaving `userPrompt` set to
+        //    the ChatML rebuild of the conversation causes the daemon to
+        //    render history twice — once in V4F tokens from `messages`,
+        //    once in ChatML tokens from `prompt`. Replace with just the
+        //    trailing user message (or "" when conversation ends with a
+        //    tool/assistant turn — daemon then continues from
+        //    `<｜Assistant｜>` directly).
+        //
+        //    Legacy arches (Qwen2 in particular) ignore the structured
+        //    `messages` field and ONLY read `prompt` — they NEED the
+        //    full ChatML rebuild for multi-turn to survive. Don't touch.
+        if (currentArch === "deepseek4") {
+          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
+          if (last && last.role === "user") {
+            const lastContent = extractContent(last.content);
+            userPrompt = lastContent.text;
+          } else {
+            userPrompt = "";
+          }
         }
 
         const reqId = `chatcmpl-${Date.now().toString(36)}`;
@@ -1817,9 +1945,40 @@ async function serve(port: number, host: string) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
-        // Include usage 
+        // Include usage
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
+
+        // Build the OpenAI-format `usage` object. The V4F daemon arm
+        // emits `prompt_tokens` (full client-visible prompt size) and
+        // `cached_tokens` (LCP-hit count from the prefix cache) as
+        // separate fields; legacy arches only emit `prefill_tokens`
+        // (== the number of tokens actually fed through the forward
+        // path) and we fall back to that for `prompt_tokens` so the
+        // total still balances on those paths.
+        //
+        // `usage.prompt_tokens_details.cached_tokens` is the OpenAI
+        // surface DeepSeek / pi-coding-agent / OpenCode read for
+        // cache-hit accounting; we emit it whenever the daemon
+        // reports cached_tokens > 0 (V4F today; other archs when /
+        // if they grow LCP detection).
+        const buildUsage = (msg: any, completion: number) => {
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : (typeof msg.prefill_tokens === "number" ? msg.prefill_tokens : 0);
+          const cachedTokens: number = typeof msg.cached_tokens === "number"
+            ? msg.cached_tokens
+            : 0;
+          const usage: any = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completion,
+            total_tokens: promptTokens + completion,
+          };
+          if (cachedTokens > 0) {
+            usage.prompt_tokens_details = { cached_tokens: cachedTokens };
+          }
+          return usage;
+        };
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -2152,6 +2311,13 @@ async function serve(port: number, host: string) {
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
+                // V4F arm emits structured `tool_calls` events via the DSML
+                // StreamParser BEFORE the `done` event lands. We track that
+                // here so the done handler can finish with
+                // `finish_reason: "tool_calls"` instead of falling back to
+                // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
+                // decide whether the message ended with a callable action).
+                let structuredToolCallsEmitted = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
@@ -2201,9 +2367,76 @@ async function serve(port: number, host: string) {
                       })}\n\n`));
                       visibleChunkSent = true;
                     }
+                  } else if (msg.type === "reasoning") {
+                    // V4F daemon arm emits structured `reasoning` events
+                    // from the DSML StreamParser; `<think>` / `</think>`
+                    // have already been stripped server-side. Forward as
+                    // OpenAI-compatible `reasoning_content` delta.
+                    const rtext = msg.text as string;
+                    if (rtext) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { reasoning_content: rtext }, finish_reason: null }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                    }
+                  } else if (msg.type === "tool_calls") {
+                    // V4F daemon arm emits structured `tool_calls` events
+                    // from the DSML StreamParser. Convert each call into
+                    // an OpenAI-format tool_call SSE delta. We emit one
+                    // SSE chunk per call so order is preserved; each call
+                    // gets a synthetic `call_<index>` id.
+                    const calls = Array.isArray(msg.calls) ? msg.calls : [];
+                    for (let i = 0; i < calls.length; i++) {
+                      const c = calls[i] as { name: string; arguments: unknown };
+                      const argStr = typeof c.arguments === "string"
+                        ? c.arguments
+                        : JSON.stringify(c.arguments);
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: i,
+                              id: `call_${reqId}_${i}`,
+                              type: "function",
+                              function: { name: c.name, arguments: argStr }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                      structuredToolCallsEmitted = true;
+                    }
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
+                    // Daemon-authoritative finish_reason (V4F sets it
+                    // from the decode-loop exit condition). Falls back
+                    // to "stop" when an older daemon build didn't carry
+                    // the field, preserving legacy behaviour for the
+                    // Qwen35 / LLaMA / Qwen2 arches that don't yet emit
+                    // it. Only "stop" | "length" | "tool_calls" are
+                    // OpenAI-valid; clamp anything else to "stop".
+                    const allowedFR = new Set(["stop", "length", "tool_calls"]);
+                    const daemonFR: string | null = typeof (msg as any).finish_reason === "string" && allowedFR.has((msg as any).finish_reason)
+                      ? (msg as any).finish_reason
+                      : null;
+                    // V4F-style: structured tool_calls already emitted on the
+                    // wire. Skip the legacy text-buffer parser path and close
+                    // out with the OpenAI-correct `finish_reason: "tool_calls"`.
+                    if (structuredToolCallsEmitted) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                      })}\n\n`));
+                      ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                      ctrl.close();
+                      return;
+                    }
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
@@ -2222,8 +2455,8 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2234,16 +2467,16 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       }
                     } else {
                       const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
@@ -2280,12 +2513,70 @@ async function serve(port: number, host: string) {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
+        let cachedTokens = 0;
         let daemonError: string | null = null;
         e.generating = true;
+        // V4F arm emits structured `tool_calls` events from the DSML
+        // StreamParser. Capture them here so the non-streaming chat-
+        // completion response can carry an OpenAI-format `tool_calls`
+        // array on the assistant message. Without this, the non-stream
+        // path falls back to `parseToolCalls(content)` on the
+        // (typically empty) accumulated text and returns
+        // `finish_reason: "stop"` with a missing `tool_calls` field.
+        let structuredToolCalls: any[] | null = null;
+        // Name-shadowing avoidance: the outer scope has `reasoning`
+        // bound to the request-level reasoning *config* (effort, etc.).
+        // Use `reasoningContent` for the accumulated `<think>…</think>`
+        // body that surfaces under `message.reasoning_content` below.
+        let reasoningContent = "";
+        let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { promptTokens = msg.prefill_tokens ?? 0; }
+          else if (msg.type === "reasoning") {
+            // V4F's StreamParser splits `<think>…</think>` content out
+            // as `reasoning` events. Accumulate so the non-stream chat
+            // completion response can surface it under
+            // `message.reasoning_content` — without this the reasoning
+            // text was silently dropped on every think-mode V4F turn.
+            if (typeof msg.text === "string") reasoningContent += msg.text;
+          }
+          else if (msg.type === "done") {
+            // `prompt_tokens` is the full client-visible prompt size
+            // (V4F emits it). `prefill_tokens` (legacy) is what
+            // actually went through forward — equal to prompt when
+            // cached_tokens is 0. Fall back to prefill_tokens so the
+            // non-V4F paths keep their existing accounting.
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : (msg.prefill_tokens ?? 0);
+            cachedTokens = typeof msg.cached_tokens === "number"
+              ? msg.cached_tokens
+              : 0;
+            // V4F daemon emits an authoritative finish_reason. Only
+            // accept the three OpenAI-valid values; anything else falls
+            // back to the legacy inference below.
+            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+              daemonFinishReason = msg.finish_reason;
+            }
+          }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+          else if (msg.type === "tool_calls") {
+            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+            if (calls.length > 0) {
+              if (structuredToolCalls === null) structuredToolCalls = [];
+              for (let i = 0; i < calls.length; i++) {
+                const c = calls[i] as { name: string; arguments: unknown };
+                const argStr = typeof c.arguments === "string"
+                  ? c.arguments
+                  : JSON.stringify(c.arguments);
+                structuredToolCalls.push({
+                  id: `call_${reqId}_${structuredToolCalls.length}`,
+                  type: "function",
+                  function: { name: c.name, arguments: argStr }
+                });
+              }
+            }
+          }
         }
         e.generating = false;
 
@@ -2331,20 +2622,56 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Check for tool calls in response
-        const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
-        if (parsed.tool_calls) {
-          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+        // Tool calls. V4F arm yields them as structured events (captured
+        // above into `structuredToolCalls`); legacy arches embed them as
+        // text the parser extracts. Prefer the structured source when it
+        // emitted anything.
+        const choice: any = { index: 0 };
+        if (structuredToolCalls && structuredToolCalls.length > 0) {
+          // V4F's `Token` events outside the `<｜DSML｜tool_calls>` block
+          // already streamed any preceding assistant text. Pass that
+          // through as the message content (trimmed — the model
+          // typically emits trailing `\n\n` after closing `</think>`).
+          choice.finish_reason = daemonFinishReason ?? "tool_calls";
+          choice.message = {
+            role: "assistant",
+            content: content.trim() || null,
+            tool_calls: structuredToolCalls,
+          };
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         } else {
-          choice.message = { role: "assistant", content };
+          const parsed = parseToolCalls(content);
+          // Prefer the daemon's authoritative finish_reason (V4F).
+          // Fall back to the legacy inference: "tool_calls" if the
+          // text parser found inline tool calls, otherwise "stop" —
+          // but if the daemon told us "length" (max_tokens hit), use
+          // that even when there's no tool call, so clients can
+          // detect truncated replies.
+          choice.finish_reason = daemonFinishReason
+            ?? (parsed.tool_calls ? "tool_calls" : "stop");
+          if (parsed.tool_calls) {
+            choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+          } else {
+            choice.message = { role: "assistant", content };
+          }
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         }
 
         safeRelease();
         const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          usage: (() => {
+            const u: any = {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+            };
+            if (cachedTokens > 0) {
+              u.prompt_tokens_details = { cached_tokens: cachedTokens };
+            }
+            return u;
+          })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;

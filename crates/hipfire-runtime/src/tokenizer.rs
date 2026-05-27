@@ -392,11 +392,19 @@ impl Tokenizer {
                     }
                     vocab[id as usize] = content.to_string();
                     token_to_id.insert(content.to_string(), id);
-                    let is_special = at.get("special").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || (content.starts_with("<") && content.ends_with(">") && content.len() > 3 && !content.contains(' '));
-                    if is_special {
-                        special_tokens.push((content.to_string(), id));
-                    }
+                    // Every `added_tokens` entry is an atomic token in the
+                    // tokenizer's intended encoding — the `special` field
+                    // marks SEMANTIC specials (BOS/EOS that need engine-
+                    // side handling) but does NOT mean "merge me back into
+                    // BPE." The DeepSeek V4 tokenizer marks all of
+                    // `<｜User｜>`, `<｜Assistant｜>`, `｜DSML｜`, the
+                    // `<｜tool▁*｜>` family, etc. as `special=false` even
+                    // though they MUST encode as single tokens for the
+                    // model to recognize them. Without this fix
+                    // `<｜DSML｜tool_calls>` BPE-fragments into 9 pieces
+                    // and tool calls round-trip into garbled output.
+                    let _ = at.get("special"); // we no longer gate on this
+                    special_tokens.push((content.to_string(), id));
                 }
             }
         }

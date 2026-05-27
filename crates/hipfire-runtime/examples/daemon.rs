@@ -27,6 +27,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -175,6 +176,195 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
+/// Stable fingerprint over an assistant turn — pair of (text content,
+/// tool_calls canonical JSON). Output is identical for two messages
+/// that have the same content+tool_calls regardless of how the
+/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
+/// upstream. Used by the V4F prefix-cache to identify "this is the
+/// same assistant turn the model previously emitted, so reuse the
+/// emitted token IDs verbatim instead of re-encoding via the DSML
+/// renderer + BPE (which is not bijective)."
+fn asst_turn_fingerprint(
+    content: &str,
+    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    "assistant".hash(&mut h);
+    if tool_calls.is_empty() {
+        // Pure-text turn — content IS the message. Trim whitespace
+        // to absorb minor formatting drift between store (model's
+        // verbatim emission) and lookup (whatever the client preserved).
+        content.trim().hash(&mut h);
+    } else {
+        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
+        // the tool_calls — pi-coding-agent (and most OpenAI-compat
+        // clients) sends `content: null` on assistant messages that
+        // carry tool_calls, even when the model originally emitted
+        // prose ahead of the tool block (e.g. "Let me check the
+        // structure first.<｜DSML｜tool_calls>…"). The store-side
+        // sees the prose in `emit_text_buf`; the lookup-side sees
+        // content=`""`. Excluding content from the fingerprint when
+        // tool_calls is non-empty matches the client's effective
+        // identity for tool-call turns and lets the cache hit.
+        //
+        // Collision risk: two distinct turns with identical
+        // tool_calls hash to the same key; the later store wins,
+        // and a replay of the earlier turn replays the later turn's
+        // tokens. In practice this only matters when the model emits
+        // the SAME tool_call twice with different surrounding prose
+        // in the same conversation — uncommon for agent flows, and
+        // the worst-case effect is the model seeing slightly altered
+        // prose in its own history.
+    }
+    for tc in tool_calls {
+        tc.name.hash(&mut h);
+        // Serialize args in a CANONICAL form: walk the Value tree and
+        // emit objects with keys sorted lexically (recursively). The
+        // upstream `serde_json::Map` uses insertion order — fine for
+        // round-tripping a single payload, but two clients (or two
+        // parser passes on the same payload) can yield different
+        // insertion orders for the same logical args. Without
+        // canonicalization those two turns hash to DIFFERENT keys,
+        // dropping cache hit rate on otherwise-identical tool calls.
+        let args = canonical_json(&tc.arguments);
+        args.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Walk a [`serde_json::Value`] and produce a canonical-key
+/// representation: objects emit keys in lexical order (recursively),
+/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
+/// messages with the same logical tool args hash identically
+/// regardless of source-side insertion order.
+fn canonical_json(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                write_canonical_json(&map[*k], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
+/// through `serde_json::json!` so embedded `"` / `\` / control chars in
+/// the message or `id` can't corrupt the line and trigger a client-side
+/// `JSON Parse error: Expected '}'` parse loop. Use this instead of
+/// `writeln!(stdout, r#"{{"type":"error",…}}"#, …)` with raw `{}` / `{:?}`
+/// interpolation of error values — Rust's `Display` will pass through
+/// a `"` unchanged, and `Debug` actively wraps strings in escaped quotes,
+/// both of which break the surrounding JSON.
+fn emit_error_with_id(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "id": id,
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+#[allow(dead_code)]
+fn emit_error_no_id(
+    stdout: &mut std::io::Stdout,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
+/// Maps:
+///   - Token(text)        → `{type:"token",   id, text}`
+///   - Reasoning(text)    → `{type:"reasoning", id, text}`
+///   - ToolCalls(calls)   → `{type:"tool_calls", id, calls:[{name, arguments}]}`
+///
+/// The CLI / OpenAI HTTP layer translates these into the corresponding
+/// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
+fn emit_stream_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
+) {
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
+    // The request id is user-supplied. Build the envelope through
+    // `serde_json` so any embedded `"` / `\` / control chars are
+    // escaped — otherwise a malformed id corrupts every subsequent
+    // line of the JSONL stream and the cli/serve loop dies with a
+    // `JSON Parse error: Expected '}'`.
+    let envelope = match ev {
+        StreamEvent::Token(text) => serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": text,
+        }),
+        StreamEvent::Reasoning(text) => serde_json::json!({
+            "type": "reasoning",
+            "id": id,
+            "text": text,
+        }),
+        StreamEvent::ToolCalls(calls) => {
+            let arr: Vec<serde_json::Value> = calls
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "arguments": c.arguments,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "tool_calls",
+                "id": id,
+                "calls": serde_json::Value::Array(arr),
+            })
+        }
+    };
+    let _ = writeln!(stdout, "{}", envelope);
+}
+
 fn emit_committed_event(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -190,11 +380,18 @@ fn emit_committed_event(
     if !on {
         return;
     }
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
-        id, tok_id, pos, t_ms
-    );
+    // Build through `serde_json::json!` for the same reason
+    // `emit_error_with_id` does: `id` is user-supplied and a single `"`
+    // or `\` in it would corrupt the line, breaking the client's JSONL
+    // parser for every subsequent event on the same connection.
+    let envelope = serde_json::json!({
+        "type": "committed",
+        "id": id,
+        "tok_id": tok_id,
+        "pos": pos,
+        "t_ms": t_ms,
+    });
+    let _ = writeln!(stdout, "{}", envelope);
 }
 
 #[allow(dead_code)]
@@ -394,6 +591,22 @@ struct LoadedModel {
     qwen2_config: Option<qwen2::Qwen2Config>,
     qwen2_weights: Option<qwen2::Qwen2Weights>,
     qwen2_state: Option<qwen2::Qwen2State>,
+    // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
+    // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
+    // SWA cache. KV cache lives inside DeepseekV4State; no separate
+    // deepseek4_kv field. None on every other arch path.
+    deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
+    deepseek4_weights: Option<hipfire_arch_deepseek4::DeepseekV4Weights>,
+    deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
+    /// Pre-allocated PrefillBatchScratch sized to `HIPFIRE_DEEPSEEK4_PP_BATCH`
+    /// (default 64). Used by both batched prefill and the MTP spec-decode
+    /// verify pass. Lazy-allocated on first arch_id=9 load — None on every
+    /// other arch path.
+    deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    /// Cached `<｜end▁of▁sentence｜>` token id resolved at load time.
+    /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
+    /// the special-token entry.
+    deepseek4_eos_tok: u32,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the
@@ -426,6 +639,42 @@ struct LoadedModel {
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
+
+    /// Per-turn token cache for V4F prefix-cache stability.
+    ///
+    /// Maps a stable fingerprint of an assistant message — `(role,
+    /// content_text, tool_calls_canonical_json)` — to the token IDs the
+    /// model ACTUALLY emitted for that turn. When the next request
+    /// replays the same assistant message in its `messages` history, the
+    /// V4F render loop uses these cached tokens verbatim instead of
+    /// re-encoding via `render_assistant_tool_calls` + tokenizer.encode.
+    ///
+    /// Why this matters: BPE is not bijective. The model can emit a
+    /// 2-token DSML tool_call (multi-char special tokens picked
+    /// greedily); our re-encode of the same text via Jinja-style
+    /// rendering may produce 67 tokens covering the same string. The
+    /// resulting prompt diverges from the prior turn's KV slots at
+    /// the assistant-turn boundary, capping the prefix-cache LCP at
+    /// the divergence point. Caching the emitted tokens restores
+    /// byte-identical replay and lets LCP extend through all prior
+    /// assistant turns.
+    ///
+    /// Cleared on model unload (LoadedModel destruction). Bounded by
+    /// the natural lifetime of a session — entries that never come
+    /// back in a `messages` history will linger but never affect
+    /// correctness (worst case: VRAM-free Vec<u32> memory growth on
+    /// the host).
+    asst_turn_cache: std::collections::HashMap<u64, Vec<u32>>,
+
+    /// Lazily-built decoded-vocab cache for grammar-guided sampling.
+    /// `tokenizer.decode(&[id])` for every id ∈ `0..vocab_size`. Built
+    /// once on first tool-using V4F request, reused for every subsequent
+    /// request on the same model. Without this cache, each generate
+    /// rebuilt all ~129k entries at request entry (one tokenizer.decode
+    /// allocation per id), adding tens of milliseconds of pure overhead
+    /// to every tool-using turn. `None` until first build; cleared by
+    /// `unload_model` via `LoadedModel` drop.
+    decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
@@ -767,6 +1016,7 @@ fn main() {
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
                             8 => "dots-ocr",
+                            9 => "deepseek4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -983,9 +1233,22 @@ fn main() {
                     },
                     None => None,
                 };
-                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
+                // Sampling defaults differ by arch: qwen35 family was tuned
+                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
+                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
+                // for local deployment, and lower values consistently fall
+                // into block-level attractors on this quantized instruct
+                // model. Pick arch-shaped defaults so a vanilla
+                // `/v1/chat/completions` POST (no sampling fields) works on
+                // both. Explicit per-request values still override either.
+                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                    (1.0_f64, 1.0_f64)
+                } else {
+                    (0.3_f64, 0.8_f64)
+                };
+                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(default_temp) as f32;
                 let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(default_top_p) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -998,6 +1261,15 @@ fn main() {
                 // and docs/investigations/2026-05-15-9b-reasoning-loop/.
                 // Clients can still opt in to a non-1.0 value per request.
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                // OpenAI-compatible `reasoning_effort` (also accept our custom
+                // `thinking_mode` alias) — only consumed by arch_id=9 today.
+                // Default = NonThink, matching the safe HF chat frame.
+                let think_mode = msg
+                    .get("reasoning_effort")
+                    .or_else(|| msg.get("thinking_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(ThinkMode::from_str)
+                    .unwrap_or(ThinkMode::NonThink);
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -1155,6 +1427,7 @@ fn main() {
                         pf_cfg_owned.as_ref(),
                         tools_json.as_deref(),
                         messages_history.as_deref(),
+                        think_mode,
                     );
                 }
             }
@@ -1213,6 +1486,31 @@ fn main() {
                     // entries into attention for the new turn — fluent
                     // garbage, no panic. See `Qwen2State::reset` doc.
                     if let Some(ref mut s) = m.qwen2_state { s.reset(); }
+                    // arch_id=9: same rationale for DeepSeek V4. Prior to
+                    // 2026-05-24 the V4F state was NEVER reset, so
+                    // `state.n_tokens` accumulated across requests and
+                    // every new prefill wrote AFTER the previous turn's
+                    // KV residue — fitting symptom for the multi-turn
+                    // pi-coding-agent corruption (`CLion` for
+                    // `CLionProjects`, `/home/n/` for `/home/nick/`).
+                    // See `DeepseekV4State::reset` doc.
+                    if let Some(ref mut s) = m.deepseek4_state {
+                        s.reset();
+                        // Drop the captured V4F decode hipGraph alongside
+                        // the state. The captured kernarg blobs hold
+                        // session-1's device-buffer pointers; a fresh
+                        // capture on session-2 binds against session-2's
+                        // pointers and host scalars. Without this the
+                        // replay path crashes with "illegal memory access"
+                        // on the post-launch logits D2H — the captured
+                        // graph dispatched against a stale slot/n_valid
+                        // computation that mis-ordered against this
+                        // session's prefill state. The matching
+                        // `ar_forward_warmed_up = false` in `reset()`
+                        // ensures we retrace warmup → capture → replay
+                        // rather than jumping straight back to replay.
+                        gpu.invalidate_graph_state();
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1259,6 +1557,7 @@ fn main() {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
                     7 => "qwen2",
+                    9 => "deepseek4",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1359,6 +1658,26 @@ fn main() {
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 9 {
+                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
+                    // the kernel cache (HC, indexer, compressor,
+                    // attention, MoE) on a short synthetic prompt
+                    // before any user-facing generate. Not the
+                    // production prefill path (that's
+                    // forward_prefill_batch_chunked in `generate`).
+                    let config = m.deepseek4_config.as_ref().unwrap();
+                    let weights = m.deepseek4_weights.as_ref().unwrap();
+                    let state = m.deepseek4_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if deepseek4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        ).is_err() {
                             ok = false;
                             break;
                         }
@@ -1724,11 +2043,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1767,11 +2088,75 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 9 {
+        // DeepSeek V4 Flash (hipfire-arch-deepseek4). Standalone bring-up —
+        // no eviction, no DFlash drafter, no PFlash, no VL. The
+        // Architecture trait gives us config + weights + state in three
+        // calls; forward goes through `deepseek4::forward::forward_prefill_*` /
+        // `decode_step` in the generate hot path.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        let state = deepseek4::DeepseekV4State::new(&config)?;
+        // Pre-allocate PrefillBatchScratch. Default B=1024 (bumped from 64
+        // on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):
+        //   PP=256: 46.4 tps   PP=512: 48.3 tps
+        //   PP=1024: 49.3 tps  PP=2048: 49.0 tps
+        // 1024 captures the L2-amortization peak; 2048 plateaus from PBS
+        // memory footprint exceeding effective L2/Inf-cache reuse window.
+        // PBS sits in (UMA) GPU memory for the model's lifetime — ~600 MB
+        // at B=1024 on V4-Flash, well within 128 GB. Override via
+        // HIPFIRE_DEEPSEEK4_PP_BATCH.
+        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
+        // Cache EOS token id. DeepSeek family uses `<｜end▁of▁sentence｜>`;
+        // fall back to 1 if tokenizer lacks the entry.
+        let eos_tok: u32 = {
+            let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+            if ids.len() == 1 { ids[0] } else { 1 }
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
+            deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1953,11 +2338,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -1984,11 +2371,13 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2071,6 +2460,11 @@ fn load_model_safetensors(
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
             llama_kv: Some(kv),
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2079,6 +2473,8 @@ fn load_model_safetensors(
             physical_cap: max_seq,
             eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(),
+            decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2131,6 +2527,11 @@ fn load_model_safetensors(
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
+        deepseek4_config: None,
+        deepseek4_weights: None,
+        deepseek4_state: None,
+        deepseek4_pbs: None,
+        deepseek4_eos_tok: 0,
         vision_config: None,
         vision_weights: None,
         tokenizer: Some(tokenizer),
@@ -2139,6 +2540,8 @@ fn load_model_safetensors(
         physical_cap: effective_max_seq,
         eviction: None,
         conversation_tokens: Vec::new(),
+        asst_turn_cache: std::collections::HashMap::new(),
+        decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template,
@@ -2264,11 +2667,13 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
         dots_ocr_config: None, dots_ocr_weights: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -2370,12 +2775,19 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // free_gpu call handles both. (Compare LLaMA where ForwardScratch and
     // KvCache are separate fields.)
     if let Some(s) = m.qwen2_state { s.free_gpu(gpu); }
+    // V4F (arch_id=9) per-session scratch + per-layer SWA/indexer/
+    // compressor caches. Without these `unload_model` would leak ~tens
+    // of MB of state buffers per load/unload cycle, defeating idle
+    // eviction.
+    if let Some(s) = m.deepseek4_state { s.free_gpu(gpu); }
+    if let Some(pbs) = m.deepseek4_pbs { pbs.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.qwen2_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.deepseek4_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
     // can land at the same device address and silently inherit stale
@@ -3589,7 +4001,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode) {
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -3609,6 +4021,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         generate_qwen2(
             m, gpu, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
+        );
+        return;
+    }
+    if m.arch_id == 9 {
+        // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
+        // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
+        // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
+        // We honour `system_prompt`, `temp`, `top_p`, `tools`, and
+        // `messages_history` per HF V4 chat template + sampling
+        // recommendations; everything else routes through future
+        // follow-ups.
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                 assistant_prefix, pflash_state, pflash_cfg);
+        let _ = (repeat_penalty, repeat_window);
+        generate_deepseek4(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, think_mode, tools, messages_history,
         );
         return;
     }
@@ -4562,6 +4991,1009 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     }
 }
 
+/// DeepSeek V4 Flash generate path (arch_id=9, hipfire-arch-deepseek4).
+///
+/// Parity with `deepseek4_chat`: batched chunked prefill +
+/// optional MTP spec-decode + greedy argmax sampler. PBS is pre-allocated
+/// once at load time (`m.deepseek4_pbs`), reused across every turn.
+///
+/// Env knobs (read fresh per generate call so they can be toggled
+/// without daemon restart):
+///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
+///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
+///   HIPFIRE_DEEPSEEK4_TOP_K=N           top-k filter (default 0 = off; HF rec)
+///   HIPFIRE_DEEPSEEK4_SEED=N            PRNG seed (default: time-based)
+///
+/// Sampling defaults follow the HF model card for `deepseek-ai/DeepSeek-V4-Flash`:
+/// `temperature = 1.0, top_p = 1.0`. Pure greedy (`temp ≤ 1e-6`) is
+/// supported but actively dangerous on this quantized instruct model —
+/// once a code fence opens, `import X\n` self-reinforces into a block-
+/// level token loop. Use `temp = 1.0` (HF default) to avoid the attractor.
+///
+/// Chat template (per HF `encoding/README.md` for V4): non-thinking-mode
+/// frame `<｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>`.
+/// The model expects the `</think>` immediately after `<｜Assistant｜>` in
+/// non-thinking mode, even though no thinking block was generated — this
+/// signals "skip reasoning, go straight to response." Omitting it leaves
+/// the model in undefined-behavior territory.
+///
+/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// no CASK eviction, no ChatML scaffolding, no tool-use, no `<think>` /
+/// `max_think_tokens`, no repeat penalty, no VL, no multi-GPU
+/// pipeline-parallel.
+///
+/// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
+/// eviction path of its own and the SWA cache wraps automatically below
+/// the sliding-window bound.
+/// HuggingFace DeepSeek V4 thinking modes (per `encoding/README.md`).
+///
+/// The chat template choice changes the open-token after `<｜Assistant｜>`
+/// and (for `Max`) prepends an extended reasoning instruction.
+#[derive(Copy, Clone, Debug)]
+pub enum ThinkMode {
+    /// Non-thinking. Frame: `<｜Assistant｜></think>{response}`.
+    /// Model skips reasoning, replies directly. HF default for chat.
+    NonThink,
+    /// Thinking-high. Frame: `<｜Assistant｜><think>{reasoning}</think>{response}`.
+    /// Model produces a `<think>` block before responding.
+    High,
+    /// Thinking-max. Same frame as `High`, plus prepended
+    /// "Reasoning Effort: Absolute maximum..." system instruction.
+    /// HF recommends context ≥ 384K for this mode.
+    Max,
+}
+
+impl ThinkMode {
+    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
+    /// project-custom `thinking_mode`) to a mode.
+    /// Accepted: "none|off|chat|minimal" → NonThink;
+    ///           "low|medium|high|thinking" → High;
+    ///           "max" → Max. Anything else → NonThink (safe default).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "max" => Self::Max,
+            "high" | "thinking" | "low" | "medium" => Self::High,
+            _ => Self::NonThink,
+        }
+    }
+}
+
+fn generate_deepseek4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.deepseek4_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m.deepseek4_weights.as_ref().expect("deepseek4_weights missing on arch_id=9 generate");
+    let pbs = m.deepseek4_pbs.as_ref().expect("deepseek4_pbs missing on arch_id=9 generate");
+    let state = m.deepseek4_state.as_mut().expect("deepseek4_state missing on arch_id=9 generate");
+    let eos_tok = m.deepseek4_eos_tok;
+
+    // DeepSeek V4 non-thinking chat template (per HF encoding/README.md):
+    //   <｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>
+    //
+    // The `</think>` immediately after `<｜Assistant｜>` is REQUIRED in
+    // non-thinking mode — it tells the model "skip the reasoning block,
+    // go straight to the response." Without it the model is in
+    // undefined-behavior territory. Raw prompts (no chat-template wrap)
+    // also collapse to attractor garbage on this quantized instruct
+    // model. Multi-turn / thinking-mode plumbing is a follow-up; this
+    // emits a single non-thinking turn per /generate call.
+    let lookup = |s: &str| -> Option<u32> {
+        let ids = tokenizer.encode(s);
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    };
+    let bos_tok = lookup("<｜begin▁of▁sentence｜>");
+    let user_tok = lookup("<｜User｜>");
+    let asst_tok = lookup("<｜Assistant｜>");
+
+    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
+    // Quoted from the model card's encoding/README.md.
+    const MAX_THINK_PREAMBLE: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
+You MUST be very thorough in your thinking and comprehensively decompose the problem.";
+
+    // Build the effective system message: optional user-supplied system
+    // text + (if request has tools) the DSML "## Tools" preamble.
+    //
+    // HF reference render: the system role is rendered as `{content}`
+    // (raw, no role prefix), then appended with `"\n\n" + render_tools`
+    // when tools are present. For an empty system + tools this becomes
+    // `"" + "\n\n" + tools_block` = `"\n\n" + tools_block` — the model
+    // was trained to see two newlines BEFORE `## Tools` even with no
+    // system content. Omitting them puts the model in off-distribution
+    // territory; observed 2026-05-23 to drive the V4F MQ2-Lloyd
+    // checkpoint into `<｜DSML｜tool_cin> / <｜DSML｜-cin>` attractor
+    // loops on no-system + 4-tools requests. The leading `\n\n` is
+    // load-bearing — do not drop.
+    let tools_block: Option<String> = tools
+        .filter(|t| !t.is_empty())
+        .map(|t| deepseek4::dsml::tools_prompt_block(t));
+    let effective_system: Option<String> = match (system_prompt.filter(|s| !s.is_empty()), tools_block.as_deref()) {
+        (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
+        (Some(sys), None) => Some(sys.to_string()),
+        (None, Some(tb)) => Some(format!("\n\n{tb}")),
+        (None, None) => None,
+    };
+
+    let mut prompt_ids: Vec<u32> = Vec::new();
+    if let Some(b) = bos_tok { prompt_ids.push(b); }
+    if matches!(think_mode, ThinkMode::Max) {
+        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    }
+    if let Some(ref sys) = effective_system {
+        prompt_ids.extend(tokenizer.encode(sys));
+    }
+
+    // Multi-turn history. Each prior message gets rendered as a turn:
+    //   user → `<｜User｜>{content}{tool_results?}`
+    //   assistant → `<｜Assistant｜>{content_or_dsml}<｜end▁of▁sentence｜>`
+    // Tool result messages (role=tool) attach to the previous user turn
+    // wrapped in `<tool_result>…</tool_result>` per HF encoding/README.md.
+    // The CURRENT user prompt is appended last (outside this loop).
+    if let Some(history) = messages_history {
+        // Skip the leading system message (if any) — already handled.
+        // Skip the trailing user prompt — we add it explicitly after.
+        // Heuristic: if last message is role=user, treat its content as
+        // the live prompt and drop it here.
+        use hipfire_runtime::prompt_frame::Role;
+        let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) { 1 } else { 0 };
+        let end = history.len().saturating_sub(trim_end);
+        // Track whether the previous emission was already a tool_result
+        // wrapped in a user turn — when YES, the next consecutive tool
+        // message MUST NOT open a new `<｜User｜>` marker; instead it
+        // stacks its `<tool_result>` body into the existing user turn.
+        // Matches the reference imatrix dataset renderer in
+        // `gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:196-201`
+        // — OpenAI's parallel-tool-call flow produces consecutive tool
+        // messages (one per parallel call), and a fresh `<｜User｜>`
+        // between them isn't what V4F was trained on.
+        let mut pending_tool_result = false;
+        for msg in &history[..end] {
+            match msg.role {
+                Role::System => {
+                    // Already handled via effective_system; skip.
+                }
+                Role::User => {
+                    if let Some(u) = user_tok { prompt_ids.push(u); }
+                    prompt_ids.extend(tokenizer.encode(&msg.content));
+                    pending_tool_result = false;
+                }
+                Role::Tool => {
+                    // Wrap as `<tool_result>{escaped}</tool_result>`. Open
+                    // a new user turn ONLY if the prior message wasn't
+                    // already a tool_result.
+                    if !pending_tool_result {
+                        if let Some(u) = user_tok { prompt_ids.push(u); }
+                    }
+                    prompt_ids.extend(
+                        tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content))
+                    );
+                    pending_tool_result = true;
+                }
+                Role::Assistant => {
+                    // Daemon-emitted surround tokens that bracket every
+                    // assistant turn in V4F format:
+                    //   <｜Assistant｜>{</think> when not in think-replay}
+                    //     {turn body — content + tool_calls}
+                    //   <｜end▁of▁sentence｜>
+                    //
+                    // The cache stores ONLY the inner turn body (the
+                    // tokens the model itself emitted during decode).
+                    // The surround tokens are deterministic functions
+                    // of `msg.content` and `think_mode` and must be
+                    // emitted IDENTICALLY on both hit and miss paths so
+                    // the prompt-cache LCP can extend through every
+                    // prior assistant turn.
+                    if let Some(a) = asst_tok { prompt_ids.push(a); }
+                    let starts_with_think_tag = msg.content.starts_with("<think>")
+                        || msg.content.starts_with("</think>");
+                    if !starts_with_think_tag {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
+
+                    // Prefix-cache fast path: if we previously emitted
+                    // this exact assistant turn, replay the model's
+                    // verbatim token sequence instead of re-rendering
+                    // via DSML + BPE encode (which is not bijective —
+                    // multi-char DSML special tokens picked greedily
+                    // during decode can come back out of
+                    // `tokenizer.encode(render(...))` as a longer
+                    // sequence with different boundaries, capping the
+                    // LCP at the assistant-turn boundary).
+                    let fp = asst_turn_fingerprint(&msg.content, &msg.tool_calls);
+                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "[asst-cache lookup] fp={:#018x} content.len={} tool_calls={} hit={}",
+                            fp, msg.content.len(), msg.tool_calls.len(),
+                            m.asst_turn_cache.contains_key(&fp),
+                        );
+                    }
+                    if let Some(cached) = m.asst_turn_cache.get(&fp) {
+                        prompt_ids.extend_from_slice(cached);
+                    } else {
+                        // Cache miss — render the turn the long way.
+                        if !msg.content.is_empty() && msg.content != "null" {
+                            prompt_ids.extend(tokenizer.encode(&msg.content));
+                        }
+                        if !msg.tool_calls.is_empty() {
+                            let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
+                                .tool_calls
+                                .iter()
+                                .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
+                                    name: c.name.clone(),
+                                    arguments: c.arguments.clone(),
+                                })
+                                .collect();
+                            let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
+                                &dsml_calls,
+                            );
+                            prompt_ids.extend(tokenizer.encode(&dsml));
+                        }
+                    }
+
+                    // Close the assistant turn with the EOS marker so
+                    // the next turn starts cleanly.
+                    prompt_ids.push(m.deepseek4_eos_tok);
+                    pending_tool_result = false;
+                }
+            }
+        }
+    }
+
+    // Append the live user turn ONLY when `prompt` carries one. When the
+    // serve has handed us a structured `messages` history that already
+    // ends in a tool result (mid-conversation, model is meant to continue
+    // generating the next assistant turn) it sends `prompt=""` — in that
+    // case we MUST NOT emit an empty `<｜User｜><｜Assistant｜>` wrapper,
+    // because the empty-user turn is off-distribution and the V4F MQ2-
+    // Lloyd checkpoint drifts into invented paths / repeated wrong tool
+    // calls when fed one.
+    if !prompt.is_empty() {
+        if let Some(u) = user_tok { prompt_ids.push(u); }
+        prompt_ids.extend(tokenizer.encode(prompt));
+    }
+    if let Some(a) = asst_tok { prompt_ids.push(a); }
+    // Thinking-mode signal token immediately after `<｜Assistant｜>`:
+    //   NonThink → `</think>`   (skip reasoning, respond directly)
+    //   High|Max → `<think>`    (open a reasoning block)
+    match think_mode {
+        ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
+        ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
+    }
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT").ok().as_deref() == Some("1") {
+        let rendered = tokenizer.decode(&prompt_ids);
+        let path = format!("/tmp/hipfire-prompt-{}.txt", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+        let _ = std::fs::write(&path, format!("# tokens: {}\n{}\n", prompt_ids.len(), rendered));
+        eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
+    }
+
+    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE").ok().as_deref() == Some("1");
+    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3);
+
+    let t0 = Instant::now();
+
+    // ── Prefix-cache LCP detection ──────────────────────────────────
+    //
+    // Reasonix's prompt-caching model (`tmp/reasonix_arch.md` Pillar 1):
+    // construct prompts as `immutable_prefix + append_only_log` so the
+    // backend's prefix cache hits on every turn. Reasonix is a CLIENT
+    // that targets DeepSeek's server-side cache; for LOCAL inference we
+    // implement the server side here.
+    //
+    // Compare the freshly-tokenized prompt against the tokens we know
+    // are already resident in the V4F KV / SWA / compressed-KV rings
+    // from the prior request (`m.conversation_tokens`). If the new
+    // prompt FULLY EXTENDS the prior conversation — i.e., starts with
+    // the entire `conversation_tokens` — we can skip prefill for those
+    // tokens and only prefill the suffix.
+    //
+    // SWA-safety analysis for partial LCP (lcp < prior.len()):
+    //
+    // Suppose prior wrote positions [0..prior_max_pos], turn 2's suffix
+    // writes [lcp..prompt_ids.len()-1]. After turn 2's prefill the new
+    // max position is `prompt_ids.len() - 1`. The model's first decode
+    // attends to a window of `min(prompt_ids.len(), 128)` positions
+    // ending at `prompt_ids.len() - 1`. Each window position maps to a
+    // unique ring slot via `pos % 128`. For correctness, every slot in
+    // that window must currently hold K_rotated for the matching
+    // position:
+    //
+    //   * For positions in `[0..lcp-1]` — turn 1 wrote them, content
+    //     matches by LCP definition. Untouched since.
+    //   * For positions in `[lcp..prompt_ids.len()-1]` — turn 2's suffix
+    //     prefill just wrote them. Content matches the new prompt.
+    //
+    // Stale-slot risk: if turn 1 had written a slot at some position
+    // `P_late ∈ [lcp..prior_max_pos]` AND turn 2 doesn't overwrite that
+    // slot, the slot holds K_rotated for P_late, not the new prompt's
+    // token at that position. The window read returns wrong content.
+    //
+    // Turn 2's suffix prefill covers positions [lcp..prompt_ids.len()-1].
+    // To overwrite every slot turn 1 wrote in `[lcp..prior_max_pos]`,
+    // we need `prompt_ids.len() - 1 ≥ prior_max_pos`, i.e.
+    // `prompt_ids.len() ≥ prior.len()`. Equivalently: the new prompt
+    // must be at least as long as the cached conversation.
+    //
+    // We additionally guard `lcp == prior.len() && prompt_ids.len() ==
+    // prior.len()` (full match, nothing to do) with a noop check
+    // downstream (suffix_tokens is empty).
+    //
+    // After the daemon's `reset` handler clears `m.conversation_tokens`
+    // (legacy stateless path), `prior` is empty and `lcp = 0` → full
+    // prefill. For prefix-cache mode the serve stops calling reset for
+    // V4F and lets this LCP detection drive cache-hit accounting.
+    let lcp: usize = {
+        let prior = &m.conversation_tokens;
+        if prior.is_empty() || prompt_ids.len() < prior.len() {
+            0
+        } else {
+            let mut n = 0usize;
+            while n < prior.len() && prior[n] == prompt_ids[n] {
+                n += 1;
+            }
+            // Edge case: new prompt is byte-identical to the cached
+            // conversation. Suffix would be empty and
+            // `forward_prefill_batch_chunked` errors on that. Step the
+            // LCP back one so we always prefill ≥ 1 token (and the
+            // post-prefill logits are well-defined for the first
+            // decode step). Costs us one token of cache credit on
+            // exact-repeat prompts — rare in practice.
+            if n == prompt_ids.len() && n > 0 {
+                n - 1
+            } else {
+                n
+            }
+        }
+    };
+
+    if lcp == 0 {
+        // Cache miss — start a fresh conversation in V4F's state.
+        state.reset();
+        m.conversation_tokens.clear();
+        // Tear down the captured V4F decode hipGraph alongside the
+        // state, same rationale as the daemon's `"reset"` handler:
+        // a fresh-context turn invalidates every device-buffer pointer
+        // and host scalar the captured graph baked in at capture time
+        // (state.attn_state_buf slot/n_valid/k_active values derived
+        // from the prior n_tokens, compressor ring/commit slots, etc.).
+        // Without this, the warmup-then-replay state machine fires
+        // warmup on the first decode (because `state.reset()` clears
+        // `ar_forward_warmed_up`), then immediately replays the STALE
+        // graph on the second decode and crashes with the same
+        // "download logits (graph path): illegal memory access" we
+        // saw on multi-turn pi sessions before the explicit-reset fix.
+        gpu.invalidate_graph_state();
+    }
+    let start_pos: u32 = lcp as u32;
+
+    // Slice off the suffix — the only tokens we actually need to prefill.
+    // For lcp=0 this is the full prompt; for a full cache hit on a turn
+    // that adds N new tokens this is just those N.
+    let suffix_tokens: &[u32] = &prompt_ids[lcp..];
+
+    // Prefill: batched chunked through PBS. If spec_mode, also fill the
+    // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
+    // draft step sees a populated MTP history.
+    let prefill_result = if spec_mode {
+        deepseek4::forward::prefill_with_mtp_fill(cfg, weights, state, gpu, pbs, suffix_tokens, start_pos)
+    } else {
+        deepseek4::forward::forward_prefill_batch_chunked(cfg, weights, state, gpu, suffix_tokens, start_pos, pbs)
+    };
+    let last_logits = match prefill_result {
+        Ok(l) => l,
+        Err(e) => {
+            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
+            return;
+        }
+    };
+    // `forward_prefill_batch_chunked` does NOT advance `state.n_tokens`.
+    // Callers are responsible for it (mirrors deepseek4_chat's explicit
+    // `state.n_tokens = pos as u64;` at deepseek4_chat.rs:324). Without this,
+    // the next decode_step queries the SWA cache at the BOS position
+    // instead of the next-prediction position and the model emits
+    // attractor garbage at greedy temp=0. The MTP-fill prefill DOES
+    // advance internally (forward.rs:7453), so we only need to update
+    // for the plain-prefill branch.
+    if !spec_mode {
+        state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
+    }
+    // Keep `m.conversation_tokens` in lockstep with what's actually
+    // resident in the KV/SWA/compressed-KV rings:
+    //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
+    //     full-prefilled the whole prompt).
+    //   - On a CACHE HIT (lcp>0): truncate the prior tracker down to
+    //     `lcp` before appending the suffix. For partial LCP this
+    //     matters — tokens in the prior tracker beyond `lcp` came
+    //     from a previous turn's decode but the slots they lived in
+    //     have just been overwritten by the suffix prefill. Leaving
+    //     them in the tracker would let the NEXT request's LCP
+    //     comparison run off the end of what's actually cached and
+    //     make divergent assumptions about ring contents.
+    if lcp == 0 {
+        m.conversation_tokens.clear();
+        m.conversation_tokens.extend_from_slice(&prompt_ids);
+    } else {
+        m.conversation_tokens.truncate(lcp);
+        m.conversation_tokens.extend_from_slice(suffix_tokens);
+    }
+    let cached_tokens: usize = lcp;
+
+    // Sync to ensure all prefill kernels have completed before stopping
+    // the timer (head's download_f32 already syncs but defensive).
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    let pos_after_prefill = state.n_tokens as u32;
+    let mut spec_windows: u64 = 0;
+    let mut spec_drafts_offered: u64 = 0;
+    let mut spec_drafts_accepted: u64 = 0;
+
+    // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
+    // for local deployment; we honor that as the default. Pure greedy
+    // (temp <= 1e-6) is supported but enters block-level attractors on
+    // structured prompts.
+    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seed: u64 = std::env::var("HIPFIRE_DEEPSEEK4_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        });
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    // Track whether the decode loop saw a complete
+    // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
+    // `done` envelope below.
+    let mut tool_calls_parsed_count: usize = 0;
+    if spec_mode {
+        // Spec-decode loop. The verifier picks argmax (greedy) so accept
+        // semantics stay deterministic. When tools are present, thread
+        // the same DSML grammar matcher through the MTP draft and main
+        // verifier logits, then parse the emitted stream into tool_calls
+        // events just like the plain decode loop.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            if let StreamEvent::ToolCalls(calls) = ev {
+                for c in calls {
+                    emit_tool_calls_buf.push(
+                        hipfire_runtime::prompt_frame::ToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        }
+                    );
+                }
+            }
+        };
+
+        let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
+        let mut spec_last_position = pos_after_prefill;
+        let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        'outer: while generated_count < max_tokens {
+            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
+                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+            };
+            let r = match if grammar_active {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs_grammar(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                    &mut matcher,
+                    decoded_vocab,
+                    &mut grammar_mask,
+                )
+            } else {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                )
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("deepseek4spec-decode failed: {e:?}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            };
+            spec_windows += 1;
+            spec_drafts_offered += spec_k as u64;
+            spec_drafts_accepted += r.n_accepted as u64;
+
+            for &t in &r.accepted_tokens {
+                if generated_count >= max_tokens || t == eos_tok {
+                    break 'outer;
+                }
+                let frag = tokenizer.decode(&[t]);
+                if grammar_active {
+                    for ev in parser.feed(&frag) {
+                        absorb_event(&ev);
+                        emit_stream_event(stdout, id, ev);
+                    }
+                } else {
+                    // Build through serde_json so `id` (user-supplied) and
+                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
+                    // can't corrupt the JSONL line.
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                }
+                emit_committed_event(stdout, id, t, generated_count, decode_t0.elapsed().as_millis() as u64);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+            }
+            if let Some(&t) = r.accepted_tokens.last() {
+                spec_last_position += r.accepted_tokens.len() as u32;
+                spec_last_token = t;
+            }
+            last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        }
+        if grammar_active {
+            for ev in parser.finish() {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            let _ = stdout.flush();
+            drop(absorb_event);
+            tool_calls_parsed_count = emit_tool_calls_buf.len();
+        }
+    } else {
+        // Plain decode loop. Sampler honours `temp` + `top_p` from the
+        // request; HF default is temp=1.0, top_p=1.0 (multinomial across
+        // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
+        // dangerous — see fn doc.
+        //
+        // Tokens are fed through a DSML stream parser that recognises
+        // `<think>…</think>` reasoning blocks and
+        // `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` tool-call blocks. The
+        // parser emits:
+        //   - StreamEvent::Token(text)       → JSONL `{type:"token"}`
+        //   - StreamEvent::Reasoning(text)   → JSONL `{type:"reasoning"}`
+        //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
+        // Markers split across token boundaries are buffered until they
+        // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
+        // Prime the parser's initial state to match the bootstrap tag
+        // we appended to `prompt_ids`. In High/Max think modes the
+        // prompt ends with `<think>` and the model's first generated
+        // token is the body of that thinking block — without
+        // `new_in_think()` the parser would sit in `Normal` and
+        // misclassify every reasoning token as plain content,
+        // including the trailing `</think>` which then leaks into
+        // `message.content`. NonThink mode appends `</think>` (closing
+        // a zero-length think block) so the response starts in Normal.
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+
+        // Grammar-guided decoding setup. When tools are present, we mask
+        // the logits against a small state machine that mirrors the DSML
+        // format — inside a `<｜DSML｜tool_calls>` block the model can
+        // only emit token IDs whose decoded text is a prefix of a legal
+        // continuation (e.g. `<｜DSML｜invoke name="` or a schema-defined
+        // tool name). In free-emission states (`Out`, `InParamBody`,
+        // and any time tools is None / empty) the mask is all-true and
+        // the mask compute is skipped.
+        //
+        // Why this exists: V4F MQ2-Lloyd has damaged logit precision on
+        // format-structural tokens — even with the byte-identical HF
+        // system prompt at temp=1.0 it deterministically emits invented
+        // variants like `<｜DSML｜tool_cbl>`, `<｜DSML｜calling>`,
+        // `</｜DSML｜paper>` that no parser can recover. The mask makes
+        // those tokens unreachable at the sampler level.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        // Precompute (or fetch the cached) decoded vocab. `tokenizer.decode`
+        // per id over ~129k ids is allocator-heavy enough that doing it
+        // per-request adds tens of ms of pure overhead to every tool-
+        // using V4F turn. The cache lives on `LoadedModel.decoded_vocab`
+        // as an `Arc<Vec<String>>` and is cleared on model unload.
+        //
+        // Borrow note: `m.decoded_vocab` is a disjoint field from
+        // `m.deepseek4_state` (which `state` holds `&mut` to) and from
+        // `m.tokenizer` (which `tokenizer` holds `&` to), so the
+        // assignment compiles under Rust's split-borrows.
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+
+        // Apply mask to the prefill-returned logits before the first
+        // sample (matcher is in `Out` here so this is a no-op, but the
+        // codepath stays uniform).
+        let mut first_logits = last_logits;
+        if grammar_active && !matcher.is_free() {
+            matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut first_logits);
+        }
+        let mut next_tok: u32 =
+            deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
+        let mut pos = pos_after_prefill;
+        // Token-cache capture for the prefix-cache replay path. We
+        // mirror the parser events into local accumulators so that —
+        // after decode completes — we can fingerprint the just-emitted
+        // assistant turn by (content_text, tool_calls) and store the
+        // exact token IDs that the model emitted at
+        // `conversation_tokens[decode_start..decode_end]`.
+        //
+        // Why mirror rather than re-parse: the streamed events from
+        // `parser.feed` carry the parser's reconstructed structure
+        // (Reasoning fragments split off from Token, ToolCalls
+        // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
+        // here once captures all the logical structure without a
+        // second tokenizer pass.
+        let decode_start_tokens_idx = m.conversation_tokens.len();
+        let mut emit_text_buf = String::new();
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            match ev {
+                StreamEvent::Token(t) => emit_text_buf.push_str(t),
+                // Reasoning fragments are NOT replayed in the next
+                // turn (the daemon's history loop emits a fresh
+                // `</think>` after `<｜Assistant｜>` based on the
+                // current `think_mode`; the prior `<think>…</think>`
+                // body is dropped). So we don't include reasoning in
+                // the fingerprint either — two turns that produced
+                // the same content + tool_calls but different
+                // reasoning hash to the same key and reuse the same
+                // cached tokens, which is correct because what we
+                // CACHE excludes the reasoning span (it lives BEFORE
+                // the daemon-emitted `</think>` in the cached tokens
+                // — see below).
+                StreamEvent::Reasoning(_) => {}
+                StreamEvent::ToolCalls(calls) => {
+                    for c in calls {
+                        emit_tool_calls_buf.push(
+                            hipfire_runtime::prompt_frame::ToolCall {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            }
+                        );
+                    }
+                }
+            }
+        };
+
+        while generated_count < max_tokens && next_tok != eos_tok {
+            let frag = tokenizer.decode(&[next_tok]);
+            for ev in parser.feed(&frag) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
+            let _ = stdout.flush();
+            m.conversation_tokens.push(next_tok);
+            if grammar_active {
+                matcher.advance(&frag);
+            }
+            generated_count += 1;
+            match deepseek4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, pos) {
+                Ok(mut logits) => {
+                    if grammar_active && !matcher.is_free() {
+                        matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+                        deepseek4::grammar::Matcher::apply_mask_to_logits(
+                            &grammar_mask,
+                            &mut logits,
+                        );
+                    }
+                    next_tok =
+                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+                    pos += 1;
+                }
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+        // Flush any buffered partial markers / content.
+        for ev in parser.finish() {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
+        }
+        let _ = stdout.flush();
+
+        // Cache the just-emitted token sequence under its (content,
+        // tool_calls) fingerprint so the next request's V4F history
+        // render can replay verbatim and avoid BPE re-encode drift.
+        // Trim leading EOS/zero residue defensively (the loop never
+        // pushes EOS, but a future model that emits EOS mid-stream
+        // shouldn't end up with EOS landing in the cached tokens).
+        drop(absorb_event); // release the &mut emit_*_buf borrow
+        // Now that the closure is dropped, we can read the buffers
+        // immutably. Snapshot the tool_calls count so the `done`
+        // envelope below can carry `finish_reason: "tool_calls"`.
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
+        // Skip caching when the turn produced no replay-able payload —
+        // empty trimmed content AND no tool_calls. The fingerprint for
+        // such turns collides on the hash of `("assistant", "")` so
+        // any subsequent empty-emission turn (the model giving up with
+        // a trailing whitespace fragment) overwrites the prior entry.
+        // Pi typically doesn't replay empty assistant turns at all, so
+        // the cache entry is dead weight at best and a subtle
+        // mis-replay risk at worst (Pi sends content="" + tool_calls=[]
+        // for a different reason and our cache hands back the wrong
+        // tokens). Two write conditions to satisfy: at least one
+        // visible event (text OR tool_calls) AND at least one raw
+        // token actually emitted.
+        let have_replayable_payload =
+            !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
+        if have_replayable_payload
+            && generated_count > 0
+            && m.conversation_tokens.len() > decode_start_tokens_idx
+        {
+            let cached_seq: Vec<u32> =
+                m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "[asst-cache store] fp={:#018x} content.len={} tool_calls={} tokens={}",
+                    fp, emit_text_buf.len(), emit_tool_calls_buf.len(), cached_seq.len(),
+                );
+            }
+            m.asst_turn_cache.insert(fp, cached_seq);
+        }
+    }
+
+    m.seq_pos = state.n_tokens as usize;
+
+    let _ = gpu.hip.device_synchronize();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+
+    // Build the done envelope through serde_json so the new
+    // `cached_tokens` field (V4F prefix-cache LCP hit count) interleaves
+    // cleanly with the legacy `prefill_tokens` / `prefill_ms` / spec
+    // counters. The TTL of stale {} interpolation here is exactly the
+    // surface area we just fixed in `emit_error_with_id` — same risk
+    // class.
+    //
+    // `prefill_tokens` semantics: number of tokens actually FED to the
+    // forward path this turn (i.e., suffix_tokens.len(), == total
+    // prompt minus cached prefix). Cache-hit accounting:
+    //   prompt_tokens (sent by client)       = prompt_ids.len()
+    //   cached_tokens (prefix-cache hit)     = cached_tokens (= lcp)
+    //   prefill_tokens (actually prefilled)  = suffix_tokens.len()
+    // Sum: cached + prefill == prompt_tokens. The CLI's OpenAI-compat
+    // layer maps `cached_tokens` → `usage.prompt_tokens_details.cached_tokens`.
+    let prompt_tokens_total = prompt_ids.len();
+    let prefill_tokens_actual = suffix_tokens.len();
+    // Tell the OpenAI-compat layer how the decode loop exited. Without
+    // this the CLI fell back to "stop" for every non-tool-call turn,
+    // hiding `max_tokens` truncation behind a natural-completion signal
+    // — strict clients use `finish_reason: "length"` to decide whether
+    // to retry with a longer budget.
+    //
+    //   tool_calls — at least one complete `<｜DSML｜tool_calls>` block
+    //                was parsed (`tool_calls_parsed_count > 0`). Wins
+    //                over "length" even when max_tokens hit after the
+    //                block closed.
+    //   length     — generated_count reached max_tokens with no
+    //                completed tool_calls block.
+    //   stop       — model emitted EOS, or generated_count is < max
+    //                because the spec-decode loop accepted EOS in the
+    //                middle of an accepted-tokens chunk.
+    //
+    // `tool_calls_parsed_count` is set inside the non-spec branch
+    // immediately after parser.finish(); spec_mode leaves it at 0.
+    let finish_reason: &'static str = if tool_calls_parsed_count > 0 {
+        "tool_calls"
+    } else if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
+    let done_envelope = if spec_mode {
+        let accept_pct = if spec_drafts_offered > 0 {
+            spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "finish_reason": finish_reason,
+            "spec_k": spec_k,
+            "spec_windows": spec_windows,
+            "spec_accept_pct": accept_pct,
+        })
+    } else {
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "finish_reason": finish_reason,
+        })
+    };
+    let _ = writeln!(stdout, "{}", done_envelope);
+    let _ = stdout.flush();
+}
+
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
 ///
 /// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
@@ -4637,7 +6069,7 @@ fn generate_qwen2(
     // first generated token.
     for &tok in &prompt_ids {
         if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2 prefill failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -4655,7 +6087,7 @@ fn generate_qwen2(
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"argmax failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -4670,16 +6102,17 @@ fn generate_qwen2(
         }
         // Emit text fragment for this token. Tokenizer.decode handles
         // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. JSON-escape the
-        // chunk so embedded quotes / control chars don't break the
-        // wire format.
+        // to an empty string we still advance the loop. Build through
+        // serde_json so `id` (user-supplied) and `frag` (arbitrary
+        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
+        // the JSONL line.
         let frag = tokenizer.decode(&[next_tok]);
-        let frag_escaped = json_escape(&frag);
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":"{}"}}"#,
-            id, frag_escaped,
-        );
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -4687,7 +6120,7 @@ fn generate_qwen2(
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_step_greedy failed: {:?}"}}"#, id, e);
+                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
                 let _ = stdout.flush();
                 return;
             }
@@ -4710,30 +6143,6 @@ fn generate_qwen2(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
-}
-
-/// Minimal JSON string escaper for the daemon's token-stream emit
-/// path. We have full control of the alphabet (BPE-decoded UTF-8)
-/// and only need to escape: backslash, double-quote, and control
-/// chars < 0x20. Non-ASCII bytes pass through as-is (the daemon
-/// client parses with serde_json which accepts UTF-8 verbatim).
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {

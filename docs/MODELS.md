@@ -19,6 +19,7 @@ sizes when you want more headroom; pull with the `:<size>-mq6` suffix.
 | `qwen3.5:35b-a3b` | 18.7 GB | 22 GB | MoE 35B / 3B-active. Local-only (no HF repo yet). |
 | `qwen3.6:27b` | 15 GB | 16 GB | 3.6 refresh, same hybrid arch as 3.5 |
 | `qwen3.6:35b-a3b` | 18.7 GB | 22 GB | 3.6 MoE refresh. Local-only. |
+| `deepseek-v4-flash` | 82 GB | 96 GB | DeepSeek V4 Flash (arch_id=9): MQ2-Lloyd routed-expert MoE, Q8_0 attn KV, Hyper-Connections + compressed-KV indexer + tail-only RoPE. `hipfire pull` also fetches the MTP sidecar for K=2 spec-decode (+29% TG on code). |
 
 Higher-quality variants:
 

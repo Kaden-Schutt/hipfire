@@ -13,6 +13,7 @@ file ids it actually loads.
 | 6 | Qwen3.5 / 3.6 MoE / A3B | `hipfire-arch-qwen35` | MoE expert routing |
 | 7 | Qwen2 dense (standalone) | `hipfire-arch-qwen2` | rev 0 skeleton; full bring-up in `docs/plans/dots-ocr-prd.md` phase 1 |
 | 8 | Qwen2-VL family (dots.ocr) | `hipfire-arch-dots-ocr` | vision tower + Strategy A E2E OCR validated 2026-05-21; daemon plumbing pending in `docs/plans/dots-ocr-prd.md` phase 3 |
+| 9 | DeepSeek V4 Flash | `hipfire-arch-deepseek4` | Hyper-Connections, compressed-KV indexer, tail-only RoPE, raw SWA; optional `mtp.0.*` MTP layer. |
 | 0xFF | toy / template | `hipfire-arch-toy` | never shipped; daemon refuses to dispatch |
 
 ## Notes
