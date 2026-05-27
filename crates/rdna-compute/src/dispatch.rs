@@ -270,6 +270,13 @@ pub trait ActivationCapture: Send + Sync {
     );
 }
 
+/// Per-weight MMQ screening state (issue #87).
+pub struct MmqScreenState {
+    pub cache: HashMap<usize, bool>,
+    pub enabled: bool,
+    pub threshold: f32,
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 pub struct Gpu {
     pub hip: HipRuntime,
@@ -294,26 +301,8 @@ pub struct Gpu {
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
 
-    // ── MMQ per-weight screening (#87) ──────────────────────────────────
-    // When enabled, each weight matrix is screened on first MMQ use: a
-    // small synthetic comparison (batch=16, WMMA vs MMQ) checks per-row
-    // max abs error. Weights exceeding the threshold fall back to WMMA.
-    //
-    // Disabled by default on all arches as of 2026-05-18; opt-in for
-    // defensive screening when adding new quant formats. Configurable via:
-    //   - config.json: `mmq_screen` (bool), `mmq_screen_threshold` (float)
-    //   - per-model config overlay
-    //   - daemon load params: `mmq_screen`, `mmq_screen_threshold`
-    //   - env override: `HIPFIRE_MMQ_SCREEN=1` to enable,
-    //     `HIPFIRE_MMQ_SCREEN_THRESHOLD=0.05` to tune
-    mmq_screen_cache: HashMap<usize, bool>,
-    /// Whether MMQ per-weight screening is enabled. Default: false on all arches.
-    pub mmq_screen: bool,
-    /// Max per-row abs error threshold for screening. Weights with any row
-    /// exceeding this fall back to WMMA.
-    /// Per-arch default (set in `Gpu::init`): 0.50 on gfx906, 0.10 elsewhere.
-    /// Override via env: `HIPFIRE_MMQ_SCREEN_THRESHOLD`.
-    pub mmq_screen_threshold: f32,
+    // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
+    pub mmq_screen: MmqScreenState,
 
     // ── hipGraph capture state (extracted to graph.rs) ─────────────────────
     pub graphs: crate::graph::GraphState,
@@ -505,9 +494,11 @@ impl Gpu {
                 q8_1_mmq_x_scratch: None,
                 q8_1_mmq_x_scratch_bytes: 0,
             },
-            mmq_screen_cache: HashMap::new(),
-            mmq_screen,
-            mmq_screen_threshold,
+            mmq_screen: MmqScreenState {
+                cache: HashMap::new(),
+                enabled: mmq_screen,
+                threshold: mmq_screen_threshold,
+            },
             graphs: crate::graph::GraphState {
                 capture_mode: false,
                 capture_blobs: Vec::new(),
@@ -882,12 +873,12 @@ impl Gpu {
     pub fn mmq_screen_weight(&mut self, a_raw: &GpuTensor, m: usize, k: usize) -> bool {
         self.bind_thread_or_warn();
         let key = a_raw.buf.as_ptr() as usize;
-        if let Some(&safe) = self.mmq_screen_cache.get(&key) {
+        if let Some(&safe) = self.mmq_screen.cache.get(&key) {
             return safe;
         }
 
         let screen_batch = 16usize;
-        let threshold = self.mmq_screen_threshold;
+        let threshold = self.mmq_screen.threshold;
 
         // Generate synthetic activations on CPU
         let mut state = 0xDEAD_BEEF_CAFE_BABEu64;
@@ -960,7 +951,7 @@ impl Gpu {
             eprintln!("  MMQ screen: error during screening ({e}), assuming unsafe");
             false
         });
-        self.mmq_screen_cache.insert(key, safe);
+        self.mmq_screen.cache.insert(key, safe);
         safe
     }
 
@@ -1441,7 +1432,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ///     entries are released back to the pool here.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
-        self.mmq_screen_cache.clear();
+        self.mmq_screen.cache.clear();
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
             let _ = self.free_tensor(t);
@@ -7364,7 +7355,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 //       dp4a shares Q8_1 quant step that MMQ failed on).
                 let mut mmq_screen_rejected = false;
                 if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
-                    let qz_safe = if self.mmq_screen {
+                    let qz_safe = if self.mmq_screen.enabled {
                         self.mmq_screen_weight(a_qkv, qkv_m, k)
                             && self.mmq_screen_weight(a_z, z_m, k)
                     } else { true };
@@ -7405,7 +7396,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                         } else { Ok(()) };
                         return r1.and(r2).and(r3);
                     }
-                    mmq_screen_rejected = self.mmq_screen;
+                    mmq_screen_rejected = self.mmq_screen.enabled;
                     // qkv or z screening rejected — fall through; screen-reject
                     // path goes to fp16, NOT dp4a.
                 }
@@ -7423,7 +7414,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 return self.gemm_qkvza_hfq4g256_fp16_wave64(a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m, alpha_m, k, batch_size);
             }
             if self.arch_caps.should_use_mmq(batch_size) {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_qkv, qkv_m, k)
                         && self.mmq_screen_weight(a_z, z_m, k)
                         && self.mmq_screen_weight(a_beta, beta_m, k)
@@ -8119,7 +8110,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 // fused wave64 if any of q/k/v screening rejects.
                 let mut mmq_screen_rejected = false;
                 if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
-                    let qkv_safe = if self.mmq_screen {
+                    let qkv_safe = if self.mmq_screen.enabled {
                         self.mmq_screen_weight(a_q, q_m, k)
                             && self.mmq_screen_weight(a_k, k_m, k)
                             && self.mmq_screen_weight(a_v, v_m, k)
@@ -8141,7 +8132,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                         } else { Ok(()) };
                         return r1.and(r2).and(r3);
                     }
-                    mmq_screen_rejected = self.mmq_screen;
+                    mmq_screen_rejected = self.mmq_screen.enabled;
                     // q/k/v screening rejected — fall through; screen-reject
                     // path goes to fp16, NOT dp4a (preserves the screen's
                     // higher-precision fallback intent).
@@ -8158,7 +8149,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 return self.gemm_qkv_hfq4g256_fp16_wave64(a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size);
             }
             if self.arch_caps.should_use_mmq(batch_size) {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_q, q_m, k)
                         && self.mmq_screen_weight(a_k, k_m, k)
                         && self.mmq_screen_weight(a_v, v_m, k)
@@ -8870,7 +8861,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // See docs/plans/gfx906-mmq-prd.md for context.
             let mut mmq_screen_rejected = false;
             if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
                 } else { true };
@@ -8887,7 +8878,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                     } else { Ok(()) };
                     return r1.and(r2);
                 }
-                mmq_screen_rejected = self.mmq_screen;
+                mmq_screen_rejected = self.mmq_screen.enabled;
                 // screening rejected at least one weight — fall through; the
                 // screen-reject path skips dp4a and lands on fp16 to preserve
                 // the higher-precision fallback intent (dp4a shares the Q8_1
@@ -8906,7 +8897,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 return self.gemm_gate_up_hfq4g256_fp16_wave64(a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size);
             }
             if self.arch_caps.should_use_mmq(batch_size) {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_gate, gate_m, k)
                         && self.mmq_screen_weight(a_up, up_m, k)
                 } else { true };
@@ -15925,7 +15916,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             //       the same Q8_1 quantization step that MMQ failed on).
             let mut mmq_screen_rejected = false;
             if self.arch_caps.is_gfx906() && self.arch_caps.should_use_mmq(batch_size) {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_raw, m, k)
                 } else {
                     true
@@ -15933,7 +15924,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 if use_mmq {
                     return self.gemm_hfq4g256_residual_mmq_gfx906(a_raw, x, y, m, k, batch_size);
                 }
-                mmq_screen_rejected = self.mmq_screen;
+                mmq_screen_rejected = self.mmq_screen.enabled;
             }
 
             // gfx906 dp4a batched residual (issue #276 Gap 2, HFQ4 sibling of
@@ -15967,7 +15958,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             // Opt-in MMQ path (RDNA3/3.5, HIPFIRE_MMQ=1 or HIPFIRE_WO_MMQ=1).
             if self.flags.wo_mmq || self.arch_caps.should_use_mmq(batch_size)
             {
-                let use_mmq = if self.mmq_screen {
+                let use_mmq = if self.mmq_screen.enabled {
                     self.mmq_screen_weight(a_raw, m, k)
                 } else {
                     true

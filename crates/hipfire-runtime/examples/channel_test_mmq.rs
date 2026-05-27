@@ -754,7 +754,7 @@ fn run_screen(
     use hipfire_arch_qwen35::qwen35::LayerWeights;
 
     eprintln!("\n=== screen: running mmq_screen_weight on all weight matrices ===");
-    eprintln!("threshold={:.4}", gpu.mmq_screen_threshold);
+    eprintln!("threshold={:.4}", gpu.mmq_screen.threshold);
 
     let mut n_safe = 0usize;
     let mut n_unsafe = 0usize;
