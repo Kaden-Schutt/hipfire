@@ -266,7 +266,7 @@ fn main() {
     // --guards on, but constructed unconditionally to keep the loop
     // body simple. Construction is cheap (no allocations until use).
     let mut filter = EosFilter::new(EosFilterConfig::default());
-    let loop_guard = LoopGuard::from_env();
+    let loop_guard = LoopGuard::from_config(hipfire_runtime::config::get());
     let mut bytes_fed_to_filter = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
 

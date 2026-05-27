@@ -185,13 +185,20 @@ Performance doesn't matter yet — correctness first.
 ## Perf benchmarking (kernel perf changes)
 
 Before claiming any kernel-level tok/s win: read
-`docs/methodology/perf-benchmarking.md`. Within-session A/B is noisy on
-gfx1100 (±10–15 % drift from DPM/thermal state); verify across a fresh
-process with `scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` and
-confirm speed-gate passes before committing. The doc also keeps a
-negative-result log of attempts that looked like wins in one-shell A/B
-but measured as no-op or regression on fresh probe — check it before
-starting a new kernel experiment.
+`docs/methodology/perf-benchmarking.md`. **Warm the kernel cache and
+DPM state first** (a couple of throwaway forwards or
+`HIPFIRE_DPM_WARMUP_SECS=10`); a cold first run is 3-7× slower and
+NOT representative. Once warm, the within-session A/B noise band on
+gfx1100 is **±1–3%** — anything bigger is a real signal, NOT
+"DPM drift". Real regressions get hand-waived by inflated noise
+claims; treat a 3%+ delta as something worth bisecting.
+
+For cross-commit perf claims, verify across a fresh process with
+`scripts/probe_commits.sh $(git rev-parse HEAD~1) HEAD` (it handles
+warmup + multi-run aggregation correctly). The methodology doc also
+keeps a negative-result log of attempts that looked like wins in
+one-shell A/B but measured as no-op or regression on fresh probe —
+check it before starting a new kernel experiment.
 
 **Δ ≥ 5% investigation rule (mandatory).** Any perf delta whose
 magnitude crosses ±5% warrants investigation. Do NOT shrug it off as
@@ -250,6 +257,13 @@ matches. Index of currently-available skills:
   `__launch_bounds__` tradeoffs. Manual disassembly via
   `clang-offload-bundler` + `llvm-readelf` is fiddly enough that the
   skill doc is faster to follow than to rederive.
+
+- **`serve-restart`** — cleanly stop, free :11435, and restart
+  `hipfire serve`. **Reach for this when:** serve "Failed to start
+  (port in use)", a stale daemon holds VRAM, a pre-warm JSON-parse /
+  os-error-2 crash left a zombie `daemon.pid` singleton, or you need a
+  guaranteed-fresh daemon. Kills bun CLI + spawned daemon, fuser-frees
+  the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
 
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
@@ -390,13 +404,15 @@ semantically load-bearing. See:
 
 **Canonical bench config (post-2026-04-26) for 27B-3.5 LRU code DFlash:**
 ```
-max=120 --no-chatml --kv-mode asym3
+max=256 --no-chatml --kv-mode q8
 PEP-8 strict prompt (\n\n\n between top-level defs)
 prompt_normalize=true (default)
 ```
-Expected: **199 tok/s τ=10.36** on 7900 XTX. ±2% deterministic. Drift >5% from
-this is a regression — start with `git bisect` against this rule, not against
-session-recalled "peak" numbers.
+DFlash perf gates must use `q8` or an FWHT KV mode. Do not use `asym*` KV modes
+for DFlash perf/gate claims; older pre-q8 DFlash perf numbers are historical
+only. Drift >5% from the current q8/max256 baseline is a regression
+— start with `git bisect` against this rule, not against session-recalled
+"peak" numbers.
 
 ## GPU Lock Protocol (Multi-Agent)
 

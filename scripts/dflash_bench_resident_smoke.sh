@@ -115,7 +115,7 @@ t0=$(date +%s)
 if ! timeout 240 "$EXE" \
     --target "$TARGET" --draft "$DRAFT" \
     --prompts-file "$MANIFEST" \
-    --ctx 1024 --kv-mode asym3 --no-chatml \
+    --ctx 1024 --kv-mode q8 --no-chatml \
     > "$OUT" 2>&1; then
     echo "smoke: FAIL — dflash_spec_demo exited non-zero"
     tail -40 "$OUT"

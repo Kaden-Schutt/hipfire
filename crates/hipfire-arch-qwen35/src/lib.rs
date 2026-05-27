@@ -32,7 +32,22 @@ pub mod speculative;
 #[cfg(feature = "deltanet")]
 pub mod pflash;
 #[cfg(feature = "deltanet")]
+pub mod mtp_probe;
+#[cfg(feature = "deltanet")]
+pub mod mtp_head;
+#[cfg(feature = "deltanet")]
+pub mod mtp_spec;
+#[cfg(feature = "deltanet")]
+pub mod mtp_compose;
+#[cfg(feature = "deltanet")]
 pub mod arch;
+#[cfg(feature = "deltanet")]
+pub mod paro_la_gates_codec;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;
+
+#[cfg(feature = "deltanet")]
+pub use mtp_compose::{
+    spec_step_dflash_mtp_tree, MtpComposeTreeResult, MtpComposeTreeState,
+};

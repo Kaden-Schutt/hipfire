@@ -1,0 +1,155 @@
+warning: variant `SolutionIndex` is never constructed
+  --> crates/hip-bridge/src/rocblas.rs:63:5
+   |
+61 | pub enum RocblasGemmAlgo {
+   |          --------------- variant in this enum
+62 |     Standard = 160,
+63 |     SolutionIndex = 161,
+   |     ^^^^^^^^^^^^^
+   |
+   = note: `RocblasGemmAlgo` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `fn_create_handle` is never read
+  --> crates/hip-bridge/src/rocblas.rs:73:5
+   |
+69 | pub struct Rocblas {
+   |            ------- field in this struct
+...
+73 |     fn_create_handle: unsafe extern "C" fn(*mut RocblasHandle) -> u32,
+   |     ^^^^^^^^^^^^^^^^
+
+warning: `hip-bridge` (lib) generated 2 warnings
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:22444:13
+      |
+22444 |         let func = &self.functions["rope_f32"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:25551:13
+      |
+25551 |         let func = &self.functions["kv_cache_write"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/dispatch.rs:27782:13
+      |
+27782 |         let func = &self.functions["bias_add_f32"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:268:66
+    |
+268 | pub fn gemm_qkv_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    |                                                                  ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:280:70
+    |
+280 | pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps, force_baseline: bool) -> (&'static str, &'static str) {
+    |                                                                      ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:317:9
+    |
+317 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:332:9
+    |
+332 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:347:9
+    |
+347 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:362:9
+    |
+362 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:549:9
+    |
+549 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:566:9
+    |
+566 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:583:9
+    |
+583 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:599:9
+    |
+599 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: constant `GEMV_MQ6G256_SRC` is never used
+   --> crates/rdna-compute/src/kernels.rs:695:11
+    |
+695 | pub const GEMV_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256.hip");
+    |           ^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `REPEAT_INTERLEAVE_QK_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:2524:11
+     |
+2524 | pub const REPEAT_INTERLEAVE_QK_SRC: &str = include_str!("../../../kernels/src/repeat_interleave_qk.hip");
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:352:5
+    |
+350 | struct RawKernelMeta {
+    |        ------------- field in this struct
+351 |     pgm_rsrc1: u32,
+352 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: `rdna-compute` (lib) generated 16 warnings (run `cargo fix --lib -p rdna-compute` to apply 13 suggestions)
+   Compiling rdna-compute v0.2.0 (/home/kaden/hipfire/.worktrees/pr319-forward-train-6126d41d/crates/rdna-compute)
+warning: unused import: `DType`
+  --> crates/rdna-compute/examples/test_gemm_mq3g256_lloyd_residual_wmma.rs:16:25
+   |
+16 | use rdna_compute::{Gpu, DType};
+   |                         ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `rdna-compute` (example "test_gemm_mq3g256_lloyd_residual_wmma") generated 1 warning (run `cargo fix --example "test_gemm_mq3g256_lloyd_residual_wmma" -p rdna-compute` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 0.34s
+     Running `target/release/examples/test_gemm_mq3g256_lloyd_residual_wmma`
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+GPU: gfx1151
+    M      K    N      max_abs      max_rel          rms  verdict
+   64   1024   16     1.490e-6     1.928e-4     4.130e-7  PASS
+   64   1024   64     1.490e-6     3.306e-4     4.365e-7  PASS
+  256   1024   64     1.878e-6     3.768e-4     4.271e-7  PASS
+   64   4096   64     9.418e-6     1.178e-3     3.655e-6  PASS
+  256   4096   16     1.049e-5     7.580e-4     3.803e-6  PASS
+  256   4096  256     1.049e-5     1.513e-3     3.770e-6  PASS
+ 1024   4096   64     1.049e-5     1.513e-3     3.769e-6  PASS
+ 1024  12288   64     5.829e-5     2.645e-2     2.568e-5  PASS
+
+Max-abs across all shapes  : 5.829e-5
+Phase A tolerance (initial): 2.000e-4
+
+ALL PASS

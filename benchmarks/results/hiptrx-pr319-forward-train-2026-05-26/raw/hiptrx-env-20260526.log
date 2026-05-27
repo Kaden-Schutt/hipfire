@@ -1,0 +1,62 @@
+2026-05-26T22:45:35+00:00
+hiptrx
+a110979194959d7fbad1afdfd6deaa2196766c28
+cargo 1.93.1 (083ac5135 2025-12-15) (built from a source tarball)
+rustc 1.93.1 (01f6ddf75 2026-02-11) (built from a source tarball)
+HIP version: 7.2.53211-671d39a71e
+AMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.2 26084 f58b06dce1f9c15707c5f808fd002e18c2accf7e)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm-7.2.2/lib/llvm/bin
+Configuration file: /opt/rocm-7.2.2/lib/llvm/bin/clang++.cfg
+
+
+============================ ROCm System Management Interface ============================
+============================== Version of System Component ===============================
+Driver version: 7.0.0-15-generic
+==========================================================================================
+======================================= Unique ID ========================================
+GPU[0]		: Unique ID: 0x9eb7aeda51c88ffd
+GPU[1]		: Unique ID: 0xe475645fe0200397
+GPU[2]		: Unique ID: 0x5f92432f2312a0e
+GPU[3]		: Unique ID: 0x85289909a86cc63
+==========================================================================================
+====================================== Product Info ======================================
+GPU[0]		: Card Series: 		AMD Radeon AI PRO R9700
+GPU[0]		: Card Model: 		0x7551
+GPU[0]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[0]		: Card SKU: 		APM107573
+GPU[0]		: Subsystem ID: 	0x5413
+GPU[0]		: Device Rev: 		0xc0
+GPU[0]		: Node ID: 		1
+GPU[0]		: GUID: 		23334
+GPU[0]		: GFX Version: 		gfx1201
+GPU[1]		: Card Series: 		AMD Radeon AI PRO R9700
+GPU[1]		: Card Model: 		0x7551
+GPU[1]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[1]		: Card SKU: 		APM107573
+GPU[1]		: Subsystem ID: 	0x5413
+GPU[1]		: Device Rev: 		0xc0
+GPU[1]		: Node ID: 		4
+GPU[1]		: GUID: 		38699
+GPU[1]		: GFX Version: 		gfx1201
+GPU[2]		: Card Series: 		AMD Radeon AI PRO R9700
+GPU[2]		: Card Model: 		0x7551
+GPU[2]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[2]		: Card SKU: 		APM107573
+GPU[2]		: Subsystem ID: 	0x5413
+GPU[2]		: Device Rev: 		0xc0
+GPU[2]		: Node ID: 		2
+GPU[2]		: GUID: 		2934
+GPU[2]		: GFX Version: 		gfx1201
+GPU[3]		: Card Series: 		AMD Radeon AI PRO R9700
+GPU[3]		: Card Model: 		0x7551
+GPU[3]		: Card Vendor: 		Advanced Micro Devices, Inc. [AMD/ATI]
+GPU[3]		: Card SKU: 		APM107573
+GPU[3]		: Subsystem ID: 	0x5413
+GPU[3]		: Device Rev: 		0xc0
+GPU[3]		: Node ID: 		3
+GPU[3]		: GUID: 		54127
+GPU[3]		: GFX Version: 		gfx1201
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

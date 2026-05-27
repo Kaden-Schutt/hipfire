@@ -27,7 +27,7 @@ extern "C" __global__ void gemv_f32(
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        y[row] = alpha * sdata[0] + beta * y[row];
+        y[row] = (beta == 0.0f) ? alpha * sdata[0] : alpha * sdata[0] + beta * y[row];
     }
 }
 
@@ -54,6 +54,6 @@ extern "C" __global__ void gemv_f16(
         __syncthreads();
     }
     if (threadIdx.x == 0) {
-        y[row] = alpha * sdata[0] + beta * y[row];
+        y[row] = (beta == 0.0f) ? alpha * sdata[0] : alpha * sdata[0] + beta * y[row];
     }
 }

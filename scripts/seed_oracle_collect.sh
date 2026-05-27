@@ -85,7 +85,7 @@ run_one() {
     out=$("$EXE" \
         --target "$TARGET_27B" --draft "$DRAFT_27B" \
         --prompt "$prompt" --max "$max" --ctx 2048 \
-        --kv-mode asym3 2>&1)
+        --kv-mode q8 2>&1)
     printf '%s\n' "$out" | python3 -c "$PARSE_PY" "$label"
 }
 

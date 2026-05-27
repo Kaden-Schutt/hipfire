@@ -1,0 +1,299 @@
+
+===== test_wmma_qkv_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- q=16 k=16 v=16 K=256 N=16 ---
+  q=16 k=16 v=16 K=256 N=16                          OK
+
+--- q=16 k=16 v=16 K=512 N=16 ---
+  q=16 k=16 v=16 K=512 N=16                          OK
+
+--- q=16 k=16 v=16 K=256 N=32 ---
+  q=16 k=16 v=16 K=256 N=32                          OK
+
+--- q=32 k=16 v=16 K=256 N=16 ---
+  q=32 k=16 v=16 K=256 N=16                          OK
+
+--- q=32 k=32 v=32 K=512 N=32 ---
+  q=32 k=32 v=32 K=512 N=32                          OK
+
+--- q=48 k=16 v=16 K=256 N=16 ---
+  q=48 k=16 v=16 K=256 N=16                          OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_qkv_gfx12
+
+===== test_wmma_qkvza_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- qkv=16 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=16 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- qkv=16 z=16 b=16 a=16 K=512 N=16 ---
+  qkv=16 z=16 b=16 a=16 K=512 N=16                             OK
+
+--- qkv=16 z=16 b=16 a=16 K=256 N=32 ---
+  qkv=16 z=16 b=16 a=16 K=256 N=32                             OK
+
+--- qkv=32 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=32 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- qkv=32 z=32 b=16 a=16 K=512 N=32 ---
+  qkv=32 z=32 b=16 a=16 K=512 N=32                             OK
+
+--- qkv=48 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=48 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_qkvza_gfx12
+
+===== test_wmma_gate_up_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- gate=16 up=16 K=256 N=16 ---
+  gate=16 up=16 K=256 N=16                           OK
+
+--- gate=16 up=16 K=512 N=16 ---
+  gate=16 up=16 K=512 N=16                           OK
+
+--- gate=16 up=16 K=256 N=32 ---
+  gate=16 up=16 K=256 N=32                           OK
+
+--- gate=32 up=16 K=256 N=16 ---
+  gate=32 up=16 K=256 N=16                           OK
+
+--- gate=32 up=32 K=512 N=32 ---
+  gate=32 up=32 K=512 N=32                           OK
+
+--- gate=48 up=16 K=256 N=16 ---
+  gate=48 up=16 K=256 N=16                           OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_gate_up_gfx12
+
+===== test_wmma_residual_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- M=16 K=256 N=16 ---
+  M=16 K=256 N=16                                    OK
+
+--- M=16 K=512 N=16 ---
+  M=16 K=512 N=16                                    OK
+
+--- M=16 K=256 N=32 ---
+  M=16 K=256 N=32                                    OK
+
+--- M=32 K=256 N=16 ---
+  M=32 K=256 N=16                                    OK
+
+--- M=32 K=512 N=32 ---
+  M=32 K=512 N=32                                    OK
+
+--- M=64 K=1024 N=32 ---
+  M=64 K=1024 N=32                                   OK
+
+--- M=4096 K=1024 N=16 ---
+  M=4096 K=1024 N=16                                 OK
+
+--- Summary ---
+  Passed: 7
+  Failed: 0
+[rc=0] test_wmma_residual_gfx12
+
+===== test_wmma_qkv_hfq6_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- q=16 k=16 v=16 K=256 N=16 ---
+  q=16 k=16 v=16 K=256 N=16                          OK
+
+--- q=16 k=16 v=16 K=512 N=16 ---
+  q=16 k=16 v=16 K=512 N=16                          OK
+
+--- q=16 k=16 v=16 K=256 N=32 ---
+  q=16 k=16 v=16 K=256 N=32                          OK
+
+--- q=32 k=16 v=16 K=256 N=16 ---
+  q=32 k=16 v=16 K=256 N=16                          OK
+
+--- q=32 k=32 v=32 K=512 N=32 ---
+  q=32 k=32 v=32 K=512 N=32                          OK
+
+--- q=48 k=16 v=16 K=256 N=16 ---
+  q=48 k=16 v=16 K=256 N=16                          OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_qkv_hfq6_gfx12
+
+===== test_wmma_qkvza_hfq6_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- qkv=16 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=16 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- qkv=16 z=16 b=16 a=16 K=512 N=16 ---
+  qkv=16 z=16 b=16 a=16 K=512 N=16                             OK
+
+--- qkv=16 z=16 b=16 a=16 K=256 N=32 ---
+  qkv=16 z=16 b=16 a=16 K=256 N=32                             OK
+
+--- qkv=32 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=32 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- qkv=32 z=32 b=16 a=16 K=512 N=32 ---
+  qkv=32 z=32 b=16 a=16 K=512 N=32                             OK
+
+--- qkv=48 z=16 b=16 a=16 K=256 N=16 ---
+  qkv=48 z=16 b=16 a=16 K=256 N=16                             OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_qkvza_hfq6_gfx12
+
+===== test_wmma_gate_up_hfq6_gfx12 =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201 (34.2 GB VRAM)
+
+--- gate=16 up=16 K=256 N=16 ---
+  gate=16 up=16 K=256 N=16                           OK
+
+--- gate=16 up=16 K=512 N=16 ---
+  gate=16 up=16 K=512 N=16                           OK
+
+--- gate=16 up=16 K=256 N=32 ---
+  gate=16 up=16 K=256 N=32                           OK
+
+--- gate=32 up=16 K=256 N=16 ---
+  gate=32 up=16 K=256 N=16                           OK
+
+--- gate=32 up=32 K=512 N=32 ---
+  gate=32 up=32 K=512 N=32                           OK
+
+--- gate=48 up=16 K=256 N=16 ---
+  gate=48 up=16 K=256 N=16                           OK
+
+--- Summary ---
+  Passed: 6
+  Failed: 0
+[rc=0] test_wmma_gate_up_hfq6_gfx12
+
+===== test_gemm_fused_mq4g256_lloyd_wmma =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201
+--- qkvza M=(64+16+8+8) K=1024 N=16 ---
+  qkv max_abs=2.980e-7  z=3.874e-7  beta=2.086e-7  alpha=2.682e-7  PASS
+--- qkvza M=(256+32+16+16) K=4096 N=64 ---
+  qkv max_abs=3.338e-6  z=2.384e-6  beta=2.682e-6  alpha=1.550e-6  PASS
+--- qkvza M=(512+64+32+32) K=4096 N=32 ---
+  qkv max_abs=3.338e-6  z=2.384e-6  beta=2.682e-6  alpha=1.550e-6  PASS
+--- qkv M=(64+64+64) K=1024 N=16 ---
+  q max_abs=2.980e-7  k=3.874e-7  v=2.980e-7  PASS
+--- qkv M=(256+32+32) K=4096 N=64 ---
+  q max_abs=3.338e-6  k=2.384e-6  v=2.682e-6  PASS
+--- qkv M=(512+64+64) K=4096 N=32 ---
+  q max_abs=3.338e-6  k=2.384e-6  v=2.682e-6  PASS
+--- gate_up M=(256+256) K=1024 N=16 ---
+  gate max_abs=3.576e-7  up=4.172e-7  PASS
+--- gate_up M=(1024+1024) K=4096 N=64 ---
+  gate max_abs=3.338e-6  up=2.623e-6  PASS
+
+ALL PASS
+[rc=0] test_gemm_fused_mq4g256_lloyd_wmma
+
+===== test_gemm_fused_mq3g256_lloyd_wmma =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201
+--- qkvza M=(64+16+8+8) K=1024 N=16 ---
+  qkv max_abs=3.874e-7  z=2.384e-7  beta=1.788e-7  alpha=2.086e-7  PASS
+--- qkvza M=(256+32+16+16) K=4096 N=64 ---
+  qkv max_abs=2.086e-6  z=1.907e-6  beta=1.252e-6  alpha=7.749e-7  PASS
+--- qkvza M=(512+64+32+32) K=4096 N=32 ---
+  qkv max_abs=2.086e-6  z=1.907e-6  beta=1.252e-6  alpha=1.550e-6  PASS
+--- qkv M=(64+64+64) K=1024 N=16 ---
+  q max_abs=3.874e-7  k=2.980e-7  v=3.129e-7  PASS
+--- qkv M=(256+32+32) K=4096 N=64 ---
+  q max_abs=2.086e-6  k=1.907e-6  v=1.252e-6  PASS
+--- qkv M=(512+64+64) K=4096 N=32 ---
+  q max_abs=2.086e-6  k=1.907e-6  v=1.311e-6  PASS
+--- gate_up M=(256+256) K=1024 N=16 ---
+  gate max_abs=3.874e-7  up=2.980e-7  PASS
+--- gate_up M=(1024+1024) K=4096 N=64 ---
+  gate max_abs=2.086e-6  up=1.967e-6  PASS
+
+ALL PASS
+[rc=0] test_gemm_fused_mq3g256_lloyd_wmma
+
+===== test_gemm_mq4g256_lloyd_residual_wmma =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201
+    M      K    N   kern      max_abs          rms     us/call  verdict
+
+thread 'main' (682794) panicked at crates/rdna-compute/src/kernels.rs:250:14:
+MQ4-Lloyd WMMA mb2 residual: unsupported arch gfx1201. gfx11-only.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[rc=101] test_gemm_mq4g256_lloyd_residual_wmma
+
+===== test_gemm_mq3g256_lloyd_residual_wmma =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201
+    M      K    N      max_abs      max_rel          rms  verdict
+   64   1024   16     3.874e-7     3.456e-5     6.523e-8  PASS
+   64   1024   64     3.874e-7     7.001e-5     6.947e-8  PASS
+  256   1024   64     3.874e-7     1.052e-4     6.744e-8  PASS
+   64   4096   64     2.086e-6     1.946e-4     5.047e-7  PASS
+  256   4096   16     2.086e-6     1.595e-4     5.176e-7  PASS
+  256   4096  256     2.086e-6     1.946e-4     5.101e-7  PASS
+ 1024   4096   64     2.086e-6     1.946e-4     5.084e-7  PASS
+ 1024  12288   64     1.574e-5     4.762e-3     4.480e-6  PASS
+
+Max-abs across all shapes  : 1.574e-5
+Phase A tolerance (initial): 2.000e-4
+
+ALL PASS
+[rc=0] test_gemm_mq3g256_lloyd_residual_wmma
+
+===== parity_causal_wmma =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+
+thread 'main' (682878) panicked at crates/rdna-compute/examples/parity_causal_wmma.rs:25:96:
+called `Result::unwrap()` on an `Err` value: HipError { code: 0, message: "hipcc compilation failed for attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32:\nfatal error: error in backend: Cannot select: intrinsic %llvm.amdgcn.wmma.f32.16x16x16.f16\nclang++: error: clang frontend command failed with exit code 70 (use -v to see invocation)\nAMD clang version 22.0.0git (https://github.com/RadeonOpenCompute/llvm-project roc-7.2.2 26084 f58b06dce1f9c15707c5f808fd002e18c2accf7e)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm-7.2.2/lib/llvm/bin\nConfiguration file: /opt/rocm-7.2.2/lib/llvm/bin/clang++.cfg\nclang++: note: diagnostic msg: \n********************\n\nPLEASE ATTACH THE FOLLOWING FILES TO THE BUG REPORT:\nPreprocessed source(s) and associated run script(s) are located at:\nclang++: note: diagnostic msg: /tmp/attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32-gfx1201-1765b1.hip\nclang++: note: diagnostic msg: /tmp/attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32-gfx1201-1765b1.sh\nclang++: note: diagnostic msg: \n\n********************\nfailed to execute:/opt/rocm-7.2.2/lib/llvm/bin/clang++  --offload-arch=gfx1201  --cuda-device-only -O3 -I/opt/rocm/include -o \".hipfire_kernels/gfx1201/attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32.hsaco\" -x hip .hipfire_kernels/gfx1201/attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32.hip\n (hipError=0)" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+[rc=101] parity_causal_wmma
+
+===== bench_decode_attention_short =====
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201  seq_len=5100  iters=100  (n_heads=12 kv=2 hd=128)
+attention_flash:  169.3 us/call
+attention_f32:    294.4 us/call
+attention_q8_0_kv:323.8 us/call (Q8 KV)
+attention_flash_gqa:208.9 us/call (vs flash maxdiff=0.00e0)
+attention_flash_gqa_fused:25522.3 us/call (vs flash maxdiff=4.00e-8)
+[rc=0] bench_decode_attention_short
+
+TOTAL_FAILS=2
