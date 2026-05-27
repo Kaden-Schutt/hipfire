@@ -121,9 +121,42 @@ the predicted fix. The 1.17× (not 2×) is because MemUnitBusy rose to
 the VALU slack and memory is the next wall. VGPR dropped 32→24 (more
 occupancy headroom).
 
+### 5. Memory-wall diagnosis: BATCH reload dominates (not GQA, not load width)
+
+wave64 is memory-bound (91% MemUnitBusy). Investigated the DRAM traffic:
+
+- **Load width: already optimal.** Disassembly shows the compiler already
+  coalesces the 4 K codes into a single `global_load_dword offset:2`. No
+  manual-packing win. (The K-code ptr is kb+2+bj → 2-aligned, so no clean
+  dwordx4, but the dword load is already there.)
+- **GQA reload (4×): NOT the dominant factor.** Predicted 133 MiB at
+  N=64; measured FetchSize was 2123 MiB — 16× higher.
+- **BATCH reload (N×): THE dominant factor — confirmed by scaling.**
+  rocprofv2 FetchSize: N=16 → 547 MB, N=64 → 2177 MB = exactly 4×
+  (linear in batch). The grid [heads, tiles, BATCH] gives each query row
+  its own block that re-streams the tile's K/V from DRAM. K/V is read N
+  times, once per query row.
+
+**Batch K/V reuse — PROBED, NOT a clear win (do not build blind).**
+Cheap rocprofv2 L2CacheHit probe before committing to the LDS-staging
+rewrite: **L2CacheHit = 78%** on all three Q8 attention kernels (tile,
+dp4a w32, dp4a w64). So the batch reuse is ALREADY mostly caught by L2 —
+each tile's K/V (~34 KB/kv-head) is small enough that consecutive batch
+rows re-hit it in the 16 MB L2. The 2123 MiB "FetchSize" is fetched-to-L2
+traffic; only ~22% misses to DRAM. LDS staging would convert L2 reads →
+LDS reads (relieve the 91% MemUnitBusy), BUT:
+- the win is bounded (L2 already does most reuse, not a 4×/N× DRAM cliff),
+- staging 34 KB/WG drops occupancy to 1 WG/CU, which HURTS latency-hiding
+  on a memory-bound kernel (LDS study's own caveat).
+Net is genuinely uncertain → high risk of a falsified-tokpar-style no-op
+or regression. **Decision: do NOT build the LDS-staging rewrite blind.**
+If pursued, must A/B it against the current wave64 with rocprofv2 proving
+MemUnitBusy drops AND wall-time improves despite the occupancy hit.
+The cheap probe (1 counter pass) saved the speculative rewrite.
+
 ### Next
 
-- NIAH-gate wave64 at long ctx (in progress), then commit.
+- NIAH-gate wave64 at long ctx (DONE — PASS), committed 8c48c089.
 - Next ceiling is MEMORY (91% MemUnitBusy). Per the gfx906 KV-read study
   (skyne98): HSD layout (we're already HSD-ish) + x4 (dwordx4/128-bit)
   vectorized K/V loads ≈ 7% mem win. The wave64 kernel reads 4 i8 + fp16
