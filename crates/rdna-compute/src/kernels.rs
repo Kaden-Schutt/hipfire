@@ -1161,6 +1161,17 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX11_DGPU_SRC: &str =
 pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx12.hip");
 
+/// gfx11 (RDNA3 / RDNA3.5) sister of `GEMM_Q8_0_WMMA_GFX12_SRC`. Uses
+/// `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32` (vs the gfx12 `_w32_gfx12`)
+/// and `half16_t` operands (vs `half8_t` with lane-group K split). Output
+/// mapping `acc[j] → C[2*j + (tid>>4)][tid & 15]` matches the other gfx11
+/// Q8 WMMA siblings (qkv / qkvza / gate_up / residual). Same drop-in
+/// motivation as the gfx12 sibling — replaces the scalar
+/// `gemm_q8_0_batched` arm on the lm_head and other Q8 prefill paths
+/// for any rdna3 fixture (A3B MTP +45% projected per gfx12 PR #5).
+pub const GEMM_Q8_0_WMMA_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx11.hip");
+
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
 /// × mi] via the inverse permutation in sorted_slot_index.

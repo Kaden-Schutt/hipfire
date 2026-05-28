@@ -21096,10 +21096,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Q8_0 batched GEMM driver that handles `n` rows by sub-batching at the
     /// kernel's MAX_BATCH=64. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
     ///
-    /// On gfx12 (RDNA4) with K % 32 == 0, routes the entire call through
-    /// the WMMA Q8 GEMM (`gemm_q8_0_wmma_gfx12`) which is ~3-4× faster
-    /// than the scalar `gemm_q8_0_batched` per output. Opt out via
-    /// HIPFIRE_Q8_BATCHED_LEGACY=1.
+    /// On gfx12 (RDNA4) and gfx11 (RDNA3 / RDNA3.5) with K % 32 == 0,
+    /// routes the entire call through the WMMA Q8 GEMM
+    /// (`gemm_q8_0_wmma_gfx12` / `gemm_q8_0_wmma_gfx11` respectively),
+    /// each ~3-4× faster than the scalar `gemm_q8_0_batched` per output.
+    /// gfx12 ship landed 2026-05-19; gfx11 sibling landed 2026-05-28
+    /// (PR #8) — A3B MTP +45% projected on gfx11 per the gfx12 PR #5
+    /// result. Opt out via HIPFIRE_Q8_BATCHED_LEGACY=1.
     pub fn gemm_q8_0_batched_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -21114,8 +21117,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let use_legacy = *USE_LEGACY.get_or_init(|| {
             self.flags.q8_batched_legacy
         });
-        if !use_legacy && self.arch_caps.is_rdna4() && k % 32 == 0 && n > 0 {
-            return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
+        if !use_legacy && k % 32 == 0 && n > 0 {
+            if self.arch_caps.is_rdna4() {
+                return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
+            }
+            if self.arch_caps.is_rdna3() {
+                return self.gemm_q8_0_wmma_gfx11(a_raw, x, y, m, k, n);
+            }
         }
 
         const MAX_BATCH: usize = 64;
@@ -21180,6 +21188,72 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_wmma_gfx12", bytes);
         let result = self.launch_maybe_blob(
             "gemm_q8_0_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// WMMA Q8_0 GEMM (no residual), gfx11 (RDNA3 / RDNA3.5) sibling of
+    /// `gemm_q8_0_wmma`. Y[N, M] = X[N, K] @ A_q8[M, K]^T.
+    /// Drop-in replacement for `gemm_q8_0_batched` on gfx11; mirrors the
+    /// gfx12 sibling that landed +45% A3B MTP tok/s in PR #5 (2026-05-19).
+    /// Same kernarg layout / launch geometry as `gemm_q8_0_wmma`; only the
+    /// kernel symbol + WMMA dialect differs (gfx11 `_w32` + `half16_t` vs
+    /// gfx12 `_w32_gfx12` + `half8_t` lane-group K split).
+    pub fn gemm_q8_0_wmma_gfx11(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma_gfx11: K must be a multiple of 32 (got K={k})");
+        debug_assert!(self.arch_caps.is_rdna3(),
+            "gemm_q8_0_wmma_gfx11: gfx11 only (got arch {})", self.arch);
+        self.ensure_kernel(
+            "gemm_q8_0_wmma_gfx11",
+            kernels::GEMM_Q8_0_WMMA_GFX11_SRC,
+            "gemm_q8_0_wmma_gfx11",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_p = a.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_wmma_gfx11", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_wmma_gfx11",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
