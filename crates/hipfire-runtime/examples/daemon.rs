@@ -245,6 +245,125 @@ fn emit_done_event(
     let _ = stdout.flush();
 }
 
+/// Inputs to [`build_prompt_frame`], the shared chat-framing helper for
+/// generate / generate_multi / generate_mtp. Bundled as a struct rather
+/// than 11 positional args so the call sites stay legible.
+///
+/// Why this exists: each of the three functions has a ~70-line
+/// Jinja-or-Plain branch that does the same thing — render via
+/// JinjaChatFrame when `HIPFIRE_JINJA_CHAT=1` + first turn + template
+/// present, else hand-roll a ChatFrame with `build_with_user_tokens`.
+/// Path-specific differences (which q_tokens to feed, how the system
+/// prompt is gated on `seq_pos`) are captured in this struct.
+///
+/// NOT used by generate_dflash — that path is single-turn (no
+/// `seq_pos == 0` gate on Jinja) AND uses `ChatFrame.build()` with the
+/// raw prompt string instead of pre-tokenized user tokens. The
+/// resulting divergence isn't worth a switchable parameter; dflash
+/// keeps its inline framing per the v2.1 plan.
+struct FrameInputs<'a> {
+    tokenizer: &'a hipfire_runtime::tokenizer::Tokenizer,
+    /// `m.chat_template.as_deref()`; None disables the Jinja path.
+    chat_template: Option<&'a str>,
+    system_prompt: Option<&'a str>,
+    /// User prompt text — passed to JinjaChatFrame.user. The Plain
+    /// fallback path uses `user_tokens` instead and ignores this.
+    prompt_text: &'a str,
+    /// Pre-tokenized user content. For PFlash-enabled paths
+    /// (generate, generate_multi) this is the post-compression
+    /// `q_tokens`. For generate_mtp this is `raw_q_tokens`. Either
+    /// way the Plain fallback wraps it with chat-template scaffolding
+    /// via `build_with_user_tokens`.
+    user_tokens: &'a [u32],
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    max_think_tokens: usize,
+    tools: Option<&'a [serde_json::Value]>,
+    messages_history: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
+    /// Current `m.seq_pos`. Used to gate the Jinja path on first turn,
+    /// and to gate the Plain system-prompt scaffolding on multi-turn.
+    seq_pos: usize,
+    /// Label spliced into the "[daemon] jinja render failed in $X path"
+    /// warning. Use `"pp"`, `"mtp"`, or `""` (empty = AR).
+    err_path_label: &'static str,
+}
+
+/// Build the prompt-frame token vector that goes into prefill. Step 2.2
+/// of docs/plans/mtp_multi_refactor.md v2.1; shared by 3 of the 4 in-
+/// scope generate functions.
+fn build_prompt_frame(inputs: &FrameInputs<'_>) -> Vec<u32> {
+    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let try_jinja = jinja_enabled && inputs.seq_pos == 0 && inputs.chat_template.is_some();
+    if try_jinja {
+        let template = inputs.chat_template.unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer: inputs.tokenizer,
+            template,
+            system: inputs.system_prompt,
+            user: inputs.prompt_text,
+            enable_thinking: inputs.max_think_tokens != 1,
+            bos_token: None,
+        };
+        let render_result = if inputs.tools.is_some() || inputs.messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match inputs.messages_history {
+                Some(msgs) => msgs,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = inputs.system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: inputs.prompt_text.to_string(),
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, inputs.tools, None)
+        } else {
+            frame.render()
+        };
+        match render_result {
+            Ok(rendered) => inputs.tokenizer.encode(&rendered),
+            Err(e) => {
+                if inputs.err_path_label.is_empty() {
+                    eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                } else {
+                    eprintln!("[daemon] jinja render failed in {} path ({e}) — falling back to Plain",
+                              inputs.err_path_label);
+                }
+                hipfire_runtime::prompt_frame::ChatFrame {
+                    tokenizer: inputs.tokenizer,
+                    system: inputs.system_prompt,
+                    user: "",
+                    assistant_prefix: inputs.assistant_prefix,
+                    raw: false,
+                }
+                .build_with_user_tokens(inputs.user_tokens)
+            }
+        }
+    } else {
+        // Plain path. Multi-turn aware: system scaffolding only on the
+        // first turn so continuations don't re-emit the system message.
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer: inputs.tokenizer,
+            system: if inputs.seq_pos == 0 { inputs.system_prompt } else { None },
+            user: "",
+            assistant_prefix: inputs.assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(inputs.user_tokens)
+    }
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -3748,70 +3867,19 @@ fn generate_mtp(
     // Jinja full-render fires only on the first turn (seq_pos==0); continuations
     // use the hand-rolled incremental frame (system only on turn 0) — identical
     // to the AR path's multi-turn handling.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
-    let new_tokens: Vec<u32> = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking: max_think_tokens != 1,
-            bos_token: None,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(msgs) => msgs,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] jinja render failed in mtp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: "",
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build_with_user_tokens(&raw_q_tokens)
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
-            user: "", // tokens passed directly via build_with_user_tokens
-            assistant_prefix,
-            raw: false,
-        }
-        .build_with_user_tokens(&raw_q_tokens)
-    };
+    let new_tokens: Vec<u32> = build_prompt_frame(&FrameInputs {
+        tokenizer,
+        chat_template: m.chat_template.as_deref(),
+        system_prompt,
+        prompt_text: prompt,
+        user_tokens: &raw_q_tokens,
+        assistant_prefix,
+        max_think_tokens,
+        tools,
+        messages_history,
+        seq_pos: m.seq_pos,
+        err_path_label: "mtp",
+    });
 
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
@@ -4313,70 +4381,19 @@ fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
-    let new_tokens = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking: max_think_tokens != 1,
-            bos_token: None,
-        };
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(m) => m,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] jinja render failed in pp path ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: if m.seq_pos == 0 { system_prompt } else { None },
-                    user: "",
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build_with_user_tokens(&q_tokens)
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
-            user: "",
-            assistant_prefix,
-            raw: false,
-        }
-        .build_with_user_tokens(&q_tokens)
-    };
+    let new_tokens = build_prompt_frame(&FrameInputs {
+        tokenizer,
+        chat_template: m.chat_template.as_deref(),
+        system_prompt,
+        prompt_text: prompt,
+        user_tokens: &q_tokens,
+        assistant_prefix,
+        max_think_tokens,
+        tools,
+        messages_history,
+        seq_pos: m.seq_pos,
+        err_path_label: "pp",
+    });
 
     let trailer = nl.len();
     if m.seq_pos + new_tokens.len() + max_tokens + trailer > m.physical_cap {
@@ -4981,80 +4998,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
-    let try_jinja = jinja_enabled && m.seq_pos == 0 && m.chat_template.is_some();
-    let new_tokens = if try_jinja {
-        let template = m.chat_template.as_ref().unwrap();
-        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-            tokenizer,
-            template,
-            system: system_prompt,
-            user: prompt,
-            enable_thinking: max_think_tokens != 1,
-            bos_token: None,
-        };
-        // Phase 1 of Jinja-everywhere migration: when the caller supplies
-        // either a `tools` array or a `messages` history (or both), route
-        // through `render_messages` so the upstream template's
-        // `{% if tools %}` / multi-turn branches fire. With neither
-        // supplied, fall through to the single-turn `render()` convenience,
-        // which is byte-identical to the synthesized [system?, user]
-        // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
-        let render_result = if tools.is_some() || messages_history.is_some() {
-            // Synthesize [system?, user] when no explicit history was
-            // provided. Tools-with-legacy-prompt is the natural OpenAI
-            // function-calling shape (one turn + tool definitions).
-            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                Some(m) => m,
-                None => {
-                    let mut v = Vec::new();
-                    if let Some(sys) = system_prompt {
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::System,
-                            content: sys.to_string(),
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                        });
-                    }
-                    v.push(hipfire_runtime::prompt_frame::Message {
-                        role: hipfire_runtime::prompt_frame::Role::User,
-                        content: prompt.to_string(),
-                        tool_calls: Vec::new(),
-                        tool_call_id: None,
-                    });
-                    synthesized = v;
-                    &synthesized
-                }
-            };
-            frame.render_messages(messages_slice, tools, None)
-        } else {
-            frame.render()
-        };
-        match render_result {
-            Ok(rendered) => tokenizer.encode(&rendered),
-            Err(e) => {
-                eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
-                hipfire_runtime::prompt_frame::ChatFrame {
-                    tokenizer,
-                    system: system_prompt,
-                    user: "",
-                    assistant_prefix,
-                    raw: false,
-                }
-                .build_with_user_tokens(&q_tokens)
-            }
-        }
-    } else {
-        hipfire_runtime::prompt_frame::ChatFrame {
-            tokenizer,
-            system: if m.seq_pos == 0 { system_prompt } else { None },
-            user: "", // unused: we pass tokens directly via build_with_user_tokens
-            assistant_prefix,
-            raw: false,
-        }
-        .build_with_user_tokens(&q_tokens)
-    };
+    let new_tokens = build_prompt_frame(&FrameInputs {
+        tokenizer,
+        chat_template: m.chat_template.as_deref(),
+        system_prompt,
+        prompt_text: prompt,
+        user_tokens: &q_tokens,
+        assistant_prefix,
+        max_think_tokens,
+        tools,
+        messages_history,
+        seq_pos: m.seq_pos,
+        err_path_label: "",
+    });
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
