@@ -1403,6 +1403,20 @@ pub fn spec_step_mtp_compressed_serial(
     for k in 0..max_n {
         let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
 
+        // ── HIPFIRE_HETERO_DIFF capture point 1: input prev_hidden ──
+        if cur_pos < 1000 {
+            if let Ok(prefix) = std::env::var("HIPFIRE_HETERO_DIFF") {
+                if k == 0 {
+                    let prev = gpu.download_f32(&state.prev_hidden)?;
+                    let path = format!("{prefix}.single.pos{cur_pos:04}.k0.prev_hidden.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(prev.as_ptr() as *const u8, prev.len() * 4)
+                    };
+                    std::fs::write(&path, bytes).expect("write capture");
+                }
+            }
+        }
+
         // Forward: in compressed mode, mtp_head_forward_compressed runs
         // block_only + rmsnorm + small GEMV against lm_head_draft in one
         // call. In full-vocab mode we run block_only here and do the
@@ -1448,6 +1462,28 @@ pub fn spec_step_mtp_compressed_serial(
                     gpu, head, &state.mtp_scratch, &mut state.mtp_kv,
                     next_tok, &prev_row, cur_pos + k, trunk_weights,
                 )?;
+            }
+        }
+
+        // ── HIPFIRE_HETERO_DIFF capture points 2 & 3: t_mtp_out, logits ──
+        if cur_pos < 1000 {
+            if let Ok(prefix) = std::env::var("HIPFIRE_HETERO_DIFF") {
+                let t_out = gpu.download_f32(&state.mtp_scratch.t_mtp_out)?;
+                let path_t = format!("{prefix}.single.pos{cur_pos:04}.k{k}.t_mtp_out.bin");
+                let bytes_t: &[u8] = unsafe {
+                    std::slice::from_raw_parts(t_out.as_ptr() as *const u8, t_out.len() * 4)
+                };
+                std::fs::write(&path_t, bytes_t).expect("write t_mtp_out");
+
+                if !use_full_vocab {
+                    let logits_c_ref = state.mtp_scratch.logits_compressed.as_ref().unwrap();
+                    let l_c = gpu.download_f32(logits_c_ref)?;
+                    let path_l = format!("{prefix}.single.pos{cur_pos:04}.k{k}.logits_compressed.bin");
+                    let bytes_l: &[u8] = unsafe {
+                        std::slice::from_raw_parts(l_c.as_ptr() as *const u8, l_c.len() * 4)
+                    };
+                    std::fs::write(&path_l, bytes_l).expect("write logits");
+                }
             }
         }
 
@@ -1814,6 +1850,13 @@ pub fn spec_step_mtp_compressed_serial(
 
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+    if cur_pos < 1000 {
+        if std::env::var("HIPFIRE_HETERO_DIFF").is_ok() {
+            eprintln!(
+                "[single-diff] cycle@cur_pos={cur_pos} candidates={candidates:?} argmax_per_pos={argmax_per_pos:?} accept={accept_count} commit={committed:?}"
+            );
+        }
+    }
 
     // h_idx contract (audited 2026-05-21 vs AtomicBot atomic-llama-cpp-
     // turboquant feature/turboquant-kv-cache): prev_hidden_row = advance - 1
@@ -2157,6 +2200,20 @@ pub fn spec_step_mtp_compressed_serial_hetero(
         // Embedding lookup on drafter using the mirrored token_embd.
         drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
 
+        // ── Capture point 1: input prev_hidden (every K step, every cycle) ──
+        if cur_pos < 1000 {
+            if let Ok(prefix) = std::env::var("HIPFIRE_HETERO_DIFF") {
+                if k == 0 {
+                    let prev = drafter_gpu.download_f32(&drafter_state.prev_hidden)?;
+                    let path = format!("{prefix}.hetero.pos{cur_pos:04}.k0.prev_hidden.bin");
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(prev.as_ptr() as *const u8, prev.len() * 4)
+                    };
+                    std::fs::write(&path, bytes).expect("write capture");
+                }
+            }
+        }
+
         // MTP head forward — feeds step_embd in via next_token_embed override,
         // reads prev_hidden (drafter-resident: at k=0 from the per-cycle peer
         // copy of last cycle's verify_hidden; at k>0 from prev step's
@@ -2172,6 +2229,26 @@ pub fn spec_step_mtp_compressed_serial_hetero(
                 drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
                 &drafter_state.step_embd, &prev_row, cur_pos + k,
             )?;
+        }
+
+        // ── Capture points 2 & 3: t_mtp_out + logits_compressed (every K) ──
+        if cur_pos < 1000 {
+            if let Ok(prefix) = std::env::var("HIPFIRE_HETERO_DIFF") {
+                let t_out = drafter_gpu.download_f32(&drafter_state.mtp_scratch.t_mtp_out)?;
+                let path_t = format!("{prefix}.hetero.pos{cur_pos:04}.k{k}.t_mtp_out.bin");
+                let bytes_t: &[u8] = unsafe {
+                    std::slice::from_raw_parts(t_out.as_ptr() as *const u8, t_out.len() * 4)
+                };
+                std::fs::write(&path_t, bytes_t).expect("write t_mtp_out");
+
+                let logits_c_ref = drafter_state.mtp_scratch.logits_compressed.as_ref().unwrap();
+                let l_c = drafter_gpu.download_f32(logits_c_ref)?;
+                let path_l = format!("{prefix}.hetero.pos{cur_pos:04}.k{k}.logits_compressed.bin");
+                let bytes_l: &[u8] = unsafe {
+                    std::slice::from_raw_parts(l_c.as_ptr() as *const u8, l_c.len() * 4)
+                };
+                std::fs::write(&path_l, bytes_l).expect("write logits");
+            }
         }
 
         // Greedy argmax over compressed logits, D2H 4 B.
@@ -2323,16 +2400,32 @@ pub fn spec_step_mtp_compressed_serial_hetero(
 
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+    if cur_pos < 1000 {
+        if std::env::var("HIPFIRE_HETERO_DIFF").is_ok() {
+            eprintln!(
+                "[hetero-diff] cycle@cur_pos={cur_pos} candidates={candidates:?} argmax_per_pos={argmax_per_pos:?} accept={accept_count} commit={committed:?}"
+            );
+        }
+    }
 
     // ── 3. Cycle-exit handoff: peer-copy verify_hidden[advance-1] →
     //      drafter.prev_hidden. This is the ONE per-cycle cross-device
     //      data movement on the critical path (~20 KB, ~38 µs steady-state
     //      per the mtp_peer_copy_microbench). Sync via target's stream
     //      since the verify just finished there.
+    //
+    // CRITICAL: must copy from row `advance - 1` of verify_hidden, NOT
+    // from offset 0. verify_hidden is [(max_n+1) × dim] F32 row-major;
+    // row 0 corresponds to last_committed, row k to candidate k-1, and
+    // row `advance-1` to the bonus token (whose post-output-norm hidden
+    // is the right prev_hidden seed for next cycle's chain). Hetero v1.0
+    // mistakenly always copied row 0, which caused τ to collapse to ~2.2
+    // because cycle N+1 started its chain from the WRONG hidden state.
     let prev_hidden_row = advance - 1;
-    target_gpu.hip.memcpy_peer(
-        &drafter_state.prev_hidden.buf, drafter_gpu.device_id,
-        &state.verify_hidden.buf, target_gpu.device_id,
+    let src_row_offset = prev_hidden_row * dim * 4;
+    target_gpu.hip.memcpy_peer_offset(
+        &drafter_state.prev_hidden.buf, 0, drafter_gpu.device_id,
+        &state.verify_hidden.buf, src_row_offset, target_gpu.device_id,
         dim * 4,
     )?;
     // Note: we use the sync memcpy_peer (not _async) since the trunk verify
@@ -2341,7 +2434,6 @@ pub fn spec_step_mtp_compressed_serial_hetero(
     // synchronizes via host, sized to 20 KB this is fast (~38 µs measured).
     // Future optimization: use memcpy_peer_async + cross-device event sync
     // (see hetero_overlap_microbench.rs in the parallel multi-gpu work).
-    let _ = prev_hidden_row;
 
     // ── 4. Rollback / replay on TARGET (same as single-gpu) ──
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
