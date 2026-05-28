@@ -12248,8 +12248,10 @@ pub enum FaPhase<'a> {
 /// Run a single FullAttn layer body on s.x at position `pos`. Extracted
 /// for use from the batched prefill path's FA-layer fallback. Byte-exact
 /// with the FA branch of forward_scratch_layers (for `FaPhase::Full`).
+/// `pub` so the TP parity harness can drive the `FaPhase::{TpAttn,TpFfn}`
+/// path against the single-GPU `Full` path.
 #[allow(clippy::too_many_arguments)]
-fn run_fa_layer_body(
+pub fn run_fa_layer_body(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,

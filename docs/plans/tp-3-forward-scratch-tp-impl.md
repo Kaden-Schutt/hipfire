@@ -24,7 +24,19 @@ all ranks start each layer with the same `s.x` and run identical
 deterministic DeltaNet weights). DeltaNet TP sharding (16 value heads +
 recurrent state) is a later stage.
 
-## 1. FA-body split (DONE — uncommitted)
+## Progress (2026-05-28)
+
+- **FA-body split** (`FaPhase`) — DONE, committed `e5afa07b`, coherence
+  gate green.
+- **FA TP machinery validated end-to-end** — `tp_fa_layer_parity.rs`
+  (uncommitted) runs the FULL `TpAttn → all_reduce(s.o) → add_f32(s.x) →
+  TpFfn` flow on a real FullAttn layer (layer 3 of 0.8B) vs single-GPU
+  `FaPhase::Full`: **max rel 1.18e-7**. The novel/risky TP piece is proven.
+- **Remaining:** DeltaNet body extraction (§2) + the `forward_scratch_tp`
+  orchestrator (§3, now just "loop the validated FA path + replicated
+  DeltaNet over all layers") + full-model parity harness (§4).
+
+## 1. FA-body split (DONE — committed e5afa07b)
 
 `run_fa_layer_body` (qwen35.rs ~8408) now takes a `phase: FaPhase`:
 

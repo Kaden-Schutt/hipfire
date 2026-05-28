@@ -30,6 +30,13 @@ name = "tp_wo_allreduce_smoke"
 path = "examples/tp_wo_allreduce_smoke.rs"
 required-features = ["deltanet"]
 
+# tp_fa_layer_parity — Stage 3a: full FullAttn TP machinery (FaPhase
+# TpAttn/all-reduce/TpFfn) vs single-GPU Full, on one real FA layer.
+[[example]]
+name = "tp_fa_layer_parity"
+path = "examples/tp_fa_layer_parity.rs"
+required-features = ["deltanet"]
+
 [[example]]
 name = "test_qwen35_state_multi"
 path = "examples/test_qwen35_state_multi.rs"
