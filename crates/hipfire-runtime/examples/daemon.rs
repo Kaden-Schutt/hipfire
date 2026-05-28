@@ -2412,19 +2412,66 @@ fn load_model_pp(
 
     let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).map_err(|e| format!("{e}"))?;
 
+    // HIPFIRE_KV_FILTER=1 enables the *_filtered_multi KV constructors
+    // (Stage 1 of the pp+mtp plan). For Qwen 3.5/3.6 hybrid models with
+    // 48 LinearAttention + 16 FullAttention layers, this allocates a
+    // 1-element placeholder for each LA layer's K/V slot instead of a
+    // full slab, saving ~3× KV VRAM. Default off until validated;
+    // turn on for the longer-ctx PP runs that motivate Stage 2.
+    let kv_filter_on = std::env::var("HIPFIRE_KV_FILTER").ok().as_deref() == Some("1");
+    let is_kv_layer: Vec<bool> = config.layer_types.iter()
+        .map(|t| matches!(t, hipfire_arch_qwen35::qwen35::LayerType::FullAttention))
+        .collect();
+    if kv_filter_on {
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!("  HIPFIRE_KV_FILTER=1 → using filtered_multi KV ({n_kv}/{} layers carry KV)", is_kv_layer.len());
+    }
+
     // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
     // physical_cap == max_seq on this path — eviction is refused at load.
     let kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "q8" => if kv_filter_on {
+            llama::KvCache::new_gpu_q8_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "asym4" | "turbo4" => if kv_filter_on {
+            llama::KvCache::new_gpu_asym4_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "asym2" | "turbo2" => if kv_filter_on {
+            llama::KvCache::new_gpu_asym2_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => if kv_filter_on {
+            llama::KvCache::new_gpu_asym3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "fwht4" => if kv_filter_on {
+            llama::KvCache::new_gpu_fwht4_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "fwht3" => if kv_filter_on {
+            llama::KvCache::new_gpu_fwht3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
+        "fwht2" => if kv_filter_on {
+            llama::KvCache::new_gpu_fwht2_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        } else {
+            llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+        },
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            if kv_filter_on {
+                llama::KvCache::new_gpu_asym3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            } else {
+                llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            }
         }
     };
 
@@ -2447,6 +2494,23 @@ fn load_model_pp(
         "  pp={pp} loaded: layer_to_device={:?}, output_device={}, peer_access={}",
         gpus.layer_to_device, gpus.output_device, gpus.peer_access_enabled,
     );
+
+    // Per-device VRAM-after-load report. Useful for validating Stage 1
+    // (HIPFIRE_KV_FILTER) savings + Stage 2 (PP+MTP layout) budget planning.
+    for (dev_idx, g) in gpus.devices.iter().enumerate() {
+        if g.bind_thread().is_ok() {
+            if let Ok((free, total)) = g.hip.get_vram_info() {
+                let used = total.saturating_sub(free);
+                eprintln!(
+                    "  dev {dev_idx} ({}): {:.2} GiB used / {:.2} GiB total ({:.2} GiB free)",
+                    g.arch,
+                    used as f64 / (1u64 << 30) as f64,
+                    total as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64,
+                );
+            }
+        }
+    }
 
     Ok(LoadedModel {
         arch_id: hfq.arch_id,
