@@ -409,6 +409,11 @@ pub struct Gpu {
     /// graph_destroy + re-capture every oscillation, which was wiping out the
     /// hipGraph replay gain entirely.
     pub verify_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// Subset of `verify_graph_cache` whose captured region also includes the
+    /// DFlash verify lm_head + argmax tail. Forward-only and extended verify
+    /// graphs share the same per-B cache, so callers need this side metadata
+    /// before deciding whether to enqueue lm_head outside the graph.
+    pub verify_graph_lmhead_argmax: HashSet<usize>,
     /// Set of B values that have completed the once-per-B JIT/scratch warmup.
     /// Capture can safely begin only after warmup — see graph_verify_warmup doc.
     pub verify_warmed_up: HashSet<usize>,
@@ -644,6 +649,7 @@ impl Gpu {
             ar_forward_kernel_dirty: true,
             ar_forward_replay_enabled: false,
             verify_graph_cache: HashMap::new(),
+            verify_graph_lmhead_argmax: HashSet::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
             replay_graph_cache: HashMap::new(),
@@ -903,6 +909,16 @@ impl Gpu {
         self.verify_graph_cache.contains_key(&b)
     }
 
+    pub fn verify_graph_has_lmhead_argmax(&self, b: usize) -> bool {
+        // bind_thread: skip — pure state query
+        self.verify_graph_lmhead_argmax.contains(&b)
+    }
+
+    pub fn verify_mark_graph_lmhead_argmax(&mut self, b: usize) {
+        // bind_thread: skip — pure state update
+        self.verify_graph_lmhead_argmax.insert(b);
+    }
+
     pub fn verify_needs_warmup(&self, b: usize) -> bool {
         // bind_thread: skip — pure state query
         !self.verify_warmed_up.contains(&b)
@@ -968,6 +984,7 @@ impl Gpu {
             let _ = self.hip.graph_exec_destroy(exec);
             let _ = self.hip.graph_destroy(graph);
         }
+        self.verify_graph_lmhead_argmax.clear();
         self.verify_warmed_up.clear();
         self.verify_capturing_b = None;
     }
@@ -22447,6 +22464,40 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+    }
+
+    /// c = a + b (element-wise), graph-capture-safe launch path. Keep the
+    /// legacy `add_f32` path unchanged for non-captured callers; use this in
+    /// subgraphs where stack-backed kernelParams would dangle on replay.
+    pub fn add_f32_graph_safe(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
+
+        let n = a.numel() as i32;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b.buf.as_ptr();
+        let mut c_ptr = c.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "add_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_ptr(c_ptr);
+                bb.push_i32(n_val);
+                bb
+            },
+        )
     }
 
     /// a += b (in-place element-wise add)
