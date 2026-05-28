@@ -160,22 +160,27 @@ JL
     fi
 
     # Extract τ from the done event (generate_mtp's done emits it inline).
-    # If the daemon dispatched to AR instead (e.g. PP+MTP before Stage 2b's
-    # Path::PpMtp arm lands), the done event won't contain "tau" — we
-    # detect that and record AR_FALLBACK so the gate doesn't silently lose
-    # MTP coverage.
+    # Two valid MTP dispatch labels in done events:
+    #   "spec_path":"mtp"     — single-gpu MTP (generate_mtp / SpecPath::Mtp)
+    #   "spec_path":"pp-mtp"  — Stage 2b PP+MTP (generate_pp_mtp / SpecPath::PpMtp)
+    # If the daemon dispatched to AR instead, the done event won't contain
+    # spec_path at all — record AR_FALLBACK so the gate doesn't silently
+    # lose MTP coverage.
     local tau=""
     local mtp_dispatched="-"
     if [ "$use_mtp" -eq 1 ]; then
-        if printf '%s' "$done_line" | grep -q '"spec_path":"mtp"'; then
+        if printf '%s' "$done_line" | grep -q '"spec_path":"pp-mtp"'; then
+            mtp_dispatched="pp-mtp"
+            tau=$(printf '%s' "$done_line" | grep -oE '"tau":[0-9.]+' | head -1 | cut -d: -f2)
+        elif printf '%s' "$done_line" | grep -q '"spec_path":"mtp"'; then
             mtp_dispatched="mtp"
             tau=$(printf '%s' "$done_line" | grep -oE '"tau":[0-9.]+' | head -1 | cut -d: -f2)
         else
             mtp_dispatched="AR_FALLBACK"
-            # Don't hard-fail; before Stage 2b's Path::PpMtp arm lands the
-            # daemon's generate dispatches m.pp > 1 + mtp through
-            # generate_multi which doesn't know about MTP. The test still
-            # validates that load succeeded and tokens emitted.
+            # Don't hard-fail; PP+MTP requests load fine but may bypass to
+            # AR on configs PpMtp doesn't yet support (sampling, full-vocab
+            # head). The test still validates that load succeeded and
+            # tokens emitted.
         fi
     fi
 
