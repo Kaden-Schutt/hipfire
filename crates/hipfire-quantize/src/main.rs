@@ -65,12 +65,6 @@ static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct SafetensorsMeta {
-    #[serde(flatten)]
-    tensors: HashMap<String, TensorMeta>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
 struct TensorMeta {
     dtype: String,
     shape: Vec<usize>,
@@ -2625,6 +2619,7 @@ const HFQ_VERSION: u32 = 1;
 enum QuantType {
     Q4F16G64 = 0,
     F16 = 1,
+    #[allow(dead_code)]
     F32 = 2,
     Q8F16 = 3,
     Q4K = 4,
@@ -2664,7 +2659,9 @@ enum QuantType {
     // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
     // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
     // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    #[allow(dead_code)]
     PARO4G128 = 28,     // ParoQuant native AWQ W4 + pairwise activation rotation metadata
+    #[allow(dead_code)]
     PARO4G128T = 29,    // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
 // HFP8E5M2G32 = 30, // v2  — HFP8 E5M2 family
@@ -2693,53 +2690,6 @@ enum QuantLevel {
     Override(GgufFormat),
     /// Use the base format as-is.
     Base,
-}
-
-/// Default kmap promote target for a given base format. Preserves the
-/// pre-`--kmap-promote` behavior byte-for-byte: MQ-family bases promote to
-/// MQ6, HFQ-family to HFQ6, FP4-family is a no-op (no FP6 sibling).
-fn default_promote_target(base: GgufFormat) -> GgufFormat {
-    match base {
-        GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
-        GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
-        GgufFormat::Hfp4 => GgufFormat::Hfp4,
-        GgufFormat::Mfp4 => GgufFormat::Mfp4,
-    }
-}
-
-/// Allowlist for explicit `--kmap-promote` overrides. Runtime mixed-format
-/// dispatch (post-#257) is validated only within same-rotation-family,
-/// upward-in-bit-width pairings. Cross-family (MQ↔HFQ, MQ↔HFP) and
-/// downward-in-bits promotions are rejected at parse time.
-fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
-    use GgufFormat::*;
-    if base == promote {
-        return true; // no-op promotion is always safe
-    }
-    match (base, promote) {
-        // Lloyd-to-Lloyd only — Lloyd variants use different codebooks +
-        // different runtime kernel families from standard MQ. Lloyd→non-Lloyd
-        // mixed-format dispatch has no runtime support today; the plan's
-        // "Future expansion" section targets the MQ2-Lloyd + MQ3-Lloyd pair
-        // specifically. Tightened per combined-review finding G2.
-        (Mq2Lloyd, Mq3Lloyd) => true,
-        (Mq2Lloyd | Mq3Lloyd, _) => false,
-        (_, Mq2Lloyd | Mq3Lloyd) => false,
-
-        // MQ-family upward bit-width (non-Lloyd)
-        (Mq2, Mq3 | Mq4 | Mq6) => true,
-        (Mq3, Mq4 | Mq6) => true,
-        (Mq4, Mq6) => true,
-
-        // HFQ-family upward bit-width
-        (Hfq4, Hfq6) => true,
-
-        // Everything else: explicitly not in the supported matrix.
-        // Cross-family (MQ↔HFQ↔FP4) rejected — runtime mixed-format dispatch
-        // (post-#257) is only same-rotation-family-safe.
-        _ => false,
-    }
 }
 
 /// Extract layer index from a tensor name.
@@ -2791,6 +2741,7 @@ fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
+#[cfg(test)]
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
     kmap_resolve_mode(name, n_layers, is_moe, 0)
 }
@@ -4018,36 +3969,9 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
                     let q = quantize_mfp4g32_2d(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MFP4G32, 32u32, "MFP4G32")
                 }
-                // Sub-6-bit promote targets: available for `--kmap-promote mq{2,3,4}`
-                // pairings (e.g. MQ2 base + MQ3 promote alternating). Same kernels
-                // as the Base arm below; just dispatched via the promote target.
-                GgufFormat::Mq4 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                }
-                GgufFormat::Mq3 => {
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                }
-                GgufFormat::Mq2 => {
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                }
-                GgufFormat::Mq2Lloyd => {
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                }
-                GgufFormat::Mq3Lloyd => {
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                }
                 GgufFormat::Mq4Lloyd => {
                     let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                }
-                GgufFormat::Hfq4 => {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 }
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
@@ -7334,7 +7258,6 @@ mod hfq_block_diag {
     struct TensorInfo {
         name: String,
         quant_type: u8,
-        shape: Vec<u32>,
         data_offset: usize,
         data_size: usize,
     }
@@ -7407,16 +7330,14 @@ mod hfq_block_diag {
             pos += name_len;
             let quant_type = mmap[pos]; pos += 1;
             let n_dims = mmap[pos] as usize; pos += 1;
-            let mut shape = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                shape.push(u32::from_le_bytes(mmap[pos..pos+4].try_into().unwrap()));
                 pos += 4;
             }
             // Skip group_size u32.
             pos += 4;
             let data_size = u64::from_le_bytes(mmap[pos..pos+8].try_into().unwrap()) as usize;
             pos += 8;
-            tensors.push(TensorInfo { name, quant_type, shape, data_offset: cum, data_size });
+            tensors.push(TensorInfo { name, quant_type, data_offset: cum, data_size });
             cum += data_size;
         }
         Ok((mmap, tensors))
