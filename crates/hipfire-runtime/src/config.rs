@@ -33,6 +33,11 @@ pub struct RuntimeConfig {
     pub lm_head_f16: String,
     pub mtp_mode: String,
     pub mtp_k: usize,
+    /// `HIPFIRE_TP_USE_RCCL=0` opts out of RCCL-backed TP collectives,
+    /// reserving the slot for a future host-driven fallback. `None` = use
+    /// RCCL (the default). `Some(true)` is the same as `None`; explicit
+    /// `Some(false)` triggers refusal in `Gpus::ensure_rccl`.
+    pub tp_use_rccl: Option<bool>,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -113,6 +118,11 @@ impl RuntimeConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3),
+            tp_use_rccl: match std::env::var("HIPFIRE_TP_USE_RCCL").ok().as_deref() {
+                Some("0") | Some("false") | Some("off") => Some(false),
+                Some(_) => Some(true),
+                None => None,
+            },
         }
     }
 }

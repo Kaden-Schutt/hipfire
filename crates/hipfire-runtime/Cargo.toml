@@ -311,6 +311,13 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "tp_comm_smoke"
 required-features = []
 
+# tp_allreduce_smoke — Stage 2 end-to-end: Gpus::all_reduce_sum_f32
+# correctness check + latency vs the direct hip-bridge::rccl_smoke
+# baseline. Uses only multi_gpu::Gpus, no arch crates.
+[[example]]
+name = "tp_allreduce_smoke"
+required-features = []
+
 # build_kld_ref needs no GPU / arch features — it just orchestrates
 # llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
 [[example]]
