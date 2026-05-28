@@ -154,6 +154,53 @@ impl Gpus {
         }
     }
 
+    /// Tensor-parallel constructor: bring up `tp_size` devices that each run
+    /// **every** layer (PP=1), sharded within-layer per a `ShardConfig`.
+    ///
+    /// Distinct from `init_uniform` (which bands layers across devices for
+    /// pipeline parallelism): here `layer_to_device = [0; n_layers]` and
+    /// `band_starts = [0, n_layers, …]` (device 0 "owns" all layers in the
+    /// PP sense; bands ≥1 are empty) so PP-oriented helpers stay well-defined,
+    /// while the TP forward path ignores the layer-band map and dispatches
+    /// every layer on every rank. `output_device = 0` — the replicated
+    /// lm_head lives on every rank and sampling reads rank 0 by convention
+    /// (TP plan §3.5 / Stage 7).
+    ///
+    /// The Q/KV-head divisibility check lives on `ShardConfig::validate`
+    /// (called at model load once head counts are known); this constructor
+    /// only validates the device count. Pre-flight runs the arch-match +
+    /// VRAM-delta gate (TP ranks are identical cards, so the uniform delta
+    /// check applies).
+    pub fn init_tp(tp_size: usize, n_layers: usize) -> HipResult<Self> {
+        if tp_size == 0 {
+            return Err(HipError::new(0, "init_tp: tp_size must be >= 1"));
+        }
+        if n_layers == 0 {
+            return Err(HipError::new(0, "init_tp: n_layers must be >= 1"));
+        }
+        let device_ids = resolve_device_ids(tp_size)?;
+        let devices = construct_devices(&device_ids)?;
+        preflight_vram_with_opts(&devices, /*check_vram_delta=*/ true)?;
+
+        // PP=1 TP topology: every device runs every layer. Encode the layer
+        // map so PP helpers see device 0 owning all layers and devices ≥1
+        // owning empty bands.
+        let mut band_starts = vec![0usize; tp_size];
+        for b in band_starts.iter_mut().skip(1) {
+            *b = n_layers;
+        }
+        Ok(Self {
+            rccl_comms: None,
+            devices,
+            layer_to_device: vec![0u8; n_layers],
+            band_starts,
+            peer_access_enabled: false,
+            output_device: 0,
+            givens_cos_per_dev: Vec::new(),
+            givens_sin_per_dev: Vec::new(),
+        })
+    }
+
     /// Bidirectional `hipDeviceEnablePeerAccess` between every pair of
     /// devices. Returns `Ok(true)` if every leg succeeded; `Ok(false)` if
     /// any pair reports `hipDeviceCanAccessPeer = 0` or

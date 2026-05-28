@@ -334,20 +334,58 @@ not adopted (worse at 512 KB; ties at small sizes).
 
 ### Stage 3 — `tp-3-attn-shard` (~4-5d)
 
+**Scaffold landed 2026-05-28** (this branch): the plan's original Stage 1
+(`ShardConfig` + TP `Gpus` constructor) was never built when Stage 2 was
+reworked to RCCL — it's now in `crates/hipfire-runtime/src/tp_shard.rs`
+(`ShardConfig`, `ExpertAssign`, head/expert range math, 10 CPU unit
+tests) + `Gpus::init_tp(tp_size, n_layers)` in `multi_gpu.rs`.
+
 `crates/hipfire-arch-qwen35/src/qwen35.rs`,
 `crates/rdna-compute/src/dispatch.rs`.
 
-- `Qwen35Weights::load_weights_tp(hfq, config, gpus, shard)` — each rank
-  loads its column-slice of wq, row-slice of wo, full wk/wv (replicated).
-- Shard-aware dispatch: `gpu.weight_gemv(rank_local_wq, x, q_local)`
-  produces `q_local` of width `n_heads/tp × head_dim`. K, V dispatched
-  on each rank from local-full wk/wv. FA / DFA runs locally on
-  rank-local Q-head slice. wo GEMV produces local partial residual.
-- All-reduce-sum on `s.x` after wo.
-- `forward_scratch_tp`: parallels `forward_scratch` (line 4212); 4
-  layer-type branches reproduced (DeltaNet, FullAttn, DeltaNetMoe,
-  FullAttnMoe). FFN branches still single-rank in Stage 3.
-- Parity acceptance: TP=2 ↔ TP=1 logits within 1e-4 on 0.8B greedy.
+**Corrected code map (post-PR #352 — the plan's old refs to
+`forward_scratch`@4212 / branches@3787,3849 are stale):**
+
+- The per-layer **decode** loop is `forward_scratch_layers`
+  (qwen35.rs ~8873), NOT `forward_scratch`@4212 (now a hipGraph-capture
+  wrapper). The decode **FullAttn** attention helper is ~8445–8650:
+  `fused_qkv_*` (8465+) → `deinterleave_f32`@8523 splits Q/gate →
+  q/k RMSNorm → RoPE → kv-write → attention_flash_* → `sigmoid_mul`@8645
+  applies the gate → `weight_gemv_residual(wo)`. **Prefill** batched FA is
+  ~7010–8270 (`pbs.fa_*_batch`, `deinterleave_f32_batched`).
+- `wq` is **2× wide and gated**: `[n_heads·head_dim·2, dim]`, laid out per
+  head as `[Q_h(hd), Gate_h(hd), …]` (`kernels/src/deinterleave.hip`).
+  Column-sharding `wq` = slicing **rows** in contiguous `2·head_dim`
+  head-blocks (`ShardConfig::wq_row_range`) — keeps each head's Q+gate
+  together. Slicing rows of a row-major quant blob is contiguous → cheap
+  per-rank load.
+- `wo` `[dim, n_heads·head_dim]` row-shard = slicing the **input** dim
+  (columns, `ShardConfig::wo_col_range`). For a row-major quant matrix
+  this is a per-row gather, NOT a contiguous byte range — so slice-loading
+  `wo` is the hard part (deferred to milestone 3b below).
+- Attention/RoPE dispatch already take `n_heads`/`n_kv_heads` as explicit
+  params → running on a Q-head subset is a param change, not surgery.
+
+**Milestone decomposition (de-risks the wo-slice problem):**
+
+- **3a — math + all-reduce validation (replicated load, masked heads):**
+  each rank loads weights full (no slicing), computes full Q/K/V, but runs
+  attention only on its local head range and zeroes non-local heads before
+  the **full** `wo` GEMV → each rank's output is exactly its partial
+  residual; `all_reduce_sum_f32` across ranks reconstructs the full
+  residual. Validates the TP decomposition + per-layer all-reduce wiring
+  on 2 physical GPUs WITHOUT touching the quant slice-loader. Not faster
+  (redundant compute) — correctness only.
+- **3b — real shard load (memory/compute win):**
+  `Qwen35Weights::load_weights_tp(hfq, config, gpus, shard)` loads only the
+  per-rank `wq` row-slice + replicated/​split `wk`/`wv`; `wo` needs a
+  column-slice quant loader (group-alignment aware) or a transposed store.
+- All-reduce-sum on `s.x` after `wo` via `Gpus::all_reduce_sum_f32`.
+- `forward_scratch_tp` parallels `forward_scratch_layers`; FFN branches
+  stay single-rank in Stage 3. Start with the **FullAttn** branch only
+  (0.8B parity target); DeltaNet/MoE branches follow.
+- Parity acceptance: TP=2 ↔ TP=1 logits within 1e-4 on `qwen3.5-0.8b.mq4`
+  greedy temp=0 (1e-4, not bit-exact — cross-rank sum reorders float adds).
 
 ### Stage 4 — `tp-4-shared-expert-shard` (~2d)
 
@@ -459,14 +497,16 @@ projection). Out of scope for this doc.
 
 | File | Role |
 |---|---|
-| `crates/hipfire-runtime/src/multi_gpu.rs` | `Gpus` orchestrator — reused; v1 adds `init_tp` constructor + `all_reduce_sum` (RCCL-backed) |
-| `crates/hipfire-runtime/src/tp_shard.rs` | **new** — `ShardConfig`, expert-to-rank, all-to-all on `boundary_copy` |
-| `crates/hip-bridge/src/rccl.rs` | **new (Stage 2)** — dlopen-style FFI for librccl: `ncclCommInitAll`, `ncclAllReduce`, group ops |
+| `crates/hipfire-runtime/src/multi_gpu.rs` | `Gpus` orchestrator — reused; adds `init_tp` constructor (shipped 2026-05-28) + `all_reduce_sum_f32` (RCCL-backed, shipped) |
+| `crates/hipfire-runtime/src/tp_shard.rs` | **shipped 2026-05-28** — `ShardConfig`, `ExpertAssign`, head/expert range math, validate(). all-to-all on `boundary_copy` is Stage 5 |
+| `crates/hip-bridge/src/rccl.rs` | **shipped (Stage 2)** — dlopen-style FFI for librccl: `ncclCommInitAll`, `ncclAllReduce`, group ops |
+| `crates/hipfire-runtime/examples/tp_allreduce_smoke.rs` | **shipped 2026-05-28** — `Gpus::all_reduce_sum_f32` correctness + latency vs direct RCCL |
 | `crates/hipfire-runtime/examples/tp_comm_smoke.rs` | **shipped 2026-05-28** — comm microbench (host-driven path) |
 | `docs/investigations/2026-05-28-tp-comm-baseline-hiptrx.md` | comm-cost baseline + RCCL comparison; load-bearing data for §3.3 |
-| `crates/hipfire-arch-qwen35/src/qwen35.rs:2974` | `moe_ffn_decode_impl` — EP shard target |
-| `crates/hipfire-arch-qwen35/src/qwen35.rs:3787, 3849` | FullAttnMoe / DeltaNetMoe forward branches |
-| `crates/hipfire-arch-qwen35/src/qwen35.rs:4212` | `forward_scratch` — `forward_scratch_tp` parallel |
+| `crates/hipfire-arch-qwen35/src/qwen35.rs` ~2974 | `moe_ffn_decode_impl` — EP shard target (verify line post-#352) |
+| `crates/hipfire-arch-qwen35/src/qwen35.rs` ~8445–8650 | decode FullAttn helper (fused_qkv → deinterleave@8523 → norm → RoPE → attention → sigmoid_mul@8645 gate → wo residual) |
+| `crates/hipfire-arch-qwen35/src/qwen35.rs` ~7010–8270 | prefill batched FullAttn (`pbs.fa_*_batch`) |
+| `crates/hipfire-arch-qwen35/src/qwen35.rs:8873` | `forward_scratch_layers` — `forward_scratch_tp` parallels THIS (not the 4212 wrapper) |
 | `crates/rdna-compute/src/dispatch.rs` | per-rank kernel dispatch; bind_thread audit applies |
 | `crates/rdna-compute/examples/tp_all2all_smoke.rs` | **new** — Stage 5 comm-primitive smoke |
 | `crates/hipfire-runtime/examples/tp_bench.rs` | **new** — Stage 8 ship-gate bench |
