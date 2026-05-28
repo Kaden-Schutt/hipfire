@@ -1248,6 +1248,53 @@ impl Gpu {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Convert F32 X to the shared FP16 scratch on every call. Use this when
+    /// the source pointer is stable but the contents change between launches.
+    fn convert_fp16_x_uncached(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+
+        let needed = n_elems * 2;
+        if self.fp16_x_scratch_bytes < needed {
+            self.fp16_x_scratch = Some(self.hip.malloc(needed)?);
+            self.fp16_x_scratch_bytes = needed;
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+
+        let in_ptr = x.buf.as_ptr();
+        let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
+        let n_val = n_elems as i32;
+        let mut in_ptr_m = in_ptr;
+        let mut out_ptr_m = out_ptr;
+        let mut n_val_m = n_val;
+        let mut conv_params: Vec<*mut c_void> = vec![
+            &mut in_ptr_m as *mut _ as *mut c_void,
+            &mut out_ptr_m as *mut _ as *mut c_void,
+            &mut n_val_m as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_elems + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "convert_f32_to_f16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut conv_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        self.fp16_x_source_ptr = in_ptr;
+
+        Ok(out_ptr)
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
@@ -33551,6 +33598,32 @@ impl Gpu {
         k: i32,
         batch_size: i32,
     ) -> HipResult<()> {
+        // DeepSeek V4 prefill shape on gfx1151 (G=8, M=1024, K=4096,
+        // B=1024): strided WMMA is ~10x faster than the scalar per-row
+        // kernel. Env keeps a one-command fallback for bisects.
+        let default_wmma = self.arch == "gfx1151" && k % 32 == 0 && m >= 64 && batch_size >= 64;
+        let use_wmma = std::env::var("HIPFIRE_DEEPSEEK4_WO_Q8_WMMA")
+            .map(|s| s != "0")
+            .unwrap_or(default_wmma);
+        if use_wmma && k % 32 == 0 {
+            return self.wo_per_group_batched_q8_0_wmma_4w(
+                wo_a, x_in, y_out, g, m, k, batch_size,
+            );
+        }
+        self.wo_per_group_batched_q8_0_1w(wo_a, x_in, y_out, g, m, k, batch_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0_1w(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 32 * 34] bytes (Q8_0-packed)
+        x_in: &GpuTensor,    // [B, G, K] plain F32 (no FWHT)
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "wo_per_group_batched_q8_0",
@@ -33579,6 +33652,61 @@ impl Gpu {
                 func,
                 [m as u32, batch_size as u32, g as u32],
                 [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0_wmma_4w(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 32 * 34] bytes (Q8_0-packed)
+        x_in: &GpuTensor,    // [B, G, K] plain F32 or F16
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "wo_per_group_batched_q8_0_wmma_4w: K must divide 32");
+        self.ensure_kernel(
+            "wo_per_group_batched_q8_0_wmma_4w",
+            kernels::WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC,
+            "wo_per_group_batched_q8_0_wmma_4w",
+        )?;
+        let xp_owned = x_in.buf.as_ptr();
+        let mut xp = if matches!(x_in.dtype, DType::F16) {
+            xp_owned
+        } else {
+            // Production prefill reuses the same x_in tensor pointer every
+            // layer with new contents, so pointer-keyed conversion caching
+            // would read stale FP16 here.
+            self.convert_fp16_x_uncached(x_in, batch_size as usize * g as usize * k as usize)?
+        };
+        let func = &self.functions["wo_per_group_batched_q8_0_wmma_4w"];
+        let mut wp = wo_a.buf.as_ptr();
+        let mut yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((m + 63) / 64) as u32, ((batch_size + 63) / 64) as u32, g as u32],
+                [128, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
