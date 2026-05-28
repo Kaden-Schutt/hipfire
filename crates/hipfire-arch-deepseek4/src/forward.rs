@@ -6636,9 +6636,9 @@ fn ffn_batched(
             _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
         } && (2 * im) % 64 == 0
           && hidden % 256 == 0;
-        // MMQ-style preload override (HIPFIRE_DEEPSEEK4_MOE_MMQLOAD=1).
+        // MMQ-style preload (default ON for 4w; opt out via =0).
         let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
+            .as_deref() != Ok("0");
         if use_mmqload {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 gate_up_ptrs,
@@ -6754,7 +6754,7 @@ fn ffn_batched(
         } && hidden % 64 == 0
           && im % 256 == 0;
         let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() == Ok("1");
+            .as_deref() != Ok("0");
         if use_mmqload_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 w2_ptrs,
