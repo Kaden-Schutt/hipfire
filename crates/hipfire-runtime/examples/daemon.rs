@@ -364,6 +364,42 @@ fn build_prompt_frame(inputs: &FrameInputs<'_>) -> Vec<u32> {
     }
 }
 
+/// Per-token streaming step. The pattern that appears in every
+/// generate function's decode loop (and in the max_think force-close
+/// inner loop, and in the im_end trailer write): push to
+/// `streamed_tokens`, fire the committed-event, decode bytes
+/// incrementally, feed the new slice to the EOS filter, and emit a
+/// `{"type":"token","text":...}` event when the filter releases bytes.
+///
+/// Callers separately push to `m.conversation_tokens` if they want
+/// the token tracked for cumulative state. Seed-emit sites don't —
+/// the seed is included in the prefill prompt and KV state already
+/// reflects it. Decode-step sites do.
+///
+/// Step 2.5 of docs/plans/mtp_multi_refactor.md v2.1.
+fn stream_token_step(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    tok: u32,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    streamed_tokens: &mut Vec<u32>,
+    bytes_fed_to_filter: &mut usize,
+    filter: &mut EosFilter,
+    t_start: Instant,
+) {
+    streamed_tokens.push(tok);
+    emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t_start.elapsed().as_millis() as u64);
+    let all_bytes = tokenizer.decode_bytes(streamed_tokens);
+    let new_bytes = &all_bytes[*bytes_fed_to_filter..];
+    *bytes_fed_to_filter = all_bytes.len();
+    if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+        if let Ok(text) = std::str::from_utf8(&text_bytes) {
+            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
+            let _ = stdout.flush();
+        }
+    }
+}
+
 /// Update the `<think>...</think>` state from the decoded-so-far bytes.
 /// Returns `(in_think_now, new_think_count)`. Caller stores
 /// `prev_in_think = in_think_now`, `think_count = new_count`, then
@@ -4523,16 +4559,7 @@ fn generate_multi(
     while generated < max_tokens {
         generated += 1;
         m.conversation_tokens.push(next_token);
-        streamed_tokens.push(next_token);
-        emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[bytes_fed_to_filter..];
-        bytes_fed_to_filter = all_bytes.len();
-        if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-            let text = std::str::from_utf8(&text_bytes).unwrap();
-            let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-            let _ = stdout.flush();
-        }
+        stream_token_step(stdout, id, next_token, tokenizer, &mut streamed_tokens, &mut bytes_fed_to_filter, &mut filter, t0);
 
         if let Err(e) = qwen35::forward_scratch_multi(gpus, weights, config, next_token, m.seq_pos, kv, dn, scratch_set) {
             let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_scratch_multi decode: {}"}}"#, id, e);
@@ -5244,19 +5271,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         while generated < max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            streamed_tokens.push(next_token);
-            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
             // Incremental UTF-8 + filter routing: feed only the new
             // bytes since last call, let the filter buffer any partial
             // codepoint or marker prefix until disambiguated.
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-                let _ = stdout.flush();
-            }
+            stream_token_step(stdout, id, next_token, tokenizer, &mut streamed_tokens, &mut bytes_fed_to_filter, &mut filter, t0);
 
             // Write this token's K/V to the cache FIRST so the next turn
             // always starts from a fully-written context. Breaking before
@@ -5563,16 +5581,7 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         for _ in 0..max_tokens {
             generated += 1;
             m.conversation_tokens.push(next_token);
-            streamed_tokens.push(next_token);
-            emit_committed_event(stdout, id, next_token, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#, id, serde_json::to_string(&text).unwrap_or_default());
-                let _ = stdout.flush();
-            }
+            stream_token_step(stdout, id, next_token, tokenizer, &mut streamed_tokens, &mut bytes_fed_to_filter, &mut filter, t0);
 
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
