@@ -53,12 +53,19 @@ fn main() {
     let mut top_k: usize = 0;
     let mut min_p: f32 = 0.0;
     let mut seed: u64 = 42;
+    // Hetero MTP: when --mtp-device N is set to a non-zero device id, the MTP
+    // head + scratch + KV live on that device and the per-cycle chain runs
+    // there, while the trunk + verify continue on the primary gpu (device 0).
+    // Requires the compressed-sidecar .mtp path (cvs16384.mtp), since v1
+    // does not implement the trunk.output mirror needed for full-vocab.
+    let mut mtp_device: i32 = 0;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--target" => { target_path = Some(args[i + 1].clone()); i += 2; }
             "--mtp-head" => { mtp_path = Some(args[i + 1].clone()); i += 2; }
+            "--mtp-device" => { mtp_device = args[i + 1].parse().unwrap(); i += 2; }
             "--prompt" => { prompt_str = Some(args[i + 1].clone()); i += 2; }
             "--prompt-file" => { prompt_file = Some(args[i + 1].clone()); i += 2; }
             "--max" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
@@ -154,6 +161,28 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("gpu: {}", gpu.arch);
 
+    // Hetero mode: second gpu hosts the MTP head + scratch + mirrored
+    // trunk.token_embd. Per-cycle peer copy of verify_hidden bridges the two.
+    // Requires the compressed-sidecar .mtp head (--compressed-serial) since
+    // v1 doesn't mirror trunk.output.
+    //
+    // ROCm 6.4.3 gotcha (see daemon.rs:2441): hipDeviceEnablePeerAccess MUST
+    // be called AFTER all allocations are live. Enabling early "succeeds" but
+    // subsequent kernel launches on the just-enabled peer fail with
+    // hipModuleLaunchKernel: invalid device ordinal. So we init drafter_gpu
+    // here (no peer access yet), load everything, then enable peer access
+    // right before the first peer-copy (the token_embd mirror).
+    let hetero_mode = mtp_device != 0;
+    let mut drafter_gpu: Option<rdna_compute::Gpu> = if hetero_mode {
+        eprintln!("hetero MTP: head/scratch/embd-mirror will live on device {}", mtp_device);
+        let d = rdna_compute::Gpu::init_with_device(mtp_device)
+            .expect("drafter gpu init");
+        eprintln!("drafter gpu: {} (device {})", d.arch, d.device_id);
+        Some(d)
+    } else {
+        None
+    };
+
     let mut slot_cfg = ModelSlotConfig::default();
     // Worst case per cycle: max_n + 1 KV slots written by trunk verify;
     // we replay back to advance ≤ max_n + 1, but the verify path actually
@@ -169,18 +198,25 @@ fn main() {
 
     // MTP head's max_seq mirrors the trunk's. The head's KV cache is one
     // single layer, so even max_seq = 100K is only ~250 MB at dim=5120.
+    // In hetero mode the head loads onto drafter_gpu; single-gpu uses `gpu`.
+    let head_load_gpu: &mut rdna_compute::Gpu = if hetero_mode {
+        drafter_gpu.as_mut().unwrap()
+    } else {
+        &mut gpu
+    };
     let t_mtp = Instant::now();
     let head = if let Some(ref mp) = mtp_path {
         // Explicit --mtp-head: standalone .mtp file (legacy path).
-        mtp_head::load_mtp_head(Path::new(mp), &mut gpu, max_seq_total)
+        mtp_head::load_mtp_head(Path::new(mp), head_load_gpu, max_seq_total)
             .expect("load mtp head")
     } else {
         // Bundled .mq4-mtp: load MTP section embedded in target file.
-        mtp_head::load_mtp_head_bundled(Path::new(&target_path), &mut gpu, max_seq_total)
+        mtp_head::load_mtp_head_bundled(Path::new(&target_path), head_load_gpu, max_seq_total)
             .expect("load bundled mtp head")
             .expect("target ends in .mq4-mtp but no MTP bundle trailer found; \
                      was the file produced by mq4_merge_mtp?")
     };
+    let _ = head_load_gpu; // borrow ends here
     let head_source = if mtp_path.is_some() { "standalone .mtp" } else { "bundled .mq4-mtp" };
     eprintln!("mtp head loaded in {:.2}s ({head_source}) — n_embd={} vocab={} n_rot={} rope_theta={} compressed_lm_head_draft={}",
               t_mtp.elapsed().as_secs_f64(),
@@ -261,14 +297,29 @@ fn main() {
     if compressed {
         match head.weights.compressed_vocab_size {
             Some(cvs) => {
-                state.mtp_scratch
-                    .ensure_compressed_logits(&mut gpu, cvs)
-                    .expect("alloc logits_compressed");
-                state.ensure_compressed_lm_logits(&mut gpu, cvs)
-                    .expect("alloc mtp_lm_logits_compressed");
-                eprintln!("compressed: ON (cvs={cvs}, K={max_n}, mode=sidecar)");
+                // In hetero mode the trunk-side mtp_scratch is vestigial
+                // (unused by spec_step_mtp_compressed_serial_hetero); the
+                // drafter-side scratch's logits_compressed gets allocated
+                // below alongside the drafter state.
+                if !hetero_mode {
+                    state.mtp_scratch
+                        .ensure_compressed_logits(&mut gpu, cvs)
+                        .expect("alloc logits_compressed (trunk)");
+                    state.ensure_compressed_lm_logits(&mut gpu, cvs)
+                        .expect("alloc mtp_lm_logits_compressed");
+                }
+                eprintln!("compressed: ON (cvs={cvs}, K={max_n}, mode=sidecar{})",
+                    if hetero_mode { ", hetero" } else { "" });
             }
             None if compressed_serial => {
+                if hetero_mode {
+                    eprintln!(
+                        "error: --mtp-device requires a compressed-sidecar .mtp (use \
+                         qwen3.6-27b-cvs16384.mtp); v1 hetero does not implement the \
+                         trunk.output mirror needed for full-vocab."
+                    );
+                    std::process::exit(2);
+                }
                 // Full-vocab discrete-token chain via trunk's lm_head.
                 // spec_step_mtp_compressed_serial dispatches against
                 // trunk_weights.output and writes into state.mtp_lm_logits.
@@ -289,6 +340,49 @@ fn main() {
             }
         }
     }
+
+    // ── Hetero MTP: drafter-side state (mirror token_embd, drafter mtp_scratch,
+    //    drafter prev_hidden, drafter mtp_kv). ──────────────────────────────
+    let mut drafter_state: Option<hipfire_arch_qwen35::mtp_spec::MtpHeteroDrafterState>
+        = if hetero_mode {
+        assert!(compressed_serial,
+            "--mtp-device requires --compressed-serial in v1 (sidecar lm_head_draft path)");
+        let cvs = head.weights.compressed_vocab_size
+            .expect("hetero sidecar path needs compressed_vocab_size");
+        let dgpu = drafter_gpu.as_mut().unwrap();
+
+        // Enable bidirectional peer access NOW (after all major allocations
+        // are live on both devices) per the ROCm 6.4.3 gotcha noted at init.
+        // Idempotent — re-running here doesn't double-enable.
+        gpu.bind_thread().unwrap();
+        gpu.hip.enable_peer_access(dgpu.device_id).expect("trunk→drafter peer");
+        dgpu.bind_thread().unwrap();
+        dgpu.hip.enable_peer_access(gpu.device_id).expect("drafter→trunk peer");
+        eprintln!("hetero: bidirectional peer access enabled (post-allocation)");
+
+        // Init-time mirror of trunk.token_embd onto drafter.
+        let t_mirror = Instant::now();
+        let mirrored = hipfire_runtime::mtp_mirror::peer_clone_tensor(
+            &gpu, dgpu, &target.weights.token_embd,
+        ).expect("mirror trunk.token_embd to drafter");
+        eprintln!("hetero: mirrored trunk.token_embd to drafter in {:.2}s ({} MiB)",
+            t_mirror.elapsed().as_secs_f64(),
+            mirrored.byte_size() as f64 / (1u64 << 20) as f64);
+
+        let embd_format = target.weights.embd_format;
+        let mut ds = hipfire_arch_qwen35::mtp_spec::MtpHeteroDrafterState::new_for_slot(
+            dgpu, &head, max_n, kv_mode, mirrored, embd_format,
+        ).expect("alloc MtpHeteroDrafterState");
+
+        // Drafter-side compressed logits scratch.
+        ds.mtp_scratch
+            .ensure_compressed_logits(dgpu, cvs)
+            .expect("alloc logits_compressed (drafter)");
+        eprintln!("hetero: drafter state allocated (cvs={cvs})");
+        Some(ds)
+    } else {
+        None
+    };
 
     let eos_token = target.config.eos_token;
 
@@ -327,6 +421,20 @@ fn main() {
     state.capture_prev_hidden_from_scratch_tmp(
         &gpu, &target.scratch.tmp, target.config.dim,
     ).expect("capture prev_hidden");
+
+    // Hetero: seed drafter-side prev_hidden with the same source via peer copy.
+    if let Some(ds) = drafter_state.as_ref() {
+        let dgpu = drafter_gpu.as_ref().unwrap();
+        // target.scratch.tmp holds the post-output-norm hidden at last prefill
+        // position; shape is [dim]. seed_prev_hidden does a sync peer copy.
+        // We need a [dim]-shape view: target.scratch.tmp is allocated as
+        // [dim] so we pass it directly. (If it were larger we'd sub_offset.)
+        let src_view = target.scratch.tmp.sub_offset(0, target.config.dim);
+        ds.seed_prev_hidden(&gpu, dgpu, &src_view)
+            .expect("hetero: seed drafter prev_hidden");
+        eprintln!("hetero: drafter prev_hidden seeded ({} bytes peer)",
+            target.config.dim * 4);
+    }
 
     // Pick the seed_token: argmax of the trunk's logits for the last prefill
     // position. This becomes cycle 0's `last_committed`.
@@ -381,7 +489,17 @@ fn main() {
             eprintln!("hit max_seq {}; stopping", max_seq_total);
             break;
         }
-        let result = if compressed_serial {
+        let result = if let (Some(ds), Some(dgpu)) =
+            (drafter_state.as_mut(), drafter_gpu.as_mut())
+        {
+            // Hetero path: chain on drafter_gpu, verify on trunk gpu, one
+            // 20 KB peer copy per cycle at exit. Compressed-sidecar only
+            // (asserted at hetero state setup).
+            mtp_spec::spec_step_mtp_compressed_serial_hetero(
+                &mut gpu, dgpu, &mut target, &head, &mut state, ds,
+                cur_pos, last_committed, eos_token,
+            ).expect("spec_step_mtp_compressed_serial_hetero")
+        } else if compressed_serial {
             mtp_spec::spec_step_mtp_compressed_serial(
                 &mut gpu, &mut target, &head, &mut state,
                 cur_pos, last_committed, eos_token,
@@ -529,5 +647,13 @@ fn main() {
     println!("preview_200:          {:?}", preview);
 
     state.free_gpu(&mut gpu);
-    head.free_gpu(&mut gpu);
+    // In hetero mode the head + drafter state live on drafter_gpu; free
+    // them against the right device. Otherwise free against the trunk gpu.
+    if let Some(ds) = drafter_state.take() {
+        let dgpu = drafter_gpu.as_mut().unwrap();
+        ds.free_gpu(dgpu);
+        head.free_gpu(dgpu);
+    } else {
+        head.free_gpu(&mut gpu);
+    }
 }

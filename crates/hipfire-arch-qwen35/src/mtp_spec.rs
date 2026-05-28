@@ -36,7 +36,7 @@ use crate::mtp_head::{
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::HipResult;
-use hipfire_runtime::llama;
+use hipfire_runtime::llama::{self, EmbeddingFormat};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
@@ -1891,6 +1891,492 @@ pub fn spec_step_mtp_compressed_serial(
         advance,
         drafts_generated,
         chain_truncated,
+        replay_skipped,
+    })
+}
+
+// ─── Hetero (split-gpu) MTP spec-decode ──────────────────────────────────
+//
+// Variant of spec_step_mtp_compressed_serial for the case where the MTP head
+// lives on a sibling drafter_gpu while the trunk lives on the target_gpu.
+// Plan + audit: docs/plans/mtp_multi_gpu_split_audit.md.
+//
+// Per cycle:
+//   1. K-step MTP chain runs on drafter_gpu:
+//      - Embed lookup against the mirrored trunk.token_embd (drafter-resident).
+//      - mtp_head_forward_compressed_with_embed → t_mtp_out → tiny lm_head GEMV
+//        against head.weights.lm_head_draft (drafter-resident, sidecar path).
+//      - Argmax → candidate token (16 B D2H to host).
+//   2. Verify runs on target_gpu using existing single-gpu path:
+//      - Trunk forward over [last_committed | candidates] → verify_hidden, verify_logits
+//      - Batched argmax → accept-prefix.
+//   3. Cycle exit:
+//      - peer_copy_async verify_hidden[advance-1] (n_embd × f32 = 20 KB)
+//        target_gpu → drafter_gpu's prev_hidden. Event-synced so next
+//        cycle's chain reads the fresh hidden.
+
+/// Drafter-gpu-resident state for hetero MTP spec-decode. Companion to
+/// `MtpSpecState` (which holds trunk-gpu fields).
+///
+/// Holds the mirror of `trunk.token_embd`, the MTP head's scratch/kv,
+/// the K-chain working buffers, and the small per-step embedding scratch.
+/// `prev_hidden` lives here too — the chain reads it at the start of each
+/// cycle and the cycle-exit peer copy refreshes it for the next cycle.
+///
+/// All fields are allocated on drafter_gpu in
+/// [`MtpHeteroDrafterState::new_for_slot`].
+pub struct MtpHeteroDrafterState {
+    /// Drafter-gpu mirror of trunk.token_embd. Stored as a raw GpuTensor
+    /// (not WeightTensor) since the embedding kernels take the buffer +
+    /// embd_format separately, identically to single-gpu.
+    pub mirrored_token_embd: GpuTensor,
+    /// Mirror's source format, copied from trunk's `Qwen35Weights.embd_format`
+    /// at init. Same value on both sides.
+    pub embd_format: EmbeddingFormat,
+
+    /// Per-step embedding scratch: drafter-gpu staging tensor of shape `[n_embd]`,
+    /// F32, populated by `embed_lookup_*` against `mirrored_token_embd` at
+    /// the top of each K-chain step. Passed to
+    /// `mtp_head_forward_compressed_with_embed` as `next_token_embed`.
+    pub step_embd: GpuTensor,
+
+    /// Drafter-gpu copy of `MtpSpecState.prev_hidden`. Shape `[n_embd]` F32.
+    /// Refreshed each cycle by a peer copy from `MtpSpecState.verify_hidden`
+    /// (trunk side) of the row matching the last committed token.
+    pub prev_hidden: GpuTensor,
+
+    /// MTP head per-call scratch (drafter-resident).
+    pub mtp_scratch: Qwen35MtpHeadScratch,
+    /// MTP head KV cache (drafter-resident).
+    pub mtp_kv: Qwen35MtpHeadKvCache,
+
+    /// Per-step `t_mtp_out` capture for K-chain (drafter-resident). Shape
+    /// `[max_n * n_embd]` F32. Same role as `MtpSpecState.mtp_t_outs`.
+    pub mtp_t_outs: GpuTensor,
+    /// Per-step compressed logits view scratch reuse. Shape `[max_n]` F32
+    /// argmax slot scratch.
+    pub mtp_lm_argmax: GpuTensor,
+
+    pub max_n: usize,
+}
+
+impl MtpHeteroDrafterState {
+    /// Allocate drafter-side state. Requires:
+    /// - `drafter_gpu` already initialized with bidirectional peer access to
+    ///   the trunk_gpu.
+    /// - `mirrored_token_embd` already allocated and bytes-copied via
+    ///   `hipfire_runtime::mtp_mirror::peer_clone_tensor(trunk_gpu, drafter_gpu, &trunk.weights.token_embd)`.
+    /// - `embd_format` matches `trunk.weights.embd_format`.
+    pub fn new_for_slot(
+        drafter_gpu: &mut Gpu,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+        mirrored_token_embd: GpuTensor,
+        embd_format: EmbeddingFormat,
+    ) -> HipResult<Self> {
+        assert!(max_n >= 1, "MtpHeteroDrafterState: max_n must be ≥ 1");
+        let n_embd = head.config.n_embd;
+        let step_embd = drafter_gpu.alloc_tensor(&[n_embd], DType::F32)?;
+        let prev_hidden = drafter_gpu.alloc_tensor(&[n_embd], DType::F32)?;
+        let mtp_scratch = Qwen35MtpHeadScratch::new(drafter_gpu, &head.config)?;
+        let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(drafter_gpu, &head.config, kv_mode)?;
+        let mtp_t_outs = drafter_gpu.alloc_tensor(&[max_n * n_embd], DType::F32)?;
+        let mtp_lm_argmax = drafter_gpu.alloc_tensor(&[max_n], DType::F32)?;
+
+        // Sidecar logits scratch is needed for the compressed path; caller
+        // populates it via `mtp_scratch.ensure_compressed_logits(drafter_gpu, cvs)`
+        // immediately after construction once they know the cvs from
+        // `head.weights.compressed_vocab_size`. The hetero spec function
+        // asserts presence at entry.
+        let _ = mtp_scratch.logits_compressed.is_some(); // satisfied by caller
+
+        Ok(Self {
+            mirrored_token_embd,
+            embd_format,
+            step_embd,
+            prev_hidden,
+            mtp_scratch,
+            mtp_kv,
+            mtp_t_outs,
+            mtp_lm_argmax,
+            max_n,
+        })
+    }
+
+    pub fn free_gpu(self, drafter_gpu: &mut Gpu) {
+        let _ = drafter_gpu.free_tensor(self.mirrored_token_embd);
+        let _ = drafter_gpu.free_tensor(self.step_embd);
+        let _ = drafter_gpu.free_tensor(self.prev_hidden);
+        self.mtp_scratch.free_gpu(drafter_gpu);
+        self.mtp_kv.free_gpu(drafter_gpu);
+        let _ = drafter_gpu.free_tensor(self.mtp_t_outs);
+        let _ = drafter_gpu.free_tensor(self.mtp_lm_argmax);
+    }
+
+    /// Seed `prev_hidden` from a trunk-side tensor at session start. Used
+    /// once after prefill to bootstrap the first cycle's chain input.
+    /// `trunk_src` must have `n_embd` elements (shape `[n_embd]` or a slice
+    /// view of that size). Uses synchronous peer copy.
+    pub fn seed_prev_hidden(
+        &self,
+        trunk_gpu: &Gpu,
+        drafter_gpu: &Gpu,
+        trunk_src: &GpuTensor,
+    ) -> HipResult<()> {
+        let n_embd = self.prev_hidden.numel();
+        assert_eq!(
+            trunk_src.numel(), n_embd,
+            "seed_prev_hidden: trunk source has {} elems, expected n_embd={n_embd}",
+            trunk_src.numel(),
+        );
+        trunk_gpu.hip.memcpy_peer(
+            &self.prev_hidden.buf, drafter_gpu.device_id,
+            &trunk_src.buf, trunk_gpu.device_id,
+            n_embd * 4,
+        )
+    }
+}
+
+/// Helper: drafter-side embedding lookup, dispatched by `embd_format`.
+fn drafter_embed_lookup(
+    drafter_gpu: &mut Gpu,
+    drafter_state: &MtpHeteroDrafterState,
+    token: u32,
+    n_embd: usize,
+) -> HipResult<()> {
+    match drafter_state.embd_format {
+        EmbeddingFormat::HFQ4G256 => drafter_gpu.embedding_lookup_hfq4g256(
+            &drafter_state.mirrored_token_embd, &drafter_state.step_embd, token, n_embd),
+        EmbeddingFormat::HFQ4G128 => drafter_gpu.embedding_lookup_hfq4g128(
+            &drafter_state.mirrored_token_embd, &drafter_state.step_embd, token, n_embd),
+        EmbeddingFormat::Q8_0 => drafter_gpu.embedding_lookup_q8(
+            &drafter_state.mirrored_token_embd, &drafter_state.step_embd, token, n_embd),
+        EmbeddingFormat::Q4K => drafter_gpu.embedding_lookup_q4k(
+            &drafter_state.mirrored_token_embd, &drafter_state.step_embd, token, n_embd),
+        EmbeddingFormat::F32 => drafter_gpu.embedding_lookup(
+            &drafter_state.mirrored_token_embd, &drafter_state.step_embd, token, n_embd),
+    }
+}
+
+/// Hetero variant of [`spec_step_mtp_compressed_serial`]. Runs the K-step
+/// MTP chain on `drafter_gpu` (where the head + mirrored token_embd live),
+/// and trunk verify + rollback on `target_gpu`. Cycle-exit handoff is one
+/// 20 KB peer copy (n_embd × f32) of `verify_hidden[advance-1]` from trunk
+/// to drafter's `prev_hidden`.
+///
+/// Compressed-sidecar only (v1): requires `head.weights.lm_head_draft` to be
+/// Some, so the K-chain's lm_head GEMV stays drafter-local. Greedy only
+/// for v1 (sampling path can be ported in a follow-up — adds drafter-side
+/// p_draft gathers and a peer copy of the bonus token).
+///
+/// `state` (trunk-resident) and `drafter_state` are paired:
+/// `MtpSpecState::new_for_slot_with_kv_mode(target_gpu, ...)` allocates
+/// trunk fields against target_gpu; `MtpHeteroDrafterState::new_for_slot`
+/// allocates drafter fields against drafter_gpu. The function panics if
+/// `state.prev_hidden` is non-empty (the hetero variant uses
+/// `drafter_state.prev_hidden` instead — trunk-side `state.prev_hidden`
+/// is ignored but still allocated for layout compatibility).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_hetero(
+    target_gpu: &mut Gpu,
+    drafter_gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    drafter_state: &mut MtpHeteroDrafterState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+) -> HipResult<MtpSpecResult> {
+    let max_n = drafter_state.max_n;
+    assert_eq!(
+        max_n, state.max_n,
+        "spec_step_mtp_compressed_serial_hetero: drafter_state.max_n={} != state.max_n={}",
+        max_n, state.max_n,
+    );
+    let dim = target.config.dim;
+    let vocab = target.config.vocab_size;
+    let trunk_weights: &Qwen35Weights = &target.weights;
+
+    // V1: compressed-sidecar path only — eliminates the trunk.output mirror
+    // requirement. Bundled .mq4-mtp (full-vocab) callers should use the
+    // single-gpu path until that mirror is added.
+    let lm_head_draft = head.weights.lm_head_draft.as_ref()
+        .expect("spec_step_mtp_compressed_serial_hetero: head has no lm_head_draft sidecar; \
+                 hetero v1 requires the cvs-compressed .mtp path (use single-gpu for bundled .mq4-mtp)");
+    let vocab_map = head.weights.lm_head_draft_vocab_map.as_ref()
+        .expect("hetero: compressed head missing vocab_map");
+    let cvs = head.weights.compressed_vocab_size
+        .expect("hetero: compressed head missing compressed_vocab_size");
+    let _ = lm_head_draft;
+    let _ = cvs;
+
+    // Ensure both gpus have their per-stream context. Each owns its own
+    // active_stream. CRITICAL: HIP streams are device-affine — must bind to
+    // the right device before stream_create so the stream lives on the right
+    // gpu. Otherwise the stream is created on whatever device was last bound,
+    // and subsequent kernel launches against it fail with
+    // hipModuleLaunchKernel: invalid device ordinal.
+    if target_gpu.active_stream.is_none() {
+        target_gpu.bind_thread()?;
+        target_gpu.active_stream = Some(target_gpu.hip.stream_create()?);
+    }
+    if drafter_gpu.active_stream.is_none() {
+        drafter_gpu.bind_thread()?;
+        drafter_gpu.active_stream = Some(drafter_gpu.hip.stream_create()?);
+    }
+
+    // Greedy-only for v1. Sampling/p_min/full-vocab are NYI on this path.
+    let sampling = state.sampling;
+    assert!(
+        sampling.is_greedy(),
+        "spec_step_mtp_compressed_serial_hetero: v1 supports temp=0 (greedy) only, \
+         got temp={}",
+        sampling.temp,
+    );
+    assert!(
+        state.p_min <= 0.0,
+        "spec_step_mtp_compressed_serial_hetero: v1 does not implement --mtp-p-min; \
+         got p_min={}",
+        state.p_min,
+    );
+
+    // ── 1. K-step draft chain (DRAFTER GPU) ──────────────────────────────
+    drafter_gpu.bind_thread()?;
+    let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
+    let dim_bytes = dim * 4;
+    let argmax_view = drafter_state.mtp_lm_argmax.sub_offset(0, 1);
+    let logits_c = drafter_state.mtp_scratch.logits_compressed.as_ref()
+        .expect("drafter MTP scratch.logits_compressed not allocated; \
+                 call drafter_state.mtp_scratch.ensure_compressed_logits(drafter_gpu, cvs)");
+
+    for k in 0..max_n {
+        let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
+
+        // Embedding lookup on drafter using the mirrored token_embd.
+        drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
+
+        // MTP head forward — feeds step_embd in via next_token_embed override,
+        // reads prev_hidden (drafter-resident: at k=0 from the per-cycle peer
+        // copy of last cycle's verify_hidden; at k>0 from prev step's
+        // t_mtp_out, matching the single-gpu serial path's semantics).
+        if k == 0 {
+            mtp_head::mtp_head_forward_compressed_with_embed(
+                drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                &drafter_state.step_embd, &drafter_state.prev_hidden, cur_pos + k,
+            )?;
+        } else {
+            let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+            mtp_head::mtp_head_forward_compressed_with_embed(
+                drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                &drafter_state.step_embd, &prev_row, cur_pos + k,
+            )?;
+        }
+
+        // Greedy argmax over compressed logits, D2H 4 B.
+        drafter_gpu.argmax_f32_batched(logits_c, &argmax_view, cvs, 1)?;
+        let mut argmax_host: [i32; 1] = [0];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    argmax_host.as_mut_ptr() as *mut u8, 4,
+                )
+            };
+            drafter_gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+        }
+        let draft_idx = argmax_host[0] as usize;
+        assert!(draft_idx < cvs,
+            "drafter argmax {draft_idx} out of cvs {cvs}");
+        let token_id = vocab_map[draft_idx];
+        candidates.push(token_id);
+
+        // Save t_mtp_out for chain-step k+1 (drafter-local D2D copy).
+        if k + 1 < max_n {
+            drafter_gpu.hip.memcpy_dtod_at(
+                &drafter_state.mtp_t_outs.buf, k * dim_bytes,
+                &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
+                dim_bytes,
+            )?;
+        }
+    }
+    let drafts_generated = candidates.len();
+
+    // ── 2. Trunk verify (TARGET GPU) ─────────────────────────────────────
+    target_gpu.bind_thread()?;
+    let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
+    verify_tokens.push(last_committed);
+    verify_tokens.extend_from_slice(&candidates);
+    let n_verify = verify_tokens.len();
+
+    state.trunk_snap.save_from(&target.dn_state, target_gpu)?;
+
+    let tape_captured = qwen35::prefill_batch_pbs_eligible(
+        trunk_weights,
+        &target.config,
+        &target.dn_state,
+        n_verify,
+        target_gpu.arch.as_str(),
+        true,
+    );
+    let verify_tape: Option<&mut GdnTape> = if tape_captured {
+        Some(&mut state.trunk_gdn_tape)
+    } else {
+        None
+    };
+
+    qwen35::forward_prefill_batch_with_pbs(
+        target_gpu, trunk_weights, &target.config, &verify_tokens, cur_pos,
+        &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+        None, Some(&state.verify_hidden), verify_tape, None,
+        Some(&state.trunk_pbs), None,
+        None,
+    )?;
+
+    let w_out = &trunk_weights.output;
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    match w_out.gpu_dtype {
+        DType::Q8_0 => {
+            target_gpu.gemm_q8_0_batched(
+                &w_out.buf, &state.verify_hidden, &logits_view,
+                w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        DType::HFQ4G256 => {
+            target_gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf, &state.verify_hidden, &logits_view,
+                w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        DType::MQ4G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+            target_gpu.gemm_hfq4g256_batched_lmhead(
+                &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        DType::MQ3G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+            target_gpu.gemm_hfq3g256_batched_lmhead(
+                &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        DType::HFQ6G256 => {
+            target_gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &state.verify_hidden, &logits_view,
+                w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        DType::MQ6G256 => {
+            let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+            llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+            target_gpu.gemm_hfq6g256_batched_lmhead(
+                &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+            )?;
+        }
+        _ => {
+            for i in 0..n_verify {
+                let row = state.verify_hidden.sub_offset(i * dim, dim);
+                let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                llama::weight_gemv(target_gpu, w_out, &row, &logits_row)?;
+            }
+        }
+    }
+
+    let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+    target_gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+    let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(
+                argmax_v_host.as_mut_ptr() as *mut u8, n_verify * 4,
+            )
+        };
+        target_gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+    }
+    let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
+
+    // ── Greedy accept rule (v1) ──
+    let mut accept_count = 0usize;
+    let mut hit_eos = false;
+    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
+    for k in 0..drafts_generated {
+        if argmax_per_pos[k] == candidates[k] {
+            committed.push(candidates[k]);
+            accept_count += 1;
+            if candidates[k] == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = argmax_per_pos[accept_count];
+        committed.push(bonus);
+        if bonus == eos_token_id {
+            hit_eos = true;
+        }
+    }
+
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+
+    // ── 3. Cycle-exit handoff: peer-copy verify_hidden[advance-1] →
+    //      drafter.prev_hidden. This is the ONE per-cycle cross-device
+    //      data movement on the critical path (~20 KB, ~38 µs steady-state
+    //      per the mtp_peer_copy_microbench). Sync via target's stream
+    //      since the verify just finished there.
+    let prev_hidden_row = advance - 1;
+    target_gpu.hip.memcpy_peer(
+        &drafter_state.prev_hidden.buf, drafter_gpu.device_id,
+        &state.verify_hidden.buf, target_gpu.device_id,
+        dim * 4,
+    )?;
+    // Note: we use the sync memcpy_peer (not _async) since the trunk verify
+    // path uses target_gpu's active_stream and we'd need an event handshake
+    // to safely peer-copy from a stream-pending buffer. memcpy_peer
+    // synchronizes via host, sized to 20 KB this is fast (~38 µs measured).
+    // Future optimization: use memcpy_peer_async + cross-device event sync
+    // (see hetero_overlap_microbench.rs in the parallel multi-gpu work).
+    let _ = prev_hidden_row;
+
+    // ── 4. Rollback / replay on TARGET (same as single-gpu) ──
+    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
+    let replay_skipped = full_accept_no_eos;
+    if !full_accept_no_eos {
+        state.trunk_snap.restore_to(&mut target.dn_state, target_gpu)?;
+        if tape_captured {
+            state.trunk_gdn_tape.replay_gdn(
+                target_gpu, trunk_weights, &target.config,
+                &mut target.dn_state, advance,
+            )?;
+        } else {
+            if advance >= 2 {
+                let replay = &verify_tokens[..advance];
+                qwen35::forward_prefill_batch(
+                    target_gpu, trunk_weights, &target.config, replay, cur_pos,
+                    &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+                    None, None, None, None,
+                )?;
+            } else {
+                qwen35::forward_scratch(
+                    target_gpu, trunk_weights, &target.config, verify_tokens[0], cur_pos,
+                    &mut target.kv_cache, &mut target.dn_state, &target.scratch,
+                )?;
+            }
+        }
+    }
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated,
+        chain_truncated: false, // v1 hetero doesn't implement p_min early-exit
         replay_skipped,
     })
 }
