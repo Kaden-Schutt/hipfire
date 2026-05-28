@@ -189,6 +189,10 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
     let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let attn_dim = config.n_heads * config.head_dim;
+    // --slice (HIPFIRE_PARITY_SLICE=1): Stage 3b — per-rank sliced weights
+    // (load_weights_tp), local-head config, local kv, no masks. Otherwise:
+    // Stage 3 — replicated full weights + per-rank head masks.
+    let slice = std::env::var("HIPFIRE_PARITY_SLICE").is_ok();
 
     let shard = ShardConfig::new(TP, false, config.num_experts, ExpertAssign::Stride).unwrap();
     shard.validate(config.n_heads, config.n_kv_heads).unwrap();
@@ -200,34 +204,49 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         dev.active_stream = Some(st);
     }
 
-    // Replicated weights + per-rank scratch/kv/dn.
+    // Per-rank config: LOCAL (sliced heads) in --slice mode, else the global
+    // config replicated. Drives scratch/kv sizing + forward_scratch_tp.
+    let configs: Vec<qwen35::Qwen35Config> = (0..TP)
+        .map(|_| if slice { qwen35::local_attn_config(&config, &shard) } else { config.clone() })
+        .collect();
+
+    // Per-rank weights/scratch/kv/dn. In --slice mode `weights[r]` is this
+    // rank's attention slice and `kvs[r]` is sized for LOCAL kv heads.
     let mut weights = Vec::with_capacity(TP);
     let mut scratches = Vec::with_capacity(TP);
     let mut kvs = Vec::with_capacity(TP);
     let mut dns = Vec::with_capacity(TP);
-    let mut masks = Vec::with_capacity(TP);
+    let mut masks: Vec<rdna_compute::GpuTensor> = Vec::with_capacity(TP);
     for r in 0..TP {
         gpus.devices[r].bind_thread().unwrap();
-        weights.push(qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).unwrap());
-        scratches.push(Qwen35Scratch::new(&mut gpus.devices[r], &config, 128).unwrap());
+        weights.push(if slice {
+            qwen35::load_weights_tp(&mut hfq, &config, &mut gpus.devices[r], &shard, r).unwrap()
+        } else {
+            qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).unwrap()
+        });
+        scratches.push(Qwen35Scratch::new(&mut gpus.devices[r], &configs[r], 128).unwrap());
         // KV + DeltaNet-state precision toggled independently (default fp32);
-        // must match run_single_gpu_opt for a meaningful comparison.
+        // must match run_single_gpu_opt. DeltaNet state is full (replicated).
         let state_q8 = state_is_q8();
-        kvs.push(make_kv(&mut gpus.devices[r], &config));
+        kvs.push(make_kv(&mut gpus.devices[r], &configs[r]));
         dns.push(DeltaNetState::new_with_quant(
             &mut gpus.devices[r], &config, if state_q8 { StateQuant::Q8 } else { StateQuant::FP32 },
         ).unwrap());
-        // mask[r]: 1.0 on this rank's local Q-heads over the attention output.
-        let range = shard.wo_col_range(r, config.n_heads, config.head_dim);
-        let mut m = vec![0.0f32; attn_dim];
-        m[range].iter_mut().for_each(|v| *v = 1.0);
-        masks.push(gpus.devices[r].upload_f32(&m, &[attn_dim]).unwrap());
+        if !slice {
+            // mask[r]: 1.0 on this rank's local Q-heads over the full
+            // attention output (replicated-weights Stage 3 path).
+            let range = shard.wo_col_range(r, config.n_heads, config.head_dim);
+            let mut m = vec![0.0f32; attn_dim];
+            m[range].iter_mut().for_each(|v| *v = 1.0);
+            masks.push(gpus.devices[r].upload_f32(&m, &[attn_dim]).unwrap());
+        }
     }
+    let fa_masks: Option<&[rdna_compute::GpuTensor]> = if slice { None } else { Some(&masks) };
 
     let mut all_logits: Vec<Vec<f32>> = Vec::new();
     for (i, &tok) in prompt_tokens.iter().enumerate() {
         qwen35::forward_scratch_tp(
-            &mut gpus, &shard, &weights, &config, tok, i, &mut kvs, &mut dns, &scratches, &masks,
+            &mut gpus, &shard, &weights, &configs, tok, i, &mut kvs, &mut dns, &scratches, fa_masks,
         )
         .expect("forward_scratch_tp prefill");
     }
@@ -246,7 +265,7 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         let pos = prompt_tokens.len() + step - 1;
         let in_tok = forced[step - 1]; // walk the reference path
         qwen35::forward_scratch_tp(
-            &mut gpus, &shard, &weights, &config, in_tok, pos, &mut kvs, &mut dns, &scratches, &masks,
+            &mut gpus, &shard, &weights, &configs, in_tok, pos, &mut kvs, &mut dns, &scratches, fa_masks,
         )
         .expect("forward_scratch_tp decode");
         // Diagnostic: do the two ranks' residual streams stay in sync? They
@@ -305,6 +324,14 @@ fn main() {
         "precision: KV={}  DeltaNet-state={}",
         kv_mode(),
         if state_is_q8() { "q8" } else { "fp32" },
+    );
+    println!(
+        "TP mode: {}",
+        if std::env::var("HIPFIRE_PARITY_SLICE").is_ok() {
+            "SLICED (3b — per-rank weight slices, local-head compute, no masks)"
+        } else {
+            "replicated (3 — full weights on every rank + head masks)"
+        }
     );
 
     // Diagnostic: ref-vs-ref determinism check. Two independent single-GPU

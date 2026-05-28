@@ -130,7 +130,7 @@ fn main() {
         set_input(&gpus.devices[r], &scratches[r], &input, 0);
         qwen35::run_fa_layer_body(
             &mut gpus.devices[r], &weights[r], &config, fa_layer, 0, 0, &mut kvs[r], &scratches[r],
-            FaPhase::TpAttn { mask: &masks[r] },
+            FaPhase::TpAttn { mask: Some(&masks[r]) },
         )
         .expect("TpAttn");
     }

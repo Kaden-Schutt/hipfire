@@ -1168,6 +1168,147 @@ fn load_norm_weight_raw(
 
 /// Load weight tensor from raw bytes + quant_type (no name lookup needed).
 ///
+// ─── TP weight slicing (Stage 3b) ───────────────────────────────────────
+//
+// Row-major group-quantized weights are sliced on CPU bytes BEFORE upload, so
+// the existing GEMV kernels run unchanged on the smaller [m'×k] (column-
+// parallel) or [m×k'] (row-parallel) matrix. The math is format-agnostic:
+// every quant tensor is a dense [m×k] blob with a uniform per-row encoding, so
+// `row_bytes = data.len()/m` exactly and, for the G256/G128 families,
+// `group_bytes = row_bytes·group_size/k`.
+
+/// Group size (elements per quant group) for a packed HFQ/MQ/PARO quant type.
+/// Only the column-slice path (input-dim shard) needs it — it must cut on
+/// group boundaries.
+fn quant_group_size(quant_type: u8) -> usize {
+    match quant_type {
+        // *G128 families (HFQ4G128, HFQ3G128, PARO4G128, PARO4G128T)
+        7 | 12 | 28 | 29 => 128,
+        // *G256 families (HFQ4/6/3/2, MQ8/6/4/3/2, MQ3/2/4-Lloyd)
+        6 | 8 | 11 | 13 | 14 | 15 | 17 | 18 | 19 | 20 => 256,
+        other => panic!(
+            "quant_group_size: quant_type {other} not mapped — add its group size \
+             before TP-column-slicing this format"
+        ),
+    }
+}
+
+/// Column-parallel slice (Megatron "column"): rows `[m0, m1)` of an `[m × k]`
+/// row-major quant blob. Contiguous byte range (uniform per-row encoding).
+/// Caller records `m' = m1 - m0`, `k` unchanged.
+fn slice_quant_rows(data: &[u8], m: usize, m0: usize, m1: usize) -> Vec<u8> {
+    assert!(m0 <= m1 && m1 <= m, "slice_quant_rows: range {m0}..{m1} out of [0,{m}]");
+    assert!(
+        data.len() % m == 0,
+        "slice_quant_rows: data.len()={} not divisible by m={m} (non-uniform rows?)",
+        data.len()
+    );
+    let row_bytes = data.len() / m;
+    data[m0 * row_bytes..m1 * row_bytes].to_vec()
+}
+
+/// Row-parallel slice (Megatron "row"): columns `[c0, c1)` of an `[m × k]`
+/// row-major quant blob, `c0`/`c1` group-aligned. Per output row this is a
+/// contiguous run of whole groups, but rows aren't contiguous in the blob, so
+/// it restrides into a fresh buffer. Caller records `m` unchanged,
+/// `k' = c1 - c0`. (Correctness rests on per-group quantization — slicing
+/// whole groups preserves each retained group's dequant; the parity gate
+/// catches it if a format turns out to rotate across group boundaries.)
+fn slice_quant_cols(
+    data: &[u8], m: usize, k: usize, c0: usize, c1: usize, group_size: usize,
+) -> Vec<u8> {
+    assert!(c0 <= c1 && c1 <= k, "slice_quant_cols: range {c0}..{c1} out of [0,{k}]");
+    assert!(
+        c0 % group_size == 0 && c1 % group_size == 0,
+        "slice_quant_cols: range {c0}..{c1} not aligned to group_size={group_size}"
+    );
+    assert!(k % group_size == 0, "slice_quant_cols: k={k} not a multiple of group_size={group_size}");
+    assert!(data.len() % m == 0, "slice_quant_cols: data.len()={} not divisible by m={m}", data.len());
+    let row_bytes = data.len() / m;
+    let n_groups = k / group_size;
+    assert!(
+        row_bytes % n_groups == 0,
+        "slice_quant_cols: row_bytes={row_bytes} not divisible by n_groups={n_groups} \
+         (per-row header/footer? this format isn't purely group-concatenated)"
+    );
+    let group_bytes = row_bytes / n_groups;
+    let (g0, g1) = (c0 / group_size, c1 / group_size);
+    let new_row_bytes = (g1 - g0) * group_bytes;
+    let mut out = Vec::with_capacity(m * new_row_bytes);
+    for r in 0..m {
+        let start = r * row_bytes + g0 * group_bytes;
+        out.extend_from_slice(&data[start..start + new_row_bytes]);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tp_slice_tests {
+    use super::{quant_group_size, slice_quant_cols, slice_quant_rows};
+
+    // Synthetic [m × k] quant blob: `group_bytes` bytes per group, byte value
+    // encodes (row, group, offset) so slices are checkable.
+    fn synth(m: usize, k: usize, gs: usize, group_bytes: usize) -> Vec<u8> {
+        let n_groups = k / gs;
+        let row_bytes = n_groups * group_bytes;
+        let mut v = vec![0u8; m * row_bytes];
+        for r in 0..m {
+            for g in 0..n_groups {
+                for b in 0..group_bytes {
+                    v[r * row_bytes + g * group_bytes + b] = ((r * 7 + g * 13 + b * 3) % 251) as u8;
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn rows_partition_reassembles() {
+        let (m, k, gs, gb) = (8usize, 512usize, 256usize, 136usize);
+        let data = synth(m, k, gs, gb);
+        let a = slice_quant_rows(&data, m, 0, 4);
+        let b = slice_quant_rows(&data, m, 4, 8);
+        let mut cat = a.clone();
+        cat.extend_from_slice(&b);
+        assert_eq!(cat, data, "row slices must tile the original");
+        assert_eq!(slice_quant_rows(&data, m, 0, m), data, "full row slice is identity");
+    }
+
+    #[test]
+    fn cols_slice_matches_manual_gather() {
+        let (m, k, gs, gb) = (4usize, 512usize, 256usize, 136usize); // 2 groups/row
+        let data = synth(m, k, gs, gb);
+        let row_bytes = (k / gs) * gb;
+        let s0 = slice_quant_cols(&data, m, k, 0, 256, gs); // group 0
+        let s1 = slice_quant_cols(&data, m, k, 256, 512, gs); // group 1
+        assert_eq!(s0.len(), m * gb);
+        assert_eq!(s1.len(), m * gb);
+        // per row: group0 ++ group1 must reassemble the original row
+        let mut cat = Vec::new();
+        for r in 0..m {
+            cat.extend_from_slice(&s0[r * gb..(r + 1) * gb]);
+            cat.extend_from_slice(&s1[r * gb..(r + 1) * gb]);
+        }
+        assert_eq!(cat, data, "col slices must reassemble per-row");
+        for r in 0..m {
+            assert_eq!(&s0[r * gb..(r + 1) * gb], &data[r * row_bytes..r * row_bytes + gb]);
+        }
+    }
+
+    #[test]
+    fn group_sizes_known() {
+        assert_eq!(quant_group_size(13), 256); // MQ4G256
+        assert_eq!(quant_group_size(7), 128); // HFQ4G128
+    }
+
+    #[test]
+    #[should_panic]
+    fn cols_unaligned_panics() {
+        let data = synth(2, 512, 256, 136);
+        let _ = slice_quant_cols(&data, 2, 512, 0, 100, 256); // 100 not group-aligned
+    }
+}
+
 /// TODO(transformer-extraction): cross-arch duplicate. The Qwen2 variant
 /// in `hipfire-arch-qwen2::qwen2::load_weight_tensor` inlines a subset
 /// of this match (only HFQ4G256, HFQ4G128, F16 — the formats Qwen2 HFQ
@@ -3224,6 +3365,164 @@ fn paro_load_f32(
             .collect()
     };
     gpu.upload_f32(&v, &[n])
+}
+
+/// TP weight-slice spec for `load_weight_tensor_sliced` (Stage 3b).
+#[derive(Clone, Copy)]
+enum WSlice {
+    /// Column-parallel: keep output rows `[m0, m1)` (contiguous byte range).
+    Rows(usize, usize),
+    /// Row-parallel: keep input columns `[c0, c1)` (group-aligned restride).
+    Cols(usize, usize),
+}
+
+/// Slicing variant of `load_weight_tensor` (Stage 3b TP). Fetches the quant
+/// blob, slices it on CPU per `slice`, uploads the smaller tensor with the
+/// adjusted (m,k). Panics if the weight carries an AWQ sidecar — sliced AWQ
+/// is not implemented (dense MQ4 0.8B/27B have none; to support a model that
+/// does, slice the `[k]` F16 scale by the same range first).
+fn load_weight_tensor_sliced(
+    hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize, slice: WSlice,
+) -> HipResult<WeightTensor> {
+    // Use the pread path (NOT tensor_data): load_weights drops the mmap on
+    // unix, and load_weights_tp calls us afterwards. `tensor_data_pread`
+    // shares ONE scratch buffer, so each returned `Ref` must be dropped before
+    // the next pread — hence the strictly sequential scopes below (resolve the
+    // name + qt, then the AWQ guard, then the final fetch+slice).
+    let mut hit: Option<(String, u8)> = None;
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, _buf)) = hfq.tensor_data_pread(&candidate) {
+            hit = Some((candidate, info.quant_type));
+            break;
+        }
+    }
+    let (candidate, qt) = hit.unwrap_or_else(|| panic!("tensor not found: {name}"));
+
+    let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate);
+    if hfq.tensor_data_pread(&format!("{stem}.awq_scale.weight")).is_some() {
+        panic!(
+            "load_weight_tensor_sliced: {name} has an AWQ sidecar; sliced AWQ is \
+             not implemented — slice the [k] F16 scale by the same range first"
+        );
+    }
+
+    let (_, buf) = hfq
+        .tensor_data_pread(&candidate)
+        .unwrap_or_else(|| panic!("tensor vanished mid-load: {candidate}"));
+    let (sliced, new_m, new_k) = match slice {
+        WSlice::Rows(m0, m1) => (slice_quant_rows(&buf[..], m, m0, m1), m1 - m0, k),
+        WSlice::Cols(c0, c1) => {
+            let gs = quant_group_size(qt);
+            (slice_quant_cols(&buf[..], m, k, c0, c1, gs), m, c1 - c0)
+        }
+    };
+    drop(buf);
+    load_weight_tensor_raw(gpu, qt, &sliced, new_m, new_k)
+}
+
+/// Tensor-parallel weight load for `rank` of `shard` (Stage 3b, FullAttn
+/// path). Loads the full model via `load_weights`, then replaces each
+/// FullAttention layer's sharded weights with this rank's slice, freeing the
+/// full buffers:
+/// - attention: `wq`/`wk`/`wv` column-sharded (output rows), `wo` row-sharded
+///   (input cols);
+/// - dense FFN: `w_gate`/`w_up` column-sharded (output rows), `w_down`
+///   row-sharded (input cols).
+/// DeltaNet layers, norms, embeddings and lm_head stay full (DeltaNet sharding
+/// is a later stage). The returned sharded weights carry LOCAL (m,k); pair with
+/// `local_attn_config(config, shard)` (which shrinks head counts AND
+/// `hidden_dim`), a local-sized `Qwen35Scratch`, and drive via
+/// `forward_scratch_tp` with `fa_masks = None`.
+///
+/// Load-then-slice: peak VRAM is full+slice during load; steady-state (after
+/// the frees) holds only the rank's slice. A from-scratch sliced loader (no
+/// full peak) is a follow-up once the path is validated.
+pub fn load_weights_tp(
+    hfq: &mut HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+    shard: &ShardConfig,
+    rank: usize,
+) -> HipResult<Qwen35Weights> {
+    let mut weights = load_weights(hfq, config, gpu)?;
+    if shard.is_single() {
+        return Ok(weights);
+    }
+    shard
+        .validate(config.n_heads, config.n_kv_heads)
+        .map_err(|e| HipError::new(0, &format!("load_weights_tp: {e}")))?;
+
+    let (n_heads, n_kv, hd, dim) = (config.n_heads, config.n_kv_heads, config.head_dim, config.dim);
+    let q_out_dim = n_heads * hd * 2; // gated wq: Q + gate per head
+    let kv_dim = n_kv * hd;
+    let attn_dim = n_heads * hd;
+    let wq_rows = shard.wq_row_range(rank, n_heads, hd);
+    let kv = shard.kv_head_range(rank, n_kv);
+    let (kv_r0, kv_r1) = (kv.start * hd, kv.end * hd);
+    let wo_cols = shard.wo_col_range(rank, n_heads, hd);
+    // FFN: w_gate/w_up column-parallel (local ffn output rows), w_down
+    // row-parallel (local ffn input cols) — same local-ffn block on both.
+    assert!(
+        config.hidden_dim % shard.tp_size == 0,
+        "load_weights_tp: hidden_dim {} not divisible by tp_size {}",
+        config.hidden_dim, shard.tp_size
+    );
+    let local_ffn = config.hidden_dim / shard.tp_size;
+    let (ffn0, ffn1) = (rank * local_ffn, (rank + 1) * local_ffn);
+
+    // free the full buffer (and any AWQ sidecar; paro is None on this path)
+    // of a weight being replaced by its slice.
+    fn free_full(gpu: &mut Gpu, old: WeightTensor) -> HipResult<()> {
+        if let Some(s) = old.awq_scale {
+            let _ = gpu.free_tensor(s);
+        }
+        gpu.free_tensor(old.buf)
+    }
+
+    for (layer_idx, lw) in weights.layers.iter_mut().enumerate() {
+        let LayerWeights::FullAttn(l) = lw else { continue };
+        let p = format!("layers.{layer_idx}");
+        let new_wq = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.self_attn.q_proj.weight"),
+            q_out_dim, dim, WSlice::Rows(wq_rows.start, wq_rows.end),
+        )?;
+        let new_wk = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.self_attn.k_proj.weight"),
+            kv_dim, dim, WSlice::Rows(kv_r0, kv_r1),
+        )?;
+        let new_wv = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.self_attn.v_proj.weight"),
+            kv_dim, dim, WSlice::Rows(kv_r0, kv_r1),
+        )?;
+        let new_wo = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.self_attn.o_proj.weight"),
+            dim, attn_dim, WSlice::Cols(wo_cols.start, wo_cols.end),
+        )?;
+        free_full(gpu, std::mem::replace(&mut l.wq, new_wq))?;
+        free_full(gpu, std::mem::replace(&mut l.wk, new_wk))?;
+        free_full(gpu, std::mem::replace(&mut l.wv, new_wv))?;
+        free_full(gpu, std::mem::replace(&mut l.wo, new_wo))?;
+
+        // FFN: w_gate/w_up column-parallel (output rows), w_down row-parallel
+        // (input cols). Pairs with local_attn_config's hidden_dim/tp + the
+        // TpFfnShard path (silu_mul + non-residual w_down → all-reduce).
+        let new_wg = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.gate_proj.weight"),
+            config.hidden_dim, dim, WSlice::Rows(ffn0, ffn1),
+        )?;
+        let new_wu = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.up_proj.weight"),
+            config.hidden_dim, dim, WSlice::Rows(ffn0, ffn1),
+        )?;
+        let new_wd = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.down_proj.weight"),
+            dim, config.hidden_dim, WSlice::Cols(ffn0, ffn1),
+        )?;
+        free_full(gpu, std::mem::replace(&mut l.w_gate, new_wg))?;
+        free_full(gpu, std::mem::replace(&mut l.w_up, new_wu))?;
+        free_full(gpu, std::mem::replace(&mut l.w_down, new_wd))?;
+    }
+    Ok(weights)
 }
 
 pub fn load_weights_paroquant(
@@ -12234,16 +12533,26 @@ fn forward_prefill_chunk(
 ///
 /// - `Full` (single-GPU, default): attention → residual `wo` into `s.x` →
 ///   FFN. Byte-identical to the pre-TP path.
-/// - `TpAttn { mask }`: attention, then mask the gated attention output to
-///   this rank's local Q-heads (`mask`), then write the **partial** `wo`
+/// - `TpAttn { mask }`: attention, then write the **partial** `wo`
 ///   contribution to `s.o` (NOT `s.x`), and return *before* the FFN. The
 ///   caller all-reduces `s.o` across ranks and adds it to `s.x`.
-/// - `TpFfn`: run only the FFN on the already-all-reduced `s.x`.
+///   - `mask = Some(m)` (Stage 3 replicated): the full-width attention output
+///     is masked to this rank's local Q-heads (`m`) before `wo` — every rank
+///     ran full attention with full weights.
+///   - `mask = None` (Stage 3b sharded): the weights are already this rank's
+///     slice, so the attention output is local-width and no mask is needed —
+///     `wo` (column-sliced) consumes it directly.
+/// - `TpFfn`: run only the FFN (full, residual into `s.x`) on the
+///   already-all-reduced `s.x` — replicated-FFN TP path.
+/// - `TpFfnShard`: run only the **sharded** FFN (local ffn slice → partial
+///   `w_down` into `s.o`, NON-residual) on the all-reduced `s.x`; the caller
+///   all-reduces `s.o` and adds it to `s.x` (Stage 3b full sharding).
 #[derive(Clone, Copy)]
 pub enum FaPhase<'a> {
     Full,
-    TpAttn { mask: &'a GpuTensor },
+    TpAttn { mask: Option<&'a GpuTensor> },
     TpFfn,
+    TpFfnShard,
 }
 
 /// Run a single FullAttn layer body on s.x at position `pos`. Extracted
@@ -12263,10 +12572,13 @@ pub fn run_fa_layer_body(
     s: &Qwen35Scratch,
     phase: FaPhase,
 ) -> HipResult<()> {
-    // TP FFN-only phase: s.x already holds the all-reduced residual; skip
+    // TP FFN-only phases: s.x already holds the all-reduced residual; skip
     // attention (it ran in the TpAttn phase) and run just the FFN.
     if let FaPhase::TpFfn = phase {
         return run_fa_ffn_body(gpu, weights, config, layer_idx, s);
+    }
+    if let FaPhase::TpFfnShard = phase {
+        return run_fa_ffn_body_sharded(gpu, weights, config, layer_idx, s);
     }
     let layer = match &weights.layers[layer_idx] {
         LayerWeights::FullAttn(l) => l,
@@ -12673,10 +12985,15 @@ pub fn run_fa_layer_body(
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
     match phase {
         FaPhase::TpAttn { mask } => {
-            // Mask the gated attention output to this rank's local Q-heads,
-            // then produce the PARTIAL wo contribution into s.o (NOT s.x).
-            // The caller all-reduces s.o across ranks and adds it to s.x.
-            gpu.mul_f32(&s.fa_attn_out, mask, &s.fa_attn_out)?;
+            // Produce the PARTIAL wo contribution into s.o (NOT s.x). The
+            // caller all-reduces s.o across ranks and adds it to s.x.
+            //   Some(m): full-width attention output (replicated weights) →
+            //            mask to this rank's local Q-heads before wo.
+            //   None:    weights are already this rank's slice → the
+            //            attention output is local-width; wo consumes directly.
+            if let Some(m) = mask {
+                gpu.mul_f32(&s.fa_attn_out, m, &s.fa_attn_out)?;
+            }
             weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
             return Ok(());
         }
@@ -12691,7 +13008,12 @@ pub fn run_fa_layer_body(
 /// residual into s.x). Split out of `run_fa_layer_body` so the TP path can
 /// insert an all-reduce between the `wo` projection and the FFN. Byte-
 /// identical to the previously-inline FFN.
-fn run_fa_ffn_body(
+/// Gate/up half of a FullAttn FFN: rmsnorm+rotate → fused (or fallback)
+/// gate/up projection, leaving `s.gate_ffn` and `s.up` populated. Shared by
+/// the residual (`run_fa_ffn_body`) and sharded (`run_fa_ffn_body_sharded`)
+/// down-projection tails. With sliced `w_gate`/`w_up` (`layer.w_*.m` = local
+/// ffn) the outputs are local-ffn-width automatically.
+fn run_fa_ffn_gate_up(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -12804,8 +13126,49 @@ fn run_fa_ffn_body(
         weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
         weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
     }
-    weight_gemv_swiglu_residual(gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x)?;
+    Ok(())
+}
 
+/// FFN half of a FullAttn layer — residual into `s.x`. Used by single-GPU
+/// `Full` and the replicated-FFN TP `TpFfn` path.
+fn run_fa_ffn_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    run_fa_ffn_gate_up(gpu, weights, config, layer_idx, s)?;
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => l,
+        _ => unreachable!(),
+    };
+    weight_gemv_swiglu_residual(
+        gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+    )?;
+    Ok(())
+}
+
+/// Sharded FFN tail (Stage 3b) — gate/up on the local ffn slice → SwiGLU →
+/// PARTIAL column-sliced `w_down` into `s.o` (NON-residual). The caller
+/// all-reduces `s.o` across ranks and adds it into `s.x`. The fused
+/// silu+rotate+down-residual op has no non-residual form, so this decomposes
+/// into `silu_mul_f32` + generic `weight_gemv` (which FWHT-rotates its input
+/// internally for MQ weights — same math as the fused residual path).
+fn run_fa_ffn_body_sharded(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    run_fa_ffn_gate_up(gpu, weights, config, layer_idx, s)?;
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => l,
+        _ => unreachable!(),
+    };
+    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+    weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
     Ok(())
 }
 
@@ -14700,52 +15063,81 @@ fn forward_scratch_layers(
     Ok(())
 }
 
-/// Tensor-parallel single-token forward (TP Stage 3).
+/// Per-rank LOCAL config for Stage 3b TP (FullAttn path): clones `config`
+/// with only `n_heads`/`n_kv_heads` reduced to a single rank's slice.
+/// DeltaNet params, `dim`, vocab, RoPE, eps AND `hidden_dim` are unchanged.
 ///
-/// Runs one decode step across `tp` ranks with weights **replicated** on
-/// every rank. FullAttn layers are sharded (Megatron column/row split):
-/// each rank computes full attention, masks its output to its local
-/// Q-heads (`fa_masks[r]`), produces the **partial** `wo` contribution into
-/// `scratches[r].o`, then the contributions are all-reduced across ranks and
-/// added back into the residual `s.x`. DeltaNet (LinearAttention) layers run
-/// **replicated** on every rank (no all-reduce — identical deterministic
-/// state keeps `s.x` in sync). Final norm + lm_head run on rank 0 only.
+/// `hidden_dim` deliberately stays FULL: it sizes the shared FFN scratch
+/// (`gate_ffn`/`up`/`ffn_hidden`), and DeltaNet layers run **replicated with
+/// their full FFN**, so the scratch must fit the full intermediate. The
+/// FullAttn FFN's locality comes from the sliced *weights* (`w_*.m` = local
+/// ffn), not the config — `run_fa_ffn_body_sharded` computes into the (full)
+/// scratch's local prefix. Shrinking `hidden_dim` here would under-size the
+/// scratch and OOB on the first replicated DeltaNet FFN.
 ///
-/// This is the wo-sharding stage: attention *compute* is still replicated
-/// (each rank runs full attention then masks). True compute/memory savings
-/// come from 3b (per-rank `wq` row-slice load + `wo` column-slice loader).
+/// Identical across ranks (every rank owns the same head count), so one
+/// instance can be cloned per rank. Pair with `load_weights_tp` (slices the
+/// matching weights) + `forward_scratch_tp` with `fa_masks = None`.
+pub fn local_attn_config(config: &Qwen35Config, shard: &ShardConfig) -> Qwen35Config {
+    let mut c = config.clone();
+    c.n_heads = shard.q_heads_per_rank(config.n_heads);
+    c.n_kv_heads = shard.kv_heads_per_rank(config.n_kv_heads);
+    c
+}
+
+/// Tensor-parallel single-token forward across `tp` ranks. Handles BOTH TP
+/// modes via the per-rank `configs` + optional `fa_masks`:
+///
+/// - **Stage 3 (replicated):** `weights` full on every rank, `configs[r]` =
+///   the global config, `fa_masks = Some(masks)`. Each rank runs full
+///   attention, masks its output to its local Q-heads, then partial `wo`.
+/// - **Stage 3b (sharded):** `weights` = per-rank slices from
+///   `load_weights_tp`, `configs[r] = local_attn_config(global, shard)`,
+///   `fa_masks = None`. Each rank runs attention on only its local heads and
+///   partial (column-sliced) `wo` — real compute/memory savings.
+///
+/// In both modes: the partial `wo` contributions land in `scratches[r].o`,
+/// are all-reduced across ranks, and added back into the residual `s.x`.
+/// DeltaNet (LinearAttention) layers run **replicated** on every rank (no
+/// all-reduce — identical deterministic state keeps `s.x` in sync). The dense
+/// FFN runs replicated (full) in both modes. Final norm + lm_head on rank 0.
 ///
 /// Requirements (caller-side):
-/// - `gpus.devices[r].active_stream = Some(stream)` set on every rank (the
-///   all-reduce requires it).
-/// - `fa_masks[r]` is `[attn_dim]` (n_heads*head_dim), 1.0 on rank r's local
-///   Q-heads (`shard.wo_col_range(r, n_heads, head_dim)`), 0.0 elsewhere.
-/// - All slices (`weights`, `kv_caches`, `dn_states`, `scratches`,
-///   `fa_masks`) have length `shard.tp_size`.
+/// - `gpus.devices[r].active_stream = Some(stream)` on every rank (the
+///   all-reduce requires it; kernels run on it, so `pos_buf` is written there).
+/// - `configs`, `weights`, `kv_caches`, `dn_states`, `scratches` (and
+///   `fa_masks` when `Some`) all have length `shard.tp_size`. In sharded
+///   mode `kv_caches[r]` must be sized for `configs[r]`'s LOCAL kv heads.
 ///
-/// Only dense FullAttn + DeltaNet weights are handled; MoE weights
-/// (A3B) reach `run_*_layer_body`'s `unreachable!()` — a later stage wires
+/// Only dense FullAttn + DeltaNet weights are handled; MoE weights (A3B)
+/// reach `run_*_layer_body`'s `unreachable!()` — a later stage wires
 /// expert-parallel MoE.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_scratch_tp(
     gpus: &mut Gpus,
     shard: &ShardConfig,
     weights: &[Qwen35Weights],
-    config: &Qwen35Config,
+    configs: &[Qwen35Config],
     token: u32,
     pos: usize,
     kv_caches: &mut [llama::KvCache],
     dn_states: &mut [DeltaNetState],
     scratches: &[Qwen35Scratch],
-    fa_masks: &[GpuTensor],
+    fa_masks: Option<&[GpuTensor]>,
 ) -> HipResult<()> {
     let tp = shard.tp_size;
-    let dim = config.dim;
+    // Global (rank-invariant) dims live on every config; use rank 0's.
+    let cfg0 = &configs[0];
+    let dim = cfg0.dim;
+    // No masks ⇒ fully-sliced (Stage 3b): weights are per-rank slices, so the
+    // FFN is sharded too (TpFfnShard + a 2nd all-reduce). Masks present ⇒
+    // replicated (Stage 3): full FFN residual (TpFfn).
+    let sharded = fa_masks.is_none();
 
     // Degenerate TP=1 → single-GPU path (byte-identical to forward_scratch).
     if shard.is_single() {
         return forward_scratch(
-            &mut gpus.devices[0], &weights[0], config, token, pos,
+            &mut gpus.devices[0], &weights[0], cfg0, token, pos,
             &mut kv_caches[0], &mut dn_states[0], &scratches[0],
         );
     }
@@ -14782,14 +15174,14 @@ pub fn forward_scratch_tp(
     //    every rank (replicated layer assignment).
     let mut delta_layer_idx = 0usize;
     let mut kv_layer_idx = 0usize;
-    for layer_idx in 0..config.n_layers {
-        match config.layer_types[layer_idx] {
+    for layer_idx in 0..cfg0.n_layers {
+        match cfg0.layer_types[layer_idx] {
             LayerType::LinearAttention => {
                 // DeltaNet: replicated on every rank, no all-reduce.
                 for r in 0..tp {
                     gpus.devices[r].bind_thread()?;
                     run_dn_layer_body(
-                        &mut gpus.devices[r], &weights[r], config, layer_idx,
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
                         delta_layer_idx, &mut dn_states[r], &scratches[r], None,
                     )?;
                 }
@@ -14800,9 +15192,9 @@ pub fn forward_scratch_tp(
                 for r in 0..tp {
                     gpus.devices[r].bind_thread()?;
                     run_fa_layer_body(
-                        &mut gpus.devices[r], &weights[r], config, layer_idx,
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
                         kv_layer_idx, pos, &mut kv_caches[r], &scratches[r],
-                        FaPhase::TpAttn { mask: &fa_masks[r] },
+                        FaPhase::TpAttn { mask: fa_masks.map(|m| &m[r]) },
                     )?;
                 }
                 // b. FA kernels run on the default stream; the all-reduce reads
@@ -14815,7 +15207,7 @@ pub fn forward_scratch_tp(
                 //    each scratches[r].o now holds the full attention output.
                 let refs: Vec<&_> = scratches.iter().map(|s| &s.o.buf).collect();
                 gpus.all_reduce_sum_f32(&refs, dim)?;
-                // d/e. Residual update (s.x += s.o) + FFN per rank on the synced x.
+                // d. Residual update s.x += s.o (full attention contribution).
                 for r in 0..tp {
                     gpus.devices[r].bind_thread()?;
                     gpus.devices[r].hip.stream_synchronize(
@@ -14825,11 +15217,43 @@ pub fn forward_scratch_tp(
                     )?;
                     let (x, o) = (&scratches[r].x, &scratches[r].o);
                     gpus.devices[r].add_f32(x, o, x)?;
-                    run_fa_layer_body(
-                        &mut gpus.devices[r], &weights[r], config, layer_idx,
-                        kv_layer_idx, pos, &mut kv_caches[r], &scratches[r],
-                        FaPhase::TpFfn,
-                    )?;
+                }
+                // e. FFN. Sharded (3b): each rank's TpFfnShard writes a partial
+                //    w_down into s.o → 2nd all-reduce → add into s.x. Replicated
+                //    (Stage 3): TpFfn runs the full FFN residual into s.x (every
+                //    rank identical, no all-reduce).
+                if sharded {
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_fa_layer_body(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            kv_layer_idx, pos, &mut kv_caches[r], &scratches[r],
+                            FaPhase::TpFfnShard,
+                        )?;
+                    }
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        gpus.devices[r].hip.device_synchronize()?;
+                    }
+                    let refs: Vec<&_> = scratches.iter().map(|s| &s.o.buf).collect();
+                    gpus.all_reduce_sum_f32(&refs, dim)?;
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        gpus.devices[r].hip.stream_synchronize(
+                            gpus.devices[r].active_stream.as_ref().unwrap(),
+                        )?;
+                        let (x, o) = (&scratches[r].x, &scratches[r].o);
+                        gpus.devices[r].add_f32(x, o, x)?;
+                    }
+                } else {
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_fa_layer_body(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            kv_layer_idx, pos, &mut kv_caches[r], &scratches[r],
+                            FaPhase::TpFfn,
+                        )?;
+                    }
                 }
                 kv_layer_idx += 1;
             }
@@ -14842,7 +15266,7 @@ pub fn forward_scratch_tp(
         let gpu = &mut gpus.devices[0];
         gpu.bind_thread()?;
         let s = &scratches[0];
-        gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, config.norm_eps)?;
+        gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, cfg0.norm_eps)?;
         weight_gemv(gpu, &weights[0].output, &s.tmp, &s.logits)?;
         gpu.hip.device_synchronize()?;
     }
