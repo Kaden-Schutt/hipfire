@@ -238,8 +238,15 @@ Order helpers by extraction complexity + blast radius (smallest first):
 2. **`build_prompt_frame`** (~70 LOC × 3 = 210 dedup). Pure function,
    no GPU access. AR + multi + mtp use this; dflash keeps its own
    (delegated by user decision).
-3. **`auto_reset_conversation`** (~25 LOC × 3 = 75 dedup). Single/multi
-   variants. AR + multi + mtp.
+3. ~~**`auto_reset_conversation`** (~25 LOC × 3 = 75 dedup).~~
+   **SKIPPED 2026-05-28 after measurement.** Closer look reveals the
+   shared part across the three call sites is only ~5 LOC (log +
+   `seq_pos = 0` + `conversation_tokens.clear()`); everything else
+   diverges (eviction gate AR-only, DN-reset single vs multi vs
+   none-here, kv.compact_offset AR+multi only, llama_kv.compact_offset
+   AR only, log prefix). Helper would save ~5 LOC net. Not worth a new
+   4-arg function. Path-specific reset code stays inline; step 5
+   per-path migrations move it under each Path arm naturally.
 4. **`enforce_max_think`** (~40 LOC × 2 = 80 dedup). AR + multi only.
 5. **`decode_loop_postlude_step`** (~20 LOC × 4 = 80 dedup). Per-token
    emit shared across all four loops.

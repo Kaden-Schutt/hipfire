@@ -364,6 +364,39 @@ fn build_prompt_frame(inputs: &FrameInputs<'_>) -> Vec<u32> {
     }
 }
 
+/// Update the `<think>...</think>` state from the decoded-so-far bytes.
+/// Returns `(in_think_now, new_think_count)`. Caller stores
+/// `prev_in_think = in_think_now`, `think_count = new_count`, then
+/// decides whether to force-close (or break, etc.) when
+/// `new_count >= max_think_tokens`.
+///
+/// Shared between generate / generate_multi / generate_dflash. NOT
+/// used by generate_mtp because that path's detector uses
+/// unterminated `"<think"` / `"</think"` patterns instead of the full
+/// `"<think>"` / `"</think>"` (deliberate; preserves MTP's existing
+/// cross-token-fragment matching). Step 2.4 of
+/// docs/plans/mtp_multi_refactor.md v2.1.
+fn detect_think_state(
+    decoded_bytes: &[u8],
+    prev_in_think: bool,
+    prev_think_count: usize,
+) -> (bool, usize) {
+    let raw_str = std::str::from_utf8(decoded_bytes).unwrap_or("");
+    let open_idx = raw_str.rfind("<think>");
+    let close_idx = raw_str.rfind("</think>");
+    let in_think = match (open_idx, close_idx) {
+        (Some(o), Some(c)) => o > c,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let new_count = if in_think {
+        if !prev_in_think { 1 } else { prev_think_count + 1 }
+    } else {
+        0
+    };
+    (in_think, new_count)
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -3742,16 +3775,8 @@ fn generate_dflash(
             // <think>/<⁄think> in decoded text and count tokens inside.
             if max_think_tokens > 0 {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let open_idx = raw_str.rfind("<think>");
-                let close_idx = raw_str.rfind("</think>");
-                let in_think = match (open_idx, close_idx) {
-                    (Some(o), Some(c)) => o > c,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if in_think && !prev_in_think { think_count = 0; }
-                if in_think { think_count += 1; }
+                let (in_think, new_count) = detect_think_state(&raw_so_far, prev_in_think, think_count);
+                think_count = new_count;
                 prev_in_think = in_think;
 
                 if in_think && think_count >= max_think_tokens {
@@ -4523,19 +4548,8 @@ fn generate_multi(
         // max_think_tokens enforcement: same decoded-text scan as pp=1.
         if max_think_tokens > 0 {
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let open_idx = raw_str.rfind("<think>");
-            let close_idx = raw_str.rfind("</think>");
-            let in_think = match (open_idx, close_idx) {
-                (Some(o), Some(c)) => o > c,
-                (Some(_), None) => true,
-                _ => false,
-            };
-            if in_think {
-                if !prev_in_think { think_count = 1; } else { think_count += 1; }
-            } else {
-                think_count = 0;
-            }
+            let (in_think, new_count) = detect_think_state(&raw_so_far, prev_in_think, think_count);
+            think_count = new_count;
             prev_in_think = in_think;
 
             if in_think && think_count >= max_think_tokens {
@@ -5275,19 +5289,8 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // incremented per-iteration only when we're still inside.
             if max_think_tokens > 0 {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
-                let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-                let open_idx = raw_str.rfind("<think>");
-                let close_idx = raw_str.rfind("</think>");
-                let in_think = match (open_idx, close_idx) {
-                    (Some(o), Some(c)) => o > c,
-                    (Some(_), None) => true,
-                    _ => false,
-                };
-                if in_think {
-                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
-                } else {
-                    think_count = 0;
-                }
+                let (in_think, new_count) = detect_think_state(&raw_so_far, prev_in_think, think_count);
+                think_count = new_count;
                 prev_in_think = in_think;
 
                 if in_think && think_count >= max_think_tokens {
