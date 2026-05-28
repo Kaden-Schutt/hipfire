@@ -21,7 +21,7 @@
 //! Ours: starts from y_in, runs gemm_hfq4g256_residual_mmq_gfx906, compares
 //! to y_out.
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 use std::path::Path;
 
 fn main() {

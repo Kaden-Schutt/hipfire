@@ -966,7 +966,6 @@ pub fn draft_forward(
     let tot = l + b;
     let h = cfg.hidden;
     let ne = cfg.num_extract();
-    let qd = cfg.q_dim();
     let kvd = cfg.kv_dim();
     let hd = cfg.head_dim;
     let eps = cfg.norm_eps;

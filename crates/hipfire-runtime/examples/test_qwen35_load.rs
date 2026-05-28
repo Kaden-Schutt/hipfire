@@ -142,7 +142,7 @@ fn main() {
         let weights =
             qwen35::load_weights(&mut hfq, &q35_config, &mut gpu).expect("failed to load weights");
         eprintln!("Loaded {} layers", weights.layers.len());
-        for (i, layer) in weights.layers.iter().enumerate() {
+        for (_i, layer) in weights.layers.iter().enumerate() {
             match layer {
                 qwen35::LayerWeights::DeltaNet(_) => eprint!("D"),
                 qwen35::LayerWeights::FullAttn(_) => eprint!("F"),

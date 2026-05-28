@@ -501,7 +501,7 @@ fn main() {
     if val_len > 0 {
         let last = val_len - 1;
         let p_q = last as f32;
-        let n_bands = config.head_dim / 2;
+        let _n_bands = config.head_dim / 2;
         let d_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
 
         // Map kv_head h_kv to the set of query heads sharing it.

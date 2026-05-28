@@ -8,7 +8,7 @@
 //! unset (default) tests the gfx1100 fast variants. Both should pass.
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu};
 
 // ─── f16 helpers (verbatim from test_gemv_mq4g256_lloyd_tail.rs) ────────────
 

@@ -20,14 +20,16 @@ extern "C" fn handle_sigint(_: libc::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
-const IMAGE_SIZE: usize = 448;
 const IMAGE_PAD_ID: u32 = 248056;
 const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
 
 fn main() {
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
     }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {

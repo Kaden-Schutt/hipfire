@@ -24,7 +24,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use rdna_compute::{DType, Gpu, GpuTensor};
+    use rdna_compute::{DType, Gpu};
     const HD: usize = 128;
     const N_HEADS: usize = 4; // smaller than prod (16) to keep test fast
     const N_TOKENS: usize = 5;

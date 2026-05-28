@@ -140,8 +140,8 @@ fn main() {
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted[sorted.len() / 2]
     };
-    let mean = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len() as f64 };
-    let p99 = |v: &[f64]| -> f64 {
+    let _mean = |v: &[f64]| -> f64 { v.iter().sum::<f64>() / v.len() as f64 };
+    let _p99 = |v: &[f64]| -> f64 {
         let mut sorted = v.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         sorted[(sorted.len() as f64 * 0.99) as usize]

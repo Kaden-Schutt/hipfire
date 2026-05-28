@@ -12,6 +12,8 @@
 //! All functions are resolved at runtime — no link-time dependency on
 //! libhsa-runtime64.so. Mirrors the hip-bridge pattern.
 
+#![allow(dead_code)]
+
 use crate::error::HsaStatus;
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_void};

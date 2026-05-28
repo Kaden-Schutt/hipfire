@@ -7,7 +7,7 @@
 //! TRANSPOSED C-output convention vs qkvza/gate_up (lane covers 1 row,
 //! 8 batches; lanes 0..15 → batches 0..7, lanes 16..31 → batches 8..15).
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 
 fn main() {
     let mut gpu = Gpu::init().expect("GPU init");

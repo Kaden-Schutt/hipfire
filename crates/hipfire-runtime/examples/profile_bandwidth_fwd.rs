@@ -121,7 +121,7 @@ fn main() {
 
     let total_time_us: f64 = by_category.values().map(|c| c.time_us).sum();
     let total_bytes: u128 = by_category.values().map(|c| c.bytes).sum();
-    let total_per_fwd_us = total_time_us / measure as f64;
+    let _total_per_fwd_us = total_time_us / measure as f64;
 
     // ─── Table 1: category breakdown ──────────────────────────────────────
     println!(

@@ -102,12 +102,6 @@ static LM_HEAD_AWQ_ENABLED: OnceLock<bool> = OnceLock::new();
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, serde::Deserialize)]
-struct SafetensorsMeta {
-    #[serde(flatten)]
-    tensors: HashMap<String, TensorMeta>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
 struct TensorMeta {
     dtype: String,
     shape: Vec<usize>,
@@ -2616,6 +2610,7 @@ fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
 ///
 /// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
 /// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
+#[cfg(test)]
 fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
     // Test-and-internal wrapper. Defaults to MQ6 promote target (the
     // pre-`--kmap-promote` behavior). Real callers should use
@@ -5081,60 +5076,58 @@ fn main() {
     let parsed_base_opt = GgufFormat::from_flag(format);
     let parsed_base = parsed_base_opt.unwrap_or(GgufFormat::Mq4);
     let promote_to = kmap_promote.unwrap_or_else(|| default_promote_target(parsed_base));
-    let kmap: HashMap<String, QuantLevel> = if no_kmap
-        || (!is_moe && !kmap_dense)
-        || parsed_base_opt.is_none()
-    {
-        HashMap::new()
-    } else {
-        let mut map = HashMap::new();
-        let mut counts = [0u32; 5]; // F16, Q8, Promote, Override, Base
-        for (name, _fi) in &all_tensors {
-            let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode, promote_to);
-            match level {
-                QuantLevel::F16 => counts[0] += 1,
-                QuantLevel::Q8 => counts[1] += 1,
-                QuantLevel::Promote(_) => counts[2] += 1,
-                QuantLevel::Override(_) => counts[3] += 1,
-                QuantLevel::Base => counts[4] += 1,
+    let kmap: HashMap<String, QuantLevel> =
+        if no_kmap || (!is_moe && !kmap_dense) || parsed_base_opt.is_none() {
+            HashMap::new()
+        } else {
+            let mut map = HashMap::new();
+            let mut counts = [0u32; 5]; // F16, Q8, Promote, Override, Base
+            for (name, _fi) in &all_tensors {
+                let level = kmap_resolve_mode(name, n_layers, is_moe, kmap_mode, promote_to);
+                match level {
+                    QuantLevel::F16 => counts[0] += 1,
+                    QuantLevel::Q8 => counts[1] += 1,
+                    QuantLevel::Promote(_) => counts[2] += 1,
+                    QuantLevel::Override(_) => counts[3] += 1,
+                    QuantLevel::Base => counts[4] += 1,
+                }
+                map.insert(name.to_string(), level);
             }
-            map.insert(name.to_string(), level);
-        }
-        if !map.is_empty() {
-            let mode_label = match kmap_mode {
-                0 => "full",
-                1 => "alternating",
-                2 => "typed",
-                3 => "typed-lite",
-                4 => "down-only",
-                _ => "?",
-            };
-            eprintln!(
+            if !map.is_empty() {
+                let mode_label = match kmap_mode {
+                    0 => "full",
+                    1 => "alternating",
+                    2 => "typed",
+                    3 => "typed-lite",
+                    4 => "down-only",
+                    _ => "?",
+                };
+                eprintln!(
                 "K-map plan ({format} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
                 promote_to.label(),
                 if is_moe { ", MoE" } else { "" }
             );
-            eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
-            eprintln!(
-                "  Q8:        {:>4} tensors (embed, routers, default lm_head)",
-                counts[1]
-            );
-            eprintln!(
-                "  Promote:   {:>4} tensors (→ {})",
-                counts[2],
-                promote_to.label()
-            );
-            if counts[3] > 0 {
+                eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
                 eprintln!(
-                    "  Override:  {:>4} tensors (lm_head → {})",
-                    counts[3],
-                    LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?")
+                    "  Q8:        {:>4} tensors (embed, routers, default lm_head)",
+                    counts[1]
                 );
+                eprintln!(
+                    "  Promote:   {:>4} tensors (→ {})",
+                    counts[2],
+                    promote_to.label()
+                );
+                if counts[3] > 0 {
+                    eprintln!(
+                        "  Override:  {:>4} tensors (lm_head → {})",
+                        counts[3],
+                        LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?")
+                    );
+                }
+                eprintln!("  Base:      {:>4} tensors (remaining)", counts[4]);
             }
-            eprintln!("  Base:      {:>4} tensors (remaining)", counts[4]);
-        }
-        map
-    };
+            map
+        };
 
     // Quantize
     let mut hfq_tensors = Vec::new();

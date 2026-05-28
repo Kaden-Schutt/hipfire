@@ -87,16 +87,6 @@ fn cpu_attention_ref(
     out
 }
 
-fn compute_n_tiles(l: usize, head_dim: usize) -> usize {
-    let block_size = std::cmp::min(256, std::cmp::max(l, head_dim));
-    let block_size = (block_size as u32).next_power_of_two() as usize;
-    const LDS_BUDGET_F32: usize = 14_336;
-    let fixed = block_size + head_dim;
-    let max_tile_room = LDS_BUDGET_F32.saturating_sub(fixed).max(1);
-    let tile_size = std::cmp::min(l.max(1), max_tile_room);
-    (l + tile_size - 1) / tile_size.max(1)
-}
-
 fn run_case(
     gpu: &mut Gpu,
     kernel: &str,

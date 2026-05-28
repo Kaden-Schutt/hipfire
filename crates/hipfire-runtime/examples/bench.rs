@@ -31,7 +31,7 @@ fn main() {
     eprintln!("Loading weights...");
     let weights = llama::load_weights(&gguf, &config, &mut gpu).unwrap();
 
-    let kv_dim = config.n_kv_heads * config.head_dim;
+    let _kv_dim = config.n_kv_heads * config.head_dim;
     let mut kv_cache = KvCache::new_gpu(
         &mut gpu,
         config.n_layers,

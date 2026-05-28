@@ -23,7 +23,6 @@ extern "C" fn handle_sigint(_: libc::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }
 
-const IMAGE_SIZE: usize = 448;
 const IMAGE_PAD_ID: u32 = 248056;
 const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
@@ -259,7 +258,7 @@ fn main() {
         .unwrap();
         let mut dn2 = DeltaNetState::new(&mut gpu, &text_config).unwrap();
         let scratch = qwen35::Qwen35Scratch::new(&mut gpu, &text_config, 128).unwrap();
-        let test_token = tokenizer.encode("Hello")[0];
+        let _test_token = tokenizer.encode("Hello")[0];
         // Run a sequence of tokens through both paths and compare at each step
         let test_seq = tokenizer.encode("What is the capital of France?");
         eprintln!(
@@ -291,12 +290,10 @@ fn main() {
             let logits_b = gpu.download_f32(&scratch.logits).unwrap();
 
             let mut max_diff = 0.0f32;
-            let mut max_idx = 0;
             for j in 0..logits_a.len().min(logits_b.len()) {
                 let d = (logits_a[j] - logits_b[j]).abs();
                 if d > max_diff {
                     max_diff = d;
-                    max_idx = j;
                 }
             }
             let mut sa: Vec<(usize, f32)> =

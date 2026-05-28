@@ -58,7 +58,10 @@ fn parse_guards_flag(args: &[String]) -> (bool, Vec<String>) {
 
 fn main() {
     unsafe {
-        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        libc::signal(
+            libc::SIGINT,
+            handle_sigint as *const () as libc::sighandler_t,
+        );
     }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).unwrap_or_else(|| {

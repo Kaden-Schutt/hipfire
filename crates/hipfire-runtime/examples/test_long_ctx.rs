@@ -175,7 +175,7 @@ it?"
 
     let mut seq_pos = 0usize;
     let mut history: Vec<u32> = Vec::new();
-    let mut rng_state: u64 = 0xDEADBEEF_CAFEBABE;
+    let rng_state: u64 = 0xDEADBEEF_CAFEBABE;
 
     println!("\n================================================================");
     println!("MODEL: {}", model_path);

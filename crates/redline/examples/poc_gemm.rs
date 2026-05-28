@@ -103,7 +103,6 @@ fn main() {
 
     // Count user SGPRs
     let mut user_sgpr_count = 0u32;
-    let mut user_sgpr_idx = 0u32; // where to place kernarg ptr
     if kcp & (1 << 0) != 0 {
         user_sgpr_count += 4;
     } // private seg buf
@@ -113,7 +112,7 @@ fn main() {
     if kcp & (1 << 2) != 0 {
         user_sgpr_count += 2;
     } // queue ptr
-    user_sgpr_idx = user_sgpr_count; // kernarg ptr starts after the above
+    let user_sgpr_idx = user_sgpr_count; // kernarg ptr starts after the above
     if kcp & (1 << 3) != 0 {
         user_sgpr_count += 2;
     } // kernarg ptr

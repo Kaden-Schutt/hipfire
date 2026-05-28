@@ -18,7 +18,7 @@ fn main() {
 
     let mut passed = 0;
     let mut failed = 0;
-    let mut skipped = 0;
+    let skipped = 0;
 
     macro_rules! test {
         ($name:expr, $body:expr) => {{
@@ -36,14 +36,6 @@ fn main() {
                 }
             }
         }};
-    }
-
-    macro_rules! skip {
-        ($name:expr, $reason:expr) => {
-            eprint!("  {:50} ", $name);
-            skipped += 1;
-            eprintln!("SKIP ({})", $reason);
-        };
     }
 
     eprintln!("\n--- Basic ops ---");

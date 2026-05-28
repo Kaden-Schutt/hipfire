@@ -150,17 +150,17 @@ struct KfdUserAlloc {
 /// A user-mode AQL compute queue via /dev/kfd.
 pub struct AqlQueue {
     kfd_fd: i32,
-    gpu_id: u32,
+    _gpu_id: u32,
     queue_id: u32,
     ring_base: *mut u8, // mmap'd ring buffer
     ring_size: u32,
     write_ptr: *mut AtomicU64, // mmap'd write pointer (kernel manages)
-    read_ptr: *mut AtomicU64,  // mmap'd read pointer
+    _read_ptr: *mut AtomicU64, // mmap'd read pointer
     doorbell: *mut u32,        // mmap'd doorbell register
-    ring_handle: u64,          // KFD allocation handle for ring
-    eop_handle: u64,           // KFD allocation handle for EOP
+    _ring_handle: u64,         // KFD allocation handle for ring
+    _eop_handle: u64,          // KFD allocation handle for EOP
     signal_buf: *mut u64,      // mmap'd signal buffer for completion
-    signal_handle: u64,
+    _signal_handle: u64,
     signal_va: u64,
 }
 
@@ -360,17 +360,17 @@ impl AqlQueue {
 
         Ok(Self {
             kfd_fd,
-            gpu_id,
+            _gpu_id: gpu_id,
             queue_id: cq.queue_id,
             ring_base: ring_base as *mut u8,
             ring_size: RING_SIZE,
             write_ptr,
-            read_ptr,
+            _read_ptr: read_ptr,
             doorbell: doorbell_page as *mut u32,
-            ring_handle: ring_alloc.handle,
-            eop_handle: eop_alloc.handle,
+            _ring_handle: ring_alloc.handle,
+            _eop_handle: eop_alloc.handle,
             signal_buf,
-            signal_handle: sig_alloc.handle,
+            _signal_handle: sig_alloc.handle,
             signal_va: sig_alloc.gpu_va,
         })
     }

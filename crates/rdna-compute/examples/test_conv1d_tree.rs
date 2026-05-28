@@ -21,7 +21,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use rdna_compute::{DType, Gpu};
+    use rdna_compute::Gpu;
 
     let mut gpu = Gpu::init().expect("GPU init failed");
 

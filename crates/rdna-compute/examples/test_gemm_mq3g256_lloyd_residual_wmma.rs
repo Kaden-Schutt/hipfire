@@ -13,7 +13,7 @@
 //! tolerance is logged-then-set empirically per Phase A acceptance criterion
 //! (plan §"Phase A": "tolerance is measured-and-set, not specified upfront").
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 
 /// f32 → IEEE 754 binary16 little-endian, RTNE on dropped 13 mantissa bits.
 /// Matches gemv_mq3g256_lloyd_tail's helper exactly so f16-roundtripped values

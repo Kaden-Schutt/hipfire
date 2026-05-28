@@ -43,7 +43,7 @@ use std::fs::File;
 use std::path::Path;
 
 use hip_bridge::HipResult;
-use rdna_compute::{DType, Gpu, GpuTensor};
+use rdna_compute::{Gpu, GpuTensor};
 
 use crate::hfq::HfqFile;
 

@@ -24,6 +24,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 /// CPU dequant of one MQ4-Lloyd-formatted row → flat f32 weights, FWHT
 /// rotation BAKED IN (so it's the GPU-side view of the row, not the
 /// pre-quantization values). 256 weights × groups_per_row.
+#[allow(dead_code)]
 fn cpu_dequant_row(row_bytes: &[u8], groups_per_row: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(groups_per_row * 256);
     for g in 0..groups_per_row {

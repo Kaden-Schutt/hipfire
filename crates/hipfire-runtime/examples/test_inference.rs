@@ -47,6 +47,7 @@ fn main() {
         ($name:expr, $timeout_ms:expr, $body:expr) => {{
             eprint!("  {:60} ", $name);
             let t = Instant::now();
+            #[allow(unused_mut)]
             let mut closure = || -> Result<String, String> { $body };
             match closure() {
                 Ok(msg) => {

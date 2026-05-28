@@ -30,9 +30,6 @@ const HIP_LAUNCH_PARAM_END: *mut c_void = 3 as *mut c_void;
 // FFI types we need beyond what hip-bridge exposes
 type HipFunction = *mut c_void;
 type HipStream = *mut c_void;
-type HipModule = *mut c_void;
-type HipGraph = *mut c_void;
-type HipGraphExec = *mut c_void;
 
 // Direct dlopen so we can call hipModuleLaunchKernel with `extra`
 struct DirectHip {

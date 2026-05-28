@@ -154,7 +154,7 @@ fn cpu_reference_gemm(
 fn bench_variant(
     gpu: &mut Gpu,
     m: usize,
-    k: usize,
+    _k: usize,
     n: usize,
     d_a: &rdna_compute::GpuTensor,
     d_x: &rdna_compute::GpuTensor,
@@ -352,12 +352,12 @@ fn main() {
         "M", "K", "N", "kern", "max_abs", "rms", "us/call", "verdict"
     );
 
-    let mut emit_row = |label: &str,
-                        m: usize,
-                        k: usize,
-                        n: usize,
-                        result: (f32, f32, f32, f64),
-                        ref_us: f64|
+    let emit_row = |label: &str,
+                    m: usize,
+                    k: usize,
+                    n: usize,
+                    result: (f32, f32, f32, f64),
+                    ref_us: f64|
      -> bool {
         let (max_abs, _max_rel, rms, us_per_call) = result;
         let pass = max_abs < phase_a_tolerance;

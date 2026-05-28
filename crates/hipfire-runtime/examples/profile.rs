@@ -85,7 +85,7 @@ fn main() {
     let gemv_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
     eprintln!("Single GEMV wq ({}x{}): {:.2}ms", q_dim, dim, gemv_ms);
     // Per layer: 7 GEMVs (wq, wk, wv, wo, gate, up, down)
-    let gemv_total_ms = gemv_ms * 7.0 * config.n_layers as f64;
+    let _gemv_total_ms = gemv_ms * 7.0 * config.n_layers as f64;
     // But gate/up/down are larger — estimate 2x for ffn
     let gemv_est_ms = gemv_ms * (4.0 + 3.0 * 2.5) * config.n_layers as f64;
     eprintln!("  Estimated GEMV total per forward: {gemv_est_ms:.1}ms");

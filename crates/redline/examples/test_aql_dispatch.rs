@@ -6,7 +6,7 @@
 //! Dispatches vector_add without any syscall in the hot path.
 
 use redline::device::Device;
-use redline::dispatch::{KernargBuilder, Kernel};
+use redline::dispatch::Kernel;
 use redline::kfd::AqlQueue;
 
 fn main() {
@@ -116,7 +116,7 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     aql.destroy();
 }
 
-fn kernel_kd_offset(module: &redline::dispatch::LoadedModule, name: &str) -> u64 {
+fn kernel_kd_offset(_module: &redline::dispatch::LoadedModule, name: &str) -> u64 {
     // The Kernel struct has code_va but for AQL we need kd_va.
     // We need the kd_offset from the hsaco module.
     // Re-parse to get it.

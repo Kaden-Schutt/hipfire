@@ -10417,7 +10417,6 @@ fn forward_prefill_chunk(
                 // forward_scratch_layers kernel-for-kernel, but every
                 // launch covers all N tokens at once.
                 let kv_dim = config.n_kv_heads * config.head_dim;
-                let q_dim = config.n_heads * config.head_dim;
                 let qkv_is_mq = matches!(
                     layer.wq.gpu_dtype,
                     DType::MQ4G256
@@ -13272,15 +13271,12 @@ fn forward_scratch_layers(
     s: &Qwen35Scratch,
     mut hidden_rb: Option<&mut HiddenStateRingBuffer>,
 ) -> HipResult<()> {
-    let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
-    let qkv_dim = k_dim * 2 + v_dim;
     let n_v_heads = config.linear_num_value_heads;
     let hd = config.linear_key_head_dim;
 
     let mut delta_layer_idx = 0usize;
-    let mut kv_layer_idx = 0usize;
 
     for layer_idx in 0..config.n_layers {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
@@ -14160,8 +14156,6 @@ fn forward_scratch_layers(
                         rb.write_at_head(gpu, slot, &s.x)?;
                     }
                 }
-
-                kv_layer_idx += 1;
             }
 
             // ── MoE variants (Qwen3.5-MoE / A3B) ──
@@ -14817,7 +14811,6 @@ fn forward_scratch_layers(
                         rb.write_at_head(gpu, slot, &s.x)?;
                     }
                 }
-                kv_layer_idx += 1;
             }
 
             _ => panic!("layer type mismatch at layer {layer_idx}"),

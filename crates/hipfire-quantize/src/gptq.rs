@@ -39,7 +39,6 @@
 
 #![cfg_attr(not(test), allow(dead_code))] // suppress until main.rs wires it
 
-use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
 use rayon::prelude::*;
 
@@ -938,6 +937,7 @@ pub fn gptq_column_sequential(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faer::prelude::Solve;
 
     /// Identity scale: `quantize_mq4_element` rounds to multiples of `scale`
     /// when `min_val = 0`.

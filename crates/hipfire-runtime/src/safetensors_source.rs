@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 struct SafetensorsFile {
     _file: File,
     mmap: Mmap,
-    header_size: usize,
 }
 
 pub struct SafetensorsSource {
@@ -114,11 +113,7 @@ impl SafetensorsSource {
                 }
             }
 
-            files.push(SafetensorsFile {
-                _file: file,
-                mmap,
-                header_size,
-            });
+            files.push(SafetensorsFile { _file: file, mmap });
         }
 
         Ok(Self {

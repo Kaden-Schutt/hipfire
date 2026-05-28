@@ -1122,15 +1122,6 @@ pub fn vision_forward(
     // error reported later (HIP errors are async-sticky — the call that
     // reports them is rarely the launch that caused them).
     let trace = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
-    macro_rules! probe {
-        ($gpu:expr, $msg:literal) => {
-            if trace {
-                eprintln!("    trace: {}", $msg);
-                $gpu.hip.device_synchronize()?;
-            }
-        };
-    }
-
     if trace {
         eprintln!("  trace: entering 42-block loop");
     }

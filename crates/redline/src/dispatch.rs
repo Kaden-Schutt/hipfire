@@ -43,8 +43,6 @@ fn pkt3(opcode: u32, body_count: u32) -> u32 {
 
 const SET_SH_REG: u32 = 0x76;
 const DISPATCH_DIRECT: u32 = 0x15;
-const RELEASE_MEM: u32 = 0x49;
-const ACQUIRE_MEM: u32 = 0x58;
 
 impl Device {
     /// Load a .hsaco module: parse ELF, upload code to VRAM, return ready-to-dispatch kernels.

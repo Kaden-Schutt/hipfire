@@ -3108,7 +3108,7 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_spec_start = std::time::Instant::now();
-    let mut t_phase = t_spec_start;
+    let t_phase = t_spec_start;
 
     // ── 1. block_output_ids seeded with prev bonus at [0], masks at [1..B] ──
     let mut block: Vec<u32> = vec![mask_token; b];

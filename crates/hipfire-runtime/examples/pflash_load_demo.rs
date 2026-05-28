@@ -196,7 +196,7 @@ fn main() {
                 // should agree to within numerical tolerance. If they don't,
                 // the new HIP kernel is wrong.
                 let scorer_health_ok = {
-                    let mut probe_state = state.drafter_loaded;
+                    let probe_state = state.drafter_loaded;
                     if probe_state {
                         let cpu = hipfire_arch_qwen35::pflash::compute_scores_batched(
                             &mut state,
@@ -235,7 +235,6 @@ fn main() {
                             }
                             (Err(e), _) | (_, Err(e)) => {
                                 eprintln!("scorer probe errored: {e:?}");
-                                probe_state = false;
                                 false
                             }
                         }

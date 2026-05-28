@@ -18,7 +18,7 @@
 //!
 //! Defaults: M=128, K=256, N=64 (one full MMQ tile).
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

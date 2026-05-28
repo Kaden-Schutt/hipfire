@@ -5,8 +5,6 @@
 //! `&dyn ModelSource` so the same loading code works for hipfire's native HFQ
 //! format and HuggingFace safetensors (ParoQuant, AWQ, etc.).
 
-use std::collections::HashMap;
-
 /// Metadata about a single tensor in a model file.
 #[derive(Debug, Clone)]
 pub struct TensorInfo {

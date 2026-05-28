@@ -8,7 +8,7 @@
 
 use hipfire_runtime::hfq::{self, HfqFile};
 use hipfire_runtime::llama::{self, weight_gemv, ForwardScratch, KvCache};
-use rdna_compute::{DType, Gpu};
+use rdna_compute::Gpu;
 use std::path::Path;
 use std::time::Instant;
 

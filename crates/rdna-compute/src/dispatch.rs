@@ -133,7 +133,7 @@ fn gemv_prefetch_enabled(arch: &str) -> bool {
 /// of x → 4× fewer WGs, 4× less x-HBM traffic. Same inner-loop math.
 ///
 /// Default ON for gfx94x. Override with HIPFIRE_GFX942_LDS_GEMV={0,1}.
-fn gfx942_lds_gemv_enabled(arch: &str) -> bool {
+fn gfx942_lds_gemv_enabled(_arch: &str) -> bool {
     static CACHE: OnceLock<Option<bool>> = OnceLock::new();
     let override_ = *CACHE.get_or_init(|| {
         std::env::var("HIPFIRE_GFX942_LDS_GEMV")
@@ -33853,7 +33853,7 @@ impl Gpu {
         &mut self,
         weight_quant: &str,
         kv_type: &str,
-        head_dim: usize,
+        _head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // asym kernels #include "turbo_common.h" + "givens_common.h"; the

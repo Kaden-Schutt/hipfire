@@ -117,12 +117,6 @@ impl MetaValue {
             _ => None,
         }
     }
-    pub fn as_f32(&self) -> Option<f32> {
-        match self {
-            MetaValue::F32(v) => Some(*v),
-            _ => None,
-        }
-    }
     pub fn as_str(&self) -> Option<&str> {
         match self {
             MetaValue::String(s) => Some(s),
@@ -237,12 +231,6 @@ impl GgufFile {
 
     pub fn meta(&self, key: &str) -> Option<&MetaValue> {
         self.metadata.get(key)
-    }
-    pub fn meta_u32(&self, key: &str) -> Option<u32> {
-        self.meta(key).and_then(|v| v.as_u32())
-    }
-    pub fn meta_f32(&self, key: &str) -> Option<f32> {
-        self.meta(key).and_then(|v| v.as_f32())
     }
     pub fn meta_str(&self, key: &str) -> Option<&str> {
         self.meta(key).and_then(|v| v.as_str())

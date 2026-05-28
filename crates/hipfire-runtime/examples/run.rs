@@ -191,7 +191,7 @@ fn main() {
     }
 
     // Speculative decode mode requires a draft model.
-    let mut spec_active = speculative && draft_slot.is_some();
+    let spec_active = speculative && draft_slot.is_some();
     if speculative && draft_slot.is_none() {
         eprintln!("--speculative ignored: no --draft-model provided");
     }
@@ -386,11 +386,11 @@ fn main() {
         let im_end_token_val = im_end_token;
 
         // Helper closure: prints a token and returns true if generation should stop.
-        let mut emit_token = |tok: u32,
-                              conversation_tokens: &mut Vec<u32>,
-                              in_thinking: &mut bool,
-                              thinking_shown: &mut bool,
-                              generated: &mut usize|
+        let emit_token = |tok: u32,
+                          conversation_tokens: &mut Vec<u32>,
+                          in_thinking: &mut bool,
+                          thinking_shown: &mut bool,
+                          generated: &mut usize|
          -> bool {
             *generated += 1;
             conversation_tokens.push(tok);

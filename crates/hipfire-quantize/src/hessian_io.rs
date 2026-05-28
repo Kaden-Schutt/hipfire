@@ -19,6 +19,8 @@
 //! calls `HessianSidecar::open(path)` once per model, then queries
 //! `get(tensor_name_without_dot_weight_suffix, 0)` per MQ4G256 tensor.
 
+#![cfg_attr(not(test), allow(dead_code))]
+
 use byteorder::{ByteOrder, LittleEndian};
 use memmap2::{Advice, Mmap};
 use std::collections::HashMap;
@@ -106,6 +108,7 @@ impl HessianDtype {
 /// Zero-copy view into one Hessian record in the mmap.
 pub struct HessianRef<'a> {
     pub name: &'a str,
+    #[allow(dead_code)]
     pub expert_idx: u32,
     pub k: usize,
     pub dtype: HessianDtype,
@@ -284,6 +287,7 @@ impl HessianSidecar {
 
     /// Iterate all stored Hessians. Used for bulk validation passes (e.g.
     /// symmetry / PSD check at start of quantize) and debug dumps.
+    #[allow(dead_code)]
     pub fn tensors(&self) -> impl Iterator<Item = HessianRef<'_>> + '_ {
         self.index.values().map(|entry| HessianRef {
             name: std::str::from_utf8(
