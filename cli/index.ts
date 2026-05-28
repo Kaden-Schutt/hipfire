@@ -2974,7 +2974,7 @@ export function findModel(name: string): string | null {
   const matchesName = (f: string) => f === name || f === searchName
     || f.includes(name) || f.includes(searchName);
   const hasValidExt = (f: string) => f.endsWith(".mq4") || f.endsWith(".mq6")
-    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq");
+    || f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq2lloyd");
 
   // Preference order when no quant hint: .mq4 → .hf4 → .hf6 → .mq6 → .hfq
   // (MQ6 only if explicitly asked; HF6 ditto — both are larger files.)
@@ -2982,8 +2982,9 @@ export function findModel(name: string): string | null {
     if (f.endsWith(".mq4")) return 0;
     if (f.endsWith(".hf4")) return 1;
     if (f.endsWith(".hfq")) return 2; // legacy HF4 naming
-    if (f.endsWith(".mq6")) return 3;
-    if (f.endsWith(".hf6")) return 4;
+    if (f.endsWith(".mq2lloyd")) return 3;
+    if (f.endsWith(".mq6")) return 4;
+    if (f.endsWith(".hf6")) return 5;
     return 99;
   };
 
@@ -3037,7 +3038,7 @@ function listLocal() {
     let entries: string[];
     try { entries = readdirSync(dir); } catch { continue; }
     for (const f of entries) {
-      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6") || f.endsWith(".mq2lloyd")) && !seen.has(f)) {
         seen.add(f);
         // statSync may throw on dangling symlinks or files removed mid-scan;
         // skip those individually instead of aborting the rest of the loop
