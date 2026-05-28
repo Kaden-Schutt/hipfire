@@ -4452,6 +4452,383 @@ fn generate_mtp(
     }, &path_extras);
 }
 
+/// Stage 2b payoff: PP+MTP. Trunk decoded across `m.pp_gpus.devices[..]`
+/// with the MTP head + drafter co-located on `output_device` (set up at
+/// load by `load_model_pp_with_mtp` in this file). Each cycle's K-step
+/// draft chain runs on output_device; verify dispatches across all PP
+/// devices via `forward_prefill_batch_multi_with_caps`; sample / accept
+/// stays on output_device.
+///
+/// V1 scope (matches `spec_step_mtp_compressed_serial_multi` limits):
+/// - compressed-sidecar MTP head only (`m.mtp.compressed == true`)
+/// - greedy-only (temp = 0); `pick_path` already routed sampling to AR
+/// - skip LoopGuard / attractor blocking / repeat_penalty / budget alerts
+///   for v1. The pp2-mtp coherence-gate-pp case exercises greedy short
+///   prompts where these aren't load-bearing.
+fn generate_pp_mtp(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
+    debug_assert_eq!(pick_path(m, ctx), SpecPath::PpMtp,
+        "generate_pp_mtp called with path={:?}", pick_path(m, ctx));
+
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let max_tokens: usize = ctx.max_tokens;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
+    // V1 silences: pp+mtp is greedy-only (temp gated by pick_path), the
+    // attractor / budget / pflash fields are intentionally skipped.
+    let _ = (ctx.temp, ctx.top_p, ctx.repeat_penalty, ctx.repeat_window,
+             ctx.budget_alert_at_tok, ctx.budget_alert_text,
+             &mut ctx.drafter_gpu, &mut ctx.pflash_state, ctx.pflash_cfg,
+             ctx.pflash_bypass_reason, ctx.pflash_alpha);
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+
+    // Multi-turn: prefill only the NEW turn's tokens on top of cumulative
+    // KV + DN. Reset when overflow would push past max_seq (mirrors AR /
+    // generate_mtp behavior).
+    let raw_q_tokens = tokenizer.encode(prompt);
+    let prompt_est = raw_q_tokens.len() + 8;
+    if m.seq_pos + prompt_est + max_tokens > m.max_seq {
+        eprintln!("[hipfire-daemon] pp-mtp: context full ({}/{}) — resetting conversation",
+                  m.seq_pos, m.max_seq);
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let new_tokens: Vec<u32> = build_prompt_frame(&FrameInputs {
+        tokenizer,
+        chat_template: m.chat_template.as_deref(),
+        system_prompt,
+        prompt_text: prompt,
+        user_tokens: &raw_q_tokens,
+        assistant_prefix,
+        max_think_tokens,
+        tools,
+        messages_history,
+        seq_pos: m.seq_pos,
+        err_path_label: "pp-mtp",
+    });
+
+    let im_end = tokenizer.encode("<|im_end|>");
+    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+
+    // Fresh-start (turn 0 or post-reset): zero recurrent state on
+    // output_device — the dn_state lives there per load_model_pp_with_mtp
+    // convention; the MTP head's KV cache also resets.
+    let output_device = m.pp_gpus.as_ref().expect("pp_gpus populated").output_device;
+    if m.seq_pos == 0 {
+        {
+            let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+            let dn = m.dn_state.as_ref().unwrap();
+            for s in &dn.s_matrices { let _ = g.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = g.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = g.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
+        if let Some(mtp) = m.mtp.as_mut() {
+            let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+            let _ = mtp.spec_state.mtp_kv.reset(g);
+        }
+    }
+    let start_pos = m.seq_pos;
+
+    let t0 = Instant::now();
+    let dim = m.q35_config.as_ref().unwrap().dim;
+
+    // Take the bookkeeping fields out of `m` so we can pass &mut refs
+    // alongside &mut m.pp_gpus. Put them back unconditionally before
+    // return (matches generate_mtp's "mtp_bail!" pattern).
+    let weights = m.q35_weights.take().expect("q35 weights");
+    let mut kv_cache = m.kv_cache.take().expect("kv cache");
+    let mut dn_state = m.dn_state.take().expect("dn state");
+    let pp_scratch_set = m.pp_scratch_set.take().expect("pp_scratch_set populated for PP path");
+    let mut mtp_state = m.mtp.take().expect("mtp populated on PpMtp path");
+    let drafter_state_opt = mtp_state.drafter_state.take();
+    let mut drafter_state = match drafter_state_opt {
+        Some(ds) => ds,
+        None => {
+            let _ = writeln!(stdout,
+                r#"{{"type":"error","id":"{}","message":"pp-mtp: m.mtp.drafter_state is None — PP+MTP load must populate it"}}"#, id);
+            let _ = stdout.flush();
+            m.q35_weights = Some(weights);
+            m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state);
+            m.pp_scratch_set = Some(pp_scratch_set);
+            mtp_state.drafter_state = None;
+            m.mtp = Some(mtp_state);
+            return;
+        }
+    };
+    let target_config = m.q35_config.as_ref().unwrap().clone();
+
+    // Restore everything before any early return / panic. Wrap the rest
+    // of the function in a closure so we can put state back even on early
+    // return / error.
+    macro_rules! ppmtp_bail {
+        ($msg:expr) => {{
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":{}}}"#,
+                id, serde_json::to_string(&$msg).unwrap_or_default());
+            let _ = stdout.flush();
+            m.q35_weights = Some(weights);
+            m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state);
+            m.pp_scratch_set = Some(pp_scratch_set);
+            mtp_state.drafter_state = Some(drafter_state);
+            m.mtp = Some(mtp_state);
+            return;
+        }};
+    }
+
+    // Allocate the per_token_hidden_out capture buffer on output_device.
+    // Sized for the WHOLE prefill (chunk loop offsets into it).
+    let per_tok_hidden_out = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        match g.alloc_tensor(&[new_tokens.len() * dim], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => ppmtp_bail!(format!("pp-mtp alloc per_tok_hidden_out: {e}")),
+        }
+    };
+
+    // ── Prefill ──
+    {
+        let gpus = m.pp_gpus.as_mut().unwrap();
+        if let Err(e) = qwen35::forward_prefill_batch_multi_with_caps(
+            gpus, &weights, &target_config, &new_tokens, start_pos,
+            &mut kv_cache, &mut dn_state, &pp_scratch_set,
+            Some(&per_tok_hidden_out),
+            None, // gdn_tape — v1 disabled (matches spec_step_mtp_compressed_serial_multi)
+            None, // tree_verify — MTP verify is linear
+        ) {
+            // Free the per-tok buffer before bail; bail returns.
+            let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppmtp_bail!(format!("pp-mtp prefill: {e}"));
+        }
+    }
+    m.conversation_tokens.extend_from_slice(&new_tokens);
+
+    // Seed MTP head's prev_hidden from the LAST row of per_tok_hidden_out.
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let last_row_off = (new_tokens.len() - 1) * dim * 4;
+        if let Err(e) = g.hip.memcpy_dtod_at(
+            &mtp_state.spec_state.prev_hidden.buf, 0,
+            &per_tok_hidden_out.buf, last_row_off,
+            dim * 4,
+        ) {
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppmtp_bail!(format!("pp-mtp seed prev_hidden: {e}"));
+        }
+        // Also seed the drafter_state's prev_hidden (the chain reads this
+        // on cycle 0). Same source row.
+        if let Err(e) = g.hip.memcpy_dtod_at(
+            &drafter_state.prev_hidden.buf, 0,
+            &per_tok_hidden_out.buf, last_row_off,
+            dim * 4,
+        ) {
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppmtp_bail!(format!("pp-mtp seed drafter_state.prev_hidden: {e}"));
+        }
+    }
+
+    // First token via argmax of the trunk's post-prefill logits — but the
+    // multi prefill doesn't write logits to a single-device buffer the way
+    // single-gpu does. Run one extra single-token forward on output_device
+    // using the LAST per_tok_hidden row → trunk.output GEMV → argmax.
+    let first_token: u32 = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        // Last row of per_tok_hidden is the post-output-norm hidden of the
+        // last prompt token. trunk.output lives on output_device per PP
+        // load layout, so GEMV is safe here.
+        let w_out = &weights.output;
+        // Allocate scratch logits + argmax (small, freed immediately).
+        let logits = match g.alloc_tensor(&[target_config.vocab_size], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = g.free_tensor(per_tok_hidden_out);
+                ppmtp_bail!(format!("pp-mtp alloc first-token logits: {e}"));
+            }
+        };
+        let last_row_view = per_tok_hidden_out.sub_offset(
+            (new_tokens.len() - 1) * dim, dim,
+        );
+        if let Err(e) = hipfire_runtime::llama::weight_gemv(g, w_out, &last_row_view, &logits) {
+            let _ = g.free_tensor(logits);
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppmtp_bail!(format!("pp-mtp first-token GEMV: {e}"));
+        }
+        let logits_host = match g.download_f32(&logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = g.free_tensor(logits);
+                let _ = g.free_tensor(per_tok_hidden_out);
+                ppmtp_bail!(format!("pp-mtp first-token download: {e}"));
+            }
+        };
+        let _ = g.free_tensor(logits);
+        logits_host.iter().enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv { (i as u32, v) } else { (best, bv) }
+            }).0
+    };
+
+    // Free the prefill capture buffer now — no longer needed.
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.free_tensor(per_tok_hidden_out);
+    }
+
+    let t_prefill = Instant::now();
+
+    // ── Decode loop ──
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = hipfire_runtime::eos_filter::EosFilter::new(
+        hipfire_runtime::eos_filter::EosFilterConfig::default());
+    let mut position = start_pos + new_tokens.len();
+    let mut seed_token = first_token;
+    let mut generated = 0usize;
+    let mut total_cycles = 0usize;
+    let mut total_accepted = 0usize;
+    let mut committed_from_cycles = 0usize;
+    let eos_token = target_config.eos_token;
+
+    // Stream the seed/first token (same as generate_mtp).
+    {
+        streamed_tokens.push(first_token);
+        emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1,
+                             t0.elapsed().as_millis() as u64);
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let hipfire_runtime::eos_filter::FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id, serde_json::to_string(text).unwrap_or_default());
+                let _ = stdout.flush();
+            }
+        }
+        generated = 1;
+    }
+    let first_token_terminal = first_token == eos_token
+        || im_end_token == Some(first_token)
+        || tokenizer.is_terminator(first_token);
+
+    while generated < max_tokens && !first_token_terminal {
+        if position + mtp_state.max_n + 1 >= m.physical_cap { break; }
+
+        let step_result = {
+            let gpus = m.pp_gpus.as_mut().unwrap();
+            hipfire_arch_qwen35::mtp_spec::spec_step_mtp_compressed_serial_multi(
+                gpus,
+                output_device,
+                &target_config,
+                &weights,
+                &mut kv_cache,
+                &mut dn_state,
+                &pp_scratch_set,
+                &mtp_state.head,
+                &mut mtp_state.spec_state,
+                &mut drafter_state,
+                position,
+                seed_token,
+                eos_token,
+            )
+        };
+        let step = match step_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"error","id":"{}","message":"pp-mtp spec_step: {}"}}"#, id, e);
+                let _ = stdout.flush();
+                break;
+            }
+        };
+
+        total_cycles += 1;
+        total_accepted += step.accept_count;
+
+        let mut hit_eos = false;
+        for &tok in &step.committed {
+            if generated >= max_tokens { break; }
+            emitted.push(tok);
+            streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1,
+                                 t0.elapsed().as_millis() as u64);
+            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let hipfire_runtime::eos_filter::FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                let text = std::str::from_utf8(&text_bytes).unwrap();
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id, serde_json::to_string(&text).unwrap_or_default());
+                let _ = stdout.flush();
+            }
+            generated += 1;
+            committed_from_cycles += 1;
+            if tok == eos_token || im_end_token == Some(tok) || tokenizer.is_terminator(tok) {
+                hit_eos = true; break;
+            }
+        }
+        position += step.advance;
+        seed_token = *step.committed.last().expect("non-empty commit");
+
+        if hit_eos { break; }
+    }
+
+    // Final-token KV write (same pattern as generate_mtp:F1 fix).
+    if generated > 0 {
+        let gpus = m.pp_gpus.as_mut().unwrap();
+        let scratch_set_ref = &pp_scratch_set;
+        if let Err(e) = qwen35::forward_scratch_multi(
+            gpus, &weights, &target_config, seed_token, position,
+            &mut kv_cache, &mut dn_state, scratch_set_ref,
+        ) {
+            eprintln!("[hipfire-daemon] pp-mtp final-token KV write failed (ignored): {e}");
+        } else {
+            position += 1;
+        }
+    }
+
+    // Put state back.
+    m.q35_weights = Some(weights);
+    m.kv_cache = Some(kv_cache);
+    m.dn_state = Some(dn_state);
+    m.pp_scratch_set = Some(pp_scratch_set);
+    mtp_state.drafter_state = Some(drafter_state);
+    m.mtp = Some(mtp_state);
+    m.conversation_tokens.extend_from_slice(&emitted);
+    m.seq_pos = position;
+
+    let mtp_state_ref = m.mtp.as_ref().unwrap();
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { new_tokens.len() as f64 / prefill_s } else { 0.0 };
+    let tau = if total_cycles > 0 { committed_from_cycles as f64 / total_cycles as f64 } else { 0.0 };
+    let accept_rate = if total_cycles > 0 { total_accepted as f64 / total_cycles as f64 } else { 0.0 };
+    let path_extras = format!(
+        r#","spec_path":"pp-mtp","mtp_k":{},"tau":{:.2},"accept_rate":{:.2},"cycles":{},"pp":{}"#,
+        mtp_state_ref.max_n, tau, accept_rate, total_cycles, m.pp,
+    );
+    emit_done_event(stdout, id, &DoneStats {
+        tokens: generated,
+        tok_s,
+        prefill_tokens: new_tokens.len(),
+        prefill_ms: prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms: prefill_s * 1000.0,
+    }, &path_extras);
+}
+
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
 /// `generate` Qwen3.5 branch feature-for-feature: ChatFrame ChatML wrap,
 /// EosFilter UTF-8 streaming + strip-think + stop_at, LoopGuard n-gram
@@ -4967,12 +5344,11 @@ fn generate_qwen35(
             );
             return;
         }
-        SpecPath::PpAr | SpecPath::PpMtp => {
-            // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1
+        SpecPath::PpAr => {
+            // Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). pp>1
             // is refused at load when DFlash / CASK / PFlash / VL is
             // requested, so this branch doesn't need to thread any of
-            // those args through. PpMtp folds in here today; step 5d
-            // splits it to its own arm with a dedicated MTP multi-GPU loop.
+            // those args through.
             let mut multi_ctx = GenerateCtx {
                 stdout, id, prompt, system_prompt, tools, messages_history,
                 assistant_prefix,
@@ -4986,6 +5362,29 @@ fn generate_qwen35(
                 pflash_alpha: None,
             };
             generate_multi(m, gpu, &mut multi_ctx);
+            return;
+        }
+        SpecPath::PpMtp => {
+            // Stage 2b payoff: pp>1 trunk + MTP head co-located on
+            // output_device. Caller's gpu arg is ignored — generate_pp_mtp
+            // pulls m.pp_gpus directly. Per-cycle MTP spec_step runs the
+            // K-step draft chain on output_device and dispatches verify
+            // across all PP devices via
+            // forward_prefill_batch_multi_with_caps.
+            let _ = gpu; // Unused: PP path uses m.pp_gpus directly.
+            let mut pp_mtp_ctx = GenerateCtx {
+                stdout, id, prompt, system_prompt, tools, messages_history,
+                assistant_prefix,
+                temp, top_p, repeat_penalty, repeat_window,
+                max_tokens, max_think_tokens,
+                budget_alert_at_tok, budget_alert_text,
+                drafter_gpu: None,
+                pflash_state,
+                pflash_cfg,
+                pflash_bypass_reason: None,
+                pflash_alpha: None,
+            };
+            generate_pp_mtp(m, &mut pp_mtp_ctx);
             return;
         }
         SpecPath::Dflash => {
