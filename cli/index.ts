@@ -8,18 +8,13 @@
 //   hipfire sidecar-gen <model>       → generate TriAttention calibration sidecar
 
 import { spawn } from "bun";
-import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync, appendFileSync, readFileSync, writeFileSync, renameSync } from "fs";
+import { existsSync, readdirSync, statSync, unlinkSync, mkdirSync } from "fs";
 import { join, resolve, basename, dirname } from "path";
 import { homedir } from "os";
 
 const HIPFIRE_DIR = join(homedir(), ".hipfire");
 const MODELS_DIR = join(HIPFIRE_DIR, "models");
-const TEMPLATES_DIR = join(HIPFIRE_DIR, "templates");
-const DRAFTS_DIR = join(HIPFIRE_DIR, "drafts");
-const TRIATTN_DIR = join(HIPFIRE_DIR, "triattn");
 const CONFIG_PATH = join(HIPFIRE_DIR, "config.json");
-const MODELS_CATALOG_PATH = join(HIPFIRE_DIR, "models.json");
-const SERVE_REQUEST_LOG_FILE = join(HIPFIRE_DIR, "serve-requests.jsonl");
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT = 11435;
 const TEMP_CORRECTION = 0.82;
@@ -154,6 +149,7 @@ export interface HipfireConfig {
   prefill_recent: number;          // Always-keep tail. Default 1024.
   prefill_block: number;           // Scoring block size. Default 128.
   prefill_drafter: string;         // Path to drafter HFQ. "" disables.
+  prefill_drafter_device: number;  // HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device for hetero compress.
   prefill_profile: boolean;        // Per-stage timing logs.
   prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
 }
@@ -215,6 +211,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_recent: 1024,
   prefill_block: 128,
   prefill_drafter: "",
+  prefill_drafter_device: -1,
   prefill_profile: false,
   prefill_sparse_threshold: 32768,
 };
@@ -257,6 +254,7 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_recent": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 65536;
     case "prefill_block": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 4096;
     case "prefill_drafter": return typeof value === "string";
+    case "prefill_drafter_device": return typeof value === "number" && Number.isInteger(value) && value >= -1 && value <= 15;
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
     default: return false;
@@ -294,9 +292,7 @@ function saveConfig(cfg: HipfireConfig) {
 const cfg = loadConfig();
 
 // ─── Per-model config overlays ──────────────────────────
-// Sparse per-tag overrides. Stored in ~/.hipfire/models.json (schema v2).
-// Legacy ~/.hipfire/per_model_config.json is read once and folded into the
-// catalog on refresh.
+// Sparse per-tag overrides. Stored in ~/.hipfire/per_model_config.json.
 // Resolution order: --flag > per-model > global > engine fallback.
 
 const PER_MODEL_CONFIG_PATH = join(HIPFIRE_DIR, "per_model_config.json");
@@ -317,7 +313,7 @@ const PER_MODEL_KEYS = [
   // changing other targets.
   "prefill_compression", "prefill_threshold", "prefill_keep_ratio",
   "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
-  "prefill_block", "prefill_drafter", "prefill_profile",
+  "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
@@ -326,43 +322,42 @@ type PerModelOverride = Partial<Pick<HipfireConfig, PerModelKey>>;
 type PerModelConfigs = Record<string, PerModelOverride>;
 
 function loadPerModelConfigs(): PerModelConfigs {
-  const out: PerModelConfigs = {};
-  const merge = (tag: string, ov: any) => {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length > 0) out[tag] = { ...(out[tag] ?? {}), ...clean };
-  };
-
-  for (const [tag, ov] of Object.entries(loadLegacyPerModelConfigsRaw())) merge(tag, ov);
-
-  const catalog = loadModelsCatalog();
-  for (const [tag, ov] of Object.entries(catalog.configs ?? {})) merge(tag, ov);
-  for (const [id, model] of Object.entries(catalog.models ?? {})) {
-    if (!model.config || Object.keys(model.config).length === 0) continue;
-    merge(id, model.config);
-  }
-  return out;
+  try {
+    const raw = JSON.parse(require("fs").readFileSync(PER_MODEL_CONFIG_PATH, "utf-8"));
+    const out: PerModelConfigs = {};
+    let migrated = false;
+    for (const [tag, ov] of Object.entries(raw ?? {})) {
+      const clean: PerModelOverride = {};
+      // Migrate legacy boolean mmq_screen → tri-state. Pre-2026-05-01 per-model
+      // overlays from PR #104 stored true/false; without this they'd fail the
+      // new tri-state validator and the override would silently disappear.
+      if (typeof (ov as any)?.mmq_screen === "boolean") {
+        (ov as any).mmq_screen = (ov as any).mmq_screen ? "on" : "off";
+        migrated = true;
+      }
+      for (const k of PER_MODEL_KEYS) {
+        const v = (ov as any)?.[k];
+        if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
+      }
+      if (Object.keys(clean).length > 0) out[tag] = clean;
+    }
+    // Persist migration so the legacy boolean doesn't sit in the file forever
+    // tripping every read. Best-effort: if the write fails (read-only fs,
+    // permission), the in-memory result is still correct for this run.
+    if (migrated) {
+      try { savePerModelConfigs(out); } catch {}
+    }
+    return out;
+  } catch { return {}; }
 }
 
 function savePerModelConfigs(all: PerModelConfigs) {
-  const catalog = refreshModelsCatalog({ write: false });
-  const configs: PerModelConfigs = {};
-
-  for (const model of Object.values(catalog.models)) delete model.config;
-
+  // Drop empty entries so the file stays minimal
+  const clean: PerModelConfigs = {};
   for (const [tag, ov] of Object.entries(all)) {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length === 0) continue;
-    const modelId = catalogModelIdForConfigKey(catalog, tag);
-    if (modelId && catalog.models[modelId]) {
-      catalog.models[modelId].config = { ...(catalog.models[modelId].config ?? {}), ...clean };
-    } else {
-      configs[tag] = clean;
-    }
+    if (Object.keys(ov).length > 0) clean[tag] = ov;
   }
-
-  catalog.configs = configs;
-  writeModelsCatalog(catalog);
-  clearLegacyPerModelConfigs();
+  require("fs").writeFileSync(PER_MODEL_CONFIG_PATH, JSON.stringify(clean, null, 2) + "\n");
 }
 
 // Return the effective config for a given model tag. Per-model overrides
@@ -372,11 +367,13 @@ function savePerModelConfigs(all: PerModelConfigs) {
 function resolveModelConfig(tag: string | null | undefined): HipfireConfig {
   const base = loadConfig();
   if (!tag) return base;
-  const resolved = resolveModelTag(tag);
   const all = loadPerModelConfigs();
-  const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), tag);
-  const overrides = all[catalogId ?? ""] ?? all[resolved] ?? all[tag] ?? {};
-  return { ...base, ...overrides };
+  const resolved = resolveModelTag(tag);
+  // Layer both keys: a model can carry overrides under the canonical
+  // registry tag AND under the user alias. Alias wins where both set a
+  // key, but neither drops the other. Previous `resolved ?? tag` picked
+  // exactly one entry, so any key only present on the other vanished.
+  return { ...base, ...(all[resolved] ?? {}), ...(tag !== resolved ? (all[tag] ?? {}) : {}) };
 }
 
 // applyThinkingMode is intentionally NOT called anywhere. The previous
@@ -519,10 +516,9 @@ function buildLoadMessage(path: string, tag?: string | null): any {
         const fallbackQuant = quant === "mq3" ? "mq4" : (quant === "mq4" ? "mq3" : null);
         const dirs = [
           dirname(path),
-          DRAFTS_DIR,
           `${process.cwd()}/models`,
           `${process.cwd()}/../../models`,
-          MODELS_DIR,
+          `${homedir()}/.hipfire/models`,
         ];
         const candidates: string[] = [];
         for (const d of dirs) {
@@ -559,7 +555,12 @@ function buildLoadMessage(path: string, tag?: string | null): any {
   // glob-style fallback for `<model>.triattn*.bin` next to the weights for
   // sidecars dropped manually.
   let autoAttachedSidecar: string | null = null;
+  // HIPFIRE_CASK_OFF=1 is an ops escape hatch: forces no auto-attach
+  // regardless of per-model/global config, so a missing/dangling sidecar
+  // can never fatally crash serve load. Pairs with cask_auto_attach=false.
+  const caskForcedOff = process.env.HIPFIRE_CASK_OFF === "1";
   if (
+    !caskForcedOff &&
     (!resolved.cask_sidecar || resolved.cask_sidecar.length === 0) &&
     !isA3B &&
     resolved.cask_auto_attach !== false
@@ -567,28 +568,18 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     const modelDir = path.includes("/") ? path.substring(0, path.lastIndexOf("/")) : MODELS_DIR;
     const entry = tag ? REGISTRY[resolveModelTag(tag)] : undefined;
     if (entry?.triattn?.file) {
-      for (const dir of [modelDir, TRIATTN_DIR]) {
-        const candidate = join(dir, entry.triattn.file);
-        if (existsSync(candidate)) {
-          autoAttachedSidecar = candidate;
-          break;
-        }
-      }
+      const candidate = join(modelDir, entry.triattn.file);
+      if (existsSync(candidate)) autoAttachedSidecar = candidate;
     }
     if (!autoAttachedSidecar) {
       // Fallback: scan modelDir for `<basename>.triattn*.bin`. Catches
       // hand-installed sidecars not in the registry.
-      const baseName = basename(path);
-      for (const dir of [modelDir, TRIATTN_DIR]) {
-        try {
-          const entries = readdirSync(dir);
-          const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
-          if (m) {
-            autoAttachedSidecar = join(dir, m);
-            break;
-          }
-        } catch { /* dir read failures are fine — try the next dir */ }
-      }
+      try {
+        const baseName = basename(path);
+        const entries = readdirSync(modelDir);
+        const m = entries.find(e => e.startsWith(baseName + ".triattn") && e.endsWith(".bin"));
+        if (m) autoAttachedSidecar = join(modelDir, m);
+      } catch { /* dir read failures are fine — fall through to no auto-attach */ }
     }
   }
   if (autoAttachedSidecar) {
@@ -646,6 +637,7 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     params.prefill_recent = resolved.prefill_recent;
     params.prefill_block = resolved.prefill_block;
     params.prefill_drafter = resolved.prefill_drafter;
+    params.prefill_drafter_device = resolved.prefill_drafter_device;
     params.prefill_profile = resolved.prefill_profile;
     params.prefill_sparse_threshold = resolved.prefill_sparse_threshold;
   } else if (resolved.prefill_compression !== "off") {
@@ -693,6 +685,13 @@ interface ModelEntry {
   /// auto-attached — see feedback_a3b_r_not_acceptable.md (R̄≈0.36–0.39 +
   /// eviction = confident-wrong hallucination on multi-turn).
   triattn?: { file: string };
+  /// Optional published MTP (Multi-Token Prediction) sidecar — currently
+  /// DeepSeek V4 only. When set, `hipfire pull` also fetches the file next
+  /// to the weights. The daemon's V4F arm auto-discovers the sidecar via
+  /// the `<stem>-mtp.<ext>` sibling convention at load time (see
+  /// `crates/hipfire-arch-deepseek4/src/arch.rs`), so no explicit env var
+  /// is required once the file is in MODELS_DIR.
+  mtp?: { file: string };
 }
 
 // Registry data lives in cli/registry.json. The CLI is bundled as a single
@@ -1011,80 +1010,6 @@ async function runViaHttp(
   return true;
 }
 
-type ServeRequestSummary = {
-  ts: string;
-  event: "request_done";
-  id: string;
-  method: string;
-  path: string;
-  status: number;
-  model: string;
-  stream: boolean;
-  duration_ms: number;
-  finish_reason?: string | null;
-  error?: string | null;
-  prompt_tokens?: number | null;
-  completion_tokens?: number | null;
-  total_tokens?: number | null;
-  max_tokens?: number | null;
-  ttft_ms?: number | null;
-  prefill_ms?: number | null;
-  prefill_tok_s?: number | null;
-  decode_tok_s?: number | null;
-  tok_s?: number | null;
-  vram_used_mb?: number | null;
-  vram_free_mb?: number | null;
-  vram_total_mb?: number | null;
-};
-
-function finiteNumber(v: any): number | null {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
-}
-
-function metric(v: any, decimals = 0): string {
-  const n = finiteNumber(v);
-  if (n === null) return "na";
-  return decimals > 0 ? n.toFixed(decimals) : String(Math.round(n));
-}
-
-function statusForDaemonError(message: string | null | undefined): number {
-  const err = String(message || "").toLowerCase();
-  if (err.includes("maximum size") || err.includes("exceeds maximum")) return 413;
-  if (err.includes("no vision encoder") || err.includes("unsupported image format")
-    || err.includes("image dimensions") || err.includes("failed to decode base64")
-    || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget")) {
-    return 400;
-  }
-  return 500;
-}
-
-function logServeRequest(summary: ServeRequestSummary) {
-  try {
-    mkdirSync(HIPFIRE_DIR, { recursive: true });
-    appendFileSync(SERVE_REQUEST_LOG_FILE, JSON.stringify(summary) + "\n");
-  } catch {}
-
-  const line = [
-    summary.ts,
-    summary.event,
-    `id=${summary.id}`,
-    `model=${summary.model || "unknown"}`,
-    `status=${summary.status}`,
-    `stream=${summary.stream ? 1 : 0}`,
-    `finish=${summary.finish_reason || (summary.error ? "error" : "unknown")}`,
-    `ttft_ms=${metric(summary.ttft_ms, 1)}`,
-    `prompt_tok=${metric(summary.prompt_tokens)}`,
-    `reply_tok=${metric(summary.completion_tokens)}`,
-    `prefill_tps=${metric(summary.prefill_tok_s, 1)}`,
-    `decode_tps=${metric(summary.decode_tok_s, 1)}`,
-    `vram_used_mb=${metric(summary.vram_used_mb)}`,
-    `vram_free_mb=${metric(summary.vram_free_mb)}`,
-    `dur_ms=${metric(summary.duration_ms)}`,
-  ].join(" ");
-  console.log(line);
-}
-
 // ─── Daemon IPC ─────────────────────────────────────────
 
 class Engine {
@@ -1324,6 +1249,36 @@ async function pull(tag: string): Promise<string> {
     }
   }
 
+  // MTP sidecar: same pattern as TriAttention. Daemon auto-attaches via the
+  // `<stem>-mtp.<ext>` sibling convention (see arch-deepseek4/src/arch.rs);
+  // missing sidecar = plain decode only, no spec-decode.
+  if (entry.mtp?.file) {
+    const sidecarDest = join(MODELS_DIR, entry.mtp.file);
+    if (existsSync(sidecarDest)) {
+      console.error(`  MTP sidecar already present: ${entry.mtp.file}`);
+    } else {
+      const sidecarUrl = `${HF_BASE}/${entry.repo}/resolve/main/${entry.mtp.file}`;
+      console.error(`  Fetching MTP sidecar: ${entry.mtp.file}`);
+      try {
+        const sres = await fetch(sidecarUrl, { headers: hfHeaders() });
+        if (!sres.ok) {
+          console.error(`  WARN: MTP sidecar fetch failed (${sres.status} ${sres.statusText}) — base is usable; spec-decode unavailable until sidecar present.`);
+        } else {
+          const sTmp = sidecarDest + ".tmp";
+          const sWriter = Bun.file(sTmp).writer();
+          for await (const chunk of sres.body as AsyncIterable<Uint8Array>) sWriter.write(chunk);
+          await sWriter.end();
+          const { renameSync } = await import("fs");
+          renameSync(sTmp, sidecarDest);
+          const ssz = (statSync(sidecarDest).size / 1e9).toFixed(2);
+          console.error(`  Saved: ${sidecarDest} (${ssz}GB)`);
+        }
+      } catch (e) {
+        console.error(`  WARN: MTP sidecar fetch error: ${e} — non-fatal.`);
+      }
+    }
+  }
+
   return dest;
 }
 
@@ -1463,6 +1418,13 @@ async function serve(port: number, host: string) {
   // was allocated for — and reload instead of letting the daemon overrun.
   let currentMaxSeq: number | null = null;
   let modelHasVL = false;
+  // Architecture tag from the most recent daemon `loaded` event (e.g.
+  // "qwen2", "qwen35", "deepseek4"). Used to gate format-specific
+  // serve-side prompt construction — V4F's daemon path renders tools
+  // via DSML and reads multi-turn history from structured `messages`,
+  // so the legacy Hermes `<tools>` block injection and ChatML
+  // conversation rebuild both turn into off-distribution noise.
+  let currentArch: string | null = null;
 
   // Idle eviction: after `idle_timeout` seconds of no requests, unload the
   // model to free VRAM. Next request reloads it (one-shot cost). 0 disables.
@@ -1529,6 +1491,7 @@ async function serve(port: number, host: string) {
         current = warmPath;
         currentMaxSeq = warmLoadMsg.params.max_seq;
         modelHasVL = loadResult.vl === true;
+        currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         console.error(`[hipfire] warm-up complete`);
       }
     } catch (err: any) {
@@ -1580,44 +1543,6 @@ async function serve(port: number, host: string) {
       await acquireLock();
       let lockReleased = false;
       const safeRelease = () => { if (!lockReleased) { lockReleased = true; releaseLock(); } };
-      const requestStartMs = Date.now();
-      const reqId = `chatcmpl-${requestStartMs.toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-      let requestLogged = false;
-      let requestModelForLog = "unknown";
-      let requestStreamForLog = false;
-      const writeRequestLog = (patch: Partial<ServeRequestSummary>) => {
-        if (requestLogged) return;
-        requestLogged = true;
-        const promptTokens = finiteNumber(patch.prompt_tokens);
-        const completionTokens = finiteNumber(patch.completion_tokens);
-        logServeRequest({
-          ts: new Date().toISOString(),
-          event: "request_done",
-          id: reqId,
-          method: req.method,
-          path: url.pathname,
-          status: patch.status ?? 500,
-          model: patch.model || "unknown",
-          stream: patch.stream ?? false,
-          duration_ms: Date.now() - requestStartMs,
-          finish_reason: patch.finish_reason ?? null,
-          error: patch.error ?? null,
-          prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          total_tokens: finiteNumber(patch.total_tokens) ?? (
-            promptTokens !== null && completionTokens !== null ? promptTokens + completionTokens : null
-          ),
-          max_tokens: finiteNumber(patch.max_tokens),
-          ttft_ms: finiteNumber(patch.ttft_ms),
-          prefill_ms: finiteNumber(patch.prefill_ms),
-          prefill_tok_s: finiteNumber(patch.prefill_tok_s),
-          decode_tok_s: finiteNumber(patch.decode_tok_s),
-          tok_s: finiteNumber(patch.tok_s),
-          vram_used_mb: finiteNumber(patch.vram_used_mb),
-          vram_free_mb: finiteNumber(patch.vram_free_mb),
-          vram_total_mb: finiteNumber(patch.vram_total_mb),
-        });
-      };
 
       // If a previous generation was interrupted (client disconnect), drain
       // remaining daemon output before sending new commands.
@@ -1631,14 +1556,40 @@ async function serve(port: number, host: string) {
 
       try {
         const body = (await req.json()) as any;
-        requestModelForLog = body.model || "default";
-        requestStreamForLog = body.stream === true;
         const messages: any[] = body.messages || [];
         const tools: any[] = body.tools || [];
 
-        // OpenAI API is stateless: each request has the full conversation.
-        // Reset daemon state so prior requests don't bleed into this one.
-        await e.send({ type: "reset" }); await e.recv();
+        // Opt-in request-body dump. Lets an operator see the full
+        // prompt a client (e.g. Pi) is sending without having to attach
+        // a strace. Off by default — gigantic for typical agent prompts.
+        if (process.env.HIPFIRE_DUMP_REQUEST === "1") {
+          try {
+            const path = `/tmp/hipfire-request-${Date.now()}.json`;
+            require("fs").writeFileSync(path, JSON.stringify(body, null, 2));
+            console.error(`[hipfire] dumped request → ${path} (msgs=${messages.length} tools=${tools.length} stream=${body.stream})`);
+          } catch (e: any) {
+            console.error(`[hipfire] request dump failed: ${e?.message ?? e}`);
+          }
+        }
+
+        // OpenAI API is stateless: each request CARRIES the full
+        // conversation. For most archs we tell the daemon to reset
+        // here so prior turn KV doesn't bleed into this one.
+        //
+        // V4F is the exception. Its daemon arm runs LCP detection
+        // (Reasonix-style prefix caching): if the freshly-tokenized
+        // prompt fully extends `m.conversation_tokens` from the prior
+        // turn, the daemon skips prefill for the matching prefix and
+        // only prefills the suffix — exactly the cache-hit shape
+        // Reasonix engineers for upstream. Calling `reset` here clears
+        // `m.conversation_tokens` and forces lcp=0 every turn, which
+        // is correct stateless behavior but throws away the cache.
+        // Skip the reset for V4F and let the daemon's auto-LCP
+        // (with a strict "fully extends" guard for SWA-ring safety)
+        // decide whether this is a continuation or a fresh request.
+        if (currentArch !== "deepseek4") {
+          await e.send({ type: "reset" }); await e.recv();
+        }
 
         // Build prompt from messages with proper role handling
         let systemPrompt = "";
@@ -1652,6 +1603,15 @@ async function serve(port: number, host: string) {
         // Image parts are filtered out (no vision encoder in serve path);
         // matches the daemon's existing text-only behaviour.
         const extractContent = (content: any): { text: string, images: string[], unsupportedImage: boolean, malformedImage: boolean } => {
+          // OpenAI assistant messages carrying only `tool_calls` send
+          // `content: null`. Returning `String(null) === "null"` here
+          // (the legacy fallback below) leaked the literal text `null`
+          // into the rendered prompt — V4F prompt dumps showed this as
+          // `<｜Assistant｜>null<｜end▁of▁sentence｜>` for every prior
+          // tool-call turn, which the model reads as "the assistant
+          // previously said the word null", not as an empty turn.
+          // Treat null/undefined as empty content.
+          if (content == null) return { text: "", images: [], unsupportedImage: false, malformedImage: false };
           if (typeof content === "string") return { text: content, images: [], unsupportedImage: false, malformedImage: false };
           if (Array.isArray(content)) {
             const textParts: string[] = [];
@@ -1759,15 +1719,14 @@ async function serve(port: number, host: string) {
         const sysMsg = messages.find((m: any) => m.role === "system" || m.role === "developer");
         if (sysMsg) systemPrompt = extractText(sysMsg.content);
 
-        // Format tools into system prompt (Hermes format)
-        if (tools.length > 0) {
-          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
-            + tools.map((t: any) => JSON.stringify(t)).join("\n")
-            + "\n</tools>\n\n"
-            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
-            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
-          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
-        }
+        // The legacy Hermes `<tools>` block injection happens LATER, after
+        // the model has actually been loaded/reloaded and `currentArch` is
+        // known to reflect the target model — not the pre-warmed one. See
+        // the post-reload site below for the actual append. We can't add
+        // it here because a request that triggers a reload to a different
+        // arch would flip the rule under our feet (e.g. pre-warmed V4F,
+        // requested Qwen35: at this point currentArch is still "deepseek4"
+        // and we'd skip the Hermes block — but Qwen35 needs it).
 
         // Build conversation as multi-turn ChatML prompt.
         // The daemon wraps the prompt as: <|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n
@@ -1793,13 +1752,6 @@ async function serve(port: number, host: string) {
         // an aggregate across the conversation. Helper unifies the
         // safeRelease + Response.json shape.
         const rejectImage = (message: string) => {
-          writeRequestLog({
-            status: 400,
-            model: body.model || "default",
-            stream: body.stream === true,
-            finish_reason: "error",
-            error: message,
-          });
           safeRelease();
           return Response.json(
             { error: { message, type: "invalid_request_error" } },
@@ -1868,19 +1820,13 @@ async function serve(port: number, host: string) {
           }
         }
         userPrompt = convParts.join("");
+        // V4F-specific override of `userPrompt` (collapse to live user
+        // message only) ALSO happens after the reload check below —
+        // same reasoning as the Hermes block: `currentArch` may change
+        // if the request triggers a reload, so we can't gate on it yet.
 
         const rawPath = findModel(body.model || "default");
-        if (!rawPath) {
-          writeRequestLog({
-            status: 404,
-            model: body.model || "default",
-            stream: body.stream === true,
-            finish_reason: "error",
-            error: "model not found",
-          });
-          safeRelease();
-          return Response.json({ error: "model not found" }, { status: 404 });
-        }
+        if (!rawPath) { safeRelease(); return Response.json({ error: "model not found" }, { status: 404 }); }
         // Normalize to avoid spurious reloads when registry vs fuzzy search give different paths
         const path = resolve(rawPath);
 
@@ -1910,22 +1856,58 @@ async function serve(port: number, host: string) {
             current = null;
             currentMaxSeq = null;
             modelHasVL = false;
-            writeRequestLog({
-              status: 500,
-              model: body.model || "default",
-              stream: body.stream === true,
-              max_tokens: requestMaxTokens,
-              finish_reason: "error",
-              error: `model load failed: ${loadResult.message}`,
-            });
             safeRelease();
             return Response.json({ error: `model load failed: ${loadResult.message}` }, { status: 500 });
           }
           current = path;
           currentMaxSeq = loadMsg.params.max_seq;
           modelHasVL = loadResult.vl === true;
+          currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
         }
 
+        // Now that currentArch reflects the model we're ACTUALLY sending
+        // to (post-reload), apply the arch-conditional prompt shaping.
+        //
+        // 1. Hermes `<tools>` block in systemPrompt: legacy daemon paths
+        //    (Qwen2 generate) only see tools through prompt text and rely
+        //    on this block. V4F (`generate_deepseek4`) builds its own
+        //    DSML tools preamble from the structured `tools` field, so
+        //    injecting Hermes on top gives the model two conflicting
+        //    tool-call format contracts (observed verbatim in
+        //    /tmp/hipfire-prompt-*.txt). Skip for V4F.
+        if (tools.length > 0 && currentArch !== "deepseek4") {
+          const toolsBlock = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n"
+            + tools.map((t: any) => JSON.stringify(t)).join("\n")
+            + "\n</tools>\n\n"
+            + 'If you choose to call a function ONLY reply in the following format with NO suffix:\n\n'
+            + '<tool_call>\n{"name": "example_function", "arguments": {"param": "value"}}\n</tool_call>';
+          systemPrompt = systemPrompt ? systemPrompt + "\n\n" + toolsBlock : toolsBlock;
+        }
+
+        // 2. `userPrompt` content: V4F's daemon path reads multi-turn
+        //    history from the structured `messages` field and treats
+        //    `prompt` as the live user input. Leaving `userPrompt` set to
+        //    the ChatML rebuild of the conversation causes the daemon to
+        //    render history twice — once in V4F tokens from `messages`,
+        //    once in ChatML tokens from `prompt`. Replace with just the
+        //    trailing user message (or "" when conversation ends with a
+        //    tool/assistant turn — daemon then continues from
+        //    `<｜Assistant｜>` directly).
+        //
+        //    Legacy arches (Qwen2 in particular) ignore the structured
+        //    `messages` field and ONLY read `prompt` — they NEED the
+        //    full ChatML rebuild for multi-turn to survive. Don't touch.
+        if (currentArch === "deepseek4") {
+          const last = nonSystem.length > 0 ? nonSystem[nonSystem.length - 1] : null;
+          if (last && last.role === "user") {
+            const lastContent = extractContent(last.content);
+            userPrompt = lastContent.text;
+          } else {
+            userPrompt = "";
+          }
+        }
+
+        const reqId = `chatcmpl-${Date.now().toString(36)}`;
         const created = Math.floor(Date.now() / 1000);
         const modelName = body.model || "hipfire";
         // Fall back to the user's configured defaults (global or per-model) when
@@ -1963,9 +1945,40 @@ async function serve(port: number, host: string) {
         const enableThinking: boolean | null = typeof ctk.enable_thinking === "boolean" ? ctk.enable_thinking : null;
         const preserveThinking: boolean = ctk.preserve_thinking === true;
 
-        // Include usage 
+        // Include usage
         // https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events
         const includeUsage = (body.stream_options && body?.stream_options?.include_usage && body?.stream_options?.include_usage === true);
+
+        // Build the OpenAI-format `usage` object. The V4F daemon arm
+        // emits `prompt_tokens` (full client-visible prompt size) and
+        // `cached_tokens` (LCP-hit count from the prefix cache) as
+        // separate fields; legacy arches only emit `prefill_tokens`
+        // (== the number of tokens actually fed through the forward
+        // path) and we fall back to that for `prompt_tokens` so the
+        // total still balances on those paths.
+        //
+        // `usage.prompt_tokens_details.cached_tokens` is the OpenAI
+        // surface DeepSeek / pi-coding-agent / OpenCode read for
+        // cache-hit accounting; we emit it whenever the daemon
+        // reports cached_tokens > 0 (V4F today; other archs when /
+        // if they grow LCP detection).
+        const buildUsage = (msg: any, completion: number) => {
+          const promptTokens: number = typeof msg.prompt_tokens === "number"
+            ? msg.prompt_tokens
+            : (typeof msg.prefill_tokens === "number" ? msg.prefill_tokens : 0);
+          const cachedTokens: number = typeof msg.cached_tokens === "number"
+            ? msg.cached_tokens
+            : 0;
+          const usage: any = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completion,
+            total_tokens: promptTokens + completion,
+          };
+          if (cachedTokens > 0) {
+            usage.prompt_tokens_details = { cached_tokens: cachedTokens };
+          }
+          return usage;
+        };
 
         // OpenAI o1/o3-style `reasoning.effort` (none / minimal / low /
         // medium / high / xhigh). Open WebUI, OpenCode, and pi-coding-agent
@@ -2033,14 +2046,6 @@ async function serve(port: number, host: string) {
 
         if (requestImages.length === 1) {
           if (!modelHasVL) {
-            writeRequestLog({
-              status: 400,
-              model: modelName,
-              stream: body.stream === true,
-              max_tokens: requestMaxTokens,
-              finish_reason: "error",
-              error: "model has no vision encoder",
-            });
             safeRelease();
             return Response.json(
               { error: { message: "model has no vision encoder", type: "invalid_request_error" } },
@@ -2306,6 +2311,13 @@ async function serve(port: number, host: string) {
                 let stripNextLeadingNl = false;
                 // When tools are present, accumulate full output for tool-call parsing
                 let accumulated = hasTool ? "" : null;
+                // V4F arm emits structured `tool_calls` events via the DSML
+                // StreamParser BEFORE the `done` event lands. We track that
+                // here so the done handler can finish with
+                // `finish_reason: "tool_calls"` instead of falling back to
+                // `"stop"` (OpenAI spec — Pi / OpenCode use this signal to
+                // decide whether the message ended with a callable action).
+                let structuredToolCallsEmitted = false;
                 for await (const msg of e.generate(genParams)) {
                   if (streamCancelled) continue; // drain remaining tokens, don't enqueue
                   if (msg.type === "token") {
@@ -2355,15 +2367,80 @@ async function serve(port: number, host: string) {
                       })}\n\n`));
                       visibleChunkSent = true;
                     }
+                  } else if (msg.type === "reasoning") {
+                    // V4F daemon arm emits structured `reasoning` events
+                    // from the DSML StreamParser; `<think>` / `</think>`
+                    // have already been stripped server-side. Forward as
+                    // OpenAI-compatible `reasoning_content` delta.
+                    const rtext = msg.text as string;
+                    if (rtext) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: { reasoning_content: rtext }, finish_reason: null }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                    }
+                  } else if (msg.type === "tool_calls") {
+                    // V4F daemon arm emits structured `tool_calls` events
+                    // from the DSML StreamParser. Convert each call into
+                    // an OpenAI-format tool_call SSE delta. We emit one
+                    // SSE chunk per call so order is preserved; each call
+                    // gets a synthetic `call_<index>` id.
+                    const calls = Array.isArray(msg.calls) ? msg.calls : [];
+                    for (let i = 0; i < calls.length; i++) {
+                      const c = calls[i] as { name: string; arguments: unknown };
+                      const argStr = typeof c.arguments === "string"
+                        ? c.arguments
+                        : JSON.stringify(c.arguments);
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{
+                          index: 0,
+                          delta: {
+                            tool_calls: [{
+                              index: i,
+                              id: `call_${reqId}_${i}`,
+                              type: "function",
+                              function: { name: c.name, arguments: argStr }
+                            }]
+                          },
+                          finish_reason: null
+                        }]
+                      })}\n\n`));
+                      visibleChunkSent = true;
+                      structuredToolCallsEmitted = true;
+                    }
                   } else if (msg.type === "done") {
                     // Every path below enqueues at least the [DONE] sentinel.
                     visibleChunkSent = true;
-                    let finishReason = "stop";
+                    // Daemon-authoritative finish_reason (V4F sets it
+                    // from the decode-loop exit condition). Falls back
+                    // to "stop" when an older daemon build didn't carry
+                    // the field, preserving legacy behaviour for the
+                    // Qwen35 / LLaMA / Qwen2 arches that don't yet emit
+                    // it. Only "stop" | "length" | "tool_calls" are
+                    // OpenAI-valid; clamp anything else to "stop".
+                    const allowedFR = new Set(["stop", "length", "tool_calls"]);
+                    const daemonFR: string | null = typeof (msg as any).finish_reason === "string" && allowedFR.has((msg as any).finish_reason)
+                      ? (msg as any).finish_reason
+                      : null;
+                    // V4F-style: structured tool_calls already emitted on the
+                    // wire. Skip the legacy text-buffer parser path and close
+                    // out with the OpenAI-correct `finish_reason: "tool_calls"`.
+                    if (structuredToolCallsEmitted) {
+                      ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
+                        id: reqId, object: "chat.completion.chunk", created, model: modelName,
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
+                      })}\n\n`));
+                      ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
+                      ctrl.close();
+                      return;
+                    }
                     // When tools are present, parse accumulated text for tool calls
                     if (accumulated !== null) {
                       const parsed = parseToolCalls(accumulated);
                       if (parsed.tool_calls) {
-                        finishReason = "tool_calls";
                         if (parsed.content) {
                           ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                             id: reqId, object: "chat.completion.chunk", created, model: modelName,
@@ -2378,8 +2455,8 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "tool_calls" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       } else {
                         if (accumulated) {
@@ -2390,37 +2467,19 @@ async function serve(port: number, host: string) {
                         }
                         ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                           id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                          ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                          choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                          ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         })}\n\n`));
                       }
                     } else {
                       const { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms } = msg;
                       ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                         id: reqId, object: "chat.completion.chunk", created, model: modelName,
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                        ...includeUsage && { usage: { prompt_tokens: msg.prefill_tokens, completion_tokens: completionTokens, total_tokens: (msg.prefill_tokens ?? 0) + completionTokens } },
+                        choices: [{ index: 0, delta: {}, finish_reason: daemonFR ?? "stop" }],
+                        ...includeUsage && { usage: buildUsage(msg, completionTokens) },
                         timings: { tokens, tok_s, prefill_tokens, prefill_ms, prefill_tok_s, decode_tok_s, ttft_ms }
                       })}\n\n`));
                     }
-                    writeRequestLog({
-                      status: 200,
-                      model: modelName,
-                      stream: true,
-                      max_tokens: requestMaxTokens,
-                      finish_reason: finishReason,
-                      prompt_tokens: msg.prefill_tokens,
-                      completion_tokens: completionTokens,
-                      total_tokens: (msg.prefill_tokens ?? 0) + completionTokens,
-                      ttft_ms: msg.ttft_ms,
-                      prefill_ms: msg.prefill_ms,
-                      prefill_tok_s: msg.prefill_tok_s,
-                      decode_tok_s: msg.decode_tok_s,
-                      tok_s: msg.tok_s,
-                      vram_used_mb: msg.vram_used_mb,
-                      vram_free_mb: msg.vram_free_mb,
-                      vram_total_mb: msg.vram_total_mb,
-                    });
                     ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
                     ctrl.close();
                     return;
@@ -2431,15 +2490,6 @@ async function serve(port: number, host: string) {
                     // normal zero-token "stop" — otherwise clients can't tell a
                     // real failure from a model that just produced no output.
                     const errMsg = msg.message || "generation failed";
-                    writeRequestLog({
-                      status: statusForDaemonError(errMsg),
-                      model: modelName,
-                      stream: true,
-                      max_tokens: requestMaxTokens,
-                      finish_reason: "error",
-                      error: errMsg,
-                      completion_tokens: completionTokens,
-                    });
                     ctrl.enqueue(enc.encode(`data: ${JSON.stringify({
                       error: { message: errMsg, type: "invalid_request_error" }
                     })}\n\n`));
@@ -2453,17 +2503,6 @@ async function serve(port: number, host: string) {
               } finally {
                 clearInterval(heartbeat);
                 e.generating = false;
-                if (streamCancelled) {
-                  writeRequestLog({
-                    status: 499,
-                    model: modelName,
-                    stream: true,
-                    max_tokens: requestMaxTokens,
-                    finish_reason: "cancelled",
-                    error: "client disconnected",
-                    completion_tokens: completionTokens,
-                  });
-                }
                 safeRelease();
               }
             },
@@ -2474,13 +2513,70 @@ async function serve(port: number, host: string) {
         let content = "";
         let completionTokens = 0;
         let promptTokens = 0;
+        let cachedTokens = 0;
         let daemonError: string | null = null;
-        let doneMsg: any = null;
         e.generating = true;
+        // V4F arm emits structured `tool_calls` events from the DSML
+        // StreamParser. Capture them here so the non-streaming chat-
+        // completion response can carry an OpenAI-format `tool_calls`
+        // array on the assistant message. Without this, the non-stream
+        // path falls back to `parseToolCalls(content)` on the
+        // (typically empty) accumulated text and returns
+        // `finish_reason: "stop"` with a missing `tool_calls` field.
+        let structuredToolCalls: any[] | null = null;
+        // Name-shadowing avoidance: the outer scope has `reasoning`
+        // bound to the request-level reasoning *config* (effort, etc.).
+        // Use `reasoningContent` for the accumulated `<think>…</think>`
+        // body that surfaces under `message.reasoning_content` below.
+        let reasoningContent = "";
+        let daemonFinishReason: string | null = null;
         for await (const msg of e.generate(genParams)) {
           if (msg.type === "token") { content += msg.text; completionTokens++; }
-          else if (msg.type === "done") { doneMsg = msg; promptTokens = msg.prefill_tokens ?? 0; }
+          else if (msg.type === "reasoning") {
+            // V4F's StreamParser splits `<think>…</think>` content out
+            // as `reasoning` events. Accumulate so the non-stream chat
+            // completion response can surface it under
+            // `message.reasoning_content` — without this the reasoning
+            // text was silently dropped on every think-mode V4F turn.
+            if (typeof msg.text === "string") reasoningContent += msg.text;
+          }
+          else if (msg.type === "done") {
+            // `prompt_tokens` is the full client-visible prompt size
+            // (V4F emits it). `prefill_tokens` (legacy) is what
+            // actually went through forward — equal to prompt when
+            // cached_tokens is 0. Fall back to prefill_tokens so the
+            // non-V4F paths keep their existing accounting.
+            promptTokens = typeof msg.prompt_tokens === "number"
+              ? msg.prompt_tokens
+              : (msg.prefill_tokens ?? 0);
+            cachedTokens = typeof msg.cached_tokens === "number"
+              ? msg.cached_tokens
+              : 0;
+            // V4F daemon emits an authoritative finish_reason. Only
+            // accept the three OpenAI-valid values; anything else falls
+            // back to the legacy inference below.
+            if (msg.finish_reason === "stop" || msg.finish_reason === "length" || msg.finish_reason === "tool_calls") {
+              daemonFinishReason = msg.finish_reason;
+            }
+          }
           else if (msg.type === "error") { daemonError = msg.message || "generation failed"; }
+          else if (msg.type === "tool_calls") {
+            const calls = Array.isArray((msg as any).calls) ? (msg as any).calls : [];
+            if (calls.length > 0) {
+              if (structuredToolCalls === null) structuredToolCalls = [];
+              for (let i = 0; i < calls.length; i++) {
+                const c = calls[i] as { name: string; arguments: unknown };
+                const argStr = typeof c.arguments === "string"
+                  ? c.arguments
+                  : JSON.stringify(c.arguments);
+                structuredToolCalls.push({
+                  id: `call_${reqId}_${structuredToolCalls.length}`,
+                  type: "function",
+                  function: { name: c.name, arguments: argStr }
+                });
+              }
+            }
+          }
         }
         e.generating = false;
 
@@ -2489,18 +2585,14 @@ async function serve(port: number, host: string) {
         // returning a 200 with empty content — otherwise a client that sent a
         // too-large request can't distinguish failure from a zero-token reply.
         if (daemonError) {
-          const status = statusForDaemonError(daemonError);
-          writeRequestLog({
-            status,
-            model: modelName,
-            stream: false,
-            max_tokens: requestMaxTokens,
-            finish_reason: "error",
-            error: daemonError,
-            prompt_tokens: promptTokens,
-            completion_tokens: completionTokens,
-          });
           safeRelease();
+          let status = 500;
+          const err = daemonError.toLowerCase();
+          if (err.includes("maximum size") || err.includes("exceeds maximum")) status = 413;
+          else if (err.includes("no vision encoder") || err.includes("unsupported image format")
+            || err.includes("image dimensions") || err.includes("failed to decode base64")
+            || err.includes("failed to decode image") || err.includes("exceeds loaded kv budget"))
+            status = 400;
           return Response.json(
             { error: { message: daemonError, type: "invalid_request_error" } },
             { status }
@@ -2530,51 +2622,62 @@ async function serve(port: number, host: string) {
           console.error(`[hipfire] ${reqId}: ${thinkWarning} — ${completionTokens} tokens consumed, all inside unclosed <think> block`);
         }
 
-        // Check for tool calls in response
-        const parsed = parseToolCalls(content);
-        const choice: any = { index: 0, finish_reason: parsed.tool_calls ? "tool_calls" : "stop" };
-        if (parsed.tool_calls) {
-          choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+        // Tool calls. V4F arm yields them as structured events (captured
+        // above into `structuredToolCalls`); legacy arches embed them as
+        // text the parser extracts. Prefer the structured source when it
+        // emitted anything.
+        const choice: any = { index: 0 };
+        if (structuredToolCalls && structuredToolCalls.length > 0) {
+          // V4F's `Token` events outside the `<｜DSML｜tool_calls>` block
+          // already streamed any preceding assistant text. Pass that
+          // through as the message content (trimmed — the model
+          // typically emits trailing `\n\n` after closing `</think>`).
+          choice.finish_reason = daemonFinishReason ?? "tool_calls";
+          choice.message = {
+            role: "assistant",
+            content: content.trim() || null,
+            tool_calls: structuredToolCalls,
+          };
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         } else {
-          choice.message = { role: "assistant", content };
+          const parsed = parseToolCalls(content);
+          // Prefer the daemon's authoritative finish_reason (V4F).
+          // Fall back to the legacy inference: "tool_calls" if the
+          // text parser found inline tool calls, otherwise "stop" —
+          // but if the daemon told us "length" (max_tokens hit), use
+          // that even when there's no tool call, so clients can
+          // detect truncated replies.
+          choice.finish_reason = daemonFinishReason
+            ?? (parsed.tool_calls ? "tool_calls" : "stop");
+          if (parsed.tool_calls) {
+            choice.message = { role: "assistant", content: parsed.content, tool_calls: parsed.tool_calls };
+          } else {
+            choice.message = { role: "assistant", content };
+          }
+          if (reasoningContent) choice.message.reasoning_content = reasoningContent;
         }
-        writeRequestLog({
-          status: 200,
-          model: modelName,
-          stream: false,
-          max_tokens: requestMaxTokens,
-          finish_reason: choice.finish_reason,
-          prompt_tokens: promptTokens,
-          completion_tokens: completionTokens,
-          total_tokens: promptTokens + completionTokens,
-          ttft_ms: doneMsg?.ttft_ms,
-          prefill_ms: doneMsg?.prefill_ms,
-          prefill_tok_s: doneMsg?.prefill_tok_s,
-          decode_tok_s: doneMsg?.decode_tok_s,
-          tok_s: doneMsg?.tok_s,
-          vram_used_mb: doneMsg?.vram_used_mb,
-          vram_free_mb: doneMsg?.vram_free_mb,
-          vram_total_mb: doneMsg?.vram_total_mb,
-        });
 
         safeRelease();
         const responseBody: any = {
           id: reqId, object: "chat.completion", created, model: modelName,
           choices: [choice],
-          usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens }
+          usage: (() => {
+            const u: any = {
+              prompt_tokens: promptTokens,
+              completion_tokens: completionTokens,
+              total_tokens: promptTokens + completionTokens,
+            };
+            if (cachedTokens > 0) {
+              u.prompt_tokens_details = { cached_tokens: cachedTokens };
+            }
+            return u;
+          })(),
         };
         if (thinkWarning) {
           responseBody.x_hipfire_warning = thinkWarning;
         }
         return Response.json(responseBody);
       } catch (err: any) {
-        writeRequestLog({
-          status: 500,
-          model: requestModelForLog,
-          stream: requestStreamForLog,
-          finish_reason: "error",
-          error: err?.message || "internal error",
-        });
         safeRelease();
         return Response.json({ error: err?.message || "internal error" }, { status: 500 });
       }
@@ -2795,16 +2898,17 @@ async function quantize(input: string, opts: QuantizeOpts): Promise<void> {
 
   // Optional: append a local user-alias so the custom tag is addressable.
   if (opts.register) {
+    const aliasPath = join(HIPFIRE_DIR, "models.json");
+    let aliases: Record<string, any> = {};
+    try { aliases = JSON.parse(require("fs").readFileSync(aliasPath, "utf-8")); } catch {}
     const primary = produced.find(p => p.format === "mq4") ?? produced[0];
-    const catalog = refreshModelsCatalog({ write: false });
-    catalog.aliases[opts.register] = {
+    aliases[opts.register] = {
       repo: opts.uploadRepo ?? "",
       file: basename(primary.path),
       local_path: primary.path,
       registered_at: new Date().toISOString(),
     };
-    writeModelsCatalog(catalog);
-    refreshModelsCatalog();
+    require("fs").writeFileSync(aliasPath, JSON.stringify(aliases, null, 2) + "\n");
     console.error(`Registered ${opts.register} → ${basename(primary.path)}`);
     console.error(`  Try: hipfire run ${opts.register} "hello"`);
   }
@@ -2819,308 +2923,10 @@ interface UserAlias {
   registered_at?: string;
 }
 
-interface LocalModelRecord {
-  id: string;
-  file: string;
-  path: string;
-  size_bytes: number;
-  size_gb: number;
-  registry_tag?: string | null;
-  aliases?: string[];
-  chat_templates?: string[];
-  dflash_drafts?: string[];
-  triattn?: string[];
-  config?: PerModelOverride;
-}
-
-interface ModelsCatalog {
-  schema_version: 2;
-  updated_at: string;
-  aliases: Record<string, UserAlias>;
-  configs?: PerModelConfigs;
-  models: Record<string, LocalModelRecord>;
-}
-
-const MODEL_EXT_RE = /\.(hf4|hf6|hfq|mq3|mq4|mq6)$/i;
-
-function readJsonFile(path: string): any | null {
-  try {
-    const raw = readFileSync(path, "utf-8").trim();
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch { return null; }
-}
-
-function sanitizePerModelOverride(ov: any): PerModelOverride {
-  const clean: PerModelOverride = {};
-  if (!ov || typeof ov !== "object") return clean;
-  const src = { ...ov };
-  // Migrate legacy boolean mmq_screen -> tri-state.
-  if (typeof src.mmq_screen === "boolean") src.mmq_screen = src.mmq_screen ? "on" : "off";
-  for (const k of PER_MODEL_KEYS) {
-    const v = src[k];
-    if (v !== undefined && validateConfigValue(k, v)) (clean as any)[k] = v;
-  }
-  return clean;
-}
-
-function normalizeAliasMap(raw: any): Record<string, UserAlias> {
-  const aliases: Record<string, UserAlias> = {};
-  if (!raw || typeof raw !== "object") return aliases;
-  for (const [tag, value] of Object.entries(raw)) {
-    if (!value || typeof value !== "object") continue;
-    const v = value as any;
-    if (typeof v.file !== "string") continue;
-    aliases[tag] = {
-      repo: typeof v.repo === "string" ? v.repo : "",
-      file: v.file,
-      local_path: typeof v.local_path === "string" ? v.local_path : undefined,
-      registered_at: typeof v.registered_at === "string" ? v.registered_at : undefined,
-    };
-  }
-  return aliases;
-}
-
-function emptyModelsCatalog(aliases: Record<string, UserAlias> = {}): ModelsCatalog {
-  return {
-    schema_version: 2,
-    updated_at: new Date().toISOString(),
-    aliases,
-    configs: {},
-    models: {},
-  };
-}
-
-function loadModelsCatalog(): ModelsCatalog {
-  const raw = readJsonFile(MODELS_CATALOG_PATH);
-  if (raw?.schema_version === 2) {
-    return {
-      schema_version: 2,
-      updated_at: typeof raw.updated_at === "string" ? raw.updated_at : new Date().toISOString(),
-      aliases: normalizeAliasMap(raw.aliases),
-      configs: sanitizePerModelConfigs(raw.configs),
-      models: normalizeCatalogModels(raw.models),
-    };
-  }
-  // Legacy models.json was a flat alias map written by quantize --register.
-  return emptyModelsCatalog(normalizeAliasMap(raw));
-}
-
-function sanitizePerModelConfigs(raw: any): PerModelConfigs {
-  const out: PerModelConfigs = {};
-  if (!raw || typeof raw !== "object") return out;
-  for (const [tag, ov] of Object.entries(raw)) {
-    const clean = sanitizePerModelOverride(ov);
-    if (Object.keys(clean).length > 0) out[tag] = clean;
-  }
-  return out;
-}
-
-function normalizeCatalogModels(raw: any): Record<string, LocalModelRecord> {
-  const models: Record<string, LocalModelRecord> = {};
-  if (!raw || typeof raw !== "object") return models;
-  for (const [id, value] of Object.entries(raw)) {
-    if (!value || typeof value !== "object") continue;
-    const v = value as any;
-    if (typeof v.path !== "string" || typeof v.file !== "string") continue;
-    models[id] = {
-      id,
-      file: v.file,
-      path: v.path,
-      size_bytes: Number(v.size_bytes) || 0,
-      size_gb: Number(v.size_gb) || 0,
-      registry_tag: typeof v.registry_tag === "string" ? v.registry_tag : null,
-      aliases: Array.isArray(v.aliases) ? v.aliases.filter((x: any) => typeof x === "string") : [],
-      chat_templates: Array.isArray(v.chat_templates) ? v.chat_templates.filter((x: any) => typeof x === "string") : [],
-      dflash_drafts: Array.isArray(v.dflash_drafts) ? v.dflash_drafts.filter((x: any) => typeof x === "string") : [],
-      triattn: Array.isArray(v.triattn) ? v.triattn.filter((x: any) => typeof x === "string") : [],
-      config: sanitizePerModelOverride(v.config),
-    };
-    if (Object.keys(models[id].config ?? {}).length === 0) delete models[id].config;
-  }
-  return models;
-}
-
-function loadLegacyPerModelConfigsRaw(): Record<string, any> {
-  const raw = readJsonFile(PER_MODEL_CONFIG_PATH);
-  return raw && typeof raw === "object" ? raw : {};
-}
-
-function clearLegacyPerModelConfigs() {
-  try {
-    if (existsSync(PER_MODEL_CONFIG_PATH)) writeFileSync(PER_MODEL_CONFIG_PATH, "{}\n");
-  } catch {}
-}
-
-function writeModelsCatalog(catalog: ModelsCatalog) {
-  mkdirSync(HIPFIRE_DIR, { recursive: true });
-  catalog.schema_version = 2;
-  catalog.updated_at = new Date().toISOString();
-  const tmp = `${MODELS_CATALOG_PATH}.tmp`;
-  writeFileSync(tmp, JSON.stringify(catalog, null, 2) + "\n");
-  renameSync(tmp, MODELS_CATALOG_PATH);
-}
-
-function scanFiles(dir: string, pred: (name: string) => boolean): string[] {
-  try {
-    return readdirSync(dir)
-      .filter(pred)
-      .map(f => join(dir, f))
-      .filter(p => {
-        try { return statSync(p).isFile(); } catch { return false; }
-      })
-      .sort();
-  } catch { return []; }
-}
-
-function registryTagForFile(file: string): string | null {
-  const fNorm = file
-    .replace(/\.q4\.hfq$/i, ".hf4")
-    .replace(/\.hfq6\.hfq$/i, ".hf6")
-    .replace(/-hfq4\.hfq$/i, ".hf4")
-    .replace(/\.hfq$/i, ".hf4");
-  return Object.entries(REGISTRY).find(([_, e]) => e.file === file || e.file === fNorm)?.[0] ?? null;
-}
-
-function modelFamily(id: string): string | null {
-  const lower = id.toLowerCase();
-  const m = lower.match(/^(qwen3(?:\.[56])?|carnice|qwopus|gemma|mistral)/);
-  return m?.[1] ?? null;
-}
-
-function templateMatchesModel(templatePath: string, modelId: string): boolean {
-  const t = basename(templatePath).toLowerCase();
-  const tStem = t.replace(/\.(j2|jinja2|jinja)$/i, "");
-  const lowerId = modelId.toLowerCase();
-  const modelStem = lowerId.replace(/\.(hf4|hf6|hfq|mq3|mq4|mq6)$/i, "");
-  if (tStem === lowerId || tStem === modelStem) return true;
-  const family = modelFamily(modelId);
-  if (!family) return false;
-  return tStem === `${family}-chat_template`
-    || tStem === `${family}_chat_template`
-    || tStem === `${family}.chat_template`;
-}
-
-function draftMatchesModel(draftPath: string, modelId: string): boolean {
-  const d = basename(draftPath).toLowerCase();
-  if (!d.endsWith(".hfq")) return false;
-  const m = modelId.toLowerCase().match(/qwen3?\.?(5|6)[-_]?([^.]+)\.(mq3|mq4|mq6|hf4|hf6|hfq)/);
-  if (!m) return false;
-  return d.startsWith(`qwen3${m[1]}-${m[2].toLowerCase()}-dflash-`);
-}
-
-function triattnMatchesModel(sidecarPath: string, modelId: string): boolean {
-  const s = basename(sidecarPath).toLowerCase();
-  return s.startsWith(`${modelId.toLowerCase()}.triattn`) && s.endsWith(".bin");
-}
-
-function catalogModelIdForConfigKey(catalog: ModelsCatalog, key: string): string | null {
-  if (catalog.models[key]) return key;
-  const resolved = resolveModelTag(key);
-  for (const model of Object.values(catalog.models)) {
-    if (model.registry_tag === key || model.registry_tag === resolved) return model.id;
-    if ((model.aliases ?? []).includes(key) || (model.aliases ?? []).includes(resolved)) return model.id;
-  }
-  return null;
-}
-
-function refreshModelsCatalog(opts: { write?: boolean } = {}): ModelsCatalog {
-  const shouldWrite = opts.write !== false;
-  const previous = loadModelsCatalog();
-  const legacyConfigs = sanitizePerModelConfigs(loadLegacyPerModelConfigsRaw());
-  const catalog = emptyModelsCatalog(previous.aliases);
-  const templates = scanFiles(TEMPLATES_DIR, f => /\.(j2|jinja|jinja2)$/i.test(f));
-  const drafts = [
-    ...scanFiles(DRAFTS_DIR, f => f.toLowerCase().endsWith(".hfq")),
-    ...scanFiles(MODELS_DIR, f => /dflash/i.test(f) && f.toLowerCase().endsWith(".hfq")),
-  ];
-  const triattn = [
-    ...scanFiles(TRIATTN_DIR, f => f.toLowerCase().endsWith(".triattn.bin")),
-    ...scanFiles(MODELS_DIR, f => /\.triattn.*\.bin$/i.test(f)),
-  ];
-
-  const existingConfigs: PerModelConfigs = { ...(previous.configs ?? {}), ...legacyConfigs };
-  for (const [id, model] of Object.entries(previous.models ?? {})) {
-    if (model.config && Object.keys(model.config).length > 0) existingConfigs[id] = model.config;
-  }
-
-  const modelPaths = [
-    ...scanFiles(MODELS_DIR, f => MODEL_EXT_RE.test(f)),
-    ...scanFiles(resolve(__dirname, "../models"), f => MODEL_EXT_RE.test(f)),
-  ];
-  const seen = new Set<string>();
-  for (const path of modelPaths) {
-    const file = basename(path);
-    if (seen.has(file)) continue;
-    seen.add(file);
-    let st;
-    try { st = statSync(path); } catch { continue; }
-    const registryTag = registryTagForFile(file);
-    const aliases = Object.entries(catalog.aliases)
-      .filter(([_, a]) => {
-        if (a.local_path && resolve(a.local_path) === resolve(path)) return true;
-        return a.file === file;
-      })
-      .map(([tag]) => tag)
-      .sort();
-
-    const config =
-      sanitizePerModelOverride(existingConfigs[file])
-      || {};
-    const configCandidates = [file, registryTag, ...aliases].filter(Boolean) as string[];
-    let mergedConfig: PerModelOverride = {};
-    for (const key of configCandidates) {
-      mergedConfig = { ...mergedConfig, ...sanitizePerModelOverride(existingConfigs[key]) };
-    }
-    if (Object.keys(config).length > 0) mergedConfig = { ...mergedConfig, ...config };
-
-    const rec: LocalModelRecord = {
-      id: file,
-      file,
-      path: resolve(path),
-      size_bytes: st.size,
-      size_gb: Number((st.size / 1e9).toFixed(3)),
-      registry_tag: registryTag,
-      aliases,
-      chat_templates: templates.filter(t => templateMatchesModel(t, file)),
-      dflash_drafts: drafts.filter(d => draftMatchesModel(d, file)),
-      triattn: triattn.filter(s => triattnMatchesModel(s, file)),
-    };
-    if (Object.keys(mergedConfig).length > 0) rec.config = mergedConfig;
-    catalog.models[file] = rec;
-  }
-
-  const unresolved: PerModelConfigs = {};
-  for (const [key, ov] of Object.entries(existingConfigs)) {
-    if (!catalogModelIdForConfigKey(catalog, key)) {
-      const clean = sanitizePerModelOverride(ov);
-      if (Object.keys(clean).length > 0) unresolved[key] = clean;
-    }
-  }
-  catalog.configs = unresolved;
-
-  if (shouldWrite) {
-    try {
-      writeModelsCatalog(catalog);
-      if (Object.keys(legacyConfigs).length > 0) clearLegacyPerModelConfigs();
-    } catch {}
-  }
-  return catalog;
-}
-
-function catalogModelOptions(): string[] {
-  const catalog = loadModelsCatalog();
-  const values = new Set<string>();
-  for (const model of Object.values(catalog.models)) {
-    values.add(model.id);
-    if (model.registry_tag) values.add(model.registry_tag);
-    for (const alias of model.aliases ?? []) values.add(alias);
-  }
-  return [...values].sort();
-}
-
 function loadUserAliases(): Record<string, UserAlias> {
-  return loadModelsCatalog().aliases;
+  try {
+    return JSON.parse(require("fs").readFileSync(join(HIPFIRE_DIR, "models.json"), "utf-8"));
+  } catch { return {}; }
 }
 
 export function findModel(name: string): string | null {
@@ -3226,13 +3032,26 @@ export function findModel(name: string): string | null {
 
 function listLocal() {
   const models: { name: string; tag: string; size: string }[] = [];
-  const catalog = loadModelsCatalog();
-  for (const model of Object.values(catalog.models).sort((a, b) => a.id.localeCompare(b.id))) {
-    models.push({
-      name: model.id,
-      tag: model.registry_tag ?? "",
-      size: `${(model.size_bytes / 1e9).toFixed(1)}GB`,
-    });
+  const seen = new Set<string>();
+  for (const dir of [MODELS_DIR, resolve(__dirname, "../models")]) {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { continue; }
+    for (const f of entries) {
+      if ((f.endsWith(".hf4") || f.endsWith(".hf6") || f.endsWith(".hfq") || f.endsWith(".mq3") || f.endsWith(".mq4") || f.endsWith(".mq6")) && !seen.has(f)) {
+        seen.add(f);
+        // statSync may throw on dangling symlinks or files removed mid-scan;
+        // skip those individually instead of aborting the rest of the loop
+        // (a previous try/catch wrapping the entire iteration ate everything
+        // after the first stale symlink — see commit log for the bug story).
+        try {
+          const sz = (statSync(join(dir, f)).size / 1e9).toFixed(1);
+          // Find matching registry tag (check new and old naming)
+          const fNorm = f.replace(/\.q4\.hfq$/, ".hf4").replace(/\.hfq6\.hfq$/, ".hf6").replace(/-hfq4\.hfq$/, ".hf4").replace(/\.hfq$/, ".hf4");
+          const tag = Object.entries(REGISTRY).find(([_, e]) => e.file === f || e.file === fNorm)?.[0] || "";
+          models.push({ name: f, tag, size: `${sz}GB` });
+        } catch {}
+      }
+    }
   }
   return models;
 }
@@ -3954,11 +3773,9 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const isOverridden = (k: keyof HipfireConfig): boolean =>
     isPerModel && (overrides as any)[k] !== undefined;
 
-  // Build default_model options from the local catalog so config does not
-  // offer registry-only models that are not actually installed. Fall back to
-  // the registry only on a completely fresh install with no local catalog yet.
-  const modelOptions = catalogModelOptions();
-  if (modelOptions.length === 0) modelOptions.push(...Object.keys(REGISTRY).sort());
+  // Build default_model options from REGISTRY so users can cycle through
+  // known tags without typing. "custom" lets them fall back to free text.
+  const modelOptions = Object.keys(REGISTRY).sort();
 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
@@ -4289,7 +4106,7 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     // Cursor home + clear screen
     write("\x1b[H\x1b[2J");
     if (isPerModel) {
-      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${MODELS_CATALOG_PATH}${C.reset}\n`);
+      write(`${C.bold}hipfire config ${C.cyan}${resolvedTag}${C.reset}  ${C.dim}${PER_MODEL_CONFIG_PATH}${C.reset}\n`);
       write(`${C.dim}per-model overlay — overrides win over global. Use r to remove an override.${C.reset}\n`);
     } else {
       write(`${C.bold}hipfire config${C.reset}  ${C.dim}${CONFIG_PATH}${C.reset}\n`);
@@ -4616,17 +4433,16 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
 }
 
 // Sub-TUI launched from the global config TUI's "[per-model configs]" row.
-// Lists local catalog models, shows which have overrides, and returns the
-// selected model id or null if user escapes.
+// Lists registered models (REGISTRY + any user-registered aliases), shows
+// which have overrides, and returns the selected tag or null if user escapes.
 function modelPickerTui(): Promise<string | null> {
-  const catalog = loadModelsCatalog();
   const tags = [
-    ...Object.keys(catalog.models),
-    ...Object.keys(catalog.configs ?? {}),
+    ...Object.keys(REGISTRY),
+    ...Object.keys(loadUserAliases()),
   ].filter((t, i, arr) => arr.indexOf(t) === i).sort();
 
   if (tags.length === 0) {
-    console.log("No local models. Pull one first: hipfire pull qwen3.5:9b");
+    console.log("No models registered. Pull one first: hipfire pull qwen3.5:9b");
     return Promise.resolve(null);
   }
 
@@ -4649,10 +4465,9 @@ function modelPickerTui(): Promise<string | null> {
       const ov = overlays[tag];
       const cnt = ov ? Object.keys(ov).length : 0;
       const caret = i === selected ? `${C.cyan}▸${C.reset}` : " ";
-      const model = catalog.models[tag];
-      const entry = model?.registry_tag ? REGISTRY[model.registry_tag] : undefined;
-      const desc = entry?.desc ?? (model ? model.path : "(config-only)");
-      const size = model ? `${model.size_gb.toFixed(1)}GB`.padStart(7) : "".padStart(7);
+      const entry = REGISTRY[tag];
+      const desc = entry?.desc ?? "(user-registered)";
+      const size = entry ? `${entry.size_gb}GB`.padStart(7) : "".padStart(7);
       const marker = cnt > 0
         ? `${C.magenta}● ${cnt} override${cnt === 1 ? "" : "s"}${C.reset}`
         : `${C.dim}(no overrides)${C.reset}`;
@@ -4734,8 +4549,6 @@ function findDep(binary: string, extraDirs: string[]): string | null {
 }
 
 // ─── Main ───────────────────────────────────────────────
-
-refreshModelsCatalog();
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
@@ -5859,13 +5672,10 @@ Examples:
     let [firstArg, maybeKey, ...valueArgs] = rest;
     let modelScope: string | null = null;
     if (firstArg && !["list", "get", "set", "reset", "cask-profile"].includes(firstArg)) {
-      // Scope to a local catalog model when possible. Registry-only tags are
-      // still accepted for scripting/backward compatibility, but the picker
-      // no longer advertises models that are not installed.
+      // If looks like a tag, scope to that model
       const resolved = resolveModelTag(firstArg);
-      const catalogId = catalogModelIdForConfigKey(loadModelsCatalog(), firstArg);
-      if (catalogId || REGISTRY[resolved] || firstArg.includes(":")) {
-        modelScope = catalogId ?? resolved;
+      if (REGISTRY[resolved] || firstArg.includes(":")) {
+        modelScope = resolved;
         [firstArg, maybeKey, ...valueArgs] = rest.slice(1);
       }
     }
@@ -5924,7 +5734,7 @@ Examples:
       if (modelScope) {
         const ov = loadPerModelConfigs()[modelScope] ?? {};
         const merged = resolveModelConfig(modelScope);
-        console.log(`Per-model config: ${modelScope}  (${MODELS_CATALOG_PATH})\n`);
+        console.log(`Per-model config: ${modelScope}  (${PER_MODEL_CONFIG_PATH})\n`);
         for (const k of validKeys) {
           if (!(PER_MODEL_KEYS as readonly string[]).includes(k)) continue;
           const v = (merged as any)[k];

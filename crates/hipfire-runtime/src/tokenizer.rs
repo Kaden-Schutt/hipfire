@@ -25,7 +25,8 @@ use std::sync::OnceLock;
 /// the priority the reference encoders use, so chunking boundaries
 /// match HF tokenizers' Split-then-ByteLevel pipeline byte-for-byte
 /// (verified against locked niah_4k token md5).
-const GPT2_PRETOK_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
+const GPT2_PRETOK_PATTERN: &str =
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+";
 
 fn gpt2_pretok_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -189,12 +190,12 @@ fn resolve_merges(
         result_buf.clear();
         result_buf.push_str(l_str);
         result_buf.push_str(r_str);
-        let result = token_to_id
-            .get(result_buf.as_str())
-            .copied()
-            .ok_or_else(|| TokenizerError::MissingMergeResult {
-                rank,
-                expected: result_buf.clone(),
+        let result =
+            token_to_id.get(result_buf.as_str()).copied().ok_or_else(|| {
+                TokenizerError::MissingMergeResult {
+                    rank,
+                    expected: result_buf.clone(),
+                }
             })?;
         merges.push(result);
         // First-rank-wins on duplicate `(left_id, right_id)` pairs:
@@ -236,11 +237,9 @@ impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
         // Read vocabulary
-        let tokens_meta =
-            gguf.meta("tokenizer.ggml.tokens")
-                .ok_or(TokenizerError::MetadataMissing {
-                    field: "tokenizer.ggml.tokens",
-                })?;
+        let tokens_meta = gguf
+            .meta("tokenizer.ggml.tokens")
+            .ok_or(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" })?;
         let vocab: Vec<String> = match tokens_meta {
             MetaValue::Array(arr) => arr
                 .iter()
@@ -249,11 +248,7 @@ impl Tokenizer {
                     _ => String::new(),
                 })
                 .collect(),
-            _ => {
-                return Err(TokenizerError::MetadataMissing {
-                    field: "tokenizer.ggml.tokens",
-                })
-            }
+            _ => return Err(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" }),
         };
 
         let mut token_to_id = HashMap::with_capacity(vocab.len());
@@ -285,7 +280,7 @@ impl Tokenizer {
         let bos_id = gguf.meta_u32("tokenizer.ggml.bos_token_id").unwrap_or(1);
         let eos_id = gguf.meta_u32("tokenizer.ggml.eos_token_id").unwrap_or(2);
         let endoftext = token_to_id.get("<|endoftext|>").copied();
-        let im_end = token_to_id.get("<|im_end|>").copied();
+        let im_end    = token_to_id.get("<|im_end|>").copied();
         let eot_id = match (endoftext, im_end) {
             (Some(et), Some(ie)) if et != eos_id && ie == eos_id => Some(et),
             (Some(et), _) if et != eos_id => Some(et),
@@ -300,10 +295,7 @@ impl Tokenizer {
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
             if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
+                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
             {
                 special_tokens.push((tok.clone(), i as u32));
             }
@@ -341,19 +333,19 @@ impl Tokenizer {
             .get("model")
             .ok_or(TokenizerError::MetadataMissing { field: "model" })?;
 
-        let vocab_map = model.get("vocab").and_then(|v| v.as_object()).ok_or(
-            TokenizerError::MetadataMissing {
-                field: "model.vocab",
-            },
-        )?;
+        let vocab_map = model
+            .get("vocab")
+            .and_then(|v| v.as_object())
+            .ok_or(TokenizerError::MetadataMissing { field: "model.vocab" })?;
         let vocab_size = vocab_map.len();
 
         let mut vocab = vec![String::new(); vocab_size + 100];
         let mut token_to_id = HashMap::with_capacity(vocab_size);
         for (token, id_val) in vocab_map {
-            let id = id_val.as_u64().ok_or(TokenizerError::MetadataMissing {
-                field: "model.vocab[*]: non-integer id",
-            })? as u32;
+            let id = id_val
+                .as_u64()
+                .ok_or(TokenizerError::MetadataMissing { field: "model.vocab[*]: non-integer id" })?
+                as u32;
             if (id as usize) >= vocab.len() {
                 vocab.resize(id as usize + 1, String::new());
             }
@@ -400,27 +392,28 @@ impl Tokenizer {
                     }
                     vocab[id as usize] = content.to_string();
                     token_to_id.insert(content.to_string(), id);
-                    let is_special = at.get("special").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || (content.starts_with("<")
-                            && content.ends_with(">")
-                            && content.len() > 3
-                            && !content.contains(' '));
-                    if is_special {
-                        special_tokens.push((content.to_string(), id));
-                    }
+                    // Every `added_tokens` entry is an atomic token in the
+                    // tokenizer's intended encoding — the `special` field
+                    // marks SEMANTIC specials (BOS/EOS that need engine-
+                    // side handling) but does NOT mean "merge me back into
+                    // BPE." The DeepSeek V4 tokenizer marks all of
+                    // `<｜User｜>`, `<｜Assistant｜>`, `｜DSML｜`, the
+                    // `<｜tool▁*｜>` family, etc. as `special=false` even
+                    // though they MUST encode as single tokens for the
+                    // model to recognize them. Without this fix
+                    // `<｜DSML｜tool_calls>` BPE-fragments into 9 pieces
+                    // and tool calls round-trip into garbled output.
+                    let _ = at.get("special"); // we no longer gate on this
+                    special_tokens.push((content.to_string(), id));
                 }
             }
         }
         special_tokens.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
-        let bos_id = token_to_id
-            .get("<|endoftext|>")
-            .copied()
+        let bos_id = token_to_id.get("<|endoftext|>").copied()
             .or_else(|| token_to_id.get("<s>").copied())
             .unwrap_or(1);
-        let eos_id = token_to_id
-            .get("<|im_end|>")
-            .copied()
+        let eos_id = token_to_id.get("<|im_end|>").copied()
             .or_else(|| token_to_id.get("<|endoftext|>").copied())
             .or_else(|| token_to_id.get("</s>").copied())
             .unwrap_or(2);
@@ -482,9 +475,7 @@ impl Tokenizer {
         if let Some(gguf_meta) = meta.get("gguf_meta") {
             return Self::from_gguf_meta_json(gguf_meta);
         }
-        Err(TokenizerError::MetadataMissing {
-            field: "tokenizer | gguf_meta",
-        })
+        Err(TokenizerError::MetadataMissing { field: "tokenizer | gguf_meta" })
     }
 
     /// Load tokenizer from a JSON-serialized GGUF metadata tree. Mirrors
@@ -495,9 +486,7 @@ impl Tokenizer {
         let tokens_arr = meta
             .get("tokenizer.ggml.tokens")
             .and_then(|v| v.as_array())
-            .ok_or(TokenizerError::MetadataMissing {
-                field: "tokenizer.ggml.tokens",
-            })?;
+            .ok_or(TokenizerError::MetadataMissing { field: "tokenizer.ggml.tokens" })?;
         let vocab: Vec<String> = tokens_arr
             .iter()
             .map(|v| v.as_str().unwrap_or("").to_string())
@@ -552,10 +541,7 @@ impl Tokenizer {
         let mut special_tokens: Vec<(String, u32)> = Vec::new();
         for (i, tok) in vocab.iter().enumerate() {
             if (tok.starts_with("<|") && tok.ends_with("|>"))
-                || (tok.starts_with("<")
-                    && tok.ends_with(">")
-                    && tok.len() > 3
-                    && !tok.contains(' '))
+                || (tok.starts_with("<") && tok.ends_with(">") && tok.len() > 3 && !tok.contains(' '))
             {
                 special_tokens.push((tok.clone(), i as u32));
             }
@@ -598,8 +584,7 @@ impl Tokenizer {
     /// when the token is not registered as a special token in this
     /// tokenizer (e.g. an older Qwen vocab without `<tool_call>`).
     pub fn special_token_id(&self, content: &str) -> Option<u32> {
-        self.special_tokens
-            .iter()
+        self.special_tokens.iter()
             .find(|(s, _)| s == content)
             .map(|(_, id)| *id)
     }
@@ -852,10 +837,7 @@ impl Tokenizer {
             .byte_to_id
             .as_ref()
             .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
-        let mut syms: Vec<u32> = chunk_bytes
-            .iter()
-            .map(|&b| byte_to_id[b as usize])
-            .collect();
+        let mut syms: Vec<u32> = chunk_bytes.iter().map(|&b| byte_to_id[b as usize]).collect();
         let n = syms.len();
         if n == 0 {
             return;
@@ -899,6 +881,7 @@ impl Tokenizer {
         for i in 0..n - 1 {
             push_pair(&mut heap, &syms, &gen, i, i + 1);
         }
+
 
         // 6. Main merge loop. Each pop is O(log N); validation is O(1);
         // splice is O(1); two pushes are O(log N). Total O(N log N).
@@ -1046,7 +1029,10 @@ fn byte_to_gpt2_char(b: u8) -> char {
 /// Reverse of byte_to_gpt2_char.
 fn gpt2_char_to_byte(c: char) -> Option<u8> {
     let c = c as u32;
-    if (0x21..=0x7E).contains(&c) || (0xA1..=0xAC).contains(&c) || (0xAE..=0xFF).contains(&c) {
+    if (0x21..=0x7E).contains(&c)
+        || (0xA1..=0xAC).contains(&c)
+        || (0xAE..=0xFF).contains(&c)
+    {
         Some(c as u8)
     } else if c >= 256 && c < 256 + 68 {
         GPT2_OFFSET_TO_BYTE.get((c - 256) as usize).copied()
@@ -1061,8 +1047,9 @@ static GPT2_BYTE_TO_OFFSET: [u8; 256] = {
     let mut n = 0u8;
     let mut b = 0u16;
     while b < 256 {
-        let is_printable =
-            (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+        let is_printable = (b >= 0x21 && b <= 0x7E)
+            || (b >= 0xA1 && b <= 0xAC)
+            || (b >= 0xAE && b <= 0xFF);
         if !is_printable {
             table[b as usize] = n;
             n += 1;
@@ -1078,8 +1065,9 @@ static GPT2_OFFSET_TO_BYTE: [u8; 68] = {
     let mut n = 0usize;
     let mut b = 0u16;
     while b < 256 {
-        let is_printable =
-            (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || (b >= 0xAE && b <= 0xFF);
+        let is_printable = (b >= 0x21 && b <= 0x7E)
+            || (b >= 0xA1 && b <= 0xAC)
+            || (b >= 0xAE && b <= 0xFF);
         if !is_printable {
             table[n] = b as u8;
             n += 1;
@@ -1205,11 +1193,7 @@ impl Tokenizer {
     fn rank_of(&self, id: u32, table: &HashMap<u32, usize>) -> Option<usize> {
         table.get(&id).copied().or_else(|| {
             let s = self.vocab.get(id as usize)?;
-            if s.len() <= 1 {
-                Some(0)
-            } else {
-                None
-            }
+            if s.len() <= 1 { Some(0) } else { None }
         })
     }
 
@@ -1226,70 +1210,40 @@ impl Tokenizer {
         for &id in &ids {
             counts[HeatClass::from_rank(self.rank_of(id, &table)) as usize] += 1;
         }
-        if std::env::var("HIPFIRE_PROMPT_HEAT_JSON").ok().as_deref() == Some("1") {
+        if crate::config::get().prompt_heat_json {
             let mut s = String::with_capacity(2048);
             s.push_str("{\"bytes\":");
             s.push_str(&text.len().to_string());
             s.push_str(",\"tokens\":");
             s.push_str(&ids.len().to_string());
             s.push_str(",\"summary\":{");
-            s.push_str(&format!(
-                "\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
-                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
-            ));
+            s.push_str(&format!("\"base\":{},\"hot\":{},\"warm\":{},\"cold\":{},\"frozen\":{},\"special\":{}",
+                counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]));
             s.push_str("},\"positions\":[");
             for (pos, &id) in ids.iter().enumerate() {
-                if pos > 0 {
-                    s.push(',');
-                }
+                if pos > 0 { s.push(','); }
                 let rank = self.rank_of(id, &table);
-                let decoded = self
-                    .decode(&[id])
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\t', "\\t")
-                    .replace('\r', "\\r");
-                s.push_str(&format!(
-                    "{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
-                    rank.map(|r| r.to_string())
-                        .unwrap_or_else(|| "null".to_string())
-                ));
+                let decoded = self.decode(&[id]).replace('\\', "\\\\").replace('"', "\\\"")
+                    .replace('\n', "\\n").replace('\t', "\\t").replace('\r', "\\r");
+                s.push_str(&format!("{{\"pos\":{pos},\"id\":{id},\"rank\":{},\"text\":\"{decoded}\"}}",
+                    rank.map(|r| r.to_string()).unwrap_or_else(|| "null".to_string())));
             }
             s.push_str("]}");
             println!("{s}");
             return;
         }
-        let limit: usize = std::env::var("HIPFIRE_PROMPT_HEAT_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(64);
-        eprintln!(
-            "[token-heat] prompt={} bytes  tokens={}",
-            text.len(),
-            ids.len()
-        );
-        eprintln!(
-            "[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}",
-            "pos", "id", "rank", "class", "decoded"
-        );
+        let limit: usize = crate::config::get().prompt_heat_limit;
+        eprintln!("[token-heat] prompt={} bytes  tokens={}", text.len(), ids.len());
+        eprintln!("[token-heat] {:>4}  {:>6}  {:>7}  {:7}  {}", "pos", "id", "rank", "class", "decoded");
         for (pos, &id) in ids.iter().take(limit).enumerate() {
             let rank = self.rank_of(id, &table);
             let class = HeatClass::from_rank(rank);
             let display = self.decode(&[id]).replace('\n', "\\n").replace('\t', "\\t");
-            let rank_str = rank
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            eprintln!(
-                "[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}",
-                class.label()
-            );
+            let rank_str = rank.map(|r| r.to_string()).unwrap_or_else(|| "-".to_string());
+            eprintln!("[token-heat] {pos:>4}  {id:>6}  {rank_str:>7}  {}  {display:?}", class.label());
         }
         if ids.len() > limit {
-            eprintln!(
-                "[token-heat] ... ({} more tokens omitted)",
-                ids.len() - limit
-            );
+            eprintln!("[token-heat] ... ({} more tokens omitted)", ids.len() - limit);
         }
         eprintln!("[token-heat] summary: BASE={} ({:.0}%)  HOT={} ({:.0}%)  WARM={} ({:.0}%)  COLD={} ({:.0}%)  FROZEN={} ({:.0}%)  SPECIAL={} ({:.0}%)",
             counts[0], 100.0*counts[0] as f32/total as f32,
@@ -1300,10 +1254,7 @@ impl Tokenizer {
             counts[5], 100.0*counts[5] as f32/total as f32);
         let cold_frac = (counts[3] + counts[4]) as f32 / total as f32;
         if cold_frac > 0.05 {
-            eprintln!(
-                "[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor",
-                100.0 * cold_frac
-            );
+            eprintln!("[token-heat] WARNING: {:.1}% cold tokens — likely τ depressor", 100.0 * cold_frac);
         }
     }
 }
@@ -1442,11 +1393,8 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
-    if let Ok(v) = std::env::var("HIPFIRE_NORMALIZE_PROMPT") {
-        let v = v.to_ascii_lowercase();
-        if v == "0" || v == "false" || v == "off" || v == "no" {
-            return Cow::Borrowed(s);
-        }
+    if !crate::config::get().normalize_prompt {
+        return Cow::Borrowed(s);
     }
 
     let mut cur: Cow<'_, str> = Cow::Borrowed(s);
@@ -1571,13 +1519,7 @@ mod bpe_tests {
         // Final symbol list: ["hello"] → [id 7]
         let tok = synth(
             &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
-            &[
-                ("h", "e"),
-                ("l", "l"),
-                ("he", "ll"),
-                ("hell", "o"),
-                ("l", "o"),
-            ],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
         );
         assert_eq!(tok.encode_gpt2_bpe("hello"), vec![7]);
     }
@@ -1588,13 +1530,7 @@ mod bpe_tests {
         // Init ["l","o","l"] → after merge ["lo","l"] → [id 8, id 2].
         let tok = synth(
             &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
-            &[
-                ("h", "e"),
-                ("l", "l"),
-                ("he", "ll"),
-                ("hell", "o"),
-                ("l", "o"),
-            ],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
         );
         assert_eq!(tok.encode_gpt2_bpe("lol"), vec![8, 2]);
     }
@@ -1604,13 +1540,7 @@ mod bpe_tests {
         // "ho" — no ("h","o") merge in the table; output is the two byte tokens.
         let tok = synth(
             &["h", "e", "l", "o", "he", "ll", "hell", "hello", "lo"],
-            &[
-                ("h", "e"),
-                ("l", "l"),
-                ("he", "ll"),
-                ("hell", "o"),
-                ("l", "o"),
-            ],
+            &[("h", "e"), ("l", "l"), ("he", "ll"), ("hell", "o"), ("l", "o")],
         );
         assert_eq!(tok.encode_gpt2_bpe("ho"), vec![0, 3]);
     }
@@ -1628,7 +1558,10 @@ mod bpe_tests {
         // first → ["ab","a","b","a"] → ("a","b") at (1,2) → ["ab","ab","a"] →
         // now ("ab","a") at (1,2) rank 1 → ["ab","aba"]. No more merges.
         // Expected: [id of "ab", id of "aba"].
-        let tok = synth(&["a", "b", "ab", "aba"], &[("a", "b"), ("ab", "a")]);
+        let tok = synth(
+            &["a", "b", "ab", "aba"],
+            &[("a", "b"), ("ab", "a")],
+        );
         assert_eq!(tok.encode_gpt2_bpe("ababa"), vec![2, 3]);
     }
 
@@ -1645,7 +1578,10 @@ mod bpe_tests {
         // and many stale heap entries (each merge invalidates ≤ 2 prior
         // entries via the gen tag). Verifies we don't panic, deadlock, or
         // produce a non-decreasing-length output for a known shape.
-        let tok = synth(&["a", "aa", "aaaa"], &[("a", "a"), ("aa", "aa")]);
+        let tok = synth(
+            &["a", "aa", "aaaa"],
+            &[("a", "a"), ("aa", "aa")],
+        );
         let input = "a".repeat(1024);
         let out = tok.encode_gpt2_bpe(&input);
         // 1024 bytes → 512 "aa" pairs (rank 0) → 256 "aaaa" (rank 1). No
@@ -1717,12 +1653,7 @@ mod consistency_tests {
             Ok(_) => panic!("expected Err, got Ok"),
         };
         match err {
-            TokenizerError::MissingMergeOperand {
-                rank: 0,
-                missing_side: Side::Left,
-                ref left,
-                ref right,
-            } => {
+            TokenizerError::MissingMergeOperand { rank: 0, missing_side: Side::Left, ref left, ref right } => {
                 assert_eq!(left, "a");
                 assert_eq!(right, "b");
             }
@@ -1739,11 +1670,7 @@ mod consistency_tests {
             Ok(_) => panic!("expected Err, got Ok"),
         };
         match err {
-            TokenizerError::MissingMergeOperand {
-                rank: 0,
-                missing_side: Side::Right,
-                ..
-            } => {}
+            TokenizerError::MissingMergeOperand { rank: 0, missing_side: Side::Right, .. } => {}
             other => panic!("expected MissingMergeOperand{{Right}}, got {other:?}"),
         }
     }
@@ -1758,10 +1685,7 @@ mod consistency_tests {
             Ok(_) => panic!("expected Err, got Ok"),
         };
         match err {
-            TokenizerError::MissingMergeResult {
-                rank: 0,
-                ref expected,
-            } => {
+            TokenizerError::MissingMergeResult { rank: 0, ref expected } => {
                 assert_eq!(expected, "ab");
             }
             other => panic!("expected MissingMergeResult, got {other:?}"),
@@ -1779,10 +1703,7 @@ mod consistency_tests {
             Ok(_) => panic!("expected Err, got Ok"),
         };
         match err {
-            TokenizerError::MissingByteSymbol {
-                byte: 0x41,
-                char: 'A',
-            } => {}
+            TokenizerError::MissingByteSymbol { byte: 0x41, char: 'A' } => {}
             other => panic!("expected MissingByteSymbol{{0x41,'A'}}, got {other:?}"),
         }
     }
@@ -1806,8 +1727,8 @@ mod consistency_tests {
         // byte_to_gpt2_char maps printable ASCII to itself, so the
         // byte chars *are* "A" and "B".
         let meta = gpt2_meta_full_bytes(None, &["AB"], &["A B"]);
-        let tok =
-            Tokenizer::from_gguf_meta_json(&meta).expect("consistent GPT-2 vocab should succeed");
+        let tok = Tokenizer::from_gguf_meta_json(&meta)
+            .expect("consistent GPT-2 vocab should succeed");
         assert!(tok.byte_to_id.is_some());
         assert_eq!(tok.merges.len(), 1);
         // Merge resolved to ids: A → 0x41, B → 0x42, AB → 256 (first extra).
@@ -1939,7 +1860,10 @@ mod prompt_norm_tests {
 
     #[test]
     fn multiple_independent_runs() {
-        assert_eq!(collapse_newline_runs("a\n\n\nb\n\n\n\nc"), "a\n\nb\n\nc");
+        assert_eq!(
+            collapse_newline_runs("a\n\n\nb\n\n\n\nc"),
+            "a\n\nb\n\nc"
+        );
     }
 
     #[test]
@@ -2013,7 +1937,10 @@ mod prompt_norm_tests {
     #[test]
     fn line_endings_mixed_crlf_and_lf() {
         // git-attributes mishap: some lines CRLF, some LF.
-        assert_eq!(normalize_line_endings("a\r\nb\nc\r\nd"), "a\nb\nc\nd");
+        assert_eq!(
+            normalize_line_endings("a\r\nb\nc\r\nd"),
+            "a\nb\nc\nd"
+        );
     }
 
     #[test]
@@ -2074,7 +2001,7 @@ mod prompt_norm_tests {
         assert!(!needs_nbsp_replace("a b"));
         // Other Latin-1 chars starting with 0xC2 must not false-positive.
         assert!(!needs_nbsp_replace("caf\u{00E9}")); // é = 0xC3 0xA9
-        assert!(!needs_nbsp_replace("\u{00A2}")); // ¢ = 0xC2 0xA2
+        assert!(!needs_nbsp_replace("\u{00A2}"));    // ¢ = 0xC2 0xA2
     }
 
     // ---- strip_trailing_line_ws ----
@@ -2134,7 +2061,10 @@ mod prompt_norm_tests {
             "\tdef foo():\n\t\treturn 1\n"
         );
         // Mixed tab + space indentation also round-trips.
-        assert_eq!(strip_trailing_line_ws("\t \tx = 1\n"), "\t \tx = 1\n");
+        assert_eq!(
+            strip_trailing_line_ws("\t \tx = 1\n"),
+            "\t \tx = 1\n"
+        );
         // Trailing tabs at end of line still get stripped.
         assert_eq!(strip_trailing_line_ws("a\tb\t\nc"), "a\tb\nc");
     }
@@ -2142,7 +2072,10 @@ mod prompt_norm_tests {
     #[test]
     fn strip_blank_line_with_indent() {
         // Whitespace-only "blank" line between code blocks — strip the indent.
-        assert_eq!(strip_trailing_line_ws("a\n    \nb"), "a\n\nb");
+        assert_eq!(
+            strip_trailing_line_ws("a\n    \nb"),
+            "a\n\nb"
+        );
     }
 
     #[test]

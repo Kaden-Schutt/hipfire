@@ -1,0 +1,23 @@
+commit=a570ea63
+arch=gfx1201
+hipcc=HIP version: 7.2.53211-671d39a71e
+--- b128
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+max-abs-diff=1.439e-4  PASS
+b=128 iters=50 scalar=79.8 us/call wmma=53.8 us/call speedup=1.48x
+--- b512
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+max-abs-diff=1.439e-4  PASS
+b=512 iters=20 scalar=1438.7 us/call wmma=225.3 us/call speedup=6.39x
+--- b1024
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+max-abs-diff=1.439e-4  PASS
+b=1024 iters=10 scalar=7310.4 us/call wmma=593.5 us/call speedup=12.32x
+--- b2048
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+max-abs-diff=1.439e-4  PASS
+b=2048 iters=5 scalar=33427.8 us/call wmma=1955.0 us/call speedup=17.10x

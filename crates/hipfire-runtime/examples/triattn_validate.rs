@@ -469,7 +469,8 @@ fn main() {
     // Destroy any cached hipGraph from Phase 1. The TriAttn capture tap
     // does synchronous D2H copies (gpu::download_f32) which are incompatible
     // with hipGraph stream capture mode (hipErrorStreamCaptureImplicit).
-    // Keeping graph disabled via ar_forward_warmed_up reset avoids re-capture.
+    // Keeping kernels dirty avoids re-capture while the TriAttn tap performs
+    // D2H copies inside the validation forward.
     gpu.graph_destroy();
 
     let cap = TriAttnCapture::new(config.n_heads, config.n_kv_heads, config.head_dim);
@@ -479,10 +480,9 @@ fn main() {
     let val_len = val_tokens.len().min(kv_seq.saturating_sub(4));
     eprintln!("validation: {val_len} tokens");
     for (pos, tid) in val_tokens.iter().take(val_len).enumerate() {
-        // Reset warmup flag so forward_scratch stays on the warmup/direct
-        // path instead of attempting graph capture (which would fail on the
-        // D2H copy inside the TriAttn capture tap).
-        gpu.ar_forward_warmed_up = false;
+        // Keep forward_scratch on the direct path instead of attempting graph
+        // capture, which would fail on the D2H copy inside the TriAttn tap.
+        gpu.mark_kernels_dirty();
         qwen35::forward_scratch(
             &mut gpu, &weights, &config, *tid, pos, &mut kv, &mut dn, &scratch,
         )

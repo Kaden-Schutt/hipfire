@@ -1,0 +1,63 @@
+2026-05-26T22:56:15+00:00
+0bcc6bb8c1a3b98c9651d53ee4bf2714a4ca5d16
+
+== test_gemm_mq4g256_lloyd_residual_wmma ==
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+GPU: gfx1201
+    M      K    N   kern      max_abs          rms     us/call  verdict
+   64   1024   16  _wmma     2.980e-7     7.405e-8         8.9  PASS  (ref)
+   64   1024   16   _mb2            -            -           -  SKIP  (gfx11-only)
+   64   1024   16   _mb4            -            -           -  SKIP  (gfx11-only)
+
+   64   1024   64  _wmma     2.980e-7     7.676e-8         9.5  PASS  (ref)
+   64   1024   64   _mb2            -            -           -  SKIP  (gfx11-only)
+   64   1024   64   _mb4            -            -           -  SKIP  (gfx11-only)
+
+  256   1024   64  _wmma     3.576e-7     7.396e-8         9.9  PASS  (ref)
+  256   1024   64   _mb2            -            -           -  SKIP  (gfx11-only)
+  256   1024   64   _mb4            -            -           -  SKIP  (gfx11-only)
+
+   64   4096   64  _wmma     3.338e-6     6.882e-7        20.7  PASS  (ref)
+   64   4096   64   _mb2            -            -           -  SKIP  (gfx11-only)
+   64   4096   64   _mb4            -            -           -  SKIP  (gfx11-only)
+
+  256   4096   16  _wmma     3.338e-6     6.789e-7        20.8  PASS  (ref)
+  256   4096   16   _mb2            -            -           -  SKIP  (gfx11-only)
+  256   4096   16   _mb4            -            -           -  SKIP  (gfx11-only)
+
+  256   4096  256  _wmma     3.338e-6     6.699e-7        30.3  PASS  (ref)
+  256   4096  256   _mb2            -            -           -  SKIP  (gfx11-only)
+  256   4096  256   _mb4            -            -           -  SKIP  (gfx11-only)
+
+ 1024   4096   64  _wmma     3.338e-6     6.710e-7        27.4  PASS  (ref)
+ 1024   4096   64   _mb2            -            -           -  SKIP  (gfx11-only)
+ 1024   4096   64   _mb4            -            -           -  SKIP  (gfx11-only)
+
+ 1024  12288   64  _wmma     2.205e-5     7.061e-6        63.9  PASS  (ref)
+ 1024  12288   64   _mb2            -            -           -  SKIP  (gfx11-only)
+ 1024  12288   64   _mb4            -            -           -  SKIP  (gfx11-only)
+
+ 4096   4096  256  _wmma     3.338e-6     6.688e-7       256.9  PASS  (ref)
+ 4096   4096  256   _mb2            -            -           -  SKIP  (gfx11-only)
+ 4096   4096  256   _mb4            -            -           -  SKIP  (gfx11-only)
+
+ 4096  12288  256  _wmma     2.205e-5     7.013e-6      1000.6  PASS  (ref)
+ 4096  12288  256   _mb2            -            -           -  SKIP  (gfx11-only)
+ 4096  12288  256   _mb4            -            -           -  SKIP  (gfx11-only)
+
+14336   4096  256  _wmma     3.338e-6     6.685e-7       893.2  PASS  (ref)
+14336   4096  256   _mb2            -            -           -  SKIP  (gfx11-only)
+14336   4096  256   _mb4            -            -           -  SKIP  (gfx11-only)
+
+Phase A tolerance (initial)      : 1.750e-4
+Aggregate us/call (_wmma)        : 2342.0
+Aggregate us/call (_mb2)         : SKIP  (gfx11-only)
+Aggregate us/call (_mb4)         : SKIP  (gfx11-only)
+
+ALL PASS
+
+== parity_causal_wmma ==
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1201
+SKIP causal WMMA parity: gfx1201 lacks gfx11 has_wmma_w32; production should use attention_causal_batched or a gfx12 sibling

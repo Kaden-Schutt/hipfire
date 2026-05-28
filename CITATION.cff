@@ -33,5 +33,5 @@ keywords:
   - speculative-decoding
   - flash-attention
 license: MIT OR Apache-2.0
-version: 0.1.20
-date-released: '2026-05-19'
+version: 0.2.0
+date-released: '2026-05-27'

@@ -609,3 +609,333 @@ caught the original mis-measurement).
    `kQLoadOnce + global_read_lds_i+2` pattern.
 3. **QKV-cast fusion** for the E2E vision-encoder win (~420 ms),
    independent of the attention kernel.
+
+## 14. Further levers investigation (2026-05-26)
+
+Cross-referenced codebase analysis, rocprof PMC data, the Gemini
+follow-up (`dots-ocr.perf-investigation-gemini.md`), and the decode
+PMC checkpoint (`2026-05-26-gfx1151-decode-attention-pmc.md`).
+
+The investigation now covers three distinct paths:
+
+| Path | Current kernel | Bottleneck | Typical shape |
+|---|---|---|---|
+| Vision encoder prefill | v3 M=64 N=128 f16 K/V | DRAM BW (28% util) | B=L=19520, hd=128, h=12 |
+| Text decoder prefill | `attention_causal_batched` | **Scalar compute + no GQA** | seq=5k-11k, h=12, kv=2 |
+| Text decoder decode | `attention_flash_gqa` | Dispatch / wave overhead | seq=5k-11k, h=12, kv=2 |
+
+### 14.1. Vision prefill: async V-load overlapped with Phase A
+
+**Highest expected single-kernel impact.**
+
+v3's outer loop is strictly sequential:
+
+```
+Phase A (QK): loads K from DRAM, computes s_acc  — V_lds is FREE
+Stage V:      loads V from DRAM into V_lds        — no compute
+Phase B:      softmax on S_lds
+Phase C:      SV using V_lds
+```
+
+V-staging at `v3:165-177` runs *after* Phase A finishes. During Phase A,
+V_lds contains stale data from the previous tile's Phase C — but nobody
+reads it. We can start loading V asynchronously during Phase A using
+RDNA3's `__builtin_amdgcn_global_load_lds` (direct global→LDS async
+copy, bypasses VGPRs entirely).
+
+**Implementation sketch:**
+
+```
+for (kt_start = 0; kt_start < L; kt_start += n_tile) {
+    if (kt_start > 0) wait_async_v_load();  // ensure prev V is ready
+
+    // Phase A: QK compute (loads K from DRAM into registers)
+    //   Concurrently: issue async global→LDS for THIS tile's V
+    issue_async_v_load(v + kt_start * kv_stride + ..., V_lds);
+    compute_qk_phase_a(...);
+
+    wait_async_v_load();  // ensure V is in LDS before Phase B
+    // Phase B + C unchanged
+}
+```
+
+No extra LDS — V_lds is reused in-place. The async load replaces the
+synchronous staging loop, saving ~32 KB of VGPR-bypassed traffic per
+outer iteration. With 152 outer iterations, this overlaps ~152 × 32 KB =
+4.9 MB of V-load latency with useful QK compute.
+
+**Why this helps:** rocprof shows 28% BW utilization (33 GB/s effective
+vs 115 GB/s peak). The DRAM pipeline is underutilized because we do
+strictly sequential load-then-compute. Overlapping V-load with QK
+compute keeps the DRAM controller busy during Phase A.
+
+**Gemini note:** §2.1 proposes `__builtin_amdgcn_s_prefetch_data` — this
+is a *scalar* prefetch (L1 I-cache / scalar D-cache), not useful for
+vector data paths. The correct intrinsic is
+`__builtin_amdgcn_global_load_lds` for global→LDS, or explicit
+double-buffering with `__builtin_amdgcn_ds_gws_init` barriers. CK's
+`global_read_i+2` pattern (issue load 2 iterations ahead) is the
+proven reference.
+
+### 14.2. Vision prefill: V_lds transpose for vectorized Phase C reads
+
+Phase C at `v3:262-274` reads V_lds in a column-major pattern:
+
+```c
+for (int j = 0; j < 16; ++j) {
+    b_reg[j] = V_lds[(s_col_base + j) * head_dim + my_d];
+}
+```
+
+16 sequential `ds_read_u16` per lane per (dc, c) iteration — the
+compiler cannot vectorize across `j` because rows are stride-128 f16
+= 256 bytes apart. Transposing V_lds from `[n_tile][head_dim]` to
+`[head_dim][n_tile]` makes the access contiguous:
+
+```c
+// Transposed: V_lds[my_d * n_tile + s_col_base + 0..15]
+b_reg = ds_read_b128(V_lds + my_d * 128 + s_col_base);  // 8 f16 at once
+b_reg2 = ds_read_b128(V_lds + my_d * 128 + s_col_base + 8);  // 8 more
+```
+
+**Impact:** Phase C does 8 dc × 8 c = 64 WMMA ops per outer iteration.
+Each WMMA loads 16 V values → 1024 V reads per lane per iter × 152
+iters = 155k reads total. Vectorizing from 16 `ds_read_u16` to 2
+`ds_read_b128` is an 8× instruction reduction on the LDS path.
+
+**Trade-off:** V-staging (`v3:165-177`) writes in `[n_tile][head_dim]`
+order, which is naturally contiguous (128 f16 per row, 128 rows).
+Transposed staging scatters writes across `head_dim` rows. Net effect:
+staging gets ~8× more instructions (same total bytes), Phase C gets ~8×
+fewer. Since Phase C dominates (softmax + SV >> staging), the net is
+positive.
+
+**Bank conflict analysis:** Current V_lds at stride 128 f16 = 64 dwords.
+Lane `l` accessing row `r`, column `my_d`: bank = `(r * 64 + my_d/2) % 32
+= (my_d/2) % 32` — all 16 lanes hit the same bank for the same `j`.
+Transposed: bank = `(my_d * 64 + r + j) % 32` — varies with lane,
+conflict-free.
+
+### 14.3. Vision prefill: N=256 with V from DRAM (drop V_lds)
+
+§10.3 notes that N=256 doesn't fit because V_lds[256×128] f16 = 64 KB
+saturates the LDS cap. If we drop V_lds entirely and load V directly
+from DRAM during Phase C via WMMA frag_b:
+
+- S_lds[64 × 256] f16 = 32 KB (or keep current S_in_registers approach)
+- No V_lds
+- O in registers
+- Total LDS: ~32-33 KB — plenty of headroom
+
+**DRAM traffic concern:** V_lds is shared across 4 waves per block.
+Without it, each wave loads its own V fragment independently. At M=64
+with 4 waves, V traffic increases 4× per block. With B/M = 305 blocks:
+- Current: 305 × 32 KB (V read once, shared) = ~9.6 MB/head
+- V via frag_b: 305 × 32 KB × 4 waves = ~38.4 MB/head
+
+That's a 4× V traffic increase on a DRAM-bound kernel. **Net DRAM
+increases**, so N=256 with V via frag_b only makes sense if combined
+with M=128 to halve the block count:
+
+- M=128 N=256 V via frag_b: 152 × 32 KB × 4 = 19.4 MB/head V traffic
+- Plus K: 152 × 64 KB = 9.7 MB/head K traffic (N=256, but K also via reg)
+- Total: ~29 MB/head vs current ~19.3 MB/head (M=64 N=128 V_lds)
+
+Still 50% more DRAM. N=256 with V via frag_b is **not recommended
+independently** — it needs to be bundled with M=128 and the async
+V-load pipeline to compensate.
+
+### 14.4. Vision prefill: M=128 query tile
+
+**Biggest single DRAM reduction but complex implementation.**
+
+At M=128: B/M = 152 → 305 blocks (was 610 at M=16). Each block reads
+all K and V once. Total K+V DRAM traffic halves vs M=64.
+
+**LDS budget at M=128 N=128 with V_lds f16:**
+
+| Buffer | Size |
+|---|---|
+| V_lds[128 × 128] f16 | 32 KB |
+| S_lds[128 × 128] f16 | 32 KB |
+| scalars (m, l, alpha × 128) | 1.5 KB |
+| **Total** | **~65.5 KB — over cap** |
+
+S_lds alone eats 32 KB. Options:
+
+**A. S in registers (llama.cpp pattern):** Each wave owns 16 rows. S for
+16 rows × 128 cols = 2048 f16 = 4 KB per wave. Per lane: 2048 / 32 =
+64 values = 128 bytes. 4 float8_t per lane — feasible in VGPRs.
+This frees 32 KB of LDS for M=128 N=128 with V_lds.
+
+**B. 256-thread block (8 waves, 16 rows/wave):** Same per-wave register
+pressure as M=64 (Q_frags = 64 VGPRs, O_frags = 64, o_acc = 64). But
+total threads = 256 → max 2 waves/CU at 256 VGPRs/lane. At 40 CUs:
+~10 concurrent blocks (vs 40 at M=64). 3× fewer concurrent blocks but
+2× fewer total blocks = 1.5× fewer block-iterations total. On a
+DRAM-bound kernel the occupancy reduction may be acceptable.
+
+**C. Two-pass sub-tiling:** Process M=128 as two sequential M=64
+sub-tiles within the same block, sharing K/V loads. Each sub-tile
+reuses the current v3 logic unchanged. Block count stays at 305
+(same as M=64), but K+V loads happen once per tile instead of once per
+sub-tile. Theoretically halves K+V traffic at constant occupancy.
+
+Option C is the simplest to implement and lowest-risk. It trades
+per-block wall time (2× more QK + SV work per block) for half the
+K+V DRAM traffic. At current K+V = 37 GB per attention call, this
+cuts to ~18.5 GB, approaching the ~17 GB theoretical floor at
+M=128 f16.
+
+### 14.5. Text prefill attention: causal WMMA + GQA
+
+**Potentially the largest untapped optimization.** The text decoder
+prefill uses `attention_causal_batched` (`kernels/src/attention_causal_batched.hip`):
+
+- Scalar (no WMMA) QK and SV computation
+- No GQA awareness — loads K/V `n_heads=12` times instead of
+  `n_kv_heads=2` times (6× redundant work for the 12:2 ratio)
+- Grid: `[n_heads, seq_len]` — one block per (head, query position)
+- Each block loops over all prior KV positions with scalar dot products
+- At seq=5000: 5000² × 12 × 128 = 38.4 GFLOP, all in scalar code
+
+A causal WMMA flash attention kernel with GQA grouping would:
+
+1. **WMMA for QK and SV** — 16× FLOP throughput on RDNA3 matrix cores
+2. **GQA grouping** — 6× fewer K/V loads (12:2 ratio)
+3. **f16 K/V** — halve DRAM traffic
+4. **Same M/N tiling** as the vision kernel — M=64 N=128, with causal
+   mask applied during Phase A (set S = -inf for key > query positions)
+
+The vision attention kernel already implements all of this except the
+causal mask. Adding a `is_causal` parameter that masks out-of-range
+S values in Phase A would make the kernel reusable for both paths.
+
+**Estimated impact:** At seq=5000, text prefill attention is likely
+taking several seconds of GPU time (scalar O(seq²) on 38.4 GFLOP).
+WMMA + GQA + f16 should bring this down by 5-10×. The text prefill
+runs 28 layers × 1 attention call each — even a 2× speedup per layer
+compounds to significant E2E savings.
+
+**Why this was missed:** The investigation focused on the vision encoder
+(the 89.3s wall-time elephant). But the text prefill path also runs
+28 layers of attention, and its kernel is the pre-optimization scalar
+baseline.
+
+### 14.6. Decode: HIP graph capture
+
+The decode loop (`qwen2.rs:769-877`) launches ~10 kernels per layer ×
+28 layers = 280 kernel launches per decode step:
+
+```
+rmsnorm → wq_gemv → wk_gemv → wv_gemv → bias_add×3 → rope →
+kv_cache_write×2 → attention_gqa → o_proj_gemv → add →
+rmsnorm → w_gate_gemv → w_up_gemv → silu_mul → w_down_gemv → add
+```
+
+PMC shows dispatch/wave overhead is the decode floor on gfx1151
+(257µs GQA, of which compute is tiny). HIP graph capture would:
+
+- Record the full 280-kernel graph once (first decode step)
+- Replay for subsequent tokens — eliminates all CPU-side dispatch
+- Removes kernel launch overhead (~5-15µs per launch × 280 = 1.4-4.2 ms)
+- At 257µs per attention call, the attention itself is only one of many
+  kernel costs; graph capture amortizes the whole loop
+
+**Expected decode speedup:** Hard to estimate without measurement.
+If dispatch overhead is ~50% of per-step wall time (consistent with
+Q8 KV showing 40× fewer fetches but same wall time), graph capture
+could give 1.5-2× decode speedup.
+
+**Complexity:** High. Requires refactoring the decode loop to use
+`hipGraphLaunch` instead of individual kernel launches. The KV cache
+write position changes every step — needs hipGraph node parameter
+updates. But HIP graphs support this via `hipGraphExecKernelNodeSetParams`.
+
+### 14.7. Decode: fused attention-reduce + output projection
+
+At decode time, the attention output is `[n_heads × head_dim]` = 1536
+floats = 6 KB. The reduce kernel writes this to `attn_out`, then
+`weight_gemv` reads it back for the output projection (`wo`).
+
+Fusing reduce + o_proj:
+
+1. Each reduce thread computes its head_dim output element
+2. Immediately computes the GEMV dot product with the corresponding
+   `wo` weight column
+3. Accumulates into a register, writes final `o[dim]` once
+
+**Impact:** Eliminates 1 DRAM write (6 KB) + 1 DRAM read (6 KB) + 1
+kernel launch per layer. At 28 layers: 28 fewer launches, 336 KB less
+DRAM traffic (tiny but the launch savings matter).
+
+This is a smaller lever than graph capture but is complementary and
+simpler to implement. Could be done as a stepping stone toward full
+graph capture.
+
+### 14.8. Decode: gfx1100 GQA chunk-size tuning
+
+The `HIPFIRE_GQA_CHUNK` env var defaults to 128, giving 80 workgroups
+at seq=5100 (2 kv_heads × 40 chunks). On gfx1151 (40 CUs) this
+saturates the GPU. On gfx1100 (96 CUs):
+
+- chunk=128 → 80 wg → 83% fill (80/96)
+- chunk=64 → 160 wg → 100% fill + 2× wave-level parallelism
+- chunk=48 → ~213 wg → 100% fill, may improve latency hiding
+
+The gfx1151 sweep showed chunk=64 gives ~2% (noise) over chunk=128.
+But gfx1100 has 2.4× more CUs — the underfill is larger, and the
+potential win from smaller chunks (more wg) is correspondingly larger.
+
+**Action:** Sweep `HIPFIRE_GQA_CHUNK={128,96,64,48}` on gfx1100 at
+seq=5100 and seq=12000. The env var already exists; just needs
+benchmarking on target hardware.
+
+### 14.9. Decode: F16 KV cache (long-sequence / gfx1100)
+
+The PMC at seq=5100 on gfx1151 shows Q8 KV (40× fewer HBM fetches)
+ties F32 at 272µs — dispatch overhead dominates, not bandwidth. But:
+
+- At seq=12000, KV traffic is 2.4× larger. Bandwidth may start to
+  matter even on gfx1151.
+- On gfx1100 (960 GB/s GDDR6), the per-access cost is 8× lower, so
+  dispatch overhead is an even larger fraction. But at long sequences
+  (12k+), the absolute KV traffic may exceed what L2 can absorb.
+- F16 KV is the simpler first step before FP8/MFP4 (no accuracy work).
+
+**Action:** Benchmark F16 KV decode on gfx1100 at seq=12000 before
+investing in FP8. If F16 doesn't help (same dispatch floor), FP8
+won't either.
+
+### 14.10. Evaluation of Gemini proposals
+
+| Gemini proposal | Assessment |
+|---|---|
+| §2.1 `__builtin_amdgcn_s_prefetch_data` | Wrong intrinsic — this is a *scalar* prefetch (I-cache / scalar D-cache). Correct approach: `__builtin_amdgcn_global_load_lds` for async global→LDS, or explicit register double-buffering. The *intent* (overlap DRAM with compute) is correct and is our §14.1. |
+| §2.2 `global_load_lds` for V-staging | Correct and high-value. See §14.1 — this is the highest-impact single-kernel lever for prefill. The 16-byte alignment constraint is satisfied at hd=128. |
+| §2.3 M=128 with striped V_lds | Correct direction. We analyze three M=128 strategies in §14.4 (S-in-registers, 256-thread block, two-pass sub-tiling). Sub-tiling (option C) is simplest and lowest-risk. |
+| §2.4 V via WMMA frag_b from DRAM | Viable only when combined with M=128 to offset the 4× V traffic increase from losing cross-wave LDS sharing (§14.3). Independently it regresses. |
+| §2.5 QKV-cast fusion | Correct and already identified. ~420 ms E2E. Independent of attention kernel changes. |
+| §3.1 Persistent GQA kernels | Correct. The fused GQA showed 96× regression from 2-wg occupancy collapse. A persistent kernel that iterates over chunks within one block would maintain occupancy while reducing launch count. Simpler alternative: HIP graph capture (§14.6) achieves the same dispatch elimination without custom persistent-kernel logic. |
+| §3.2 FP8 KV cache | Premature for decode. PMC shows bandwidth isn't the decode bottleneck on gfx1151 at seq=5100. F16 KV (§14.9) is the simpler first step. FP8 may matter on gfx1100 at long sequences — test F16 first. The text backbone currently uses F32 KV; F16 is the natural next step. |
+| §4 ranked action plan | Rankings mostly match our analysis. Prefetch/V-load overlap and QKV fusion are the top prefill levers. However the plan misses: (1) text prefill WMMA causal attention (§14.5, potentially the largest single win), (2) V_lds transpose (§14.2, simple LDS layout change), (3) HIP graph capture for decode (§14.6, bigger than persistent kernels for the dispatch floor). |
+
+### 14.11. Revised ranked action plan
+
+| Rank | Lever | Target | Expected impact | Complexity |
+|---:|---|---|---|---|
+| 1 | **Causal WMMA flash attention + GQA** for text prefill (§14.5) | Text prefill | **5-10× text-prefill attention** | Medium — extend vision kernel with causal mask |
+| 2 | **Async V-load overlapped with Phase A** via `global_load_lds` (§14.1) | Vision prefill | **+10-15% vision wall** | Medium — restructure outer loop |
+| 3 | **QKV-cast fusion** (§2.5 / §13.5) | Vision E2E | **+420 ms saved** | Medium — modify GEMM to output f16 K/V |
+| 4 | **V_lds transpose** for vectorized Phase C reads (§14.2) | Vision prefill | **+5-10% attention** | Low — LDS layout change |
+| 5 | **M=128 two-pass sub-tiling** (§14.4 option C) | Vision prefill | **+15-25% attention** | Medium — double QK+SV per block |
+| 6 | **HIP graph capture** for decode loop (§14.6) | Decode | **1.5-2× decode** | High — refactor decode loop |
+| 7 | **gfx1100 GQA chunk sweep** (§14.8) | Decode | **+5-15% decode on gfx1100** | Low — env var tuning |
+| 8 | **Fused attention-reduce + o_proj** (§14.7) | Decode | **+3-5% decode** | Low — merge two kernels |
+| 9 | **F16 KV cache for decode** (§14.9) | Decode (long seq) | **+0-10% decode** | Low — reuse existing F16 cast path |
+| 10 | **FP8 / MFP4 K/V** (§3.2) | Vision prefill | **+20-40% attention** | High — needs accuracy validation |
+
+Items 1-4 are independent and can be parallelized. Item 5 benefits from
+items 2 and 4 landing first (the sub-tile inherits the async load and
+transpose). Item 6 is the biggest decode lever but has the highest
+implementation risk. Items 7-9 are cheap experiments.

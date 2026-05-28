@@ -23,12 +23,7 @@ use std::path::Path;
 #[cfg(unix)]
 fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
     unsafe {
-        libc::posix_fadvise(
-            fd,
-            offset as libc::off_t,
-            len as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        );
+        libc::posix_fadvise(fd, offset as libc::off_t, len as libc::off_t, libc::POSIX_FADV_DONTNEED);
     }
 }
 
@@ -71,6 +66,20 @@ pub struct HfqFile {
 
 impl HfqFile {
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_at_offset(path, 0)
+    }
+
+    /// Open an HFQM container that lives inside a larger file, starting at
+    /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
+    /// MTP section embedded after the trunk's tensor data.
+    ///
+    /// The whole file is mmap'd, and the HFQM header is read starting at
+    /// `base_offset`. All stored offsets inside the HFQM container are
+    /// rebased to absolute file offsets (`base_offset + stored_offset`).
+    ///
+    /// Callers passing `base_offset = 0` go through the canonical [`Self::open`]
+    /// entry point.
+    pub fn open_at_offset(path: &Path, base_offset: u64) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Sequential access hint: helps the kernel readahead and drop pages sooner.
@@ -84,14 +93,23 @@ impl HfqFile {
             }
         }
 
-        // Parse header (32 bytes)
-        let magic = &mmap[0..4];
-        assert_eq!(magic, b"HFQM", "Not an HFQ file");
-        let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
-        let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
-        let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
-        let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
-        let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+        let base = base_offset as usize;
+        assert!(
+            base + 32 <= mmap.len(),
+            "HfqFile::open_at_offset: base ({base}) + 32 > file size ({}); not enough bytes for header",
+            mmap.len(),
+        );
+
+        // Parse header (32 bytes) at base offset.
+        let magic = &mmap[base..base + 4];
+        assert_eq!(magic, b"HFQM", "Not an HFQ container at offset {base}");
+        let _version = u32::from_le_bytes(mmap[base + 4..base + 8].try_into().unwrap());
+        let arch_id = u32::from_le_bytes(mmap[base + 8..base + 12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(mmap[base + 12..base + 16].try_into().unwrap()) as usize;
+        // Stored offsets are relative to the container start; rebase to absolute
+        // file offsets so all the existing mmap slicing below works unchanged.
+        let metadata_offset = u64::from_le_bytes(mmap[base + 16..base + 24].try_into().unwrap()) as usize + base;
+        let data_offset = u64::from_le_bytes(mmap[base + 24..base + 32].try_into().unwrap()) as usize + base;
 
         // Read metadata JSON
         // Metadata ends at the tensor index, which starts right after metadata
@@ -99,6 +117,7 @@ impl HfqFile {
         // We need to find where the index starts - it's right after metadata
         // The index starts with a u32 tensor count
         // Let's scan for it by reading from metadata_offset until we find the tensor count
+        let index_start = metadata_offset;
         // First, find the metadata end by looking for the tensor count in the index
         // The metadata is a JSON blob. The index follows immediately.
         // We know data_offset, so index is between metadata_offset and data_offset.
@@ -125,9 +144,7 @@ impl HfqFile {
                 continue;
             }
             if !in_string {
-                if b == b'{' {
-                    brace_depth += 1;
-                }
+                if b == b'{' { brace_depth += 1; }
                 if b == b'}' {
                     brace_depth -= 1;
                     if brace_depth == 0 {
@@ -183,11 +200,7 @@ impl HfqFile {
         Ok(Self {
             _file: file,
             path: path.to_path_buf(),
-            mmap: Some(mmap),
-            arch_id,
-            metadata_json,
-            tensors,
-            tensor_map,
+            mmap: Some(mmap), arch_id, metadata_json, tensors, tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
         })
     }
@@ -205,6 +218,23 @@ impl HfqFile {
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
         self.mmap = None;
+    }
+
+    /// Release the pread reuse buffer back to the allocator. After a
+    /// large tensor is read (e.g. DeepSeek V4's `head.weight` at ~560 MB on a Q8F16
+    /// build), `pread_buf` keeps that capacity for the rest of the
+    /// `HfqFile`'s lifetime. On UMA systems where GPU and CPU share
+    /// physical RAM, that competes with the routed-expert upload pass —
+    /// the difference between fitting and OOM-at-layer-42 on the 88 GB
+    /// deepseek4-q8-mtp build.
+    ///
+    /// Call between load phases when you know subsequent reads will be
+    /// much smaller than the peak. Safe at any time; the next pread
+    /// auto-grows the buffer as needed.
+    pub fn shrink_pread_buf(&self) {
+        let mut buf = self.pread_buf.borrow_mut();
+        buf.clear();
+        buf.shrink_to_fit();
     }
 
     /// Path the HFQ file was opened from. The weight pager uses this to
@@ -286,10 +316,7 @@ impl HfqFile {
             "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
         );
         let mmap = self.mmap.as_ref()?;
-        Some((
-            info,
-            &mmap[info.data_offset..info.data_offset + info.data_size],
-        ))
+        Some((info, &mmap[info.data_offset..info.data_offset + info.data_size]))
     }
 
     /// Read tensor data via pread into a reusable buffer, then FADV_DONTNEED
@@ -300,10 +327,7 @@ impl HfqFile {
     /// Returns (info, guard) where guard derefs to `&[u8]`. The buffer is
     /// reused across calls — the previous data is overwritten.
     #[cfg(unix)]
-    pub fn tensor_data_pread(
-        &self,
-        name: &str,
-    ) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
+    pub fn tensor_data_pread(&self, name: &str) -> Option<(&HfqTensorInfo, std::cell::Ref<'_, Vec<u8>>)> {
         use std::os::unix::io::AsRawFd;
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
@@ -321,9 +345,7 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
-                    break;
-                }
+                if n <= 0 { break; }
                 total_read += n as usize;
             }
             // Evict these pages from cache — works because pread doesn't hold a mapping.
@@ -362,9 +384,7 @@ impl HfqFile {
                         (info.data_offset + total_read) as libc::off_t,
                     )
                 };
-                if n <= 0 {
-                    break;
-                }
+                if n <= 0 { break; }
                 total_read += n as usize;
             }
             fadvise_dontneed(fd, info.data_offset, info.data_size);
@@ -374,10 +394,7 @@ impl HfqFile {
         #[cfg(not(unix))]
         {
             let mmap = self.mmap.as_ref()?;
-            Some((
-                info,
-                mmap[info.data_offset..info.data_offset + info.data_size].to_vec(),
-            ))
+            Some((info, mmap[info.data_offset..info.data_offset + info.data_size].to_vec()))
         }
     }
 
@@ -390,9 +407,7 @@ impl HfqFile {
             fadvise_dontneed(self._file.as_raw_fd(), offset, len);
         }
         #[cfg(not(unix))]
-        {
-            let _ = (offset, len);
-        }
+        { let _ = (offset, len); }
     }
 
     /// Return the (start_offset, end_offset) byte range covering all tensors
@@ -408,11 +423,7 @@ impl HfqFile {
                 hi = hi.max(t.data_offset + t.data_size);
             }
         }
-        if lo < hi {
-            Some((lo, hi))
-        } else {
-            None
-        }
+        if lo < hi { Some((lo, hi)) } else { None }
     }
 
     fn find_tensor(&self, name: &str) -> Option<&HfqTensorInfo> {
@@ -454,7 +465,7 @@ impl crate::model_source::ModelSource for HfqFile {
         None // HFQ files encode quant_type per-tensor, not via a global config
     }
 
-    fn tensor_data(&self, _name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+    fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
         // HfqFile's tensor_data returns (&HfqTensorInfo, &[u8]).
         // We can't return a reference to a TensorInfo we don't own,
         // so this method is not directly usable for HFQ. The HFQ path
@@ -463,7 +474,7 @@ impl crate::model_source::ModelSource for HfqFile {
         None
     }
 
-    fn tensor_info(&self, _name: &str) -> Option<&crate::model_source::TensorInfo> {
+    fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
         None // HFQ uses its own HfqTensorInfo type
     }
 
@@ -497,58 +508,39 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<LlamaConfig> {
     let dim = config.get("hidden_size")?.as_u64()? as usize;
     let n_layers = config.get("num_hidden_layers")?.as_u64()? as usize;
     let n_heads = config.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = config
-        .get("num_key_value_heads")
+    let n_kv_heads = config.get("num_key_value_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(n_heads as u64) as usize;
     let hidden_dim = config.get("intermediate_size")?.as_u64()? as usize;
     let vocab_size = config.get("vocab_size")?.as_u64()? as usize;
-    let norm_eps = config
-        .get("rms_norm_eps")
+    let norm_eps = config.get("rms_norm_eps")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-5) as f32;
-    let max_seq_len = config
-        .get("max_position_embeddings")
+    let max_seq_len = config.get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .unwrap_or(2048) as usize;
-    let rope_freq_base = config
-        .get("rope_theta")
+    let rope_freq_base = config.get("rope_theta")
         .and_then(|v| v.as_f64())
         .unwrap_or(10000.0) as f32;
 
-    let has_qk_norm = hfq
-        .find_tensor("model.layers.0.self_attn.q_norm.weight")
-        .is_some();
+    let has_qk_norm = hfq.find_tensor("model.layers.0.self_attn.q_norm.weight").is_some();
 
-    let head_dim = config
-        .get("head_dim")
+    let head_dim = config.get("head_dim")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(dim / n_heads);
 
-    let bos_token = config
-        .get("bos_token_id")
+    let bos_token = config.get("bos_token_id")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
-    let eos_token = config
-        .get("eos_token_id")
+    let eos_token = config.get("eos_token_id")
         .and_then(|v| v.as_u64())
         .unwrap_or(2) as u32;
 
     Some(LlamaConfig {
-        arch,
-        dim,
-        hidden_dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        vocab_size,
-        head_dim,
-        norm_eps,
-        max_seq_len,
-        rope_freq_base,
-        bos_token,
-        eos_token,
+        arch, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size,
+        head_dim, norm_eps, max_seq_len, rope_freq_base,
+        bos_token, eos_token,
         has_qk_norm,
     })
 }
@@ -556,33 +548,22 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<LlamaConfig> {
 // ─── Weight Loading ─────────────────────────────────────────────────────────
 
 /// Load a tensor as F32 on GPU (for norms, embeddings).
-fn load_f16_tensor(
-    hfq: &HfqFile,
-    gpu: &mut Gpu,
-    st_name: &str,
-    shape: &[usize],
-) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(st_name)
+fn load_f16_tensor(hfq: &HfqFile, gpu: &mut Gpu, st_name: &str, shape: &[usize]) -> HipResult<GpuTensor> {
+    let (info, data) = hfq.tensor_data(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
 
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => {
-            // F16
+        1 => { // F16
             data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()
         }
-        2 => {
-            // F32
+        2 => { // F32
             data.chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
-        _ => panic!(
-            "expected F16/F32 tensor for {st_name}, got quant_type={}",
-            info.quant_type
-        ),
+        _ => panic!("expected F16/F32 tensor for {st_name}, got quant_type={}", info.quant_type),
     };
 
     gpu.upload_f32(&f32_data, shape)
@@ -639,321 +620,125 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
-fn load_weight_tensor(
-    hfq: &HfqFile,
-    gpu: &Gpu,
-    st_name: &str,
-    m: usize,
-    k: usize,
-) -> HipResult<WeightTensor> {
-    let (info, data) = hfq
-        .tensor_data(st_name)
+fn load_weight_tensor(hfq: &HfqFile, gpu: &Gpu, st_name: &str, m: usize, k: usize) -> HipResult<WeightTensor> {
+    let (info, data) = hfq.tensor_data(st_name)
         .unwrap_or_else(|| panic!("tensor not found: {st_name}"));
 
     let mut wt = match info.quant_type {
-        0 => {
-            // Q4F16G64
+        0 => { // Q4F16G64
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q4F16G64,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q4F16G64, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        3 => {
-            // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
+        3 => { // Q8F16 — same block format as GGML Q8_0 (34 bytes per 32 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8_0,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8_0, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        4 => {
-            // Q4_K — GGML-compatible Q4_K blocks (144 bytes per 256 elements)
+        4 => { // Q4_K — GGML-compatible Q4_K blocks (144 bytes per 256 elements)
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q4K,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q4K, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        5 => {
-            // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
+        5 => { // Q8HFQ — split-metadata layout (scales then values, 128B-aligned rows)
             let n_groups = k / 32;
             let raw_row = n_groups * 2 + k;
             let row_stride = (raw_row + 127) & !127;
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::Q8HFQ,
-                m,
-                k,
-                row_stride,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::Q8HFQ, m, k, row_stride, paro: None, awq_scale: None })
         }
-        6 => {
-            // HFQ4-G256 — flat 4-bit, 136 bytes per 256 elements
+        6 => { // HFQ4-G256 — flat 4-bit, 136 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        7 => {
-            // HFQ4-G128 — flat 4-bit, 72 bytes per 128 elements
+        7 => { // HFQ4-G128 — flat 4-bit, 72 bytes per 128 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ4G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        8 => {
-            // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
+        28 => { // PARO4-G128 — ParoQuant rotated-activation W4 probe format
+            assert!(k % 128 == 0, "PARO4G128 weight {st_name} has K={k} but kernel requires K%128==0");
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ6G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        9 => {
-            // HFQ2-G256 — flat 2-bit, 72 bytes per 256 elements
+        29 => { // PARO4-G128T — same metadata, qweight retiled as [M/8, K] for GEMV
+            assert!(k % 128 == 0, "PARO4G128T weight {st_name} has K={k} but kernel requires K%128==0");
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ2G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::PARO4G128T, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        10 => {
-            // HFQ2-G128 — flat 2-bit, 40 bytes per 128 elements
+        8 => { // HFQ6-G256 — 6-bit, 200 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ2G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ6G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        11 => {
-            // HFQ3-G256 — flat 3-bit, 104 bytes per 256 elements
+        9 => { // HFQ2-G256 — flat 2-bit, 72 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ2G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        12 => {
-            // HFQ3-G128 — flat 3-bit, 56 bytes per 128 elements
+        10 => { // HFQ2-G128 — flat 2-bit, 40 bytes per 128 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFQ3G128,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ2G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        13 => {
-            // MQ4-G256 — MagnumQuant FWHT-rotated 4-bit
+        11 => { // HFQ3-G256 — flat 3-bit, 104 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        14 => {
-            // MQ8-G256 — MagnumQuant FWHT-rotated symmetric INT8, dp4a
+        12 => { // HFQ3-G128 — flat 3-bit, 56 bytes per 128 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ8G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFQ3G128, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        17 => {
-            // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit, 104 bytes per 256 elements
+        13 => { // MQ4-G256 — MagnumQuant FWHT-rotated 4-bit
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        18 => {
-            // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit, 72 bytes per 256 elements
+        14 => { // MQ8-G256 — MagnumQuant FWHT-rotated symmetric INT8, dp4a
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ8G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        19 => {
-            // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook, 72 bytes per 256 elements
+        17 => { // MQ3-G256 — MagnumQuant FWHT-rotated 3-bit, 104 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ2G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        20 => {
-            // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook, 112 bytes per 256 elements
+        18 => { // MQ2-G256 — MagnumQuant FWHT-rotated 2-bit, 72 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ3G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        21 => {
-            // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale.
-            // Per-row hdr 16 B + (K/32) blocks × 17 B. See docs/quant-formats/hfp4.md.
-            // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs);
-            // refuse here so a stale or externally-quantized file fails at
-            // load instead of panicking on first dispatch.
-            assert!(
-                k % 256 == 0,
-                "HFP4G32 v1 weight {st_name} has K={k} but kernel requires K%256==0"
-            );
+        19 => { // MQ2-G256-Lloyd — 2-bit + 4-entry fp16 codebook, 72 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::HFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ2G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        24 => {
-            // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement).
-            // Same byte layout as qtype 21; format_flags=0x05 in row hdr.
-            // See docs/quant-formats/hfp4.md.
-            assert!(
-                k % 256 == 0,
-                "MFP4G32 weight {st_name} has K={k} but kernel + FWHT both require K%256==0"
-            );
+        20 => { // MQ3-G256-Lloyd — 3-bit + 8-entry fp16 codebook, 112 bytes per 256 elements
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MFP4G32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ3G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        30 => {
-            // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook, 160 bytes per 256 elements.
-            // Renumbered from qtype 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-            // Models quantized pre-renumber MUST be re-quantized.
+        21 => { // HFP4G32 — E2M1 + UE8M0 g32 + FP16 row scale.
+                // Per-row hdr 16 B + (K/32) blocks × 17 B. See docs/quant-formats/hfp4.md.
+                // K%256 — kernel constraint (gemv_hfp4g32 in dispatch.rs);
+                // refuse here so a stale or externally-quantized file fails at
+                // load instead of panicking on first dispatch.
+            assert!(k % 256 == 0, "HFP4G32 v1 weight {st_name} has K={k} but kernel requires K%256==0");
             let buf = gpu.upload_raw(data, &[data.len()])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::MQ4G256Lloyd,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::HFP4G32, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        1 => {
-            // F16 — dequant to F32 for F32 GEMV
-            let f32_data: Vec<f32> = data
-                .chunks_exact(2)
+        24 => { // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement).
+                // Same byte layout as qtype 21; format_flags=0x05 in row hdr.
+                // See docs/quant-formats/hfp4.md.
+            assert!(k % 256 == 0, "MFP4G32 weight {st_name} has K={k} but kernel + FWHT both require K%256==0");
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MFP4G32, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        30 => { // MQ4-G256-Lloyd — 4-bit + 16-entry fp16 codebook, 160 bytes per 256 elements.
+                // Renumbered from qtype 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+                // Models quantized pre-renumber MUST be re-quantized.
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor { buf, gpu_dtype: DType::MQ4G256Lloyd, m, k, row_stride: 0, paro: None, awq_scale: None })
+        }
+        1 => { // F16 — dequant to F32 for F32 GEMV
+            let f32_data: Vec<f32> = data.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect();
             let bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
             };
             let buf = gpu.upload_raw(bytes, &[m, k])?;
-            Ok(WeightTensor {
-                buf,
-                gpu_dtype: DType::F32,
-                m,
-                k,
-                row_stride: 0,
-                paro: None,
-                awq_scale: None,
-            })
+            Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
         }
-        _ => panic!(
-            "unsupported quant_type {} for weight {st_name}",
-            info.quant_type
-        ),
+        _ => panic!("unsupported quant_type {} for weight {st_name}", info.quant_type),
     }?;
     // Centralized AWQ sidecar attachment. Replaces the prior per-arm
     // inline `load_awq_scale()` calls at the qt=13 / qt=17 arms — those
@@ -990,10 +775,7 @@ pub fn load_weights_hfq(
     // model_type tag or the model family — both LLaMA and Qwen3 lack
     // these bias tensors, so any HFQ with `model.layers.0.self_attn.q_proj.bias`
     // is by definition a Qwen2-family input.)
-    if hfq
-        .find_tensor_info("model.layers.0.self_attn.q_proj.bias")
-        .is_some()
-    {
+    if hfq.find_tensor_info("model.layers.0.self_attn.q_proj.bias").is_some() {
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
@@ -1015,45 +797,25 @@ pub fn load_weights_hfq(
     }
 
     eprintln!("  loading token_embd...");
-    let embd_info = hfq
-        .tensor_data("model.embed_tokens.weight")
+    let embd_info = hfq.tensor_data("model.embed_tokens.weight")
         .expect("embed_tokens not found");
     let (token_embd, embd_fmt) = if embd_info.0.quant_type == 4 {
         // Q4_K: upload raw, use Q4K embedding lookup at inference
         eprintln!("    (Q4K raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::Q4K,
-        )
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q4K)
     } else if embd_info.0.quant_type == 6 {
         eprintln!("    (HFQ4-G256 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G256,
-        )
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G256)
     } else if embd_info.0.quant_type == 7 {
         eprintln!("    (HFQ4-G128 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::HFQ4G128,
-        )
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::HFQ4G128)
     } else if embd_info.0.quant_type == 3 {
         // Q8F16: upload raw, use Q8 embedding lookup at inference
         eprintln!("    (Q8 raw, {} MB)", embd_info.1.len() / 1_000_000);
-        (
-            gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?,
-            EmbeddingFormat::Q8_0,
-        )
+        (gpu.upload_raw(embd_info.1, &[embd_info.1.len()])?, EmbeddingFormat::Q8_0)
     } else {
-        (
-            load_f16_tensor(
-                hfq,
-                gpu,
-                "model.embed_tokens.weight",
-                &[config.vocab_size, config.dim],
-            )?,
-            EmbeddingFormat::F32,
-        )
+        (load_f16_tensor(hfq, gpu, "model.embed_tokens.weight",
+            &[config.vocab_size, config.dim])?, EmbeddingFormat::F32)
     };
 
     eprintln!("  loading output_norm...");
@@ -1065,23 +827,14 @@ pub fn load_weights_hfq(
     } else {
         // Tied embeddings — reuse token_embd as output weights (F32 for GEMV)
         let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
-        let f32_data: Vec<f32> = data
-            .chunks_exact(2)
+        let f32_data: Vec<f32> = data.chunks_exact(2)
             .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
         let bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
         };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
     };
 
     let mut layers = Vec::with_capacity(config.n_layers);
@@ -1092,107 +845,44 @@ pub fn load_weights_hfq(
         let q_out_dim = config.n_heads * config.head_dim;
 
         let layer = LayerWeights {
-            attn_norm: load_f16_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.input_layernorm.weight"),
-                &[config.dim],
-            )?,
-            wq: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.self_attn.q_proj.weight"),
-                q_out_dim,
-                config.dim,
-            )?,
-            wk: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.self_attn.k_proj.weight"),
-                kv_dim,
-                config.dim,
-            )?,
-            wv: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.self_attn.v_proj.weight"),
-                kv_dim,
-                config.dim,
-            )?,
-            wo: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.self_attn.o_proj.weight"),
-                config.dim,
-                q_out_dim,
-            )?,
+            attn_norm: load_f16_tensor(hfq, gpu,
+                &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+            wq: load_weight_tensor(hfq, gpu,
+                &format!("{p}.self_attn.q_proj.weight"), q_out_dim, config.dim)?,
+            wk: load_weight_tensor(hfq, gpu,
+                &format!("{p}.self_attn.k_proj.weight"), kv_dim, config.dim)?,
+            wv: load_weight_tensor(hfq, gpu,
+                &format!("{p}.self_attn.v_proj.weight"), kv_dim, config.dim)?,
+            wo: load_weight_tensor(hfq, gpu,
+                &format!("{p}.self_attn.o_proj.weight"), config.dim, q_out_dim)?,
             q_norm: if config.has_qk_norm {
-                Some(load_f16_tensor(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_norm.weight"),
-                    &[config.head_dim],
-                )?)
-            } else {
-                None
-            },
+                Some(load_f16_tensor(hfq, gpu,
+                    &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?)
+            } else { None },
             k_norm: if config.has_qk_norm {
-                Some(load_f16_tensor(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_norm.weight"),
-                    &[config.head_dim],
-                )?)
-            } else {
-                None
-            },
-            ffn_norm: load_f16_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.post_attention_layernorm.weight"),
-                &[config.dim],
-            )?,
-            w_gate: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.gate_proj.weight"),
-                config.hidden_dim,
-                config.dim,
-            )?,
-            w_up: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.up_proj.weight"),
-                config.hidden_dim,
-                config.dim,
-            )?,
-            w_down: load_weight_tensor(
-                hfq,
-                gpu,
-                &format!("{p}.mlp.down_proj.weight"),
-                config.dim,
-                config.hidden_dim,
-            )?,
+                Some(load_f16_tensor(hfq, gpu,
+                    &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?)
+            } else { None },
+            ffn_norm: load_f16_tensor(hfq, gpu,
+                &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+            w_gate: load_weight_tensor(hfq, gpu,
+                &format!("{p}.mlp.gate_proj.weight"), config.hidden_dim, config.dim)?,
+            w_up: load_weight_tensor(hfq, gpu,
+                &format!("{p}.mlp.up_proj.weight"), config.hidden_dim, config.dim)?,
+            w_down: load_weight_tensor(hfq, gpu,
+                &format!("{p}.mlp.down_proj.weight"), config.dim, config.hidden_dim)?,
         };
         layers.push(layer);
     }
 
-    Ok(LlamaWeights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        layers,
-    })
+    Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
 }
 
 // ─── ParoQuant safetensors loading (LLaMA / Qwen3 arch) ────────────────────
 
 /// Parse a LlamaConfig from a SafetensorsSource's metadata JSON.
 /// The metadata JSON has structure: `{ "config": { ...config.json... } }`.
-pub fn config_from_safetensors_llama(
-    source: &dyn crate::model_source::ModelSource,
-) -> Option<LlamaConfig> {
+pub fn config_from_safetensors_llama(source: &dyn crate::model_source::ModelSource) -> Option<LlamaConfig> {
     let meta: serde_json::Value = serde_json::from_str(source.metadata_json()).ok()?;
     let config = meta.get("config")?;
 
@@ -1206,59 +896,40 @@ pub fn config_from_safetensors_llama(
     let dim = config.get("hidden_size")?.as_u64()? as usize;
     let n_layers = config.get("num_hidden_layers")?.as_u64()? as usize;
     let n_heads = config.get("num_attention_heads")?.as_u64()? as usize;
-    let n_kv_heads = config
-        .get("num_key_value_heads")
+    let n_kv_heads = config.get("num_key_value_heads")
         .and_then(|v| v.as_u64())
         .unwrap_or(n_heads as u64) as usize;
     let hidden_dim = config.get("intermediate_size")?.as_u64()? as usize;
     let vocab_size = config.get("vocab_size")?.as_u64()? as usize;
-    let norm_eps = config
-        .get("rms_norm_eps")
+    let norm_eps = config.get("rms_norm_eps")
         .and_then(|v| v.as_f64())
         .unwrap_or(1e-5) as f32;
-    let max_seq_len = config
-        .get("max_position_embeddings")
+    let max_seq_len = config.get("max_position_embeddings")
         .and_then(|v| v.as_u64())
         .unwrap_or(2048) as usize;
-    let rope_freq_base = config
-        .get("rope_theta")
+    let rope_freq_base = config.get("rope_theta")
         .and_then(|v| v.as_f64())
         .unwrap_or(10000.0) as f32;
 
-    let head_dim = config
-        .get("head_dim")
+    let head_dim = config.get("head_dim")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(dim / n_heads);
 
-    let bos_token = config
-        .get("bos_token_id")
+    let bos_token = config.get("bos_token_id")
         .and_then(|v| v.as_u64())
         .unwrap_or(1) as u32;
-    let eos_token = config
-        .get("eos_token_id")
+    let eos_token = config.get("eos_token_id")
         .and_then(|v| v.as_u64())
         .unwrap_or(2) as u32;
 
     // Detect QK norm from tensor names
-    let has_qk_norm = source
-        .tensor_info("model.layers.0.self_attn.q_norm.weight")
-        .is_some();
+    let has_qk_norm = source.tensor_info("model.layers.0.self_attn.q_norm.weight").is_some();
 
     Some(LlamaConfig {
-        arch,
-        dim,
-        hidden_dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        vocab_size,
-        head_dim,
-        norm_eps,
-        max_seq_len,
-        rope_freq_base,
-        bos_token,
-        eos_token,
+        arch, dim, hidden_dim, n_layers, n_heads, n_kv_heads, vocab_size,
+        head_dim, norm_eps, max_seq_len, rope_freq_base,
+        bos_token, eos_token,
         has_qk_norm,
     })
 }
@@ -1281,31 +952,22 @@ fn repack_awq_to_hfq4g128(
     let bytes_per_row = groups_per_row * 72;
     let mut out = vec![0u8; out_dim * bytes_per_row];
 
-    debug_assert_eq!(
-        qweight.as_ptr() as usize % 4,
-        0,
-        "AWQ qweight not 4-byte aligned"
-    );
-    let qw: &[u32] =
-        unsafe { std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4) };
+    debug_assert_eq!(qweight.as_ptr() as usize % 4, 0, "AWQ qweight not 4-byte aligned");
+    let qw: &[u32] = unsafe {
+        std::slice::from_raw_parts(qweight.as_ptr() as *const u32, qweight.len() / 4)
+    };
     let qw_cols = out_dim / 8;
 
-    debug_assert_eq!(
-        qzeros.as_ptr() as usize % 4,
-        0,
-        "AWQ qzeros not 4-byte aligned"
-    );
-    let qz: &[u32] =
-        unsafe { std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4) };
+    debug_assert_eq!(qzeros.as_ptr() as usize % 4, 0, "AWQ qzeros not 4-byte aligned");
+    let qz: &[u32] = unsafe {
+        std::slice::from_raw_parts(qzeros.as_ptr() as *const u32, qzeros.len() / 4)
+    };
     let qz_cols = out_dim / 8;
 
-    debug_assert_eq!(
-        scales.as_ptr() as usize % 2,
-        0,
-        "AWQ scales not 2-byte aligned"
-    );
-    let sc: &[u16] =
-        unsafe { std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2) };
+    debug_assert_eq!(scales.as_ptr() as usize % 2, 0, "AWQ scales not 2-byte aligned");
+    let sc: &[u16] = unsafe {
+        std::slice::from_raw_parts(scales.as_ptr() as *const u16, scales.len() / 2)
+    };
 
     for m in 0..out_dim {
         for g in 0..groups_per_row {
@@ -1359,34 +1021,21 @@ fn load_paroquant_weight_from_source(
     let theta_name = format!("{tensor_prefix}.theta");
     let cs_name = format!("{tensor_prefix}.channel_scales");
 
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
+    let (_, qw_data) = source.tensor_data(&qw_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
+    let (_, qz_data) = source.tensor_data(&qz_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
+    let (_, sc_data) = source.tensor_data(&sc_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
 
-    let hfq_data = repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
-        out_dim,
-        in_dim,
-        group_size as usize,
-    );
+    let hfq_data = repack_awq_to_hfq4g128(qw_data, qz_data, sc_data, out_dim, in_dim, group_size as usize);
     let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
 
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
+    let (_, pairs_data) = source.tensor_data(&pairs_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
+    let (_, theta_data) = source.tensor_data(&theta_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
+    let (_, cs_data) = source.tensor_data(&cs_name)
         .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
 
     let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
@@ -1419,25 +1068,16 @@ fn load_fp16_weight_tensor_from_source(
     m: usize,
     k: usize,
 ) -> HipResult<WeightTensor> {
-    let (_, data) = source
-        .tensor_data(name)
+    let (_, data) = source.tensor_data(name)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
-    let f32_data: Vec<f32> = data
-        .chunks_exact(2)
+    let f32_data: Vec<f32> = data.chunks_exact(2)
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4) };
+    let bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(f32_data.as_ptr() as *const u8, f32_data.len() * 4)
+    };
     let buf = gpu.upload_raw(bytes, &[m, k])?;
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::F32,
-        m,
-        k,
-        row_stride: 0,
-        paro: None,
-        awq_scale: None,
-    })
+    Ok(WeightTensor { buf, gpu_dtype: DType::F32, m, k, row_stride: 0, paro: None, awq_scale: None })
 }
 
 /// Load a ParoQuant weight (quantized or FP16 fallback) using `model.` tensor prefix.
@@ -1462,21 +1102,16 @@ fn paro_load_llama_wt(
 fn paro_load_llama_norm_raw(
     source: &dyn crate::model_source::ModelSource,
     gpu: &mut Gpu,
-    name: &str, // e.g. "layers.0.input_layernorm.weight"
+    name: &str,   // e.g. "layers.0.input_layernorm.weight"
     shape: &[usize],
 ) -> HipResult<GpuTensor> {
     let full = format!("model.{name}");
-    let (info, data) = source
-        .tensor_data(&full)
+    let (info, data) = source.tensor_data(&full)
         .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {full}")))?;
     let v: Vec<f32> = if info.dtype == "F16" {
-        data.chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()
+        data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect()
     } else {
-        data.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+        data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     };
     gpu.upload_f32(&v, shape)
 }
@@ -1490,8 +1125,7 @@ pub fn load_weights_paroquant_llama(
     config: &LlamaConfig,
     gpu: &mut Gpu,
 ) -> HipResult<LlamaWeights> {
-    let qc = source
-        .quant_config()
+    let qc = source.quant_config()
         .ok_or_else(|| HipError::new(0, "ParoQuant model must have quantization_config"))?;
     let gs = qc.group_size;
     let kr = qc.krot;
@@ -1499,13 +1133,10 @@ pub fn load_weights_paroquant_llama(
     // Embedding
     eprintln!("  loading token_embd (ParoQuant LLaMA/Qwen3)...");
     let embd_name = "model.embed_tokens.weight";
-    let (_, embd_data) = source
-        .tensor_data(embd_name)
+    let (_, embd_data) = source.tensor_data(embd_name)
         .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens not found"))?;
-    let f32_embd: Vec<f32> = embd_data
-        .chunks_exact(2)
-        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect();
+    let f32_embd: Vec<f32> = embd_data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
     let token_embd = gpu.upload_f32(&f32_embd, &[config.vocab_size, config.dim])?;
     let embd_fmt = EmbeddingFormat::F32;
 
@@ -1517,170 +1148,69 @@ pub fn load_weights_paroquant_llama(
     let output = if source.tensor_info("lm_head.weight").is_some() {
         eprintln!("  loading output (separate lm_head)...");
         let lm_prefix = "lm_head";
-        if source
-            .tensor_info(&format!("{lm_prefix}.qweight"))
-            .is_some()
-        {
-            load_paroquant_weight_from_source(
-                source,
-                gpu,
-                lm_prefix,
-                config.vocab_size,
-                config.dim,
-                gs,
-                kr,
-            )?
+        if source.tensor_info(&format!("{lm_prefix}.qweight")).is_some() {
+            load_paroquant_weight_from_source(source, gpu, lm_prefix, config.vocab_size, config.dim, gs, kr)?
         } else {
-            load_fp16_weight_tensor_from_source(
-                source,
-                gpu,
-                &format!("{lm_prefix}.weight"),
-                config.vocab_size,
-                config.dim,
-            )?
+            load_fp16_weight_tensor_from_source(source, gpu, &format!("{lm_prefix}.weight"), config.vocab_size, config.dim)?
         }
     } else {
         eprintln!("  loading output (tied embeddings)...");
-        let (_, td) = source
-            .tensor_data(embd_name)
+        let (_, td) = source.tensor_data(embd_name)
             .ok_or_else(|| HipError::new(0, "PARO tensor not found: embed_tokens for lm_head"))?;
-        let f: Vec<f32> = td
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
-        let bytes: &[u8] =
-            unsafe { std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4) };
+        let f: Vec<f32> = td.chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(f.as_ptr() as *const u8, f.len() * 4)
+        };
         let buf = gpu.upload_raw(bytes, &[config.vocab_size, config.dim])?;
-        WeightTensor {
-            buf,
-            gpu_dtype: DType::F32,
-            m: config.vocab_size,
-            k: config.dim,
-            row_stride: 0,
-            paro: None,
-            awq_scale: None,
-        }
+        WeightTensor { buf, gpu_dtype: DType::F32, m: config.vocab_size, k: config.dim, row_stride: 0, paro: None, awq_scale: None }
     };
 
     // Layers
     let mut layers = Vec::with_capacity(config.n_layers);
     for i in 0..config.n_layers {
-        eprintln!(
-            "  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...",
-            config.n_layers
-        );
+        eprintln!("  loading layer {i}/{} (ParoQuant LLaMA/Qwen3)...", config.n_layers);
         let p = format!("layers.{i}");
         let q_out_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
         let q_norm = if config.has_qk_norm {
-            Some(paro_load_llama_norm_raw(
-                source,
-                gpu,
-                &format!("{p}.self_attn.q_norm.weight"),
-                &[config.head_dim],
-            )?)
+            Some(paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.self_attn.q_norm.weight"), &[config.head_dim])?)
         } else {
             None
         };
         let k_norm = if config.has_qk_norm {
-            Some(paro_load_llama_norm_raw(
-                source,
-                gpu,
-                &format!("{p}.self_attn.k_norm.weight"),
-                &[config.head_dim],
-            )?)
+            Some(paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.self_attn.k_norm.weight"), &[config.head_dim])?)
         } else {
             None
         };
 
         let layer = LayerWeights {
-            attn_norm: paro_load_llama_norm_raw(
-                source,
-                gpu,
-                &format!("{p}.input_layernorm.weight"),
-                &[config.dim],
-            )?,
-            wq: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.self_attn.q_proj"),
-                q_out_dim,
-                config.dim,
-                gs,
-                kr,
-            )?,
-            wk: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.self_attn.k_proj"),
-                kv_dim,
-                config.dim,
-                gs,
-                kr,
-            )?,
-            wv: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.self_attn.v_proj"),
-                kv_dim,
-                config.dim,
-                gs,
-                kr,
-            )?,
-            wo: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.self_attn.o_proj"),
-                config.dim,
-                q_out_dim,
-                gs,
-                kr,
-            )?,
+            attn_norm: paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.input_layernorm.weight"), &[config.dim])?,
+            wq: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.q_proj"), q_out_dim, config.dim, gs, kr)?,
+            wk: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.k_proj"), kv_dim, config.dim, gs, kr)?,
+            wv: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.v_proj"), kv_dim, config.dim, gs, kr)?,
+            wo: paro_load_llama_wt(source, gpu,
+                &format!("{p}.self_attn.o_proj"), config.dim, q_out_dim, gs, kr)?,
             q_norm,
             k_norm,
-            ffn_norm: paro_load_llama_norm_raw(
-                source,
-                gpu,
-                &format!("{p}.post_attention_layernorm.weight"),
-                &[config.dim],
-            )?,
-            w_gate: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.mlp.gate_proj"),
-                config.hidden_dim,
-                config.dim,
-                gs,
-                kr,
-            )?,
-            w_up: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.mlp.up_proj"),
-                config.hidden_dim,
-                config.dim,
-                gs,
-                kr,
-            )?,
-            w_down: paro_load_llama_wt(
-                source,
-                gpu,
-                &format!("{p}.mlp.down_proj"),
-                config.dim,
-                config.hidden_dim,
-                gs,
-                kr,
-            )?,
+            ffn_norm: paro_load_llama_norm_raw(source, gpu,
+                &format!("{p}.post_attention_layernorm.weight"), &[config.dim])?,
+            w_gate: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.gate_proj"), config.hidden_dim, config.dim, gs, kr)?,
+            w_up: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.up_proj"), config.hidden_dim, config.dim, gs, kr)?,
+            w_down: paro_load_llama_wt(source, gpu,
+                &format!("{p}.mlp.down_proj"), config.dim, config.hidden_dim, gs, kr)?,
         };
         layers.push(layer);
     }
 
-    Ok(LlamaWeights {
-        token_embd,
-        embd_format: embd_fmt,
-        output_norm,
-        output,
-        layers,
-    })
+    Ok(LlamaWeights { token_embd, embd_format: embd_fmt, output_norm, output, layers })
 }

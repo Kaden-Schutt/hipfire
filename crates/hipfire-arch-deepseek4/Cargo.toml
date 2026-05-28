@@ -1,0 +1,18 @@
+[package]
+name = "hipfire-arch-deepseek4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "DeepSeek V4 Flash architecture for hipfire (Hyper-Connections + compressed-KV indexer + tail-only RoPE)"
+
+# Full DeepSeek V4 Flash inference crate: Architecture trait impl,
+# forward pass (Hyper-Connections, compressed-KV indexer, tail-only
+# RoPE, Q/O-LoRA, raw SWA), MTP speculative-decode head, and the
+# `deepseek4_chat` example binary.
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }

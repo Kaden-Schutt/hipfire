@@ -47,16 +47,8 @@ impl LoopGuard {
     ///   disable the guard entirely.
     /// - `HIPFIRE_NGRAM_WINDOW` (default 256): how many trailing tokens to
     ///   inspect on each `check` call.
-    pub fn from_env() -> Self {
-        let ngram_threshold: usize = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(8);
-        let ngram_window: usize = std::env::var("HIPFIRE_NGRAM_WINDOW")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(256);
-        Self::new(ngram_threshold, ngram_window)
+    pub fn from_config(config: &crate::config::RuntimeConfig) -> Self {
+        Self::new(config.ngram_loop_threshold, config.ngram_window)
     }
 
     /// Construct with explicit threshold and window. `threshold = 0` disables

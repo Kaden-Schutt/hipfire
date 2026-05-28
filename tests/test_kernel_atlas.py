@@ -752,6 +752,69 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
 
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256.gfx1201.hip"])
 
+    def test_build_task_bundle_from_suggestion_records_experiment_contract(self):
+        row = {
+            "arch": "gfx1100",
+            "hostname": "k9lin",
+            "workload": "qwen3.5-0.8b-paro4-native",
+            "quant": "paro4",
+            "phase": "decode_ar",
+            "shape_bucket": "decode_ar_pp32_gen16",
+            "metrics": {"gen_tok_s": 72.5},
+            "command": ["bench_qwen35_mq4", "/models/paro4.hfq"],
+            "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_GRAPH": "0"}},
+            "artifacts": {
+                "profile_kernels": kernel_atlas.annotate_profile_kernels(
+                    [
+                        {"name": "rmsnorm_f32", "pct": 24.3},
+                        {"name": "fused_qk_l2_norm_scale_f32", "pct": 8.8},
+                    ]
+                ),
+                "dispatch": {
+                    "entries": [
+                        {
+                            "name": "rmsnorm_f32",
+                            "source_files": [{"path": "kernels/src/fused_rmsnorm_mq_rotate.hip"}],
+                            "dispatch_refs": [{"path": "crates/hipfire-runtime/src/llama.rs", "line": 679}],
+                        }
+                    ]
+                },
+            },
+        }
+        suggestion = {
+            "id": "sug-fusion",
+            "rank": 1,
+            "title": "Prioritize decode launch/fusion experiments over matrix-path changes",
+            "lever_type": "fusion",
+            "risk": "medium",
+            "expected_impact": "high",
+            "score": 92.0,
+            "history_key": "hist-fusion",
+            "hot_kernel": None,
+            "allowed_files": [
+                "crates/hipfire-runtime/src/llama.rs",
+                "kernels/src/fused_rmsnorm_mq_rotate.hip",
+                "crates/hipfire-runtime/src/llama.rs",
+            ],
+            "rationale": ["launch dominated"],
+            "candidate_steps": ["fuse one adjacent transform"],
+            "correctness_commands": [["./scripts/coherence-gate-dflash.sh"]],
+        }
+
+        task = kernel_atlas.build_task_bundle_from_row(row, manifest={}, suggestion=suggestion)
+        text = kernel_atlas.render_task_markdown(task)
+
+        self.assertEqual(task["producer"]["kind"], "hipfire-atlas-suggestion")
+        self.assertEqual(task["producer"]["suggestion"]["id"], "sug-fusion")
+        self.assertEqual(task["experiment"]["lever_type"], "fusion")
+        self.assertEqual(
+            task["constraints"]["allowed_files"],
+            ["crates/hipfire-runtime/src/llama.rs", "kernels/src/fused_rmsnorm_mq_rotate.hip"],
+        )
+        self.assertEqual(task["eval"]["correctness_commands"], [["./scripts/coherence-gate-dflash.sh"]])
+        self.assertIn("## Suggested Experiment", text)
+        self.assertIn("Prioritize decode launch/fusion experiments", text)
+
     def test_build_suggestion_queue_emits_multiple_ranked_experiments(self):
         row = {
             "arch": "gfx1201",
@@ -978,6 +1041,43 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
         self.assertEqual(result["delta"]["speedup"], 1.25)
         self.assertEqual(ledger_rows[0]["task_id"], "atlas-test-task")
         self.assertEqual(ledger_rows[0]["status"], "pass")
+
+    def test_run_task_command_supports_shell_chains_for_correctness_commands(self):
+        result = kernel_atlas.run_task_command("python3 -c 'print(1)' && python3 -c 'print(2)'")
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertTrue(result["shell"])
+        self.assertIn("1\n2", result["output_tail"])
+
+    def test_run_graph_ab_for_row_records_second_pass_lift(self):
+        code = (
+            "import os; "
+            "g=os.environ.get('HIPFIRE_GRAPH'); "
+            "v=100.0 if g=='0' else 125.0; "
+            "print(f'SUMMARY gen_tok_s={v} bw_gib_s=1.0 prefill_tok_s={v/10} avg_ms=2.0 p50_ms=2.0')"
+        )
+        row = {
+            "arch": "gfx1100",
+            "hostname": "k9lin",
+            "workload": "qwen3.5-0.8b-paro4-native",
+            "quant": "paro4",
+            "phase": "decode_ar",
+            "shape_bucket": "decode_ar_pp32_gen16",
+            "command": ["python3", "-c", code],
+            "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_KV_MODE": "q8"}},
+        }
+
+        result = kernel_atlas.run_graph_ab_for_row(row)
+
+        self.assertEqual(result["schema"], "hipfire.kernel_atlas.graph_ab.v0")
+        self.assertEqual(result["status"], "pass")
+        self.assertEqual(result["stripped_env_keys"], ["HIPFIRE_PROFILE_DECODE"])
+        self.assertEqual(result["graph_off"]["headline_pass"], 2)
+        self.assertEqual(len(result["graph_off"]["passes"]), 2)
+        self.assertEqual(result["graph_off"]["metrics"]["gen_tok_s"], 100.0)
+        self.assertEqual(result["graph_on"]["metrics"]["gen_tok_s"], 125.0)
+        self.assertEqual(result["delta"]["lift"], 1.25)
+        self.assertEqual(result["graph_on"]["route"]["graph_enabled"], True)
 
     def test_evaluate_task_bundle_uses_median_across_repeated_runs(self):
         command = (
@@ -1245,6 +1345,81 @@ amdhsa.target:   amdgcn-amd-amdhsa--gfx1100
             task = kernel_atlas.load_json_or_jsonl(str(out_dir / "task.json"))
 
         self.assertEqual(task["constraints"]["allowed_files"], ["kernels/src/gemv_hfq4g256.gfx1201.hip"])
+
+    def test_task_cli_can_build_from_ranked_suggestion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            row_path = root / "row.jsonl"
+            isa_path = root / "isa.json"
+            dispatch_path = root / "dispatch.json"
+            out_dir = root / "task-out"
+            row = {
+                "arch": "gfx1100",
+                "hostname": "k9lin",
+                "workload": "qwen3.5-0.8b-paro4-native",
+                "quant": "paro4",
+                "phase": "decode_ar",
+                "shape_bucket": "decode_ar_pp32_gen16",
+                "metrics": {"gen_tok_s": 72.5},
+                "command": ["python3", "-c", "print('gen_tok_s=73.0')"],
+                "variant": {"env": {"HIPFIRE_PROFILE_DECODE": "1", "HIPFIRE_GRAPH": "0"}},
+                "artifacts": {
+                    "profile_kernels": kernel_atlas.annotate_profile_kernels(
+                        [{"name": "rmsnorm_f32", "pct": 24.3}]
+                    )
+                },
+            }
+            isa = {
+                "objects": [
+                    {
+                        "kernels": [{"name": "gemv_paro4g128"}],
+                        "instruction_summary": {"instruction_count": 10, "category_counts": {"valu": 10}},
+                    }
+                ]
+            }
+            dispatch = {
+                "entries": [
+                    {
+                        "name": "rmsnorm_f32",
+                        "source_files": [{"path": "kernels/src/fused_rmsnorm_mq_rotate.hip"}],
+                        "dispatch_refs": [{"path": "crates/hipfire-runtime/src/llama.rs", "line": 679}],
+                    }
+                ]
+            }
+            row_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+            isa_path.write_text(json.dumps(isa), encoding="utf-8")
+            dispatch_path.write_text(json.dumps(dispatch), encoding="utf-8")
+
+            subprocess.run(
+                [
+                    "python3",
+                    str(ATLAS_PATH),
+                    "task",
+                    "--row",
+                    str(row_path),
+                    "--isa",
+                    str(isa_path),
+                    "--dispatch",
+                    str(dispatch_path),
+                    "--suggestion-rank",
+                    "1",
+                    "--output-dir",
+                    str(out_dir),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+
+            task = kernel_atlas.load_json_or_jsonl(str(out_dir / "task.json"))
+            text = (out_dir / "TASK.md").read_text(encoding="utf-8")
+
+        self.assertEqual(task["producer"]["kind"], "hipfire-atlas-suggestion")
+        self.assertEqual(task["producer"]["suggestion"]["rank"], 1)
+        self.assertEqual(task["experiment"]["lever_type"], "fusion")
+        self.assertIn("kernels/src/fused_rmsnorm_mq_rotate.hip", task["constraints"]["allowed_files"])
+        self.assertIn("## Suggested Experiment", text)
 
     def test_suggest_cli_outputs_ranked_json(self):
         with tempfile.TemporaryDirectory() as td:

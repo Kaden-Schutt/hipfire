@@ -1,8 +1,12 @@
 # dots.ocr (Qwen2-VL family) — PRD
 
-**Status:** Phase 2 closed (vision tower + end-to-end OCR validated
-2026-05-21 against vLLM reference). Phase 3 (daemon plumbing) not
-started. This PRD is the durable design and decision record; for
+**Status:** Phase 2 merged to master (2026-05-25). Phase 3 (daemon
+serving) **substantially landed** on `feat/dots-ocr-phase-3-daemon`:
+the daemon serves dots.ocr over its JSONL protocol (arch_id=8 load arm,
+`generate_vl_dots_ocr`, file-path + base64 image input), validated
+13/13 exact-match vs the vLLM reference, with batched prefill (per-token
+46.8s → 0.35s). Remaining phase-3 items: multi-image, non-greedy
+sampling. This PRD is the durable design and decision record; for
 commit-by-commit progress see [`dots-ocr-devlog.md`](dots-ocr-devlog.md).
 
 ## Goal
@@ -324,6 +328,36 @@ Phases 0-2 are closed (see devlog). Phases 3-5 are forward-looking.
 
 ### Phase 3 — daemon plumbing (6-10 hr)
 
+> **Status (2026-05-25): substantially landed** on
+> `feat/dots-ocr-phase-3-daemon` — see devlog `d9e00e4e`, `3d2412b5`,
+> `a3389fc2`, `995d7449`. Workstream items below:
+> 1. Token-id constants + arch-trait overrides — **done** (were already
+>    present in `arch.rs`; `IMGPAD/IMG_START/IMG_END/USER/ENDOFUSER/
+>    ASSISTANT/ENDOFASSISTANT/ENDOFTEXT` constants exported from
+>    `dots_ocr.rs`).
+> 2. Chat-template framing — **done & decided.** The image-OCR turn is
+>    NOT wrapped in `<|user|>`/`<|endofuser|>` (the text-only template
+>    branch is; the image branch isn't). `dots_ocr::build_prompt_ids`
+>    hand-rolls the framing `220 <|img|> N×<|imgpad|> <|endofimg|>
+>    <prompt> <|assistant|>` and is verified **byte-exact** against the
+>    HF `apply_chat_template` capture. (The Jinja renderer exists, but
+>    image-token expansion must be hand-rolled regardless — pure Jinja
+>    emits one `<|imgpad|>`, not N; same pattern as qwen35-vl.)
+> 3. `LoadedModel` fields + dispatch arm — **done.** Added
+>    `dots_ocr_config` + `dots_ocr_weights`; text decode state reuses
+>    the existing `qwen2_state`. `load_model` arm for `arch_id == 8`.
+> 4. Splice + IMGPAD assertion — **done.** `generate_vl_dots_ocr` with
+>    the merger-count-vs-IMGPAD-slot hard guard.
+> 5. Multi-image per-image loop — **deferred** (single-image ships).
+>
+> Also landed beyond the original list: **base64 image input**
+> (`image::preprocess_image_bytes`), correct `loaded`-event metadata,
+> and **batched prefill** (`qwen2::forward_prefill_batch_embeds` +
+> `kv_cache_write_f32_batched.hip`) cutting prefill 46.8s → 0.35s.
+> Validated 13/13 exact-match vs vLLM over the daemon path (both
+> file-path and base64). **Still open:** multi-image, non-greedy
+> sampling. Decode (~55 tok/s) is now the dominant request cost.
+
 Promote the splice pattern from
 `crates/hipfire-arch-dots-ocr/examples/ocr_e2e.rs` (commit
 `1f94da31`) into the daemon's serving path. The example demonstrates:
@@ -486,8 +520,13 @@ during phases 1-2.)
   KV cache @ 128K context + vision activations at max image. Unified
   memory means host pressure visible too. Back-of-envelope check
   before pushing context length up.
-- **Chat-template Jinja2 vs ChatML-only renderer.** Decision in
-  phase 3; affects how `prompt_frame_overrides` is implemented.
+- **Chat-template Jinja2 vs ChatML-only renderer.** ~~Decision in
+  phase 3~~ **RESOLVED (phase 3):** the daemon has a minijinja renderer,
+  but image-token expansion can't come from Jinja (it emits one
+  `<|imgpad|>`, not N). The image-OCR turn is hand-rolled by
+  `dots_ocr::build_prompt_ids` and verified byte-exact against the HF
+  `apply_chat_template` capture. `prompt_frame_overrides` stays at
+  default.
 - **Multi-image attention leakage in `vit_attention_*`.** No
   cu_seqlens masking. Phase 3 mitigates with a per-image loop; an
   attention-kernel fix is phase 6+ perf work.
