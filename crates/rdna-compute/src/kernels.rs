@@ -2866,6 +2866,12 @@ pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");
 
+/// Multi-row Q8_0 variant (Lever 1). Same contract as the single-row
+/// `wo_per_group_batched_q8_0` but with block processing R output rows
+/// and hoisting x loads across rows. Grid = [ceil(M/R), B, G].
+pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_multirow.hip");
+
 /// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =

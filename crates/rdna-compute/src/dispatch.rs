@@ -33586,6 +33586,59 @@ impl Gpu {
         }
     }
 
+    /// Multi-row Q8_0 variant (Lever 1). Same contract as
+    /// `wo_per_group_batched_q8_0` but one block processes R output rows,
+    /// hoisting x loads across rows. Grid = [ceil(M/R), B, G].
+    /// `rows_per_block` must be 2 or 4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0_multirow(
+        &mut self,
+        wo_a: &GpuTensor,
+        x_in: &GpuTensor,
+        y_out: &GpuTensor,
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+        rows_per_block: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (name, grid_x) = match rows_per_block {
+            2 => ("wo_per_group_batched_q8_0_multirow_r2", ((m as u32) + 1) / 2),
+            4 => ("wo_per_group_batched_q8_0_multirow_r4", ((m as u32) + 3) / 4),
+            _ => return Err(hip_bridge::HipError::new(1,
+                "wo_per_group_batched_q8_0_multirow: rows_per_block must be 2 or 4")),
+        };
+        self.ensure_kernel(name, kernels::WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC, name)?;
+        let func = &self.functions[name];
+        let wp = wo_a.buf.as_ptr();
+        let xp = x_in.buf.as_ptr();
+        let yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &wp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [grid_x, batch_size as u32, g as u32],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Atomic-free MQ2-Lloyd MoE down GEMV (K4-unrolled). Writes per-
     /// (token, krank) expert outputs to `expert_outputs[N × K_TOP × M]`
     /// — no atomicAdd. Pair with `moe_down_combine_k8_batched` to fold
