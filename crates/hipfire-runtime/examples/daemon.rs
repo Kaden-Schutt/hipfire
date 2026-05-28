@@ -2667,26 +2667,22 @@ fn load_model_pp(
         //
         // Borrow gymnastics: trunk_weights is taken; we put it back AFTER
         // the mirror's source borrow ends.
-        let mirror_result = (|| -> Result<_, String> {
-            // src and dst are different devices in the standard layout but
-            // we still need separate &mut accesses. Split the slice.
-            let (left, right) = gpus.devices.split_at_mut(output_device.max(1));
-            let (src_gpu, dst_gpu) = if output_device == 0 {
-                // src == dst gpu; peer_clone shortcut handles it.
-                let dev0 = &mut left[0];
-                let dev0_ptr: *mut rdna_compute::Gpu = dev0;
-                // Safety: we know we use the same device; alias is intentional
-                // for this branch. peer_clone_tensor's same-device path uses
-                // only one device.
-                let dst = unsafe { &mut *dev0_ptr };
-                (&*dev0, dst)
-            } else {
-                (&left[0], &mut right[0])
-            };
-            hipfire_runtime::mtp_mirror::peer_clone_tensor(
-                src_gpu, dst_gpu, &trunk_weights.token_embd,
-            ).map_err(|e| format!("mirror token_embd: {e}"))
-        })();
+        // token_embd lives on dev 0 (Variant 2 load convention); mirror
+        // it onto output_device. When output_device == 0 (single-band
+        // PP or pp=1 hetero), src and dst are the same gpu — use
+        // clone_tensor_same with a single &mut. When output_device != 0,
+        // use split_pair_mut to get the (&Gpu, &mut Gpu) pair without
+        // aliasing. This replaces the Stage 2a `unsafe { &mut *dev0_ptr }`
+        // workaround per Step −1 of docs/plans/mtp_multi_refactor.md.
+        let mirror_result = if output_device == 0 {
+            let g = gpus.single_mut(0);
+            hipfire_runtime::mtp_mirror::clone_tensor_same(g, &trunk_weights.token_embd)
+                .map_err(|e| format!("mirror token_embd: {e}"))
+        } else {
+            let (src_gpu, dst_gpu) = gpus.split_pair_mut(0, output_device);
+            hipfire_runtime::mtp_mirror::clone_tensor_peer(src_gpu, dst_gpu, &trunk_weights.token_embd)
+                .map_err(|e| format!("mirror token_embd: {e}"))
+        };
 
         let mirrored_token_embd = match mirror_result {
             Ok(t) => t,

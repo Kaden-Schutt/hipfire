@@ -44,20 +44,84 @@ pub fn peer_clone_tensor(
 
     // Same-device shortcut: if src and dst are on the same gpu, the
     // "peer copy" is really a D2D memcpy. Avoids a needless host
-    // round-trip via hipMemcpyPeer. Stage 2 PP+MTP can hit this when
-    // MTP head loads onto the device that already holds token_embd.
+    // round-trip via hipMemcpyPeer.
+    //
+    // NOTE: this same-device branch is no longer reachable from new
+    // callers — Step −1 of the Stage 2b plan migrates callers to
+    // `clone_tensor_same` (no aliasing required) for the same-device
+    // case and `clone_tensor_peer` (strict distinct gpus) for the
+    // cross-device case. This wrapper kept for backwards compat with
+    // any third-party callers; prefer the new primitives going forward.
     if src_gpu.device_id == dst_gpu.device_id {
         src_gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
     } else {
-        // Synchronous peer copy. memcpy_peer blocks the host until the copy
-        // lands — fine for init-time, eliminates the need for an event +
-        // wait_event handshake here.
         src_gpu.hip.memcpy_peer(
             &dst.buf, dst_gpu.device_id,
             &src.buf,  src_gpu.device_id,
             byte_size,
         )?;
     }
+
+    debug_assert_eq!(dst.dtype, dtype);
+    debug_assert_eq!(dst.shape, shape);
+    debug_assert_eq!(dst.byte_size(), byte_size);
+
+    Ok(dst)
+}
+
+/// Same-device variant of [`peer_clone_tensor`]: takes ONE `&mut Gpu`
+/// instead of `(&Gpu, &mut Gpu)`. Use when the source tensor lives on
+/// the same gpu as the destination — avoids the Rust aliasing problem
+/// the two-arg signature forces on callers (the `(&gpu, &mut gpu)`
+/// pair is impossible without unsafe).
+///
+/// Mirrors the same-device branch of [`peer_clone_tensor`]: allocates
+/// a same-shape, same-dtype tensor on `gpu` and D2D-copies the bytes.
+pub fn clone_tensor_same(gpu: &mut Gpu, src: &GpuTensor) -> HipResult<GpuTensor> {
+    let dtype = src.dtype;
+    let shape = src.shape.clone();
+    let byte_size = src.byte_size();
+
+    gpu.bind_thread()?;
+    let dst = gpu.alloc_tensor(&shape, dtype)?;
+    gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
+
+    debug_assert_eq!(dst.dtype, dtype);
+    debug_assert_eq!(dst.shape, shape);
+    debug_assert_eq!(dst.byte_size(), byte_size);
+
+    Ok(dst)
+}
+
+/// Cross-device variant of [`peer_clone_tensor`]: requires distinct
+/// `src_gpu` and `dst_gpu`. Panics in debug builds when
+/// `src_gpu.device_id == dst_gpu.device_id` — that's a programming
+/// error; the caller should have routed to [`clone_tensor_same`] instead.
+///
+/// Strict-distinct signature lets the borrow checker enforce the
+/// aliasing invariant the same-device branch can't satisfy. Used by
+/// Step −1 of the Stage 2b plan to eliminate the
+/// `unsafe { &mut *dev0_ptr }` workaround in daemon.rs.
+pub fn clone_tensor_peer(
+    src_gpu: &Gpu,
+    dst_gpu: &mut Gpu,
+    src: &GpuTensor,
+) -> HipResult<GpuTensor> {
+    debug_assert_ne!(
+        src_gpu.device_id, dst_gpu.device_id,
+        "clone_tensor_peer: src and dst are the same device — use clone_tensor_same",
+    );
+    let dtype = src.dtype;
+    let shape = src.shape.clone();
+    let byte_size = src.byte_size();
+
+    dst_gpu.bind_thread()?;
+    let dst = dst_gpu.alloc_tensor(&shape, dtype)?;
+    src_gpu.hip.memcpy_peer(
+        &dst.buf, dst_gpu.device_id,
+        &src.buf,  src_gpu.device_id,
+        byte_size,
+    )?;
 
     debug_assert_eq!(dst.dtype, dtype);
     debug_assert_eq!(dst.shape, shape);

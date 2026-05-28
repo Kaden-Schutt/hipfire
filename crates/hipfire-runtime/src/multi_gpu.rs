@@ -212,6 +212,47 @@ impl Gpus {
         self.layer_to_device[layer_idx] as usize
     }
 
+    /// Mutable access to a single device by index. Cleaner-than-indexing
+    /// helper used by callers that previously wrote `&mut gpus.devices[i]`
+    /// and want a method on `Gpus` for symmetry with [`split_pair_mut`].
+    ///
+    /// Panics if `i >= self.devices.len()`. Same panic shape as
+    /// `&mut self.devices[i]`.
+    #[inline]
+    pub fn single_mut(&mut self, i: usize) -> &mut Gpu {
+        &mut self.devices[i]
+    }
+
+    /// Split-borrow accessor: returns `(&Gpu, &mut Gpu)` for distinct
+    /// device indices `src_i` and `dst_i`. Used when one operation
+    /// reads from one device's resources and writes to another (e.g.
+    /// `peer_clone_tensor` / `clone_tensor_peer`).
+    ///
+    /// **Strict-distinct contract:** panics when `src_i == dst_i`.
+    /// Same-device callers should use [`single_mut`] and a
+    /// same-device API (e.g. `clone_tensor_same`) — Rust's aliasing
+    /// rules cannot represent `(&Gpu, &mut Gpu)` to the same value
+    /// without unsafe.
+    pub fn split_pair_mut(&mut self, src_i: usize, dst_i: usize) -> (&Gpu, &mut Gpu) {
+        assert!(
+            src_i != dst_i,
+            "split_pair_mut: src_i == dst_i ({src_i}) — same-device case is not representable as (&Gpu, &mut Gpu); use single_mut + a same-device helper instead",
+        );
+        let n = self.devices.len();
+        assert!(src_i < n && dst_i < n,
+            "split_pair_mut: src_i={src_i} or dst_i={dst_i} out of range (n_devices={n})");
+        // Split the underlying slice so the borrow checker sees two
+        // disjoint mutable regions; we hand back &Gpu for src and
+        // &mut Gpu for dst.
+        if src_i < dst_i {
+            let (left, right) = self.devices.split_at_mut(dst_i);
+            (&left[src_i], &mut right[0])
+        } else {
+            let (left, right) = self.devices.split_at_mut(src_i);
+            (&right[0], &mut left[dst_i])
+        }
+    }
+
     /// True when the layer at `layer_idx + 1` lives on a different device
     /// than `layer_idx`. False at the last layer (no successor).
     #[inline]
