@@ -364,6 +364,63 @@ fn build_prompt_frame(inputs: &FrameInputs<'_>) -> Vec<u32> {
     }
 }
 
+/// Bundled inputs to the generate family. Step 3 of
+/// docs/plans/mtp_multi_refactor.md v2.1: the four generate
+/// functions (generate / generate_multi / generate_mtp /
+/// generate_dflash) collectively take 21 distinct params. Threading
+/// them positionally is unreadable. `GenerateCtx<'a>` collects them
+/// in one struct so each signature becomes
+/// `fn generate_x(m, gpu_or_gpus, ctx)`.
+///
+/// Field-by-field divergence handling:
+/// - Sampling fields (`temp`, `top_p`, `repeat_penalty`,
+///   `repeat_window`) are always passed; dflash ignores them since
+///   it's greedy-only by construction.
+/// - `budget_alert_at_tok` / `budget_alert_text` only fire in the AR
+///   path today. MTP/DFlash ignore them.
+/// - `drafter_gpu` is only consumed by AR's PFlash compress site;
+///   stored as `&mut` so the caller can borrow it back after the
+///   ctx scope ends.
+/// - `pflash_state` / `pflash_cfg` consumed by AR's compress site;
+///   resolved at dispatcher level into `pflash_bypass_reason` /
+///   `pflash_alpha` for the dflash leaf (dflash doesn't itself run
+///   compress, so it only needs the resolved indicators).
+struct GenerateCtx<'a> {
+    // I/O
+    stdout: &'a mut std::io::Stdout,
+    id: &'a str,
+    // Prompt
+    prompt: &'a str,
+    system_prompt: Option<&'a str>,
+    tools: Option<&'a [serde_json::Value]>,
+    messages_history: Option<&'a [hipfire_runtime::prompt_frame::Message]>,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    // Sampling
+    temp: f32,
+    top_p: f32,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    // Decode budget
+    max_tokens: usize,
+    max_think_tokens: usize,
+    budget_alert_at_tok: usize,
+    budget_alert_text: &'a str,
+    // Co-GPU resources (AR PFlash path only)
+    drafter_gpu: Option<&'a mut rdna_compute::Gpu>,
+    pflash_state: Option<&'a mut hipfire_arch_qwen35::pflash::PflashState>,
+    pflash_cfg: Option<&'a hipfire_arch_qwen35::pflash::PflashConfig>,
+    /// Resolved by the dispatcher when generate routes to
+    /// generate_dflash: when PFlash mode is non-Off AND a drafter is
+    /// loaded, dflash gets a documented `pflash_bypass_reason` event
+    /// so operators can see why compression didn't fire on the
+    /// DFlash path. `None` when PFlash wasn't requested or the
+    /// dispatcher didn't compute it.
+    pflash_bypass_reason: Option<&'a str>,
+    /// `pflash_cfg.alpha` echoed by the dflash done event for PRD
+    /// §3.1 compliance. `None` when PFlash wasn't requested.
+    pflash_alpha: Option<f32>,
+}
+
 /// Per-token streaming step. The pattern that appears in every
 /// generate function's decode loop (and in the max_think force-close
 /// inner loop, and in the im_end trailer write): push to
@@ -3404,18 +3461,20 @@ fn load_dflash_state(
 fn generate_dflash(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    pflash_bypass_reason: Option<&str>,
-    pflash_alpha: Option<f32>,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    ctx: &mut GenerateCtx<'_>,
 ) {
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let max_tokens: usize = ctx.max_tokens;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let pflash_bypass_reason: Option<&str> = ctx.pflash_bypass_reason;
+    let pflash_alpha: Option<f32> = ctx.pflash_alpha;
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
+
     use hipfire_arch_qwen35::speculative::{
         spec_step_ddtree_batched, spec_step_ddtree_path_c, spec_step_dflash, ModelSlot,
         ModelSlotConfig, Phase2Snapshots, SpecStats,
@@ -3895,21 +3954,25 @@ fn generate_dflash(
 fn generate_mtp(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    max_tokens: usize,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    temp: f32,
-    top_p: f32,
-    repeat_penalty: f32,
-    repeat_window: usize,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    ctx: &mut GenerateCtx<'_>,
 ) {
     use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
+
+    // Local aliases so the body stays readable without `ctx.` prefix
+    // everywhere. Sampling fields are Copy; refs are reborrowed.
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let max_tokens: usize = ctx.max_tokens;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let temp: f32 = ctx.temp;
+    let top_p: f32 = ctx.top_p;
+    let repeat_penalty: f32 = ctx.repeat_penalty;
+    let _repeat_window: usize = ctx.repeat_window; // unused in mtp path; MTP residual-sample uses top_k=20 hardcoded
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
 
     let tokenizer = m.tokenizer.as_ref().unwrap();
 
@@ -4311,28 +4374,31 @@ fn generate_mtp(
 /// `gpus.devices[dev]` and `scratch_set.per_device[dev]`; the final
 /// sample lives on `gpus.output_device`. DFlash, CASK, PFlash, VL and
 /// arch_id < 5 are refused upstream at load.
-#[allow(clippy::too_many_arguments)]
 fn generate_multi(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
-    pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>,
-    pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>,
-    stdout: &mut std::io::Stdout,
-    id: &str,
-    prompt: &str,
-    system_prompt: Option<&str>,
-    temp: f32,
-    top_p: f32,
-    max_tokens: usize,
-    repeat_penalty: f32,
-    _repeat_window: usize,
-    budget_alert_at_tok: usize,
-    budget_alert_text: &str,
-    max_think_tokens: usize,
-    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
-    tools: Option<&[serde_json::Value]>,
-    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    ctx: &mut GenerateCtx<'_>,
 ) {
+    // Local aliases preserve the existing body verbatim. Sampling /
+    // budget fields are Copy; ref fields are reborrowed.
+    let pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState> =
+        ctx.pflash_state.as_deref_mut();
+    let pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig> = ctx.pflash_cfg;
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let temp: f32 = ctx.temp;
+    let top_p: f32 = ctx.top_p;
+    let max_tokens: usize = ctx.max_tokens;
+    let repeat_penalty: f32 = ctx.repeat_penalty;
+    let _repeat_window: usize = ctx.repeat_window;
+    let budget_alert_at_tok: usize = ctx.budget_alert_at_tok;
+    let budget_alert_text: &str = ctx.budget_alert_text;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
     if m.seq_pos + prompt_est + max_tokens > m.max_seq {
@@ -4758,13 +4824,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // at load when DFlash / CASK / PFlash / VL is requested, so this branch
     // doesn't need to thread any of those args through.
     if m.pp > 1 {
-        generate_multi(
-            m, gpu, pflash_state, pflash_cfg, stdout, id, prompt, system_prompt,
-            temp, top_p, max_tokens, repeat_penalty, repeat_window,
-            budget_alert_at_tok, budget_alert_text, max_think_tokens,
+        let mut multi_ctx = GenerateCtx {
+            stdout, id, prompt, system_prompt, tools, messages_history,
             assistant_prefix,
-            tools, messages_history,
-        );
+            temp, top_p, repeat_penalty, repeat_window,
+            max_tokens, max_think_tokens,
+            budget_alert_at_tok, budget_alert_text,
+            drafter_gpu: None,
+            pflash_state,
+            pflash_cfg,
+            pflash_bypass_reason: None,
+            pflash_alpha: None,
+        };
+        generate_multi(m, gpu, &mut multi_ctx);
         return;
     }
     // DFlash fast path -- only when a draft model is loaded AND temperature is
@@ -4803,11 +4875,25 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // mirrors the AR path's <think>/</think> counter). The "ignored
         // on DFlash" warning that used to live here is gone -- the cap
         // is real on both paths now.
-        generate_dflash(m, gpu, stdout, id, prompt, system_prompt, max_tokens, max_think_tokens, assistant_prefix, dflash_bypass_reason, dflash_alpha, tools, messages_history);
+        let dflash_bypass_reason_owned = dflash_bypass_reason.map(|s| s.to_string());
+        let mut dflash_ctx = GenerateCtx {
+            stdout, id, prompt, system_prompt, tools, messages_history,
+            assistant_prefix,
+            temp, top_p, repeat_penalty, repeat_window,
+            max_tokens, max_think_tokens,
+            budget_alert_at_tok: 0,
+            budget_alert_text: "",
+            drafter_gpu: None,
+            pflash_state: None,
+            pflash_cfg: None,
+            pflash_bypass_reason: dflash_bypass_reason_owned.as_deref(),
+            pflash_alpha: dflash_alpha,
+        };
+        generate_dflash(m, gpu, &mut dflash_ctx);
         // Silence unused-variable warnings for the params DFlash doesn't
         // consume (top_p / repeat penalties are AR-only sampling knobs;
         // pflash_state is bypassed on the DFlash decode path).
-        let _ = (top_p, repeat_penalty, repeat_window, budget_alert_at_tok, budget_alert_text, pflash_state);
+        let _ = (budget_alert_at_tok, budget_alert_text, pflash_state);
         return;
     }
 
@@ -4819,11 +4905,24 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     let mtp_blocked_by_penalty = repeat_penalty > 1.0 + 1e-3;
     if m.mtp.is_some() && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar && !mtp_blocked_by_penalty {
-        generate_mtp(
-            m, gpu, stdout, id, prompt, system_prompt, max_tokens,
-            max_think_tokens, assistant_prefix, temp, top_p,
-            repeat_penalty, repeat_window, tools, messages_history,
-        );
+        // Build a transient GenerateCtx covering MTP's needs. MTP
+        // doesn't use drafter_gpu / pflash_state / pflash_cfg /
+        // budget_alert_* / pflash_bypass_reason / pflash_alpha — pass
+        // None / empty defaults; the body ignores them.
+        let mut mtp_ctx = GenerateCtx {
+            stdout, id, prompt, system_prompt, tools, messages_history,
+            assistant_prefix,
+            temp, top_p, repeat_penalty, repeat_window,
+            max_tokens, max_think_tokens,
+            budget_alert_at_tok: 0,
+            budget_alert_text: "",
+            drafter_gpu: None,
+            pflash_state: None,
+            pflash_cfg: None,
+            pflash_bypass_reason: None,
+            pflash_alpha: None,
+        };
+        generate_mtp(m, gpu, &mut mtp_ctx);
         let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
         return;
     }
