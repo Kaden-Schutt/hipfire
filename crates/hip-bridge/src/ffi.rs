@@ -1324,6 +1324,18 @@ impl Stream {
 }
 unsafe impl Send for Stream {}
 
+impl Stream {
+    /// Raw `hipStream_t` pointer. Required to pass the handle to other
+    /// dlopen'd ROCm libraries (rocBLAS, RCCL, etc.) without a back-
+    /// channel through the lifecycle-owning `HipRuntime`. Caller is
+    /// responsible for not freeing or sharing the pointer outside this
+    /// `Stream`'s lifetime.
+    #[inline]
+    pub fn raw_ptr(&self) -> *mut std::ffi::c_void {
+        self.0
+    }
+}
+
 /// Loaded GPU module (compiled kernels).
 pub struct Module(HipModule);
 unsafe impl Send for Module {}
