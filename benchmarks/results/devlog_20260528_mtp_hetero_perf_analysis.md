@@ -1,104 +1,98 @@
-# Devlog 2026-05-28 — Hetero MTP perf analysis: not the kernels, the τ
+# Devlog 2026-05-28 — Hetero MTP perf: was a bug in MY peer-copy, not RDNA2
 
-Hetero MTP shipped earlier today (commit fe11669c). On the validation
-prompt "Hello", hetero ran -47% tok/s vs single-gpu (11.64 vs 21.93).
-Initial assumption: gfx1031 (RDNA2) kernels for the MTP head are
-under-optimized vs gfx906. Profile data falsifies that.
+**This entry supersedes my earlier analysis on the same day.** I claimed
+RDNA2 numerical drift caused τ to collapse from 3.25 → 2.24 in hetero
+MTP. The investigation (bit-diff of capture points in chain forward at
+cycle 0/1) **falsified that hypothesis**: the MTP head produces
+bit-identical outputs on gfx906 and gfx1031. Looking further, the bug
+was in MY hetero spec function, not in RDNA2 kernels.
 
-## Profile setup
+## The actual bug
 
-Same prompt for both runs (md5 fbe1cc14880397f613ba81aa84bac201,
-md5-stable across normalize):
-"Write a Python function to compute the sum of an array using a loop."
-qwen3.6-27b AWQ trunk + cvs16384 .mtp head, --compressed-serial,
-max=64, temp=0, HIPFIRE_PROFILE=1 + HIPFIRE_PROFILE_CYCLES=8.
+Cycle-exit handoff (`spec_step_mtp_compressed_serial_hetero`) computed
+`prev_hidden_row = advance - 1` correctly, but the peer copy IGNORED
+it — it always copied from byte offset 0 of `verify_hidden` (= row 0 =
+`last_committed`'s post-output-norm hidden), instead of row
+`advance - 1` (the bonus token's hidden, which IS what next cycle's
+chain should read).
 
-## Numbers
+Single-gpu's `capture_prev_hidden_from_verify_row` correctly uses
+`memcpy_dtod_at(dst, 0, src, row*dim*4, dim*4)`. My hetero variant
+called `memcpy_peer` (no offset param) and added `let _ = prev_hidden_row;`
+to silence the unused warning. Compiler did not catch this; the only
+symptom was τ collapse.
 
-| metric                   | single-gpu | hetero (gfx906+gfx1031) | delta  |
-| ---                      | ---        | ---                     | ---    |
-| **per-cycle kernel tot** | 167 ms     | 169 ms                  | +1.5%  |
-| trunk gemm_gate_up       | 793 µs/call| 798 µs/call             | +0.6%  |
-| trunk gemm_residual      | 378 µs/call| 379 µs/call             | +0.3%  |
-| trunk gemm_qkvza         | 399 µs/call| 404 µs/call             | +1.3%  |
-| total decode wall        | 3.67 s     | 5.45 s                  | +48%   |
-| cycles needed (66 tok)   | 20         | 29                      | +45%   |
-| **τ**                    | 3.25       | 2.24                    | **-31%** |
+## How the diagnostic worked
 
-## What the data actually says
+Built tooling: `HIPFIRE_HETERO_DIFF=<prefix>` env that dumps three
+points of every K step of every cycle into `<prefix>.{single|hetero}.posXXXX.kY.{prev_hidden,t_mtp_out,logits_compressed}.bin`.
+Plus a `diff_f32_bin` example that reports bit-equal count, RMS, top-10
+diverging indices.
 
-The per-cycle kernel cost is **statistically identical** (+1.5% is well
-within run-to-run noise). MTP head kernels (rmsnorm_f32 etc.) account
-for <1% of cycle time on both paths — the cycle is dominated by trunk
-verify (gemm_gate_up + gemm_residual + gemm_qkvza = ~70%).
+Ran both single-gpu and hetero on the same prompt, then `diff_f32_bin`
+on each cycle. Findings:
+- **Cycle 0 (cur_pos=23) all K steps: 100% bit-equal** (5120/5120 +
+  16384/16384 elements match across 4 chain steps)
+- **Cycle 1 (cur_pos=24) all K steps: 100% bit-equal**
+- **Cycle 2 (cur_pos=29) k=0 prev_hidden: 0% bit-equal** (RMS=2.6,
+  max diff=27, argmax differs)
 
-The 48% wall-clock regression is **entirely from needing +45% more
-cycles** to produce the same 66-token output. That's a τ collapse
-(3.25 → 2.24), not a kernel slowdown.
+That was the smoking gun — the MTP block forward is bit-equal across
+the two archs, but the INPUT to it (`prev_hidden`) diverged at cycle 2.
+prev_hidden is set by the cycle-exit handoff. Reading my hetero
+handoff code revealed the row-0 bug.
 
-Trunk + head are bit-identical between single-gpu and hetero on the
-weight side (same .hfq, same .mtp file). The drafter's chain produces
-different draft tokens that the trunk rejects more often, leading to
-more cycles.
+## Numbers after the fix
 
-## Hypothesis
+| metric                  | single-gpu (gfx906)  | hetero (gfx906+gfx1031) | delta  |
+| ---                     | ---                  | ---                     | ---    |
+| τ                       | 3.25                 | **3.25**                | match  |
+| cycles for 66 tok       | 20                   | **20**                  | match  |
+| accepted_mtp_total      | 45                   | **45**                  | match  |
+| bonus_total             | 20                   | **20**                  | match  |
+| replay_skipped          | 7 (35%)              | 7 (35%)                 | match  |
+| **tok/s**               | **20.10**            | **18.13**               | **-10%** |
+| output text             | identical            | identical               | ✓      |
 
-**Numerical drift on RDNA2 kernels.** Same algorithm, slightly
-different FP rounding due to:
-- wave32 (RDNA) vs wave64 (gfx906/Vega) reduction order
-- Different fma/multiply-add intrinsics
-- Possibly different rmsnorm shared-memory reduction tree shape
+## Real cross-device overhead
 
-A 1e-4 magnitude drift in the MTP head's `t_mtp_out` would produce a
-slightly different distribution over 16k compressed-vocab logits;
-argmax can shift on close calls. Compounded over a 4-step chain, this
-shifts which candidate tokens get proposed, and trunk verify
-(unchanged on gfx906) rejects more of them.
+The 10% tok/s gap (3.28 s → 3.64 s decode wall over 20 cycles =
+164 ms/cycle → 182 ms/cycle = +18 ms/cycle) is the actual cost of:
 
-The `feedback_attention_precision` memory note from May 2026 is the
-canary: "5% attention error cascades into attractor within ~10 tokens
-under greedy decode." Our drift is tiny (no attractor in coherence
-output, identical text actually produced), but a small drift is
-enough to shift τ.
+- 2 peer copies per cycle (20 KB prev_hidden + the per-step chain
+  control flow that involves D2H token args)
+- Drafter-side stream/event setup
+- The 1.29 GiB token_embd mirror (one-shot at init, not per-cycle)
 
-## Next investigation steps
+Microbench predicted ~112 µs/cycle for the cycle-exit handoff alone,
+which would be 0.7% of cycle. We see 11%. The gap is probably the
+per-step embedding D2H token argument (4 B but a host roundtrip per
+chain step, K=4 per cycle = 4 round-trips × 30 µs each ≈ 120 µs/cycle)
+plus the multiple cross-device active_stream operations. Still
+reasonable — not a +12% gain over single-gpu, but not blocking. Hetero
+MTP frees ~800 MB on gfx906 (the head + scratch + KV) at a -10%
+tok/s cost.
 
-1. **Element-wise compare MTP draft logits across paths.** Dump
-   `state.mtp_lm_logits_compressed` (or drafter_state's equivalent) at
-   cycle 0 step 0 from both runs and compute max-abs-diff. If <1e-4
-   we're seeing a meaningful but small drift; if ~1e-2 we have a kernel
-   issue.
-2. **Walk the chain backwards.** Capture `prev_hidden` (post-peer-copy
-   on hetero, post-capture on single) and verify byte-identical (should
-   be — same memcpy source). Then capture `t_mtp_out` after the first
-   head forward on both and compare. Then the rmsnorm output. The first
-   divergence point isolates the culprit kernel.
-3. **Re-run hetero with all RDNA2 kernels swapped to higher precision.**
-   E.g. force rmsnorm_f32 to use full f32 (vs any internal f16
-   shortcuts). If τ recovers, precision is the lever.
+## What I retract from the earlier devlog
 
-## What this does NOT mean
+Specifically: the claim "this re-orients the RDNA2-kernel-work
+question: the direction is NUMERICAL EQUIVALENCE with gfx906's
+output." That's wrong. **RDNA2 IS numerically equivalent on this
+workload — every kernel called from the MTP head produces bit-equal
+output to gfx906.** I had no evidence for the drift hypothesis; I
+inferred it from circumstantial perf data without instrumenting.
 
-- It does NOT mean "RDNA2 kernels are bad." They run at the same wall
-  time as gfx906 here (which is genuinely interesting on its own —
-  gfx1031 with its smaller chip + smaller memory bandwidth matches
-  gfx906 on this workload).
-- It does NOT mean the hetero plumbing is wrong. The plumbing is
-  measurably correct: bit-identical output text, same peer-copy cost
-  the microbench predicted.
-- It does NOT mean the multi-GPU MTP project is dead. The path to
-  +12% sync ROI was always conditional on τ holding within 5-10% of
-  single-gpu. A -31% τ drop kills that — but the fix is in the
-  numerical correctness of the drafter-side kernels, not in the
-  cross-device orchestration.
+The lesson for future hetero-class bugs: **don't speculate about
+kernel-level numerical drift without first bit-comparing the
+captures**. The diagnostic tooling we built (HIPFIRE_HETERO_DIFF +
+diff_f32_bin) is now permanent; reach for it BEFORE forming a
+kernel-perf hypothesis.
 
-## What this DOES mean
+## What this means for the multi-GPU MTP project
 
-RDNA2 kernel work IS the right direction for hetero MTP perf — but
-not the optimization direction we expected (faster kernels). The
-direction is **numerical equivalence** with gfx906's output.
-
-If we can match gfx906's MTP head output bit-for-bit (or within a
-tight tolerance) on RDNA2, τ should recover, and hetero MTP becomes a
-straight win (frees ~800 MB of gfx906 VRAM, gets the projected ~12%
-ROI from offloading the MTP head's compute share).
+Goes from "needs RDNA2 numerical-equivalence work" to "ships at -10%
+tok/s, frees ~800 MB gfx906 VRAM, plumbing is correct." Whether to
+keep paying that 10% in production depends on whether the freed VRAM
+unblocks something else (longer context, larger model, parallel
+PFlash decoder co-resident with MTP-on-drafter). Plumbing is done;
+v1 sync split is genuinely viable.
