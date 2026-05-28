@@ -421,8 +421,10 @@ fn main() {
         eprintln!("prefilling {} tokens (batched)...", prompt_tokens.len());
     }
     let t_prefill = Instant::now();
+    let mut trunk_prefill_secs: Option<f64> = None;
+    let mut mtp_prompt_fill_secs: Option<f64> = None;
     if trunk_spine {
-        mtp_spec::prefill_trunk_and_mtp_cache(
+        let timings = mtp_spec::prefill_trunk_and_mtp_cache(
             &mut gpu,
             &mut target,
             &head,
@@ -431,6 +433,8 @@ fn main() {
             0,
         )
         .expect("prefill trunk + mtp cache");
+        trunk_prefill_secs = Some(timings.trunk_prefill_secs);
+        mtp_prompt_fill_secs = Some(timings.mtp_prompt_fill_secs);
     } else {
         hipfire_arch_qwen35::qwen35::forward_prefill_batch(
             &mut gpu,
@@ -451,6 +455,13 @@ fn main() {
     let prefill_secs = t_prefill.elapsed().as_secs_f64();
     let prefill_tok_s = prompt_tokens.len() as f64 / prefill_secs.max(1e-9);
     eprintln!("prefill: {:.2}s ({:.1} tok/s)", prefill_secs, prefill_tok_s);
+    if let (Some(trunk_secs), Some(mtp_secs)) = (trunk_prefill_secs, mtp_prompt_fill_secs) {
+        let trunk_tok_s = prompt_tokens.len() as f64 / trunk_secs.max(1e-9);
+        eprintln!(
+            "prefill split: trunk={:.3}s ({:.1} tok/s) mtp_prompt_fill={:.3}s total={:.3}s",
+            trunk_secs, trunk_tok_s, mtp_secs, prefill_secs
+        );
+    }
 
     // Snapshot trunk's prev_hidden (post-output-norm at last prefill position).
     if !trunk_spine {
@@ -703,6 +714,12 @@ fn main() {
     println!("tau:                  {:.4}", tau);
     println!("prefill_secs:         {:.3}", prefill_secs);
     println!("prefill_tok_s:        {:.2}", prefill_tok_s);
+    if let (Some(trunk_secs), Some(mtp_secs)) = (trunk_prefill_secs, mtp_prompt_fill_secs) {
+        let trunk_tok_s = prompt_tokens.len() as f64 / trunk_secs.max(1e-9);
+        println!("trunk_prefill_secs:   {:.3}", trunk_secs);
+        println!("trunk_prefill_tok_s:  {:.2}", trunk_tok_s);
+        println!("mtp_prompt_fill_secs: {:.3}", mtp_secs);
+    }
     println!("decode_secs:          {:.3}", decode_secs);
     println!("tok_s:                {:.2}", tok_per_s);
     println!("eos_hit:              {}", if hit_eos { "y" } else { "n" });

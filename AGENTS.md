@@ -539,6 +539,64 @@ For dataclass benches:
 - Confirmation that the regression appears across genres (not just one
   prompt that happens to hit a different distribution)
 
+### Pinned Hugging Face bench fixture
+
+For hiptrx dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify
+the canonical trunk by local filename. Local filenames drift and lookalike
+AWQ/MQ4 files are not comparable.
+
+The canonical trunk is whichever local artifact byte-matches the current
+Hugging Face `.mq4` artifact:
+
+- HF repo: `schuttdev/hipfire-qwen3.6-27b`
+- HF file: `qwen3.6-27b.mq4`
+- HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
+- File size: `14984158208`
+- SHA-256 / HF `x-linked-etag`:
+  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`
+
+Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
+trunk with `sha256sum` and require the digest above. If Hugging Face has
+published a newer `.mq4`, refresh the HF headers first and pin the new
+`x-linked-etag`/size in the report.
+
+Reports that use a trunk with a different digest are not comparable and
+should be discarded.
+
+### Pinned A3B MoE DFlash fixtures
+
+For hiptrx Qwen3.6-35B-A3B MoE DFlash perf/profiling work, use the
+following command shape and do not substitute other prompts unless the
+user explicitly updates this fixture section:
+
+```bash
+./target/release/examples/dflash_spec_demo \
+  --target /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --draft /home/kaden/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
+  --prompt-file <allowed-prompt> \
+  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
+  --block-size 6 --no-adaptive-b
+```
+
+Pinned artifacts:
+
+- target md5: `edde51ec1dac0f2bd42cff5ef1cb8944`
+- draft md5: `8254bbe1ffe31edf2b38f3889d6325f1`
+
+The only permitted prompt fixtures for this A3B MoE DFlash thread are:
+
+- `benchmarks/prompts/merge_sort_thinking_off.txt`
+  - md5: `253c7ac50857fe6d0e10fb0d2c5e35c0`
+  - best observed post-MoE tape replay fix: `151.00 tok/s`, tau `2.711`,
+    accept rate `0.5422`, `45` cycles, `168` emitted tokens.
+- `benchmarks/prompts/humaneval_3_below_zero.txt`
+  - md5: `37c5aad9f9efe93b5c47f27256bdf149`
+  - best observed before the MoE tape replay optimization: `127.61 tok/s`,
+    tau `3.714`.
+
+Runs using any other prompt are exploratory only and must not be compared
+against the A3B MoE DFlash perfmaxx line.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)

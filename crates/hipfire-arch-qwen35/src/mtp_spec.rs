@@ -36,6 +36,7 @@ use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::time::Instant;
 
 // ─── Sampling primitives (host-side, used by temp>0 spec-decode path) ────
 
@@ -120,9 +121,7 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     // WMMA when the arch/shape supports it, otherwise it falls back to scalar.
     // Prompt-sweep parity is clean; opt out with HIPFIRE_MTP_Q8_VERIFY_WMMA=0.
     mtp_q8_verify_wmma_enabled_from_env_value(
-        std::env::var("HIPFIRE_MTP_Q8_VERIFY_WMMA")
-            .ok()
-            .as_deref(),
+        std::env::var("HIPFIRE_MTP_Q8_VERIFY_WMMA").ok().as_deref(),
     )
 }
 
@@ -546,8 +545,12 @@ impl MtpSpecState {
         let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
         // Snapshot overlap resources are construction-time only; set the env
         // before creating MtpSpecState when comparing the opt-in path.
-        let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env() {
-            (Some(gpu.hip.stream_create()?), Some(gpu.hip.event_create()?))
+        let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env()
+        {
+            (
+                Some(gpu.hip.stream_create()?),
+                Some(gpu.hip.event_create()?),
+            )
         } else {
             (None, None)
         };
@@ -847,7 +850,8 @@ fn upload_mtp_proposal_graph_inputs(
     let seed_token = last_committed as i32;
     let seed_bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(&seed_token as *const i32 as *const u8, 4) };
-    gpu.hip.memcpy_htod(&state.mtp_token_chain.buf, seed_bytes)?;
+    gpu.hip
+        .memcpy_htod(&state.mtp_token_chain.buf, seed_bytes)?;
 
     let positions: Vec<i32> = (0..max_n).map(|k| (cur_pos + k) as i32).collect();
     let pos_bytes: &[u8] =
@@ -888,7 +892,13 @@ fn run_mtp_proposal_graph_body_q8(
 
     for k in 0..max_n {
         let token_slot = state.mtp_token_chain.sub_offset(k, 1);
-        embed_device_token_into(gpu, &target.weights, &state.mtp_token_embed, &token_slot, dim)?;
+        embed_device_token_into(
+            gpu,
+            &target.weights,
+            &state.mtp_token_embed,
+            &token_slot,
+            dim,
+        )?;
 
         let pos_slot = state.mtp_positions.sub_offset(k, 1);
         if k == 0 {
@@ -954,9 +964,7 @@ fn begin_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<()> {
     gpu.hip.stream_begin_capture(stream, 0)
 }
 
-fn end_mtp_proposal_graph_capture(
-    gpu: &mut Gpu,
-) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
+fn end_mtp_proposal_graph_capture(gpu: &mut Gpu) -> HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> {
     gpu.capture_mode = false;
     let stream = gpu.active_stream.as_ref().unwrap();
     let graph = gpu.hip.stream_end_capture(stream)?;
@@ -1071,6 +1079,12 @@ fn assemble_greedy_accept_from_gpu_result(
 /// prompt token, then runs the MTP block-only path over those same prompt
 /// positions. The MTP layer enters decode with a warm private KV cache instead
 /// of starting at the first generated token.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TrunkSpinePrefillTimings {
+    pub trunk_prefill_secs: f64,
+    pub mtp_prompt_fill_secs: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_trunk_and_mtp_cache(
     gpu: &mut Gpu,
@@ -1079,16 +1093,17 @@ pub fn prefill_trunk_and_mtp_cache(
     state: &mut MtpSpecState,
     prompt_tokens: &[u32],
     start_pos: usize,
-) -> HipResult<()> {
+) -> HipResult<TrunkSpinePrefillTimings> {
     if prompt_tokens.is_empty() {
-        return Ok(());
+        return Ok(TrunkSpinePrefillTimings::default());
     }
 
     let dim = target.config.dim;
     let dim_bytes = dim * 4;
     let prompt_hidden = gpu.alloc_tensor(&[prompt_tokens.len() * dim], DType::F32)?;
 
-    let result = (|| -> HipResult<()> {
+    let result = (|| -> HipResult<TrunkSpinePrefillTimings> {
+        let t_trunk = Instant::now();
         qwen35::forward_prefill_batch(
             gpu,
             &target.weights,
@@ -1103,7 +1118,9 @@ pub fn prefill_trunk_and_mtp_cache(
             None,
             None,
         )?;
+        let trunk_prefill_secs = t_trunk.elapsed().as_secs_f64();
 
+        let t_mtp_fill = Instant::now();
         for (i, &token) in prompt_tokens.iter().enumerate() {
             let hidden_row = prompt_hidden.sub_offset(i * dim, dim);
             mtp_head::mtp_head_forward_block_only(
@@ -1127,7 +1144,11 @@ pub fn prefill_trunk_and_mtp_cache(
             last * dim_bytes,
             dim_bytes,
         )?;
-        Ok(())
+        let mtp_prompt_fill_secs = t_mtp_fill.elapsed().as_secs_f64();
+        Ok(TrunkSpinePrefillTimings {
+            trunk_prefill_secs,
+            mtp_prompt_fill_secs,
+        })
     })();
 
     let _ = gpu.free_tensor(prompt_hidden);
@@ -1363,8 +1384,8 @@ pub fn spec_step_mtp(
         None, // gdn_tape
         None, // tree_verify
         Some(&state.trunk_pbs),
-        None, // mask_override
-        None, // max_layer
+        None,  // mask_override
+        None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
     )?;
 
@@ -1797,8 +1818,8 @@ pub fn spec_step_mtp_compressed(
         None,
         None,
         Some(&state.trunk_pbs),
-        None, // mask_override
-        None, // max_layer
+        None,  // mask_override
+        None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
     )?;
 
@@ -2200,19 +2221,17 @@ pub fn spec_step_mtp_compressed_serial(
         } else if state.mtp_proposal_graph_warmed {
             let capture_result: HipResult<(Graph, GraphExec, Vec<Vec<u8>>)> = (|| {
                 begin_mtp_proposal_graph_capture(gpu)?;
-                if let Err(e) =
-                    run_mtp_proposal_graph_body_q8(
-                        gpu,
-                        target,
-                        head,
-                        state,
-                        cur_pos,
-                        max_n,
-                        dim,
-                        cvs,
-                        proposal_graph_seq_cap,
-                    )
-                {
+                if let Err(e) = run_mtp_proposal_graph_body_q8(
+                    gpu,
+                    target,
+                    head,
+                    state,
+                    cur_pos,
+                    max_n,
+                    dim,
+                    cvs,
+                    proposal_graph_seq_cap,
+                ) {
                     abort_mtp_proposal_graph_capture(gpu);
                     return Err(e);
                 }
@@ -2233,10 +2252,7 @@ pub fn spec_step_mtp_compressed_serial(
                 Err(e) => {
                     abort_mtp_proposal_graph_capture(gpu);
                     state.mtp_proposal_graph_disabled = true;
-                    eprintln!(
-                        "[mtp-proposal-graph] disabled after capture failure: {}",
-                        e
-                    );
+                    eprintln!("[mtp-proposal-graph] disabled after capture failure: {}", e);
                 }
             }
         } else {
@@ -2246,276 +2262,284 @@ pub fn spec_step_mtp_compressed_serial(
 
     if !proposal_graph_ran {
         for k in 0..max_n {
-        let next_tok = if use_device_token_chain {
-            0
-        } else if k == 0 {
-            last_committed
-        } else {
-            candidates[k - 1]
-        };
-        let next_token_embed = if use_device_token_chain {
-            let token_slot = state.mtp_token_chain.sub_offset(k, 1);
-            embed_device_token_into(gpu, trunk_weights, &state.mtp_token_embed, &token_slot, dim)?;
-            Some(&state.mtp_token_embed)
-        } else {
-            None
-        };
-
-        // Forward: in compressed mode, mtp_head_forward_compressed runs
-        // block_only + rmsnorm + small GEMV against lm_head_draft in one
-        // call. In full-vocab mode we run block_only here and do the
-        // rmsnorm + trunk-lm_head GEMV manually below.
-        if use_full_vocab {
-            if k == 0 {
-                mtp_head::mtp_head_forward_block_only(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &state.prev_hidden,
-                    next_token_embed,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
+            let next_tok = if use_device_token_chain {
+                0
+            } else if k == 0 {
+                last_committed
             } else {
-                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                mtp_head::mtp_head_forward_block_only(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &prev_row,
-                    next_token_embed,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
-            }
-            // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
-            // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
-            // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
-            // trunk's output dtype.
-            gpu.rmsnorm_f32(
-                &state.mtp_scratch.t_mtp_out,
-                &head.weights.shared_head_norm,
-                &state.mtp_scratch.tmp,
-                head.config.rms_norm_eps,
-            )?;
-            llama::weight_gemv(
-                gpu,
-                &trunk_weights.output,
-                &state.mtp_scratch.tmp,
-                &full_vocab_logits_view,
-            )?;
-        } else if use_device_token_chain {
-            if k == 0 {
-                mtp_head::mtp_head_forward_block_only(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &state.prev_hidden,
-                    next_token_embed,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
-            } else {
-                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                mtp_head::mtp_head_forward_block_only(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &prev_row,
-                    next_token_embed,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
-            }
-            mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
-        } else {
-            if k == 0 {
-                mtp_head::mtp_head_forward_compressed(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &state.prev_hidden,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
-            } else {
-                let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
-                mtp_head::mtp_head_forward_compressed(
-                    gpu,
-                    head,
-                    &state.mtp_scratch,
-                    &mut state.mtp_kv,
-                    next_tok,
-                    &prev_row,
-                    cur_pos + k,
-                    trunk_weights,
-                )?;
-            }
-        }
-
-        // Pick the logits buffer to argmax over (mode-dependent).
-        let logits_for_argmax: &GpuTensor = if use_full_vocab {
-            &full_vocab_logits_view
-        } else {
-            state.mtp_scratch.logits_compressed.as_ref().unwrap()
-        };
-        let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
-
-        let draft_idx: usize;
-        if use_sampling {
-            // GPU sample_top_p: kernel does the whole top_k(=20) + top_p +
-            // multinomial sample on-device. Returns 8 B (token id + new rng
-            // state). Eliminates the full 1 MB draft logits D2H + host
-            // softmax sample (~600 μs each step → ~3 ms/cycle saved).
-            //
-            // sample_top_p modifies logits in-place ONLY if repeat_penalty > 1
-            // and repeat_window > 0; we pass 1.0/0 so logits are untouched
-            // and the subsequent prob-gather sees the same values.
-            let (token_u32, new_rng) = gpu.sample_top_p(
-                logits_for_argmax,
-                &state.mtp_sample_result,
-                &state.mtp_sample_repeat_buf,
-                argmax_vocab,
-                sampling.temp,
-                sampling.top_p,
-                state.gpu_rng_state,
-                /* repeat_window */ 0,
-                /* repeat_penalty */ 1.0,
-            )?;
-            state.gpu_rng_state = new_rng;
-            draft_idx = token_u32 as usize;
-            assert!(
-                draft_idx < argmax_vocab,
-                "draft sample {draft_idx} out of argmax_vocab {argmax_vocab}"
-            );
-
-            // GPU p_draft gather: H2D the sampled token id, run the gather
-            // kernel with n_rows=1, D2H 4 B prob. Replaces the host
-            // softmax_prob_at_temp call (~600 μs).
-            let token_i32: i32 = token_u32 as i32;
-            let idx_bytes: &[u8] =
-                unsafe { std::slice::from_raw_parts(&token_i32 as *const i32 as *const u8, 4) };
-            gpu.hip
-                .memcpy_htod(&state.mtp_gather_idx_draft.buf, idx_bytes)?;
-            gpu.softmax_prob_gather_batched_f32(
-                logits_for_argmax,
-                &state.mtp_gather_idx_draft,
-                &state.mtp_gather_prob_draft,
-                argmax_vocab,
-                sampling.temp,
-                /* n_rows */ 1,
-            )?;
-            let mut p_draft_host: [f32; 1] = [0.0];
-            {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(p_draft_host.as_mut_ptr() as *mut u8, 4)
-                };
-                gpu.hip
-                    .memcpy_dtoh(bytes, &state.mtp_gather_prob_draft.buf)?;
-            }
-            draft_probs.push(p_draft_host[0]);
-
-            let token_id = match vocab_map_opt {
-                Some(vm) => vm[draft_idx],
-                None => draft_idx as u32,
+                candidates[k - 1]
             };
-            candidates.push(token_id);
-            // draft_logits_host is unused on the GPU sampling path; left
-            // allocated for symmetry with the (now-removed) host-sample
-            // fallback. Compiler will elide.
-            let _ = &draft_logits_host;
-        } else if use_p_min {
-            // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
-            gpu.topk_logsumexp_batched_f32(
-                logits_for_argmax,
-                &state.mtp_topk_idx,
-                &state.mtp_topk_logp,
-                argmax_vocab,
-                /* k */ 2,
-                /* b */ 1,
-            )?;
-            let mut idx_host: [i32; 2] = [0, 0];
-            let mut logp_host: [f32; 2] = [0.0, 0.0];
-            {
-                let idx_bytes: &mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, 8) };
-                gpu.hip.memcpy_dtoh(idx_bytes, &state.mtp_topk_idx.buf)?;
-                let logp_bytes: &mut [u8] =
-                    unsafe { std::slice::from_raw_parts_mut(logp_host.as_mut_ptr() as *mut u8, 8) };
-                gpu.hip.memcpy_dtoh(logp_bytes, &state.mtp_topk_logp.buf)?;
-            }
-            draft_idx = idx_host[0] as usize;
-            assert!(
-                draft_idx < argmax_vocab,
-                "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}"
-            );
-            // Compressed: remap via vocab_map. Full-vocab: idx IS the token id.
-            let token_id = match vocab_map_opt {
-                Some(vm) => vm[draft_idx],
-                None => draft_idx as u32,
-            };
-            candidates.push(token_id);
-
-            // Check confidence AFTER pushing — keep this candidate, just
-            // skip future steps if confidence is below threshold.
-            if logp_host[0] < log_p_min {
-                chain_truncated = true;
-                break;
-            }
-        } else if use_device_token_chain {
-            let vocab_map_gpu = if use_full_vocab {
+            let next_token_embed = if use_device_token_chain {
+                let token_slot = state.mtp_token_chain.sub_offset(k, 1);
+                embed_device_token_into(
+                    gpu,
+                    trunk_weights,
+                    &state.mtp_token_embed,
+                    &token_slot,
+                    dim,
+                )?;
+                Some(&state.mtp_token_embed)
+            } else {
                 None
-            } else {
-                head.weights.lm_head_draft_vocab_map_gpu.as_ref()
             };
-            gpu.argmax_token_chain_f32(
-                logits_for_argmax,
-                &argmax_view,
-                &state.mtp_token_chain,
-                vocab_map_gpu,
-                argmax_vocab,
-                k + 1,
-            )?;
-        } else {
-            gpu.argmax_f32_batched(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
-            let mut argmax_host: [i32; 1] = [0];
-            {
-                let bytes: &mut [u8] = unsafe {
-                    std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, 4)
-                };
-                gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
-            }
-            draft_idx = argmax_host[0] as usize;
-            assert!(
-                draft_idx < argmax_vocab,
-                "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}"
-            );
-            let token_id = match vocab_map_opt {
-                Some(vm) => vm[draft_idx],
-                None => draft_idx as u32,
-            };
-            candidates.push(token_id);
-        }
 
-        if k + 1 < max_n {
-            gpu.memcpy_dtod_at_auto(
-                &state.mtp_t_outs.buf,
-                k * dim_bytes,
-                &state.mtp_scratch.t_mtp_out.buf,
-                0,
-                dim_bytes,
-            )?;
-        }
+            // Forward: in compressed mode, mtp_head_forward_compressed runs
+            // block_only + rmsnorm + small GEMV against lm_head_draft in one
+            // call. In full-vocab mode we run block_only here and do the
+            // rmsnorm + trunk-lm_head GEMV manually below.
+            if use_full_vocab {
+                if k == 0 {
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &state.prev_hidden,
+                        next_token_embed,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                } else {
+                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &prev_row,
+                        next_token_embed,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                }
+                // rmsnorm(t_mtp_out, shared_head_norm) → tmp, then trunk lm_head
+                // GEMV → full_vocab_logits_view. weight_gemv dispatches the right
+                // kernel (gemv_mq4g256_with_rotate / gemv_q8_0 / etc.) on the
+                // trunk's output dtype.
+                gpu.rmsnorm_f32(
+                    &state.mtp_scratch.t_mtp_out,
+                    &head.weights.shared_head_norm,
+                    &state.mtp_scratch.tmp,
+                    head.config.rms_norm_eps,
+                )?;
+                llama::weight_gemv(
+                    gpu,
+                    &trunk_weights.output,
+                    &state.mtp_scratch.tmp,
+                    &full_vocab_logits_view,
+                )?;
+            } else if use_device_token_chain {
+                if k == 0 {
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &state.prev_hidden,
+                        next_token_embed,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                } else {
+                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    mtp_head::mtp_head_forward_block_only(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &prev_row,
+                        next_token_embed,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                }
+                mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
+            } else {
+                if k == 0 {
+                    mtp_head::mtp_head_forward_compressed(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &state.prev_hidden,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                } else {
+                    let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                    mtp_head::mtp_head_forward_compressed(
+                        gpu,
+                        head,
+                        &state.mtp_scratch,
+                        &mut state.mtp_kv,
+                        next_tok,
+                        &prev_row,
+                        cur_pos + k,
+                        trunk_weights,
+                    )?;
+                }
+            }
+
+            // Pick the logits buffer to argmax over (mode-dependent).
+            let logits_for_argmax: &GpuTensor = if use_full_vocab {
+                &full_vocab_logits_view
+            } else {
+                state.mtp_scratch.logits_compressed.as_ref().unwrap()
+            };
+            let argmax_vocab = cvs; // = full vocab in full-vocab mode, = compressed vocab in compressed mode
+
+            let draft_idx: usize;
+            if use_sampling {
+                // GPU sample_top_p: kernel does the whole top_k(=20) + top_p +
+                // multinomial sample on-device. Returns 8 B (token id + new rng
+                // state). Eliminates the full 1 MB draft logits D2H + host
+                // softmax sample (~600 μs each step → ~3 ms/cycle saved).
+                //
+                // sample_top_p modifies logits in-place ONLY if repeat_penalty > 1
+                // and repeat_window > 0; we pass 1.0/0 so logits are untouched
+                // and the subsequent prob-gather sees the same values.
+                let (token_u32, new_rng) = gpu.sample_top_p(
+                    logits_for_argmax,
+                    &state.mtp_sample_result,
+                    &state.mtp_sample_repeat_buf,
+                    argmax_vocab,
+                    sampling.temp,
+                    sampling.top_p,
+                    state.gpu_rng_state,
+                    /* repeat_window */ 0,
+                    /* repeat_penalty */ 1.0,
+                )?;
+                state.gpu_rng_state = new_rng;
+                draft_idx = token_u32 as usize;
+                assert!(
+                    draft_idx < argmax_vocab,
+                    "draft sample {draft_idx} out of argmax_vocab {argmax_vocab}"
+                );
+
+                // GPU p_draft gather: H2D the sampled token id, run the gather
+                // kernel with n_rows=1, D2H 4 B prob. Replaces the host
+                // softmax_prob_at_temp call (~600 μs).
+                let token_i32: i32 = token_u32 as i32;
+                let idx_bytes: &[u8] =
+                    unsafe { std::slice::from_raw_parts(&token_i32 as *const i32 as *const u8, 4) };
+                gpu.hip
+                    .memcpy_htod(&state.mtp_gather_idx_draft.buf, idx_bytes)?;
+                gpu.softmax_prob_gather_batched_f32(
+                    logits_for_argmax,
+                    &state.mtp_gather_idx_draft,
+                    &state.mtp_gather_prob_draft,
+                    argmax_vocab,
+                    sampling.temp,
+                    /* n_rows */ 1,
+                )?;
+                let mut p_draft_host: [f32; 1] = [0.0];
+                {
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(p_draft_host.as_mut_ptr() as *mut u8, 4)
+                    };
+                    gpu.hip
+                        .memcpy_dtoh(bytes, &state.mtp_gather_prob_draft.buf)?;
+                }
+                draft_probs.push(p_draft_host[0]);
+
+                let token_id = match vocab_map_opt {
+                    Some(vm) => vm[draft_idx],
+                    None => draft_idx as u32,
+                };
+                candidates.push(token_id);
+                // draft_logits_host is unused on the GPU sampling path; left
+                // allocated for symmetry with the (now-removed) host-sample
+                // fallback. Compiler will elide.
+                let _ = &draft_logits_host;
+            } else if use_p_min {
+                // Top-2 with log-softmax probs: 8 B idx + 8 B logp D2H per step.
+                gpu.topk_logsumexp_batched_f32(
+                    logits_for_argmax,
+                    &state.mtp_topk_idx,
+                    &state.mtp_topk_logp,
+                    argmax_vocab,
+                    /* k */ 2,
+                    /* b */ 1,
+                )?;
+                let mut idx_host: [i32; 2] = [0, 0];
+                let mut logp_host: [f32; 2] = [0.0, 0.0];
+                {
+                    let idx_bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(idx_host.as_mut_ptr() as *mut u8, 8)
+                    };
+                    gpu.hip.memcpy_dtoh(idx_bytes, &state.mtp_topk_idx.buf)?;
+                    let logp_bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(logp_host.as_mut_ptr() as *mut u8, 8)
+                    };
+                    gpu.hip.memcpy_dtoh(logp_bytes, &state.mtp_topk_logp.buf)?;
+                }
+                draft_idx = idx_host[0] as usize;
+                assert!(
+                    draft_idx < argmax_vocab,
+                    "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}"
+                );
+                // Compressed: remap via vocab_map. Full-vocab: idx IS the token id.
+                let token_id = match vocab_map_opt {
+                    Some(vm) => vm[draft_idx],
+                    None => draft_idx as u32,
+                };
+                candidates.push(token_id);
+
+                // Check confidence AFTER pushing — keep this candidate, just
+                // skip future steps if confidence is below threshold.
+                if logp_host[0] < log_p_min {
+                    chain_truncated = true;
+                    break;
+                }
+            } else if use_device_token_chain {
+                let vocab_map_gpu = if use_full_vocab {
+                    None
+                } else {
+                    head.weights.lm_head_draft_vocab_map_gpu.as_ref()
+                };
+                gpu.argmax_token_chain_f32(
+                    logits_for_argmax,
+                    &argmax_view,
+                    &state.mtp_token_chain,
+                    vocab_map_gpu,
+                    argmax_vocab,
+                    k + 1,
+                )?;
+            } else {
+                gpu.argmax_f32_batched(logits_for_argmax, &argmax_view, argmax_vocab, 1)?;
+                let mut argmax_host: [i32; 1] = [0];
+                {
+                    let bytes: &mut [u8] = unsafe {
+                        std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, 4)
+                    };
+                    gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+                }
+                draft_idx = argmax_host[0] as usize;
+                assert!(
+                    draft_idx < argmax_vocab,
+                    "draft argmax {draft_idx} out of argmax_vocab {argmax_vocab}"
+                );
+                let token_id = match vocab_map_opt {
+                    Some(vm) => vm[draft_idx],
+                    None => draft_idx as u32,
+                };
+                candidates.push(token_id);
+            }
+
+            if k + 1 < max_n {
+                gpu.memcpy_dtod_at_auto(
+                    &state.mtp_t_outs.buf,
+                    k * dim_bytes,
+                    &state.mtp_scratch.t_mtp_out.buf,
+                    0,
+                    dim_bytes,
+                )?;
+            }
         }
     }
     let drafts_generated = if use_device_token_chain {
@@ -2588,8 +2612,8 @@ pub fn spec_step_mtp_compressed_serial(
         verify_tape,
         None,
         Some(&state.trunk_pbs),
-        None, // mask_override
-        None, // max_layer
+        None,  // mask_override
+        None,  // max_layer
         false, // MTP computes all verify logits from verify_hidden below
     )?;
 
@@ -2810,8 +2834,7 @@ pub fn spec_step_mtp_compressed_serial(
         let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
         gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
 
-        let use_gpu_accept =
-            use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
+        let use_gpu_accept = use_device_token_chain && mtp_gpu_greedy_accept_enabled_from_env();
         let accepted = if use_gpu_accept {
             let candidate_device = state.mtp_token_chain.sub_offset(1, drafts_generated);
             let accept_result = state.verify_argmax.sub_offset(0, 2);
@@ -2846,8 +2869,7 @@ pub fn spec_step_mtp_compressed_serial(
                 };
                 gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
             }
-            let argmax_per_pos: Vec<u32> =
-                argmax_v_host.into_iter().map(|x| x as u32).collect();
+            let argmax_per_pos: Vec<u32> = argmax_v_host.into_iter().map(|x| x as u32).collect();
             greedy_trunk_spine_accept(
                 &candidates[..drafts_generated],
                 &argmax_per_pos,
