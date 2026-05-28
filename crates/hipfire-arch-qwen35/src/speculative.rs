@@ -26,6 +26,43 @@ use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+fn dflash_q8_lmhead_wmma_enabled_from_env() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        match std::env::var("HIPFIRE_DFLASH_Q8_LMHEAD_WMMA") {
+            Ok(v) => {
+                let v = v.trim().to_ascii_lowercase();
+                !(v == "0" || v == "false" || v == "off" || v == "no")
+            }
+            Err(_) => true,
+        }
+    })
+}
+
+fn dflash_gemm_q8_lmhead(
+    gpu: &mut Gpu,
+    w_out: &llama::WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    if dflash_q8_lmhead_wmma_enabled_from_env() {
+        return gpu.gemm_q8_0_batched_chunked(&w_out.buf, x, y, w_out.m, w_out.k, n);
+    }
+
+    const Q8_LM_MAX: usize = 64;
+    let mut chunk_start = 0usize;
+    while chunk_start < n {
+        let chunk_end = (chunk_start + Q8_LM_MAX).min(n);
+        let chunk_n = chunk_end - chunk_start;
+        let x_chunk = x.sub_offset(chunk_start * w_out.k, chunk_n * w_out.k);
+        let y_chunk = y.sub_offset(chunk_start * w_out.m, chunk_n * w_out.m);
+        gpu.gemm_q8_0_batched(&w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n)?;
+        chunk_start = chunk_end;
+    }
+    Ok(())
+}
+
 /// Task #93 Phase B seed-prediction oracle counters.
 ///
 /// Three proxies, all derived from data the draft already computes (zero
@@ -2184,7 +2221,7 @@ fn verify_dflash_block_inner(
     batch_result?;
 
     // Per-position lm_head. Fast paths in priority order:
-    //   Q8_0      → batched gemm_q8_0_batched (one launch + one D2H).
+    //   Q8_0      → DFlash-scoped Q8 lm_head dispatcher (gfx12 WMMA by default).
     //   MQ4G256   → batched rotate + gemm_hfq4g256 (one launch + one D2H).
     //   HFQ4G256  → batched gemm_hfq4g256 directly.
     //   else      → B sequential weight_gemv calls + B downloads (legacy).
@@ -2204,33 +2241,14 @@ fn verify_dflash_block_inner(
 
     if try_batched {
         let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
-        // Q8_0 gemm_q8_0_batched has a hard MAX_BATCH=64 in the kernel, so
-        // tree-verify blocks exceeding 64 (budget + 1 > 64) need chunking.
-        // MQ4/HFQ4/HFQ6/MQ6 kernels have no such cap — they take the single-shot path.
-        //
-        // INVARIANT: this path MUST stay on `gemm_q8_0_batched` (the substrate),
-        // NOT the Tier 3 `gemm_qkv_q8_0_wmma` family. The substrate matches
-        // `gemv_q8_0`'s single-accumulator reduction order, preserving byte-exact
-        // greedy parity with decode — required for DFlash+Q8 spec-verify to ever
-        // be a valid eval target (see docs/plans/q8-fused-prefill-kernels.md
-        // §Constraints — "greedy-parity invariant"). The WMMA family uses a
-        // hardware-determined reduction order and will not match.
+        // Q8_0 routes through the DFlash lm_head helper so the gfx12 WMMA
+        // arm can be coherence-gated independently of MTP. Set
+        // HIPFIRE_DFLASH_Q8_LMHEAD_WMMA=0 to force the legacy scalar chunks.
+        // MQ4/HFQ4/HFQ6/MQ6 kernels have no 64-row cap and take the
+        // single-shot path.
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                const Q8_LM_MAX: usize = 64;
-                let mut chunk_start = 0usize;
-                while chunk_start < b {
-                    let chunk_end = (chunk_start + Q8_LM_MAX).min(b);
-                    let chunk_n = chunk_end - chunk_start;
-                    let x_chunk = final_hidden.sub_offset(chunk_start * dim, chunk_n * dim);
-                    let y_chunk = logits_batch.sub_offset(chunk_start * vocab, chunk_n * vocab);
-                    // DO NOT route this through the Q8 WMMA dispatcher — see
-                    // greedy-parity invariant above.
-                    gpu.gemm_q8_0_batched(
-                        &w_out.buf, &x_chunk, &y_chunk, w_out.m, w_out.k, chunk_n,
-                    )?;
-                    chunk_start = chunk_end;
-                }
+                dflash_gemm_q8_lmhead(gpu, w_out, &final_hidden, &logits_batch, b)?;
             }
             rdna_compute::DType::HFQ4G256 => {
                 gpu.gemm_hfq4g256_batched_lmhead(
@@ -2791,10 +2809,7 @@ pub fn spec_step_dflash(
 
         match w_out.gpu_dtype {
             rdna_compute::DType::Q8_0 => {
-                // INVARIANT: substrate-only (greedy-parity with decode); see the
-                // earlier Q8_0 spec-verify path in this file for the full rationale.
-                // Do not route through the Q8 WMMA dispatcher.
-                gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)?;
+                dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)?;
             }
             rdna_compute::DType::HFQ4G256 => {
                 gpu.gemm_hfq4g256_batched_lmhead(
@@ -3427,7 +3442,7 @@ fn run_dflash_draft_for_logits(
 
     let gemm_result = match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
-            gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+            dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
         rdna_compute::DType::HFQ4G256 => {
             gpu.gemm_hfq4g256(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
@@ -3592,7 +3607,7 @@ fn run_dflash_draft_for_topk_gpu(
     let w_out = &target.weights.output;
     let gemm_result = match w_out.gpu_dtype {
         rdna_compute::DType::Q8_0 => {
-            gpu.gemm_q8_0_batched(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
+            dflash_gemm_q8_lmhead(gpu, w_out, &hidden_rows, &logits_batch, batch)
         }
         rdna_compute::DType::HFQ4G256 => {
             gpu.gemm_hfq4g256(&w_out.buf, &hidden_rows, &logits_batch, w_out.m, w_out.k, batch)
