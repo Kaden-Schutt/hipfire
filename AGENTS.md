@@ -183,31 +183,31 @@ qwen3.5-9b-awq-mq4.quality.json
 
 ---
 
-# Testing playbook (v0.1.9-alpha)
+# Testing playbook (v0.2.0)
 
 **Audience:** agents (or humans) running smoke / perf / correctness
-tests on hipfire v0.1.9-alpha — particularly the production-ready MQ3
-sub-4-bit Magnum Quant family, the DFlash MQ3 cross-quant matrix, and
-the existing DFlash draft pull / prompt-shape adaptation paths
-inherited from v0.1.8.
+tests on hipfire v0.2.0-era branches — particularly MQ-family
+prefill/decode, MoE/A3B batching, MTP/DFlash verify paths, prompt-shape
+adaptation, and arch-specific kernel dispatch.
 
 **Companion docs:** [`CLAUDE.md`](CLAUDE.md) holds project-wide rules
 (non-negotiable hard rules, e.g. coherence-gate is the canonical gate).
 This file holds the *testing playbook* — how to verify v0.1.9-alpha
 works, what to measure, what counts as pass/fail.
 
-**v0.1.9-alpha default behavior to be aware of:**
-- **MQ3 is production on gfx11** (`gfx1100/1101/1102/1150/1151`) and
-  gfx12 (`gfx1200/1201`). On gfx10 / gfx906 / gfx94x, MQ3 weights still
-  load and run via per-token GEMV fallback — correct, just slower
-  prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
-  path).
-- **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
-  cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` default carries over from v0.1.8.** Any test
-  exercising DFlash still needs `hipfire config set dflash_mode auto`
-  or `HIPFIRE_DFLASH_DRAFT=<path>` first.
+**v0.2.0-era default behavior to be aware of:**
+- **MQ4 remains the MoE/A3B correctness control.** Do not admit MQ3 or
+  MQ6 MoE/A3B paths to production on benchmark evidence alone; keep MQ4
+  parity as the reference until shared batched-prefill tests are stable.
+- **MQ3 dense paths are production on validated RDNA arches, but MQ3
+  inside MoE/A3B is still guarded.** The shared batched MoE prefill path
+  has format-specific stride assumptions; add explicit gate/up and
+  shared-expert-down parity before broadening admission.
+- **MQ6 MoE/A3B is opt-in for investigation.** Use
+  `HIPFIRE_MOE_MQ6_ADMIT=1` only for targeted parity work.
+- **`dflash_mode=off` remains the default.** Any test exercising DFlash
+  still needs `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first.
 
 ---
 
@@ -240,6 +240,11 @@ works, what to measure, what counts as pass/fail.
    test name, rename it. The previous per-file enumeration grew stale
    silently after PR #129 (issue #163, naive fix #165, structural fix
    in this rule's enforcing PR).
+7. **Run the no-GPU subset before handing off workflow-only changes.**
+   `./scripts/no-gpu-ci.sh` is the default CI shape: Rust check/examples,
+   no-GPU Rust units, CPU Python tests, env/docs drift, and Bun
+   tests/typecheck when Bun is installed. It does not replace hardware
+   coherence or speed gates.
 
 ---
 
@@ -604,9 +609,8 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-05-02 (v0.1.9-alpha — MQ3 production-ready: K4
-decode, WMMA prefill family, DFlash cross-quant matrix, gfx12 port,
-cache-invalidation lifecycle, defensive parseToolCalls (#111 stopgap),
-gfx906 + gfx1152 arch gating, speed-gate DPM warmup). When this doc
-gets stale (more than 1-2 releases behind HEAD), update it as part of
-the release PR.*
+*Last updated: 2026-05-29 (v0.2.0-era gates — no-GPU CI subset,
+idempotent hook installer, MoE/MTP correctness-first guardrails, MQ4
+as the MoE/A3B control, MQ6 admission still opt-in). When this doc gets
+stale (more than 1-2 releases behind HEAD), update it as part of the
+release PR.*
