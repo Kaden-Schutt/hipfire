@@ -24,6 +24,7 @@ pub mod model_source;
 pub mod safetensors_source;
 pub mod loop_guard;
 pub mod multi_gpu;
+pub mod mtp_mirror;
 pub mod sampler;
 #[cfg(feature = "deltanet")]
 pub mod dflash;
