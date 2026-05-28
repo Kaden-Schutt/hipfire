@@ -2956,6 +2956,10 @@ pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
 pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched.hip");
 
+/// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
+
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
 /// path. Same launch shape and byte-equality contract at batch=1.

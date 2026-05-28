@@ -5590,6 +5590,11 @@ fn attention_block_batched_mixed(
     let o_lora_rank = cfg.o_lora_rank;
     let groups_o_lora = n_groups * o_lora_rank;
     let topk_max = cfg.index_topk;
+    let use_topk_direct = ratio == 4
+        && std::env::var("HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT")
+            .map(|s| s != "0")
+            .unwrap_or(gpu.arch == "gfx1151" && batch_size >= 64);
+    let mut topk_direct_n_compressed = 0usize;
 
     // Lazy-alloc SWA rings.
     {
@@ -5938,6 +5943,7 @@ fn attention_block_batched_mixed(
             .map(|b| (((start_pos as usize) + b + 1) / ratio).min(max_compressed) as i32)
             .collect();
         let n_max_chunk = *n_per_batch_host.iter().max().unwrap_or(&0) as usize;
+        topk_direct_n_compressed = n_max_chunk;
         if n_max_chunk == 0 {
             // No commits yet — nothing to score/gather. n_active_topk stays 0.
         } else {
@@ -6063,19 +6069,21 @@ fn attention_block_batched_mixed(
                 .main_kv_cache
                 .as_ref()
                 .ok_or_else(|| "main_kv_cache missing".to_string())?;
-            gpu.deepseek4_topk_kv_gather_batched_f32(
-                main_kv_cache,
-                &pbs.idx_topk_indices_batch,
-                &pbs.topk_staged_batch,
-                topk_max as i32,
-                head_dim as i32,
-                n_max_chunk as i32,
-                topk_max as i32,
-                0,
-                /*scale=*/ 1.0,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+            if !use_topk_direct {
+                gpu.deepseek4_topk_kv_gather_batched_f32(
+                    main_kv_cache,
+                    &pbs.idx_topk_indices_batch,
+                    &pbs.topk_staged_batch,
+                    topk_max as i32,
+                    head_dim as i32,
+                    n_max_chunk as i32,
+                    topk_max as i32,
+                    0,
+                    /*scale=*/ 1.0,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("deepseek4_topk_kv_gather_batched l{layer_idx}: {e:?}"))?;
+            }
 
             // n_active_topk[b] = min(topk_max, n_per_batch[b]) — top-K
             // returned -1 sentinels past n_per_batch[b], and gather wrote
@@ -6125,23 +6133,48 @@ fn attention_block_batched_mixed(
         .map_err(|e| format!("htod n_active_topk_arr: {e:?}"))?;
 
     // 4. Batched joint-softmax attention over SWA + topK + sink.
-    gpu.deepseek4_attn_swa_topk_batched_f32(
-        &pbs.q_batch,
-        &pbs.swa_staged_batch,
-        &pbs.swa_staged_batch, // K=V tied
-        &pbs.topk_staged_batch,
-        &pbs.topk_staged_batch,
-        attn_sink,
-        &pbs.n_valid_swa_arr,
-        &pbs.n_active_topk_arr,
-        &pbs.attn_out_raw_batch,
-        n_heads as i32,
-        head_dim as i32,
-        win as i32,
-        topk_max as i32,
-        batch_size as i32,
-    )
-    .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    if use_topk_direct {
+        let main_kv_cache = state._indexer[layer_idx]
+            .main_kv_cache
+            .as_ref()
+            .ok_or_else(|| "main_kv_cache missing".to_string())?;
+        gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch,
+            &pbs.swa_staged_batch, // K=V tied
+            main_kv_cache,
+            &pbs.idx_topk_indices_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr,
+            &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32,
+            head_dim as i32,
+            win as i32,
+            topk_max as i32,
+            topk_direct_n_compressed as i32,
+            batch_size as i32,
+        )
+        .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+    } else {
+        gpu.deepseek4_attn_swa_topk_batched_f32(
+            &pbs.q_batch,
+            &pbs.swa_staged_batch,
+            &pbs.swa_staged_batch, // K=V tied
+            &pbs.topk_staged_batch,
+            &pbs.topk_staged_batch,
+            attn_sink,
+            &pbs.n_valid_swa_arr,
+            &pbs.n_active_topk_arr,
+            &pbs.attn_out_raw_batch,
+            n_heads as i32,
+            head_dim as i32,
+            win as i32,
+            topk_max as i32,
+            batch_size as i32,
+        )
+        .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+    }
 
     // 5. Inverse RoPE.
     {
