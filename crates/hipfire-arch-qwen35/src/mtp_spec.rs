@@ -2073,6 +2073,14 @@ impl MtpHeteroDrafterState {
             "seed_prev_hidden: trunk source has {} elems, expected n_embd={n_embd}",
             trunk_src.numel(),
         );
+        // Same-device shortcut for the Stage 2 PP+MTP co-located case.
+        if trunk_gpu.device_id == drafter_gpu.device_id {
+            return trunk_gpu.hip.memcpy_dtod_at(
+                &self.prev_hidden.buf, 0,
+                &trunk_src.buf, 0,
+                n_embd * 4,
+            );
+        }
         trunk_gpu.hip.memcpy_peer(
             &self.prev_hidden.buf, drafter_gpu.device_id,
             &trunk_src.buf, trunk_gpu.device_id,
@@ -2423,17 +2431,29 @@ pub fn spec_step_mtp_compressed_serial_hetero(
     // because cycle N+1 started its chain from the WRONG hidden state.
     let prev_hidden_row = advance - 1;
     let src_row_offset = prev_hidden_row * dim * 4;
-    target_gpu.hip.memcpy_peer_offset(
-        &drafter_state.prev_hidden.buf, 0, drafter_gpu.device_id,
-        &state.verify_hidden.buf, src_row_offset, target_gpu.device_id,
-        dim * 4,
-    )?;
-    // Note: we use the sync memcpy_peer (not _async) since the trunk verify
-    // path uses target_gpu's active_stream and we'd need an event handshake
-    // to safely peer-copy from a stream-pending buffer. memcpy_peer
-    // synchronizes via host, sized to 20 KB this is fast (~38 µs measured).
-    // Future optimization: use memcpy_peer_async + cross-device event sync
-    // (see hetero_overlap_microbench.rs in the parallel multi-gpu work).
+    if target_gpu.device_id == drafter_gpu.device_id {
+        // Same-device case (Stage 2 PP+MTP: MTP head co-located with the
+        // trunk's output_device). Verify_hidden and prev_hidden are both
+        // on this gpu; use a same-device D2D memcpy. ~10 µs instead of
+        // the ~38 µs cross-device peer copy. Stays on target_gpu's
+        // active_stream — no event handshake needed.
+        target_gpu.hip.memcpy_dtod_at(
+            &drafter_state.prev_hidden.buf, 0,
+            &state.verify_hidden.buf, src_row_offset,
+            dim * 4,
+        )?;
+    } else {
+        // Cross-device case (hetero MTP without PP, or PP with MTP on a
+        // non-output_device gpu). Use sync memcpy_peer with offset.
+        // memcpy_peer host-synchronizes, sized to 20 KB this is fast
+        // (~38 µs measured). Future optimization: memcpy_peer_async +
+        // cross-device event sync (see hetero_overlap_microbench).
+        target_gpu.hip.memcpy_peer_offset(
+            &drafter_state.prev_hidden.buf, 0, drafter_gpu.device_id,
+            &state.verify_hidden.buf, src_row_offset, target_gpu.device_id,
+            dim * 4,
+        )?;
+    }
 
     // ── 4. Rollback / replay on TARGET (same as single-gpu) ──
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;

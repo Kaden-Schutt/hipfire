@@ -42,14 +42,22 @@ pub fn peer_clone_tensor(
     dst_gpu.bind_thread()?;
     let dst = dst_gpu.alloc_tensor(&shape, dtype)?;
 
-    // Synchronous peer copy. memcpy_peer blocks the host until the copy
-    // lands — fine for init-time, eliminates the need for an event +
-    // wait_event handshake here.
-    src_gpu.hip.memcpy_peer(
-        &dst.buf, dst_gpu.device_id,
-        &src.buf,  src_gpu.device_id,
-        byte_size,
-    )?;
+    // Same-device shortcut: if src and dst are on the same gpu, the
+    // "peer copy" is really a D2D memcpy. Avoids a needless host
+    // round-trip via hipMemcpyPeer. Stage 2 PP+MTP can hit this when
+    // MTP head loads onto the device that already holds token_embd.
+    if src_gpu.device_id == dst_gpu.device_id {
+        src_gpu.hip.memcpy_dtod_at(&dst.buf, 0, &src.buf, 0, byte_size)?;
+    } else {
+        // Synchronous peer copy. memcpy_peer blocks the host until the copy
+        // lands — fine for init-time, eliminates the need for an event +
+        // wait_event handshake here.
+        src_gpu.hip.memcpy_peer(
+            &dst.buf, dst_gpu.device_id,
+            &src.buf,  src_gpu.device_id,
+            byte_size,
+        )?;
+    }
 
     debug_assert_eq!(dst.dtype, dtype);
     debug_assert_eq!(dst.shape, shape);

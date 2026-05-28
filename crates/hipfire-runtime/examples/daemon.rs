@@ -372,6 +372,14 @@ struct MtpState {
     max_n: usize,
     p_min: f32,
     compressed: bool,
+    /// Stage 2 (PP+MTP combo): drafter-side state when running hetero
+    /// MTP. `None` for the single-gpu MTP path. When `Some`, the MTP
+    /// head + scratch + KV + token_embd mirror live on the drafter gpu
+    /// indicated by the spec function call (which is `output_device` in
+    /// the PP=2 layout); the cycle dispatcher selects
+    /// `spec_step_mtp_compressed_serial_hetero` instead of
+    /// `spec_step_mtp_compressed_serial`.
+    drafter_state: Option<hipfire_arch_qwen35::mtp_spec::MtpHeteroDrafterState>,
 }
 
 struct LoadedModel {
@@ -1620,7 +1628,10 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
         let _ = (draft_path, cask);
-        return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
+        return load_model_pp(
+            path, max_seq, kv_mode_override, state_quant_override, pp,
+            mtp_head_path, mtp_k, mtp_p_min, mtp_kv_mode_str, gpu,
+        );
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -2143,6 +2154,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                     max_n: mtp_k,
                     p_min: mtp_p_min,
                     compressed,
+                    drafter_state: None,
                 }))
             })();
 
@@ -2349,12 +2361,17 @@ fn load_model_safetensors(
 /// `gpu` parameter is unused on this path. Eviction is refused at this layer
 /// because TriAttention/CASK/PFlash live on a single device and are not v1
 /// targets for pp>1 — physical_cap == max_seq accordingly.
+#[allow(clippy::too_many_arguments)]
 fn load_model_pp(
     path: &str,
     max_seq: usize,
     kv_mode_override: Option<&str>,
     state_quant_override: Option<&str>,
     pp: usize,
+    mtp_head_path: Option<&str>,
+    mtp_k: usize,
+    mtp_p_min: f32,
+    mtp_kv_mode_str: &str,
     _gpu: &mut rdna_compute::Gpu,
 ) -> Result<LoadedModel, String> {
     let kv_mode = kv_mode_override
@@ -2512,7 +2529,7 @@ fn load_model_pp(
         }
     }
 
-    Ok(LoadedModel {
+    let mut loaded = LoadedModel {
         arch_id: hfq.arch_id,
         pp,
         pp_gpus: Some(gpus),
@@ -2534,7 +2551,295 @@ fn load_model_pp(
         dflash: None,
         mtp: None,
         chat_template: resolve_chat_template(&hfq, path),
-    })
+    };
+
+    // ─── Stage 2: PP + MTP-on-output_device ─────────────────────────────
+    //
+    // If the load supplied an MTP head (--mtp-head / bundled trailer), load
+    // it onto gpus.devices[gpus.output_device]. The output_device convention
+    // (verify lm_head + output_norm live there) makes that gpu the natural
+    // home for the MTP head — verify_hidden is allocated there, so the
+    // per-cycle prev_hidden handoff collapses from a cross-device peer copy
+    // to a same-device memcpy_dtod_at.
+    //
+    // Also mirrors trunk.weights.token_embd from dev 0 onto output_device
+    // (peer_clone_tensor with same-device shortcut when output_device == 0).
+    //
+    // Only compressed-sidecar heads are supported in v1 hetero — the
+    // bundled .mq4-mtp path needs the trunk.output mirror too which we
+    // haven't built (see docs/plans/mtp_multi_gpu_split_audit.md).
+    let mut mtp_load_block = || -> Result<Option<MtpState>, String> {
+        // Bail early when no head was requested AND no bundled trailer
+        // exists on the trunk file.
+        let want_bundled = mtp_head_path.is_none()
+            && hipfire_arch_qwen35::mtp_head::detect_bundled_mtp_offset(Path::new(path))
+                .ok().flatten().is_some();
+        if mtp_head_path.is_none() && !want_bundled {
+            return Ok(None);
+        }
+
+        // Borrow gpus mutably; we'll restore loaded.pp_gpus after the load.
+        let mut gpus = loaded.pp_gpus.take().expect("pp_gpus populated above");
+        let output_device = gpus.output_device;
+        let trunk_weights = loaded.q35_weights.take().expect("q35 weights populated");
+        let trunk_config = loaded.q35_config.as_ref().expect("q35 config populated").clone();
+
+        // Load MTP head onto output_device. The head's KV cache size is
+        // physical_cap (= max_seq on this path); fits comfortably given
+        // the audit's per-device budget.
+        let head_res = {
+            let dev = &mut gpus.devices[output_device];
+            if let Some(mp) = mtp_head_path {
+                hipfire_arch_qwen35::mtp_head::load_mtp_head(Path::new(mp), dev, max_seq)
+                    .map_err(|e| format!("load mtp sidecar '{}': {e}", mp))
+            } else {
+                hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(Path::new(path), dev, max_seq)
+                    .map_err(|e| format!("load bundled mtp: {e}"))?
+                    .ok_or_else(|| "no bundled mtp trailer".to_string())
+            }
+        };
+        let head: Qwen35MtpHead = match head_res {
+            Ok(h) => h,
+            Err(e) => {
+                // Restore state so the caller still gets a working pp model.
+                loaded.pp_gpus = Some(gpus);
+                loaded.q35_weights = Some(trunk_weights);
+                return Err(e);
+            }
+        };
+
+        // Config-compat checks (mirror pp=1 path).
+        if head.config.n_embd != trunk_config.dim {
+            let e = format!(
+                "MTP head n_embd={} != trunk dim={}",
+                head.config.n_embd, trunk_config.dim,
+            );
+            head.free_gpu(&mut gpus.devices[output_device]);
+            loaded.pp_gpus = Some(gpus);
+            loaded.q35_weights = Some(trunk_weights);
+            return Err(e);
+        }
+        if head.config.vocab_size != trunk_config.vocab_size {
+            let e = format!(
+                "MTP head vocab_size={} != trunk vocab={}",
+                head.config.vocab_size, trunk_config.vocab_size,
+            );
+            head.free_gpu(&mut gpus.devices[output_device]);
+            loaded.pp_gpus = Some(gpus);
+            loaded.q35_weights = Some(trunk_weights);
+            return Err(e);
+        }
+        let trunk_rope_theta = trunk_config.rope_theta as f32;
+        if (head.config.rope_theta - trunk_rope_theta).abs()
+            > trunk_rope_theta.abs() * 1e-3 + 1.0 {
+            let e = format!(
+                "MTP head rope_theta={} != trunk rope_theta={}",
+                head.config.rope_theta, trunk_rope_theta,
+            );
+            head.free_gpu(&mut gpus.devices[output_device]);
+            loaded.pp_gpus = Some(gpus);
+            loaded.q35_weights = Some(trunk_weights);
+            return Err(e);
+        }
+
+        // Stage 2 v1 requires the compressed-sidecar path (cvs head). The
+        // bundled full-vocab path would need a trunk.output mirror too,
+        // which we haven't built. Refuse early with a clear error.
+        let cvs = match head.weights.compressed_vocab_size {
+            Some(c) => c,
+            None => {
+                let e = "Stage 2 PP+MTP requires a compressed-sidecar .mtp \
+                    head (e.g. qwen3.6-27b-cvs16384.mtp). Bundled full-vocab \
+                    heads need the trunk.output mirror, not implemented in v1.".to_string();
+                head.free_gpu(&mut gpus.devices[output_device]);
+                loaded.pp_gpus = Some(gpus);
+                loaded.q35_weights = Some(trunk_weights);
+                return Err(e);
+            }
+        };
+        let compressed = true;
+
+        // Mirror trunk.token_embd from dev 0 (per load_weights_multi's
+        // Variant 2 convention) onto output_device. peer_clone_tensor has
+        // a same-device shortcut, so if output_device == 0 this is a D2D
+        // memcpy. The token_embd ownership stays on dev 0 — the mirror
+        // is read by the chain's embed_lookup on output_device.
+        //
+        // Borrow gymnastics: trunk_weights is taken; we put it back AFTER
+        // the mirror's source borrow ends.
+        let mirror_result = (|| -> Result<_, String> {
+            // src and dst are different devices in the standard layout but
+            // we still need separate &mut accesses. Split the slice.
+            let (left, right) = gpus.devices.split_at_mut(output_device.max(1));
+            let (src_gpu, dst_gpu) = if output_device == 0 {
+                // src == dst gpu; peer_clone shortcut handles it.
+                let dev0 = &mut left[0];
+                let dev0_ptr: *mut rdna_compute::Gpu = dev0;
+                // Safety: we know we use the same device; alias is intentional
+                // for this branch. peer_clone_tensor's same-device path uses
+                // only one device.
+                let dst = unsafe { &mut *dev0_ptr };
+                (&*dev0, dst)
+            } else {
+                (&left[0], &mut right[0])
+            };
+            hipfire_runtime::mtp_mirror::peer_clone_tensor(
+                src_gpu, dst_gpu, &trunk_weights.token_embd,
+            ).map_err(|e| format!("mirror token_embd: {e}"))
+        })();
+
+        let mirrored_token_embd = match mirror_result {
+            Ok(t) => t,
+            Err(e) => {
+                head.free_gpu(&mut gpus.devices[output_device]);
+                loaded.pp_gpus = Some(gpus);
+                loaded.q35_weights = Some(trunk_weights);
+                return Err(e);
+            }
+        };
+        let embd_format = trunk_weights.embd_format;
+
+        // Allocate trunk-side MtpSpecState on output_device (where verify_hidden
+        // gets written by the trunk verify) — that's also where prev_hidden
+        // should logically live for the spec function's bookkeeping, though
+        // the actual prev_hidden the chain reads is drafter_state.prev_hidden
+        // (which is the same device in this layout — so the spec function's
+        // same-device shortcut kicks in).
+        //
+        // Need a transient ModelSlot to satisfy MtpSpecState::new_for_slot_with_kv_mode.
+        let kv_mode_mtp = match MtpKvMode::parse(mtp_kv_mode_str) {
+            Ok(m) => m,
+            Err(e) => {
+                head.free_gpu(&mut gpus.devices[output_device]);
+                gpus.devices[output_device].free_tensor(mirrored_token_embd).ok();
+                loaded.pp_gpus = Some(gpus);
+                loaded.q35_weights = Some(trunk_weights);
+                return Err(format!("mtp kv mode parse: {e}"));
+            }
+        };
+
+        // The trunk-side MtpSpecState needs a ModelSlot — but our trunk
+        // weights live multi-gpu. Build the spec state directly with the
+        // output_device gpu and the trunk_config (the constructor reads
+        // config + dn_state for sizing, not weights). We DO need dn_state;
+        // take it from loaded.
+        let tmp_dn = loaded.dn_state.take().expect("dn_state populated");
+        let tmp_kv = loaded.kv_cache.take().expect("kv_cache populated");
+        let tmp_scratch = loaded.q35_scratch.take(); // None on pp path
+        let _ = tmp_scratch;
+
+        // ModelSlot wants its OWN single-gpu scratch + weights. Since on the
+        // pp path the trunk is already multi-gpu, we build a TRANSIENT
+        // ModelSlot only for the MtpSpecState constructor's signature, then
+        // immediately destructure it to reclaim the components. The actual
+        // forward path uses gpus directly, not the slot.
+        let slot_config = speculative::ModelSlotConfig::default();
+        let tmp_hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+        // Build a transient single-device Qwen35Scratch on output_device.
+        // The MtpSpecState constructor only needs it for shape/size
+        // inspection; not used at runtime in the hetero spec function.
+        let tmp_q35_scratch_for_slot = qwen35::Qwen35Scratch::new_with_kv_max(
+            &mut gpus.devices[output_device], &trunk_config, 128, max_seq,
+        ).map_err(|e| format!("alloc transient q35 scratch: {e}"))?;
+
+        let mut target = speculative::ModelSlot {
+            name: String::from("target"),
+            hfq: tmp_hfq,
+            config: trunk_config.clone(),
+            weights: trunk_weights,
+            kv_cache: tmp_kv,
+            dn_state: tmp_dn,
+            scratch: tmp_q35_scratch_for_slot,
+            slot_config,
+        };
+
+        let spec_state_res = MtpSpecState::new_for_slot_with_kv_mode(
+            &mut gpus.devices[output_device], &target, &head, mtp_k, kv_mode_mtp,
+        );
+
+        let mut spec_state = match spec_state_res {
+            Ok(s) => s,
+            Err(e) => {
+                head.free_gpu(&mut gpus.devices[output_device]);
+                gpus.devices[output_device].free_tensor(mirrored_token_embd).ok();
+                // Restore loaded state (and free transient scratch).
+                target.scratch.free_gpu(&mut gpus.devices[output_device]);
+                loaded.q35_weights = Some(target.weights);
+                loaded.kv_cache = Some(target.kv_cache);
+                loaded.dn_state = Some(target.dn_state);
+                loaded.pp_gpus = Some(gpus);
+                return Err(format!("alloc MtpSpecState: {e}"));
+            }
+        };
+        if mtp_p_min > 0.0 {
+            spec_state.set_p_min(mtp_p_min);
+        }
+        // Compressed scratch on the trunk-side MtpSpecState — needed by the
+        // single-gpu spec path, but the hetero path uses drafter_state's
+        // own mtp_scratch.logits_compressed instead. Alloc both for safety
+        // (cheap; ~64 KB).
+        spec_state.mtp_scratch.ensure_compressed_logits(&mut gpus.devices[output_device], cvs)
+            .map_err(|e| format!("alloc trunk-side logits_compressed: {e}"))?;
+        spec_state.ensure_compressed_lm_logits(&mut gpus.devices[output_device], cvs)
+            .map_err(|e| format!("alloc trunk-side mtp_lm_logits_compressed: {e}"))?;
+
+        // Drafter-side state on output_device (= same device as spec state).
+        // mtp_scratch.ensure_compressed_logits is called by new_for_slot's
+        // caller convention; do it explicitly.
+        let drafter_state_res = hipfire_arch_qwen35::mtp_spec::MtpHeteroDrafterState::new_for_slot(
+            &mut gpus.devices[output_device], &head, mtp_k, kv_mode_mtp,
+            mirrored_token_embd, embd_format,
+        );
+        let mut drafter_state = match drafter_state_res {
+            Ok(d) => d,
+            Err(e) => {
+                spec_state.free_gpu(&mut gpus.devices[output_device]);
+                head.free_gpu(&mut gpus.devices[output_device]);
+                target.scratch.free_gpu(&mut gpus.devices[output_device]);
+                loaded.q35_weights = Some(target.weights);
+                loaded.kv_cache = Some(target.kv_cache);
+                loaded.dn_state = Some(target.dn_state);
+                loaded.pp_gpus = Some(gpus);
+                return Err(format!("alloc MtpHeteroDrafterState: {e}"));
+            }
+        };
+        drafter_state.mtp_scratch.ensure_compressed_logits(
+            &mut gpus.devices[output_device], cvs,
+        ).map_err(|e| format!("alloc drafter logits_compressed: {e}"))?;
+
+        // Restore borrowed pieces.
+        target.scratch.free_gpu(&mut gpus.devices[output_device]);
+        loaded.q35_weights = Some(target.weights);
+        loaded.kv_cache = Some(target.kv_cache);
+        loaded.dn_state = Some(target.dn_state);
+        loaded.pp_gpus = Some(gpus);
+
+        eprintln!(
+            "  MTP head loaded on output_device={} (n_embd={}, vocab={}, cvs={}, k={}, p_min={:.2})",
+            output_device,
+            head.config.n_embd, head.config.vocab_size,
+            cvs, mtp_k, mtp_p_min,
+        );
+
+        Ok(Some(MtpState {
+            head,
+            spec_state,
+            max_n: mtp_k,
+            p_min: mtp_p_min,
+            compressed,
+            drafter_state: Some(drafter_state),
+        }))
+    };
+
+    match mtp_load_block() {
+        Ok(Some(state)) => loaded.mtp = Some(state),
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("  MTP head load failed ({}) — falling back to AR-only on PP", e);
+        }
+    }
+
+    Ok(loaded)
 }
 
 /// Pre-screen all Qwen3.5/3.6 weight matrices for MMQ safety (#87).
