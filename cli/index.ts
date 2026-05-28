@@ -4102,6 +4102,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       desc: "HIP device for the PFlash drafter. -1 = same device as target; 0+ pins the drafter to that GPU.",
       range: [-1, 15], step: 1,
     },
+    prefill_drafter_device: {
+      label: "prefill_drafter_device",
+      desc: "HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device index for hetero compress.",
+      range: [-1, 15], step: 1,
+    },
     prefill_profile: {
       label: "prefill_profile",
       desc: "Emit per-stage PFlash timing logs (score / select / gather). Off in production.",
