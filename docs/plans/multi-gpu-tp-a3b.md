@@ -366,8 +366,28 @@ tests) + `Gpus::init_tp(tp_size, n_layers)` in `multi_gpu.rs`.
 - Attention/RoPE dispatch already take `n_heads`/`n_kv_heads` as explicit
   params → running on a Q-head subset is a param change, not surgery.
 
+**`qwen3.5-0.8b.mq4` is HYBRID, not pure FullAttn** (corrects an earlier
+note): it's a qwen3.5-vl text wrapper, `dim=1024, n_heads=8, n_kv_heads=2,
+head_dim=256` (so `wo`: 2048→1024), tied embeddings, dense FFN
+(`num_experts=0`), with **FullAttention at layers 3,7,11,15,19,23 (every
+4th)** and **DeltaNet (LinearAttention) on the rest** (layer 0 is DeltaNet).
+A full-model TP=2↔TP=1 parity gate on 0.8B therefore runs *mostly* DeltaNet
+layers. **Design decision for `forward_scratch_tp`:** in Stage 3, run
+DeltaNet layers **replicated/unsharded** (full + identical on every rank —
+the residual stays in sync), and TP-shard only the FullAttn layers
+(masked-head attention + `wo` partial + all-reduce). DeltaNet TP sharding
+(16 value heads + linear-attention state) is a later stage.
+
 **Milestone decomposition (de-risks the wo-slice problem):**
 
+- **3a.0 — wo-partial + all-reduce mechanism smoke (DONE 2026-05-28):**
+  `crates/hipfire-arch-qwen35/examples/tp_wo_allreduce_smoke.rs` loads the
+  real 0.8B on 2 GPUs (replicated), feeds the real quantized `wo` (FullAttn
+  layer 3) a `wo_col_range`-masked attention vector per rank, and
+  `all_reduce_sum_f32`s the partials. Reconstructs single-GPU
+  `wo @ attn_out` to **max rel 9.6e-8** — confirms `wo_col_range` ↔ GEMV
+  input-layout alignment + all-reduce reconstruction on real weights,
+  without `forward_scratch_tp` or a quant slicer.
 - **3a — math + all-reduce validation (replicated load, masked heads):**
   each rank loads weights full (no slicing), computes full Q/K/V, but runs
   attention only on its local head range and zeroes non-local heads before

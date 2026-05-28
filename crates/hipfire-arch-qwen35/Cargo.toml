@@ -23,6 +23,13 @@ name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"
 required-features = ["deltanet"]
 
+# tp_wo_allreduce_smoke — Stage 3a: validate the row-parallel wo partial +
+# all-reduce decomposition on the real quantized wo of qwen3.5-0.8b.mq4.
+[[example]]
+name = "tp_wo_allreduce_smoke"
+path = "examples/tp_wo_allreduce_smoke.rs"
+required-features = ["deltanet"]
+
 [[example]]
 name = "test_qwen35_state_multi"
 path = "examples/test_qwen35_state_multi.rs"
