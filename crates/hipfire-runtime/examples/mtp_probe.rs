@@ -30,7 +30,7 @@ Arguments:
   model-with-mtp.hfq  HFQ model produced with hipfire-quantize --include-mtp
   prompt              Prompt text to seed greedy decode [default: Hello]
   steps               Maximum generated tokens [default: 64]
-  mtp_batch           Proposal batch size, clamped to at least 1 [default: 4]
+  mtp_batch           Dense-target proposal batch size, clamped to at least 1 [default: 4]
 
 Options:
   --probe-only        Run the simpler probe path instead of production-step MTP
@@ -78,6 +78,41 @@ fn top_k_ids(logits: &[f32], k: usize) -> Vec<usize> {
 #[cfg(feature = "deltanet")]
 fn top_k_overlap(a: &[usize], b: &[usize]) -> usize {
     a.iter().filter(|id| b.contains(id)).count()
+}
+
+#[cfg(feature = "deltanet")]
+fn model_has_moe_layers(weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights) -> bool {
+    weights.layers.iter().any(|lw| {
+        matches!(
+            lw,
+            hipfire_arch_qwen35::qwen35::LayerWeights::DeltaNetMoe(_)
+                | hipfire_arch_qwen35::qwen35::LayerWeights::FullAttnMoe(_)
+        )
+    })
+}
+
+#[cfg(feature = "deltanet")]
+fn append_committed_non_terminators<F>(
+    generated: &mut Vec<u32>,
+    all_tokens: &mut Vec<u32>,
+    committed: &[u32],
+    max_generated: usize,
+    mut is_terminator: F,
+) -> bool
+where
+    F: FnMut(u32) -> bool,
+{
+    for &tok in committed {
+        if generated.len() >= max_generated {
+            break;
+        }
+        if is_terminator(tok) {
+            return true;
+        }
+        all_tokens.push(tok);
+        generated.push(tok);
+    }
+    false
 }
 
 #[cfg(feature = "deltanet")]
@@ -264,6 +299,12 @@ fn main() {
         },
     )
     .expect("load model");
+    if model_has_moe_layers(&target.weights) {
+        eprintln!(
+            "mtp_probe: MoE MTP deferred until dense MTP is validated; mtp_batch currently only applies to dense targets"
+        );
+        std::process::exit(2);
+    }
     let tokenizer = target.load_tokenizer().expect("parse tokenizer");
     let prompt_tokens = tokenizer.encode(prompt);
     if prompt_tokens.is_empty() {
@@ -556,17 +597,14 @@ fn main() {
         verify_us += step.verify_us;
         replay_us += step.replay_us;
         mtp_repair_us += step.mtp_repair_us;
-        for tok in step.committed {
-            if tokenizer.is_terminator(tok) || generated.len() >= steps {
-                break;
-            }
-            all_tokens.push(tok);
-            generated.push(tok);
-        }
-        if generated
-            .last()
-            .is_some_and(|t| tokenizer.is_terminator(*t))
-        {
+        let stop_seen = append_committed_non_terminators(
+            &mut generated,
+            &mut all_tokens,
+            &step.committed,
+            steps,
+            |tok| tokenizer.is_terminator(tok),
+        );
+        if stop_seen {
             break;
         }
     }
@@ -643,4 +681,27 @@ fn main() {
     verify_scratch.free_gpu(&mut gpu);
     mtp_scratch.free_gpu(&mut gpu);
     ar_scratch.free_gpu(&mut gpu);
+}
+
+#[cfg(all(test, feature = "deltanet"))]
+mod tests {
+    use super::append_committed_non_terminators;
+
+    #[test]
+    fn committed_tokens_stop_before_terminator() {
+        let mut generated = vec![10];
+        let mut all_tokens = vec![1, 2, 10];
+
+        let stop_seen = append_committed_non_terminators(
+            &mut generated,
+            &mut all_tokens,
+            &[11, 12, 99, 13],
+            8,
+            |tok| tok == 99,
+        );
+
+        assert!(stop_seen);
+        assert_eq!(generated, vec![10, 11, 12]);
+        assert_eq!(all_tokens, vec![1, 2, 10, 11, 12]);
+    }
 }

@@ -1928,6 +1928,22 @@ pub fn spec_step_mtp_greedy(
     let b = block_size.max(1).min(verify_scratch.max_n);
     let vocab = target.config.vocab_size;
 
+    let target_has_moe = target.weights.layers.iter().any(|lw| {
+        matches!(
+            lw,
+            qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_)
+        )
+    });
+    if target_has_moe {
+        // TODO: route MoE MTP through the shared
+        // forward_prefill_batch_with_pbs/prefill_moe_ffn_body_batched
+        // validation path once dense MTP is proven.
+        return Err(hip_bridge::HipError::new(
+            0,
+            "MoE MTP deferred until dense MTP is validated; mtp_batch currently only applies to dense targets",
+        ));
+    }
+
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create()?);
     }
@@ -1969,31 +1985,6 @@ pub fn spec_step_mtp_greedy(
     }
     let mtp_propose_us = t_mtp_start.elapsed().as_micros();
 
-    let target_has_moe = target.weights.layers.iter().any(|lw| {
-        matches!(
-            lw,
-            qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_)
-        )
-    });
-    let target_has_mq36_moe = qwen35::model_has_plain_mq36_moe(&target.weights);
-    let allow_batched_moe_verify =
-        !target_has_mq36_moe || qwen35::unsafe_mq36_moe_batched_prefill_enabled();
-    if target_has_mq36_moe && allow_batched_moe_verify {
-        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            eprintln!(
-                "[mtp] WARN: HIPFIRE_MOE_UNSAFE_MQ36_BATCHED_PREFILL=1 enables a diagnostic-only MQ3/MQ6 MoE batched verifier; it is known to diverge from AR on the 122B A10B target."
-            );
-        }
-    }
-
-    if target_has_moe {
-        return Err(hip_bridge::HipError::new(
-            0,
-            "native MTP v1 only supports dense greedy targets; MoE MTP is intentionally disabled",
-        ));
-    }
-
     if b == 1 {
         let t_online_start = std::time::Instant::now();
         let accepted = usize::from(drafted[0] == target_next);
@@ -2023,80 +2014,6 @@ pub fn spec_step_mtp_greedy(
             drafted,
             committed: vec![committed_token],
             proposal_count: 1,
-            mtp_propose_us,
-            verify_us: 0,
-            replay_us: t_online_start.elapsed().as_micros(),
-            mtp_repair_us,
-        });
-    }
-
-    // Safe MQ3/MQ6 MoE path: verify and commit online against the live target
-    // state. The previous conservative path ran target once for verification,
-    // restored DeltaNet state, then replayed committed tokens through target
-    // again. Online commit keeps the exact AR state while removing that second
-    // target pass. Greedy acceptance is the v1 policy; future non-greedy
-    // speculative sampling should plug in here by comparing target/draft
-    // probabilities before each live commit.
-    if target_has_moe && !allow_batched_moe_verify {
-        let t_online_start = std::time::Instant::now();
-        let mut accepted = 0usize;
-        let mut committed = Vec::with_capacity(b + 1);
-        let mut mtp_repair_us = 0u128;
-        let mut expected = target_next;
-
-        for (j, &tok) in drafted.iter().enumerate() {
-            if tok != expected {
-                break;
-            }
-            accepted += 1;
-            committed.push(tok);
-            let pos = position + j;
-            target.forward_no_graph(gpu, tok, pos)?;
-            let t_mtp_repair = std::time::Instant::now();
-            qwen35::mtp_forward_dense_gpu_with_scratch(
-                gpu,
-                &target.weights,
-                &target.config,
-                tok,
-                &target.scratch.x,
-                pos,
-                j,
-                mtp_kv_cache,
-                mtp_scratch,
-            )?;
-            mtp_repair_us += t_mtp_repair.elapsed().as_micros();
-            expected = argmax_gpu_u32(
-                gpu,
-                &target.scratch.logits,
-                &verify_scratch.argmax.sub_offset(0, 1),
-                vocab,
-            )?;
-        }
-
-        let bonus_token = expected;
-        committed.push(bonus_token);
-        let bonus_pos = position + accepted;
-        target.forward_no_graph(gpu, bonus_token, bonus_pos)?;
-        let t_mtp_repair = std::time::Instant::now();
-        qwen35::mtp_forward_dense_gpu_with_scratch(
-            gpu,
-            &target.weights,
-            &target.config,
-            bonus_token,
-            &target.scratch.x,
-            bonus_pos,
-            accepted,
-            mtp_kv_cache,
-            mtp_scratch,
-        )?;
-        mtp_repair_us += t_mtp_repair.elapsed().as_micros();
-
-        return Ok(MtpSpecStepResult {
-            accepted,
-            bonus_token,
-            drafted,
-            committed,
-            proposal_count: b,
             mtp_propose_us,
             verify_us: 0,
             replay_us: t_online_start.elapsed().as_micros(),
