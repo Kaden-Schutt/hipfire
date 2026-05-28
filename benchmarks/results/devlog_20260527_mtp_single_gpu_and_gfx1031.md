@@ -63,3 +63,36 @@ Single-GPU MTP confirmed. gfx1031 placement options (all need new code):
 - Prereq either way: a multi-GPU MTP harness (extend mtp_only_demo with
   `init_with_device` for the head + peer-copy prev_hidden), since the
   daemon serve path is also single-GPU for MTP today.
+
+## Cross-device cost de-risk (microbench, gfx906↔gfx1031)
+
+Before any cross-device MTP code, measured the real per-cycle overhead of
+the shuttle on this exact PCIe / ROCm 6.4 / hardware combo
+(`examples/mtp_peer_copy_microbench`, 1000 iters after 50 warmup).
+
+Payload per cycle (confirmed against mtp_head config dump for
+qwen3.6-27b-cvs16384.mtp): `n_embd=5120 × f32 = 20480 B` hidden 906→1031;
+`max_n=4 × u32 = 16 B` tokens 1031→906.
+
+| op                                              | median | p99    | range            |
+| ---                                             | ---    | ---    | ---              |
+| raw peer copy 20 KB 906→1031 (no event)         | 38 µs  | 40 µs  | [37 .. 64]       |
+| forward leg (1 event + 1 peer 20 KB + sync)     | 80 µs  | 108 µs | [53 .. 112]      |
+| full cycle (8 ops, 2 peer copies, 2 events)     | 112 µs | 126 µs | [94 .. 154]      |
+
+**Verdict: ≤500 µs gate cleared by ~4×.** 112 µs is **1.2% of the MTP
+head's ~9.5 ms budget per cycle**. Plan's 12% sync-offload ROI estimate
+is structurally salvageable on this hardware: cross-device sync is
+negligible vs MTP head wall.
+
+Tight p99 distribution (range 94-154 µs) indicates real peer DMA
+working — the earlier 5.4 MB/s reported by peer_smoke was a one-shot
+cold-call artifact, not steady-state. Async API on a dedicated stream
+gives clean numbers.
+
+**Decision:** sync split (option A) is the right next step. Build the
+multi-GPU MTP harness: extend mtp_only_demo / mtp_spec to allow MTP
+head on a sibling device, with `peer_copy_async` of `prev_hidden`
+per-cycle. Skip asymmetric-async (option B) for v1 — sync's 12% ROI
+is enough to validate the orchestration plumbing before adding
+speculation-on-top-of-speculation complexity.
