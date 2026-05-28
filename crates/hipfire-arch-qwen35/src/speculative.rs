@@ -2074,7 +2074,7 @@ fn verify_dflash_block_inner(
             // hits "hipMalloc not permitted under stream capture" the first
             // time any kernel is compiled inline. One warmup per distinct b.
             gpu.verify_mark_warmup_done(b);
-            let r = qwen35::forward_prefill_batch_single_chunk_captured(
+            let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
                 &target.config,
@@ -2088,6 +2088,7 @@ fn verify_dflash_block_inner(
                 Some(&final_hidden),
                 gdn_tape,
                 tree_verify,
+                false, // DFlash computes all verify logits from final_hidden below
             );
             if r.is_ok() {
                 eprintln!("[verify-graph] warmup for B={} complete — capture next cycle at this B", b);
@@ -2097,7 +2098,7 @@ fn verify_dflash_block_inner(
             vg_mode = "capture";
             // Capture path: first call at this B after warmup.
             gpu.begin_verify_graph_capture(b)?;
-            let r = qwen35::forward_prefill_batch_single_chunk_captured(
+            let r = qwen35::forward_prefill_batch_single_chunk_captured_opts(
                 gpu,
                 &target.weights,
                 &target.config,
@@ -2111,6 +2112,7 @@ fn verify_dflash_block_inner(
                 Some(&final_hidden),
                 gdn_tape,
                 tree_verify,
+                false, // DFlash computes all verify logits from final_hidden below
             );
             if r.is_ok() {
                 let blob_count = gpu.capture_blobs.len();
@@ -2138,7 +2140,7 @@ fn verify_dflash_block_inner(
             r
         }
     } else {
-        qwen35::forward_prefill_batch_with_pbs(
+        qwen35::forward_prefill_batch_with_pbs_opts(
             gpu,
             &target.weights,
             &target.config,
@@ -2154,6 +2156,7 @@ fn verify_dflash_block_inner(
             verify_scratch.prefill_batch.as_ref(),
             None, // mask_override: speculative verify path doesn't use the MTP probe hook
             None, // max_layer: DFlash verify always runs the full stack
+            false, // DFlash computes all verify logits from final_hidden below
         )
     };
 

@@ -5319,6 +5319,41 @@ pub fn forward_prefill_batch_single_chunk_captured(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
+    forward_prefill_batch_single_chunk_captured_opts(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        pbs,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_single_chunk_captured_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
+) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0 && n <= pbs.max_batch,
         "single_chunk_captured: n={} but pbs.max_batch={}", n, pbs.max_batch);
@@ -5489,7 +5524,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
-        true, // needs_last_token_logits: preserve captured-prefill post-condition
+        needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
     )
 }
