@@ -19227,7 +19227,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // ~26.68% of composition cycle wall in this scalar path).
         let arch = self.arch.as_str();
         let wmma_eligible = batch_size > 1
-            && self.arch_caps.has_wmma_w32()
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
