@@ -3,7 +3,7 @@
 //! (arch_id = 21, `QWEN35_MTP_HEAD`).
 //!
 //! Usage:
-//!     mtp_extract --hf-dir <safetensors_dir> --output <out.mtp>
+//!     mtp_extract --hf-dir <safetensors_dir> --output <trunk-mq4.mtp.hfq>
 //!                 [--quant {mq4,q8}] [--verbose]
 //!
 //! Empirical: every released dense Qwen3.5 (0.8B / 2B / 4B / 9B / 27B)
@@ -456,7 +456,7 @@ fn parse_args() -> Args {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: mtp_extract --hf-dir <safetensors_dir> --output <out.mtp> \
+                    "Usage: mtp_extract --hf-dir <safetensors_dir> --output <trunk-mq4.mtp.hfq> \
                      [--quant mq4|q8] [--vocab-sidecar <sidecar.json>] [--verbose]"
                 );
                 std::process::exit(0);

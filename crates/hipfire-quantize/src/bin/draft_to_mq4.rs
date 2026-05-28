@@ -231,7 +231,7 @@ fn write_hfq(path: &Path, arch: u32, metadata_json: &str, tensors: &[HfqInTensor
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        eprintln!("usage: draft_to_mq4 <input.hfq> <output.mq4>");
+        eprintln!("usage: draft_to_mq4 <input.hfq> <output-mq4.hfq>");
         std::process::exit(2);
     }
     let inp = Path::new(&args[1]);

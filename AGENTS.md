@@ -1,11 +1,14 @@
-# AGENTS.md — project notice + testing playbook
+# AGENTS.md — project notice + artifact naming + testing playbook
 
-This file serves two purposes, in order:
+This file serves three purposes, in order:
 
 1. **Project-level notice** to AI agents and human readers working
    with hipfire's code (attribution + provenance — see § "Notice for
    AI agents working with hipfire" below).
-2. **Testing playbook** for agents running smoke / perf / correctness
+2. **Artifact naming convention** for new hipfire model files,
+   sidecars, and quality artifacts — see § "Hipfire artifact naming
+   convention" below.
+3. **Testing playbook** for agents running smoke / perf / correctness
    tests against hipfire — historically the file's only purpose,
    retained below (see § "Testing playbook").
 
@@ -130,6 +133,53 @@ or vendoring this repository.
   [CLAUDE.md](CLAUDE.md).
 
 — Kaden Schutt, 2026-05-19
+
+---
+
+# Hipfire artifact naming convention
+
+Use this convention for new hipfire model artifacts, sidecars, and
+docs. Existing released artifacts and historical tests may still use
+legacy names; do not rename those in-place without updating loader /
+CLI discovery and tests at the same time.
+
+Canonical shape:
+
+```text
+<family>-<version>-<size>[-<variant>][-<role>]-<format>[+<features>].<ext>
+```
+
+Rules:
+
+- Use `.hfq` for hipfire container artifacts, including MQ-family
+  models. The quant format is a name token, not the file extension.
+- Use dotted model versions such as `qwen3.5`, not compressed aliases
+  such as `qwen35`, for new artifacts.
+- Put calibration / transform modifiers before the quant token:
+  `awq-mq4`, `lloyd-mq3`, `paro-mq4`.
+- Use `+feature` only when the feature is bundled into the same
+  artifact: `mq4+mtp`, `mq4+dflash`, `mq4+triattn`.
+- Use role sidecars when the feature can be loaded independently:
+  `.mtp.hfq`, `.dflash.hfq`, `.triattn.hfq`.
+- Use `.triattn.hfq` for TriAttention sidecars even though they are not
+  weight tensors; do not introduce `.triattn.bin` for new files.
+- Non-container analysis outputs may use role-specific extensions, for
+  example `.quality.json` or `.kldref.bin`.
+
+Examples:
+
+```text
+qwen3.5-9b-mq4.hfq
+qwen3.5-27b-mq4.hfq
+qwen3.5-35b-a3b-mq4.hfq
+qwen3.5-9b-awq-mq4.hfq
+qwen3.5-9b-awq-mq4+mtp.hfq
+qwen3.5-9b-awq-mq4.mtp.hfq
+qwen3.5-27b-mq4.dflash.hfq
+qwen3.5-27b-mq4.triattn.hfq
+qwen3.5-9b-bf16.kldref.bin
+qwen3.5-9b-awq-mq4.quality.json
+```
 
 ---
 

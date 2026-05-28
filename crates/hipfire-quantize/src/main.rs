@@ -4996,7 +4996,8 @@ fn main() {
     // with this prefix are ingested; everything else is silently skipped.
     // Used to produce side-car HFQs (e.g. `--include-prefix mtp.` builds an
     // MTP-only addon that pairs with an existing base HFQ via the loader's
-    // `.mtp-addon.hfq` discovery). When unset (default), all tensors pass
+    // `.mtp.hfq` sidecar discovery; some legacy loaders also accept
+    // `.mtp-addon.hfq`). When unset (default), all tensors pass
     // this gate and the usual mtp/vision skip rules below apply.
     let include_prefix = std::env::args().position(|a| a == "--include-prefix")
         .and_then(|i| std::env::args().nth(i + 1));

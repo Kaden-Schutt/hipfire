@@ -745,7 +745,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "synthetic.ls.mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
@@ -804,7 +804,7 @@ class AstreaTests(unittest.TestCase):
             root = Path(td)
             source_dir = root / "source"
             source_dir.mkdir()
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             candidate = root / "synthetic.awq.mq4.hfq"
             imatrix = root / "imatrix.gguf"
             plan_path = root / "plan.json"
@@ -1368,7 +1368,7 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
@@ -1395,13 +1395,13 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
             plan = astrea.build_bundle_plan(
                 model=str(model),
-                output=str(root / "synthetic.mq4.astrea.hfq"),
+                output=str(root / "synthetic-mq4.astrea.hfq"),
                 include=["weights", "paro", "kv-policy", "triattn"],
                 triattn=str(triattn),
                 policy_id="combined-policy-smoke",
@@ -1422,7 +1422,7 @@ class AstreaTests(unittest.TestCase):
         astrea = load_astrea()
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            model = root / "synthetic.mq4.hfq"
+            model = root / "synthetic-mq4.hfq"
             sensitivity = root / "sensitivity.json"
             self.write_minimal_hfq(
                 model,
@@ -1474,7 +1474,7 @@ class AstreaTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             model = root / "synthetic.mq4.hfq"
-            triattn = root / "synthetic.mq4.hfq.triattn.bin"
+            triattn = root / "synthetic-mq4.triattn.hfq"
             self.write_minimal_hfq(model)
             triattn.write_bytes(b"TRIA" + b"\0" * 32)
 
