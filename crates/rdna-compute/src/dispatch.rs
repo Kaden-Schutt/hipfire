@@ -565,6 +565,26 @@ impl Gpu {
                 &format!("device id {id} out of range (count={count})"),
             ));
         }
+        if let Ok(mode) = std::env::var("HIPFIRE_HIP_WAIT") {
+            let mode_lc = mode.to_ascii_lowercase();
+            let flags = match mode_lc.as_str() {
+                "auto" => Some(0x00),
+                "spin" => Some(0x01),
+                "yield" => Some(0x02),
+                "block" | "blocking" | "blocking_sync" => Some(0x04),
+                "" => None,
+                other => {
+                    eprintln!(
+                        "WARNING: unknown HIPFIRE_HIP_WAIT={other:?}; expected auto|spin|yield|blocking"
+                    );
+                    None
+                }
+            };
+            if let Some(flags) = flags {
+                hip.set_device_flags(flags)?;
+                eprintln!("[hipfire] HIP wait mode: {mode_lc}");
+            }
+        }
         // set_device must precede try_init_rocblas — rocBLAS captures the
         // currently-bound device into its handle.
         hip.set_device(id)?;

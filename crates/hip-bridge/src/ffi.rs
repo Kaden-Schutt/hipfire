@@ -155,6 +155,7 @@ pub struct HipRuntime {
     // Device management
     fn_get_device_count: unsafe extern "C" fn(*mut c_int) -> u32,
     fn_set_device: unsafe extern "C" fn(c_int) -> u32,
+    fn_set_device_flags: unsafe extern "C" fn(c_uint) -> u32,
     fn_get_device: unsafe extern "C" fn(*mut c_int) -> u32,
 
     // Multi-device / peer access
@@ -322,6 +323,11 @@ impl HipRuntime {
                     unsafe extern "C" fn(*mut c_int) -> u32
                 ),
                 fn_set_device: load_fn!(lib, "hipSetDevice", unsafe extern "C" fn(c_int) -> u32),
+                fn_set_device_flags: load_fn!(
+                    lib,
+                    "hipSetDeviceFlags",
+                    unsafe extern "C" fn(c_uint) -> u32
+                ),
                 fn_get_device: load_fn!(
                     lib,
                     "hipGetDevice",
@@ -591,6 +597,16 @@ impl HipRuntime {
     pub fn set_device(&self, id: i32) -> HipResult<()> {
         let code = unsafe { (self.fn_set_device)(id) };
         self.check(code, "hipSetDevice")
+    }
+
+    /// Set HIP device scheduling flags before the device context is created.
+    ///
+    /// HIP uses these flags to choose how host sync calls wait for GPU work:
+    /// spin is lowest-latency but consumes a CPU core; yield/blocking are more
+    /// cooperative with the OS and reduce CPU pressure during long prefill.
+    pub fn set_device_flags(&self, flags: u32) -> HipResult<()> {
+        let code = unsafe { (self.fn_set_device_flags)(flags as c_uint) };
+        self.check(code, "hipSetDeviceFlags")
     }
 
     pub fn current_device(&self) -> HipResult<i32> {
