@@ -8,8 +8,10 @@
 //!
 //! Empirical: every released dense Qwen3.5 (0.8B / 2B / 4B / 9B / 27B)
 //! and Qwen3.6-27B exposes the SAME 15 MTP-block tensors in safetensors.
-//! MoE variants (35B-A3B, 122B-A10B, 397B-A17B) inflate this to hundreds
-//! of expert tensors and are out of scope for this binary.
+//! MoE variants replace the dense FFN triple with a router, shared expert,
+//! scalar shared gate, and 3D stacked routed experts. The extractor splits
+//! those expert tensors into per-expert 2D weights so the runtime can reuse
+//! the same indexed MoE decode kernels as A3B trunk inference.
 //!
 //! Output container:
 //!   * arch_id = 21 (QWEN35_MTP_HEAD)
@@ -50,8 +52,8 @@ impl SafetensorsFile {
         let header_len = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
         let header_json = std::str::from_utf8(&mmap[8..8 + header_len])
             .expect("safetensors header is not valid utf8");
-        let raw: serde_json::Value = serde_json::from_str(header_json)
-            .expect("safetensors header JSON parse failed");
+        let raw: serde_json::Value =
+            serde_json::from_str(header_json).expect("safetensors header JSON parse failed");
         let mut tensors = HashMap::new();
         if let serde_json::Value::Object(map) = raw {
             for (k, v) in map {
@@ -152,6 +154,26 @@ fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     }
 }
 
+fn dtype_size(dtype: &str) -> usize {
+    match dtype {
+        "F16" | "BF16" => 2,
+        "F32" => 4,
+        other => panic!("unsupported input dtype: {other}"),
+    }
+}
+
+fn to_f32_range(data: &[u8], dtype: &str, elem_start: usize, elem_count: usize) -> Vec<f32> {
+    let elem_size = dtype_size(dtype);
+    let byte_start = elem_start * elem_size;
+    let byte_end = byte_start + elem_count * elem_size;
+    assert!(
+        byte_end <= data.len(),
+        "to_f32_range out of bounds: bytes {byte_start}..{byte_end} > {}",
+        data.len()
+    );
+    to_f32(&data[byte_start..byte_end], dtype)
+}
+
 fn f32_slice_to_f32_bytes(f32_data: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(f32_data.len() * 4);
     for &v in f32_data {
@@ -193,11 +215,12 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
     (0..n)
         .map(|_| {
-            state = state
-                .wrapping_mul(1103515245)
-                .wrapping_add(12345)
-                & 0x7fffffff;
-            if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
         })
         .collect()
 }
@@ -353,22 +376,107 @@ fn write_hfq(
 /// matches the trunk extractor's natural dependency order at consume time).
 const MTP_NAMING_MAP: &[(&str, &str, bool, bool)] = &[
     // Norms (F32, 1D)
-    ("mtp.norm.weight",                              "shared_head_norm", true,  false),
-    ("mtp.pre_fc_norm_embedding.weight",             "enorm",            true,  false),
-    ("mtp.pre_fc_norm_hidden.weight",                "hnorm",            true,  false),
-    ("mtp.layers.0.input_layernorm.weight",          "attn_norm",        true,  false),
-    ("mtp.layers.0.post_attention_layernorm.weight", "attn_post_norm",   true,  false),
-    ("mtp.layers.0.self_attn.q_norm.weight",         "attn_q_norm",      true,  false),
-    ("mtp.layers.0.self_attn.k_norm.weight",         "attn_k_norm",      true,  false),
+    ("mtp.norm.weight", "shared_head_norm", true, false),
+    ("mtp.pre_fc_norm_embedding.weight", "enorm", true, false),
+    ("mtp.pre_fc_norm_hidden.weight", "hnorm", true, false),
+    (
+        "mtp.layers.0.input_layernorm.weight",
+        "attn_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "attn_post_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "attn_q_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "attn_k_norm",
+        true,
+        false,
+    ),
     // 2D weights (MQ4 / Q8)
-    ("mtp.fc.weight",                                "eh_proj",          false, true),
-    ("mtp.layers.0.self_attn.q_proj.weight",         "wq",               false, true),
-    ("mtp.layers.0.self_attn.k_proj.weight",         "wk",               false, true),
-    ("mtp.layers.0.self_attn.v_proj.weight",         "wv",               false, true),
-    ("mtp.layers.0.self_attn.o_proj.weight",         "wo",               false, true),
-    ("mtp.layers.0.mlp.gate_proj.weight",            "ffn_gate",         false, true),
-    ("mtp.layers.0.mlp.up_proj.weight",              "ffn_up",           false, true),
-    ("mtp.layers.0.mlp.down_proj.weight",            "ffn_down",         false, true),
+    ("mtp.fc.weight", "eh_proj", false, true),
+    ("mtp.layers.0.self_attn.q_proj.weight", "wq", false, true),
+    ("mtp.layers.0.self_attn.k_proj.weight", "wk", false, true),
+    ("mtp.layers.0.self_attn.v_proj.weight", "wv", false, true),
+    ("mtp.layers.0.self_attn.o_proj.weight", "wo", false, true),
+    ("mtp.layers.0.mlp.gate_proj.weight", "ffn_gate", false, true),
+    ("mtp.layers.0.mlp.up_proj.weight", "ffn_up", false, true),
+    ("mtp.layers.0.mlp.down_proj.weight", "ffn_down", false, true),
+];
+
+const MTP_COMMON_NAMING_MAP: &[(&str, &str, bool, bool)] = &[
+    // Norms (F32, 1D)
+    ("mtp.norm.weight", "shared_head_norm", true, false),
+    ("mtp.pre_fc_norm_embedding.weight", "enorm", true, false),
+    ("mtp.pre_fc_norm_hidden.weight", "hnorm", true, false),
+    (
+        "mtp.layers.0.input_layernorm.weight",
+        "attn_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "attn_post_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "attn_q_norm",
+        true,
+        false,
+    ),
+    (
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "attn_k_norm",
+        true,
+        false,
+    ),
+    // NextN projection + attention weights.
+    ("mtp.fc.weight", "eh_proj", false, true),
+    ("mtp.layers.0.self_attn.q_proj.weight", "wq", false, true),
+    ("mtp.layers.0.self_attn.k_proj.weight", "wk", false, true),
+    ("mtp.layers.0.self_attn.v_proj.weight", "wv", false, true),
+    ("mtp.layers.0.self_attn.o_proj.weight", "wo", false, true),
+];
+
+const MTP_MOE_2D_NAMING_MAP: &[(&str, &str, bool, bool)] = &[
+    ("mtp.layers.0.mlp.gate.weight", "moe_router", false, true),
+    (
+        "mtp.layers.0.mlp.shared_expert_gate.weight",
+        "moe_shared_expert_gate",
+        false,
+        true,
+    ),
+    (
+        "mtp.layers.0.mlp.shared_expert.gate_proj.weight",
+        "moe_shared_gate",
+        false,
+        true,
+    ),
+    (
+        "mtp.layers.0.mlp.shared_expert.up_proj.weight",
+        "moe_shared_up",
+        false,
+        true,
+    ),
+    (
+        "mtp.layers.0.mlp.shared_expert.down_proj.weight",
+        "moe_shared_down",
+        false,
+        true,
+    ),
 ];
 
 // ─── Discovery ───────────────────────────────────────────────────────────
@@ -382,6 +490,18 @@ fn find_safetensors(dir: &Path) -> Vec<PathBuf> {
         .collect();
     files.sort();
     files
+}
+
+fn find_tensor<'a>(
+    st_files: &'a [SafetensorsFile],
+    name: &str,
+) -> Option<(&'a TensorMeta, &'a [u8])> {
+    for st in st_files {
+        if let Some((meta, data)) = st.tensor_data(name) {
+            return Some((meta, data));
+        }
+    }
+    None
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────
@@ -418,6 +538,106 @@ struct Args {
     /// lm_head, MQ4G256) and a `lm_head_draft.vocab_map` (u32 IDs packed
     /// as f32 bit-cast). Tensor count goes 15 -> 17 when present.
     vocab_sidecar: Option<PathBuf>,
+}
+
+fn quantize_mtp_tensor(
+    hf_name: &str,
+    shape: &[usize],
+    f32_data: &[f32],
+    is_norm: bool,
+    is_2d: bool,
+    quant: QuantChoice,
+    force_q8: bool,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> (QuantType, u32, Vec<u8>, &'static str) {
+    let n_elements: usize = shape.iter().product();
+    assert_eq!(
+        f32_data.len(),
+        n_elements,
+        "tensor {hf_name}: element count mismatch (got {}, expected {n_elements})",
+        f32_data.len()
+    );
+    if is_norm || !is_2d {
+        return (QuantType::F32, 0, f32_slice_to_f32_bytes(f32_data), "F32");
+    }
+
+    let k_dim = *shape.last().expect("2D weight has shape");
+    if force_q8 {
+        let q = quantize_q8f16(f32_data);
+        return (QuantType::Q8F16, 32, q, "Q8_F16");
+    }
+
+    match quant {
+        QuantChoice::Mq4 if k_dim % 256 == 0 && n_elements >= 256 => {
+            let q = quantize_mq4g256(f32_data, signs1, signs2);
+            (QuantType::MQ4G256, 256, q, "MQ4G256")
+        }
+        QuantChoice::Mq4 => {
+            eprintln!("  note: {hf_name} K={k_dim} not 256-aligned — falling back to Q8_F16");
+            let q = quantize_q8f16(f32_data);
+            (QuantType::Q8F16, 32, q, "Q8_F16")
+        }
+        QuantChoice::Q8 => {
+            let q = quantize_q8f16(f32_data);
+            (QuantType::Q8F16, 32, q, "Q8_F16")
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn pack_safetensor_2d_or_norm(
+    st_files: &[SafetensorsFile],
+    st_name: &str,
+    hf_name: &str,
+    is_norm: bool,
+    is_2d: bool,
+    quant: QuantChoice,
+    force_q8: bool,
+    signs1: &[f32],
+    signs2: &[f32],
+    verbose: bool,
+) -> (HfqTensor, usize, usize) {
+    let (meta, raw) = find_tensor(st_files, st_name).unwrap_or_else(|| {
+        panic!(
+            "safetensors missing required MTP tensor '{st_name}' \
+             — is this actually a Qwen3.5/3.6 model with MTP head?"
+        )
+    });
+    let f32_data = to_f32(raw, &meta.dtype);
+    let shape_usize = meta.shape.clone();
+    let shape: Vec<u32> = shape_usize.iter().map(|d| *d as u32).collect();
+    let (quant_type, group_size, bytes, label) = quantize_mtp_tensor(
+        hf_name,
+        &shape_usize,
+        &f32_data,
+        is_norm,
+        is_2d,
+        quant,
+        force_q8,
+        signs1,
+        signs2,
+    );
+    if verbose {
+        eprintln!(
+            "  [{label:>7}] {hf_name:>24}  shape={:?}  in={:>10}B  out={:>10}B  \
+             (src={st_name})",
+            shape,
+            raw.len(),
+            bytes.len()
+        );
+    }
+    (
+        HfqTensor {
+            name: hf_name.to_string(),
+            quant_type,
+            shape,
+            group_size,
+            data: bytes,
+        },
+        raw.len(),
+        f32_data.len(),
+    )
 }
 
 fn parse_args() -> Args {
@@ -554,15 +774,21 @@ fn verify_round_trip(path: &Path, expected: &[HfqTensor], verbose: bool) {
         assert_eq!(name, exp.name, "verify: tensor[{i}] name mismatch");
         assert_eq!(qt, exp.quant_type as u8, "verify: tensor[{i}] qt mismatch");
         assert_eq!(shape, exp.shape, "verify: tensor[{i}] shape mismatch");
-        assert_eq!(group_size, exp.group_size, "verify: tensor[{i}] gs mismatch");
-        assert_eq!(data_size, exp.data.len(), "verify: tensor[{i}] data_size mismatch");
+        assert_eq!(
+            group_size, exp.group_size,
+            "verify: tensor[{i}] gs mismatch"
+        );
+        assert_eq!(
+            data_size,
+            exp.data.len(),
+            "verify: tensor[{i}] data_size mismatch"
+        );
 
         // Spot-check first/last byte of data region against the in-memory
         // tensor. This catches misaligned data_offset / forgotten padding.
         if !exp.data.is_empty() {
             assert_eq!(
-                mmap[cumulative],
-                exp.data[0],
+                mmap[cumulative], exp.data[0],
                 "verify: tensor[{i}]={name} first byte mismatch"
             );
             assert_eq!(
@@ -580,9 +806,7 @@ fn verify_round_trip(path: &Path, expected: &[HfqTensor], verbose: bool) {
             );
         }
     }
-    eprintln!(
-        "verify: PASS — {n_tensors} tensors round-trip clean (arch_id={arch_id})"
-    );
+    eprintln!("verify: PASS — {n_tensors} tensors round-trip clean (arch_id={arch_id})");
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────
@@ -613,9 +837,8 @@ fn main() {
             .and_then(|v| v.as_u64())
             .unwrap_or_else(|| panic!("config.json missing {k}"))
     };
-    let get_f64 = |k: &str| -> Option<f64> {
-        tc.get(k).or_else(|| config.get(k)).and_then(|v| v.as_f64())
-    };
+    let get_f64 =
+        |k: &str| -> Option<f64> { tc.get(k).or_else(|| config.get(k)).and_then(|v| v.as_f64()) };
 
     let n_embd = get_u64("hidden_size") as usize;
     let n_layer = get_u64("num_hidden_layers") as usize;
@@ -627,7 +850,37 @@ fn main() {
         .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(n_embd / n_head);
-    let n_ff = get_u64("intermediate_size") as usize;
+    let intermediate_size = tc
+        .get("intermediate_size")
+        .or_else(|| config.get("intermediate_size"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let num_experts = tc
+        .get("num_experts")
+        .or_else(|| config.get("num_experts"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let num_experts_per_tok = tc
+        .get("num_experts_per_tok")
+        .or_else(|| config.get("num_experts_per_tok"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let moe_intermediate_size = tc
+        .get("moe_intermediate_size")
+        .or_else(|| config.get("moe_intermediate_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let shared_expert_intermediate_size = tc
+        .get("shared_expert_intermediate_size")
+        .or_else(|| config.get("shared_expert_intermediate_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let norm_topk_prob = tc
+        .get("norm_topk_prob")
+        .or_else(|| config.get("norm_topk_prob"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let n_ff = intermediate_size.unwrap_or(moe_intermediate_size);
     let vocab_size = get_u64("vocab_size") as usize;
     let nextn_predict_layers = tc
         .get("mtp_num_hidden_layers")
@@ -678,6 +931,13 @@ fn main() {
         "  dims   : n_embd={n_embd} n_layer={n_layer} n_head={n_head} n_head_kv={n_head_kv} \
          head_dim={n_embd_head} n_ff={n_ff} vocab={vocab_size}"
     );
+    if num_experts > 0 {
+        eprintln!(
+            "  moe    : experts={num_experts} top_k={num_experts_per_tok} \
+             moe_intermediate={moe_intermediate_size} shared_intermediate={shared_expert_intermediate_size} \
+             norm_topk_prob={norm_topk_prob}"
+        );
+    }
     eprintln!(
         "  rope   : theta={rope_theta} sections={}",
         serde_json::to_string(&rope_sections).unwrap_or("null".into())
@@ -704,98 +964,187 @@ fn main() {
     let signs1 = gen_fwht_signs(42, 256);
     let signs2 = gen_fwht_signs(1042, 256);
 
-    let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(MTP_NAMING_MAP.len());
+    let dense_mtp = find_tensor(&st_files, "mtp.layers.0.mlp.gate_proj.weight").is_some();
+    let moe_mtp = find_tensor(&st_files, "mtp.layers.0.mlp.experts.gate_up_proj").is_some();
+    let ffn_kind = match (dense_mtp, moe_mtp) {
+        (true, _) => "dense",
+        (false, true) => "moe",
+        (false, false) => panic!(
+            "MTP FFN tensors not found: expected dense gate_proj/up_proj/down_proj \
+             or MoE experts.gate_up_proj"
+        ),
+    };
+
+    let estimated_tensors = if ffn_kind == "moe" {
+        MTP_COMMON_NAMING_MAP.len() + MTP_MOE_2D_NAMING_MAP.len() + 2 * num_experts
+    } else {
+        MTP_NAMING_MAP.len()
+    };
+    let mut hfq_tensors: Vec<HfqTensor> = Vec::with_capacity(estimated_tensors);
     let mut total_in_bytes: usize = 0;
     let mut total_out_bytes: usize = 0;
 
-    for (st_name, hf_name, is_norm, is_2d) in MTP_NAMING_MAP {
-        // Locate the tensor across shards.
-        let mut found: Option<(&SafetensorsFile, &TensorMeta, &[u8])> = None;
-        for st in &st_files {
-            if let Some((meta, data)) = st.tensor_data(st_name) {
-                found = Some((st, meta, data));
-                break;
-            }
-        }
-        let (_st, meta, raw) = found.unwrap_or_else(|| {
-            panic!(
-                "safetensors missing required MTP tensor '{st_name}' \
-                 — is this actually a Qwen3.5/3.6 dense model with MTP head?"
-            )
-        });
-
-        let in_bytes = raw.len();
-        total_in_bytes += in_bytes;
-
-        let f32_data = to_f32(raw, &meta.dtype);
-        let n_elements: usize = meta.shape.iter().product();
-        assert_eq!(
-            f32_data.len(),
-            n_elements,
-            "tensor {st_name}: element count mismatch (got {}, expected {n_elements})",
-            f32_data.len()
+    let base_map = if ffn_kind == "moe" {
+        MTP_COMMON_NAMING_MAP
+    } else {
+        MTP_NAMING_MAP
+    };
+    for (st_name, hf_name, is_norm, is_2d) in base_map {
+        let (tensor, in_bytes, _n_elems) = pack_safetensor_2d_or_norm(
+            &st_files,
+            st_name,
+            hf_name,
+            *is_norm,
+            *is_2d,
+            args.quant,
+            false,
+            &signs1,
+            &signs2,
+            args.verbose,
         );
-        let shape: Vec<u32> = meta.shape.iter().map(|d| *d as u32).collect();
-
-        // Quantization decision:
-        //   norms (1D *norm) → F32 (matches CLAUDE.md trunk pattern in
-        //                      `should_quantize`; precision-critical, small).
-        //   2D weights      → MQ4 / Q8 per --quant, with a Q8 fallback when
-        //                      MQ4's K%256==0 alignment is not satisfied.
-        let (quant_type, group_size, bytes, label) = if *is_norm || !*is_2d {
-            (
-                QuantType::F32,
-                0u32,
-                f32_slice_to_f32_bytes(&f32_data),
-                "F32",
-            )
-        } else {
-            // 2D weight. K is the innermost dim per safetensors convention.
-            let k_dim = *shape.last().expect("2D weight has shape") as usize;
-            match args.quant {
-                QuantChoice::Mq4 if k_dim % 256 == 0 && n_elements >= 256 => {
-                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                    (QuantType::MQ4G256, 256u32, q, "MQ4G256")
-                }
-                QuantChoice::Mq4 => {
-                    eprintln!(
-                        "  note: {hf_name} K={k_dim} not 256-aligned — falling back to Q8_F16"
-                    );
-                    let q = quantize_q8f16(&f32_data);
-                    (QuantType::Q8F16, 32u32, q, "Q8_F16")
-                }
-                QuantChoice::Q8 => {
-                    let q = quantize_q8f16(&f32_data);
-                    (QuantType::Q8F16, 32u32, q, "Q8_F16")
-                }
-            }
-        };
-
-        total_out_bytes += bytes.len();
-
-        if args.verbose {
-            eprintln!(
-                "  [{label:>7}] {hf_name:>18}  shape={:?}  in={:>9}B  out={:>9}B  \
-                 (src={st_name})",
-                shape, in_bytes, bytes.len()
-            );
-        }
-
-        hfq_tensors.push(HfqTensor {
-            name: hf_name.to_string(),
-            quant_type,
-            shape,
-            group_size,
-            data: bytes,
-        });
+        total_in_bytes += in_bytes;
+        total_out_bytes += tensor.data.len();
+        hfq_tensors.push(tensor);
     }
 
-    assert_eq!(
-        hfq_tensors.len(),
-        15,
-        "expected to pack exactly 15 MTP tensors before optional sidecar, got {}",
-        hfq_tensors.len()
-    );
+    if ffn_kind == "moe" {
+        assert!(
+            num_experts > 0,
+            "MoE MTP detected but config num_experts is 0"
+        );
+        assert_eq!(
+            num_experts_per_tok, 8,
+            "current MoE MTP runtime supports top_k=8; config has {num_experts_per_tok}"
+        );
+        assert!(
+            moe_intermediate_size > 0,
+            "MoE MTP requires moe_intermediate_size"
+        );
+        assert!(
+            shared_expert_intermediate_size > 0,
+            "MoE MTP requires shared_expert_intermediate_size"
+        );
+
+        for (st_name, hf_name, is_norm, is_2d) in MTP_MOE_2D_NAMING_MAP {
+            // Match the production A3B loader convention: routers and the
+            // scalar shared-expert gate stay Q8, expert/shared FFNs use the
+            // requested quant format.
+            let force_q8 = *hf_name == "moe_router" || *hf_name == "moe_shared_expert_gate";
+            let (tensor, in_bytes, _n_elems) = pack_safetensor_2d_or_norm(
+                &st_files,
+                st_name,
+                hf_name,
+                *is_norm,
+                *is_2d,
+                args.quant,
+                force_q8,
+                &signs1,
+                &signs2,
+                args.verbose,
+            );
+            total_in_bytes += in_bytes;
+            total_out_bytes += tensor.data.len();
+            hfq_tensors.push(tensor);
+        }
+
+        let (gate_up_meta, gate_up_raw) =
+            find_tensor(&st_files, "mtp.layers.0.mlp.experts.gate_up_proj")
+                .expect("MoE MTP missing experts.gate_up_proj");
+        let (down_meta, down_raw) = find_tensor(&st_files, "mtp.layers.0.mlp.experts.down_proj")
+            .expect("MoE MTP missing experts.down_proj");
+        assert_eq!(
+            gate_up_meta.shape,
+            vec![num_experts, 2 * moe_intermediate_size, n_embd],
+            "experts.gate_up_proj shape mismatch"
+        );
+        assert_eq!(
+            down_meta.shape,
+            vec![num_experts, n_embd, moe_intermediate_size],
+            "experts.down_proj shape mismatch"
+        );
+
+        let gate_up_elems = 2 * moe_intermediate_size * n_embd;
+        let down_elems = n_embd * moe_intermediate_size;
+        total_in_bytes += gate_up_raw.len() + down_raw.len();
+        for expert_idx in 0..num_experts {
+            let f32_data = to_f32_range(
+                gate_up_raw,
+                &gate_up_meta.dtype,
+                expert_idx * gate_up_elems,
+                gate_up_elems,
+            );
+            let hf_name = format!("moe_experts.{expert_idx}.gate_up");
+            let (quant_type, group_size, bytes, label) = quantize_mtp_tensor(
+                &hf_name,
+                &[2 * moe_intermediate_size, n_embd],
+                &f32_data,
+                false,
+                true,
+                args.quant,
+                false,
+                &signs1,
+                &signs2,
+            );
+            if args.verbose && (expert_idx < 4 || expert_idx + 4 >= num_experts) {
+                eprintln!(
+                    "  [{label:>7}] {hf_name:>24}  shape=[{}, {}]  out={:>10}B",
+                    2 * moe_intermediate_size,
+                    n_embd,
+                    bytes.len()
+                );
+            }
+            total_out_bytes += bytes.len();
+            hfq_tensors.push(HfqTensor {
+                name: hf_name,
+                quant_type,
+                shape: vec![(2 * moe_intermediate_size) as u32, n_embd as u32],
+                group_size,
+                data: bytes,
+            });
+        }
+        for expert_idx in 0..num_experts {
+            let f32_data = to_f32_range(
+                down_raw,
+                &down_meta.dtype,
+                expert_idx * down_elems,
+                down_elems,
+            );
+            let hf_name = format!("moe_experts.{expert_idx}.down");
+            let (quant_type, group_size, bytes, label) = quantize_mtp_tensor(
+                &hf_name,
+                &[n_embd, moe_intermediate_size],
+                &f32_data,
+                false,
+                true,
+                args.quant,
+                false,
+                &signs1,
+                &signs2,
+            );
+            if args.verbose && (expert_idx < 4 || expert_idx + 4 >= num_experts) {
+                eprintln!(
+                    "  [{label:>7}] {hf_name:>24}  shape=[{}, {}]  out={:>10}B",
+                    n_embd,
+                    moe_intermediate_size,
+                    bytes.len()
+                );
+            }
+            total_out_bytes += bytes.len();
+            hfq_tensors.push(HfqTensor {
+                name: hf_name,
+                quant_type,
+                shape: vec![n_embd as u32, moe_intermediate_size as u32],
+                group_size,
+                data: bytes,
+            });
+        }
+        if args.verbose && num_experts > 8 {
+            eprintln!(
+                "  ... packed {} routed experts for gate_up and down",
+                num_experts
+            );
+        }
+    }
 
     // ─── Optional FastMTP-style vocab-compression sidecar ─────────────────
     //
@@ -816,8 +1165,8 @@ fn main() {
         eprintln!("  sidecar: {}", sidecar_path.display());
         let sidecar_str = std::fs::read_to_string(sidecar_path)
             .unwrap_or_else(|e| panic!("cannot read sidecar {}: {e}", sidecar_path.display()));
-        let sidecar: serde_json::Value = serde_json::from_str(&sidecar_str)
-            .expect("sidecar JSON parse failed");
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&sidecar_str).expect("sidecar JSON parse failed");
         let draft_to_full: Vec<u32> = sidecar
             .get("draft_to_full")
             .and_then(|v| v.as_array())
@@ -870,7 +1219,10 @@ fn main() {
                 lm_head_candidates
             )
         });
-        eprintln!("  lm_head src: {lm_name} dtype={} shape={:?}", lm_meta.dtype, lm_meta.shape);
+        eprintln!(
+            "  lm_head src: {lm_name} dtype={} shape={:?}",
+            lm_meta.dtype, lm_meta.shape
+        );
         assert_eq!(
             lm_meta.shape.len(),
             2,
@@ -926,7 +1278,9 @@ fn main() {
         total_out_bytes += lm_bytes.len();
         eprintln!(
             "  [{lm_label:>7}] {:>18}  shape=[{k_dim}, {h_dim}]  full_f32={:>10}B  out={:>10}B",
-            "lm_head_draft", lm_in_bytes, lm_bytes.len()
+            "lm_head_draft",
+            lm_in_bytes,
+            lm_bytes.len()
         );
         hfq_tensors.push(HfqTensor {
             name: "lm_head_draft.weight".to_string(),
@@ -958,7 +1312,17 @@ fn main() {
         compressed_vocab_size = Some(k_dim);
     }
 
-    let expected_tensor_count = if compressed_vocab_size.is_some() { 17 } else { 15 };
+    let expected_base_tensor_count = if ffn_kind == "moe" {
+        MTP_COMMON_NAMING_MAP.len() + MTP_MOE_2D_NAMING_MAP.len() + 2 * num_experts
+    } else {
+        MTP_NAMING_MAP.len()
+    };
+    let expected_tensor_count = expected_base_tensor_count
+        + if compressed_vocab_size.is_some() {
+            2
+        } else {
+            0
+        };
     assert_eq!(
         hfq_tensors.len(),
         expected_tensor_count,
@@ -972,9 +1336,7 @@ fn main() {
     let tie_word_embeddings = config
         .get("tie_word_embeddings")
         .and_then(|v| v.as_bool())
-        .or_else(|| {
-            tc.get("tie_word_embeddings").and_then(|v| v.as_bool())
-        })
+        .or_else(|| tc.get("tie_word_embeddings").and_then(|v| v.as_bool()))
         .unwrap_or(true);
 
     let metadata = serde_json::json!({
@@ -988,6 +1350,12 @@ fn main() {
         "n_head_kv": n_head_kv,
         "n_embd_head": n_embd_head,
         "n_ff": n_ff,
+        "ffn_kind": ffn_kind,
+        "num_experts": num_experts,
+        "num_experts_per_tok": num_experts_per_tok,
+        "moe_intermediate_size": moe_intermediate_size,
+        "shared_expert_intermediate_size": shared_expert_intermediate_size,
+        "norm_topk_prob": norm_topk_prob,
         "vocab_size": vocab_size,
         "rope_theta": rope_theta,
         "rope_sections": rope_sections,
@@ -1016,9 +1384,7 @@ fn main() {
     )
     .expect("write_hfq failed");
 
-    let file_size = std::fs::metadata(&args.output)
-        .expect("stat output")
-        .len();
+    let file_size = std::fs::metadata(&args.output).expect("stat output").len();
     eprintln!(
         "wrote {}: {:.2} MiB  ({} tensors, in={:.2} MiB, out={:.2} MiB)",
         args.output.display(),

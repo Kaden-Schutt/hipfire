@@ -21,7 +21,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipResult, Stream};
 use rdna_compute::{Gpu, GpuTensor};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -521,6 +521,31 @@ impl DeltaNetSnapshot {
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
             gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+        }
+        Ok(())
+    }
+
+    /// Async copy live state → backup on `stream`.
+    ///
+    /// Caller owns cross-stream ordering. MTP trunk-spine uses this as an
+    /// opt-in experiment to overlap DN snapshot copy with proposal work.
+    pub fn save_from_async_on(
+        &mut self,
+        state: &DeltaNetState,
+        gpu: &Gpu,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
+            gpu.hip
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+        }
+        for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
+            gpu.hip
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+        }
+        for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
+            gpu.hip
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
         }
         Ok(())
     }

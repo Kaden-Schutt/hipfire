@@ -2482,6 +2482,14 @@ pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
 
+/// Single-row argmax that writes the selected token into an on-device MTP
+/// token chain, optionally remapping through a compressed-vocab sidecar.
+pub const ARGMAX_TOKEN_CHAIN_SRC: &str = include_str!("../../../kernels/src/argmax_token_chain.hip");
+
+/// Device-side greedy MTP accept prefix scan over verify argmaxes and draft
+/// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
+pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)

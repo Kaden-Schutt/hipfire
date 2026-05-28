@@ -22381,6 +22381,118 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
+    /// GPU-side single-row argmax that writes directly into an MTP token
+    /// chain. If `vocab_map` is present, the argmax index is treated as a
+    /// compressed-vocab row and remapped to the full-vocab token id before
+    /// storing `token_chain[dst_slot]`.
+    pub fn argmax_token_chain_f32(
+        &mut self,
+        data: &GpuTensor,
+        argmax_out: &GpuTensor,
+        token_chain: &GpuTensor,
+        vocab_map: Option<&GpuTensor>,
+        n: usize,
+        dst_slot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "argmax_token_chain",
+            kernels::ARGMAX_TOKEN_CHAIN_SRC,
+            "argmax_token_chain_f32",
+        )?;
+
+        let mut dp = data.buf.as_ptr();
+        let mut ap = argmax_out.buf.as_ptr();
+        let mut cp = token_chain.buf.as_ptr();
+        let mut vp = vocab_map
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let mut nn = n as i32;
+        let mut ds = dst_slot as i32;
+        let mut use_map = i32::from(vocab_map.is_some());
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void,
+            &mut use_map as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8; // f32 + i32 per thread
+        self.launch_maybe_blob(
+            "argmax_token_chain_f32",
+            [1, 1, 1],
+            [block_size, 1, 1],
+            shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(vp);
+                b.push_i32(nn);
+                b.push_i32(ds);
+                b.push_i32(use_map);
+                b
+            },
+        )
+    }
+
+    /// Device-side greedy accept prefix scan over verify argmaxes and MTP
+    /// candidates. `result[0]` is accept_count; `result[1]` is the bonus
+    /// token, or -1 if an accepted candidate was EOS and no bonus is present.
+    pub fn greedy_accept_from_argmax_i32(
+        &mut self,
+        argmax_per_pos: &GpuTensor,
+        candidates: &GpuTensor,
+        result: &GpuTensor,
+        drafts_generated: usize,
+        eos_token_id: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "greedy_accept",
+            kernels::GREEDY_ACCEPT_SRC,
+            "greedy_accept_from_argmax_i32",
+        )?;
+
+        let mut ap = argmax_per_pos.buf.as_ptr();
+        let mut cp = candidates.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut dg = drafts_generated as i32;
+        let mut eos = eos_token_id as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut dg as *mut _ as *mut c_void,
+            &mut eos as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "greedy_accept_from_argmax_i32",
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(rp);
+                b.push_i32(dg);
+                b.push_i32(eos);
+                b
+            },
+        )
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;
@@ -25225,7 +25337,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("attention_q8_0_kv", kernels::ATTENTION_Q8_0_KV_SRC, "attention_q8_0_kv")?;
-        let func = &self.functions["attention_q8_0_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
@@ -25244,7 +25355,27 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
         let bytes = crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv",
+            [n_heads as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
