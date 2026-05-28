@@ -44,6 +44,7 @@ pub struct FeatureFlags {
     pub fp16_layer_max: Option<usize>,
     pub wo_mmq: bool,
     pub lm_head_wmma_disabled: bool,
+    pub lm_head_overwrite: bool,
 
     // ── MMQ screening ─────────────────────────────────────────────
     pub mmq_screen: bool,
@@ -160,6 +161,7 @@ impl FeatureFlags {
             fp16_layer_max: parse_usize("HIPFIRE_FP16_LAYER_MAX"),
             wo_mmq: std::env::var("HIPFIRE_WO_MMQ").ok().as_deref() == Some("1"),
             lm_head_wmma_disabled: std::env::var("HIPFIRE_LM_HEAD_WMMA").map_or(false, |v| v == "0"),
+            lm_head_overwrite: std::env::var("HIPFIRE_LM_HEAD_OVERWRITE").as_deref() == Ok("1"),
 
             // MMQ screening
             mmq_screen: std::env::var("HIPFIRE_MMQ_SCREEN")
@@ -311,6 +313,7 @@ impl FeatureFlags {
             fp16_layer_max: None,
             wo_mmq: false,
             lm_head_wmma_disabled: false,
+            lm_head_overwrite: false,
             mmq_screen: false,
             mmq_screen_threshold: if is_gfx906 { 0.50 } else { 0.10 },
             mmq_diag_quantize_only: false,
