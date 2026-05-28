@@ -8,7 +8,7 @@
 //!
 //! Usage:
 //!   profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N]
-//!                              [--pp-batch N]
+//!                              [--pp-batch N] [--mtp-fill]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() { eprintln!("build with --features deltanet"); }
@@ -25,7 +25,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N] [--pp-batch N]");
+        eprintln!("Usage: profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N] [--pp-batch N] [--mtp-fill]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -33,19 +33,21 @@ fn main() {
     let mut prefill_len: usize = 2048;
     let mut warmup_iters: usize = 1;
     let mut pp_batch: usize = 1024;
+    let mut mtp_fill = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--prefill"  => { prefill_len = args[i + 1].parse().unwrap(); i += 2; }
             "--warmup"   => { warmup_iters = args[i + 1].parse().unwrap(); i += 2; }
             "--pp-batch" => { pp_batch = args[i + 1].parse().unwrap(); i += 2; }
+            "--mtp-fill" => { mtp_fill = true; i += 1; }
             other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
         }
     }
 
     eprintln!("=== profile_prefill_deepseek4 ===");
     eprintln!("Model: {model_path}");
-    eprintln!("Prefill: {prefill_len}  Warmup: {warmup_iters}  PP-batch: {pp_batch}");
+    eprintln!("Prefill: {prefill_len}  Warmup: {warmup_iters}  PP-batch: {pp_batch}  MTP-fill: {mtp_fill}");
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = <DeepseekV4 as Architecture>::config_from_hfq(&hfq).expect("read config");
@@ -68,26 +70,43 @@ fn main() {
     // Deterministic synthetic prompt.
     let prompt_tokens: Vec<u32> = (0..prefill_len as u32).map(|t| (t % 1000) + 100).collect();
 
+    let run_prefill = |state: &mut DeepseekV4State, gpu: &mut rdna_compute::Gpu| {
+        state.reset();
+        let _ = gpu.hip.device_synchronize();
+        let t = Instant::now();
+        if mtp_fill {
+            hipfire_arch_deepseek4::forward::prefill_with_mtp_fill(
+                &config, &weights, state, gpu, &pbs, &prompt_tokens, 0,
+            ).expect("mtp-fill prefill failed");
+        } else {
+            hipfire_arch_deepseek4::forward::forward_prefill_batch_chunked(
+                &config, &weights, state, gpu, &prompt_tokens, 0, &pbs,
+            ).expect("prefill failed");
+        }
+        let _ = gpu.hip.device_synchronize();
+        t.elapsed().as_secs_f64() * 1000.0
+    };
+
     // Warmup.
     for w in 0..warmup_iters {
-        let t = Instant::now();
-        hipfire_arch_deepseek4::forward::forward_prefill_batch_chunked(
-            &config, &weights, &mut state, &mut gpu, &prompt_tokens, 0, &pbs,
-        ).expect("warmup prefill failed");
-        eprintln!("warmup {}: {:.1}ms", w + 1, t.elapsed().as_secs_f64() * 1000.0);
-        state.n_tokens = 0;
+        let ms = run_prefill(&mut state, &mut gpu);
+        eprintln!(
+            "warmup {}: {:.1}ms ({:.1} tok/s)",
+            w + 1,
+            ms,
+            prefill_len as f64 * 1000.0 / ms.max(1.0),
+        );
     }
 
     eprintln!("\n=== profiled forward_prefill_batch_chunked (prompt={prefill_len}) ===");
     profile::start();
-    let t_profile = Instant::now();
-    hipfire_arch_deepseek4::forward::forward_prefill_batch_chunked(
-        &config, &weights, &mut state, &mut gpu, &prompt_tokens, 0, &pbs,
-    ).expect("profile prefill failed");
-    let profile_wall_ms = t_profile.elapsed().as_secs_f64() * 1000.0;
+    let profile_wall_ms = run_prefill(&mut state, &mut gpu);
     let entries = profile::stop().unwrap_or_default();
     eprintln!("Captured {} profile entries", entries.len());
-    eprintln!("Wall under profiling: {profile_wall_ms:.1}ms (profiler serializes launches)");
+    eprintln!(
+        "Wall under profiling: {profile_wall_ms:.1}ms ({:.1} tok/s; profiler serializes launches)",
+        prefill_len as f64 * 1000.0 / profile_wall_ms.max(1.0),
+    );
 
     #[derive(Default)]
     struct Agg { calls: usize, total_us: f64, total_bytes: usize }

@@ -6589,14 +6589,21 @@ fn ffn_batched(
         // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
         // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
         //
-        // Opt-in 4-warp 64×16 variant (HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1):
-        // bit-exact vs the single-warp baseline (`bench_mq2g256_lloyd_moe_4w`
-        // max_abs=0 across all V4F MoE cells). 1.04-1.13× microbench at
-        // PP_BATCH ∈ {128, 256, 1024}. Default OFF — the kernel is
-        // memory-latency / scheduling bound at ~6 GiB/s (well below DRAM
-        // peak), so the tile lever is small here; opt in for tuning.
-        let use_lloyd_4w = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref() == Ok("1")
+        // 4-warp 64×16 variant: bit-exact vs the single-warp baseline
+        // (`bench_mq2g256_lloyd_moe_4w` max_abs=0 across all V4F MoE cells).
+        // Default ON for gfx1151 grouped prefill shapes after an end-to-end
+        // 2K-token V4F sweep measured 34.69s → 31.94s (+8.6%). Keep the
+        // explicit env override for quick A/B and for non-Halo arch bring-up:
+        //   HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0  force baseline
+        //   HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1  force 4w when shape-valid
+        let lloyd_4w_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").ok();
+        let lloyd_4w_default = gpu.arch == "gfx1151";
+        let lloyd_4w_requested = match lloyd_4w_env.as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => lloyd_4w_default,
+        };
+        let use_lloyd_4w = lloyd_4w_requested
             && (2 * im) % 64 == 0
             && hidden % 256 == 0;
         if use_lloyd_4w {
@@ -6690,9 +6697,8 @@ fn ffn_batched(
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
-        // Same 4w shape-gated opt-in as the gate_up GEMM above.
-        let use_lloyd_4w_down = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
-            .as_deref() == Ok("1")
+        // Same 4w shape gate as the gate_up GEMM above.
+        let use_lloyd_4w_down = lloyd_4w_requested
             && hidden % 64 == 0
             && im % 256 == 0;
         if use_lloyd_4w_down {
