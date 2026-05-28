@@ -10814,6 +10814,55 @@ pub fn forward_prefill_batch_multi(
     dn_state: &mut DeltaNetState,
     scratch_set: &Qwen35ScratchSet,
 ) -> HipResult<()> {
+    forward_prefill_batch_multi_with_caps(
+        gpus, weights, config, tokens, start_pos, kv_cache, dn_state, scratch_set,
+        None, None, None,
+    )
+}
+
+/// Spec-decode capable variant of [`forward_prefill_batch_multi`].
+/// Added in Stage 2b step 0b to enable PP+MTP — the existing multi
+/// prefill dropped `per_token_hidden_out` / `gdn_tape` / `tree_verify`
+/// silently because no caller needed them.
+///
+/// `per_token_hidden_out`: optional GpuTensor on `gpus.output_device`
+/// receiving the per-token post-output-norm hidden state. The
+/// multi-gpu loop only writes when processing the LAST band's chunk
+/// (post-output-norm runs there per the Variant 2 layout). MTP's
+/// `capture_prev_hidden_from_scratch_tmp` reads this slot to seed
+/// `prev_hidden` for cycle 0's chain.
+///
+/// `gdn_tape`: optional pointer to a single-gpu [`GdnTape`] on
+/// `gpus.output_device` (where the consumer's replay runs).
+/// Internally allocates [`GdnTapeShards`] per call (one shard per
+/// band, on the band's device), threads each shard into its band's
+/// chunk call, then [`GdnTapeShards::assemble_into`] peer-copies all
+/// shards back to the target tape at end of chunk loop. ~1 MB/cycle
+/// of peer copies for qwen3.6-27b's 48 LA layers at max_n=5 —
+/// sub-cycle cost.
+///
+/// `tree_verify`: PP-DFlash is refused at load (HIPFIRE_PP_DFLASH=1
+/// is an experimental escape that the spec function won't enter in
+/// v1). The param is plumbed but `assert!(tree_verify.is_none())`
+/// guards misuse; once PP-DFlash lands this becomes a real plumb.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_multi_with_caps(
+    gpus: &mut Gpus,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch_set: &Qwen35ScratchSet,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    assert!(
+        tree_verify.is_none(),
+        "forward_prefill_batch_multi_with_caps: tree_verify under PP is not implemented in v1 (DFlash+PP refused at load); see docs/plans/mtp_multi_refactor.md",
+    );
     let n_total = tokens.len();
     if n_total == 0 {
         return Ok(());
@@ -10927,6 +10976,20 @@ pub fn forward_prefill_batch_multi(
     let dim = config.dim;
     let dim_row_bytes = dim * 4;
 
+    // GdnTape sharding for PP+MTP: when caller wants tape capture
+    // (gdn_tape.is_some()), allocate one shard per band on its own
+    // device, thread shard[b] into band b's chunk call, then
+    // assemble-into the caller's target tape after the loop. See
+    // GdnTapeShards docstring for the design rationale.
+    let mut gdn_tape_shards: Option<crate::speculative::GdnTapeShards> =
+        if gdn_tape.is_some() {
+            Some(crate::speculative::GdnTapeShards::new(gpus, config, max_batch)?)
+        } else {
+            None
+        };
+
+    let last_band = n_bands - 1;
+
     let result = (|| -> HipResult<()> {
         let mut chunk_start = 0usize;
         while chunk_start < n_total {
@@ -10950,6 +11013,19 @@ pub fn forward_prefill_batch_multi(
                     givens_cos,
                     givens_sin,
                 };
+                // per_token_hidden_out: only the LAST band runs
+                // post-output-norm (Variant 2 layout), so only its
+                // chunk dispatch should write into the caller's tensor.
+                // The single-gpu chunk function takes (tensor, offset)
+                // where offset = chunk_start (rows already filled
+                // before this chunk).
+                let pth_for_band = if b == last_band {
+                    per_token_hidden_out.map(|t| (t, chunk_start))
+                } else {
+                    None
+                };
+                let tape_for_band: Option<&mut crate::speculative::GdnTape> =
+                    gdn_tape_shards.as_mut().map(|shards| shards.shard_mut(b));
                 {
                     let pbs_b: &PrefillBatchScratch = &pbs_per_band[b];
                     let s_b = &scratch_set.per_device[b];
@@ -10958,10 +11034,10 @@ pub fn forward_prefill_batch_multi(
                         g_b, weights, config, chunk, start_pos + chunk_start,
                         kv_cache, dn_state, s_b, pbs_b,
                         None, // hidden_rb: pp=1 only
-                        None, // per_token_hidden_out: pp=1 only
-                        None, // gdn_tape: pp=1 only
+                        pth_for_band,
+                        tape_for_band,
                         0,
-                        None, // tree_verify: pp=1 only
+                        None, // tree_verify: asserted None above
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
@@ -10993,6 +11069,18 @@ pub fn forward_prefill_batch_multi(
         let g = &mut gpus.devices[b];
         let _ = g.bind_thread();
         pbs.free_gpu(g);
+    }
+
+    // Assemble shards into the caller's tape, then free the shards.
+    // Only runs if the forward loop succeeded (assembly would copy
+    // garbage on partial failure).
+    if let Some(shards) = gdn_tape_shards.take() {
+        if result.is_ok() {
+            if let Some(target_tape) = gdn_tape {
+                shards.assemble_into(gpus, target_tape)?;
+            }
+        }
+        shards.free_gpu(gpus);
     }
 
     result

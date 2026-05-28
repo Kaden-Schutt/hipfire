@@ -19,6 +19,7 @@
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::multi_gpu::Gpus;
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
 use hip_bridge::{DeviceBuffer, HipResult};
@@ -653,7 +654,247 @@ impl GdnTape {
         let _ = gpu.free_tensor(self.k_scratch);
         let _ = gpu.free_tensor(self.attn_scratch);
     }
+}
 
+/// Multi-band tape sharding for Stage 2b PP+MTP. The single-gpu `GdnTape`
+/// allocates one tensor per LinearAttention layer, all on one device.
+/// Under pipeline parallelism, LA layers are spread across bands; each
+/// band's prefill chunk needs to capture into tape slots that live on
+/// the band's OWN device (kernels can't write across devices).
+///
+/// `GdnTapeShards` holds one [`GdnTape`] per band. Each shard's
+/// `qkv_bufs` / `alpha_bufs` / `beta_bufs` are `Vec`s of length
+/// `n_la_total` (the global LA layer count); entries at indices
+/// corresponding to LA layers in THAT band are real allocations on
+/// the band's device, all other entries are 1-byte placeholders on
+/// the same device. This means the chunk dispatch code (which uses
+/// the global `delta_layer_idx`) can index `shard.qkv_bufs[delta_layer_idx]`
+/// unchanged — only the slots that match actually get written.
+///
+/// After the prefill chunk completes, [`GdnTapeShards::assemble_into`]
+/// peer-copies each shard's real-allocated slots into a target
+/// [`GdnTape`] on the consumer's device (typically `output_device`
+/// in PP+MTP). The target tape's [`GdnTape::replay_gdn`] then runs
+/// on the consumer device with all per-layer data co-resident.
+pub struct GdnTapeShards {
+    pub shards: Vec<GdnTape>,
+    /// Global LA layer count. `shards[b].qkv_bufs.len() == n_la_total`
+    /// for every band; entries with `shard_owns[b][i] == true` are
+    /// real allocations.
+    pub n_la_total: usize,
+    /// `shard_owns[band][global_la_idx] == true` when band `band`
+    /// owns the LA layer at global delta index `global_la_idx`.
+    /// Used by [`assemble_into`] to pick the right source shard.
+    pub shard_owns: Vec<Vec<bool>>,
+}
+
+impl GdnTapeShards {
+    /// Allocate per-band tape shards. Mirrors single-gpu [`GdnTape::new_for_config`]
+    /// but distributes per-layer tape tensors across bands according
+    /// to `gpus.layer_to_device`. Each band's `qkv_bufs` etc. have
+    /// length `n_la_total`; real allocations only at indices owned by
+    /// that band, 1-byte placeholders elsewhere. Replay scratch
+    /// (q_raw / k_raw / v / q / k / attn) is full-size on every band
+    /// since the consumer device's tape needs its own scratch — these
+    /// shards are write-only (capture path); the target `GdnTape` does
+    /// the read-side replay.
+    pub fn new(
+        gpus: &mut Gpus,
+        config: &Qwen35Config,
+        max_n: usize,
+    ) -> HipResult<Self> {
+        let n_bands = gpus.devices.len();
+        let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let qkv_dim = k_dim * 2 + v_dim;
+        let n_v_heads = config.linear_num_value_heads;
+        let n_key_heads = config.linear_num_key_heads;
+
+        // Build per-band ownership maps + total LA count.
+        let n_la_total = config
+            .layer_types
+            .iter()
+            .filter(|t| **t == qwen35::LayerType::LinearAttention)
+            .count();
+        let mut shard_owns: Vec<Vec<bool>> = vec![vec![false; n_la_total]; n_bands];
+        {
+            let mut delta_idx = 0usize;
+            for (li, lt) in config.layer_types.iter().enumerate() {
+                if *lt == qwen35::LayerType::LinearAttention {
+                    let band = gpus.device_for_layer(li);
+                    shard_owns[band][delta_idx] = true;
+                    delta_idx += 1;
+                }
+            }
+            debug_assert_eq!(delta_idx, n_la_total);
+        }
+
+        // Allocate each shard on its band's device.
+        let mut shards: Vec<GdnTape> = Vec::with_capacity(n_bands);
+        for band in 0..n_bands {
+            let g = &mut gpus.devices[band];
+            g.bind_thread()?;
+            let mut qkv_bufs = Vec::with_capacity(n_la_total);
+            let mut alpha_bufs = Vec::with_capacity(n_la_total);
+            let mut beta_bufs = Vec::with_capacity(n_la_total);
+            for global_la_idx in 0..n_la_total {
+                if shard_owns[band][global_la_idx] {
+                    qkv_bufs.push(g.alloc_tensor(&[max_n * qkv_dim], rdna_compute::DType::F32)?);
+                    alpha_bufs.push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                    beta_bufs.push(g.alloc_tensor(&[max_n * n_v_heads], rdna_compute::DType::F32)?);
+                } else {
+                    // Placeholder: 1 F32 element. Lets the chunk dispatch
+                    // index `qkv_bufs[delta_layer_idx]` without bounds-
+                    // checking the band ownership at every call site.
+                    // These entries are never written under correct
+                    // dispatch (the chunk loop only iterates layers in
+                    // this band).
+                    qkv_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    alpha_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                    beta_bufs.push(g.alloc_tensor(&[1], rdna_compute::DType::F32)?);
+                }
+            }
+            shards.push(GdnTape {
+                max_n,
+                qkv_dim, v_dim, k_dim,
+                n_v_heads, n_key_heads,
+                value_head_dim: config.linear_value_head_dim,
+                key_head_dim: config.linear_key_head_dim,
+                qkv_bufs, alpha_bufs, beta_bufs,
+                // Replay scratch: each band gets its own (cheap) so the
+                // chunk dispatch can call replay-related helpers on the
+                // band-local scratch. PP+MTP consumer's replay runs on
+                // the target tape, not the shards, but allocating these
+                // keeps the GdnTape struct invariant.
+                q_raw_scratch: g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
+                k_raw_scratch: g.alloc_tensor(&[max_n * k_dim], rdna_compute::DType::F32)?,
+                v_scratch:     g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+                q_scratch:     g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+                k_scratch:     g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+                attn_scratch:  g.alloc_tensor(&[max_n * v_dim], rdna_compute::DType::F32)?,
+            });
+        }
+
+        Ok(Self { shards, n_la_total, shard_owns })
+    }
+
+    /// Mutable access to a single band's shard. Used by the multi-gpu
+    /// prefill chunk loop to pass `Option<&mut GdnTape>` for that band.
+    pub fn shard_mut(&mut self, band: usize) -> &mut GdnTape {
+        &mut self.shards[band]
+    }
+
+    /// Peer-copy each shard's real-allocated tape slots into the
+    /// `target` tape's matching global-indexed slots. Target must have
+    /// `n_la_total` entries; its home device receives all the data.
+    ///
+    /// Bytes per LA layer: `max_n * (qkv_dim + 2 * n_v_heads) * 4`.
+    /// For qwen3.6-27b at max_n=5 (verify K+1): ~30 KB/layer × 48
+    /// total LA layers = ~1.4 MB worst-case full assembly; less than
+    /// 1 ms at PCIe DMA speeds. Sub-cycle cost on the MTP critical
+    /// path.
+    pub fn assemble_into(
+        &self,
+        gpus: &mut Gpus,
+        target: &mut GdnTape,
+    ) -> HipResult<()> {
+        // Find target's home device by checking which gpu owns its first
+        // real allocation. (All target buffers live on the same gpu;
+        // we just need to pick the right peer-copy direction per shard.)
+        // Target was allocated via GdnTape::new_for_config on ONE Gpu,
+        // so all its buffers share that device. The caller passes the
+        // gpu index implicitly via gpus.output_device convention; we
+        // verify shapes match.
+        assert_eq!(target.qkv_bufs.len(), self.n_la_total,
+            "assemble_into: target tape has {} layers, shards have {}",
+            target.qkv_bufs.len(), self.n_la_total);
+        assert_eq!(target.max_n, self.shards[0].max_n,
+            "assemble_into: max_n mismatch (target={}, shards={})",
+            target.max_n, self.shards[0].max_n);
+
+        // For each LA layer, find the owning band and peer-copy its
+        // tape data to the target. We use the conservative same-device
+        // detection: target's home is the device that owns the layer's
+        // dst buffer in the target — but since target is a single-gpu
+        // GdnTape, all buffers are on one device. We need to know
+        // which one.
+        //
+        // The cheapest correct way: ask the caller. But the caller
+        // (MtpSpecState in PP+MTP) has output_device available. We
+        // wire it via the convention that target's home == output_device.
+        let target_dev = gpus.output_device;
+
+        for global_la_idx in 0..self.n_la_total {
+            // Identify owning band.
+            let owning_band: usize = (0..self.shards.len())
+                .find(|&b| self.shard_owns[b][global_la_idx])
+                .expect("every LA layer must be owned by exactly one band");
+            // Compute bytes per layer slot (shape: max_n × {qkv_dim, n_v_heads, n_v_heads}).
+            let qkv_bytes   = target.max_n * target.qkv_dim * 4;
+            let alpha_bytes = target.max_n * target.n_v_heads * 4;
+            let beta_bytes  = alpha_bytes;
+
+            if owning_band == target_dev {
+                // Same-device: D2D memcpy from shard to target on
+                // target_dev. Free; no peer copy.
+                let g = &mut gpus.devices[target_dev];
+                g.bind_thread()?;
+                g.hip.memcpy_dtod_at(
+                    &target.qkv_bufs[global_la_idx].buf, 0,
+                    &self.shards[owning_band].qkv_bufs[global_la_idx].buf, 0,
+                    qkv_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.alpha_bufs[global_la_idx].buf, 0,
+                    &self.shards[owning_band].alpha_bufs[global_la_idx].buf, 0,
+                    alpha_bytes,
+                )?;
+                g.hip.memcpy_dtod_at(
+                    &target.beta_bufs[global_la_idx].buf, 0,
+                    &self.shards[owning_band].beta_bufs[global_la_idx].buf, 0,
+                    beta_bytes,
+                )?;
+            } else {
+                // Cross-device: hipMemcpyPeer from owning_band's
+                // device to target_dev. Use split_pair_mut to get
+                // both handles without aliasing.
+                let (src_g, dst_g) = gpus.split_pair_mut(owning_band, target_dev);
+                let src_dev_id = src_g.device_id;
+                let dst_dev_id = dst_g.device_id;
+                let runtime = &dst_g.hip;
+                runtime.memcpy_peer(
+                    &target.qkv_bufs[global_la_idx].buf, dst_dev_id,
+                    &self.shards[owning_band].qkv_bufs[global_la_idx].buf, src_dev_id,
+                    qkv_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.alpha_bufs[global_la_idx].buf, dst_dev_id,
+                    &self.shards[owning_band].alpha_bufs[global_la_idx].buf, src_dev_id,
+                    alpha_bytes,
+                )?;
+                runtime.memcpy_peer(
+                    &target.beta_bufs[global_la_idx].buf, dst_dev_id,
+                    &self.shards[owning_band].beta_bufs[global_la_idx].buf, src_dev_id,
+                    beta_bytes,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn free_gpu(self, gpus: &mut Gpus) {
+        for (band, shard) in self.shards.into_iter().enumerate() {
+            shard.free_gpu(&mut gpus.devices[band]);
+        }
+    }
+}
+
+// ─── (continuing GdnTape impl below — `replay_gdn` and friends were
+//      originally part of `impl GdnTape`. After splitting out
+//      GdnTapeShards above, this block reopens `impl GdnTape` so the
+//      replay-side methods stay where they were. No behavior change
+//      vs pre-Stage-2b.) ──────────────────────────────────────────────
+impl GdnTape {
     /// Replay the full LA sub-pipeline (conv1d + qk-l2norm + repeat-interleave +
     /// GDN recurrence) for `n_steps` across all LinearAttention layers. Advances
     /// both `dn_state.s_matrices`/`s_scales` AND `dn_state.conv_states` by
