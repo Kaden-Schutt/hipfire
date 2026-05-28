@@ -10,6 +10,12 @@ use crate::arch_caps::ArchCaps;
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");
 
+/// Q8_1 activation quantizer with one d/mean pair per 16-value WMMA K tile.
+/// Used by experimental grouped MoE i8 paths where the 32-value DS4 scale is
+/// too coarse for model quality.
+pub const QUANTIZE_Q8_1_MMQ_DS8_SRC: &str =
+    include_str!("../../../kernels/src/quantize_q8_1_mmq_ds8.hip");
+
 
 /// GEMV Q4_K: matrix-vector multiply with on-the-fly Q4_K dequantization.
 /// A is stored as Q4_K blocks (144 bytes per 256 elements).
@@ -1002,6 +1008,12 @@ pub const MOE_SCATTER_PERMUTE_K8_SRC: &str =
 pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip");
 
+/// gfx1151 4-warp M-row-widened grouped-WMMA sister. Slot tile stays 16
+/// to preserve the one-expert-per-block contract. Gated by
+/// `HIPFIRE_MOE_GROUPED_4W=1`.
+pub const GEMM_HFQ4G256_MOE_GROUPED_WMMA_4W_K2_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_moe_grouped_wmma_4w_k2.gfx1151.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2
@@ -1111,6 +1123,26 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX12_SRC: &str =
 /// **gfx12 (RDNA4) only.** Unblocks AWQ A3B prefill (~50% of experts MQ6).
 pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip");
+
+/// gfx1151 (Strix Halo) HFQ6/MQ6 sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC.
+/// Same Path 2 grouped-dispatch contract as the HFQ4 k2 kernel, but with the
+/// 200 B/group HFQ6/MQ6 dequant inner loop. Uses the gfx11 wave32 FP16 WMMA
+/// ABI (half16 operands + base `_w32` builtin).
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_k2.gfx1151.hip");
+
+/// gfx1151 4-warp M-row-widened grouped-WMMA sister for HFQ6/MQ6. Slot tile
+/// stays 16 to preserve the one-expert-per-block contract. Gated by
+/// `HIPFIRE_MOE_GROUPED_4W=1`.
+pub const GEMM_HFQ6G256_MOE_GROUPED_WMMA_4W_K2_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_wmma_4w_k2.gfx1151.hip");
+
+/// gfx1151 i8-MMQ K8 variant for HFQ6/MQ6 grouped MoE. Experimental.
+/// Uses DS8 centered activation quantization and is routed only for gate/up
+/// by default; opt into unsafe down/all experiments with
+/// `HIPFIRE_MOE_HFQ6_I8_ROLE=down|all`.
+pub const GEMM_HFQ6G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq6g256_moe_grouped_mmq_k8.gfx1151.hip");
 
 /// M-direction 2×1 reg-blocked sister of GEMM_HFQ6G256_MOE_GROUPED_WMMA_GFX12_SRC.
 /// Each warp covers a 32-row × 16-slot output tile (vs 16×16 in v1); per
@@ -1766,14 +1798,30 @@ pub const GEMM_Q8_0_BATCHED_SRC: &str = include_str!("../../../kernels/src/gemm_
 /// (FP16-WMMA, register-redundant dequant, no LDS).
 pub const GEMM_QKV_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma.hip");
 
+/// Wider-N 16x64 sibling of GEMM_QKV_Q8_0_WMMA_SRC for gfx1151 A3B prefill.
+pub const GEMM_QKV_Q8_0_WMMA_X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkv_q8_0_wmma_x64.hip");
+
 /// WMMA 4-way fused qkv+z+beta+alpha GEMM for Q8_0 (DeltaNet LA preamble).
 pub const GEMM_QKVZA_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma.hip");
+
+/// Wider-N 16x64 sibling of GEMM_QKVZA_Q8_0_WMMA_SRC for gfx1151 A3B prefill.
+pub const GEMM_QKVZA_Q8_0_WMMA_X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_q8_0_wmma_x64.hip");
 
 /// WMMA 2-way fused gate+up GEMM for Q8_0 (FFN preamble).
 pub const GEMM_GATE_UP_Q8_0_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_q8_0_wmma.hip");
 
 /// WMMA Q8_0 GEMM with fused residual add (wo, w_down post-projection).
 pub const GEMM_Q8_0_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_q8_0_residual_wmma.hip");
+
+/// 4-warp 64x64 sibling of GEMM_Q8_0_RESIDUAL_WMMA_SRC for gfx1151.
+pub const GEMM_Q8_0_RESIDUAL_WMMA_4W_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_residual_wmma_4w.hip");
+
+/// Wider-N 16x64 sibling of GEMM_Q8_0_RESIDUAL_WMMA_SRC for gfx1151 A3B prefill.
+pub const GEMM_Q8_0_RESIDUAL_WMMA_X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_residual_wmma_x64.hip");
 
 // gfx12 (RDNA4) sister of GEMM_QKV_Q8_0_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)

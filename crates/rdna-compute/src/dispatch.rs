@@ -330,6 +330,11 @@ pub struct Gpu {
     /// `block_q8_1_mmq`, ordered by [K/128 block, batch column].
     q8_1_mmq_x_scratch: Option<hip_bridge::DeviceBuffer>,
     q8_1_mmq_x_scratch_bytes: usize,
+    /// Finer Q8_1/MMQ scratch for grouped MoE i8 WMMA. Same [K/128 block,
+    /// batch column] order as `q8_1_mmq_x_scratch`, but stores one d/mean pair
+    /// per 16-value WMMA K tile instead of per 32 values.
+    q8_1_mmq_ds8_x_scratch: Option<hip_bridge::DeviceBuffer>,
+    q8_1_mmq_ds8_x_scratch_bytes: usize,
 
     // ── MMQ per-weight screening (#87) ──────────────────────────────────
     // When enabled, each weight matrix is screened on first MMQ use: a
@@ -632,6 +637,8 @@ impl Gpu {
             mq_x_rot_fp8_bytes: 0,
             q8_1_mmq_x_scratch: None,
             q8_1_mmq_x_scratch_bytes: 0,
+            q8_1_mmq_ds8_x_scratch: None,
+            q8_1_mmq_ds8_x_scratch_bytes: 0,
             mmq_screen_cache: HashMap::new(),
             mmq_screen,
             mmq_screen_threshold,
@@ -1350,6 +1357,63 @@ impl Gpu {
         }
 
         Ok(self.q8_1_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure prefill activations are quantized into the DS8 MMQ layout.
+    /// This is only for the grouped MoE i8 WMMA experiments: each 128-K block
+    /// stores 8 d/mean pairs, matching the 8 WMMA K tiles consumed by K8.
+    pub fn ensure_q8_1_mmq_ds8_x(
+        &mut self,
+        x: &GpuTensor,
+        batch_size: usize,
+        k: usize,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "quantize_q8_1_mmq_ds8",
+            kernels::QUANTIZE_Q8_1_MMQ_DS8_SRC,
+            "quantize_q8_1_mmq_ds8",
+        )?;
+
+        let blocks_k = (k + 127) / 128;
+        let block_q8_1_mmq_ds8_bytes = 160usize;
+        let needed = blocks_k * batch_size * block_q8_1_mmq_ds8_bytes;
+        if self.q8_1_mmq_ds8_x_scratch_bytes < needed {
+            self.q8_1_mmq_ds8_x_scratch = Some(self.hip.malloc(needed)?);
+            self.q8_1_mmq_ds8_x_scratch_bytes = needed;
+        }
+
+        let src_ptr = x.buf.as_ptr();
+        let out_ptr = self.q8_1_mmq_ds8_x_scratch.as_ref().unwrap().as_ptr();
+        let mut xp = src_ptr;
+        let mut yp = out_ptr;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((k + 1023) / 1024) as u32;
+        let grid_y = batch_size as u32;
+        self.launch_maybe_blob(
+            "quantize_q8_1_mmq_ds8",
+            [grid_x, grid_y, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+
+        Ok(self.q8_1_mmq_ds8_x_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Screen a weight matrix for MMQ safety (#87). Runs a small synthetic
@@ -15162,6 +15226,72 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ///   down:    x_src = rot_batch [N*K_TOP × K], x_row_div = 1
     /// `x_src_rows` is the number of rows in x_src (N or N*K_TOP).
     #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq4g256_moe_grouped_wmma_4w_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 256, 0, "gemm_hfq4g256_moe_grouped_wmma_4w_gfx1151: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_hfq4g256_moe_grouped_wmma_4w_k2_gfx1151";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_HFQ4G256_MOE_GROUPED_WMMA_4W_K2_GFX1151_SRC,
+            kernel_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn gemm_hfq4g256_moe_grouped_wmma_k2(
         &mut self,
         expert_weight_ptrs: &GpuTensor, // [E] u64
@@ -15176,36 +15306,50 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx1151 (Strix Halo iGPU) i8 MMQ port: lift the compute ceiling
-        // from ~71 (FP16 WMMA) to ~140 TFLOPS (i8 WMMA). Opt-out via
-        // HIPFIRE_MOE_GROUPED_I8=0; default ON for gfx1151 only.
+        // gfx1151 (Strix Halo iGPU) i8 MMQ port. Keep this opt-in: full
+        // Qwen3.6-A3B .0528.mq4 smoke hits the AT/ATA attractor through the
+        // i8 path, while the FP16 WMMA path is coherent. Use
+        // HIPFIRE_MOE_GROUPED_I8=1 only for isolated experiments.
         let use_i8_gfx1151 = self.arch_caps.is_gfx1151()
-            && self.flags.moe_grouped_i8.unwrap_or(true);
+            && self.flags.moe_grouped_i8.unwrap_or(false);
         if use_i8_gfx1151 {
-            // Optional deeper-pipeline variants (opt-IN, default OFF).
-            // Same kernarg layout + scatter contract as the k2 default.
-            // - k8: processes all 4 sub-blocks of one Q8_1 block per inner
-            //   iteration (8 WMMAs into 4 independent int32 accumulators).
-            // - k4: pairs adjacent Q8_1 sub-blocks (4 WMMAs into 2 accumulators).
-            // - k2 (default): one sub-block per inner iteration.
-            let use_k8 = self.flags.moe_grouped_i8_k8;
-            let use_k4 = self.flags.moe_grouped_i8_k4;
-            if use_k8 {
-                return self.gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151(
+            let role_ok = match std::env::var("HIPFIRE_MOE_GROUPED_I8_ROLE").ok().as_deref() {
+                Some("all") => true,
+                Some("gate_up") => x_row_div > 1,
+                Some("down") => x_row_div == 1,
+                // Strix Halo full HFQ4 i8 corrupts A3B generation through
+                // the down route. Keep the opt-in experiment coherent by
+                // defaulting to gate/up only; use ROLE=all for isolated perf
+                // experiments that do not gate on generation quality.
+                _ => x_row_div > 1,
+            };
+            if role_ok {
+                // Optional deeper-pipeline variants (opt-IN, default OFF).
+                // Same kernarg layout + scatter contract as the k2 default.
+                // - k8: processes all 4 sub-blocks of one Q8_1 block per inner
+                //   iteration (8 WMMAs into 4 independent int32 accumulators).
+                // - k4: pairs adjacent Q8_1 sub-blocks (4 WMMAs into 2 accumulators).
+                // - k2 (default): one sub-block per inner iteration.
+                let use_k8 = self.flags.moe_grouped_i8_k8;
+                let use_k4 = self.flags.moe_grouped_i8_k4;
+                if use_k8 {
+                    return self.gemm_hfq4g256_moe_grouped_mmq_k8_gfx1151(
+                        expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
+                        x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+                    );
+                }
+                if use_k4 {
+                    return self.gemm_hfq4g256_moe_grouped_mmq_k4_gfx1151(
+                        expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
+                        x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+                    );
+                }
+                return self.gemm_hfq4g256_moe_grouped_mmq_gfx1151(
                     expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
                     x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
                 );
             }
-            if use_k4 {
-                return self.gemm_hfq4g256_moe_grouped_mmq_k4_gfx1151(
-                    expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
-                    x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
-                );
-            }
-            return self.gemm_hfq4g256_moe_grouped_mmq_gfx1151(
-                expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
-                x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
-            );
+            // Otherwise fall through to the FP16 grouped WMMA path.
         }
         // gfx11 dGPU i8 MMQ port (gfx1100/1101/1102/1103 — 7900 XTX, 7800/
         // 7700, 7600, Phoenix mobile). Same lift as gfx1151: doubles the
@@ -15261,6 +15405,12 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 );
             }
             return self.gemm_hfq4g256_moe_grouped_mmq_gfx12(
+                expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
+                x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+            );
+        }
+        if self.arch_caps.is_gfx1151() && self.flags.moe_grouped_4w {
+            return self.gemm_hfq4g256_moe_grouped_wmma_4w_gfx1151(
                 expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
                 x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
             );
@@ -15567,8 +15717,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// so the kernel needs `x_src_rows` to compute the row stride).
     ///
     /// Used as a drop-in replacement for `gemm_hfq4g256_moe_grouped_wmma_k2`
-    /// on gfx1151 when `HIPFIRE_MOE_GROUPED_I8 != "0"` (default ON for
-    /// gfx1151). The FP16 sister still owns gfx12/gfx11-non-1151 paths.
+    /// on gfx1151 when `HIPFIRE_MOE_GROUPED_I8=1`. The FP16 WMMA sister is
+    /// the default and validated production route.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_hfq4g256_moe_grouped_mmq_gfx1151(
         &mut self,
@@ -16140,9 +16290,144 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ///   down:    x_src = rot_batch [N*K_TOP × K], x_row_div = 1
     /// `x_src_rows` is the number of rows in x_src (N or N*K_TOP).
     ///
-    /// **gfx12 (RDNA4) only.** Panics with a clear message on other archs;
-    /// the gfx11 sister can be added later by mirroring the HFQ4
-    /// `_k2` sibling.
+    /// gfx12 uses the RDNA4 sister (`half8` operands + `_gfx12` builtin);
+    /// gfx1151 uses the Halo/RDNA3.5 k2 sister (`half16` operands + base
+    /// `_w32` builtin). Other gfx11 chips intentionally retain the previous
+    /// guard until the same MQ6 production path is validated there.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq6g256_moe_grouped_wmma_4w_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 256, 0, "gemm_hfq6g256_moe_grouped_wmma_4w_gfx1151: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_hfq6g256_moe_grouped_wmma_4w_k2_gfx1151";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_4W_K2_GFX1151_SRC,
+            kernel_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + crate::profile::gemv_hfq6g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_hfq6g256_moe_grouped_mmq_k8_gfx1151(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_hfq6g256_moe_grouped_mmq_k8_gfx1151";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_HFQ6G256_MOE_GROUPED_MMQ_K8_GFX1151_SRC,
+            kernel_name,
+        )?;
+        let x_q8_ptr = self.ensure_q8_1_mmq_ds8_x(x_src, x_src_rows, k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_q8_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let xsr_val = x_src_rows as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &xsr_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let bytes = (m_total * k) + (m_total * m) * 4 + crate::profile::gemv_hfq6g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b.push_i32(xsr_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_hfq6g256_moe_grouped_wmma(
         &mut self,
@@ -16158,12 +16443,29 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         x_src_rows: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_rdna4() {
+        if !self.arch_caps.is_rdna4() && !self.arch_caps.is_gfx1151() {
             panic!(
-                "gemm_hfq6g256_moe_grouped_wmma: gfx12-only kernel (current arch = {}). \
-                 The gfx11 sister is not yet implemented; add a _k2 variant if needed.",
+                "gemm_hfq6g256_moe_grouped_wmma: supported on gfx12 and gfx1151 only \
+                 (current arch = {}). Other gfx11 chips still need validation before routing.",
                 self.arch
             );
+        }
+        if self.arch_caps.is_gfx1151() && self.flags.moe_hfq6_i8 && self.flags.moe_grouped_i8_k8 {
+            let role_ok = match std::env::var("HIPFIRE_MOE_HFQ6_I8_ROLE").ok().as_deref() {
+                Some("all") => true,
+                Some("gate_up") => x_row_div > 1,
+                Some("down") => x_row_div == 1,
+                // The down projection consumes post-SiLU MoE activations and
+                // is not model-safe under i8 MMQ yet. Gate/up is the only
+                // coherent default route for this experimental flag.
+                _ => x_row_div > 1,
+            };
+            if role_ok {
+                return self.gemm_hfq6g256_moe_grouped_mmq_k8_gfx1151(
+                    expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
+                    x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+                );
+            }
         }
         // v2 lever (M-direction 2×1 reg-block, env-gated). Defaults off;
         // promotes when `HIPFIRE_MOE_HFQ6_V2=1`. Each warp covers 32 rows
@@ -16171,12 +16473,23 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // existing BLOCK_M=16 scatter — only the M (row) dimension is
         // restrided. The slot tile stride stays at 16 so expert-boundary
         // safety is unchanged from v1.
-        let use_v2 = self.flags.moe_hfq6_v2;
+        let use_v2 = self.arch_caps.is_rdna4() && self.flags.moe_hfq6_v2;
         let (kernel_name, kernel_src, row_tile_stride) = if use_v2 {
             (
                 "gemm_hfq6g256_moe_grouped_wmma_v2_gfx12",
                 kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_V2_GFX12_SRC,
                 32usize,
+            )
+        } else if self.arch_caps.is_gfx1151() && self.flags.moe_grouped_4w {
+            return self.gemm_hfq6g256_moe_grouped_wmma_4w_gfx1151(
+                expert_weight_ptrs, expert_tile_ids, sorted_slot_index,
+                x_src, y_grouped, m, k, x_row_div, m_total, x_src_rows,
+            );
+        } else if self.arch_caps.is_gfx1151() {
+            (
+                "gemm_hfq6g256_moe_grouped_wmma_k2_gfx1151",
+                kernels::GEMM_HFQ6G256_MOE_GROUPED_WMMA_K2_GFX1151_SRC,
+                16usize,
             )
         } else {
             (
@@ -21205,10 +21518,34 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         {
             return self.gemm_q8_0_wmma_4w(a_raw, x, y, m, k, n);
         }
-        if !use_legacy && k % 32 == 0 && n >= 64 && (n % 64 == 0)
-            && std::env::var("HIPFIRE_Q8_WMMA_X64").as_deref() == Ok("1")
-        {
-            return self.gemm_q8_0_wmma_x64(a_raw, x, y, m, k, n);
+        // gfx1151 A3B prefill has many skinny Q8 GEMMs (router +
+        // shared-expert gate) at N>=128. The scalar Q8 batched kernel was
+        // ~75ms/pass of hidden prefill time at B=128; the X64 WMMA route lifts
+        // q8 prefill from ~650 tok/s to 1000+ tok/s on the .0528 AWQ model.
+        let force_x64 = std::env::var("HIPFIRE_Q8_WMMA_X64").as_deref() == Ok("1");
+        let use_x64 = self.arch_caps.is_gfx1151() || force_x64;
+        let x64_min_n = if force_x64 { 64 } else { 128 };
+        if !use_legacy && use_x64 && k % 32 == 0 && n >= x64_min_n {
+            let bulk = n & !63usize;
+            if bulk > 0 {
+                if bulk == n {
+                    return self.gemm_q8_0_wmma_x64(a_raw, x, y, m, k, n);
+                }
+                let x_bulk = x.sub_offset(0, bulk * k);
+                let y_bulk = y.sub_offset(0, bulk * m);
+                self.gemm_q8_0_wmma_x64(a_raw, &x_bulk, &y_bulk, m, k, bulk)?;
+
+                const MAX_BATCH: usize = 64;
+                let mut off = bulk;
+                while off < n {
+                    let take = (n - off).min(MAX_BATCH);
+                    let x_sub = x.sub_offset(off * k, take * k);
+                    let y_sub = y.sub_offset(off * m, take * m);
+                    self.gemm_q8_0_batched(a_raw, &x_sub, &y_sub, m, k, take)?;
+                    off += take;
+                }
+                return Ok(());
+            }
         }
         if !use_legacy && self.arch_caps.is_rdna4() && k % 32 == 0 && n > 0 {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
@@ -21444,6 +21781,88 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
+    /// Wider-N WMMA 4-way fused Q8_0 GEMM. Covers 64 batch positions per
+    /// workgroup and reuses each Q8_0 A fragment across four B fragments.
+    pub fn gemm_qkvza_q8_0_wmma_x64(
+        &mut self,
+        a_qkv: &GpuTensor, a_z: &GpuTensor, a_beta: &GpuTensor, a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        y_qkv: &GpuTensor, y_z: &GpuTensor, y_beta: &GpuTensor, y_alpha: &GpuTensor,
+        qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma_x64: K must be a multiple of 32 (got K={k})");
+        self.ensure_kernel(
+            "gemm_qkvza_q8_0_wmma_x64",
+            kernels::GEMM_QKVZA_Q8_0_WMMA_X64_SRC,
+            "gemm_qkvza_q8_0_wmma_x64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_qkv_p = a_qkv.buf.as_ptr();
+        let mut a_z_p = a_z.buf.as_ptr();
+        let mut a_beta_p = a_beta.buf.as_ptr();
+        let mut a_alpha_p = a_alpha.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_qkv_p = y_qkv.buf.as_ptr();
+        let mut y_z_p = y_z.buf.as_ptr();
+        let mut y_beta_p = y_beta.buf.as_ptr();
+        let mut y_alpha_p = y_alpha.buf.as_ptr();
+        let mut qkv_m_val = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut beta_m_val = beta_m as i32;
+        let mut alpha_m_val = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_qkv_p as *mut _ as *mut c_void,
+            &mut a_z_p as *mut _ as *mut c_void,
+            &mut a_beta_p as *mut _ as *mut c_void,
+            &mut a_alpha_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_qkv_p as *mut _ as *mut c_void,
+            &mut y_z_p as *mut _ as *mut c_void,
+            &mut y_beta_p as *mut _ as *mut c_void,
+            &mut y_alpha_p as *mut _ as *mut c_void,
+            &mut qkv_m_val as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut beta_m_val as *mut _ as *mut c_void,
+            &mut alpha_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 63) / 64;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes = q8_bytes(qkv_m) + q8_bytes(z_m) + q8_bytes(beta_m) + q8_bytes(alpha_m)
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_q8_0_wmma_x64", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkvza_q8_0_wmma_x64",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_qkv_p); b.push_ptr(a_z_p); b.push_ptr(a_beta_p); b.push_ptr(a_alpha_p);
+                b.push_ptr(xp);
+                b.push_ptr(y_qkv_p); b.push_ptr(y_z_p); b.push_ptr(y_beta_p); b.push_ptr(y_alpha_p);
+                b.push_i32(qkv_m_val); b.push_i32(z_m_val); b.push_i32(beta_m_val); b.push_i32(alpha_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// WMMA 4-way fused Q8_0 GEMM (wqkv + wz + w_beta + w_alpha).
     /// DeltaNet LA preamble. Auto-routes to gfx12 sibling on RDNA4.
     pub fn gemm_qkvza_q8_0_wmma(
@@ -21467,6 +21886,12 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // multiple of 32. All current production shapes satisfy this; guard
         // here to catch future shape regressions before they corrupt output.
         debug_assert_eq!(k % 32, 0, "gemm_qkvza_q8_0_wmma: K must be a multiple of 32 (got K={k})");
+        if self.arch_caps.is_gfx1151() && batch_size >= 128 {
+            return self.gemm_qkvza_q8_0_wmma_x64(
+                a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha,
+                qkv_m, z_m, beta_m, alpha_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_qkvza_q8_0_wmma",
             kernels::GEMM_QKVZA_Q8_0_WMMA_SRC,
@@ -21614,6 +22039,122 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// WMMA Q8_0 GEMM with fused residual add (Y += X @ A^T).
     /// Caller seeds Y with the residual. Auto-routes to gfx12 sibling
     /// on RDNA4.
+    pub fn gemm_q8_0_residual_wmma_4w(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma_4w: K must be a multiple of 32");
+        debug_assert_eq!(m % 64, 0, "gemm_q8_0_residual_wmma_4w: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(batch_size % 64, 0, "gemm_q8_0_residual_wmma_4w: N must be a multiple of 64 (got {batch_size})");
+        self.ensure_kernel(
+            "gemm_q8_0_residual_wmma_4w",
+            kernels::GEMM_Q8_0_RESIDUAL_WMMA_4W_SRC,
+            "gemm_q8_0_residual_wmma_4w",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_p = a.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_residual_wmma_4w", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_residual_wmma_4w",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    pub fn gemm_q8_0_residual_wmma_x64(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma_x64: K must be a multiple of 32 (got K={k})");
+        self.ensure_kernel(
+            "gemm_q8_0_residual_wmma_x64",
+            kernels::GEMM_Q8_0_RESIDUAL_WMMA_X64_SRC,
+            "gemm_q8_0_residual_wmma_x64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_p = a.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 63) / 64;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_q8_0_residual_wmma_x64", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_residual_wmma_x64",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     pub fn gemm_q8_0_residual_wmma(
         &mut self,
         a: &GpuTensor,
@@ -21628,6 +22169,18 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             return self.gemm_q8_0_residual_wmma_gfx12(a, x, y, m, k, batch_size);
         }
         debug_assert_eq!(k % 32, 0, "gemm_q8_0_residual_wmma: K must be a multiple of 32 (got K={k})");
+        if self.arch_caps.is_gfx1151()
+            && batch_size >= 128
+            && m % 64 == 0
+            && batch_size % 64 == 0
+            && std::env::var("HIPFIRE_Q8_RESIDUAL_4W").as_deref() == Ok("1")
+        {
+            return self.gemm_q8_0_residual_wmma_4w(a, x, y, m, k, batch_size);
+        }
+        let force_x64 = std::env::var("HIPFIRE_Q8_RESIDUAL_X64").ok().as_deref() == Some("1");
+        if self.arch_caps.is_gfx1151() && force_x64 && batch_size >= 128 {
+            return self.gemm_q8_0_residual_wmma_x64(a, x, y, m, k, batch_size);
+        }
         self.ensure_kernel(
             "gemm_q8_0_residual_wmma",
             kernels::GEMM_Q8_0_RESIDUAL_WMMA_SRC,
@@ -21678,6 +22231,80 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// Auto-routes to the gfx12 sibling on RDNA4 archs; gfx11 path is the
     /// canonical implementation (X is converted from F32 to FP16 via
     /// `ensure_fp16_x`). Mirrors `gemm_qkv_hfq4g256_wmma`.
+    pub fn gemm_qkv_q8_0_wmma_x64(
+        &mut self,
+        a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
+        x: &GpuTensor,
+        y_q: &GpuTensor, y_k: &GpuTensor, y_v: &GpuTensor,
+        q_m: usize, k_m: usize, v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma_x64: K must be a multiple of 32 (got K={k})");
+        self.ensure_kernel(
+            "gemm_qkv_q8_0_wmma_x64",
+            kernels::GEMM_QKV_Q8_0_WMMA_X64_SRC,
+            "gemm_qkv_q8_0_wmma_x64",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xp = x_f16_ptr;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = (total_m + 15) / 16;
+        let batch_tiles = (batch_size + 63) / 64;
+        let q8_bytes = |m: usize| m * (k / 32) * 34;
+        let bytes = q8_bytes(q_m) + q8_bytes(k_m) + q8_bytes(v_m)
+                  + batch_size * k * 2
+                  + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_q8_0_wmma_x64", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_qkv_q8_0_wmma_x64",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq); b.push_ptr(ak); b.push_ptr(av);
+                b.push_ptr(xp);
+                b.push_ptr(yq); b.push_ptr(yk); b.push_ptr(yv);
+                b.push_i32(q_m_val); b.push_i32(k_m_val); b.push_i32(v_m_val);
+                b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     pub fn gemm_qkv_q8_0_wmma(
         &mut self,
         a_q: &GpuTensor, a_k: &GpuTensor, a_v: &GpuTensor,
@@ -21694,6 +22321,11 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             );
         }
         debug_assert_eq!(k % 32, 0, "gemm_qkv_q8_0_wmma: K must be a multiple of 32 (got K={k})");
+        if self.arch_caps.is_gfx1151() && batch_size >= 128 {
+            return self.gemm_qkv_q8_0_wmma_x64(
+                a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
+            );
+        }
         self.ensure_kernel(
             "gemm_qkv_q8_0_wmma",
             kernels::GEMM_QKV_Q8_0_WMMA_SRC,
