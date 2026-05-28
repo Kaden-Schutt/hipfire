@@ -4907,6 +4907,10 @@ fn generate_qwen35(
     gpu: &mut rdna_compute::Gpu,
     ctx: &mut GenerateCtx<'_>,
 ) {
+    // Compute the dispatch decision BEFORE the alias-binding block —
+    // pick_path takes `&GenerateCtx`, which conflicts with the `&mut
+    // *ctx.stdout` reborrow below.
+    let path = pick_path(m, ctx);
     // Local aliases preserve the existing body verbatim. Sampling /
     // budget fields are Copy; ref fields are reborrowed. The
     // drafter_gpu field is `take()`n into a mutable local so the
@@ -4931,133 +4935,132 @@ fn generate_qwen35(
     let tools: Option<&[serde_json::Value]> = ctx.tools;
     let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
     let mut drafter_gpu = ctx.drafter_gpu.take();
-    // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
-    // generate() body is qwen35/llama-shaped and would panic on
-    // None unwraps for q35_*/llama_* fields when applied to a
-    // Qwen2 model. Route here BEFORE PFlash / DFlash / multi-GPU
-    // / ChatML scaffolding since none of those are wired for
-    // arch_id=7 yet (R3 bring-up scope).
-    if m.arch_id == 7 {
-        // Silence the qwen35/llama-only params we deliberately don't
-        // honor on this path. See generate_qwen2 doc for the deferral
-        // list.
-        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
-                 assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
-        generate_qwen2(
-            m, gpu, stdout, id, prompt, system_prompt,
-            temp, top_p, max_tokens, repeat_penalty, repeat_window,
-        );
-        return;
-    }
-    // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1 is refused
-    // at load when DFlash / CASK / PFlash / VL is requested, so this branch
-    // doesn't need to thread any of those args through.
-    if m.pp > 1 {
-        let mut multi_ctx = GenerateCtx {
-            stdout, id, prompt, system_prompt, tools, messages_history,
-            assistant_prefix,
-            temp, top_p, repeat_penalty, repeat_window,
-            max_tokens, max_think_tokens,
-            budget_alert_at_tok, budget_alert_text,
-            drafter_gpu: None,
-            pflash_state,
-            pflash_cfg,
-            pflash_bypass_reason: None,
-            pflash_alpha: None,
-        };
-        generate_multi(m, gpu, &mut multi_ctx);
-        return;
-    }
-    // DFlash fast path -- only when a draft model is loaded AND temperature is
-    // effectively 0 (DFlash is greedy-only in this integration). Skip the
-    // normal AR sampling setup entirely.
+    // ── Step 5b: unified dispatch via pick_path ─────────────────────────
     //
-    // Exception: thinking-on + max_think_tokens currently needs the AR path.
-    // DFlash's budget cap can close/strip the think span but does not yet
-    // continue into visible answer text after the forced close. AR already
-    // splices </think> through KV and continues generation, so route budgeted
-    // thinking requests there until DFlash continuation is implemented.
-    let budgeted_thinking_needs_ar = max_think_tokens > 0
-        && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
-    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
-        // PFlash + DFlash decode path is not yet wired -- the DFlash spec
-        // loop builds its own prompt token stream internally, so the
-        // generate() PFlash block below never runs. Surface this loud so
-        // an operator who set prefill_compression != off sees a clear
-        // bypass event instead of silently getting full-prefill behavior
-        // they didn't ask for. Compression-on-DFlash lands in a future
-        // phase that threads PflashState through generate_dflash().
-        let mut dflash_bypass_reason: Option<&'static str> = None;
-        let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
-        if let Some(cfg) = pflash_cfg.as_ref() {
-            if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
-                    id,
-                );
-                let _ = stdout.flush();
-                dflash_bypass_reason = Some("dflash_decode_active");
+    // Replaces the chain of four `if … return` short-circuits with one
+    // explicit match on the SpecPath enum. Each arm rebuilds the per-leaf
+    // GenerateCtx (separate borrows from the moved-out scalars/refs above)
+    // and delegates to the leaf function exactly as the prior dispatches did.
+    //
+    // - PpAr and PpMtp BOTH delegate to generate_multi today. There is no
+    //   generate_mtp_multi yet; the PpMtp branch lands in step 5d.
+    // - The MTP-blocked-by-penalty warning still fires on the Ar arm when
+    //   the model has MTP loaded but repeat_penalty > 1.0 (lossless verify
+    //   can't honor a sampling penalty).
+    // - Ar is the only arm that falls through to the inline body below.
+    //
+    // The body of generate_multi / generate_mtp / generate_dflash assertion-
+    // checks pick_path on entry, so a divergence between this match and
+    // pick_path() is caught immediately under debug.
+    match path {
+        SpecPath::Qwen2 => {
+            // arch_id=7 (hipfire-arch-qwen2). The standard qwen35/llama
+            // body would panic on None unwraps for q35_*/llama_* fields
+            // when applied to a Qwen2 model. None of PFlash / DFlash /
+            // multi-GPU / ChatML scaffolding is wired for arch_id=7 yet
+            // (R3 bring-up scope).
+            let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                     assistant_prefix, pflash_state, pflash_cfg, tools, messages_history);
+            generate_qwen2(
+                m, gpu, stdout, id, prompt, system_prompt,
+                temp, top_p, max_tokens, repeat_penalty, repeat_window,
+            );
+            return;
+        }
+        SpecPath::PpAr | SpecPath::PpMtp => {
+            // Multi-GPU pipeline-parallel dispatch (Stage 7 of #58). pp>1
+            // is refused at load when DFlash / CASK / PFlash / VL is
+            // requested, so this branch doesn't need to thread any of
+            // those args through. PpMtp folds in here today; step 5d
+            // splits it to its own arm with a dedicated MTP multi-GPU loop.
+            let mut multi_ctx = GenerateCtx {
+                stdout, id, prompt, system_prompt, tools, messages_history,
+                assistant_prefix,
+                temp, top_p, repeat_penalty, repeat_window,
+                max_tokens, max_think_tokens,
+                budget_alert_at_tok, budget_alert_text,
+                drafter_gpu: None,
+                pflash_state,
+                pflash_cfg,
+                pflash_bypass_reason: None,
+                pflash_alpha: None,
+            };
+            generate_multi(m, gpu, &mut multi_ctx);
+            return;
+        }
+        SpecPath::Dflash => {
+            // DFlash spec-decode (greedy-only). PFlash compression on the
+            // DFlash path is not yet wired — emit a loud bypass event if
+            // an operator set prefill_compression != off, so they see the
+            // bypass instead of silent full-prefill behavior.
+            let mut dflash_bypass_reason: Option<&'static str> = None;
+            let dflash_alpha = pflash_cfg.as_ref().map(|c| c.alpha);
+            if let Some(cfg) = pflash_cfg.as_ref() {
+                if cfg.mode != hipfire_arch_qwen35::pflash::PflashMode::Off {
+                    let _ = writeln!(
+                        stdout,
+                        r#"{{"type":"pflash_bypass","id":"{}","reason":"dflash_decode_active (pflash compression on the DFlash path is a follow-up; set dflash_mode=off to compress with AR decode)"}}"#,
+                        id,
+                    );
+                    let _ = stdout.flush();
+                    dflash_bypass_reason = Some("dflash_decode_active");
+                }
+            }
+            let dflash_bypass_reason_owned = dflash_bypass_reason.map(|s| s.to_string());
+            let mut dflash_ctx = GenerateCtx {
+                stdout, id, prompt, system_prompt, tools, messages_history,
+                assistant_prefix,
+                temp, top_p, repeat_penalty, repeat_window,
+                max_tokens, max_think_tokens,
+                budget_alert_at_tok: 0,
+                budget_alert_text: "",
+                drafter_gpu: None,
+                pflash_state: None,
+                pflash_cfg: None,
+                pflash_bypass_reason: dflash_bypass_reason_owned.as_deref(),
+                pflash_alpha: dflash_alpha,
+            };
+            generate_dflash(m, gpu, &mut dflash_ctx);
+            // top_p / repeat penalties are AR-only sampling knobs;
+            // pflash_state is bypassed on the DFlash decode path.
+            let _ = (budget_alert_at_tok, budget_alert_text, pflash_state);
+            return;
+        }
+        SpecPath::Mtp => {
+            // MTP spec-decode (greedy + temp>0 via compressed-serial
+            // residual-accept). MTP doesn't use drafter_gpu / pflash_state /
+            // pflash_cfg / budget_alert_* / pflash_bypass_reason /
+            // pflash_alpha — pass None / empty defaults.
+            let mut mtp_ctx = GenerateCtx {
+                stdout, id, prompt, system_prompt, tools, messages_history,
+                assistant_prefix,
+                temp, top_p, repeat_penalty, repeat_window,
+                max_tokens, max_think_tokens,
+                budget_alert_at_tok: 0,
+                budget_alert_text: "",
+                drafter_gpu: None,
+                pflash_state: None,
+                pflash_cfg: None,
+                pflash_bypass_reason: None,
+                pflash_alpha: None,
+            };
+            generate_mtp(m, gpu, &mut mtp_ctx);
+            let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
+            return;
+        }
+        SpecPath::Ar => {
+            // Falls through to the inline AR body below. If MTP is loaded
+            // but blocked by a sampling penalty, surface that loud so the
+            // operator sees the AR fallback instead of silently losing
+            // their MTP speedup.
+            if m.mtp.is_some() && repeat_penalty > 1.0 + 1e-3 {
+                eprintln!("[hipfire-daemon] MTP bypassed (AR fallback): repeat_penalty={repeat_penalty:.3} != 1.0 is not supported by the lossless MTP verify");
             }
         }
-        // max_think_tokens is now enforced inside generate_dflash (it
-        // mirrors the AR path's <think>/</think> counter). The "ignored
-        // on DFlash" warning that used to live here is gone -- the cap
-        // is real on both paths now.
-        let dflash_bypass_reason_owned = dflash_bypass_reason.map(|s| s.to_string());
-        let mut dflash_ctx = GenerateCtx {
-            stdout, id, prompt, system_prompt, tools, messages_history,
-            assistant_prefix,
-            temp, top_p, repeat_penalty, repeat_window,
-            max_tokens, max_think_tokens,
-            budget_alert_at_tok: 0,
-            budget_alert_text: "",
-            drafter_gpu: None,
-            pflash_state: None,
-            pflash_cfg: None,
-            pflash_bypass_reason: dflash_bypass_reason_owned.as_deref(),
-            pflash_alpha: dflash_alpha,
-        };
-        generate_dflash(m, gpu, &mut dflash_ctx);
-        // Silence unused-variable warnings for the params DFlash doesn't
-        // consume (top_p / repeat penalties are AR-only sampling knobs;
-        // pflash_state is bypassed on the DFlash decode path).
-        let _ = (budget_alert_at_tok, budget_alert_text, pflash_state);
-        return;
     }
-
-    // MTP spec-decode path. Supports greedy AND sampling (temp>0) via the
-    // compressed-serial residual-accept path. Routes to AR when: a repeat
-    // penalty is set (the lossless verify argmaxes raw, not penalized, logits,
-    // so it can't honor a penalty without diverging), or budgeted thinking
-    // needs AR (think-continuation not yet wired — same as DFlash).
-    let mtp_blocked_by_penalty = repeat_penalty > 1.0 + 1e-3;
-    if m.mtp.is_some() && (m.arch_id == 5 || m.arch_id == 6)
-        && !budgeted_thinking_needs_ar && !mtp_blocked_by_penalty {
-        // Build a transient GenerateCtx covering MTP's needs. MTP
-        // doesn't use drafter_gpu / pflash_state / pflash_cfg /
-        // budget_alert_* / pflash_bypass_reason / pflash_alpha — pass
-        // None / empty defaults; the body ignores them.
-        let mut mtp_ctx = GenerateCtx {
-            stdout, id, prompt, system_prompt, tools, messages_history,
-            assistant_prefix,
-            temp, top_p, repeat_penalty, repeat_window,
-            max_tokens, max_think_tokens,
-            budget_alert_at_tok: 0,
-            budget_alert_text: "",
-            drafter_gpu: None,
-            pflash_state: None,
-            pflash_cfg: None,
-            pflash_bypass_reason: None,
-            pflash_alpha: None,
-        };
-        generate_mtp(m, gpu, &mut mtp_ctx);
-        let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
-        return;
-    }
-    if m.mtp.is_some() && mtp_blocked_by_penalty {
-        eprintln!("[hipfire-daemon] MTP bypassed (AR fallback): repeat_penalty={repeat_penalty:.3} != 1.0 is not supported by the lossless MTP verify");
-    }
+    // budgeted_thinking_needs_ar is consumed by pick_path. The inline AR
+    // body below doesn't gate on it — think-budget bookkeeping happens in
+    // the decode loop's <think>/</think> counter directly.
 
     // Auto-reset on multi-turn rollover. When eviction is active (operator
     // enabled cask_sidecar at load), the physical buffer is bounded by
