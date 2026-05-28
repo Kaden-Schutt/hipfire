@@ -157,6 +157,7 @@ fn run_single_gpu_opt(path: &str, prompt_tokens: &[u32], use_stream: bool) -> (V
         next
     };
     tokens.push(tok);
+    let t_decode = std::time::Instant::now();
     for step in 1..N_DECODE {
         let pos = prompt_tokens.len() + step - 1;
         qwen35::forward_scratch(&mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch)
@@ -167,6 +168,11 @@ fn run_single_gpu_opt(path: &str, prompt_tokens: &[u32], use_stream: bool) -> (V
         tokens.push(tok);
         all_logits.push(logits);
     }
+    let dsecs = t_decode.elapsed().as_secs_f64();
+    eprintln!(
+        "[timing] TP=1 (1 GPU) decode: {:.1} tok/s ({} tok / {:.3}s, incl per-step logits D2H)",
+        (N_DECODE - 1) as f64 / dsecs, N_DECODE - 1, dsecs
+    );
     scratch.free_gpu(&mut gpu);
     dn.free_gpu(&mut gpu);
     kv.free_gpu(&mut gpu);
@@ -261,6 +267,7 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
     tokens.push(tok);
     let _ = tok; // TP's own step-0 argmax recorded; input is forced below.
     let rankdiff = std::env::var("HIPFIRE_PARITY_RANKDIFF").is_ok();
+    let t_decode = std::time::Instant::now();
     for step in 1..N_DECODE {
         let pos = prompt_tokens.len() + step - 1;
         let in_tok = forced[step - 1]; // walk the reference path
@@ -291,6 +298,12 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         tokens.push(argmax(&logits)); // TP's own pick (for divergence reporting)
         all_logits.push(logits);
     }
+    let dsecs = t_decode.elapsed().as_secs_f64();
+    eprintln!(
+        "[timing] TP={} ({}) decode: {:.1} tok/s ({} tok / {:.3}s, incl 2 all-reduces/FA layer + rank-0 logits D2H)",
+        TP, if slice { "3b sliced" } else { "3 replicated" },
+        (N_DECODE - 1) as f64 / dsecs, N_DECODE - 1, dsecs
+    );
 
     // Minimal cleanup: destroy the per-rank streams (process exit reclaims
     // the rest; Gpus Drop frees devices/comms in declared order).

@@ -3378,17 +3378,17 @@ enum WSlice {
 
 /// Slicing variant of `load_weight_tensor` (Stage 3b TP). Fetches the quant
 /// blob, slices it on CPU per `slice`, uploads the smaller tensor with the
-/// adjusted (m,k). Panics if the weight carries an AWQ sidecar — sliced AWQ
-/// is not implemented (dense MQ4 0.8B/27B have none; to support a model that
-/// does, slice the `[k]` F16 scale by the same range first).
+/// adjusted (m,k). Slices the AWQ sidecar too when present: the `[k]` F16
+/// per-input-channel scale is unchanged by a column-parallel (Rows) slice
+/// (input dim unchanged) and sliced to `[c0..c1)` by a row-parallel (Cols)
+/// slice (27B-3.x mq4-awq exercises this; 0.8B mq4 has none).
 fn load_weight_tensor_sliced(
     hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize, slice: WSlice,
 ) -> HipResult<WeightTensor> {
     // Use the pread path (NOT tensor_data): load_weights drops the mmap on
     // unix, and load_weights_tp calls us afterwards. `tensor_data_pread`
     // shares ONE scratch buffer, so each returned `Ref` must be dropped before
-    // the next pread — hence the strictly sequential scopes below (resolve the
-    // name + qt, then the AWQ guard, then the final fetch+slice).
+    // the next pread — hence the strictly sequential scopes below.
     let mut hit: Option<(String, u8)> = None;
     for candidate in qwen35_tensor_name_candidates(name) {
         if let Some((info, _buf)) = hfq.tensor_data_pread(&candidate) {
@@ -3397,27 +3397,45 @@ fn load_weight_tensor_sliced(
         }
     }
     let (candidate, qt) = hit.unwrap_or_else(|| panic!("tensor not found: {name}"));
+    let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate).to_string();
 
-    let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate);
-    if hfq.tensor_data_pread(&format!("{stem}.awq_scale.weight")).is_some() {
-        panic!(
-            "load_weight_tensor_sliced: {name} has an AWQ sidecar; sliced AWQ is \
-             not implemented — slice the [k] F16 scale by the same range first"
-        );
-    }
-
-    let (_, buf) = hfq
-        .tensor_data_pread(&candidate)
-        .unwrap_or_else(|| panic!("tensor vanished mid-load: {candidate}"));
-    let (sliced, new_m, new_k) = match slice {
-        WSlice::Rows(m0, m1) => (slice_quant_rows(&buf[..], m, m0, m1), m1 - m0, k),
-        WSlice::Cols(c0, c1) => {
-            let gs = quant_group_size(qt);
-            (slice_quant_cols(&buf[..], m, k, c0, c1, gs), m, c1 - c0)
+    // Weight bytes → slice → upload. The `buf` Ref is dropped before the
+    // AWQ pread below (shared pread buffer).
+    let (sliced, new_m, new_k) = {
+        let (_, buf) = hfq
+            .tensor_data_pread(&candidate)
+            .unwrap_or_else(|| panic!("tensor vanished mid-load: {candidate}"));
+        match slice {
+            WSlice::Rows(m0, m1) => (slice_quant_rows(&buf[..], m, m0, m1), m1 - m0, k),
+            WSlice::Cols(c0, c1) => {
+                let gs = quant_group_size(qt);
+                (slice_quant_cols(&buf[..], m, k, c0, c1, gs), m, c1 - c0)
+            }
         }
     };
-    drop(buf);
-    load_weight_tensor_raw(gpu, qt, &sliced, new_m, new_k)
+    let mut wt = load_weight_tensor_raw(gpu, qt, &sliced, new_m, new_k)?;
+
+    // AWQ sidecar: `[k]` F16 per-input-channel scale. Slice it to match the
+    // weight's INPUT dim (Rows: full k unchanged; Cols: [c0, c1)).
+    let awq_name = format!("{stem}.awq_scale.weight");
+    if let Some((sc_info, sc_buf)) = hfq.tensor_data_pread(&awq_name) {
+        assert_eq!(
+            sc_info.quant_type, 1,
+            "AWQ sidecar {awq_name} expected F16 (qt=1), got qt={}",
+            sc_info.quant_type
+        );
+        let (e0, e1) = match slice {
+            WSlice::Rows(_, _) => (0, k),
+            WSlice::Cols(c0, c1) => (c0, c1),
+        };
+        let f32_scale: Vec<f32> = sc_buf[e0 * 2..e1 * 2]
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let bytes: Vec<u8> = f32_scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+        wt.awq_scale = Some(gpu.upload_raw(&bytes, &[bytes.len()])?);
+    }
+    Ok(wt)
 }
 
 /// Tensor-parallel weight load for `rank` of `shard` (Stage 3b, FullAttn
