@@ -30,6 +30,7 @@
 //! Greedy-only (temp=0). No DDTree, no PLD, no rejection sampling — that's
 //! Task 11 territory.
 
+use hipfire_runtime::multi_gpu::Gpus;
 use crate::mtp_head::{
     self, Qwen35MtpHead, Qwen35MtpHeadKvCache, Qwen35MtpHeadScratch,
 };
@@ -2489,6 +2490,358 @@ pub fn spec_step_mtp_compressed_serial_hetero(
         advance,
         drafts_generated,
         chain_truncated: false, // v1 hetero doesn't implement p_min early-exit
+        replay_skipped,
+    })
+}
+
+// ─── PP-aware (multi-GPU trunk) MTP spec-decode ──────────────────────────
+//
+// Stage 2b of docs/plans/mtp_multi_refactor.md. Combines pipeline-parallel
+// trunk decoding (pp>1, layers split across GPUs) with native MTP. The MTP
+// head + drafter live on `gpus.devices[output_device]` (mirrored at load
+// time by load_model_pp_with_mtp in daemon.rs). The K-step draft chain
+// runs entirely on output_device — identical to the hetero same-device
+// branch — but **verify** dispatches the trunk forward across all PP
+// devices via `forward_prefill_batch_multi_with_caps`.
+//
+// Two structural differences vs `spec_step_mtp_compressed_serial_hetero`:
+//
+// 1. Verify swap. `_hetero` calls `forward_prefill_batch_with_pbs(
+//    target_gpu, ...)` assuming the trunk is single-GPU. `_multi` calls
+//    `forward_prefill_batch_multi_with_caps(gpus, ...)` which dispatches
+//    each layer to its owning band. MTP verify is linear (no tree
+//    branching), so `tree_verify=None` satisfies the `_multi_with_caps`
+//    assert.
+//
+// 2. Fast-path replay disabled. `_hetero`'s rollback path may take
+//    `trunk_gdn_tape.replay_gdn(target_gpu, trunk_weights, ...)` for
+//    cheap GDN-only replay. Under PP, `trunk_weights.layers[i]` for an
+//    LA layer i lives on its owning band — not output_device — so
+//    launching `conv1d_silu_split_f32_n` against `&weights.layers[i].
+//    conv_weight` from output_device's gpu errors with "invalid device
+//    ordinal". We force `tape_captured = false` so replay_gdn is never
+//    called; rollback always takes the slow-path full-trunk replay via
+//    `forward_prefill_batch_multi`. v1 perf cost: ~10 ms per partial-
+//    accept cycle vs ~1 ms for tape replay (~2/3 of cycles at τ≈3 fire
+//    rollback). See plan §5d for the future-work options to recover
+//    this — mirror LA conv weights to output_device (simpler) or thread
+//    Gpus into replay_gdn_inner per-layer (more general).
+//
+// Borrow shape: takes `gpus: &mut Gpus` + `output_device: usize`. The
+// chain & sampling rebind a single `&mut Gpu` to `&mut gpus.devices[
+// output_device]` for the duration of each phase; the verify call hands
+// `gpus` directly to `forward_prefill_batch_multi_with_caps` which
+// handles band dispatch internally. No `split_pair_mut` needed because
+// draft and verify both run on output_device (no cross-device peer copy
+// on the critical path).
+//
+// V1 limits inherited from `_hetero`:
+// - compressed-sidecar lm_head_draft path only (bundled full-vocab .mq4-mtp
+//   would need a trunk.output mirror; daemon load gates the head shape)
+// - greedy-only (temp = 0)
+// - no p_min early-exit
+pub fn spec_step_mtp_compressed_serial_multi(
+    gpus: &mut Gpus,
+    output_device: usize,
+    target_config: &qwen35::Qwen35Config,
+    trunk_weights: &Qwen35Weights,
+    target_kv: &mut hipfire_runtime::llama::KvCache,
+    target_dn: &mut qwen35::DeltaNetState,
+    pp_scratch_set: &qwen35::Qwen35ScratchSet,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    drafter_state: &mut MtpHeteroDrafterState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+) -> HipResult<MtpSpecResult> {
+    let max_n = drafter_state.max_n;
+    assert_eq!(
+        max_n, state.max_n,
+        "spec_step_mtp_compressed_serial_multi: drafter_state.max_n={} != state.max_n={}",
+        max_n, state.max_n,
+    );
+    let dim = target_config.dim;
+    let vocab = target_config.vocab_size;
+
+    // V1: compressed-sidecar path only (same constraint as _hetero).
+    let lm_head_draft = head.weights.lm_head_draft.as_ref()
+        .expect("spec_step_mtp_compressed_serial_multi: head has no lm_head_draft sidecar; \
+                 v1 requires the cvs-compressed .mtp path (bundled full-vocab .mq4-mtp \
+                 needs trunk.output mirror, not implemented)");
+    let vocab_map = head.weights.lm_head_draft_vocab_map.as_ref()
+        .expect("multi: compressed head missing vocab_map");
+    let cvs = head.weights.compressed_vocab_size
+        .expect("multi: compressed head missing compressed_vocab_size");
+    let _ = lm_head_draft;
+
+    // Greedy-only for v1 (matches _hetero).
+    let sampling = state.sampling;
+    assert!(
+        sampling.is_greedy(),
+        "spec_step_mtp_compressed_serial_multi: v1 supports temp=0 (greedy) only, \
+         got temp={}",
+        sampling.temp,
+    );
+    assert!(
+        state.p_min <= 0.0,
+        "spec_step_mtp_compressed_serial_multi: v1 does not implement --mtp-p-min; \
+         got p_min={}",
+        state.p_min,
+    );
+
+    // ── 1. K-step draft chain (output_device) ────────────────────────────
+    //
+    // Identical to _hetero's drafter-side loop. Rebind a single &mut Gpu to
+    // output_device for the chain; everything reads from drafter_state's
+    // own scratch / mirrored_token_embd / mtp_kv on this device.
+    let drafts_generated;
+    let mut candidates: Vec<u32>;
+    {
+        let drafter_gpu = &mut gpus.devices[output_device];
+        if drafter_gpu.active_stream.is_none() {
+            drafter_gpu.bind_thread()?;
+            drafter_gpu.active_stream = Some(drafter_gpu.hip.stream_create()?);
+        }
+        drafter_gpu.bind_thread()?;
+
+        candidates = Vec::with_capacity(max_n);
+        let dim_bytes = dim * 4;
+        let argmax_view = drafter_state.mtp_lm_argmax.sub_offset(0, 1);
+        let logits_c = drafter_state.mtp_scratch.logits_compressed.as_ref()
+            .expect("drafter MTP scratch.logits_compressed not allocated; \
+                     call drafter_state.mtp_scratch.ensure_compressed_logits(\
+                     output_device gpu, cvs)");
+
+        for k in 0..max_n {
+            let next_tok = if k == 0 { last_committed } else { candidates[k - 1] };
+
+            drafter_embed_lookup(drafter_gpu, drafter_state, next_tok, dim)?;
+
+            if k == 0 {
+                mtp_head::mtp_head_forward_compressed_with_embed(
+                    drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                    &drafter_state.step_embd, &drafter_state.prev_hidden, cur_pos + k,
+                )?;
+            } else {
+                let prev_row = drafter_state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
+                mtp_head::mtp_head_forward_compressed_with_embed(
+                    drafter_gpu, head, &drafter_state.mtp_scratch, &mut drafter_state.mtp_kv,
+                    &drafter_state.step_embd, &prev_row, cur_pos + k,
+                )?;
+            }
+
+            drafter_gpu.argmax_f32_batched(logits_c, &argmax_view, cvs, 1)?;
+            let mut argmax_host: [i32; 1] = [0];
+            {
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        argmax_host.as_mut_ptr() as *mut u8, 4,
+                    )
+                };
+                drafter_gpu.hip.memcpy_dtoh(bytes, &argmax_view.buf)?;
+            }
+            let draft_idx = argmax_host[0] as usize;
+            assert!(draft_idx < cvs,
+                "drafter argmax {draft_idx} out of cvs {cvs}");
+            let token_id = vocab_map[draft_idx];
+            candidates.push(token_id);
+
+            if k + 1 < max_n {
+                drafter_gpu.hip.memcpy_dtod_at(
+                    &drafter_state.mtp_t_outs.buf, k * dim_bytes,
+                    &drafter_state.mtp_scratch.t_mtp_out.buf, 0,
+                    dim_bytes,
+                )?;
+            }
+        }
+        drafts_generated = candidates.len();
+    }
+
+    // ── 2. Trunk verify (multi-GPU dispatch via forward_prefill_batch_multi_with_caps) ──
+    let mut verify_tokens: Vec<u32> = Vec::with_capacity(max_n + 1);
+    verify_tokens.push(last_committed);
+    verify_tokens.extend_from_slice(&candidates);
+    let n_verify = verify_tokens.len();
+
+    // Snapshot dn_state (lives on output_device per load_model_pp_with_mtp
+    // convention — verify writes there, rollback restores from there).
+    {
+        let target_gpu = &mut gpus.devices[output_device];
+        state.trunk_snap.save_from(target_dn, target_gpu)?;
+    }
+
+    // v1: force tape_captured = false. See header comment for rationale.
+    // tape_captured is still tracked as a let-binding for clarity vs _hetero.
+    let tape_captured = false;
+    let verify_tape: Option<&mut GdnTape> = None;
+    let _ = verify_tape; // silence unused-mut if tape_captured ever flips
+
+    // Multi-GPU trunk verify. forward_prefill_batch_multi_with_caps dispatches
+    // each layer to its owning band; per_token_hidden_out lands on output_device
+    // (where the output_norm + output reside per qwen35.rs:598). MTP verify is
+    // linear (no tree branching), tree_verify=None satisfies the assert.
+    //
+    // The pp_scratch_set is the loaded model's pre-allocated multi-GPU
+    // scratch (one Qwen35Scratch per band, sized at load time). Same scratch
+    // used by generate_multi's prefill — reuse to avoid per-cycle alloc.
+    qwen35::forward_prefill_batch_multi_with_caps(
+        gpus, trunk_weights, target_config, &verify_tokens, cur_pos,
+        target_kv, target_dn, pp_scratch_set,
+        Some(&state.verify_hidden),
+        None, // gdn_tape — v1 disabled (see header)
+        None, // tree_verify — MTP verify is linear
+    )?;
+
+    // ── 2b. lm_head GEMM + argmax (output_device — trunk.output lives there) ──
+    let argmax_per_pos: Vec<u32>;
+    {
+        let target_gpu = &mut gpus.devices[output_device];
+        let w_out = &trunk_weights.output;
+        let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+        match w_out.gpu_dtype {
+            DType::Q8_0 => {
+                target_gpu.gemm_q8_0_batched(
+                    &w_out.buf, &state.verify_hidden, &logits_view,
+                    w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            DType::HFQ4G256 => {
+                target_gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &state.verify_hidden, &logits_view,
+                    w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            DType::MQ4G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                target_gpu.gemm_hfq4g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            DType::MQ3G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                target_gpu.gemm_hfq3g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            DType::HFQ6G256 => {
+                target_gpu.gemm_hfq6g256_batched_lmhead(
+                    &w_out.buf, &state.verify_hidden, &logits_view,
+                    w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            DType::MQ6G256 => {
+                let rot = state.verify_rot.sub_offset(0, n_verify * w_out.k);
+                llama::rotate_x_mq_batched_for(target_gpu, w_out, &state.verify_hidden, &rot, w_out.k, n_verify)?;
+                target_gpu.gemm_hfq6g256_batched_lmhead(
+                    &w_out.buf, &rot, &logits_view, w_out.m, w_out.k, n_verify,
+                )?;
+            }
+            _ => {
+                for i in 0..n_verify {
+                    let row = state.verify_hidden.sub_offset(i * dim, dim);
+                    let logits_row = state.verify_logits.sub_offset(i * vocab, vocab);
+                    llama::weight_gemv(target_gpu, w_out, &row, &logits_row)?;
+                }
+            }
+        }
+
+        let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+        target_gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+        let mut argmax_v_host: Vec<i32> = vec![0; n_verify];
+        {
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    argmax_v_host.as_mut_ptr() as *mut u8, n_verify * 4,
+                )
+            };
+            target_gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+        }
+        argmax_per_pos = argmax_v_host.into_iter().map(|x| x as u32).collect();
+    }
+
+    // ── Greedy accept rule (v1 — sampling/p_min NYI) ──
+    let mut accept_count = 0usize;
+    let mut hit_eos = false;
+    let mut committed: Vec<u32> = Vec::with_capacity(drafts_generated + 1);
+    for k in 0..drafts_generated {
+        if argmax_per_pos[k] == candidates[k] {
+            committed.push(candidates[k]);
+            accept_count += 1;
+            if candidates[k] == eos_token_id {
+                hit_eos = true;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    if !hit_eos {
+        let bonus = argmax_per_pos[accept_count];
+        committed.push(bonus);
+        if bonus == eos_token_id {
+            hit_eos = true;
+        }
+    }
+
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+
+    // ── Same-device handoff: verify_hidden[advance-1] → drafter.prev_hidden ──
+    //
+    // Both buffers live on output_device (drafter & verify co-locate). Pure
+    // D2D memcpy, ~10 µs. Same shape as `_hetero`'s same-device branch
+    // (line 2434) but unconditional here.
+    let prev_hidden_row = advance - 1;
+    let src_row_offset = prev_hidden_row * dim * 4;
+    {
+        let g = &mut gpus.devices[output_device];
+        g.hip.memcpy_dtod_at(
+            &drafter_state.prev_hidden.buf, 0,
+            &state.verify_hidden.buf, src_row_offset,
+            dim * 4,
+        )?;
+    }
+
+    // ── 3. Rollback / replay on multi-GPU trunk ──
+    //
+    // Fast path (replay_gdn) is disabled in v1 — tape_captured forced to
+    // false above. Slow path uses forward_prefill_batch_multi / forward_scratch_multi.
+    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
+    let replay_skipped = full_accept_no_eos;
+    if !full_accept_no_eos {
+        {
+            let target_gpu = &mut gpus.devices[output_device];
+            state.trunk_snap.restore_to(target_dn, target_gpu)?;
+        }
+        if tape_captured {
+            // Disabled in v1 — see header comment + plan §5d future work.
+            unreachable!("PpMtp v1 forces tape_captured=false; this branch should be unreachable");
+        } else {
+            if advance >= 2 {
+                let replay = &verify_tokens[..advance];
+                qwen35::forward_prefill_batch_multi(
+                    gpus, trunk_weights, target_config, replay, cur_pos,
+                    target_kv, target_dn, pp_scratch_set,
+                )?;
+            } else {
+                qwen35::forward_scratch_multi(
+                    gpus, trunk_weights, target_config, verify_tokens[0], cur_pos,
+                    target_kv, target_dn, pp_scratch_set,
+                )?;
+            }
+        }
+    }
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated,
+        chain_truncated: false, // v1 multi doesn't implement p_min early-exit
         replay_skipped,
     })
 }

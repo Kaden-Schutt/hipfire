@@ -335,13 +335,72 @@ migrates one call site:
   the arm via existing branch. Old `generate_mtp` deleted.
   Validate: single-gpu MTP τ + tok/s unchanged; hetero MTP τ + tok/s
   unchanged.
-- **5d (Path::PpMtp) — STAGE 2B PAYOFF:** new arm. Trunk verify uses
-  `forward_prefill_batch_multi` (option A or B from step 0b). Spec
-  loop calls `spec_step_mtp_compressed_serial_hetero` with
-  `target_gpu = drafter_gpu = m.pp_gpus.devices[output_device]`.
-  Same-device shortcut in spec function avoids cross-device peer
-  copy. **Validate: coherent output; τ within 5% of single-gpu MTP;
-  tok/s within 10%; VRAM matches audit projection.**
+- **5d (Path::PpMtp) — STAGE 2B PAYOFF:** new arm. Reading the
+  existing spec functions (2026-05-28) revealed
+  `spec_step_mtp_compressed_serial_hetero` is "MTP head on different
+  card than trunk, but trunk is **still single-GPU**" — it calls
+  `forward_prefill_batch_with_pbs(target_gpu, …)` for verify and
+  doesn't address PP at all. The borrow-checker collision (two
+  `&mut Gpu` for same device) is also unsolvable through that
+  function.
+  
+  Revised 5d shape (split into two commits per user decision
+  2026-05-28):
+  
+  - **5d-i:** add a NEW function `spec_step_mtp_compressed_serial_multi`
+    in `crates/hipfire-arch-qwen35/src/mtp_spec.rs` (~350 LOC,
+    structurally a copy of `_hetero` with `target_gpu == drafter_gpu`
+    collapsed to `gpus.devices[output_device]`). Surgical swaps:
+    - Phase 2 verify: `forward_prefill_batch_with_pbs(target_gpu, …,
+      Some(&trunk_pbs), …)` → `forward_prefill_batch_multi_with_caps(
+      gpus, …, Some(&verify_hidden), None /* gdn_tape, see below */,
+      None /* tree_verify */)`. MTP verify is linear, so
+      `tree_verify=None` satisfies `_multi_with_caps`'s assert.
+    - Phase 3 slow-path: `forward_prefill_batch(gpu, …)` →
+      `forward_prefill_batch_multi(gpus, …)`; `forward_scratch(gpu, …)`
+      → `forward_scratch_multi(gpus, …)`.
+    - **Phase 3 fast path is disabled in v1**: force `tape_captured =
+      false` so `trunk_gdn_tape.replay_gdn(...)` is never called.
+      Reason: `replay_gdn_inner` does
+      `gpu.conv1d_silu_split_f32_n(..., conv_weight, ...)` where
+      `conv_weight = &weights.layers[layer_idx].conv_weight` — under
+      PP, that conv_weight tensor lives on the layer's owning band,
+      which may be != output_device. Launching a kernel against a
+      remote-device tensor errors with "invalid device ordinal".
+      Cost of this v1 simplification: full-trunk replay on every
+      partial-accept cycle (~10 ms vs ~1 ms for tape replay). For
+      τ≈3 this fires on ~2/3 of cycles, putting the cycle floor
+      around 30 ms baseline + replay. Still a net positive over AR.
+    
+  - **5d-ii:** split `SpecPath::PpAr | SpecPath::PpMtp =>` arm in
+    `crates/hipfire-runtime/examples/daemon.rs` into two arms. PpAr
+    keeps the `generate_multi` delegate. PpMtp builds prompt frame,
+    runs `forward_prefill_batch_multi_with_caps(..., Some(
+    &per_token_hidden_out), None, None)` for prefill, seeds MTP
+    head's prev_hidden from the last row, decode loop calls the new
+    `spec_step_mtp_compressed_serial_multi`.
+
+  **Validate (5d-ii):** coherent output; τ within 5% of single-gpu MTP
+  (currently 3.00); tok/s ≥ pp2-ar (currently 16.9) — should beat
+  pp2-ar by τ-mediated multiplier minus replay overhead; VRAM matches
+  audit projection (gfx906 free of MTP head + scratch ~1 GB).
+  
+  **Future work — GDN-tape fast-path replay under PP** (deferred from
+  v1 5d-i): two viable approaches:
+  1. **Mirror LA conv weights to output_device** at PP+MTP load
+     time. The conv_weight tensor is tiny (~few MB per LA layer,
+     ~150 MB total for qwen3.6-27b's 48 LA layers). Adds load-time
+     VRAM cost on output_device but eliminates the ~10 ms × ~2/3
+     cycle penalty (recovers ~6 ms/cycle ≈ +20% tok/s at τ=3).
+     Mirror happens once at load; replay reads output_device's copy.
+  2. **PP-aware replay_gdn that dispatches per-layer to the owning
+     band's gpu.** Threads `gpus: &mut Gpus` into `replay_gdn_inner`
+     and selects `gpu = &mut gpus.devices[band_for_la_layer(layer_idx)]`
+     per iteration. Adds peer copies for `dn_state.conv_states` rows
+     between bands (since conv_states is allocated once per layer
+     and `replay_gdn` mutates it). Higher complexity than option (1)
+     and similar perf ceiling — option (1) is the recommended path
+     when the v1 penalty becomes the bottleneck worth removing.
 - **5e (DFlash delegate):** add `Path::DFlashSingle` arm that
   decomposes `GenerateCtx` into the args `generate_dflash` expects
   and wraps-and-returns. ~10 LOC. Per user decision: `generate_dflash`
