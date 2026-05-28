@@ -1,11 +1,25 @@
-# Plan: PP+MTP serve dispatch via consolidated generate path (Stage 2b) — **v2**
+# Plan: PP+MTP serve dispatch via consolidated generate path (Stage 2b) — **v2.1**
 
-Status: v2 plan, post-adversarial-review. Stage 2a foundation already
-shipped in commit `54e18194`; this doc scopes Stage 2b — the
-daemon-serve dispatch for PP+MTP.
+Status: v2.1 plan, post-adversarial-review + user decisions locked
+2026-05-28. Stage 2a foundation already shipped in commit `54e18194`;
+this doc scopes Stage 2b — the daemon-serve dispatch for PP+MTP.
 
-**v2 changes vs v1** (see `mtp_multi_refactor_plan_rev_claude.md`
-for the full audit):
+## User decisions (locked 2026-05-28)
+
+- **Option A** for `forward_prefill_batch_multi` — extend the
+  signature with `per_token_hidden_out` + `gdn_tape` + `tree_verify`
+  so PP-MTP keeps full τ parity with single-gpu MTP. Cost: ~200 LOC,
+  half-day to a day extra.
+- **Unify** rather than ship Option X (separate `generate_mtp_multi`).
+  Reason: maintenance burden across the existing four functions is
+  already high; consolidating now is worth the extra days.
+- **PFlash+MTP refused with `pflash_bypass` event** for v1. Joint
+  validation deferred to a future workpackage.
+
+These decisions remove the "User picks at execution" framing
+throughout this doc. The plan now has one path.
+
+## v2 changes vs v1 (see `mtp_multi_refactor_plan_rev_claude.md` for the full audit)
 
 1. **Scope correction:** v1 said "unify three functions"; reality is
    `generate` is itself a top-level dispatcher with an inline AR impl,
@@ -19,8 +33,9 @@ for the full audit):
    `(&Gpu, &mut Gpu)` signature when src/dst are the same device. Step −1
    designs a clean `Gpus::disjoint_pair_mut` / `single_mut` API to
    eliminate that pattern before propagation.
-4. **`forward_prefill_batch_multi` extension or tape-less fallback** decision
-   raised to Step 0. Two options costed; user picks at execution.
+4. **`forward_prefill_batch_multi` extension** (Option A, locked).
+   Step 0b adds `per_token_hidden_out` + `gdn_tape` + `tree_verify`
+   params. ~200 LOC, full τ parity for PP-MTP.
 5. **Surgery split into 5 per-path commits** (gemini's recommendation),
    not one all-or-nothing commit.
 6. **`GenerateCtx` struct** added to tame the 23-param union.
@@ -173,25 +188,27 @@ claim of "300 LOC removed" was overstated by ~2.5×.
    triggers, PFlash decision branching). Mitigation: per-path
    migration commits (see step 5) keep each switch surgical.
 
-2. **`forward_prefill_batch_multi` lacks `per_token_hidden_out` /
-   `gdn_tape` / `tree_verify` params** that MTP needs (P0-3). Two
-   options; user picks at execution:
+2. **`forward_prefill_batch_multi` extension (Option A, locked)**.
+   The multi prefill lacks `per_token_hidden_out` / `gdn_tape` /
+   `tree_verify` params that MTP needs (P0-3). Step 0b adds them:
 
-   - **Option A: extend multi prefill (~200 LOC, full fidelity).**
-     Add `per_token_hidden_out: Option<&GpuTensor>` (lives on
-     output_device) and `gdn_tape: Option<&mut GdnTape>` (per-band
-     capture + cross-device assembly). Full τ parity with single-gpu.
+   - `per_token_hidden_out: Option<&GpuTensor>` — output_device
+     resident; the MTP seed reads this row (or trunk's `scratch.tmp`
+     post-prefill) when bootstrapping cycle 0's `prev_hidden`.
+   - `gdn_tape: Option<&mut GdnTape>` — per-band capture during the
+     prefill chunk's GDN layers, with cross-device assembly into the
+     caller's single tape. Mirrors how `replicate_givens_to_all_devices`
+     handles per-band shared metadata.
+   - `tree_verify: Option<TreeVerifyCtx>` — DDTree verify context,
+     used by DFlash. PP-DFlash is refused at load, so this param is
+     plumbed-but-asserted-None in the multi caller; documenting it
+     keeps the signature consistent with the single-gpu version
+     instead of diverging silently again.
 
-   - **Option B: tape-less fallback (~20 LOC, ~6% tok/s loss).** Pass
-     `gdn_tape: None` through multi prefill; mtp_spec's existing
-     tape-less branch (mtp_spec.rs:1884-1894) takes a "full-trunk
-     replay of committed prefix" on every partial-accept cycle.
-     Math: τ=3.25 → ~35% partial-accept rate × ~30 ms extra forward
-     per partial-accept × 20 cycles = ~+6% wall under PP-MTP.
-
-   Default: Option B for v1. Option A is correct long-term but costs
-   another 1-2 days. Stage 2b ships with B; Option A becomes
-   Stage 2c if perf matters more than ship-speed.
+   Cost: ~200 LOC, half a day to a day. Full τ parity with
+   single-gpu MTP. Validated by hetero MTP regression (which uses
+   the single-gpu prefill today) staying clean, plus PP-AR coherence
+   gate still passing.
 
 3. **Borrow-checker (P0-5):** Stage 2a's `unsafe { &mut *dev0_ptr }`
    in daemon.rs:2677 is a smell. Prerequisite Step −1 lands a
@@ -241,16 +258,27 @@ same 9-model matrix as `coherence-gate.sh` but with the
 `HIPFIRE_ALLOW_MIXED_ARCH=1 HIPFIRE_PP_LAYERS=48,16` env. Without
 this we can't validate "PP-AR doesn't regress" at any step.
 
-### Step 0b: pick prefill_multi extension option (Option A or B above)
+### Step 0b: extend `forward_prefill_batch_multi` (Option A, locked)
 
-User decision point. Default to B for v1 unless A's cost is acceptable.
+Add `per_token_hidden_out: Option<&GpuTensor>` (output_device-resident),
+`gdn_tape: Option<&mut GdnTape>` (per-band capture + cross-device
+assembly), and `tree_verify: Option<TreeVerifyCtx>` (plumbed-but-
+asserted-None for PP since DFlash+PP is refused at load) to
+`forward_prefill_batch_multi`. ~200 LOC.
 
-If A: extend `forward_prefill_batch_multi` signature. ~200 LOC,
-half a day. Validate: hetero MTP still works (single-gpu callers
-unaffected); PP-AR coherence still passes.
+Implementation note for `gdn_tape` under PP: the tape today is a
+single `GdnTape` allocated per-cycle in `MtpSpecState.trunk_gdn_tape`.
+Under PP, LinearAttention layers live on multiple bands. The
+simplest implementation: each band's per-device prefill captures
+into a per-band tape segment; at the end of `forward_prefill_batch_multi`,
+the per-band segments are stitched in-order onto the caller's
+GdnTape via D2D or peer copy back to the tape's home device. The
+tape's home device should be the device where the caller's
+mtp_spec replay runs — which in PP-MTP is `output_device`.
 
-If B: stub the new args as `None` in multi caller. ~20 LOC. Document
-the τ cost.
+Validate: hetero MTP (single-gpu prefill caller) unaffected;
+PP-AR coherence-gate still passes; freshly written PP-AR test
+(step 0a) passes.
 
 ### Step 1: read all four function bodies into a comparison table
 
@@ -314,9 +342,11 @@ migrates one call site:
   Same-device shortcut in spec function avoids cross-device peer
   copy. **Validate: coherent output; τ within 5% of single-gpu MTP;
   tok/s within 10%; VRAM matches audit projection.**
-- **5e (cleanup):** delete `generate_dflash`-as-leaf and instead have
-  `Path::DFlashSingle` arm wrap-and-return. ~5 LOC. Optional; keeps
-  `generate_dflash` as a free function if cleaner.
+- **5e (DFlash delegate):** add `Path::DFlashSingle` arm that
+  decomposes `GenerateCtx` into the args `generate_dflash` expects
+  and wraps-and-returns. ~10 LOC. Per user decision: `generate_dflash`
+  stays as a separate function (PP-DFlash is a known perf loss; no
+  inlining benefit). The delegate just centralizes the dispatch.
 
 If any of 5a-5d regresses, **revert that one commit** back to the
 prior state (which is itself a working refactor step). The whole
@@ -336,66 +366,56 @@ After all 5 migrations land:
 
 ## Honest timeline
 
-**Per glm5 #12: v1's "2-3 days" was optimistic.** Realistic budget:
+**Per glm5 #12: v1's "2-3 days" was optimistic.** Realistic budget
+with Option A locked in for prefill_multi:
 
 | step | desc | est |
 | --- | --- | --- |
 | −1 | Gpus access cleanup | 0.5 day |
 | 0a | PP-AR coherence test | 0.5 day |
-| 0b | prefill_multi extension (A or B) | 0.5–1 day |
+| 0b | prefill_multi extension (Option A) | 1 day |
 | 1 | read & compare | 1 hour |
 | 2 | extract helpers (4 commits) | 1 day |
 | 3 | GenerateCtx | 0.5 day |
 | 4 | Path enum + decision gate | 0.5 day |
 | 5a-5e | per-path migrations | 2 days |
 | 6 | validation + docs | 0.5 day |
-| **total** | | **5–6 days** focused |
+| **total** | | **6 days** focused |
 
 Plus debugging buffer (1-2 days) for the inevitable issues a 1500-LOC
 refactor surfaces.
 
-**Realistic: 6-8 days end-to-end** for the unification path.
+**Realistic: 7-8 days end-to-end.**
 
-## Alternative: Option X (separate `generate_mtp_multi`, ~600 LOC)
+## Alternative considered: Option X (separate `generate_mtp_multi`)
 
-External reviewers (glm5 #13) argued I undersold this. Honest
-re-comparison:
+External reviewers (glm5 #13) argued Option X — a separate
+`generate_mtp_multi` of ~600 LOC, no consolidation — was a credible
+first option. Honest cost compare:
 
-| | Unification (rev2) | Option X (separate fn) |
+| | Unification (chosen) | Option X (rejected) |
 |---|---|---|
 | LOC change | +180 (new helpers/Ctx) -120 (dedup) +600 moved | +600 (new fn) +20 (prefill_multi) +80 (Gpus access cleanup) |
 | Files touched | daemon.rs (heavy), multi_gpu.rs, mtp_spec.rs | daemon.rs (light), multi_gpu.rs, mtp_spec.rs |
-| Risk to existing paths | High (touches AR/MtpSingle/PpAr inside the refactor) | Low (new function added beside existing) |
+| Risk to existing paths | Higher (touches AR/MtpSingle/PpAr inside the refactor) | Lower (new function added beside existing) |
 | Maintenance debt | Low after refactor | One more per-combo function to keep in sync |
-| Time | 6-8 days | 2-3 days |
+| Time | 7-8 days | 3-4 days |
 | Stage 2b payoff | At end of step 5d | At end of new function |
 
-**Option X is the lower-risk Stage 2b deliverable.** The unification
-pays back over time IF we keep adding combos. Today we have 5 combos;
-adding a 6th becomes ~600 LOC under Option X vs ~80 LOC under
-unification — but that's a future cost, not today's. Both options
-require the same step −1 (Gpus cleanup) and step 0 (prefill_multi
-decision).
+**Rejected because** (user input 2026-05-28): "maintenance burden is
+already high." Adding a 5th leaf function on top of 4 existing ones
+worsens drift between paths. The 4-5 extra days of refactor work
+pay for themselves the first time we change a behavior that all
+paths share (e.g. a sampling fix, a tokenizer-decoding change, a
+chatml-frame regression).
 
-**My recommendation:** ship Option X first as Stage 2b. Land the PP+MTP
-combo working in production at ~3 days. Schedule the unification as a
-follow-up sprint (Stage 2c) when there's time and the combo count
-justifies it. This is the lower-risk path to user-visible value.
+## All previously-open questions: locked
 
-If user prefers the unification path, the v2 plan above is the
-concrete roadmap.
-
-## Open questions for user
-
-1. **Option A or Option B for prefill_multi (step 0b)?** A: ~200 LOC,
-   full τ parity. B: ~20 LOC, ~6% tok/s loss under PP-MTP from
-   tape-less replay on partial-accepts.
-2. **Option X (separate function, ship in 3 days) or unification (rev2
-   plan, 6-8 days)?** Both deliver PP+MTP working in production.
-   Unification trades 4-5 extra days of refactor work for a lower
-   maintenance footprint going forward.
-3. **PFlash+MTP under PP timeline.** Refused with bypass event in v1;
-   if you need it sooner, it's its own work package.
+| # | question | decision |
+|---|---|---|
+| 1 | Option A or B for prefill_multi (step 0b)? | **A (full extension, full τ parity)** |
+| 2 | Option X (separate fn) or unification? | **Unify** (this plan) |
+| 3 | PFlash+MTP under PP timeline? | **Refused with bypass event in v1**; separate workpackage if needed sooner |
 
 ## Decision gates
 
@@ -411,20 +431,21 @@ concrete roadmap.
 ## What the v1 plan got right (carried forward)
 
 - Direction (path-dispatched function) is sound.
-- "Ship Option X as fallback" is the right escape valve.
 - Decision-gate idea is the right governance pattern.
+- Per-step revertable commits as the safety harness.
 
-## What v2 corrects vs v1
+## What v2.1 corrects vs v1
 
-| v1 claim | v2 reality |
+| v1 claim | v2.1 reality |
 |---|---|
-| 3 functions, 1586 LOC | 4 functions, 2421 LOC; DFlash stays as delegate |
+| 3 functions, 1586 LOC | 4 functions, 2421 LOC; DFlash stays as delegate (user decision) |
 | ~300 LOC deletable | ~120 LOC deletable; main payoff is maintenance not size |
-| 2-3 days | 6-8 days (or 2-3 for Option X) |
+| 2-3 days | 7-8 days (unification chosen; Option X rejected per user) |
 | One surgery commit | 5 per-path migration commits |
 | `(gpu, drafter_gpu)` signature works | Borrow checker forbids same-device aliasing; needs Gpus helper |
 | 18-param function is fine | Need GenerateCtx struct |
 | Validate at every step | Honest gate cost ~15 min; budget accordingly |
-| PFlash+MTP "enable silently" | Refuse with bypass event; validate later |
+| PFlash+MTP "enable silently" | Refuse with bypass event; validate later (user decision) |
 | Eviction "disable at load" | Already refused for pp>1; for pp=1+MTP carry defensive code |
 | Step 3 decision gate | Move to step 4 (step 3 can't actually fail) |
+| User-decision flags at execution | All three decisions LOCKED 2026-05-28: Option A + unify + bypass |
