@@ -31,6 +31,8 @@ pub struct RuntimeConfig {
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub lm_head_f16: String,
+    pub mtp_mode: String,
+    pub mtp_k: usize,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -105,6 +107,12 @@ impl RuntimeConfig {
                 .and_then(|s| s.parse().ok()),
             lm_head_f16: std::env::var("HIPFIRE_LM_HEAD_F16")
                 .unwrap_or_else(|_| "auto".to_string()),
+            mtp_mode: std::env::var("HIPFIRE_MTP_MODE")
+                .unwrap_or_else(|_| "auto".to_string()),
+            mtp_k: std::env::var("HIPFIRE_MTP_K")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3),
         }
     }
 }

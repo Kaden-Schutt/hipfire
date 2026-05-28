@@ -160,6 +160,10 @@ export interface HipfireConfig {
   prefill_drafter_device: number;  // HIP device for the PFlash drafter. -1 = same as target (default). Set to a sibling device for hetero compress.
   prefill_profile: boolean;        // Per-stage timing logs.
   prefill_sparse_threshold: number;// Phase 3 sparse-attention threshold (32768).
+
+  // ── MTP speculative decode ──────────────────────────────
+  mtp_mode: string;      // "off" | "on" | "auto"
+  mtp_k: number;         // draft tokens per spec-decode window
 }
 
 // Detect GPU at import time for smart defaults
@@ -226,6 +230,8 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   prefill_drafter_device: -1,
   prefill_profile: false,
   prefill_sparse_threshold: 32768,
+  mtp_mode: "auto",
+  mtp_k: 3,
 };
 
 function validateConfigValue(key: string, value: any): boolean {
@@ -273,6 +279,8 @@ function validateConfigValue(key: string, value: any): boolean {
     case "prefill_drafter_device": return typeof value === "number" && Number.isInteger(value) && value >= -1 && value <= 15;
     case "prefill_profile": return typeof value === "boolean";
     case "prefill_sparse_threshold": return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 524288;
+    case "mtp_mode": return ["off", "on", "auto"].includes(value);
+    case "mtp_k": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 10;
     default: return false;
   }
 }
@@ -331,6 +339,7 @@ const PER_MODEL_KEYS = [
   "prefill_alpha", "prefill_min_keep", "prefill_sink", "prefill_recent",
   "prefill_block", "prefill_drafter", "prefill_drafter_device", "prefill_profile",
   "prefill_sparse_threshold",
+  "mtp_mode", "mtp_k",
 ] as const;
 type PerModelKey = typeof PER_MODEL_KEYS[number];
 
@@ -670,6 +679,9 @@ function buildLoadMessage(path: string, tag?: string | null): any {
     );
   }
 
+  params.mtp_mode = resolved.mtp_mode;
+  params.mtp_k = resolved.mtp_k;
+
   return { type: "load", model: path, params };
 }
 
@@ -899,6 +911,8 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
   } else {
     delete process.env.HIPFIRE_DFLASH_NGRAM_BLOCK;
   }
+  process.env.HIPFIRE_MTP_MODE = cfg.mtp_mode;
+  process.env.HIPFIRE_MTP_K = String(cfg.mtp_k);
 }
 
 // ─── Background serve lifecycle ─────────────────────────
