@@ -421,6 +421,80 @@ struct GenerateCtx<'a> {
     pflash_alpha: Option<f32>,
 }
 
+/// Which generate path the dispatcher routes a request to. Step 4 of
+/// docs/plans/mtp_multi_refactor.md v2.1: making the path decision
+/// explicit catches load-handler refusal-matrix bugs (a combo that
+/// shouldn't reach a function actually CAN) before they cascade into
+/// runtime confusion.
+///
+/// Note: `SpecPath` depends on BOTH `LoadedModel` state AND request-
+/// scope args (temp, repeat_penalty, max_think_tokens,
+/// assistant_prefix) because today's dispatch in `generate` mixes
+/// them. See [`pick_path`].
+///
+/// Exhaustive over POST-LOAD-VALIDATION combos only. The load
+/// handler refuses several combos at request time (MTP+DFlash,
+/// CASK+pp>1, etc.), so `pick_path` doesn't need to handle them.
+///
+/// Named `SpecPath` (not `Path`) to avoid colliding with `std::path::Path`
+/// which is used elsewhere in this file for model file paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecPath {
+    /// Qwen2 arch (arch_id 7). Routed to generate_qwen2 unchanged
+    /// in v1; not folded into the unification.
+    Qwen2,
+    /// pp=1, no spec, AR sampling. The "generate inline AR body".
+    Ar,
+    /// pp>1 trunk, AR sampling. generate_multi today.
+    PpAr,
+    /// pp=1, MTP spec-decode (single-gpu or hetero via drafter_state).
+    /// generate_mtp today.
+    Mtp,
+    /// pp>1, MTP spec-decode (Stage 2b's payoff path). Will exist
+    /// after step 5d lands; today falls through to PpAr.
+    PpMtp,
+    /// pp=1, DFlash spec-decode (greedy-only). generate_dflash today.
+    Dflash,
+}
+
+/// Decide which path a request would take given the loaded model
+/// state and the request's runtime args. Used to assert the
+/// dispatch decision is consistent with the path-arm convention,
+/// AND will become the central match in step 5's unified
+/// generate_qwen35.
+fn pick_path(m: &LoadedModel, ctx: &GenerateCtx<'_>) -> SpecPath {
+    // Mirror the dispatch order in `generate`: arch_id check first,
+    // then PP, then DFlash (with all its runtime gates), then MTP
+    // (with its own runtime gates), else AR.
+    if m.arch_id == 7 {
+        return SpecPath::Qwen2;
+    }
+    if m.pp > 1 {
+        // PP+MTP routes to Mtp ONLY when step 5d's SpecPath::PpMtp arm
+        // exists. Today (pre-step-5d) the dispatcher falls through to
+        // generate_multi for the PP+MTP case — record that as PpAr so
+        // the assertion matches today's behavior. Step 5d flips this
+        // to PpMtp.
+        if m.mtp.is_some() {
+            return SpecPath::PpMtp;
+        }
+        return SpecPath::PpAr;
+    }
+    let budgeted_thinking_needs_ar = ctx.max_think_tokens > 0
+        && !matches!(ctx.assistant_prefix,
+                     hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
+    if m.dflash.is_some() && ctx.temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6)
+        && !budgeted_thinking_needs_ar {
+        return SpecPath::Dflash;
+    }
+    let mtp_blocked_by_penalty = ctx.repeat_penalty > 1.0 + 1e-3;
+    if m.mtp.is_some() && (m.arch_id == 5 || m.arch_id == 6)
+        && !budgeted_thinking_needs_ar && !mtp_blocked_by_penalty {
+        return SpecPath::Mtp;
+    }
+    SpecPath::Ar
+}
+
 /// Per-token streaming step. The pattern that appears in every
 /// generate function's decode loop (and in the max_think force-close
 /// inner loop, and in the im_end trailer write): push to
@@ -3463,6 +3537,8 @@ fn generate_dflash(
     gpu: &mut rdna_compute::Gpu,
     ctx: &mut GenerateCtx<'_>,
 ) {
+    debug_assert_eq!(pick_path(m, ctx), SpecPath::Dflash,
+        "generate_dflash called with path={:?}", pick_path(m, ctx));
     let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
     let id: &str = ctx.id;
     let prompt: &str = ctx.prompt;
@@ -3956,6 +4032,8 @@ fn generate_mtp(
     gpu: &mut rdna_compute::Gpu,
     ctx: &mut GenerateCtx<'_>,
 ) {
+    debug_assert_eq!(pick_path(m, ctx), SpecPath::Mtp,
+        "generate_mtp called with path={:?}", pick_path(m, ctx));
     use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
 
     // Local aliases so the body stays readable without `ctx.` prefix
@@ -4379,6 +4457,14 @@ fn generate_multi(
     gpu: &mut rdna_compute::Gpu,
     ctx: &mut GenerateCtx<'_>,
 ) {
+    // Allow both PpAr (true PP-AR) and PpMtp (pre-step-5d: PP+MTP
+    // falls back to AR through this function). After step 5d's
+    // Path::PpMtp arm lands and the dispatcher routes PP+MTP
+    // elsewhere, the second arm should be removed.
+    debug_assert!(
+        matches!(pick_path(m, ctx), SpecPath::PpAr | SpecPath::PpMtp),
+        "generate_multi called with path={:?}", pick_path(m, ctx),
+    );
     // Local aliases preserve the existing body verbatim. Sampling /
     // budget fields are Copy; ref fields are reborrowed.
     let pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState> =
