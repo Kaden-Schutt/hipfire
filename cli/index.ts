@@ -3955,6 +3955,11 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
       label: "prefill_drafter",
       desc: "Path to PFlash drafter HFQ (e.g. ~/.hipfire/models/qwen3-0.6b.hf4). Tokenizer must match the target's. Empty = disabled.",
     },
+    prefill_drafter_device: {
+      label: "prefill_drafter_device",
+      desc: "HIP device for the PFlash drafter. -1 = same device as target; 0+ pins the drafter to that GPU.",
+      range: [-1, 15], step: 1,
+    },
     prefill_profile: {
       label: "prefill_profile",
       desc: "Emit per-stage PFlash timing logs (score / select / gather). Off in production.",
