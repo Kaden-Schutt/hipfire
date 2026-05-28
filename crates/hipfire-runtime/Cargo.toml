@@ -305,6 +305,12 @@ required-features = ["arch-qwen35", "deltanet"]
 name = "pp2_vram_probe"
 required-features = ["arch-qwen35", "deltanet"]
 
+# tp_comm_smoke — TP-plan ship-gate microbench. No arch features needed
+# (uses multi_gpu::Gpus + raw HipRuntime FFI only).
+[[example]]
+name = "tp_comm_smoke"
+required-features = []
+
 # build_kld_ref needs no GPU / arch features — it just orchestrates
 # llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
 [[example]]
