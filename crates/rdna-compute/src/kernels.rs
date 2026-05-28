@@ -1235,6 +1235,10 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
+// gfx11 (RDNA3) sibling of GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC — overwrite
+// variant of GEMM_HFQ4G256_RESIDUAL_WMMA_SRC (skips zero-fill + RMW at the
+// largest matrix in the decode cycle).
+pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX11_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx11.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
 // Pre-quantizes activations to Q8_1 + uses i8 WMMA over 128×128 tiles. Targets
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100

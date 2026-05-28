@@ -13535,6 +13535,68 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
+    /// gfx11 lm_head sibling of `gemm_hfq4g256_residual_wmma`.
+    /// Same WMMA tile mapping as the gfx11 residual kernel but overwrites Y
+    /// instead of accumulating, so lm_head callers can skip the full-vocab
+    /// zero-fill memset and the per-tile RMW. Mirror of
+    /// `gemm_hfq4g256_lmhead_wmma_gfx12` (RDNA4) in the gfx11 WMMA dialect.
+    pub fn gemm_hfq4g256_lmhead_wmma_gfx11(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_lmhead_wmma_gfx11",
+            kernels::GEMM_HFQ4G256_LMHEAD_WMMA_GFX11_SRC,
+            "gemm_hfq4g256_lmhead_wmma_gfx11",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_lmhead_wmma_gfx11", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_lmhead_wmma_gfx11",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// gfx12 lm_head sibling of `gemm_hfq4g256_residual_wmma_gfx12`.
     /// Uses the same WMMA tile mapping but overwrites Y instead of reading
     /// and adding to it, so lm_head callers can skip a full-vocab zero-fill.
@@ -19160,8 +19222,10 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).
-    /// HIPFIRE_LM_HEAD_OVERWRITE=1 opts into a gfx12 overwrite sibling that
-    /// skips the zero-fill; measured as a small win but not enough to default.
+    /// HIPFIRE_LM_HEAD_OVERWRITE=1 opts into a gfx12/gfx11 overwrite sibling
+    /// that skips the zero-fill; measured as a small win on gfx12 but not
+    /// enough to default. The gfx11 sibling
+    /// (`gemm_hfq4g256_lmhead_wmma_gfx11`) was ported under the same gate.
     ///
     /// NOT numerically identical to `gemm_hfq4g256`. Uses FP16 tensor cores
     /// with the accumulators in FP32 the residual kernel ships. On the
@@ -19202,8 +19266,18 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            if arch.starts_with("gfx12") && self.flags.lm_head_overwrite {
-                self.gemm_hfq4g256_lmhead_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            // lm_head_overwrite (HIPFIRE_LM_HEAD_OVERWRITE=1) skips the
+            // pre-call zero-fill memset + per-tile RMW by using an overwrite
+            // variant instead of residual+memset. gfx12 (RDNA4) and gfx11
+            // (RDNA3) each ship their own dialect.
+            if self.flags.lm_head_overwrite
+                && (arch.starts_with("gfx12") || arch.starts_with("gfx11"))
+            {
+                if arch.starts_with("gfx12") {
+                    self.gemm_hfq4g256_lmhead_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+                } else {
+                    self.gemm_hfq4g256_lmhead_wmma_gfx11(a_raw, x, y, m, k, batch_size)
+                }
             } else {
                 match self.active_stream.as_ref() {
                     Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
