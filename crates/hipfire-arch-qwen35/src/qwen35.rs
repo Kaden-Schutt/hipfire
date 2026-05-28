@@ -10912,6 +10912,7 @@ fn forward_prefill_chunk(
                         pos,
                         kv_cache,
                         s,
+                        FaPhase::Full,
                     )?;
                     gpu.hip.memcpy_dtod_at(
                         &pbs.x_batch.buf,
@@ -12227,9 +12228,26 @@ fn forward_prefill_chunk(
     Ok(())
 }
 
+/// Phase selector for `run_fa_layer_body`, enabling tensor-parallel reuse
+/// without duplicating the FullAttn body. See `forward_scratch_tp`.
+///
+/// - `Full` (single-GPU, default): attention → residual `wo` into `s.x` →
+///   FFN. Byte-identical to the pre-TP path.
+/// - `TpAttn { mask }`: attention, then mask the gated attention output to
+///   this rank's local Q-heads (`mask`), then write the **partial** `wo`
+///   contribution to `s.o` (NOT `s.x`), and return *before* the FFN. The
+///   caller all-reduces `s.o` across ranks and adds it to `s.x`.
+/// - `TpFfn`: run only the FFN on the already-all-reduced `s.x`.
+#[derive(Clone, Copy)]
+pub enum FaPhase<'a> {
+    Full,
+    TpAttn { mask: &'a GpuTensor },
+    TpFfn,
+}
+
 /// Run a single FullAttn layer body on s.x at position `pos`. Extracted
 /// for use from the batched prefill path's FA-layer fallback. Byte-exact
-/// with the FA branch of forward_scratch_layers.
+/// with the FA branch of forward_scratch_layers (for `FaPhase::Full`).
 #[allow(clippy::too_many_arguments)]
 fn run_fa_layer_body(
     gpu: &mut Gpu,
@@ -12240,7 +12258,13 @@ fn run_fa_layer_body(
     pos: usize,
     kv_cache: &mut llama::KvCache,
     s: &Qwen35Scratch,
+    phase: FaPhase,
 ) -> HipResult<()> {
+    // TP FFN-only phase: s.x already holds the all-reduced residual; skip
+    // attention (it ran in the TpAttn phase) and run just the FFN.
+    if let FaPhase::TpFfn = phase {
+        return run_fa_ffn_body(gpu, weights, config, layer_idx, s);
+    }
     let layer = match &weights.layers[layer_idx] {
         LayerWeights::FullAttn(l) => l,
         _ => unreachable!(),
@@ -12645,7 +12669,37 @@ fn run_fa_layer_body(
     }
 
     gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
-    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+    match phase {
+        FaPhase::TpAttn { mask } => {
+            // Mask the gated attention output to this rank's local Q-heads,
+            // then produce the PARTIAL wo contribution into s.o (NOT s.x).
+            // The caller all-reduces s.o across ranks and adds it to s.x.
+            gpu.mul_f32(&s.fa_attn_out, mask, &s.fa_attn_out)?;
+            weight_gemv(gpu, &layer.wo, &s.fa_attn_out, &s.o)?;
+            return Ok(());
+        }
+        // Full (single-GPU) — TpFfn already returned at the top of the fn.
+        _ => weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?,
+    }
+
+    run_fa_ffn_body(gpu, weights, config, layer_idx, s)
+}
+
+/// FFN half of a FullAttn layer (RMSNorm → fused gate/up → SwiGLU-down
+/// residual into s.x). Split out of `run_fa_layer_body` so the TP path can
+/// insert an all-reduce between the `wo` projection and the FFN. Byte-
+/// identical to the previously-inline FFN.
+fn run_fa_ffn_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => l,
+        _ => unreachable!(),
+    };
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
     let x_rot = fused_rmsnorm_rotate_for_mq(
