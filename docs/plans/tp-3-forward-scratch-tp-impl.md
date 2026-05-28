@@ -1,10 +1,93 @@
 # Stage 3 — `forward_scratch_tp` implementation guide
 
-**Status:** in progress (2026-05-28). FA-body split landed (uncommitted);
-DeltaNet extraction + orchestrator + parity harness remain.
-**Target:** TP=2 ↔ TP=1 logits within 1e-4 on `qwen3.5-0.8b.mq4` greedy.
+**Status:** ✅ COMPLETE (2026-05-28, uncommitted). DeltaNet extraction +
+`forward_scratch_tp` orchestrator + full-model parity harness all landed and
+green. TP=2 ↔ TP=1 fp32 parity = **2.6e-6, 32/32 argmax identical, PASS**.
+**Target (met):** TP=2 ↔ TP=1 logits within 1e-4 on `qwen3.5-0.8b.mq4` greedy.
 **Prereqs done:** RCCL all-reduce (`1cde4e80`), `ShardConfig`+`init_tp`
-(`87b6c90a`), 3a wo+all-reduce mechanism smoke green (`44735ed0`).
+(`87b6c90a`), 3a wo+all-reduce mechanism smoke green (`44735ed0`),
+FA-body split (`e5afa07b`), FA-layer parity (`5f728d98`).
+
+## Acceptance result + two bugs found (2026-05-28)
+
+`crates/hipfire-arch-qwen35/examples/tp_attn_parity.rs` drives the reference
+greedy path and force-feeds it to TP (identical input path → apples-to-apples
+per-position logit delta). Final: **fp32 KV + fp32 DeltaNet state → worst rel
+Δ 2.6e-6, 32/32 argmax match, PASS.**
+
+Getting there surfaced two real bugs (both fixed):
+
+1. **`run_fa_layer_body` q8 attention ignored `flash_mode`.** It always called
+   non-flash `attention_q8_0_kv`, but the inline decode FA arm uses a
+   `use_flash` dispatch and on gfx11/gfx12 `flash_mode` defaults to **2 (always
+   flash)**. So ref used `attention_flash_q8_0` and TP used non-flash → they
+   agree at pos 0 (single key → V regardless of scores) but diverge at pos ≥ 1.
+   Fix: `run_fa_layer_body`'s q8 branch now mirrors the inline arm's flash
+   dispatch (fulfilling its documented "byte-exact with the FA branch"
+   contract). The FA-layer parity (`5f728d98`) missed this because *both* sides
+   used `run_fa_layer_body` and tested pos 0 only.
+
+2. **`pos_buf` written on the null stream while kernels run on `active_stream`.**
+   `forward_scratch_tp` sets `active_stream` (required by the all-reduce); every
+   kernel then launches on it (`dispatch.rs:1150`), but `pos_buf` was written
+   with raw `memcpy_htod` (null stream) → ordering hazard. Fixed to
+   `memcpy_htod_async` on the active stream. (Turned out not to be the
+   divergence cause here — null/active gave identical results — but it is a
+   latent correctness hazard, so the fix stays.)
+
+## The q8-sensitivity finding — it's the DeltaNet STATE, not the KV (NOT a TP bug)
+
+Root cause: the cross-rank all-reduce computes `wo@cols[0:1024] +
+wo@cols[1024:2048]` in a different summation order than the single-GPU
+`wo@cols[0:2048]` → an unavoidable ~1e-7 reassociation in `s.x`. Quantized
+state amplifies that 1e-7 across quantization buckets and recurrence compounds
+it. Single-GPU is immune only because it is perturbation-free (ref-vs-ref is
+bit-exact 0.0). This is the `feedback_attention_precision` "tiny attention error
+→ cascade" sensitivity at the quantization-boundary level — a model-precision
+property, not a TP-implementation bug.
+
+**Isolation matrix (qwen3.5-0.8b, full ChatML prompt, 32 decode steps,
+TP=2↔TP=1 along the identical forced path):**
+
+| KV   | DeltaNet state | worst rel logit Δ | argmax agreement |
+|------|----------------|-------------------|------------------|
+| fp32 | fp32           | **2.6e-6**        | 32/32            |
+| q8   | fp32           | **4.1e-3**        | **32/32**        |
+| fwht | fp32           | **3.5e-3**        | **32/32**        |
+| fp32 | q8             | **3.7e-1**        | 32/32 (on edge)  |
+| q8   | q8             | 3.7e-1            | 30/32            |
+| fwht | q8             | 3.2e-1            | 31/32            |
+
+**The DeltaNet recurrent *state* quant is the amplifier; the KV cache is not —
+for q8 AND FWHT KV alike.** Both q8 and fwht KV add only ~3–4e-3 with zero token
+flips: the KV cache is *read* (a fresh weighted sum per position), so its
+quantization noise doesn't compound. The DeltaNet state is *recurrently updated*
+and carries forward, so q8 state turns the 1e-7 reassociation into ~3.2–3.7e-1
+regardless of KV mode. Physically sensible.
+
+(FWHT KV under TP required fixing `run_fa_layer_body`'s asym4 branch to add the
+`fwht4` sub-branch the inline decode arm already had — without it TP ran plain
+asym4 while single-GPU ran fwht4. The 3.5e-3 fwht/fp32-state result validates
+that fix; a broken fwht4 dispatch would have shown a large flash-bug-style
+mismatch even at fp32 state.)
+
+**Production recommendation for TP:** keep the KV cache quantized — **q8 or
+FWHT both work** (the big VRAM consumer) — and run the DeltaNet recurrent state
+in **fp32** (small per-layer matrix — cheap). Either KV mode holds
+token-identical to single-GPU in this test (32/32) at ~3–4e-3 logit Δ. Do NOT
+run q8 DeltaNet state under TP (token flips by ~step 8–12).
+
+**Gate:** the default fp32/fp32 acceptance isolates and validates the TP forward
+math (2.6e-6 < 1e-4, PASS). The harness exposes `HIPFIRE_PARITY_KV={fp32,q8}` and
+`HIPFIRE_PARITY_STATE={fp32,q8}` independently to reproduce any cell above.
+Implication for A3B: validate TP math at fp32; ship TP with q8 KV + fp32
+DeltaNet state.
+
+Diagnostics built into the harness (env-gated): `HIPFIRE_PARITY_NTOK`,
+`HIPFIRE_PARITY_REFREF`, `HIPFIRE_PARITY_REFSTREAM`, `HIPFIRE_PARITY_RANKDIFF`,
+`HIPFIRE_PARITY_Q8`. RANKDIFF confirmed the two ranks stay **bit-identical**
+(0.0) — replication is exact; the only divergence vs single-GPU is the
+all-reduce reassociation.
 
 This is the execution recipe grounded in the real post-#352 code. All
 line numbers are current as of this commit; re-grep if the file moved.
