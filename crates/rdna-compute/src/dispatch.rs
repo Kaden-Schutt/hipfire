@@ -13543,6 +13543,66 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
+    /// gfx12 lm_head sibling of `gemm_hfq4g256_residual_wmma_gfx12`.
+    /// Uses the same WMMA tile mapping but overwrites Y instead of reading
+    /// and adding to it, so lm_head callers can skip a full-vocab zero-fill.
+    pub fn gemm_hfq4g256_lmhead_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            kernels::GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC,
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_lmhead_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -19224,6 +19284,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).
+    /// HIPFIRE_LM_HEAD_OVERWRITE=1 opts into a gfx12 overwrite sibling that
+    /// skips the zero-fill; measured as a small win but not enough to default.
     ///
     /// NOT numerically identical to `gemm_hfq4g256`. Uses FP16 tensor cores
     /// with the accumulators in FP32 the residual kernel ships. On the
@@ -19264,17 +19326,22 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
-                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
-            }
-            return if arch.starts_with("gfx12") {
-                self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            if arch.starts_with("gfx12") && self.flags.lm_head_overwrite {
+                self.gemm_hfq4g256_lmhead_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
-                self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
-            };
+                match self.active_stream.as_ref() {
+                    Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                    None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+                }
+                if arch.starts_with("gfx12") {
+                    self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+                } else {
+                    self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+                }
+            }
+        } else {
+            self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
         }
-        self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
 
     /// HFQ6-G256 sister of `gemm_hfq4g256_batched_lmhead`. Phase A.4

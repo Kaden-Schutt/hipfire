@@ -70,11 +70,22 @@ fn main() {
         match run_one(&mut gpu, m, k, n) {
             Ok(()) => {
                 total_pass += 1;
-                eprintln!("  {label:50} OK");
+                eprintln!("  residual {label:41} OK");
             }
             Err(e) => {
                 total_fail += 1;
-                eprintln!("  {label:50} FAIL");
+                eprintln!("  residual {label:41} FAIL");
+                eprintln!("{e}");
+            }
+        }
+        match run_one_lmhead(&mut gpu, m, k, n) {
+            Ok(()) => {
+                total_pass += 1;
+                eprintln!("  lmhead   {label:41} OK");
+            }
+            Err(e) => {
+                total_fail += 1;
+                eprintln!("  lmhead   {label:41} FAIL");
                 eprintln!("{e}");
             }
         }
@@ -85,6 +96,62 @@ fn main() {
     eprintln!("  Failed: {total_fail}");
     if total_fail > 0 {
         std::process::exit(1);
+    }
+}
+
+fn run_one_lmhead(gpu: &mut Gpu, m: usize, k: usize, n: usize) -> Result<(), String> {
+    assert_eq!(m % 16, 0);
+    assert_eq!(k % 256, 0, "K must be multiple of 256 (HFQ4G256 group size)");
+    assert_eq!(n % 16, 0, "N must be multiple of 16 (WMMA batch tile)");
+
+    let a_bytes = build_hfq4g256(m, k, 0xB4);
+    let a = gpu
+        .upload_raw(&a_bytes, &[m, k])
+        .map_err(|e| format!("upload a: {e}"))?;
+
+    let x_f32: Vec<f32> = (0..(n * k))
+        .map(|i| {
+            let b = (i / k) as i32;
+            let kk = (i % k) as i32;
+            ((b * 5 + kk * 3) % 37 - 18) as f32 * 0.04
+        })
+        .collect();
+    let x = gpu
+        .upload_f32(&x_f32, &[n, k])
+        .map_err(|e| format!("upload x: {e}"))?;
+
+    let y_zero = vec![0.0f32; n * m];
+    let y_ref = gpu
+        .upload_f32(&y_zero, &[n, m])
+        .map_err(|e| format!("upload y_ref init: {e}"))?;
+    gpu.gemm_hfq4g256_residual_fp16(&a, &x, &y_ref, m, k, n)
+        .map_err(|e| format!("dot2-fp16 residual zero-init: {e}"))?;
+    let ref_y = gpu
+        .download_f32(&y_ref)
+        .map_err(|e| format!("download y_ref: {e}"))?;
+
+    let y_dirty: Vec<f32> = (0..(n * m))
+        .map(|i| ((i * 19) % 29) as f32 * 0.01 + 0.25)
+        .collect();
+    let y_cand = gpu
+        .upload_f32(&y_dirty, &[n, m])
+        .map_err(|e| format!("upload y_cand dirty init: {e}"))?;
+    gpu.gemm_hfq4g256_lmhead_wmma_gfx12(&a, &x, &y_cand, m, k, n)
+        .map_err(|e| format!("wmma_gfx12 lmhead: {e}"))?;
+    let cand_y = gpu
+        .download_f32(&y_cand)
+        .map_err(|e| format!("download y_cand: {e}"))?;
+
+    gpu.free_tensor(a).ok();
+    gpu.free_tensor(x).ok();
+    gpu.free_tensor(y_ref).ok();
+    gpu.free_tensor(y_cand).ok();
+
+    let mut report = String::new();
+    if compare("Y_lmhead", n, m, &cand_y, &ref_y, &mut report) {
+        Ok(())
+    } else {
+        Err(report)
     }
 }
 
