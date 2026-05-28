@@ -38,6 +38,7 @@ kernels/compiled/
 .remember/
 .codex
 .sisyphus/
+AGENTS.local.md
 
 # Local secrets (lmx api key, etc.) — never commit
 .env
