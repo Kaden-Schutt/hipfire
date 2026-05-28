@@ -151,57 +151,153 @@ us anything beyond plain PP — we lose the MTP-frees-gfx906-VRAM
 property. Only interesting if there's some reason the MTP head MUST
 share locality with most trunk layers, which there isn't.
 
-## Recommendation
+## User-direction (2026-05-28 follow-up)
 
-**Build Option B in two stages:**
+User confirmed: **longer ctx is the goal**, alongside any real perf
+gain from PP itself. Asked whether co-locating MTP head with the band
+that holds the early layers (or the output band) can eliminate any
+syncs.
+
+### Where co-location actually helps
+
+Walking the data path for PP=2 (Variant 2 layout, output_norm + lm_head
+on `gpus.output_device` = the LAST device, per `qwen35.rs:9871-9873`):
+
+```
+[dev 0] embed_lookup(token_embd lives here)
+  ↓
+[dev 0] layers 0..k
+  ↓ boundary_copy: residual stream 5×dim×f32 = 100 KB
+[dev 1] layers k..N
+  ↓ same device
+[dev 1] output_norm + lm_head   ← output_device by convention
+  ↓ verify_hidden, verify_logits both allocated on dev 1
+[host] argmax → candidates
+[? gpu] MTP chain reads prev_hidden, embeds, runs head, produces next draft
+```
+
+The hetero-MTP impl shipped today (`spec_step_mtp_compressed_serial_hetero`)
+peer-copies `state.verify_hidden[advance-1]` from the trunk gpu to the
+drafter gpu's `prev_hidden` at cycle exit (line 2417 of mtp_spec.rs).
+In PP, that trunk gpu IS `gpus.output_device`.
+
+**If MTP head is co-located on `gpus.output_device` (the last device),
+the per-cycle prev_hidden peer copy collapses to a same-device
+`memcpy_dtod_at`** — exactly what the original single-gpu
+`capture_prev_hidden_from_verify_row` does. Saves the 112 µs/cycle the
+microbench measured for the cross-device handoff.
+
+### Where co-location does NOT help
+
+- **Boundary copy for trunk verify is unaffected.** Residual stream
+  flows dev_0→dev_last regardless of which gpu hosts MTP; MTP isn't on
+  the trunk's hot path.
+- **First-band locality has no advantage.** PP work per band is
+  ~symmetric; there's no first-vs-last asymmetry that benefits from
+  putting MTP near the embedding side. Putting MTP near `dev 0` would
+  *re-introduce* the per-cycle peer copy for prev_hidden (now flowing
+  output_device→dev_0) and cost more than it saves.
+- **token_embd mirror is still needed.** `token_embd` lives on
+  `gpus.devices[0]` by convention; MTP chain reads it every step. The
+  cheap fix is the same one-shot ~1.29 GB peer-clone we already do, NOT
+  a per-step copy. Total cost: 1.29 GB drafter VRAM, paid once at session
+  init (~200 ms peer-DMA, validated by mirror smoke).
+- **Async overlap potential.** With MTP on a SEPARATE card from
+  output_device, the MTP chain could in principle overlap with the
+  trunk's next verify. With MTP co-located on output_device they
+  serialize. We don't exploit async overlap today (the cycle is all
+  sync), so this is a "future loss" not a "current loss" — and the
+  microbench has already shown the sync handoff is cheap. Net: pick
+  co-location, revisit async-overlap only if perf demands it.
+
+### Verdict: MTP head on `output_device` (= last PP device = gfx1031)
+
+The cleanest design is the one that already falls out of existing PP
+conventions:
+
+- gfx906 (32 GB) = dev 0: bands 0..k of trunk + token_embd. Most of the
+  trunk-weight bulk, most of the KV cache.
+- gfx1031 (12 GB) = dev 1 = `output_device`: bands k..N of trunk +
+  output_norm + lm_head + **MTP head + token_embd peer-mirror**.
+
+Saves the 38-112 µs/cycle prev_hidden handoff. Slots into the existing
+PP code with NO layout changes (MTP gets loaded onto
+`gpus.devices[gpus.output_device]`, naturally co-located with verify
+output).
+
+## Recommendation (UPDATED)
+
+**Build in two stages:**
 
 **Stage 1 (cheap, ~150 LOC, independent value): add `_multi_filtered`
 KV constructors.** This is a pure PP improvement — any current PP user
 of qwen3.5/3.6 hybrid models is wasting 3× KV. No new architecture
 required, just mirror the existing single-gpu `_filtered` pattern into
-the multi path. Likely worth landing on its own regardless of the MTP
-combo decision.
+the multi path. Ships on its own. ROI **today** = unblocks longer-ctx
+PP without the MTP combo. Validated by the table above: 24 layers on
+gfx1031 at 128k jumps from impossible (15.2 GB ❌) to comfortable
+(10.4 GB ✓) with the filter.
 
-**Stage 2 (~450 LOC, needs Stage 1): combine PP-trunk with MTP-on-drafter.**
+**Stage 2 (~450 LOC, needs Stage 1): PP-trunk + MTP-on-output_device.**
 
 - Extend `load_model_pp` to accept an `mtp_head_path` and load it
-  onto `gpus.devices[mtp_device]` (an env-selectable index, default
-  the last device).
-- Reuse the `MtpHeteroDrafterState` already shipped. The trunk-side
-  half of MtpSpecState gets allocated on the chosen "verify primary"
-  device (the device that owns the lm_head output norm).
-- Per-cycle handoff: same row-correct peer copy we already do for
-  hetero MTP, but with the source device being whichever PP device
-  owns the output norm (not necessarily dev 0).
-- Daemon serve wiring: rebuild the `generate_mtp` dispatch path to
-  handle the `pp_gpus.is_some() && mtp.is_some()` case.
+  onto `gpus.devices[gpus.output_device]`. NO env override needed in
+  v1 — the output_device convention is the right placement.
+- Mirror `trunk.weights.token_embd` from dev 0 (where the trunk loader
+  put it) to output_device using `mtp_mirror::peer_clone_tensor`,
+  same primitive shipped today.
+- Reuse the `MtpHeteroDrafterState` struct verbatim — it already takes
+  drafter_gpu as a `&mut Gpu`, doesn't care it's a PP band.
+- Trunk-side `MtpSpecState` (verify_hidden, verify_logits, trunk_snap,
+  etc.) gets allocated on `output_device` since that's where the
+  trunk verify writes them — natural fit, no logic change.
+- Per-cycle handoff: when drafter_gpu == output_device, use the existing
+  single-gpu `state.capture_prev_hidden_from_verify_row` (same-device
+  D2D memcpy). When drafter_gpu != output_device, use the
+  `memcpy_peer_offset` path we shipped today. **One unified
+  spec_step function gets both behaviors via a same-device branch.**
+- Daemon serve wiring: extend `generate_mtp` dispatch to handle the
+  `pp_gpus.is_some() && mtp.is_some()` case. Trunk verify routes
+  through the existing pp forward; MTP chain routes through the hetero
+  spec function with drafter_gpu pointed at output_device.
 
 **Don't build Stage 2 without Stage 1** — without filtered_multi, the
-gfx1031 budget is tight enough that the configuration won't fit useful
-contexts.
+gfx1031 budget caps at 25% of trunk layers at 128k ctx, which doesn't
+free enough on gfx906 to materially raise the ctx cap.
 
-## Open question for the user
+## Projected outcomes
 
-Whether to build this depends on what we'd USE the freed VRAM for. The
-hetero-MTP ship today freed ~800 MB on gfx906. Combined with Option B,
-we'd shift another ~10 GB to gfx1031. **What's the gfx906 VRAM
-target?** Specifically:
+With Stage 1 + Stage 2 deployed, layout: 40 layers on gfx906 + 24 on
+gfx1031 (37.5% offload), filtered_multi for KV, MTP head on
+output_device = gfx1031:
 
-1. Run 27B at much longer ctx (we currently cap at ~120k → would 256k
-   be useful, or do we already saturate the model's positional
-   encoding)?
-2. Co-resident DFlash drafter for hybrid spec-decode at low-temp
-   sampling cases?
-3. PFlash drafter co-resident with full-ctx 27B?
-4. Just headroom (no specific destination yet)?
+| metric                | today (pp=1 + hetero-MTP) | Stage 1+2 (pp=2 + MTP-on-out_dev) |
+| ---                   | ---                       | ---                                |
+| gfx906 VRAM used      | ~14 GB (full trunk - 0.8 GB freed) | ~6 GB (40/64 layers + their KV) |
+| gfx906 VRAM free      | ~18 GB                    | ~26 GB                             |
+| gfx1031 VRAM used     | ~2.1 GB (head + mirror)   | ~10.4 GB (24/64 layers + KV + head + mirror) |
+| gfx1031 VRAM free     | ~10 GB (mostly idle)      | ~1.6 GB                            |
+| ctx ceiling (current) | ~120k (per existing serve)| ~256k+ (gfx906 has 26 GB free)     |
+| per-cycle MTP overhead| 112 µs cross-device       | ~0 µs (same-device on out_dev)     |
+| trunk verify overhead | 0 (single-gpu)            | 1 PP boundary copy ~100 KB/cycle   |
+| projected tok/s vs today | baseline               | maybe -5% from PP boundary; +0% from MTP handoff being free; net **~-5%** |
 
-If the answer is (4), Option B is speculative-ROI work. If any of
-(1)-(3) is a real near-term need, Option B + Stage 1 is well-justified.
+Notes:
+- Stage 1 alone (PP without MTP combo) already unblocks ctx growth
+  for the existing pp=2 serve path. Land it first regardless.
+- The "ctx ceiling" estimate above is the GPU-VRAM ceiling; actual
+  serving ctx may still be capped by the existing `physical_cap` /
+  rope_theta / etc. constraints. Worth validating once Stage 1 lands.
+- Stage 2's "~-5%" estimate assumes PP boundary copy cost dominates;
+  microbenching the actual PP=2 cost on this hardware pair should be
+  the FIRST validation step after Stage 1 lands (don't build Stage 2
+  if PP boundary cost on this hardware turns out to be much worse than
+  predicted).
 
 ## Tasks summary
 
-- [x] Audit (this doc)
-- [ ] Decision on Option B build vs. shelve
-- [ ] If build: Stage 1 — `_multi_filtered` KV constructors
-- [ ] If build: Stage 2 — PP+MTP combo in daemon + spec function
-- [ ] If shelve: keep hetero-MTP as the stable v1 deliverable
+- [x] Audit (this doc, updated)
+- [ ] Stage 1: `_multi_filtered` KV constructors (~150 LOC, ships on its own)
+- [ ] Microbench PP=2 boundary cost on gfx906↔gfx1031 (gate before Stage 2)
+- [ ] Stage 2: PP+MTP combo with MTP-on-output_device (~450 LOC)
+- [ ] Validation: 27B at 256k ctx serving via combined path
