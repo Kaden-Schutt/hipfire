@@ -781,6 +781,12 @@ pub const FUSED_QKVZA_HFQ4G256_V2_GFX942_SRC: &str = include_str!("../../../kern
 /// variant scales by an on-device sigmoid gate (no D2H sync).
 pub const GEMV_HFQ4G256_RESIDUAL_SCALED_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_scaled.hip");
 
+/// HFQ3/MQ3-G256 batched GEMV with fused sigmoid-scaled residual:
+///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
+/// HFQ3 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched`.
+pub const GEMV_HFQ3G256_RESIDUAL_SIGMOID_SCALED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq3g256_residual_sigmoid_scaled.hip");
+
 /// HFQ6/MQ6-G256 batched GEMV with fused sigmoid-scaled residual:
 ///   y_batch[bid,row] += sigmoid(c_batch[bid]) * (A[row] · x_batch[bid]).
 /// HFQ6 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched` —

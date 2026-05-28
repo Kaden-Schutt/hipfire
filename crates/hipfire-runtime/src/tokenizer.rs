@@ -1393,6 +1393,12 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
+    if matches!(
+        std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref(),
+        Some("0") | Some("false") | Some("off") | Some("no")
+    ) {
+        return Cow::Borrowed(s);
+    }
     if !crate::config::get().normalize_prompt {
         return Cow::Borrowed(s);
     }

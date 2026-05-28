@@ -13910,6 +13910,60 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
+    /// HFQ3/MQ3 analogue of `gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched`.
+    /// Same grid shape, but reads HFQ3's 104 B / group layout. MQ3G256 shares
+    /// storage with HFQ3G256; callers apply the FWHT rotation upstream.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_batch: &GpuTensor,
+        y_batch: &GpuTensor,
+        c_batch: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq3g256_residual_sigmoid_scaled",
+            kernels::GEMV_HFQ3G256_RESIDUAL_SIGMOID_SCALED_SRC,
+            "gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_batch.buf.as_ptr();
+        let y_ptr = y_batch.buf.as_ptr();
+        let c_ptr = c_batch.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &c_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let groups = k / 256;
+        let weight_bytes = m * groups * 104;
+        let bytes = batch_size * (weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemv", "gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_hfq3g256_residual_sigmoid_scaled_gpu_batched",
+            [m as u32, batch_size as u32, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr); b.push_ptr(c_ptr);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G128 batched GEMV with fused per-token sigmoid-scaled residual.
     ///
     /// y_batch[token, row] += sigmoid(c_batch[token]) * (A[row] · x_batch[token])

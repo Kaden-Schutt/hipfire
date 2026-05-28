@@ -46,7 +46,7 @@ pub fn init() {
 impl RuntimeConfig {
     pub fn from_env() -> Self {
         let normalize_prompt = match std::env::var("HIPFIRE_NORMALIZE_PROMPT").ok().as_deref() {
-            Some("0") | Some("false") | Some("off") => false,
+            Some("0") | Some("false") | Some("off") | Some("no") => false,
             _ => true,
         };
 

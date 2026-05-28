@@ -112,6 +112,14 @@ export interface HipfireConfig {
   // 2026-04-26 (commit 9a2c667).
   prompt_normalize: boolean;
 
+  // ── Loader / HIP runtime controls ─────────────────────────────────────
+  // These mirror low-level runtime env vars so locally spawned daemon/run
+  // paths can persist the same behavior as ad-hoc shell exports.
+  gpu_slab_load: "auto" | "on" | "off";       // HIPFIRE_GPU_SLAB_LOAD
+  gpu_slab_mib: number;                       // HIPFIRE_GPU_SLAB_MIB
+  load_transport: "pread" | "pinned" | "direct"; // HIPFIRE_LOAD_TRANSPORT
+  hip_wait: "auto" | "spin" | "yield" | "blocking"; // HIPFIRE_HIP_WAIT
+
   // ── MMQ per-weight screening (#87) ──────────────────────────────────
   // Tri-state guard for the i8 WMMA (MMQ) prefill path. When MMQ is
   // active (HIPFIRE_MMQ=1 / HIPFIRE_WO_MMQ=1), Q8_1 precision loss on
@@ -191,6 +199,10 @@ const CONFIG_DEFAULTS: HipfireConfig = {
   // +24% τ on PEP-8-style code prompts (159→196 tok/s on 27B-3.5 LRU DFlash).
   // Set false (or HIPFIRE_NORMALIZE_PROMPT=0) to opt out.
   prompt_normalize: true,
+  gpu_slab_load: "auto",
+  gpu_slab_mib: 512,
+  load_transport: "pread",
+  hip_wait: "auto",
   // MMQ per-weight screening: detect Q8_1 outlier rows and fall back to
   // WMMA. Default `auto`: the daemon arch-gates this to RDNA3/3.5
   // (gfx1100/1101/1102/1103/1150/1151) and only fires when MMQ is active
@@ -243,6 +255,10 @@ function validateConfigValue(key: string, value: any): boolean {
     case "cask_fold_m": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 16;
     case "cask_auto_attach": return typeof value === "boolean";
     case "prompt_normalize": return typeof value === "boolean";
+    case "gpu_slab_load": return ["auto", "on", "off"].includes(value);
+    case "gpu_slab_mib": return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 262144;
+    case "load_transport": return ["pread", "pinned", "direct"].includes(value);
+    case "hip_wait": return ["auto", "spin", "yield", "blocking"].includes(value);
     case "mmq_screen": return ["off", "on", "auto"].includes(value);
     case "mmq_screen_threshold": return typeof value === "number" && value > 0 && value <= 1;
     case "prefill_compression": return ["off", "auto", "always"].includes(value);
@@ -851,6 +867,20 @@ function applyConfigEnv(cfg: HipfireConfig, modelTag?: string | null): void {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "1";
   } else {
     process.env.HIPFIRE_NORMALIZE_PROMPT = "0";
+  }
+  // Loader / HIP runtime controls. Shell env wins for one-off diagnostics;
+  // otherwise persistent config flows into locally spawned runtime paths.
+  if (!process.env.HIPFIRE_GPU_SLAB_LOAD && cfg.gpu_slab_load !== "auto") {
+    process.env.HIPFIRE_GPU_SLAB_LOAD = cfg.gpu_slab_load;
+  }
+  if (!process.env.HIPFIRE_GPU_SLAB_MIB && cfg.gpu_slab_mib !== CONFIG_DEFAULTS.gpu_slab_mib) {
+    process.env.HIPFIRE_GPU_SLAB_MIB = String(cfg.gpu_slab_mib);
+  }
+  if (!process.env.HIPFIRE_LOAD_TRANSPORT && cfg.load_transport !== "pread") {
+    process.env.HIPFIRE_LOAD_TRANSPORT = cfg.load_transport;
+  }
+  if (!process.env.HIPFIRE_HIP_WAIT && cfg.hip_wait !== "auto") {
+    process.env.HIPFIRE_HIP_WAIT = cfg.hip_wait;
   }
   // dflash_ngram_block: auto-resolve from model tag when "auto", else honor
   // explicit boolean. Only set the env var when we want it ON; daemon /
@@ -3898,8 +3928,28 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
     },
     prompt_normalize: {
       label: "prompt_normalize",
-      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; off by default)",
+      desc: "collapse \\n{3,} → \\n\\n before encode (lifts τ +26.7% on PEP-8 code prompts; on by default)",
       options: ["true", "false"],
+    },
+    gpu_slab_load: {
+      label: "gpu_slab_load",
+      desc: "GPU slab model preload. auto = enable on HIP-reported integrated/UMA GPUs, on = force, off = disable.",
+      options: ["auto", "on", "off"],
+    },
+    gpu_slab_mib: {
+      label: "gpu_slab_mib",
+      desc: "GPU slab bank size in MiB for the slab loader. Larger banks reduce bookkeeping; smaller banks reduce allocation spikes.",
+      range: [1, 262144], step: 64,
+    },
+    load_transport: {
+      label: "load_transport",
+      desc: "Paged-weight load transport. pread = heap staging, pinned = HIP pinned host staging, direct = O_DIRECT host staging.",
+      options: ["pread", "pinned", "direct"],
+    },
+    hip_wait: {
+      label: "hip_wait",
+      desc: "HIP host wait policy. auto = HIP default, spin = lowest latency, yield/blocking reduce CPU pressure.",
+      options: ["auto", "spin", "yield", "blocking"],
     },
     mmq_screen: {
       label: "mmq_screen",
@@ -5801,6 +5851,10 @@ Examples:
           port: "integer between 1 and 65535",
           idle_timeout: "seconds of inactivity before serve unloads the model (0 = never, max 86400)",
           default_model: "non-empty model tag",
+          gpu_slab_load: "one of: auto, on, off",
+          gpu_slab_mib: "integer MiB between 1 and 262144",
+          load_transport: "one of: pread, pinned, direct",
+          hip_wait: "one of: auto, spin, yield, blocking",
         };
         console.error(`${key} must be ${hints[key] || "valid"}`); process.exit(1);
       }
