@@ -199,6 +199,52 @@ fn emit_committed_event(
     );
 }
 
+/// Base stats for the `{"type":"done"}` event. All four generate
+/// functions emit a done event with the same seven base fields; the
+/// only divergence is path-specific extras (e.g. DFlash adds
+/// `"dflash":true,"tau":..,"cycles":..`; MTP adds
+/// `"spec_path":"mtp","mtp_k":..,"tau":..,"accept_rate":..,"cycles":..,"mtp_sampling":..`;
+/// AR adds `pflash` info via a separate helper).
+///
+/// Step 2 of docs/plans/mtp_multi_refactor.md v2.1: extract the
+/// shared base-emission so each call site shrinks from ~6 lines of
+/// `writeln!` plumbing to one helper call + the path extras string.
+#[derive(Clone, Copy)]
+struct DoneStats {
+    tokens: usize,
+    tok_s: f64,
+    prefill_tokens: usize,
+    prefill_ms: f64,
+    prefill_tok_s: f64,
+    decode_tok_s: f64,
+    ttft_ms: f64,
+}
+
+/// Emit a `{"type":"done", ...}` event with the seven base fields plus
+/// optional path-specific extras. `path_extras` MUST start with a
+/// leading comma (e.g. `,"dflash":true,"tau":3.40,"cycles":12`) when
+/// non-empty, OR be the empty string. Mirrors the existing
+/// `pflash_done_fragment` convention so the AR call sites can keep
+/// using that helper unchanged.
+///
+/// Flushes stdout after writing — matches the previous inline
+/// `writeln! + stdout.flush()` pattern at every call site.
+fn emit_done_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    stats: &DoneStats,
+    path_extras: &str,
+) {
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
+        id, stats.tokens, stats.tok_s, stats.prefill_tokens,
+        stats.prefill_ms, stats.prefill_tok_s, stats.decode_tok_s, stats.ttft_ms,
+        path_extras,
+    );
+    let _ = stdout.flush();
+}
+
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
     gpu: &rdna_compute::Gpu,
@@ -3650,14 +3696,19 @@ fn generate_dflash(
         ),
         _ => String::new(),
     };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
-        id, generated, tok_s, prompt_tokens.len(),
-        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+    let path_extras = format!(
+        r#","dflash":true,"tau":{:.2},"cycles":{}{}"#,
         tau, stats.cycles, pflash_done_field,
     );
-    let _ = stdout.flush();
+    emit_done_event(stdout, id, &DoneStats {
+        tokens: generated,
+        tok_s,
+        prefill_tokens: prompt_tokens.len(),
+        prefill_ms: prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms: prefill_s * 1000.0,
+    }, &path_extras);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4107,14 +4158,19 @@ fn generate_mtp(
     let tau = if total_cycles > 0 { committed_from_cycles as f64 / total_cycles as f64 } else { 0.0 };
     let accept_rate = if total_cycles > 0 { total_accepted as f64 / total_cycles as f64 } else { 0.0 };
     let mtp_sampling = temp > 1e-6;
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"spec_path":"mtp","mtp_k":{},"tau":{:.2},"accept_rate":{:.2},"cycles":{},"mtp_sampling":{}}}"#,
-        id, generated, tok_s, new_tokens.len(),
-        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+    let path_extras = format!(
+        r#","spec_path":"mtp","mtp_k":{},"tau":{:.2},"accept_rate":{:.2},"cycles":{},"mtp_sampling":{}"#,
         mtp_state.max_n, tau, accept_rate, total_cycles, mtp_sampling,
     );
-    let _ = stdout.flush();
+    emit_done_event(stdout, id, &DoneStats {
+        tokens: generated,
+        tok_s,
+        prefill_tokens: new_tokens.len(),
+        prefill_ms: prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms: prefill_s * 1000.0,
+    }, &path_extras);
 }
 
 /// Multi-GPU pipeline-parallel AR decode (Stage 7 of #58). Mirrors the pp=1
@@ -4605,13 +4661,15 @@ fn generate_multi(
     let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
     let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
     let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}}}"#,
-        id, generated, tok_s, prefill_tokens,
-        prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
-    );
-    let _ = stdout.flush();
+    emit_done_event(stdout, id, &DoneStats {
+        tokens: generated,
+        tok_s,
+        prefill_tokens,
+        prefill_ms: prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms: prefill_s * 1000.0,
+    }, "");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5497,14 +5555,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
         let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
         let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
-            id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
-        );
-        let _ = stdout.flush();
+        emit_done_event(stdout, id, &DoneStats {
+            tokens: generated,
+            tok_s,
+            prefill_tokens,
+            prefill_ms: prefill_s * 1000.0,
+            prefill_tok_s,
+            decode_tok_s,
+            ttft_ms: prefill_s * 1000.0,
+        }, &pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha));
     } else {
         // Qwen3 / LLaMA path -- multi-turn aware
         let config = m.llama_config.as_ref().unwrap();
@@ -5597,14 +5656,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
         let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
         let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
-            id, generated, tok_s, prefill_tokens,
-            prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-            pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
-        );
-        let _ = stdout.flush();
+        emit_done_event(stdout, id, &DoneStats {
+            tokens: generated,
+            tok_s,
+            prefill_tokens,
+            prefill_ms: prefill_s * 1000.0,
+            prefill_tok_s,
+            decode_tok_s,
+            ttft_ms: prefill_s * 1000.0,
+        }, &pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha));
     }
 }
 
