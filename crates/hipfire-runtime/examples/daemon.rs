@@ -1588,16 +1588,25 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    generate(
-                        m, &mut gpu, pflash_drafter_gpu.as_mut(), &mut stdout, id, prompt, system,
-                        temp, top_p, max_tokens, repeat_penalty, repeat_window,
-                        budget_alert_at_tok, &budget_alert_text, max_think_tokens,
+                    let mut gen_ctx = GenerateCtx {
+                        stdout: &mut stdout,
+                        id,
+                        prompt,
+                        system_prompt: system,
+                        tools: tools_json.as_deref(),
+                        messages_history: messages_history.as_deref(),
                         assistant_prefix,
-                        pflash_state.as_mut(),
-                        pf_cfg_owned.as_ref(),
-                        tools_json.as_deref(),
-                        messages_history.as_deref(),
-                    );
+                        temp, top_p, repeat_penalty, repeat_window,
+                        max_tokens, max_think_tokens,
+                        budget_alert_at_tok,
+                        budget_alert_text: &budget_alert_text,
+                        drafter_gpu: pflash_drafter_gpu.as_mut(),
+                        pflash_state: pflash_state.as_mut(),
+                        pflash_cfg: pf_cfg_owned.as_ref(),
+                        pflash_bypass_reason: None,
+                        pflash_alpha: None,
+                    };
+                    generate_qwen35(m, &mut gpu, &mut gen_ctx);
                 }
             }
 
@@ -4882,12 +4891,46 @@ fn generate_multi(
     }, "");
 }
 
-#[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
-    // Compress runs on the PFlash drafter handle when one is set (hetero
-    // sibling device), else on the target gpu. The handle is consumed at
-    // the seq_pos==0 compress site; decode always uses `gpu`.
-    let mut drafter_gpu = drafter_gpu;
+/// Top-level generate dispatcher for the qwen35-family of paths
+/// (arch_id 5/6 + Qwen2 routing for arch_id 7). Step 5a of
+/// docs/plans/mtp_multi_refactor.md v2.1 renamed the prior
+/// `generate` to `generate_qwen35` and switched its signature to the
+/// `GenerateCtx` shape that the three leaf functions already use.
+///
+/// The body still contains the inline AR implementation AND the
+/// short-circuit dispatches to generate_qwen2 / generate_multi /
+/// generate_dflash / generate_mtp at the top. Subsequent step 5b/5c/5d
+/// commits will collapse those dispatches into a single match on
+/// pick_path(), folding each leaf's body in turn.
+fn generate_qwen35(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    ctx: &mut GenerateCtx<'_>,
+) {
+    // Local aliases preserve the existing body verbatim. Sampling /
+    // budget fields are Copy; ref fields are reborrowed. The
+    // drafter_gpu field is `take()`n into a mutable local so the
+    // PFlash compress site can `as_deref_mut` it (matches the prior
+    // `let mut drafter_gpu = drafter_gpu;` pattern).
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let temp: f32 = ctx.temp;
+    let top_p: f32 = ctx.top_p;
+    let max_tokens: usize = ctx.max_tokens;
+    let repeat_penalty: f32 = ctx.repeat_penalty;
+    let repeat_window: usize = ctx.repeat_window;
+    let budget_alert_at_tok: usize = ctx.budget_alert_at_tok;
+    let budget_alert_text: &str = ctx.budget_alert_text;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState> =
+        ctx.pflash_state.as_deref_mut();
+    let pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig> = ctx.pflash_cfg;
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
+    let mut drafter_gpu = ctx.drafter_gpu.take();
     // arch_id=7 (hipfire-arch-qwen2) short-circuit. The standard
     // generate() body is qwen35/llama-shaped and would panic on
     // None unwraps for q35_*/llama_* fields when applied to a
