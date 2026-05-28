@@ -61,21 +61,66 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--bf16-gguf"     => { bf16_gguf = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--slice"         => { slice = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--top-k"         => { top_k = argv[i + 1].parse().expect("--top-k must be u32"); i += 2; }
-            "--output"        => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--n-ctx"         => { n_ctx = argv[i + 1].parse().expect("--n-ctx must be u32"); i += 2; }
-            "--n-batch"       => { n_batch = argv[i + 1].parse().expect("--n-batch must be u32"); i += 2; }
-            "--llama-perplexity-bin" => { llama_perplexity_bin = argv[i + 1].clone(); i += 2; }
-            "-h" | "--help"   => { print_usage(); std::process::exit(0); }
-            other             => { eprintln!("unknown arg: {other}"); print_usage(); std::process::exit(1); }
+            "--bf16-gguf" => {
+                bf16_gguf = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--slice" => {
+                slice = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--top-k" => {
+                top_k = argv[i + 1].parse().expect("--top-k must be u32");
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--n-ctx" => {
+                n_ctx = argv[i + 1].parse().expect("--n-ctx must be u32");
+                i += 2;
+            }
+            "--n-batch" => {
+                n_batch = argv[i + 1].parse().expect("--n-batch must be u32");
+                i += 2;
+            }
+            "--llama-perplexity-bin" => {
+                llama_perplexity_bin = argv[i + 1].clone();
+                i += 2;
+            }
+            "-h" | "--help" => {
+                print_usage();
+                std::process::exit(0);
+            }
+            other => {
+                eprintln!("unknown arg: {other}");
+                print_usage();
+                std::process::exit(1);
+            }
         }
     }
-    let bf16_gguf = bf16_gguf.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
-    let slice = slice.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
-    let output = output.unwrap_or_else(|| { print_usage(); std::process::exit(1); });
-    Args { bf16_gguf, slice, top_k, output, n_ctx, n_batch, llama_perplexity_bin }
+    let bf16_gguf = bf16_gguf.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
+    let slice = slice.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
+    let output = output.unwrap_or_else(|| {
+        print_usage();
+        std::process::exit(1);
+    });
+    Args {
+        bf16_gguf,
+        slice,
+        top_k,
+        output,
+        n_ctx,
+        n_batch,
+        llama_perplexity_bin,
+    }
 }
 
 /// Drop guard that unlinks the FIFO on scope exit. Survives panics.
@@ -91,7 +136,9 @@ fn main() {
 
     // 0. Sanity checks (H1 + M4): pinned llama.cpp commit + slice md5.
     hipfire_runtime::eval_common::verify_llama_commit(
-        &args.llama_perplexity_bin, PINNED_LLAMACPP_COMMIT, "build_kld_ref",
+        &args.llama_perplexity_bin,
+        PINNED_LLAMACPP_COMMIT,
+        "build_kld_ref",
     );
     hipfire_runtime::eval_common::verify_slice_md5(&args.slice, "build_kld_ref");
 
@@ -141,7 +188,10 @@ fn main() {
     let mut magic = [0u8; 8];
     input.read_exact(&mut magic).expect("read llama magic");
     if &magic != LLAMA_MAGIC {
-        eprintln!("bad llama.cpp magic: got {:?}, want {:?}", magic, LLAMA_MAGIC);
+        eprintln!(
+            "bad llama.cpp magic: got {:?}, want {:?}",
+            magic, LLAMA_MAGIC
+        );
         std::process::exit(2);
     }
     let mut hdr_rest = [0u8; 12];
@@ -165,7 +215,11 @@ fn main() {
     let n_tokens = n_ctx_actual * n_chunk;
     let mut tokens = vec![0u8; n_tokens * 4];
     input.read_exact(&mut tokens).expect("read tokens");
-    eprintln!("build_kld_ref: read {} tokens ({} bytes)", n_tokens, tokens.len());
+    eprintln!(
+        "build_kld_ref: read {} tokens ({} bytes)",
+        n_tokens,
+        tokens.len()
+    );
 
     // 6. Open output, write hipfire β header + tokens.
     if let Some(parent) = args.output.parent() {
@@ -177,13 +231,17 @@ fn main() {
     let mut output = BufWriter::with_capacity(4 * 1024 * 1024, output_file);
     output.write_all(HIPFIRE_MAGIC).unwrap();
     output.write_all(&HIPFIRE_VERSION.to_le_bytes()).unwrap();
-    output.write_all(&(n_ctx_actual as u32).to_le_bytes()).unwrap();
+    output
+        .write_all(&(n_ctx_actual as u32).to_le_bytes())
+        .unwrap();
     output.write_all(&(n_vocab as u32).to_le_bytes()).unwrap();
     output.write_all(&(n_chunk as u32).to_le_bytes()).unwrap();
-    output.write_all(&(args.top_k as u16).to_le_bytes()).unwrap();
+    output
+        .write_all(&(args.top_k as u16).to_le_bytes())
+        .unwrap();
     output.write_all(&0u16.to_le_bytes()).unwrap(); // flags
     output.write_all(&0u32.to_le_bytes()).unwrap(); // reserved
-    // tokens: pass-through. Llama writes int32; hipfire reads as uint32 (same bit-pattern, no negatives expected for vocab IDs).
+                                                    // tokens: pass-through. Llama writes int32; hipfire reads as uint32 (same bit-pattern, no negatives expected for vocab IDs).
     output.write_all(&tokens).unwrap();
 
     // 7. Per-token loop: reduce to top-K + sum_p_residual.
@@ -229,9 +287,8 @@ fn main() {
         // position k-1 in O(n) average; first k entries are the top-K but
         // unsorted. Then sort the first k descending — O(k log k) at k=256
         // is negligible.
-        let cmp_desc = |a: &(u32, f32), b: &(u32, f32)| {
-            b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal)
-        };
+        let cmp_desc =
+            |a: &(u32, f32), b: &(u32, f32)| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal);
         if k < log_probs.len() {
             log_probs.select_nth_unstable_by(k - 1, cmp_desc);
         }
@@ -260,7 +317,10 @@ fn main() {
             let toks_per_sec = (i + 1) as f64 / elapsed;
             eprint!(
                 "\r  {:>6.2}%  ({}/{} tokens, {:.0} tok/s)   ",
-                pct, i + 1, total_scored, toks_per_sec
+                pct,
+                i + 1,
+                total_scored,
+                toks_per_sec
             );
         }
     }
@@ -278,9 +338,7 @@ fn main() {
         );
     }
 
-    let out_size = fs::metadata(&args.output)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let out_size = fs::metadata(&args.output).map(|m| m.len()).unwrap_or(0);
     let elapsed = t0.elapsed().as_secs_f64();
     eprintln!(
         "build_kld_ref: wrote {} ({} bytes = {:.2} GB) in {:.1}s",

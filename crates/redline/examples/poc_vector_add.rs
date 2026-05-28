@@ -22,15 +22,29 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 "#;
     std::fs::write("/tmp/redline_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3", "-o", "/tmp/redline_va.hsaco", "/tmp/redline_va.hip"])
-        .output().expect("hipcc");
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_va.hsaco",
+            "/tmp/redline_va.hip",
+        ])
+        .output()
+        .expect("hipcc");
     assert!(out.status.success(), "hipcc failed");
 
     // Parse
     let module = HsacoModule::from_file("/tmp/redline_va.hsaco").unwrap();
     let k = &module.kernels[0];
-    eprintln!("kernel: {} vgprs={} sgprs={} lds={} kernarg={}",
-        k.name, k.vgpr_count(), k.sgpr_count(), k.group_segment_size, k.kernarg_size);
+    eprintln!(
+        "kernel: {} vgprs={} sgprs={} lds={} kernarg={}",
+        k.name,
+        k.vgpr_count(),
+        k.sgpr_count(),
+        k.group_segment_size,
+        k.kernarg_size
+    );
 
     // Open GPU
     let dev = Device::open(None).unwrap();
@@ -75,20 +89,20 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // 1. SET_SH_REG: COMPUTE_PGM_LO/HI (code entry addr >> 8)
     pm4.push(hdr(0x76, 3)); // SET_SH_REG, 3 body dwords
-    pm4.push(0x020C);       // offset: COMPUTE_PGM_LO
+    pm4.push(0x020C); // offset: COMPUTE_PGM_LO
     pm4.push((code_va >> 8) as u32);
     pm4.push((code_va >> 40) as u32);
 
     // 2. SET_SH_REG: COMPUTE_PGM_RSRC1 + RSRC2
     pm4.push(hdr(0x76, 3));
-    pm4.push(0x0212);       // offset: COMPUTE_PGM_RSRC1
+    pm4.push(0x0212); // offset: COMPUTE_PGM_RSRC1
     pm4.push(k.pgm_rsrc1);
     pm4.push(k.pgm_rsrc2);
 
     // 2b. SET_SH_REG: COMPUTE_PGM_RSRC3 (GFX10 requires this)
     pm4.push(hdr(0x76, 2));
-    pm4.push(0x0228);       // offset: COMPUTE_PGM_RSRC3
-    pm4.push(0);             // SHARED_VGPR_CNT = 0
+    pm4.push(0x0228); // offset: COMPUTE_PGM_RSRC3
+    pm4.push(0); // SHARED_VGPR_CNT = 0
 
     // 3. SET_SH_REG: COMPUTE_TMPRING_SIZE = 0 (no scratch)
     pm4.push(hdr(0x76, 2));
@@ -97,10 +111,10 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
 
     // 4. SET_SH_REG: COMPUTE_NUM_THREAD_X/Y/Z
     pm4.push(hdr(0x76, 4));
-    pm4.push(0x0207);       // offset: COMPUTE_NUM_THREAD_X
-    pm4.push(256);           // threads per group X
-    pm4.push(1);             // Y
-    pm4.push(1);             // Z
+    pm4.push(0x0207); // offset: COMPUTE_NUM_THREAD_X
+    pm4.push(256); // threads per group X
+    pm4.push(1); // Y
+    pm4.push(1); // Z
 
     // 5. SET_SH_REG: COMPUTE_RESOURCE_LIMITS = 0
     pm4.push(hdr(0x76, 2));
@@ -112,10 +126,13 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
     //   s[0:3] = private segment buffer (4 SGPRs = 0)
     //   s[4:5] = kernarg pointer
     pm4.push(hdr(0x76, 7)); // offset + 6 values
-    pm4.push(0x0240);       // COMPUTE_USER_DATA_0
-    pm4.push(0); pm4.push(0); pm4.push(0); pm4.push(0); // private seg buf (unused)
-    pm4.push(ka_buf.gpu_addr as u32);                     // kernarg lo
-    pm4.push((ka_buf.gpu_addr >> 32) as u32);              // kernarg hi
+    pm4.push(0x0240); // COMPUTE_USER_DATA_0
+    pm4.push(0);
+    pm4.push(0);
+    pm4.push(0);
+    pm4.push(0); // private seg buf (unused)
+    pm4.push(ka_buf.gpu_addr as u32); // kernarg lo
+    pm4.push((ka_buf.gpu_addr >> 32) as u32); // kernarg hi
 
     // 7. DISPATCH_DIRECT
     let groups = (n + 255) / 256;
@@ -135,11 +152,17 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
     dev.upload(&ib_buf, &ib_bytes).unwrap();
 
     let queue = ComputeQueue::new(&dev).unwrap();
-    match queue.submit_and_wait(&dev, &ib_buf, pm4.len() as u32,
-        &[&ib_buf, &code_buf, &a_buf, &b_buf, &c_buf, &ka_buf])
-    {
+    match queue.submit_and_wait(
+        &dev,
+        &ib_buf,
+        pm4.len() as u32,
+        &[&ib_buf, &code_buf, &a_buf, &b_buf, &c_buf, &ka_buf],
+    ) {
         Ok(()) => eprintln!("GPU returned"),
-        Err(e) => { eprintln!("FAILED: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("FAILED: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Verify
@@ -150,7 +173,9 @@ extern "C" __global__ void vector_add(const float* a, const float* b, float* c, 
     let mut bad = 0;
     for i in 0..n as usize {
         if (c[i] - expected[i]).abs() > 0.001 {
-            if bad < 5 { eprintln!("  [{i}] got={} exp={}", c[i], expected[i]); }
+            if bad < 5 {
+                eprintln!("  [{i}] got={} exp={}", c[i], expected[i]);
+            }
             bad += 1;
         }
     }

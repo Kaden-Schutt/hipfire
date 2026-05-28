@@ -50,8 +50,16 @@ enum Want {
 
 #[derive(Debug, Clone)]
 enum OwnedEvent {
-    Committed { tok_id: u32, pos: usize, t_ms: u64 },
-    Token { text: String, t_ms: u64, synthetic: bool },
+    Committed {
+        tok_id: u32,
+        pos: usize,
+        t_ms: u64,
+    },
+    Token {
+        text: String,
+        t_ms: u64,
+        synthetic: bool,
+    },
     Done {
         total_tokens: usize,
         total_visible_bytes: usize,
@@ -267,8 +275,7 @@ pub struct SelfCheckReport {
 
 impl SelfCheckReport {
     pub fn ok(&self) -> bool {
-        self.phase_a.iter().all(|(_, ok, _)| *ok)
-            && self.phase_b.iter().all(|(_, ok, _)| *ok)
+        self.phase_a.iter().all(|(_, ok, _)| *ok) && self.phase_b.iter().all(|(_, ok, _)| *ok)
     }
 }
 
@@ -401,20 +408,12 @@ pub fn run_phase_b() -> Vec<(String, bool, String)> {
         let finals = replay(&mut bank, &events);
         let mut misses: Vec<String> = Vec::new();
         for (det_name, want) in fx.expectations {
-            let verdict = finals
-                .iter()
-                .find(|(n, _)| *n == *det_name)
-                .map(|(_, v)| v);
+            let verdict = finals.iter().find(|(n, _)| *n == *det_name).map(|(_, v)| v);
             match verdict {
                 None => misses.push(format!("{} not in bank", det_name)),
                 Some(v) => {
                     if !evaluate_expectation(v, *want) {
-                        misses.push(format!(
-                            "{}: want {:?}, got {}",
-                            det_name,
-                            want,
-                            v.label()
-                        ));
+                        misses.push(format!("{}: want {:?}, got {}", det_name, want, v.label()));
                     }
                 }
             }
@@ -471,14 +470,8 @@ pub fn parse_jsonl_events(jsonl: &str) -> Vec<OwnedEventPub> {
                         .get("total_visible_bytes")
                         .and_then(|x| x.as_u64())
                         .unwrap_or(0) as usize,
-                    wall_ms: v
-                        .get("wall_ms")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
-                    ttft_ms: v
-                        .get("ttft_ms")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0),
+                    wall_ms: v.get("wall_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                    ttft_ms: v.get("ttft_ms").and_then(|x| x.as_u64()).unwrap_or(0),
                 }),
                 _ => None,
             }
@@ -490,7 +483,11 @@ pub fn parse_jsonl_events(jsonl: &str) -> Vec<OwnedEventPub> {
 /// streams without going through JSONL.
 #[derive(Debug, Clone)]
 pub enum OwnedEventPub {
-    Committed { tok_id: u32, pos: usize, t_ms: u64 },
+    Committed {
+        tok_id: u32,
+        pos: usize,
+        t_ms: u64,
+    },
     Token {
         text: String,
         t_ms: u64,

@@ -45,7 +45,10 @@ pub fn parse_bench_summary(text: &str) -> Result<BTreeMap<String, f64>, String> 
     }
     // Also merge PREFILL_SUMMARY fields if present (latency split metrics
     // emitted by bench_qwen35_mq4 starting 2026-05-14).
-    if let Some(prefill_line) = text.lines().find(|line| line.starts_with("PREFILL_SUMMARY")) {
+    if let Some(prefill_line) = text
+        .lines()
+        .find(|line| line.starts_with("PREFILL_SUMMARY"))
+    {
         for cap in pair_re.captures_iter(prefill_line) {
             let key = cap[1].to_string();
             if let Ok(v) = cap[2].parse::<f64>() {
@@ -74,13 +77,18 @@ pub fn parse_dflash_summary(text: &str) -> Result<BTreeMap<String, Value>, Strin
         }
     }
 
-    let emitted_re = Regex::new(
-        r"emitted:\s*([0-9]+)\s+tokens\s+in\s+([0-9.]+)s\s+\(([0-9.]+)\s+tok/s\)",
-    )
-    .expect("valid regex");
+    let emitted_re =
+        Regex::new(r"emitted:\s*([0-9]+)\s+tokens\s+in\s+([0-9.]+)s\s+\(([0-9.]+)\s+tok/s\)")
+            .expect("valid regex");
     if let Some(cap) = emitted_re.captures(text) {
-        metrics.insert("emitted_tokens".to_string(), json!(cap[1].parse::<u64>().unwrap_or(0)));
-        metrics.insert("elapsed_s".to_string(), json!(cap[2].parse::<f64>().unwrap_or(0.0)));
+        metrics.insert(
+            "emitted_tokens".to_string(),
+            json!(cap[1].parse::<u64>().unwrap_or(0)),
+        );
+        metrics.insert(
+            "elapsed_s".to_string(),
+            json!(cap[2].parse::<f64>().unwrap_or(0.0)),
+        );
         metrics
             .entry("decode_tok_s".to_string())
             .or_insert_with(|| json!(cap[3].parse::<f64>().unwrap_or(0.0)));
@@ -89,7 +97,10 @@ pub fn parse_dflash_summary(text: &str) -> Result<BTreeMap<String, Value>, Strin
     if !metrics.contains_key("tau") {
         let tau_re = Regex::new(r"(?:tau|τ)=([0-9.]+)").expect("valid regex");
         if let Some(cap) = tau_re.captures(text) {
-            metrics.insert("tau".to_string(), json!(cap[1].parse::<f64>().unwrap_or(0.0)));
+            metrics.insert(
+                "tau".to_string(),
+                json!(cap[1].parse::<f64>().unwrap_or(0.0)),
+            );
         }
     }
 
@@ -129,16 +140,21 @@ pub fn parse_profile_sections(text: &str) -> BTreeMap<String, Vec<Value>> {
             continue;
         }
         let Some(section) = current else { continue };
-        let Some(cap) = line_re.captures(line) else { continue };
-        sections.entry(section.to_string()).or_default().push(json!({
-            "name": &cap[1],
-            "calls": cap[2].parse::<u64>().unwrap_or(0),
-            "total_ms": cap[3].parse::<f64>().unwrap_or(0.0),
-            "avg_us": cap[4].parse::<f64>().unwrap_or(0.0),
-            "pct": cap[5].parse::<f64>().unwrap_or(0.0),
-            "gib_s": cap[6].parse::<f64>().unwrap_or(0.0),
-            "op": classify_kernel_op(&cap[1]),
-        }));
+        let Some(cap) = line_re.captures(line) else {
+            continue;
+        };
+        sections
+            .entry(section.to_string())
+            .or_default()
+            .push(json!({
+                "name": &cap[1],
+                "calls": cap[2].parse::<u64>().unwrap_or(0),
+                "total_ms": cap[3].parse::<f64>().unwrap_or(0.0),
+                "avg_us": cap[4].parse::<f64>().unwrap_or(0.0),
+                "pct": cap[5].parse::<f64>().unwrap_or(0.0),
+                "gib_s": cap[6].parse::<f64>().unwrap_or(0.0),
+                "op": classify_kernel_op(&cap[1]),
+            }));
     }
     sections
 }
@@ -186,10 +202,9 @@ pub fn bench_rows_from_output(text: &str) -> Result<Vec<AtlasRow>, String> {
     let profiles = parse_profile_sections(text);
     let mut prefill = AtlasRow::new("prefill", "ar");
     prefill.shape_bucket = "parsed_bench".to_string();
-    prefill.metrics.insert(
-        "prefill_tok_s".to_string(),
-        json!(summary["prefill_tok_s"]),
-    );
+    prefill
+        .metrics
+        .insert("prefill_tok_s".to_string(), json!(summary["prefill_tok_s"]));
     // Carry the latency split if present.
     for k in [
         "prefill_tok_s_kernel",
@@ -258,7 +273,8 @@ mod tests {
 
     #[test]
     fn parses_dflash_summary() {
-        let out = "decode_tok_s: 88.5\ndecode_tau: 7.25\nemitted: 120 tokens in 1.4s (85.7 tok/s)\n";
+        let out =
+            "decode_tok_s: 88.5\ndecode_tau: 7.25\nemitted: 120 tokens in 1.4s (85.7 tok/s)\n";
         let values = parse_dflash_summary(out).unwrap();
         assert_eq!(values["tau"].as_f64().unwrap(), 7.25);
         assert_eq!(values["emitted_tokens"].as_u64().unwrap(), 120);

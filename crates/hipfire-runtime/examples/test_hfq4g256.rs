@@ -33,22 +33,47 @@ fn main() {
 
     // Quantize to HFQ4-G256
     let quantized = quantize_hfq4g256(&f32_weights);
-    eprintln!("Quantized {} floats → {} bytes", f32_weights.len(), quantized.len());
+    eprintln!(
+        "Quantized {} floats → {} bytes",
+        f32_weights.len(),
+        quantized.len()
+    );
 
     // Verify quantized layout
     for row in 0..m {
         let off = row * 136;
-        let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-        let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
+        let scale = f32::from_le_bytes([
+            quantized[off],
+            quantized[off + 1],
+            quantized[off + 2],
+            quantized[off + 3],
+        ]);
+        let zero = f32::from_le_bytes([
+            quantized[off + 4],
+            quantized[off + 5],
+            quantized[off + 6],
+            quantized[off + 7],
+        ]);
         eprintln!("Row {}: scale={:.6}, zero={:.6}", row, scale, zero);
 
         // CPU dequant first 8 weights
         for i in 0..8 {
             let byte_idx = i / 2;
-            let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
+            let nibble = if i % 2 == 0 {
+                quantized[off + 8 + byte_idx] & 0xF
+            } else {
+                quantized[off + 8 + byte_idx] >> 4
+            };
             let dequant = scale * nibble as f32 + zero;
-            eprintln!("  w[{}][{}]: orig={:.4}, q={}, dequant={:.4}, err={:.4}",
-                row, i, f32_weights[row * k + i], nibble, dequant, (dequant - f32_weights[row * k + i]).abs());
+            eprintln!(
+                "  w[{}][{}]: orig={:.4}, q={}, dequant={:.4}, err={:.4}",
+                row,
+                i,
+                f32_weights[row * k + i],
+                nibble,
+                dequant,
+                (dequant - f32_weights[row * k + i]).abs()
+            );
         }
     }
 
@@ -69,21 +94,40 @@ fn main() {
     let mut y_cpu_dequant = vec![0.0f32; m];
     for row in 0..m {
         let off = row * 136;
-        let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-        let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
+        let scale = f32::from_le_bytes([
+            quantized[off],
+            quantized[off + 1],
+            quantized[off + 2],
+            quantized[off + 3],
+        ]);
+        let zero = f32::from_le_bytes([
+            quantized[off + 4],
+            quantized[off + 5],
+            quantized[off + 6],
+            quantized[off + 7],
+        ]);
         for i in 0..k {
             let byte_idx = i / 2;
-            let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
+            let nibble = if i % 2 == 0 {
+                quantized[off + 8 + byte_idx] & 0xF
+            } else {
+                quantized[off + 8 + byte_idx] >> 4
+            };
             let w = scale * nibble as f32 + zero;
             y_cpu_dequant[row] += w * x[i];
         }
     }
 
-    eprintln!("\n{:<6} {:>12} {:>12} {:>12} {:>12}", "Row", "F32 ref", "CPU dequant", "GPU dequant", "GPU-CPU err");
+    eprintln!(
+        "\n{:<6} {:>12} {:>12} {:>12} {:>12}",
+        "Row", "F32 ref", "CPU dequant", "GPU dequant", "GPU-CPU err"
+    );
     for row in 0..m {
         let err = (y_gpu[row] - y_cpu_dequant[row]).abs();
-        eprintln!("{:<6} {:>12.4} {:>12.4} {:>12.4} {:>12.6}",
-            row, y_ref[row], y_cpu_dequant[row], y_gpu[row], err);
+        eprintln!(
+            "{:<6} {:>12.4} {:>12.4} {:>12.4} {:>12.6}",
+            row, y_ref[row], y_cpu_dequant[row], y_gpu[row], err
+        );
     }
 
     // Now test embedding lookup
@@ -92,24 +136,46 @@ fn main() {
     let d_out = gpu.zeros(&[k], rdna_compute::DType::F32).unwrap();
 
     // Lookup row 2
-    gpu.embedding_lookup_hfq4g256(&d_embd, &d_out, 2, k).unwrap();
+    gpu.embedding_lookup_hfq4g256(&d_embd, &d_out, 2, k)
+        .unwrap();
     let mut embd_gpu = vec![0.0f32; k];
-    let embd_bytes = unsafe { std::slice::from_raw_parts_mut(embd_gpu.as_mut_ptr() as *mut u8, k * 4) };
+    let embd_bytes =
+        unsafe { std::slice::from_raw_parts_mut(embd_gpu.as_mut_ptr() as *mut u8, k * 4) };
     gpu.hip.memcpy_dtoh(embd_bytes, &d_out.buf).unwrap();
 
     // Compare first 16 values
     let off = 2 * 136;
-    let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-    let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
-    eprintln!("{:<6} {:>10} {:>10} {:>10}", "Idx", "Original", "GPU", "Error");
+    let scale = f32::from_le_bytes([
+        quantized[off],
+        quantized[off + 1],
+        quantized[off + 2],
+        quantized[off + 3],
+    ]);
+    let zero = f32::from_le_bytes([
+        quantized[off + 4],
+        quantized[off + 5],
+        quantized[off + 6],
+        quantized[off + 7],
+    ]);
+    eprintln!(
+        "{:<6} {:>10} {:>10} {:>10}",
+        "Idx", "Original", "GPU", "Error"
+    );
     let mut max_err = 0.0f32;
     for i in 0..16 {
         let byte_idx = i / 2;
-        let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
+        let nibble = if i % 2 == 0 {
+            quantized[off + 8 + byte_idx] & 0xF
+        } else {
+            quantized[off + 8 + byte_idx] >> 4
+        };
         let expected = scale * nibble as f32 + zero;
         let err = (embd_gpu[i] - expected).abs();
         max_err = max_err.max(err);
-        eprintln!("{:<6} {:>10.4} {:>10.4} {:>10.6}", i, expected, embd_gpu[i], err);
+        eprintln!(
+            "{:<6} {:>10.4} {:>10.4} {:>10.6}",
+            i, expected, embd_gpu[i], err
+        );
     }
     eprintln!("Max embedding error: {:.6}", max_err);
 }
@@ -141,8 +207,16 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
         for i in 0..128 {
             let idx_lo = 2 * i;
             let idx_hi = 2 * i + 1;
-            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
-            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;

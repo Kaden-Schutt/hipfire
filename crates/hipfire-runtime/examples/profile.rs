@@ -5,7 +5,7 @@
 //! Profile: measure time breakdown within a single forward pass.
 
 use hipfire_runtime::gguf::GgufFile;
-use hipfire_runtime::llama::{self, LlamaConfig, KvCache};
+use hipfire_runtime::llama::{self, KvCache, LlamaConfig};
 use std::path::Path;
 use std::time::Instant;
 
@@ -16,7 +16,14 @@ fn main() {
     let mut gpu = rdna_compute::Gpu::init().unwrap();
     let weights = llama::load_weights(&gguf, &config, &mut gpu).unwrap();
     let kv_seq_len = config.max_seq_len.min(2048);
-    let mut kv_cache = KvCache::new_gpu(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq_len).unwrap();
+    let mut kv_cache = KvCache::new_gpu(
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq_len,
+    )
+    .unwrap();
 
     // Warmup
     let _ = llama::forward(&mut gpu, &weights, &config, 1, 0, &mut kv_cache);
@@ -52,7 +59,9 @@ fn main() {
     // Count allocs per forward pass: ~20 per layer × 22 layers + a few global = ~450
     let allocs_per_fwd = 20 * config.n_layers + 5;
     let malloc_total_ms = malloc_us * allocs_per_fwd as f64 / 1000.0;
-    eprintln!("  Estimated malloc overhead per forward: {malloc_total_ms:.1}ms ({allocs_per_fwd} allocs)");
+    eprintln!(
+        "  Estimated malloc overhead per forward: {malloc_total_ms:.1}ms ({allocs_per_fwd} allocs)"
+    );
 
     // 2. Embedding download (the full vocab table)
     let t = Instant::now();
@@ -60,7 +69,11 @@ fn main() {
         let _ = gpu.download_f32(&weights.token_embd);
     }
     let embd_ms = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
-    eprintln!("Embedding download ({}MB): {:.1}ms", config.vocab_size * dim * 4 / 1_000_000, embd_ms);
+    eprintln!(
+        "Embedding download ({}MB): {:.1}ms",
+        config.vocab_size * dim * 4 / 1_000_000,
+        embd_ms
+    );
 
     // 3. Single GEMV (quantized)
     let tmp = gpu.zeros(&[dim], rdna_compute::DType::F32).unwrap();
@@ -85,9 +98,16 @@ fn main() {
         let _ = gpu.download_f32(&k_buf);
     }
     let dl_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
-    eprintln!("Q+K download ({:.0}KB): {:.2}ms", (q_dim + kv_dim) as f64 * 4.0 / 1024.0, dl_ms);
+    eprintln!(
+        "Q+K download ({:.0}KB): {:.2}ms",
+        (q_dim + kv_dim) as f64 * 4.0 / 1024.0,
+        dl_ms
+    );
     let rope_dl_total = dl_ms * config.n_layers as f64;
-    eprintln!("  Download total per forward (×{}): {:.1}ms", config.n_layers, rope_dl_total);
+    eprintln!(
+        "  Download total per forward (×{}): {:.1}ms",
+        config.n_layers, rope_dl_total
+    );
 
     // 5. RoPE CPU computation
     let mut q_data = vec![0.1f32; q_dim];
@@ -107,9 +127,16 @@ fn main() {
         gpu.free_tensor(up).unwrap();
     }
     let upload_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
-    eprintln!("Q upload+free ({:.0}KB): {:.2}ms", q_dim as f64 * 4.0 / 1024.0, upload_ms);
+    eprintln!(
+        "Q upload+free ({:.0}KB): {:.2}ms",
+        q_dim as f64 * 4.0 / 1024.0,
+        upload_ms
+    );
     let upload_total = upload_ms * config.n_layers as f64;
-    eprintln!("  Upload total per forward (×{}): {:.1}ms", config.n_layers, upload_total);
+    eprintln!(
+        "  Upload total per forward (×{}): {:.1}ms",
+        config.n_layers, upload_total
+    );
 
     // 7. KV cache write (memcpy_htod_offset)
     let v_data = vec![0.1f32; kv_dim];
@@ -118,17 +145,29 @@ fn main() {
         kv_cache.store_kv_pub(&gpu, 0, 5, &k_data, &v_data).unwrap();
     }
     let kv_ms = t.elapsed().as_secs_f64() * 1000.0 / 100.0;
-    eprintln!("KV cache write ({:.0}KB): {:.2}ms", kv_dim as f64 * 4.0 * 2.0 / 1024.0, kv_ms);
+    eprintln!(
+        "KV cache write ({:.0}KB): {:.2}ms",
+        kv_dim as f64 * 4.0 * 2.0 / 1024.0,
+        kv_ms
+    );
 
     // Summary
     eprintln!("\n=== Time Budget Estimate (per forward pass) ===");
     eprintln!("  Embedding download:  {embd_ms:.1}ms");
     eprintln!("  GEMV total:          {gemv_est_ms:.1}ms");
     eprintln!("  Q/K/V download:      {rope_dl_total:.1}ms");
-    eprintln!("  RoPE CPU:            {:.1}ms", rope_us * config.n_layers as f64 / 1000.0);
+    eprintln!(
+        "  RoPE CPU:            {:.1}ms",
+        rope_us * config.n_layers as f64 / 1000.0
+    );
     eprintln!("  Q upload:            {upload_total:.1}ms");
     eprintln!("  hipMalloc overhead:  {malloc_total_ms:.1}ms");
-    let accounted = embd_ms + gemv_est_ms + rope_dl_total + rope_us * config.n_layers as f64 / 1000.0 + upload_total + malloc_total_ms;
+    let accounted = embd_ms
+        + gemv_est_ms
+        + rope_dl_total
+        + rope_us * config.n_layers as f64 / 1000.0
+        + upload_total
+        + malloc_total_ms;
     eprintln!("  Accounted:           {accounted:.1}ms");
     eprintln!("  Actual:              {avg:.1}ms");
     eprintln!("  Unaccounted:         {:.1}ms", avg - accounted);

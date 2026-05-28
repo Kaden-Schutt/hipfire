@@ -78,8 +78,8 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35;
+    use hipfire_runtime::hfq::HfqFile;
     use std::path::Path;
 
     // ── CLI parsing ──────────────────────────────────────────────────────
@@ -91,7 +91,9 @@ fn main() {
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --model <path>       Model file (.mq4 / .hfq), required");
-        eprintln!("  --stage <name>       site-scan (default) | channel-map | layer-sweep | screen");
+        eprintln!(
+            "  --stage <name>       site-scan (default) | channel-map | layer-sweep | screen"
+        );
         eprintln!("  --batch <N>          Synthetic activation batch size (default: 128)");
         eprintln!("  --threshold <F>      Abs error threshold for flagging (default: 0.01)");
         eprintln!("  --layer <N>          Filter to layer N (channel-map, layer-sweep)");
@@ -155,7 +157,9 @@ fn main() {
     let arch = gpu.arch.clone();
     eprintln!("GPU: {arch}");
 
-    let mmq_archs = ["gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152"];
+    let mmq_archs = [
+        "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152",
+    ];
     if !mmq_archs.contains(&arch.as_str()) {
         eprintln!(
             "SKIP: MMQ requires RDNA3/3.5 (gfx1100..gfx1103, gfx1150, gfx1151, gfx1152). \
@@ -182,7 +186,15 @@ fn main() {
         }
         "channel-map" => {
             let site = site_filter.expect("--site <name> required for channel-map");
-            run_channel_map(&mut gpu, &weights, &config, batch_size, threshold, &site, layer_filter);
+            run_channel_map(
+                &mut gpu,
+                &weights,
+                &config,
+                batch_size,
+                threshold,
+                &site,
+                layer_filter,
+            );
         }
         "layer-sweep" => {
             let site = site_filter.expect("--site <name> required for layer-sweep");
@@ -192,7 +204,9 @@ fn main() {
             run_screen(&mut gpu, &weights, &config);
         }
         other => {
-            eprintln!("Unknown stage: {other}  (use site-scan | channel-map | layer-sweep | screen)");
+            eprintln!(
+                "Unknown stage: {other}  (use site-scan | channel-map | layer-sweep | screen)"
+            );
             std::process::exit(1);
         }
     }
@@ -322,37 +336,37 @@ fn get_weight_for_site<'a>(
     use hipfire_arch_qwen35::qwen35::LayerWeights;
     match layer {
         LayerWeights::DeltaNet(l) => match site_name {
-            "qkvza.qkv"   => Some(&l.wqkv),
-            "qkvza.z"     => Some(&l.wz),
-            "qkvza.beta"  => Some(&l.w_beta),
+            "qkvza.qkv" => Some(&l.wqkv),
+            "qkvza.z" => Some(&l.wz),
+            "qkvza.beta" => Some(&l.w_beta),
             "qkvza.alpha" => Some(&l.w_alpha),
             "gate_up.gate" => Some(&l.w_gate),
-            "gate_up.up"   => Some(&l.w_up),
-            "residual"    => Some(&l.wo),
+            "gate_up.up" => Some(&l.w_up),
+            "residual" => Some(&l.wo),
             _ => None,
         },
         LayerWeights::FullAttn(l) => match site_name {
-            "qkv.q"       => Some(&l.wq),
-            "qkv.k"       => Some(&l.wk),
-            "qkv.v"       => Some(&l.wv),
+            "qkv.q" => Some(&l.wq),
+            "qkv.k" => Some(&l.wk),
+            "qkv.v" => Some(&l.wv),
             "gate_up.gate" => Some(&l.w_gate),
-            "gate_up.up"   => Some(&l.w_up),
-            "residual"    => Some(&l.wo),
+            "gate_up.up" => Some(&l.w_up),
+            "residual" => Some(&l.wo),
             _ => None,
         },
         // MoE variants: same attention sites, no FFN sites (MoE uses routed experts)
         LayerWeights::DeltaNetMoe(l) => match site_name {
-            "qkvza.qkv"   => Some(&l.wqkv),
-            "qkvza.z"     => Some(&l.wz),
-            "qkvza.beta"  => Some(&l.w_beta),
+            "qkvza.qkv" => Some(&l.wqkv),
+            "qkvza.z" => Some(&l.wz),
+            "qkvza.beta" => Some(&l.w_beta),
             "qkvza.alpha" => Some(&l.w_alpha),
-            "residual"    => Some(&l.wo),
+            "residual" => Some(&l.wo),
             _ => None,
         },
         LayerWeights::FullAttnMoe(l) => match site_name {
-            "qkv.q"    => Some(&l.wq),
-            "qkv.k"    => Some(&l.wk),
-            "qkv.v"    => Some(&l.wv),
+            "qkv.q" => Some(&l.wq),
+            "qkv.k" => Some(&l.wk),
+            "qkv.v" => Some(&l.wv),
             "residual" => Some(&l.wo),
             _ => None,
         },
@@ -450,12 +464,10 @@ fn compare_residual_raw(
 
     // ── MMQ path ─────────────────────────────────────────────────────────
     let r_mmq = if r_wmma.is_ok() {
-        let xq: *mut c_void = gpu
-            .ensure_q8_1_mmq_x(&x, batch_size, k)
-            .map_err(|e| {
-                gpu.capture_mode = false;
-                format!("ensure_q8_1_mmq_x: {e}")
-            })?;
+        let xq: *mut c_void = gpu.ensure_q8_1_mmq_x(&x, batch_size, k).map_err(|e| {
+            gpu.capture_mode = false;
+            format!("ensure_q8_1_mmq_x: {e}")
+        })?;
         gpu.gemm_hfq4g256_mmq_set_prequant(&weight.buf, xq, &y_mmq_buf, m, k, batch_size)
     } else {
         Ok(())
@@ -519,7 +531,11 @@ fn per_row_diff(y_ref: &[f32], y_mmq: &[f32], m: usize, batch_size: usize) -> Ve
         })
         .collect();
 
-    rows.sort_by(|a, b| b.max_err.partial_cmp(&a.max_err).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.max_err
+            .partial_cmp(&a.max_err)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows
 }
 
@@ -560,7 +576,10 @@ fn run_site_scan(
                 Some(w) => w,
                 None => continue,
             };
-            if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+            if !matches!(
+                weight.gpu_dtype,
+                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+            ) {
                 continue;
             }
             let m = weight.m;
@@ -568,7 +587,9 @@ fn run_site_scan(
             let seed = seed_for_site(site_name);
             let x_data = synth_activations(batch_size, k, seed);
 
-            match compare_residual(gpu, weight, &x_data, m, k, batch_size, site_name, layer_idx, threshold) {
+            match compare_residual(
+                gpu, weight, &x_data, m, k, batch_size, site_name, layer_idx, threshold,
+            ) {
                 Ok(stats) => {
                     stats.print();
                     if stats.bad_count > 0 {
@@ -577,16 +598,18 @@ fn run_site_scan(
                     all_stats.push(stats);
                 }
                 Err(e) => {
-                    eprintln!(
-                        "  layer={layer_idx} site={site_name}: ERROR — {e}"
-                    );
+                    eprintln!("  layer={layer_idx} site={site_name}: ERROR — {e}");
                 }
             }
         }
     }
 
     // ── Top-10 worst sites ───────────────────────────────────────────────
-    all_stats.sort_by(|a, b| b.max_err.partial_cmp(&a.max_err).unwrap_or(std::cmp::Ordering::Equal));
+    all_stats.sort_by(|a, b| {
+        b.max_err
+            .partial_cmp(&a.max_err)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     eprintln!("\n--- Top-10 worst sites by max_err ---");
     SiteStats::header();
     for s in all_stats.iter().take(10) {
@@ -634,7 +657,10 @@ fn run_channel_map(
                 continue;
             }
         };
-        if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+        if !matches!(
+            weight.gpu_dtype,
+            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+        ) {
             eprintln!("  layer={layer_idx}: site '{site_name}' not HFQ4G256 (skipped)");
             continue;
         }
@@ -697,7 +723,10 @@ fn run_layer_sweep(
             Some(w) => w,
             None => continue,
         };
-        if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+        if !matches!(
+            weight.gpu_dtype,
+            rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+        ) {
             continue;
         }
 
@@ -706,7 +735,9 @@ fn run_layer_sweep(
         let seed = seed_for_site(site_name);
         let x_data = synth_activations(batch_size, k, seed);
 
-        match compare_residual(gpu, weight, &x_data, m, k, batch_size, site_name, layer_idx, threshold) {
+        match compare_residual(
+            gpu, weight, &x_data, m, k, batch_size, site_name, layer_idx, threshold,
+        ) {
             Ok(stats) => {
                 stats.print();
                 all_stats.push(stats);
@@ -725,7 +756,11 @@ fn run_layer_sweep(
     // Identify worst layer
     let worst = all_stats
         .iter()
-        .max_by(|a, b| a.max_err.partial_cmp(&b.max_err).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.max_err
+                .partial_cmp(&b.max_err)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .unwrap();
 
     eprintln!("\n--- Summary ---");
@@ -768,15 +803,20 @@ fn run_screen(
             };
             // MMQ screening only applies to HFQ4G256 weights — other formats
             // (MQ3, MQ2, HFQ6) use different kernels and would OOB. See PR #106.
-            if !matches!(weight.gpu_dtype, rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256) {
+            if !matches!(
+                weight.gpu_dtype,
+                rdna_compute::DType::HFQ4G256 | rdna_compute::DType::MQ4G256
+            ) {
                 continue;
             }
             let safe = gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k);
             if safe {
                 n_safe += 1;
             } else {
-                eprintln!("  layer={layer_idx} site={site_name} m={} k={} → UNSAFE",
-                    weight.m, weight.k);
+                eprintln!(
+                    "  layer={layer_idx} site={site_name} m={} k={} → UNSAFE",
+                    weight.m, weight.k
+                );
                 n_unsafe += 1;
             }
         }
@@ -787,7 +827,9 @@ fn run_screen(
     eprintln!("  Unsafe: {n_unsafe}");
     eprintln!("  Total: {}", n_safe + n_unsafe);
     if n_unsafe > 0 {
-        eprintln!("  With HIPFIRE_MMQ_SCREEN=1, these {n_unsafe} weight(s) will fall back to WMMA.");
+        eprintln!(
+            "  With HIPFIRE_MMQ_SCREEN=1, these {n_unsafe} weight(s) will fall back to WMMA."
+        );
     } else {
         eprintln!("  All weights pass screening — MMQ is safe for this model.");
     }

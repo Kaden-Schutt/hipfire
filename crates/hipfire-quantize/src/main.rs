@@ -23,8 +23,10 @@ use std::sync::OnceLock;
 
 // imatrix lookup populated once in main() when --imatrix is supplied; keyed by
 // ggml-style tensor name (see safetensors_to_ggml_name), value is the
-// per-input-channel `Σ_token act²` vector. Consumed by AWQ pre-scaling to
-// derive per-channel `RMS_act` for the smoothing-quant scale.
+// per-input-channel `Σ_token act²` vector. MoE imatrix tensors carry one
+// column per expert; those columns are summed into a layer-level vector because
+// the current MoE runtime rotates each routed activation once per layer and
+// uses one representative AWQ scale for the indexed expert kernels.
 static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 
 // Phase A Stage A — AWQ (Activation-aware Weight Quantization, Lin et al
@@ -62,13 +64,13 @@ static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 // AWQ at alpha=0.55; --awq <value> sets explicit alpha. Alpha=0 disables;
 // alpha=1 is pure activation-magnitude scaling (no smoothing).
 static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
-static AWQ_FORMULA: OnceLock<bool> = OnceLock::new();  // true = autoawq formula, false/unset = paper
-// AWQ scope. Default (None or true) = F1-only (input-side projections only — q/k/v,
-// gate/up, in_proj_*, router). F2 (false) extends to output-side (o_proj/down_proj/
-// out_proj) but empirically regresses KLD when stacked with AWQ-aware GPTQ:
-// v3 (F1) = 0.1257 vs F2 = 0.1386 on 9B Qwen3.5 c512 q8 prefill. F1 is the v3 winner
-// recipe and the production default. Opt into F2 via --awq-scope f2 or
-// HIPFIRE_AWQ_F1_ONLY=0 env-var override.
+static AWQ_FORMULA: OnceLock<bool> = OnceLock::new(); // true = autoawq formula, false/unset = paper
+                                                      // AWQ scope. Default (None or true) = F1-only (input-side projections only — q/k/v,
+                                                      // gate/up, in_proj_*, router). F2 (false) extends to output-side (o_proj/down_proj/
+                                                      // out_proj) but empirically regresses KLD when stacked with AWQ-aware GPTQ:
+                                                      // v3 (F1) = 0.1257 vs F2 = 0.1386 on 9B Qwen3.5 c512 q8 prefill. F1 is the v3 winner
+                                                      // recipe and the production default. Opt into F2 via --awq-scope f2 or
+                                                      // HIPFIRE_AWQ_F1_ONLY=0 env-var override.
 static AWQ_SCOPE_F1: OnceLock<bool> = OnceLock::new();
 
 // Phase A Stage B — GPTQ on MQ4G256. When `--gptq <hessian-path>` is set,
@@ -167,7 +169,9 @@ impl SafetensorsFile {
             use std::os::unix::io::AsRawFd;
             // POSIX_FADV_DONTNEED = 4
             unsafe {
-                extern "C" { fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32; }
+                extern "C" {
+                    fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+                }
                 posix_fadvise(self._file.as_raw_fd(), start as i64, len as i64, 4);
             }
         }
@@ -216,10 +220,15 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1F) as u32;
     let frac = (bits & 0x3FF) as u32;
     if exp == 0 {
-        if frac == 0 { return f32::from_bits(sign << 31); }
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        }
         let mut e = 0i32;
         let mut f = frac;
-        while f & 0x400 == 0 { f <<= 1; e -= 1; }
+        while f & 0x400 == 0 {
+            f <<= 1;
+            e -= 1;
+        }
         f &= 0x3FF;
         let exp32 = (127 - 15 + 1 + e) as u32;
         return f32::from_bits((sign << 31) | (exp32 << 23) | (f << 13));
@@ -245,9 +254,13 @@ fn f32_to_f16(val: f32) -> u16 {
         return ((sign << 15) | (0x1F << 10) | f16_frac) as u16;
     }
     let new_exp = exp - 127 + 15;
-    if new_exp >= 31 { return ((sign << 15) | (0x1F << 10)) as u16; }
+    if new_exp >= 31 {
+        return ((sign << 15) | (0x1F << 10)) as u16;
+    }
     if new_exp <= 0 {
-        if new_exp < -10 { return (sign << 15) as u16; }
+        if new_exp < -10 {
+            return (sign << 15) as u16;
+        }
         let f = frac | 0x800000;
         let shift = (1 - new_exp + 13) as u32;
         return ((sign << 15) | (f >> shift)) as u16;
@@ -258,21 +271,18 @@ fn f32_to_f16(val: f32) -> u16 {
 /// Convert raw tensor bytes to F32 based on dtype string
 fn to_f32(data: &[u8], dtype: &str) -> Vec<f32> {
     match dtype {
-        "F16" => {
-            data.chunks_exact(2)
-                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect()
-        }
-        "BF16" => {
-            data.chunks_exact(2)
-                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-                .collect()
-        }
-        "F32" => {
-            data.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect()
-        }
+        "F16" => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "BF16" => data
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        "F32" => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         other => panic!("unsupported dtype: {other}"),
     }
 }
@@ -308,7 +318,11 @@ fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
         let actual_len = end - start;
         for i in 0..32 {
             let lo_val = if i < actual_len { group[i] } else { min_val };
-            let hi_val = if 32 + i < actual_len { group[32 + i] } else { min_val };
+            let hi_val = if 32 + i < actual_len {
+                group[32 + i]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -344,7 +358,9 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
         for sb in 0..8 {
             let start = sb_start + sb * 32;
             let end = (start + 32).min(sb_end);
-            if start >= sb_end { break; }
+            if start >= sb_end {
+                break;
+            }
             let group = &f32_data[start..end];
 
             let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -359,7 +375,11 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
         let max_scale = sub_scales.iter().cloned().fold(0.0f32, f32::max);
         let max_min = sub_mins.iter().map(|m| -m).fold(0.0f32, f32::max); // mins are typically negative
 
-        let d = if max_scale > 0.0 { max_scale / 63.0 } else { 0.0 }; // 6-bit scale range
+        let d = if max_scale > 0.0 {
+            max_scale / 63.0
+        } else {
+            0.0
+        }; // 6-bit scale range
         let dmin = if max_min > 0.0 { max_min / 63.0 } else { 0.0 };
 
         let inv_d = if d > 0.0 { 1.0 / d } else { 0.0 };
@@ -399,11 +419,19 @@ fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
 
             let eff_scale_e = d * scale_ints[sb_even] as f32;
             let eff_min_e = dmin * min_ints[sb_even] as f32;
-            let inv_se = if eff_scale_e > 0.0 { 1.0 / eff_scale_e } else { 0.0 };
+            let inv_se = if eff_scale_e > 0.0 {
+                1.0 / eff_scale_e
+            } else {
+                0.0
+            };
 
             let eff_scale_o = d * scale_ints[sb_odd] as f32;
             let eff_min_o = dmin * min_ints[sb_odd] as f32;
-            let inv_so = if eff_scale_o > 0.0 { 1.0 / eff_scale_o } else { 0.0 };
+            let inv_so = if eff_scale_o > 0.0 {
+                1.0 / eff_scale_o
+            } else {
+                0.0
+            };
 
             for l in 0..32 {
                 let idx_e = sb_start + group * 64 + l;
@@ -538,7 +566,9 @@ fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, usize) {
 /// Matches the GPU-side fwht_forward_256 in turbo_common: signs1 → butterfly → scale → signs2.
 fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
-    for i in 0..256 { x[i] *= signs1[i]; }
+    for i in 0..256 {
+        x[i] *= signs1[i];
+    }
     let mut stride = 1;
     while stride < 256 {
         let mut i = 0;
@@ -554,18 +584,25 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
         stride <<= 1;
     }
     let scale = 0.0625; // 1/sqrt(256) = 1/16
-    for i in 0..256 { x[i] *= scale * signs2[i]; }
+    for i in 0..256 {
+        x[i] *= scale * signs2[i];
+    }
 }
 
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
 fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
-    (0..n).map(|_| {
-        state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-        if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
-    }).collect()
+    (0..n)
+        .map(|_| {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
+        })
+        .collect()
 }
-
 
 /// MagnumQuant HFQ4-G256: FWHT-rotated 4-bit quantization.
 /// Same binary format as HFQ4-G256 (136 bytes/group) — the rotation is baked
@@ -655,7 +692,7 @@ fn quantize_mq6g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8>
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off] = q0 | (q1 << 6);
             output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
             output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }
@@ -737,8 +774,16 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
         for i in 0..128 {
             let idx_lo = 2 * i;
             let idx_hi = 2 * i + 1;
-            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
-            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -761,8 +806,7 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
 /// OCP E2M1 magnitude lattice (signed 4-bit FP). 16 codes: {±0, ±0.5, ±1, ±1.5, ±2, ±3, ±4, ±6}.
 /// Order: positive 0..7, then negative 0..7 (mirrors hardware-canonical sign-magnitude packing).
 const E2M1_LUT: [f32; 16] = [
-    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ];
 
 /// E2M1 round-to-nearest in the 16-code lattice. Returns the nibble (0..15).
@@ -787,7 +831,11 @@ fn e2m1_round(x: f32) -> u8 {
 /// K must be a multiple of 32 (hipfire model dims always satisfy this).
 /// Returns 16-B header + (K/32) × 17-B blocks = 16 + 17 * (K/32) bytes.
 fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
-    assert!(row.len() % 32 == 0, "HFP4G32 requires K%32 == 0, got K={}", row.len());
+    assert!(
+        row.len() % 32 == 0,
+        "HFP4G32 requires K%32 == 0, got K={}",
+        row.len()
+    );
     let k = row.len();
     let n_blocks = k / 32;
     let row_bytes = 16 + n_blocks * 17;
@@ -795,16 +843,24 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 
     // Per-row FP16 second-level scale: row_scale_a = max_abs(row) / 6.0  (E2M1 max = 6.0).
     let row_max_abs = row.iter().cloned().fold(0.0f32, |m, v| m.max(v.abs()));
-    let row_scale_a = if row_max_abs > 0.0 { row_max_abs / 6.0 } else { 1.0 };
-    let inv_row_scale = if row_max_abs > 0.0 { 1.0 / row_scale_a } else { 0.0 };
+    let row_scale_a = if row_max_abs > 0.0 {
+        row_max_abs / 6.0
+    } else {
+        1.0
+    };
+    let inv_row_scale = if row_max_abs > 0.0 {
+        1.0 / row_scale_a
+    } else {
+        0.0
+    };
 
     // Header.
     out[0..2].copy_from_slice(&f32_to_f16(row_scale_a).to_le_bytes());
-    out[2..4].copy_from_slice(&0u16.to_le_bytes());           // row_scale_b unused in v1
+    out[2..4].copy_from_slice(&0u16.to_le_bytes()); // row_scale_b unused in v1
     out[4..6].copy_from_slice(&(n_blocks as u16).to_le_bytes()); // block_count
-    out[6] = 0u8;                                              // format_flags = 0 (no rotation)
-    out[7] = 0u8;                                              // reserved
-    // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
+    out[6] = 0u8; // format_flags = 0 (no rotation)
+    out[7] = 0u8; // reserved
+                  // out[8..16] reserved zeros (already zeroed by vec![0u8; ...])
 
     // Per-block payload.
     for b in 0..n_blocks {
@@ -831,7 +887,11 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 
         let block_scale = (block_e as i32 - 127) as f32;
         let block_scale_factor = block_scale.exp2(); // 2^(block_e - 127)
-        let inv_block_scale = if block_scale_factor > 0.0 { 1.0 / block_scale_factor } else { 0.0 };
+        let inv_block_scale = if block_scale_factor > 0.0 {
+            1.0 / block_scale_factor
+        } else {
+            0.0
+        };
 
         // Block payload offset in the row buffer.
         let payload_off = 16 + b * 17;
@@ -860,7 +920,14 @@ fn quantize_hfp4g32_row(row: &[f32]) -> Vec<u8> {
 /// makes the failure mode "quantize rejects bad input" rather than "runtime
 /// panics on first dispatch with a tensor a previous step already accepted."
 fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
-    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
+    assert_eq!(
+        f32_data.len(),
+        m * k,
+        "2D shape mismatch: {} vs {}*{}",
+        f32_data.len(),
+        m,
+        k
+    );
     assert!(k % 256 == 0, "HFP4G32 v1 requires K%256==0 (gemv_hfp4g32 kernel constraint; v2 will lift to K%32==0), got K={}", k);
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
@@ -881,9 +948,26 @@ fn quantize_hfp4g32_2d(f32_data: &[f32], m: usize, k: usize) -> Vec<u8> {
 /// Sets per-row `format_flags` to `0x05` (bit 0 = rotation present, bits 2-3 = 01
 /// = offline FWHT). This is metadata only — the kernel can still consume the
 /// row as plain HFP4G32 because the rotation is baked into the codes.
-fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
-    assert_eq!(f32_data.len(), m * k, "2D shape mismatch: {} vs {}*{}", f32_data.len(), m, k);
-    assert!(k % 256 == 0, "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}", k);
+fn quantize_mfp4g32_2d(
+    f32_data: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    assert_eq!(
+        f32_data.len(),
+        m * k,
+        "2D shape mismatch: {} vs {}*{}",
+        f32_data.len(),
+        m,
+        k
+    );
+    assert!(
+        k % 256 == 0,
+        "MFP4G32 requires k % 256 == 0 for 256-element FWHT, got k={}",
+        k
+    );
     let row_bytes = 16 + 17 * (k / 32);
     let mut out = Vec::with_capacity(m * row_bytes);
 
@@ -912,7 +996,11 @@ fn quantize_mfp4g32_2d(f32_data: &[f32], m: usize, k: usize, signs1: &[f32], sig
 fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
     assert!(k % 32 == 0, "HFP4G32 requires K%32 == 0");
     let n_blocks = k / 32;
-    assert_eq!(packed.len(), 16 + n_blocks * 17, "HFP4G32 row size mismatch");
+    assert_eq!(
+        packed.len(),
+        16 + n_blocks * 17,
+        "HFP4G32 row size mismatch"
+    );
 
     let row_scale_a_bits = u16::from_le_bytes([packed[0], packed[1]]);
     let row_scale_a = f16_to_f32(row_scale_a_bits);
@@ -929,7 +1017,7 @@ fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
             let byte = packed[payload_off + 1 + i];
             let lo_nibble = (byte & 0x0F) as usize;
             let hi_nibble = ((byte >> 4) & 0x0F) as usize;
-            out[b * 32 + 2 * i]     = scale * E2M1_LUT[lo_nibble];
+            out[b * 32 + 2 * i] = scale * E2M1_LUT[lo_nibble];
             out[b * 32 + 2 * i + 1] = scale * E2M1_LUT[hi_nibble];
         }
     }
@@ -947,18 +1035,18 @@ mod awq_tests {
     fn awq_scales_geomean_is_one() {
         // Realistic-ish imatrix: log-normal-ish per-channel statistics
         let in_sum2: Vec<f32> = (0..256)
-            .map(|j| (1.0 + 10.0 * (j as f32 / 256.0)).exp())  // 1.0 → e^11
+            .map(|j| (1.0 + 10.0 * (j as f32 / 256.0)).exp()) // 1.0 → e^11
             .collect();
         for &alpha in &[0.0f32, 0.25, 0.5, 0.75, 1.0] {
             let s = compute_awq_scales(&in_sum2, alpha);
             assert_eq!(s.len(), in_sum2.len());
             // Geometric mean = exp(mean(log(s)))
-            let log_mean = s.iter()
-                .map(|&v| (v as f64).ln())
-                .sum::<f64>() / s.len() as f64;
+            let log_mean = s.iter().map(|&v| (v as f64).ln()).sum::<f64>() / s.len() as f64;
             let geo_mean = log_mean.exp();
-            assert!((geo_mean - 1.0).abs() < 1e-4,
-                "alpha={alpha}: geo_mean={geo_mean} (want 1.0)");
+            assert!(
+                (geo_mean - 1.0).abs() < 1e-4,
+                "alpha={alpha}: geo_mean={geo_mean} (want 1.0)"
+            );
         }
     }
 
@@ -1021,8 +1109,13 @@ mod awq_tests {
         // Compare
         for i in 0..m {
             let rel = (y_awq[i] - y_ref[i]).abs() / y_ref[i].abs().max(1e-6);
-            assert!(rel < 1e-5,
-                "row {i}: AWQ y={} ref y={} rel_err={}", y_awq[i], y_ref[i], rel);
+            assert!(
+                rel < 1e-5,
+                "row {i}: AWQ y={} ref y={} rel_err={}",
+                y_awq[i],
+                y_ref[i],
+                rel
+            );
         }
     }
 
@@ -1033,8 +1126,44 @@ mod awq_tests {
         let in_sum2 = vec![0.0_f32, 1.0, 4.0, 0.0];
         let s = compute_awq_scales(&in_sum2, 0.5);
         for &v in &s {
-            assert!(v.is_finite() && v > 0.0, "scale {v} should be finite + positive");
+            assert!(
+                v.is_finite() && v > 0.0,
+                "scale {v} should be finite + positive"
+            );
         }
+    }
+
+    #[test]
+    fn imatrix_moe_columns_are_aggregated_by_channel() {
+        // GGML tensor shape [K=3, experts=2] stores K-contiguous columns:
+        // expert0=[1,2,3], expert1=[10,20,30].
+        let raw_values = [1.0_f32, 2.0, 3.0, 10.0, 20.0, 30.0];
+        let raw: Vec<u8> = raw_values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let aggregated = imatrix_vector_from_f32_data(&raw, 3, 2);
+        assert_eq!(aggregated, vec![11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn imatrix_maps_moe_expert_and_shared_names() {
+        assert_eq!(
+            safetensors_to_ggml_name("model.language_model.layers.7.mlp.experts.gate_up_proj")
+                .as_deref(),
+            Some("blk.7.ffn_gate_exps.weight")
+        );
+        assert_eq!(
+            safetensors_to_ggml_name(
+                "model.language_model.layers.7.mlp.experts.42.down_proj.weight"
+            )
+            .as_deref(),
+            Some("blk.7.ffn_down_exps.weight")
+        );
+        assert_eq!(
+            safetensors_to_ggml_name(
+                "model.language_model.layers.7.mlp.shared_expert.down_proj.weight"
+            )
+            .as_deref(),
+            Some("blk.7.ffn_down_shexp.weight")
+        );
     }
 }
 
@@ -1049,9 +1178,17 @@ mod hfp4_tests {
             let nibble = e2m1_round(val);
             // +0 and -0 are both at value 0.0; either nibble is acceptable.
             if val.abs() < 1e-6 {
-                assert!(nibble == 0 || nibble == 8, "zero rounds to nibble {}", nibble);
+                assert!(
+                    nibble == 0 || nibble == 8,
+                    "zero rounds to nibble {}",
+                    nibble
+                );
             } else {
-                assert_eq!(nibble, i as u8, "code {} rounded to nibble {} not {}", i, nibble, i);
+                assert_eq!(
+                    nibble, i as u8,
+                    "code {} rounded to nibble {} not {}",
+                    i, nibble, i
+                );
             }
         }
     }
@@ -1080,10 +1217,12 @@ mod hfp4_tests {
     #[test]
     fn round_trip_mixed_magnitudes() {
         // Row with mixed positive/negative E2M1 magnitudes — should round-trip exactly.
-        let row: Vec<f32> = (0..64).map(|i| {
-            let v = E2M1_LUT[i % 16];
-            v * 6.0 // scale up so row_scale_a sees max abs at 6 * 6 = 36, brings code lattice back to [-6, 6]
-        }).collect();
+        let row: Vec<f32> = (0..64)
+            .map(|i| {
+                let v = E2M1_LUT[i % 16];
+                v * 6.0 // scale up so row_scale_a sees max abs at 6 * 6 = 36, brings code lattice back to [-6, 6]
+            })
+            .collect();
         let packed = quantize_hfp4g32_row(&row);
         let recovered = dequant_hfp4g32_row(&packed, 64);
         // Bound: |recovered - input| ≤ row_scale * 2^(block_e - 127) * 0.5 (half min E2M1 step).
@@ -1091,7 +1230,14 @@ mod hfp4_tests {
         // Actual tolerance should be much tighter for exact lattice values; allow some headroom.
         for (i, (&got, &want)) in recovered.iter().zip(row.iter()).enumerate() {
             let rel_err = (got - want).abs() / want.abs().max(1.0);
-            assert!(rel_err < 0.1, "elem {}: got {} want {} rel_err {}", i, got, want, rel_err);
+            assert!(
+                rel_err < 0.1,
+                "elem {}: got {} want {} rel_err {}",
+                i,
+                got,
+                want,
+                rel_err
+            );
         }
     }
 
@@ -1112,13 +1258,15 @@ mod hfp4_tests {
             ((rng_state & 0x00FF_FFFF) as f32 / 0x0100_0000 as f32).max(1e-7)
         };
         // Box-Muller Gaussian std=0.5.
-        let row: Vec<f32> = (0..512).flat_map(|_| {
-            let u1 = next_uniform();
-            let u2 = next_uniform();
-            let r = (-2.0 * u1.ln()).sqrt();
-            let t = 2.0 * std::f32::consts::PI * u2;
-            [r * t.cos() * 0.5, r * t.sin() * 0.5]
-        }).collect();
+        let row: Vec<f32> = (0..512)
+            .flat_map(|_| {
+                let u1 = next_uniform();
+                let u2 = next_uniform();
+                let r = (-2.0 * u1.ln()).sqrt();
+                let t = 2.0 * std::f32::consts::PI * u2;
+                [r * t.cos() * 0.5, r * t.sin() * 0.5]
+            })
+            .collect();
 
         let k = row.len();
         let packed = quantize_hfp4g32_row(&row);
@@ -1177,7 +1325,13 @@ mod hfp4_tests {
         assert_eq!(packed.len(), m * row_bytes, "MFP4G32 byte length mismatch");
         for r in 0..m {
             let off = r * row_bytes;
-            assert_eq!(packed[off + 6], 0x05, "row {} format_flags expected 0x05, got {:#x}", r, packed[off + 6]);
+            assert_eq!(
+                packed[off + 6],
+                0x05,
+                "row {} format_flags expected 0x05, got {:#x}",
+                r,
+                packed[off + 6]
+            );
             // block_count must equal k/32.
             let bc = u16::from_le_bytes([packed[off + 4], packed[off + 5]]);
             assert_eq!(bc as usize, k / 32);
@@ -1331,7 +1485,9 @@ fn f32_to_fp16_bits(v: f32) -> u16 {
             // Mantissa overflow → carry into exponent
             m16 = 0;
             exp += 1;
-            if exp >= 0x1F { return sign | 0x7C00; }
+            if exp >= 0x1F {
+                return sign | 0x7C00;
+            }
         }
     }
     sign | ((exp as u16) << 10) | m16
@@ -1387,15 +1543,22 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
                         let mut best_d = (w - cb[0]).abs();
                         for k in 1..8 {
                             let d = (w - cb[k]).abs();
-                            if d < best_d { best_d = d; best = k; }
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
                         }
-                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        if it == 0 || prev_assignments[i] != best as u8 {
+                            changed += 1;
+                        }
                         prev_assignments[i] = best as u8;
                         indices[i] = best as u8;
                         sums[best] += w as f64;
                         counts[best] += 1;
                     }
-                    if it > 0 && changed == 0 { break; }
+                    if it > 0 && changed == 0 {
+                        break;
+                    }
                     for k in 0..8 {
                         if counts[k] > 0 {
                             cb[k] = (sums[k] / counts[k] as f64) as f32;
@@ -1406,19 +1569,25 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
 
             // Sort centroids ascending; remap indices.
             let mut order: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
-            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            order.sort_by(|&a, &b| {
+                cb[a]
+                    .partial_cmp(&cb[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let mut sorted_cb = [0.0f32; 8];
             let mut inv: [u8; 8] = [0; 8];
             for new_idx in 0..8 {
                 sorted_cb[new_idx] = cb[order[new_idx]];
                 inv[order[new_idx]] = new_idx as u8;
             }
-            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for i in 0..256 {
+                indices[i] = inv[indices[i] as usize];
+            }
 
             // Header: 8 fp16 centroids = 16 bytes.
             for k in 0..8 {
                 let bits = f32_to_fp16_bits(sorted_cb[k]);
-                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k] = (bits & 0xFF) as u8;
                 out_chunk[2 * k + 1] = (bits >> 8) as u8;
             }
 
@@ -1428,8 +1597,14 @@ fn quantize_mq3g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
             for chunk in 0..32 {
                 let ci = chunk * 8;
                 let q = [
-                    indices[ci]     & 7, indices[ci + 1] & 7, indices[ci + 2] & 7, indices[ci + 3] & 7,
-                    indices[ci + 4] & 7, indices[ci + 5] & 7, indices[ci + 6] & 7, indices[ci + 7] & 7,
+                    indices[ci] & 7,
+                    indices[ci + 1] & 7,
+                    indices[ci + 2] & 7,
+                    indices[ci + 3] & 7,
+                    indices[ci + 4] & 7,
+                    indices[ci + 5] & 7,
+                    indices[ci + 6] & 7,
+                    indices[ci + 7] & 7,
                 ];
                 let b0 = q[0] | (q[1] << 3) | ((q[2] & 3) << 6);
                 let b1 = (q[2] >> 2) | (q[3] << 1) | (q[4] << 4) | ((q[5] & 1) << 7);
@@ -1497,15 +1672,22 @@ fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
                         let mut best_d = (w - cb[0]).abs();
                         for k in 1..16 {
                             let d = (w - cb[k]).abs();
-                            if d < best_d { best_d = d; best = k; }
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
                         }
-                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        if it == 0 || prev_assignments[i] != best as u8 {
+                            changed += 1;
+                        }
                         prev_assignments[i] = best as u8;
                         indices[i] = best as u8;
                         sums[best] += w as f64;
                         counts[best] += 1;
                     }
-                    if it > 0 && changed == 0 { break; }
+                    if it > 0 && changed == 0 {
+                        break;
+                    }
                     for k in 0..16 {
                         if counts[k] > 0 {
                             cb[k] = (sums[k] / counts[k] as f64) as f32;
@@ -1516,19 +1698,25 @@ fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
 
             // Sort centroids ascending; remap indices.
             let mut order: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            order.sort_by(|&a, &b| {
+                cb[a]
+                    .partial_cmp(&cb[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let mut sorted_cb = [0.0f32; 16];
             let mut inv: [u8; 16] = [0; 16];
             for new_idx in 0..16 {
                 sorted_cb[new_idx] = cb[order[new_idx]];
                 inv[order[new_idx]] = new_idx as u8;
             }
-            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for i in 0..256 {
+                indices[i] = inv[indices[i] as usize];
+            }
 
             // Header: 16 fp16 centroids = 32 bytes.
             for k in 0..16 {
                 let bits = f32_to_fp16_bits(sorted_cb[k]);
-                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k] = (bits & 0xFF) as u8;
                 out_chunk[2 * k + 1] = (bits >> 8) as u8;
             }
 
@@ -1537,7 +1725,7 @@ fn quantize_mq4g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
             // unpack code is identical; only the recon changes from
             // `min + scale*q` to `cb[q]`.
             for i in 0..128 {
-                let lo = indices[2 * i]     & 0x0F;
+                let lo = indices[2 * i] & 0x0F;
                 let hi = indices[2 * i + 1] & 0x0F;
                 out_chunk[32 + i] = lo | (hi << 4);
             }
@@ -1608,15 +1796,22 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
                         let mut best_d = (w - cb[0]).abs();
                         for k in 1..4 {
                             let d = (w - cb[k]).abs();
-                            if d < best_d { best_d = d; best = k; }
+                            if d < best_d {
+                                best_d = d;
+                                best = k;
+                            }
                         }
-                        if it == 0 || prev_assignments[i] != best as u8 { changed += 1; }
+                        if it == 0 || prev_assignments[i] != best as u8 {
+                            changed += 1;
+                        }
                         prev_assignments[i] = best as u8;
                         indices[i] = best as u8;
                         sums[best] += w as f64;
                         counts[best] += 1;
                     }
-                    if it > 0 && changed == 0 { break; }
+                    if it > 0 && changed == 0 {
+                        break;
+                    }
                     for k in 0..4 {
                         if counts[k] > 0 {
                             cb[k] = (sums[k] / counts[k] as f64) as f32;
@@ -1628,24 +1823,32 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
             // Sort centroids ascending; remap indices to keep header canonical
             // and the permutation deterministic across re-runs.
             let mut order: [usize; 4] = [0, 1, 2, 3];
-            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            order.sort_by(|&a, &b| {
+                cb[a]
+                    .partial_cmp(&cb[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             let mut sorted_cb = [0.0f32; 4];
             let mut inv: [u8; 4] = [0; 4];
             for new_idx in 0..4 {
                 sorted_cb[new_idx] = cb[order[new_idx]];
                 inv[order[new_idx]] = new_idx as u8;
             }
-            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            for i in 0..256 {
+                indices[i] = inv[indices[i] as usize];
+            }
 
             for k in 0..4 {
                 let bits = f32_to_fp16_bits(sorted_cb[k]);
-                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k] = (bits & 0xFF) as u8;
                 out_chunk[2 * k + 1] = (bits >> 8) as u8;
             }
             // 256 indices × 2 bits = 64 bytes. Same packing as uniform MQ2.
             for i in 0..64 {
                 let mut byte_val = 0u8;
-                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                for j in 0..4 {
+                    byte_val |= (indices[4 * i + j] & 0x3) << (j * 2);
+                }
                 out_chunk[8 + i] = byte_val;
             }
         });
@@ -1688,7 +1891,11 @@ fn quantize_hfq3g256(f32_data: &[f32]) -> Vec<u8> {
             let mut q = [0u8; 8];
             for j in 0..8 {
                 let idx = ci + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
             }
             // Pack 8 × 3-bit into 3 bytes (little-endian bitstream)
@@ -1747,7 +1954,11 @@ fn quantize_hfq3g128(f32_data: &[f32]) -> Vec<u8> {
             let mut q = [0u8; 8];
             for j in 0..8 {
                 let idx = ci + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 q[j] = ((val - min_val) * inv_scale + 0.5).clamp(0.0, 7.0) as u8;
             }
             let b0 = (q[0] & 7) | ((q[1] & 7) << 3) | ((q[2] & 3) << 6);
@@ -1782,7 +1993,7 @@ fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
         let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
 
         let range = max_val - min_val;
-        let scale = if range > 0.0 { range / 3.0 } else { 1.0 };  // 2-bit: 4 levels (0-3)
+        let scale = if range > 0.0 { range / 3.0 } else { 1.0 }; // 2-bit: 4 levels (0-3)
         let inv_scale = if range > 0.0 { 1.0 / scale } else { 0.0 };
 
         let out_off = b * block_bytes;
@@ -1795,7 +2006,11 @@ fn quantize_hfq2g256(f32_data: &[f32]) -> Vec<u8> {
             let mut byte_val = 0u8;
             for j in 0..4 {
                 let idx = 4 * i + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 let q = ((val - min_val) * inv_scale + 0.5) as u8;
                 byte_val |= q.min(3) << (j * 2);
             }
@@ -1836,7 +2051,11 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
             let mut byte_val = 0u8;
             for j in 0..4 {
                 let idx = 4 * i + j;
-                let val = if idx < actual_len { group[idx] } else { min_val };
+                let val = if idx < actual_len {
+                    group[idx]
+                } else {
+                    min_val
+                };
                 let q = ((val - min_val) * inv_scale + 0.5) as u8;
                 byte_val |= q.min(3) << (j * 2);
             }
@@ -1874,17 +2093,33 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
         let actual_len = end - start;
         // Pack 4 values per 3 bytes: v0[5:0]|v1[1:0], v1[5:2]|v2[3:0], v2[5:4]|v3[5:0]
         for i in (0..256).step_by(4) {
-            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = if i < actual_len {
+                ((group[i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q1 = if i + 1 < actual_len {
+                ((group[i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q2 = if i + 2 < actual_len {
+                ((group[i + 2] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q3 = if i + 3 < actual_len {
+                ((group[i + 3] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             let q0 = q0.min(63);
             let q1 = q1.min(63);
             let q2 = q2.min(63);
             let q3 = q3.min(63);
 
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0 | (q1 << 6);
+            output[out_off + byte_off] = q0 | (q1 << 6);
             output[out_off + byte_off + 1] = (q1 >> 2) | (q2 << 4);
             output[out_off + byte_off + 2] = (q2 >> 4) | (q3 << 2);
         }
@@ -1922,8 +2157,16 @@ fn quantize_hfq4g128(f32_data: &[f32]) -> Vec<u8> {
         for i in 0..64 {
             let idx_lo = 2 * i;
             let idx_hi = 2 * i + 1;
-            let lo_val = if idx_lo < actual_len { group[idx_lo] } else { min_val };
-            let hi_val = if idx_hi < actual_len { group[idx_hi] } else { min_val };
+            let lo_val = if idx_lo < actual_len {
+                group[idx_lo]
+            } else {
+                min_val
+            };
+            let hi_val = if idx_hi < actual_len {
+                group[idx_hi]
+            } else {
+                min_val
+            };
 
             let lo_q = ((lo_val - min_val) * inv_scale + 0.5) as u8;
             let hi_q = ((hi_val - min_val) * inv_scale + 0.5) as u8;
@@ -1941,7 +2184,8 @@ const HFQ_MAGIC: &[u8; 4] = b"HFQM";
 const HFQ_VERSION: u32 = 1;
 
 #[repr(u8)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
 enum QuantType {
     Q4F16G64 = 0,
     F16 = 1,
@@ -1956,22 +2200,22 @@ enum QuantType {
     HFQ2G128 = 10,
     HFQ3G256 = 11,
     HFQ3G128 = 12,
-    MQ4G256 = 13,  // MagnumQuant: FWHT-rotated HFQ4-G256
-    MQ8G256 = 14,  // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
-    MQ6G256 = 15,  // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
-    BF16 = 16,     // Original BF16 weights (zero precision loss for vision)
-    MQ3G256 = 17,  // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
-    MQ2G256 = 18,  // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MQ4G256 = 13,      // MagnumQuant: FWHT-rotated HFQ4-G256
+    MQ8G256 = 14,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
+    MQ6G256 = 15,      // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
+    BF16 = 16,         // Original BF16 weights (zero precision loss for vision)
+    MQ3G256 = 17,      // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
+    MQ2G256 = 18,      // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
     MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
     MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
     // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
     // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
     // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
-    HFP4G32 = 21,      // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    HFP4G32 = 21, // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
     // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
     // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
     // signals "rotation present, offline FWHT" for future interop/detection.
-    MFP4G32 = 24,      // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    MFP4G32 = 24, // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
     // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
     // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation
     // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
@@ -1981,8 +2225,265 @@ enum QuantType {
     // HFP8E5M2G32 = 28, // v2  — HFP8 E5M2 family
     // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
     MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
-                       // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
-                       // Models quantized pre-renumber MUST be re-quantized.
+    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+    // Models quantized pre-renumber MUST be re-quantized.
+    MQMIXG256 = 31, // Mixed MagnumQuant: per-contiguous-K G256 segments over MQ2/MQ3/MQ4/MQ6.
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct MqMixG256Segment {
+    k_group_start: u32,
+    group_count: u32,
+    quant_type: QuantType,
+    payload_offset: u64,
+    payload_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct MqMixG256Header {
+    group_size: u32,
+    rows: u32,
+    cols: u32,
+    groups_per_row: u32,
+    segments: Vec<MqMixG256Segment>,
+}
+
+#[allow(dead_code)]
+const MQMIXG256_MAGIC: &[u8; 4] = b"MQMX";
+#[allow(dead_code)]
+const MQMIXG256_VERSION: u32 = 1;
+#[allow(dead_code)]
+const MQMIXG256_HEADER_FIXED_BYTES: usize = 28;
+#[allow(dead_code)]
+const MQMIXG256_SEGMENT_BYTES: usize = 32;
+
+#[allow(dead_code)]
+fn quant_type_from_u8(value: u8) -> Option<QuantType> {
+    match value {
+        13 => Some(QuantType::MQ4G256),
+        15 => Some(QuantType::MQ6G256),
+        17 => Some(QuantType::MQ3G256),
+        18 => Some(QuantType::MQ2G256),
+        _ => None,
+    }
+}
+
+#[allow(dead_code)]
+fn encode_mqmixg256_header(header: &MqMixG256Header) -> Result<Vec<u8>, String> {
+    if header.group_size != 256 {
+        return Err(format!(
+            "MQMIXG256 group_size must be 256, got {}",
+            header.group_size
+        ));
+    }
+    if header.cols % 256 != 0 {
+        return Err(format!(
+            "MQMIXG256 cols must be divisible by 256, got {}",
+            header.cols
+        ));
+    }
+    let expected_groups = header.cols / 256;
+    if header.groups_per_row != expected_groups {
+        return Err(format!(
+            "MQMIXG256 groups_per_row {} does not match cols/256 {}",
+            header.groups_per_row, expected_groups
+        ));
+    }
+    let mut out = Vec::with_capacity(
+        MQMIXG256_HEADER_FIXED_BYTES + header.segments.len() * MQMIXG256_SEGMENT_BYTES,
+    );
+    out.extend_from_slice(MQMIXG256_MAGIC);
+    out.extend_from_slice(&MQMIXG256_VERSION.to_le_bytes());
+    out.extend_from_slice(&header.group_size.to_le_bytes());
+    out.extend_from_slice(&header.rows.to_le_bytes());
+    out.extend_from_slice(&header.cols.to_le_bytes());
+    out.extend_from_slice(&header.groups_per_row.to_le_bytes());
+    out.extend_from_slice(&(header.segments.len() as u32).to_le_bytes());
+    for segment in &header.segments {
+        if segment.group_count == 0 {
+            return Err("MQMIXG256 segment group_count must be non-zero".to_string());
+        }
+        if segment.k_group_start + segment.group_count > header.groups_per_row {
+            return Err(format!(
+                "MQMIXG256 segment [{}, {}) exceeds groups_per_row {}",
+                segment.k_group_start,
+                segment.k_group_start + segment.group_count,
+                header.groups_per_row
+            ));
+        }
+        if !matches!(
+            segment.quant_type,
+            QuantType::MQ2G256 | QuantType::MQ3G256 | QuantType::MQ4G256 | QuantType::MQ6G256
+        ) {
+            return Err(format!(
+                "MQMIXG256 segment uses unsupported quant_type {:?}",
+                segment.quant_type
+            ));
+        }
+        out.extend_from_slice(&segment.k_group_start.to_le_bytes());
+        out.extend_from_slice(&segment.group_count.to_le_bytes());
+        out.push(segment.quant_type as u8);
+        out.extend_from_slice(&[0u8; 7]);
+        out.extend_from_slice(&segment.payload_offset.to_le_bytes());
+        out.extend_from_slice(&segment.payload_len.to_le_bytes());
+    }
+    Ok(out)
+}
+
+#[allow(dead_code)]
+fn parse_mqmixg256_header(data: &[u8]) -> Result<MqMixG256Header, String> {
+    if data.len() < MQMIXG256_HEADER_FIXED_BYTES {
+        return Err("MQMIXG256 payload is too small for header".to_string());
+    }
+    if &data[0..4] != MQMIXG256_MAGIC {
+        return Err("MQMIXG256 payload missing MQMX magic".to_string());
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if version != MQMIXG256_VERSION {
+        return Err(format!("unsupported MQMIXG256 version {version}"));
+    }
+    let group_size = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let rows = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let cols = u32::from_le_bytes(data[16..20].try_into().unwrap());
+    let groups_per_row = u32::from_le_bytes(data[20..24].try_into().unwrap());
+    let n_segments = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+    if group_size != 256 {
+        return Err(format!(
+            "MQMIXG256 group_size must be 256, got {group_size}"
+        ));
+    }
+    if cols % 256 != 0 {
+        return Err(format!(
+            "MQMIXG256 cols must be divisible by 256, got {cols}"
+        ));
+    }
+    if groups_per_row != cols / 256 {
+        return Err(format!(
+            "MQMIXG256 groups_per_row {groups_per_row} does not match cols/256 {}",
+            cols / 256
+        ));
+    }
+    let table_end = MQMIXG256_HEADER_FIXED_BYTES + n_segments * MQMIXG256_SEGMENT_BYTES;
+    if data.len() < table_end {
+        return Err("MQMIXG256 segment table is truncated".to_string());
+    }
+    let mut segments = Vec::with_capacity(n_segments);
+    let mut pos = MQMIXG256_HEADER_FIXED_BYTES;
+    for _ in 0..n_segments {
+        let k_group_start = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let group_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let quant_type = quant_type_from_u8(data[pos])
+            .ok_or_else(|| format!("unsupported MQMIXG256 segment quant_type {}", data[pos]))?;
+        pos += 8;
+        let payload_offset = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        let payload_len = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+        pos += 8;
+        if group_count == 0 {
+            return Err("MQMIXG256 segment group_count must be non-zero".to_string());
+        }
+        if k_group_start + group_count > groups_per_row {
+            return Err(format!(
+                "MQMIXG256 segment [{}, {}) exceeds groups_per_row {}",
+                k_group_start,
+                k_group_start + group_count,
+                groups_per_row
+            ));
+        }
+        let payload_end = payload_offset
+            .checked_add(payload_len)
+            .ok_or_else(|| "MQMIXG256 segment payload range overflows u64".to_string())?;
+        if payload_end as usize > data.len() {
+            return Err("MQMIXG256 segment payload range exceeds tensor payload".to_string());
+        }
+        segments.push(MqMixG256Segment {
+            k_group_start,
+            group_count,
+            quant_type,
+            payload_offset,
+            payload_len,
+        });
+    }
+    Ok(MqMixG256Header {
+        group_size,
+        rows,
+        cols,
+        groups_per_row,
+        segments,
+    })
+}
+
+#[cfg(test)]
+mod mqmixg256_tests {
+    use super::*;
+
+    #[test]
+    fn mqmixg256_header_round_trips_segments() {
+        let table_len = MQMIXG256_HEADER_FIXED_BYTES + 2 * MQMIXG256_SEGMENT_BYTES;
+        let header = MqMixG256Header {
+            group_size: 256,
+            rows: 2,
+            cols: 768,
+            groups_per_row: 3,
+            segments: vec![
+                MqMixG256Segment {
+                    k_group_start: 0,
+                    group_count: 1,
+                    quant_type: QuantType::MQ3G256,
+                    payload_offset: table_len as u64,
+                    payload_len: 208,
+                },
+                MqMixG256Segment {
+                    k_group_start: 1,
+                    group_count: 2,
+                    quant_type: QuantType::MQ4G256,
+                    payload_offset: table_len as u64 + 208,
+                    payload_len: 544,
+                },
+            ],
+        };
+        let mut payload = encode_mqmixg256_header(&header).unwrap();
+        payload.resize(table_len + 208 + 544, 0);
+
+        assert_eq!(parse_mqmixg256_header(&payload).unwrap(), header);
+    }
+
+    #[test]
+    fn mqmixg256_header_rejects_ragged_k() {
+        let header = MqMixG256Header {
+            group_size: 256,
+            rows: 1,
+            cols: 384,
+            groups_per_row: 1,
+            segments: Vec::new(),
+        };
+        let err = encode_mqmixg256_header(&header).unwrap_err();
+        assert!(err.contains("divisible by 256"), "{err}");
+    }
+
+    #[test]
+    fn mqmixg256_header_rejects_bad_segment_offsets() {
+        let header = MqMixG256Header {
+            group_size: 256,
+            rows: 1,
+            cols: 256,
+            groups_per_row: 1,
+            segments: vec![MqMixG256Segment {
+                k_group_start: 0,
+                group_count: 1,
+                quant_type: QuantType::MQ6G256,
+                payload_offset: 1024,
+                payload_len: 200,
+            }],
+        };
+        let payload = encode_mqmixg256_header(&header).unwrap();
+        let err = parse_mqmixg256_header(&payload).unwrap_err();
+        assert!(err.contains("exceeds tensor payload"), "{err}");
+    }
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -2013,8 +2514,13 @@ enum QuantLevel {
 /// MQ6, HFQ-family to HFQ6, FP4-family is a no-op (no FP6 sibling).
 fn default_promote_target(base: GgufFormat) -> GgufFormat {
     match base {
-        GgufFormat::Mq2 | GgufFormat::Mq3 | GgufFormat::Mq4 | GgufFormat::Mq6
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
+        GgufFormat::Mq2
+        | GgufFormat::Mq3
+        | GgufFormat::Mq4
+        | GgufFormat::Mq6
+        | GgufFormat::Mq2Lloyd
+        | GgufFormat::Mq3Lloyd
+        | GgufFormat::Mq4Lloyd => GgufFormat::Mq6,
         GgufFormat::Hfq4 | GgufFormat::Hfq6 => GgufFormat::Hfq6,
         GgufFormat::Hfp4 => GgufFormat::Hfp4,
         GgufFormat::Mfp4 => GgufFormat::Mfp4,
@@ -2090,8 +2596,12 @@ const ALTERNATING_STRIDE: usize = 3;
 /// llama.cpp-style alternating promotion: edge layers always promoted,
 /// middle layers promoted every `stride` layers.
 fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
-    if n_layers == 0 || stride == 0 { return false; }
-    if idx < 2 || idx >= n_layers.saturating_sub(2) { return true; }
+    if n_layers == 0 || stride == 0 {
+        return false;
+    }
+    if idx < 2 || idx >= n_layers.saturating_sub(2) {
+        return true;
+    }
     (idx - 2) % stride == 0
 }
 
@@ -2150,11 +2660,16 @@ fn kmap_resolve_mode(
     }
 
     // Rule 3: MoE routers
-    if is_moe
-        && (name.ends_with("mlp.gate.weight")
-            || name.contains("shared_expert_gate"))
-    {
+    if is_moe && (name.ends_with("mlp.gate.weight") || name.contains("shared_expert_gate")) {
         return QuantLevel::Q8;
+    }
+
+    // Native Qwen3.5/3.6 MTP is a proposal model, not an ordinary target
+    // layer. Low-bit quantization of the MTP bridge/head can collapse
+    // acceptance, especially on 122B-A10B. Promote MTP 2D weights while the
+    // router/embed rules above still keep their Q8 handling.
+    if name.starts_with("mtp.") {
+        return QuantLevel::Promote(promote_to);
     }
 
     // Rule 4: MoE expert FFN weights
@@ -2308,7 +2823,11 @@ impl TensorSpill {
             .create_new(true)
             .open(&path)?;
         let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, raw);
-        Ok(Self { file, path, offset: 0 })
+        Ok(Self {
+            file,
+            path,
+            offset: 0,
+        })
     }
 
     /// Write tensor data to the spill file. Returns the byte count written.
@@ -2340,8 +2859,14 @@ impl Drop for TensorSpill {
 /// Spill tensors whose data is in memory to the spill file, freeing RAM.
 /// Called after each layer's expert batch to keep peak RSS bounded.
 fn maybe_spill(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
-    let in_mem: usize = tensors.iter().filter(|t| t.spilled_len == 0).map(|t| t.data.len()).sum();
-    if in_mem < threshold { return; }
+    let in_mem: usize = tensors
+        .iter()
+        .filter(|t| t.spilled_len == 0)
+        .map(|t| t.data.len())
+        .sum();
+    if in_mem < threshold {
+        return;
+    }
     for t in tensors.iter_mut() {
         if t.spilled_len == 0 && !t.data.is_empty() {
             let len = spill.spill(&t.data).unwrap_or(0);
@@ -2388,7 +2913,11 @@ fn write_hfq(
         // group size
         index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
         // data size (offset computed at read time from cumulative sizes)
-        let data_len = if t.spilled_len > 0 { t.spilled_len } else { t.data.len() as u64 };
+        let data_len = if t.spilled_len > 0 {
+            t.spilled_len
+        } else {
+            t.data.len() as u64
+        };
         index_bytes.extend_from_slice(&data_len.to_le_bytes());
     }
 
@@ -2417,9 +2946,7 @@ fn write_hfq(
     // Write tensor data — from spill file or from memory
     if let Some(spill) = spill {
         let _ = spill.flush();
-        let mut spill_reader = std::io::BufReader::new(
-            File::open(&spill.path)?
-        );
+        let mut spill_reader = std::io::BufReader::new(File::open(&spill.path)?);
         let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
         for t in tensors {
             if t.spilled_len > 0 {
@@ -2523,7 +3050,9 @@ fn resolve_model_path(input: &str) -> String {
     }
 
     // Check if it looks like a HuggingFace model ID (contains exactly one /)
-    if input.contains('/') && !input.contains(std::path::MAIN_SEPARATOR) || (cfg!(unix) && input.matches('/').count() == 1) {
+    if input.contains('/') && !input.contains(std::path::MAIN_SEPARATOR)
+        || (cfg!(unix) && input.matches('/').count() == 1)
+    {
         let parts: Vec<&str> = input.splitn(2, '/').collect();
         if parts.len() == 2 {
             let org = parts[0];
@@ -2567,7 +3096,9 @@ fn resolve_model_path(input: &str) -> String {
                     }
                 }
                 Ok(s) => eprintln!("huggingface-cli download failed with status {s}"),
-                Err(e) => eprintln!("Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"),
+                Err(e) => eprintln!(
+                    "Failed to run huggingface-cli: {e}. Install with: pip install huggingface_hub"
+                ),
             }
         }
     }
@@ -2604,7 +3135,7 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
         let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
@@ -2668,13 +3199,44 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     let dot = rest.find('.')?;
     let layer_idx = &rest[..dot];
     let slot_full = &rest[dot + 1..];
-    let slot = slot_full.strip_suffix(".weight")?;
+    let slot = slot_full.strip_suffix(".weight").unwrap_or(slot_full);
+
+    if let Some(expert_slot) = slot.strip_prefix("mlp.experts.") {
+        let projection = if let Some((head, tail)) = expert_slot.split_once('.') {
+            if head.parse::<usize>().is_ok() {
+                tail
+            } else {
+                expert_slot
+            }
+        } else {
+            expert_slot
+        };
+        let translated = match projection {
+            // Hipfire stores routed gate/up as one fused gate_up projection.
+            // Use llama.cpp's gate-side expert imatrix as the shared input
+            // statistic for that fused tensor; up_exps is shape-compatible
+            // evidence but cannot be applied separately without splitting the
+            // runtime tensor.
+            "gate_proj" | "gate_up_proj" => "ffn_gate_exps",
+            "up_proj" => "ffn_up_exps",
+            "down_proj" => "ffn_down_exps",
+            _ => return None,
+        };
+        return Some(format!("blk.{layer_idx}.{translated}.weight"));
+    }
 
     let translated = match slot {
         // MLP — present on every layer.
         "mlp.gate_proj" => "ffn_gate",
         "mlp.up_proj" => "ffn_up",
         "mlp.down_proj" => "ffn_down",
+        // Qwen3.5 MoE shared expert. Router and shared-expert gate entries
+        // are mapped for diagnostics, but AWQ remains gated by awq_eligible.
+        "mlp.gate" => "ffn_gate_inp",
+        "mlp.shared_expert_gate" => "ffn_gate_inp_shexp",
+        "mlp.shared_expert.gate_proj" => "ffn_gate_shexp",
+        "mlp.shared_expert.up_proj" => "ffn_up_shexp",
+        "mlp.shared_expert.down_proj" => "ffn_down_shexp",
         // FullAttention layer tensors (standard names).
         "self_attn.q_proj" => "attn_q",
         "self_attn.k_proj" => "attn_k",
@@ -2695,6 +3257,31 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
     Some(format!("blk.{layer_idx}.{translated}.weight"))
 }
 
+fn imatrix_vector_from_f32_data(data: &[u8], k: usize, n_mat: usize) -> Vec<f32> {
+    debug_assert!(k > 0);
+    debug_assert!(n_mat > 0);
+    let expected = k
+        .checked_mul(n_mat)
+        .and_then(|n| n.checked_mul(4))
+        .expect("imatrix tensor size overflow");
+    assert!(
+        data.len() >= expected,
+        "imatrix tensor data truncated: got {} bytes, expected at least {}",
+        data.len(),
+        expected
+    );
+
+    let mut values = vec![0.0_f32; k];
+    for c in 0..n_mat {
+        let column_base = c * k;
+        for (j, value) in values.iter_mut().enumerate() {
+            let off = (column_base + j) * 4;
+            *value += f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        }
+    }
+    values
+}
+
 /// Load an llama.cpp-compatible imatrix GGUF file and build a lookup
 /// keyed by ggml-style tensor name. The GGUF stores per-linear-layer
 /// pairs:
@@ -2702,9 +3289,10 @@ fn safetensors_to_ggml_name(name: &str) -> Option<String> {
 ///   {name}.counts      F32[1, n_mat]   token count contributing per matrix
 ///
 /// For non-MoE models n_mat=1; the [k] vector goes into the map directly.
-/// For MoE we'd need per-expert handling — out of scope for Step 5a
-/// (Qwen3.5 dense + Qwen3.6 dense are the first cohort targets; A3B MoE
-/// is deferred to a future iteration that handles n_mat > 1).
+/// For MoE n_mat is the expert count. The current MoE runtime rotates routed
+/// activations once per layer and uses a representative expert weight to choose
+/// AWQ scaling, so the quantizer stores a single layer-level vector by summing
+/// every expert column for each input channel.
 ///
 /// Returns `HashMap<ggml_name, Vec<f32>>` with the .in_sum2 values keyed by
 /// the BASE tensor name (the ".in_sum2" suffix stripped).
@@ -2717,43 +3305,65 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
 
     let mut map: HashMap<String, Vec<f32>> = HashMap::new();
     let mut total_entries = 0usize;
-    let mut skipped_moe = 0usize;
+    let mut aggregated_moe = 0usize;
+    let mut skipped_bad_shape = 0usize;
     for t in &gguf.tensors {
         let name = match t.name.strip_suffix(".in_sum2") {
             Some(n) => n.to_string(),
             None => continue, // ignore .counts and any other entries
         };
         if t.dtype != GgmlType::F32 {
-            eprintln!("warning: imatrix entry {} has non-F32 dtype {:?}; skipping",
-                t.name, t.dtype);
+            eprintln!(
+                "warning: imatrix entry {} has non-F32 dtype {:?}; skipping",
+                t.name, t.dtype
+            );
             continue;
         }
-        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. Skip multi-mat
-        // tensors with a warning — Step 5a doesn't handle them yet.
+        if t.shape.is_empty() {
+            eprintln!(
+                "warning: imatrix entry {} has empty shape; skipping",
+                t.name
+            );
+            skipped_bad_shape += 1;
+            continue;
+        }
+        // Shape is [k] (1D) for non-MoE; [k, n_mat] for MoE. GGML stores the
+        // first dimension contiguous, so column c begins at c*k.
         let n_mat = if t.shape.len() >= 2 { t.shape[1] } else { 1 };
-        if n_mat != 1 {
-            skipped_moe += 1;
+        if n_mat == 0 {
+            eprintln!(
+                "warning: imatrix entry {} has zero matrix count; skipping",
+                t.name
+            );
+            skipped_bad_shape += 1;
             continue;
         }
         let k = t.shape[0];
+        if k == 0 {
+            eprintln!(
+                "warning: imatrix entry {} has zero K dimension; skipping",
+                t.name
+            );
+            skipped_bad_shape += 1;
+            continue;
+        }
 
         // Read the F32 values from the tensor data segment.
         let data = gguf.tensor_data(t);
-        let mut values = Vec::with_capacity(k);
-        for i in 0..k {
-            let off = i * 4;
-            let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            values.push(v);
+        let values = imatrix_vector_from_f32_data(data, k, n_mat);
+        if n_mat > 1 {
+            aggregated_moe += 1;
         }
         map.insert(name, values);
         total_entries += 1;
     }
 
     eprintln!(
-        "imatrix: loaded {} entries from {} ({} MoE multi-matrix entries skipped — Step 5a is dense-only)",
+        "imatrix: loaded {} entries from {} ({} MoE multi-matrix entries aggregated, {} malformed entries skipped)",
         total_entries,
         path.display(),
-        skipped_moe,
+        aggregated_moe,
+        skipped_bad_shape,
     );
     if total_entries == 0 {
         eprintln!("error: imatrix file contains no usable .in_sum2 entries");
@@ -2829,7 +3439,8 @@ fn compute_awq_scales_autoawq(in_sum2: &[f32], w_rms: &[f32], alpha: f32) -> Vec
         sum_log += log_s;
     }
     let mean_log = sum_log / (k as f64);
-    log_s_raw.into_iter()
+    log_s_raw
+        .into_iter()
         .map(|l| ((l - mean_log).exp()) as f32)
         .collect()
 }
@@ -2867,7 +3478,7 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     let mut sum_log: f64 = 0.0;
     for &v in in_sum2 {
         let v_clamped = (v as f64).max(1e-12);
-        let log_s = half_alpha * v_clamped.ln();   // log(v^(alpha/2)) = (alpha/2) * log(v)
+        let log_s = half_alpha * v_clamped.ln(); // log(v^(alpha/2)) = (alpha/2) * log(v)
         log_s_raw.push(log_s);
         sum_log += log_s;
     }
@@ -2875,7 +3486,8 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
 
     // Step 3: subtract mean in log space, then exp back. After this,
     // geo_mean(s) = exp(0) = 1.0 exactly (within floating-point precision).
-    log_s_raw.into_iter()
+    log_s_raw
+        .into_iter()
         .map(|l| ((l - mean_log).exp()) as f32)
         .collect()
 }
@@ -2903,9 +3515,49 @@ fn awq_pre_scale_weights(weights: &mut [f32], m: usize, k: usize, scales: &[f32]
 /// Helper: convert a `Vec<f32>` AWQ-scale vector into the F16 byte
 /// payload that `HfqTensor` consumes for sidecar emission.
 fn awq_scales_to_f16_bytes(scales: &[f32]) -> Vec<u8> {
-    scales.iter()
+    scales
+        .iter()
         .flat_map(|&s| f32_to_f16(s).to_le_bytes())
         .collect()
+}
+
+fn awq_sidecar_name(weight_name: &str) -> String {
+    match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    }
+}
+
+fn maybe_apply_awq_pre_scale(
+    name: &str,
+    weights: &mut [f32],
+    m: usize,
+    k: usize,
+) -> Option<Vec<f32>> {
+    let (Some(alpha), Some(im_weights)) = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+    else {
+        return None;
+    };
+    if !awq_eligible(name) {
+        return None;
+    }
+    if im_weights.len() != k {
+        eprintln!(
+            "error: imatrix length ({}) != K dim ({}) for {}",
+            im_weights.len(),
+            k,
+            name,
+        );
+        std::process::exit(2);
+    }
+    let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
+        let w_rms = compute_weight_rms_per_input(weights, m, k);
+        compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+    } else {
+        compute_awq_scales(im_weights, alpha)
+    };
+    awq_pre_scale_weights(weights, m, k, &scales);
+    Some(scales)
 }
 
 /// AWQ pre-scaling is mathematically valid only for weights whose runtime
@@ -2960,7 +3612,7 @@ fn awq_eligible(name: &str) -> bool {
     let f1_only = match std::env::var("HIPFIRE_AWQ_F1_ONLY").ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
-        _ => AWQ_SCOPE_F1.get().copied().unwrap_or(true),  // default: F1
+        _ => AWQ_SCOPE_F1.get().copied().unwrap_or(true), // default: F1
     };
     let f1_match =
     // Full-attention input projections (HF naming + fused variants).
@@ -2994,7 +3646,9 @@ fn awq_eligible(name: &str) -> bool {
         // arch might choose; kept for safety.
         || name.ends_with("mlp.gate.weight")
         || name.ends_with("router.weight");
-    if f1_only { return f1_match; }
+    if f1_only {
+        return f1_match;
+    }
     let f2_match =
         // ── F2 (2026-05-14): output-side projections ────────────────────
         // These now have AWQ-aware runtime kernels (rotate_x_mq_awq for
@@ -3023,44 +3677,36 @@ fn gguf_is_embed_tensor(name: &str) -> bool {
 /// reads. Mirrors the field names HuggingFace uses in `config.json` for
 /// LlamaForCausalLM / Qwen3ForCausalLM, populated from the GGUF
 /// `<arch>.*` metadata keys.
-fn config_json_from_gguf(
-    gguf: &gguf_input::GgufFile,
-    arch_str: &str,
-) -> serde_json::Value {
+fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_json::Value {
     // GGUF prefixes its model hyperparameters with the architecture name —
     // e.g. for `general.architecture=llama` the keys live under `llama.*`.
     let prefix = arch_str;
 
     let read_u = |k: &str| -> Option<u64> {
-        gguf.metadata
-            .get(k)
-            .and_then(|v| match v {
-                gguf_input::MetaValue::U8(x) => Some(*x as u64),
-                gguf_input::MetaValue::I8(x) => Some(*x as u64),
-                gguf_input::MetaValue::U16(x) => Some(*x as u64),
-                gguf_input::MetaValue::I16(x) => Some(*x as u64),
-                gguf_input::MetaValue::U32(x) => Some(*x as u64),
-                gguf_input::MetaValue::I32(x) => Some(*x as u64),
-                gguf_input::MetaValue::U64(x) => Some(*x),
-                gguf_input::MetaValue::I64(x) => Some(*x as u64),
-                _ => None,
-            })
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::U8(x) => Some(*x as u64),
+            gguf_input::MetaValue::I8(x) => Some(*x as u64),
+            gguf_input::MetaValue::U16(x) => Some(*x as u64),
+            gguf_input::MetaValue::I16(x) => Some(*x as u64),
+            gguf_input::MetaValue::U32(x) => Some(*x as u64),
+            gguf_input::MetaValue::I32(x) => Some(*x as u64),
+            gguf_input::MetaValue::U64(x) => Some(*x),
+            gguf_input::MetaValue::I64(x) => Some(*x as u64),
+            _ => None,
+        })
     };
     let read_f = |k: &str| -> Option<f64> {
-        gguf.metadata
-            .get(k)
-            .and_then(|v| match v {
-                gguf_input::MetaValue::F32(x) => Some(*x as f64),
-                gguf_input::MetaValue::F64(x) => Some(*x),
-                _ => None,
-            })
+        gguf.metadata.get(k).and_then(|v| match v {
+            gguf_input::MetaValue::F32(x) => Some(*x as f64),
+            gguf_input::MetaValue::F64(x) => Some(*x),
+            _ => None,
+        })
     };
 
     let dim = read_u(&format!("{prefix}.embedding_length"));
     let n_layers = read_u(&format!("{prefix}.block_count"));
     let n_heads = read_u(&format!("{prefix}.attention.head_count"));
-    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv"))
-        .or(n_heads);
+    let n_kv_heads = read_u(&format!("{prefix}.attention.head_count_kv")).or(n_heads);
     let hidden_dim = read_u(&format!("{prefix}.feed_forward_length"));
     // vocab_size: prefer metadata, fall back to token_embd shape[1].
     let vocab_size = read_u(&format!("{prefix}.vocab_size")).or_else(|| {
@@ -3072,12 +3718,10 @@ fn config_json_from_gguf(
     let max_seq_len = read_u(&format!("{prefix}.context_length"));
     let rope_theta = read_f(&format!("{prefix}.rope.freq_base"));
     let rms_eps = read_f(&format!("{prefix}.attention.layer_norm_rms_epsilon"));
-    let head_dim = read_u(&format!("{prefix}.attention.key_length"))
-        .or_else(|| {
-            // Fall back: head_dim = dim / n_heads.
-            dim.zip(n_heads)
-                .map(|(d, h)| if h > 0 { d / h } else { d })
-        });
+    let head_dim = read_u(&format!("{prefix}.attention.key_length")).or_else(|| {
+        // Fall back: head_dim = dim / n_heads.
+        dim.zip(n_heads).map(|(d, h)| if h > 0 { d / h } else { d })
+    });
     let bos = read_u("tokenizer.ggml.bos_token_id").unwrap_or(1);
     let eos = read_u("tokenizer.ggml.eos_token_id").unwrap_or(2);
 
@@ -3105,10 +3749,7 @@ fn config_json_from_gguf(
         );
     }
     if let Some(v) = hidden_dim {
-        cfg.insert(
-            "intermediate_size".to_string(),
-            serde_json::Value::from(v),
-        );
+        cfg.insert("intermediate_size".to_string(), serde_json::Value::from(v));
     }
     if let Some(v) = vocab_size {
         cfg.insert("vocab_size".to_string(), serde_json::Value::from(v));
@@ -3163,9 +3804,7 @@ fn mv_to_json(v: &gguf_input::MetaValue) -> serde_json::Value {
         MV::F64(x) => serde_json::Value::from(*x),
         // Tokenizer arrays (tokens, scores, merges, ...) can be huge —
         // serialize them as JSON arrays so the engine side can re-parse.
-        MV::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(mv_to_json).collect())
-        }
+        MV::Array(arr) => serde_json::Value::Array(arr.iter().map(mv_to_json).collect()),
     }
 }
 
@@ -3197,8 +3836,8 @@ enum GgufFormat {
     Mq2Lloyd,
     Mq3Lloyd,
     Mq4Lloyd,
-    Hfp4,  // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
-    Mfp4,  // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
+    Hfp4, // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale)
+    Mfp4, // MFP4G32 — HFP4G32 + offline FWHT rotation (drop-in MQ4 replacement)
 }
 
 impl GgufFormat {
@@ -3299,12 +3938,27 @@ fn run_gguf_pipeline(
 
     // FWHT signs — only used when --format is mq4/mq6. Same seed pair as the
     // safetensors path so the engine's runtime FWHT inverse stays identical.
-    let needs_signs = matches!(format,
-        GgufFormat::Mq4 | GgufFormat::Mq6 | GgufFormat::Mq3 | GgufFormat::Mq2
-        | GgufFormat::Mq2Lloyd | GgufFormat::Mq3Lloyd | GgufFormat::Mq4Lloyd
-        | GgufFormat::Mfp4);
-    let signs1 = if needs_signs { gen_fwht_signs(42, 256) } else { Vec::new() };
-    let signs2 = if needs_signs { gen_fwht_signs(1042, 256) } else { Vec::new() };
+    let needs_signs = matches!(
+        format,
+        GgufFormat::Mq4
+            | GgufFormat::Mq6
+            | GgufFormat::Mq3
+            | GgufFormat::Mq2
+            | GgufFormat::Mq2Lloyd
+            | GgufFormat::Mq3Lloyd
+            | GgufFormat::Mq4Lloyd
+            | GgufFormat::Mfp4
+    );
+    let signs1 = if needs_signs {
+        gen_fwht_signs(42, 256)
+    } else {
+        Vec::new()
+    };
+    let signs2 = if needs_signs {
+        gen_fwht_signs(1042, 256)
+    } else {
+        Vec::new()
+    };
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
@@ -3329,8 +3983,8 @@ fn run_gguf_pipeline(
         let mut map = HashMap::new();
         let mut counts = [0u32; 5];
         for info in &gguf.tensors {
-            let out_name = gguf_to_safetensors_name(&info.name)
-                .unwrap_or_else(|| info.name.clone());
+            let out_name =
+                gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
             let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode, promote_to);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
@@ -3350,16 +4004,25 @@ fn run_gguf_pipeline(
                 4 => "down-only",
                 _ => "?",
             };
-            eprintln!("K-map plan ({} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
+            eprintln!(
+                "K-map plan ({} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
                 format.label(),
                 promote_to.label(),
-                if is_moe { ", MoE" } else { "" });
+                if is_moe { ", MoE" } else { "" }
+            );
             eprintln!("  F16:       {:>4} tensors", counts[0]);
             eprintln!("  Q8:        {:>4} tensors", counts[1]);
-            eprintln!("  Promote:   {:>4} tensors (→ {})", counts[2], promote_to.label());
+            eprintln!(
+                "  Promote:   {:>4} tensors (→ {})",
+                counts[2],
+                promote_to.label()
+            );
             if counts[3] > 0 {
-                eprintln!("  Override:  {:>4} tensors (lm_head → {})", counts[3],
-                    LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?"));
+                eprintln!(
+                    "  Override:  {:>4} tensors (lm_head → {})",
+                    counts[3],
+                    LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?")
+                );
             }
             eprintln!("  Base:      {:>4} tensors", counts[4]);
         }
@@ -3389,8 +4052,7 @@ fn run_gguf_pipeline(
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name)
-            .unwrap_or_else(|| info.name.clone());
+        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
@@ -3635,15 +4297,24 @@ fn main() {
     // or HIPFIRE_QUANT_THREADS env). Quantization is CPU-bound and saturates
     // memory bandwidth, so leaving headroom for the rest of the system avoids
     // making the whole box unresponsive during a multi-hour quantize run.
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(8);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8);
     let default_threads = ((cores * 8) / 10).max(1);
-    let threads = args.iter().position(|a| a == "--threads")
+    let threads = args
+        .iter()
+        .position(|a| a == "--threads")
         .and_then(|i| args.get(i + 1).and_then(|s| s.parse::<usize>().ok()))
-        .or_else(|| std::env::var("HIPFIRE_QUANT_THREADS").ok().and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            std::env::var("HIPFIRE_QUANT_THREADS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(default_threads);
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(threads).build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
     eprintln!("Rayon: {threads} worker threads ({cores} cores available, default 80% = {default_threads})");
-
 
     let input_dir = args.iter().position(|a| a == "--input")
         .map(|i| &args[i + 1])
@@ -3653,7 +4324,9 @@ fn main() {
         .map(|i| &args[i + 1])
         .unwrap_or_else(|| { eprintln!("Usage: hipfire-quantize --input <model_dir> --output <output.hfq> [--format <fmt>] [--kmap-mode 0|1|2] [--kmap-promote <fmt>] [--lm-head-format <fmt>] [--arch-id <u32>]"); std::process::exit(1); });
 
-    let format = args.iter().position(|a| a == "--format")
+    let format = args
+        .iter()
+        .position(|a| a == "--format")
         .map(|i| args[i + 1].as_str())
         .unwrap_or("q8f16");
     // q8f16 = all weights Q8 (interleaved blocks)
@@ -3674,7 +4347,7 @@ fn main() {
     let use_hfq3g128 = format == "hfq3g128" || format == "hfq3" || format == "hf3"; // default HF3 = G128
     let use_hfq2g256 = format == "hfq2g256";
     let use_hfq2g128 = format == "hfq2g128" || format == "hfq2" || format == "hf2";
-    let use_hfq_mixed = format == "hfq-mixed";  // Q8 attn + HFQ4 FFN
+    let use_hfq_mixed = format == "hfq-mixed"; // Q8 attn + HFQ4 FFN
     let use_mq6g256 = format == "mq6" || format == "mq6g256";
     // Mixed: MQ4 for attention/shared-expert + MQ6 for routed experts only.
     // Saves ~15 GB vs full MQ6 on 122B-A10B (75 GB vs 90 GB), fits in 125 GB UMA.
@@ -3688,9 +4361,12 @@ fn main() {
     }
     let use_mq3g256 = format == "mq3" || format == "mq3g256";
     let use_mq2g256 = format == "mq2" || format == "mq2g256";
-    let use_mq2g256_lloyd = format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
-    let use_mq3g256_lloyd = format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
-    let use_mq4g256_lloyd = format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
+    let use_mq2g256_lloyd =
+        format == "mq2-lloyd" || format == "mq2g256-lloyd" || format == "mq2lloyd";
+    let use_mq3g256_lloyd =
+        format == "mq3-lloyd" || format == "mq3g256-lloyd" || format == "mq3lloyd";
+    let use_mq4g256_lloyd =
+        format == "mq4-lloyd" || format == "mq4g256-lloyd" || format == "mq4lloyd";
     let use_hfq6 = format == "hfq6" || format == "hfq6g256" || format == "hf6";
     // HFP4G32 — RDNA-optimal FP4 (E2M1 + UE8M0 g32 + FP16 row scale). Spec at docs/quant-formats/hfp4.md.
     let use_hfp4 = format == "hfp4" || format == "hfp4g32" || format == "hf4p" || format == "fp4";
@@ -3705,7 +4381,8 @@ fn main() {
     // --f16-conv1d / --mq6-conv1d for quality ablations.
     let f16_conv1d = args.iter().any(|a| a == "--f16-conv1d");
     let mq6_conv1d = args.iter().any(|a| a == "--mq6-conv1d");
-    let q8_conv1d_default = !f16_conv1d && !mq6_conv1d && !args.iter().any(|a| a == "--no-q8-conv1d");
+    let q8_conv1d_default =
+        !f16_conv1d && !mq6_conv1d && !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
@@ -3719,7 +4396,9 @@ fn main() {
     // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
     // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
     // conv1d / lookup tables have no imatrix entry.
-    let imatrix_path = args.iter().position(|a| a == "--imatrix")
+    let imatrix_path = args
+        .iter()
+        .position(|a| a == "--imatrix")
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
     if let Some(path) = &imatrix_path {
@@ -3728,7 +4407,9 @@ fn main() {
             std::process::exit(1);
         }
         let table = load_imatrix(path);
-        IMATRIX.set(table).expect("IMATRIX set twice — should not happen");
+        IMATRIX
+            .set(table)
+            .expect("IMATRIX set twice — should not happen");
         eprintln!("imatrix loaded from {}", path.display());
     }
 
@@ -3748,9 +4429,10 @@ fn main() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.iter().any(|a| a == "--awq")
-        || args.iter().any(|a| a == "--awq-alpha");
-    let awq_alpha = args.iter().position(|a| a == "--awq-alpha")
+    let awq_enabled = args.iter().any(|a| a == "--awq") || args.iter().any(|a| a == "--awq-alpha");
+    let awq_alpha = args
+        .iter()
+        .position(|a| a == "--awq-alpha")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.55);
@@ -3760,11 +4442,17 @@ fn main() {
             std::process::exit(1);
         }
         if !(0.0..=1.0).contains(&awq_alpha) {
-            eprintln!("warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway");
+            eprintln!(
+                "warning: --awq-alpha {awq_alpha} outside typical [0, 1] range; using anyway"
+            );
         }
-        AWQ_ALPHA.set(awq_alpha).expect("AWQ_ALPHA set twice — should not happen");
+        AWQ_ALPHA
+            .set(awq_alpha)
+            .expect("AWQ_ALPHA set twice — should not happen");
 
-        let awq_formula = args.iter().position(|a| a == "--awq-formula")
+        let awq_formula = args
+            .iter()
+            .position(|a| a == "--awq-formula")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.as_str())
             .unwrap_or("paper");
@@ -3774,7 +4462,9 @@ fn main() {
         }
         AWQ_FORMULA.set(awq_formula == "autoawq").ok();
 
-        let awq_scope = args.iter().position(|a| a == "--awq-scope")
+        let awq_scope = args
+            .iter()
+            .position(|a| a == "--awq-scope")
             .and_then(|i| args.get(i + 1))
             .map(|s| s.as_str())
             .unwrap_or("f1");
@@ -3783,7 +4473,11 @@ fn main() {
             std::process::exit(1);
         }
         AWQ_SCOPE_F1.set(awq_scope == "f1").ok();
-        let formula_label = if awq_formula == "autoawq" { "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)" } else { "s[j]=(RMS_act[j])^alpha" };
+        let formula_label = if awq_formula == "autoawq" {
+            "s[j]=(RMS_act[j])^alpha * (RMS_w[j])^(1-alpha)"
+        } else {
+            "s[j]=(RMS_act[j])^alpha"
+        };
         eprintln!("AWQ pre-scaling: ENABLED (alpha={awq_alpha}, scope={awq_scope}, formula={awq_formula}: {formula_label}, geo-mean normalized to 1)");
     }
 
@@ -3797,14 +4491,20 @@ fn main() {
     // Stacks with --awq. GPTQ runs AFTER AWQ pre-scaling and BEFORE the
     // existing FWHT+pack step in the MQ4G256 branch. Implementation +
     // composability rationale: docs/plans/gptq.md v2.
-    let gptq_path = args.iter().position(|a| a == "--gptq")
+    let gptq_path = args
+        .iter()
+        .position(|a| a == "--gptq")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from);
-    let gptq_damp = args.iter().position(|a| a == "--gptq-damp")
+    let gptq_damp = args
+        .iter()
+        .position(|a| a == "--gptq-damp")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(0.01);
-    let gptq_max_damp = args.iter().position(|a| a == "--gptq-max-damp")
+    let gptq_max_damp = args
+        .iter()
+        .position(|a| a == "--gptq-max-damp")
         .and_then(|i| args.get(i + 1))
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
@@ -3816,7 +4516,10 @@ fn main() {
         let sc = match hessian_io::HessianSidecar::open(path) {
             Ok(sc) => sc,
             Err(e) => {
-                eprintln!("error: failed to open --gptq sidecar {}: {e}", path.display());
+                eprintln!(
+                    "error: failed to open --gptq sidecar {}: {e}",
+                    path.display()
+                );
                 std::process::exit(1);
             }
         };
@@ -3825,7 +4528,10 @@ fn main() {
             path.display(),
             sc.n_tensors()
         );
-        GPTQ_HESSIAN.set(sc).map_err(|_| "GPTQ_HESSIAN set twice").unwrap();
+        GPTQ_HESSIAN
+            .set(sc)
+            .map_err(|_| "GPTQ_HESSIAN set twice")
+            .unwrap();
     }
     // Cache GPTQ tuning params for the MQ4G256 branch below.
     let gptq_initial_damp = gptq_damp;
@@ -3840,7 +4546,9 @@ fn main() {
     // 2=typed (ffn_down+attn_v everywhere + edge blanket), 3=typed-lite
     // (ffn_down+attn_v only), 4=down-only. Default: alternating — same PPL as full
     // at 17% less model size on MoE (22.9 vs 27.7 GB, PPL 8K: 19.96 vs 20.07).
-    let kmap_mode: u8 = args.iter().position(|a| a == "--kmap-mode")
+    let kmap_mode: u8 = args
+        .iter()
+        .position(|a| a == "--kmap-mode")
         .and_then(|i| args.get(i + 1))
         .map(|v| match v.as_str() {
             "full" | "0" => 0,
@@ -3848,7 +4556,10 @@ fn main() {
             "typed" | "2" => 2,
             "typed-lite" | "typed_lite" | "lite" | "3" => 3,
             "down-only" | "down_only" | "down" | "4" => 4,
-            _ => { eprintln!("warning: unknown --kmap-mode '{v}', using alternating"); 1 }
+            _ => {
+                eprintln!("warning: unknown --kmap-mode '{v}', using alternating");
+                1
+            }
         })
         .unwrap_or(1);
 
@@ -3858,24 +4569,25 @@ fn main() {
     // applies regardless of base. Validated against the promote-pair allowlist
     // when both sides are known GgufFormat values. See
     // docs/plans/configurable-kmap-pair.md Phase 1a.
-    let kmap_promote: Option<GgufFormat> = if let Some(i) = args.iter().position(|a| a == "--kmap-promote") {
-        let v = args.get(i + 1).unwrap_or_else(|| {
-            eprintln!(
-                "error: --kmap-promote requires a value (e.g. --kmap-promote mq4). \
+    let kmap_promote: Option<GgufFormat> =
+        if let Some(i) = args.iter().position(|a| a == "--kmap-promote") {
+            let v = args.get(i + 1).unwrap_or_else(|| {
+                eprintln!(
+                    "error: --kmap-promote requires a value (e.g. --kmap-promote mq4). \
                  Supported: mq2, mq3, mq4, mq6, mq2-lloyd, mq3-lloyd, hfq4, hfq6, mfp4, hfp4."
-            );
-            std::process::exit(2);
-        });
-        Some(GgufFormat::from_flag(v).unwrap_or_else(|| {
-            eprintln!(
-                "error: --kmap-promote '{v}' is not a recognized format. \
+                );
+                std::process::exit(2);
+            });
+            Some(GgufFormat::from_flag(v).unwrap_or_else(|| {
+                eprintln!(
+                    "error: --kmap-promote '{v}' is not a recognized format. \
                  Supported: mq2, mq3, mq4, mq6, mq2-lloyd, mq3-lloyd, hfq4, hfq6, mfp4, hfp4."
-            );
-            std::process::exit(2);
-        }))
-    } else {
-        None
-    };
+                );
+                std::process::exit(2);
+            }))
+        } else {
+            None
+        };
     if let Some(promote) = kmap_promote {
         if let Some(base) = GgufFormat::from_flag(format) {
             if !is_promote_pair_supported(base, promote) {
@@ -3883,7 +4595,8 @@ fn main() {
                     "error: --kmap-promote {} not allowed for --format {}. \
                      Promote target must be same-family upward-in-bits. \
                      See docs/plans/configurable-kmap-pair.md for the supported pair matrix.",
-                    promote.label(), base.label()
+                    promote.label(),
+                    base.label()
                 );
                 std::process::exit(2);
             }
@@ -4030,7 +4743,15 @@ fn main() {
                 GgufFormat::Hfq4
             });
             let out = Path::new(output_path);
-            if let Err(e) = run_gguf_pipeline(raw_input, out, gguf_format, no_kmap, kmap_dense, kmap_mode, kmap_promote) {
+            if let Err(e) = run_gguf_pipeline(
+                raw_input,
+                out,
+                gguf_format,
+                no_kmap,
+                kmap_dense,
+                kmap_mode,
+                kmap_promote,
+            ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
             }
@@ -4049,7 +4770,10 @@ fn main() {
         .unwrap_or_else(|_| panic!("Cannot read {}. If using a HuggingFace model ID, ensure it's downloaded: huggingface-cli download {}", config_path.display(), input_dir.display()));
     let config: serde_json::Value = serde_json::from_str(&config_str).unwrap();
 
-    let arch_str = config.get("model_type").and_then(|v| v.as_str()).unwrap_or("llama");
+    let arch_str = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama");
     let auto_arch_id = match arch_str {
         "llama" => 0u32,
         "qwen3" | "qwen2" => 1,
@@ -4063,7 +4787,10 @@ fn main() {
         // SwiGLU, RMSNorm. Crate: hipfire-arch-dots-ocr. See docs/plans/
         // dots-ocr-prd.md.
         "dots_ocr" => 8,
-        other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
+        other => {
+            eprintln!("Warning: unknown architecture '{other}', treating as llama");
+            0
+        }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
     // model's family maps to a different crate than the default
@@ -4091,11 +4818,17 @@ fn main() {
     // Qwen3.5+ nests config under "text_config"; try both paths.
     let n_layers: usize = config
         .get("num_hidden_layers")
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("num_hidden_layers")))
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("num_hidden_layers"))
+        })
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as usize;
     if n_layers == 0 {
-        eprintln!("  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled");
+        eprintln!(
+            "  warning: num_hidden_layers not found in config.json — edge-layer promotion disabled"
+        );
     }
 
     // Read tokenizer if present
@@ -4134,10 +4867,26 @@ fn main() {
         None
     };
 
+    let include_mtp = args.iter().any(|a| a == "--include-mtp");
+    let text_config = config.get("text_config").unwrap_or(&config);
+    let mtp_num_hidden_layers = text_config
+        .get("mtp_num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let mtp_use_dedicated_embeddings = text_config
+        .get("mtp_use_dedicated_embeddings")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Build metadata JSON for .hfq
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
+        "mtp": {
+            "included": include_mtp,
+            "num_hidden_layers": mtp_num_hidden_layers,
+            "use_dedicated_embeddings": mtp_use_dedicated_embeddings,
+        },
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
@@ -4192,20 +4941,23 @@ fn main() {
     // Deprecated alias: `HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ=1` (CUDA branch's
     // env-var path) is treated as `--lm-head-format mq4` for one release
     // cycle; emits a deprecation warning. Removed in the next release.
-    let lm_head_format_cli: Option<&str> = if let Some(i) = args.iter().position(|a| a == "--lm-head-format") {
-        let v = args.get(i + 1).unwrap_or_else(|| {
-            eprintln!(
-                "error: --lm-head-format requires a value (e.g. --lm-head-format mq4). \
+    let lm_head_format_cli: Option<&str> =
+        if let Some(i) = args.iter().position(|a| a == "--lm-head-format") {
+            let v = args.get(i + 1).unwrap_or_else(|| {
+                eprintln!(
+                    "error: --lm-head-format requires a value (e.g. --lm-head-format mq4). \
                  Supported: q8, f16, mq4, mq6, mq3, mfp4, hfq4, hfq6."
-            );
-            std::process::exit(2);
-        });
-        Some(v.as_str())
-    } else {
-        None
-    };
+                );
+                std::process::exit(2);
+            });
+            Some(v.as_str())
+        } else {
+            None
+        };
     let cuda_env_alias = std::env::var("HIPFIRE_QUANTIZE_LM_HEAD_MQ4_AWQ")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     let lm_head_format_arg: Option<&str> = if let Some(v) = lm_head_format_cli {
         Some(v)
     } else if cuda_env_alias {
@@ -4243,8 +4995,11 @@ fn main() {
 
     if let Some(fmt) = lm_head_format {
         // (a) Tied-embedding refusal (hardened: explicit match on the field).
-        let tied_embed_field = config.get("tie_word_embeddings")
-            .or_else(|| config.get("text_config").and_then(|tc| tc.get("tie_word_embeddings")));
+        let tied_embed_field = config.get("tie_word_embeddings").or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("tie_word_embeddings"))
+        });
         match tied_embed_field.and_then(|v| v.as_bool()) {
             Some(true) => {
                 eprintln!(
@@ -4273,8 +5028,7 @@ fn main() {
         // (b) UNSAFE runtime gate: any non-Q8 lm-head-format requires the
         // operator to acknowledge that the AWQ-aware lm_head runtime kernel
         // hasn't shipped yet. Drops in lockstep with the CUDA branch landing.
-        let unsafe_gate = std::env::var("HIPFIRE_LM_HEAD_AWQ_UNSAFE")
-            .ok().as_deref() == Some("1");
+        let unsafe_gate = std::env::var("HIPFIRE_LM_HEAD_AWQ_UNSAFE").ok().as_deref() == Some("1");
         if !unsafe_gate {
             eprintln!(
                 "error: --lm-head-format {} requires HIPFIRE_LM_HEAD_AWQ_UNSAFE=1 \
@@ -4310,7 +5064,8 @@ fn main() {
                     "warning: AWQ pre-scaling for --lm-head-format {} is not yet wired \
                      (runtime supports MQ4/MQ3 only via DType::supports_awq_sidecar). \
                      lm_head will be plain {} without an AWQ sidecar.",
-                    fmt.label(), fmt.label()
+                    fmt.label(),
+                    fmt.label()
                 );
             }
         }
@@ -4326,7 +5081,10 @@ fn main() {
     let parsed_base_opt = GgufFormat::from_flag(format);
     let parsed_base = parsed_base_opt.unwrap_or(GgufFormat::Mq4);
     let promote_to = kmap_promote.unwrap_or_else(|| default_promote_target(parsed_base));
-    let kmap: HashMap<String, QuantLevel> = if no_kmap || (!is_moe && !kmap_dense) || parsed_base_opt.is_none() {
+    let kmap: HashMap<String, QuantLevel> = if no_kmap
+        || (!is_moe && !kmap_dense)
+        || parsed_base_opt.is_none()
+    {
         HashMap::new()
     } else {
         let mut map = HashMap::new();
@@ -4351,15 +5109,27 @@ fn main() {
                 4 => "down-only",
                 _ => "?",
             };
-            eprintln!("K-map plan ({format} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
+            eprintln!(
+                "K-map plan ({format} base → {} promote, {n_layers} layers{}, mode={mode_label}):",
                 promote_to.label(),
-                if is_moe { ", MoE" } else { "" });
+                if is_moe { ", MoE" } else { "" }
+            );
             eprintln!("  F16:       {:>4} tensors (norms, biases)", counts[0]);
-            eprintln!("  Q8:        {:>4} tensors (embed, routers, default lm_head)", counts[1]);
-            eprintln!("  Promote:   {:>4} tensors (→ {})", counts[2], promote_to.label());
+            eprintln!(
+                "  Q8:        {:>4} tensors (embed, routers, default lm_head)",
+                counts[1]
+            );
+            eprintln!(
+                "  Promote:   {:>4} tensors (→ {})",
+                counts[2],
+                promote_to.label()
+            );
             if counts[3] > 0 {
-                eprintln!("  Override:  {:>4} tensors (lm_head → {})", counts[3],
-                    LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?"));
+                eprintln!(
+                    "  Override:  {:>4} tensors (lm_head → {})",
+                    counts[3],
+                    LM_HEAD_FORMAT.get().map(|f| f.label()).unwrap_or("?")
+                );
             }
             eprintln!("  Base:      {:>4} tensors (remaining)", counts[4]);
         }
@@ -4378,13 +5148,15 @@ fn main() {
     let mut max_quant_error = 0.0f32;
     let mut _n_quant_groups = 0u64;
 
-    let include_vision = std::env::args().any(|a| a == "--include-vision");
-    let vision_quant = std::env::args().position(|a| a == "--vision-quant")
+    let include_vision = args.iter().any(|a| a == "--include-vision");
+    let vision_quant = std::env::args()
+        .position(|a| a == "--vision-quant")
         .and_then(|i| std::env::args().nth(i + 1))
         .unwrap_or_default();
     let mut skipped_params = 0u64;
     for (name, file_idx) in &all_tensors {
-        // Skip MTP head; optionally include vision encoder for VL inference.
+        // Skip MTP head unless explicitly requested; optionally include vision
+        // encoder for VL inference.
         // Qwen3.5-VL names vision tensors `model.visual.*` / `visual.*`;
         // dots.ocr names them `vision_tower.*`. Both fall through to the
         // F16 fallback path (see should_quantize: vision_tower.* is
@@ -4398,7 +5170,7 @@ fn main() {
             skipped_params += n as u64;
             continue;
         }
-        if name.starts_with("mtp.") {
+        if name.starts_with("mtp.") && !include_mtp {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -4428,12 +5200,17 @@ fn main() {
             let n_experts = meta.shape[0];
             let inner_n: usize = meta.shape[1..].iter().product();
             let elem_size = match meta.dtype.as_str() {
-                "F32" => 4, "F16" | "BF16" => 2,
+                "F32" => 4,
+                "F16" | "BF16" => 2,
                 other => panic!("unsupported expert tensor dtype: {other}"),
             };
             let inner_bytes = inner_n * elem_size;
             let inner_shape: Vec<u32> = meta.shape[1..].iter().map(|&s| s as u32).collect();
-            let base_name = if name.ends_with("gate_up_proj") { "gate_up_proj" } else { "down_proj" };
+            let base_name = if name.ends_with("gate_up_proj") {
+                "gate_up_proj"
+            } else {
+                "down_proj"
+            };
             // Strip the trailing base; what remains is the parent path with `experts.` already on the end
             let parent = &name[..name.len() - base_name.len()];
 
@@ -4473,10 +5250,14 @@ fn main() {
             let parent_owned = parent.to_string();
             let inner_shape_clone = inner_shape.clone();
             let base_owned = base_name.to_string();
-            let mut new_tensors: Vec<HfqTensor> = (0..n_experts).into_par_iter().map(|x| {
+            let new_tensor_groups: Vec<Vec<HfqTensor>> = (0..n_experts).into_par_iter().map(|x| {
                 let slice_off = x * inner_bytes;
                 let slice = &raw_data[slice_off..slice_off + inner_bytes];
-                let f32_slice = to_f32(slice, &dtype);
+                let mut f32_slice = to_f32(slice, &dtype);
+                let out_name = format!("{parent_owned}{x}.{base_owned}.weight");
+                let m_dim = inner_shape_clone[0] as usize;
+                let k_dim = inner_shape_clone[1] as usize;
+                let mut awq_sidecar_scales: Option<Vec<f32>> = None;
                 let (quantized, qt, gs) = if let Some(fmt) = expert_promote_fmt {
                     // Promoted: dispatch on the carried Promote(<fmt>) target.
                     // Non-256-aligned promoted tensors fall to HFQ4G128 (same as
@@ -4496,10 +5277,22 @@ fn main() {
                                 (q, QuantType::HFQ6G256, 256u32)
                             }
                             GgufFormat::Mq4 => {
+                                awq_sidecar_scales = maybe_apply_awq_pre_scale(
+                                    &out_name,
+                                    &mut f32_slice,
+                                    m_dim,
+                                    k_dim,
+                                );
                                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                                 (q, QuantType::MQ4G256, 256u32)
                             }
                             GgufFormat::Mq3 => {
+                                awq_sidecar_scales = maybe_apply_awq_pre_scale(
+                                    &out_name,
+                                    &mut f32_slice,
+                                    m_dim,
+                                    k_dim,
+                                );
                                 let q = quantize_mq3g256(&f32_slice, &signs1, &signs2);
                                 (q, QuantType::MQ3G256, 256u32)
                             }
@@ -4546,30 +5339,61 @@ fn main() {
                     let q = quantize_hfq4g256(&f32_slice);
                     (q, QuantType::HFQ4G256, 256u32)
                 } else if supports_g256 {
+                    awq_sidecar_scales = maybe_apply_awq_pre_scale(
+                        &out_name,
+                        &mut f32_slice,
+                        m_dim,
+                        k_dim,
+                    );
                     let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32)
                 } else {
                     let q = quantize_hfq4g128(&f32_slice);
                     (q, QuantType::HFQ4G128, 128u32)
                 };
-                HfqTensor {
-                    name: format!("{parent_owned}{x}.{base_owned}.weight"),
+                let mut out = Vec::with_capacity(if awq_sidecar_scales.is_some() { 2 } else { 1 });
+                out.push(HfqTensor {
+                    name: out_name.clone(),
                     quant_type: qt,
                     shape: inner_shape_clone.clone(),
                     group_size: gs,
                     data: quantized,
                     spilled_len: 0,
+                });
+                if let Some(scales) = awq_sidecar_scales {
+                    let sidecar_name = awq_sidecar_name(&out_name);
+                    let bytes = awq_scales_to_f16_bytes(&scales);
+                    out.push(HfqTensor {
+                        name: sidecar_name,
+                        quant_type: QuantType::F16,
+                        shape: vec![scales.len() as u32],
+                        group_size: 0,
+                        data: bytes,
+                        spilled_len: 0,
+                    });
                 }
+                out
             }).collect();
+            let mut new_tensors: Vec<HfqTensor> = new_tensor_groups.into_iter().flatten().collect();
             quantized_params += inner_n as u64 * n_experts as u64;
             // Single eprintln to summarize the whole expert sweep.
             let label = if let Some(fmt) = expert_promote_fmt {
-                if supports_g256 { fmt.label() } else { "HFQ4G128" }
-            } else if expert_mq6 { "MQ6G256" }
-              else if expert_hfq6 { "HFQ6G256" }
-              else if expert_hfq4 { "HFQ4G256" }
-              else if supports_g256 { "MQ4G256" }
-              else { "HFQ4G128" };
+                if supports_g256 {
+                    fmt.label()
+                } else {
+                    "HFQ4G128"
+                }
+            } else if expert_mq6 {
+                "MQ6G256"
+            } else if expert_hfq6 {
+                "HFQ6G256"
+            } else if expert_hfq4 {
+                "HFQ4G256"
+            } else if supports_g256 {
+                "MQ4G256"
+            } else {
+                "HFQ4G128"
+            };
             let bytes_per = new_tensors.first().map(|t| t.data.len()).unwrap_or(0);
             eprintln!("  {label:>8}: {parent_owned}{{0..{n_experts}}}.{base_owned}.weight {:?} (×{n_experts} experts || {:.1} KB/expert, parallel)",
                 inner_shape, bytes_per as f64 / 1024.0);
@@ -4617,11 +5441,16 @@ fn main() {
                     }
                 }
 
-                eprintln!("  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
-                    "Q8_HFQ", name, meta.shape, n_elements,
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB, stride={})",
+                    "Q8_HFQ",
+                    name,
+                    meta.shape,
+                    n_elements,
                     raw_data.len() as f64 / 1024.0,
                     quantized.len() as f64 / 1024.0,
-                    row_stride);
+                    row_stride
+                );
 
                 hfq_tensors.push(HfqTensor {
                     name: name.to_string(),
@@ -4632,724 +5461,881 @@ fn main() {
                     spilled_len: 0,
                 });
             } else {
+                // ── K-map override ──────────────────────────────────────────────
+                let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
 
-            // ── K-map override ──────────────────────────────────────────────
-            let kmap_level = kmap.get(&**name).copied().unwrap_or(QuantLevel::Base);
+                // AWQ sidecar scales for this tensor — populated only inside the
+                // MQ4G256 arm when --awq is enabled and an imatrix entry exists
+                // for this tensor's ggml-translated name. After the main tensor
+                // push, we emit an `<name>.awq_scale` 1D F16 sidecar tensor so
+                // the runtime can apply `x / s` before the rotation kernel at
+                // inference time.
+                let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
-            // AWQ sidecar scales for this tensor — populated only inside the
-            // MQ4G256 arm when --awq is enabled and an imatrix entry exists
-            // for this tensor's ggml-translated name. After the main tensor
-            // push, we emit an `<name>.awq_scale` 1D F16 sidecar tensor so
-            // the runtime can apply `x / s` before the rotation kernel at
-            // inference time.
-            let mut awq_sidecar_scales: Option<Vec<f32>> = None;
-
-            let (quantized, qt, gs, label) = if mq6_conv1d && is_conv1d_tensor(name) {
-                // DeltaNet conv1d MQ6 ablation. Runtime loads this tensor as
-                // F32 through load_any_as_f32, so this isolates quant quality.
-                let signs1 = gen_fwht_signs(42, 256);
-                let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-            } else if f16_conv1d && is_conv1d_tensor(name) {
-                // DeltaNet conv1d F16 ablation. Runtime loads this path as F32,
-                // same as Q8/MQ4/MQ6 conv1d, so this isolates quant quality.
-                let f16_bytes: Vec<u8> = f32_data
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect();
-                (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if q8_conv1d_default && is_conv1d_tensor(name) {
-                // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if kmap_level == QuantLevel::Q8 {
-                // K-map says Q8 (embed, lm_head, router)
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if kmap_level == QuantLevel::F16 {
-                // K-map says F16 (should not normally reach here — should_quantize filters first)
-                let f16_bytes: Vec<u8> = f32_data
-                    .iter()
-                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
-                    .collect();
-                (f16_bytes, QuantType::F16, 0u32, "F16")
-            } else if let QuantLevel::Promote(promote_fmt) = kmap_level {
-                // K-map says promote. The carried format (from `--kmap-promote`
-                // or `default_promote_target(base)`) drives the dispatch.
-                // Non-256-aligned tensors fall back to Q8.
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    match promote_fmt {
-                        GgufFormat::Mq6 => {
-                            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                        }
-                        GgufFormat::Hfq6 => {
-                            let q = quantize_hfq6g256(&f32_data);
-                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                        }
-                        GgufFormat::Mq4 => {
-                            // MQ4 promote target: wire AWQ inline-quantize when
-                            // --awq is set and the tensor is on the F1/F2
-                            // whitelist (q_proj, k_proj, v_proj, gate_proj,
-                            // up_proj, o_proj, down_proj, wo, w_down, etc.).
-                            // Runtime supports MQ4G256 AWQ sidecars
-                            // (DType::supports_awq_sidecar). Without this,
-                            // promoted tensors miss AWQ and the kmap-pair
-                            // model loses quality on the precisely the layers
-                            // kmap was supposed to protect (combined-review G5).
-                            let q = if let (Some(alpha), Some(im_weights))
-                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq4g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                        }
-                        GgufFormat::Mq3 => {
-                            // MQ3 promote target: same AWQ wiring as MQ4.
-                            // Runtime supports MQ3G256 AWQ sidecars too
-                            // (DType::supports_awq_sidecar).
-                            let q = if let (Some(alpha), Some(im_weights))
-                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq3g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq3g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                        }
-                        GgufFormat::Mq2 => {
-                            let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                        }
-                        GgufFormat::Mq2Lloyd => {
-                            let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                        }
-                        GgufFormat::Mq3Lloyd => {
-                            let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                        }
-                        GgufFormat::Mq4Lloyd => {
-                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                        }
-                        GgufFormat::Hfq4 => {
-                            let q = quantize_hfq4g256(&f32_data);
-                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                        }
-                        GgufFormat::Hfp4 => {
-                            // No FP6 sibling — Promote-to-HFP4 is the no-op identity.
-                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
-                            let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                        }
-                        GgufFormat::Mfp4 => {
-                            // No FP6 sibling — Promote-to-MFP4 is the no-op identity.
-                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
-                            let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                        }
-                    }
-                } else {
-                    // Non-256-aligned fallback: Q8
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                }
-            } else if let QuantLevel::Override(override_fmt) = kmap_level {
-                // K-map says override (today: lm_head when --lm-head-format set).
-                // Dispatch on the carried format. For MQ4 with AWQ enabled,
-                // apply AWQ pre-scaling + emit a sidecar so the runtime
-                // (once the CUDA-branch AWQ-aware lm_head dispatch lands)
-                // sees scaled bytes and inverse-divides correctly. For any
-                // other format, plain quantize (the AWQ wiring outside MQ4
-                // is a follow-up).
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    match override_fmt {
-                        GgufFormat::Mq4 => {
-                            // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
-                            let q = if let (Some(alpha), Some(im_weights))
-                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq4g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                        }
-                        GgufFormat::Mq6 => {
-                            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
-                        }
-                        GgufFormat::Mq3 => {
-                            // MQ3 + AWQ on lm_head: runtime supports the sidecar via
-                            // DType::supports_awq_sidecar(MQ3G256)=true (per the
-                            // fix/lm-head-awq-runtime branch). Wire the same AWQ
-                            // inline-quantize dance as the MQ4 arm.
-                            let q = if let (Some(alpha), Some(im_weights))
-                                = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                            {
-                                if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
-                                    let m_dim = meta.shape[0];
-                                    let mut scaled = f32_data.clone();
-                                    awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq3g256(&scaled, &signs1, &signs2)
-                                } else {
-                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
-                                }
-                            } else {
-                                quantize_mq3g256(&f32_data, &signs1, &signs2)
-                            };
-                            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                        }
-                        GgufFormat::Hfq4 => {
-                            let q = quantize_hfq4g256(&f32_data);
-                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                        }
-                        GgufFormat::Hfq6 => {
-                            let q = quantize_hfq6g256(&f32_data);
-                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                        }
-                        // Other Override targets: not yet wired with AWQ;
-                        // emit plain quantization. Used in Phase 0 sweeps
-                        // for non-AWQ lm_head experiments.
-                        GgufFormat::Mq2 => {
-                            let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                        }
-                        GgufFormat::Mq2Lloyd => {
-                            let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                        }
-                        GgufFormat::Mq3Lloyd => {
-                            let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                        }
-                        GgufFormat::Mq4Lloyd => {
-                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                        }
-                        GgufFormat::Mfp4 => {
-                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
-                            let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                        }
-                        GgufFormat::Hfp4 => {
-                            let m = if meta.shape.len() == 2 { meta.shape[0] } else { 1 };
-                            let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                        }
-                    }
-                } else {
-                    // Non-256-aligned override target: Q8 fallback.
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                }
-            } else {
-            // QuantLevel::Base — existing format-specific logic below
-
-            // Choose quant format per tensor
-            let this_q8 = if use_q4k_all {
-                false // everything Q4_K
-            } else if use_q4k_q8embed {
-                name.contains("embed") || name.contains("lm_head") // only embed/output Q8
-            } else if use_mixed || use_fast {
-                is_q8_tensor(name)
-            } else {
-                use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
-            };
-            let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
-            let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
-
-            // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
-            // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-            let is_embed = name.contains("embed_tokens");
-
-            if use_hfq_mixed {
-                // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
-                let is_ffn = name.contains("mlp.") || name.contains("ffn");
-                if !is_ffn {
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                } else {
-                    let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                    if k_dim % 256 == 0 {
-                        let q = quantize_hfq4g256(&f32_data);
-                        (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                    } else {
-                        let q = quantize_hfq4g128(&f32_data);
-                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                    }
-                }
-            } else if use_hfq6 {
-                // HFQ6-G256: all weights 6-bit, embeddings Q8
-                if is_embed {
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                } else {
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-            } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_hfq2g128 {
-                let q = quantize_hfq2g128(&f32_data);
-                (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-            } else if use_hfq2g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq2g256(&f32_data);
-                    (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
-                } else {
-                    // Fallback to HFQ4 for non-256-aligned
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mq8g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq8g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq8g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ8G256, 256u32, "MQ8G256")
-                } else {
-                    // Fallback to Q8 for non-256-aligned
-                    let q = quantize_q8f16(&f32_data);
-                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
-                }
-            } else if q8_router && is_q8_tensor(name) {
-                // Q8 router for MoE: keep mlp.gate.weight and
-                // shared_expert_gate.weight at Q8 regardless of --format.
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256 || use_mq4_mq6exp {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
-                    // AND we have imatrix data for this tensor AND the tensor
-                    // is on the AWQ whitelist (see `awq_eligible`). Mutates a
-                    // local copy of the weights so the original f32_data
-                    // returned by to_f32() is left intact for downstream
-                    // consumers (we don't currently have any here, but this
-                    // is hygienic).
-                    //
-                    // The `awq_eligible(name)` guard is critical: pre-scaling
-                    // weights whose runtime path lacks the inverse divide
-                    // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
-                    // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
-                    // this guard landed). See `docs/plans/awq_fix_claude.md`.
-                    //
-                    // Phase A Stage B — GPTQ on MQ4G256 (commit pending).
-                    // When --gptq is enabled AND we have a Hessian for this
-                    // tensor, route through `gptq::gptq_pipeline_mq4g256`
-                    // which does AWQ-Hessian-rescale + FWHT-similarity +
-                    // FWHT-rotate-weights + frozen-grids + column-sequential
-                    // OBS update + pack. Stacks cleanly with AWQ (the
-                    // pipeline takes AWQ scales as input). For non-AWQ
-                    // tensors (o_proj/out_proj/down_proj per the whitelist),
-                    // pass identity scales — Stage B widens GPTQ coverage to
-                    // all MQ4G256 tensors per GLM5 M5.
-                    let m_dim = meta.shape[0];
-                    // Step 1: AWQ pre-scaling (if eligible + enabled).
-                    let (working_weights, awq_scales_for_pipeline_f64) =
-                        if let (Some(alpha), Some(im_weights))
-                            = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
-                        {
-                            if awq_eligible(name) {
-                                debug_assert_eq!(im_weights.len(), k_dim,
-                                    "imatrix length ({}) != K dim ({}) for {}",
-                                    im_weights.len(), k_dim, name);
-                                let scales = if AWQ_FORMULA.get().copied().unwrap_or(false) {
-                                    let w_rms = compute_weight_rms_per_input(&f32_data, m_dim, k_dim);
-                                    compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
-                                } else {
-                                    compute_awq_scales(im_weights, alpha)
-                                };
-                                awq_sidecar_scales = Some(scales.clone());
-                                let mut scaled = f32_data.clone();
-                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                let scales_f64: Vec<f64> = scales.iter().map(|&v| v as f64).collect();
-                                (scaled, scales_f64)
-                            } else {
-                                // AWQ-ineligible: plain weights, identity scales.
-                                (f32_data.clone(), vec![1.0_f64; k_dim])
-                            }
-                        } else {
-                            (f32_data.clone(), vec![1.0_f64; k_dim])
-                        };
-
-                    // Step 2: GPTQ (if --gptq enabled + Hessian present) or plain pack.
-                    let q = if let Some(sc) = GPTQ_HESSIAN.get() {
-                        // Strip ".weight" to match collect_hessian.py's key
-                        // convention (HFHS format spec §3.1).
-                        let h_key = name.strip_suffix(".weight").unwrap_or(name);
-                        if let Some(href) = sc.get(h_key, 0) {
-                            if href.k != k_dim {
-                                eprintln!(
-                                    "warning: GPTQ {h_key}: Hessian K={} != tensor K={k_dim}; skipping GPTQ for this tensor",
-                                    href.k
-                                );
-                                quantize_mq4g256(&working_weights, &signs1, &signs2)
-                            } else {
-                                // FP32 view of the K×K Hessian (promoted to FP64 inside the pipeline).
-                                let h_unrot_f32: Vec<f32> = href.iter_f64().map(|v| v as f32).collect();
-                                match gptq::gptq_pipeline_mq4g256(
-                                    &working_weights, m_dim, k_dim,
-                                    &h_unrot_f32, &awq_scales_for_pipeline_f64,
-                                    &signs1, &signs2,
-                                    gptq_initial_damp, gptq_max_damp_multiplier,
-                                    h_key,
-                                ) {
-                                    Ok(packed) => packed,
-                                    Err(e) => {
-                                        eprintln!("warning: GPTQ failed for {name}: {e}; falling back to plain MQ4");
-                                        quantize_mq4g256(&working_weights, &signs1, &signs2)
-                                    }
-                                }
-                            }
-                        } else {
-                            // No Hessian recorded for this tensor — happens
-                            // for tensors the Python collector didn't hook
-                            // (e.g. embedding layers, or arch additions not
-                            // in GPTQ_TARGET_SUFFIXES). Plain MQ4 pack.
-                            quantize_mq4g256(&working_weights, &signs1, &signs2)
-                        }
-                    } else {
-                        // --gptq not enabled — Stage A AWQ-only or plain MQ4.
-                        quantize_mq4g256(&working_weights, &signs1, &signs2)
-                    };
-                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
-                } else {
-                    // Fallback to standard HFQ4-G128 for non-256-aligned
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_hfp4 && is_embed {
-                // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
-                // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_hfp4 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 32 == 0 && meta.shape.len() == 2 {
-                    let m = meta.shape[0];
-                    let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
-                    (q, QuantType::HFP4G32, 32u32, "HFP4G32")
-                } else {
-                    // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mfp4 && is_embed {
-                // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mfp4 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 && meta.shape.len() == 2 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let m = meta.shape[0];
-                    let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
-                    (q, QuantType::MFP4G32, 32u32, "MFP4G32")
-                } else {
-                    // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
-                    // requires 256-element segments). Matches MQ4's ragged fallback.
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mq6g256 && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq6g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
+                let (quantized, qt, gs, label) = if mq6_conv1d && is_conv1d_tensor(name) {
+                    // DeltaNet conv1d MQ6 ablation. Runtime loads this tensor as
+                    // F32 through load_any_as_f32, so this isolates quant quality.
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
                     let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                } else if f16_conv1d && is_conv1d_tensor(name) {
+                    // DeltaNet conv1d F16 ablation. Runtime loads this path as F32,
+                    // same as Q8/MQ4/MQ6 conv1d, so this isolates quant quality.
+                    let f16_bytes: Vec<u8> = f32_data
+                        .iter()
+                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                        .collect();
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
+                } else if q8_conv1d_default && is_conv1d_tensor(name) {
+                    // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if kmap_level == QuantLevel::Q8 {
+                    // K-map says Q8 (embed, lm_head, router)
+                    let q = quantize_q8f16(&f32_data);
+                    (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                } else if kmap_level == QuantLevel::F16 {
+                    // K-map says F16 (should not normally reach here — should_quantize filters first)
+                    let f16_bytes: Vec<u8> = f32_data
+                        .iter()
+                        .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                        .collect();
+                    (f16_bytes, QuantType::F16, 0u32, "F16")
+                } else if let QuantLevel::Promote(promote_fmt) = kmap_level {
+                    // K-map says promote. The carried format (from `--kmap-promote`
+                    // or `default_promote_target(base)`) drives the dispatch.
+                    // Non-256-aligned tensors fall back to Q8.
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        match promote_fmt {
+                            GgufFormat::Mq6 => {
+                                let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                            }
+                            GgufFormat::Hfq6 => {
+                                let q = quantize_hfq6g256(&f32_data);
+                                (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                            }
+                            GgufFormat::Mq4 => {
+                                // MQ4 promote target: wire AWQ inline-quantize when
+                                // --awq is set and the tensor is on the F1/F2
+                                // whitelist (q_proj, k_proj, v_proj, gate_proj,
+                                // up_proj, o_proj, down_proj, wo, w_down, etc.).
+                                // Runtime supports MQ4G256 AWQ sidecars
+                                // (DType::supports_awq_sidecar). Without this,
+                                // promoted tensors miss AWQ and the kmap-pair
+                                // model loses quality on the precisely the layers
+                                // kmap was supposed to protect (combined-review G5).
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq4g256(&scaled, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                    }
+                                } else {
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            }
+                            GgufFormat::Mq3 => {
+                                // MQ3 promote target: same AWQ wiring as MQ4.
+                                // Runtime supports MQ3G256 AWQ sidecars too
+                                // (DType::supports_awq_sidecar).
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq3g256(&scaled, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                    }
+                                } else {
+                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                            }
+                            GgufFormat::Mq2 => {
+                                let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                            }
+                            GgufFormat::Mq2Lloyd => {
+                                let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                            }
+                            GgufFormat::Mq3Lloyd => {
+                                let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                            }
+                            GgufFormat::Mq4Lloyd => {
+                                let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                            }
+                            GgufFormat::Hfq4 => {
+                                let q = quantize_hfq4g256(&f32_data);
+                                (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                            }
+                            GgufFormat::Hfp4 => {
+                                // No FP6 sibling — Promote-to-HFP4 is the no-op identity.
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                                (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                            }
+                            GgufFormat::Mfp4 => {
+                                // No FP6 sibling — Promote-to-MFP4 is the no-op identity.
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                            }
+                        }
+                    } else {
+                        // Non-256-aligned fallback: Q8
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    }
+                } else if let QuantLevel::Override(override_fmt) = kmap_level {
+                    // K-map says override (today: lm_head when --lm-head-format set).
+                    // Dispatch on the carried format. For MQ4 with AWQ enabled,
+                    // apply AWQ pre-scaling + emit a sidecar so the runtime
+                    // (once the CUDA-branch AWQ-aware lm_head dispatch lands)
+                    // sees scaled bytes and inverse-divides correctly. For any
+                    // other format, plain quantize (the AWQ wiring outside MQ4
+                    // is a follow-up).
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        match override_fmt {
+                            GgufFormat::Mq4 => {
+                                // Inline AWQ + MQ4 dance (mirrors the Base MQ4 arm).
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq4g256(&scaled, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                    }
+                                } else {
+                                    quantize_mq4g256(&f32_data, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                            }
+                            GgufFormat::Mq6 => {
+                                let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                            }
+                            GgufFormat::Mq3 => {
+                                // MQ3 + AWQ on lm_head: runtime supports the sidecar via
+                                // DType::supports_awq_sidecar(MQ3G256)=true (per the
+                                // fix/lm-head-awq-runtime branch). Wire the same AWQ
+                                // inline-quantize dance as the MQ4 arm.
+                                let q = if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        let scales = compute_awq_scales(im_weights, alpha);
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let m_dim = meta.shape[0];
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        quantize_mq3g256(&scaled, &signs1, &signs2)
+                                    } else {
+                                        quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                    }
+                                } else {
+                                    quantize_mq3g256(&f32_data, &signs1, &signs2)
+                                };
+                                (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                            }
+                            GgufFormat::Hfq4 => {
+                                let q = quantize_hfq4g256(&f32_data);
+                                (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                            }
+                            GgufFormat::Hfq6 => {
+                                let q = quantize_hfq6g256(&f32_data);
+                                (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                            }
+                            // Other Override targets: not yet wired with AWQ;
+                            // emit plain quantization. Used in Phase 0 sweeps
+                            // for non-AWQ lm_head experiments.
+                            GgufFormat::Mq2 => {
+                                let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                            }
+                            GgufFormat::Mq2Lloyd => {
+                                let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                            }
+                            GgufFormat::Mq3Lloyd => {
+                                let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                            }
+                            GgufFormat::Mq4Lloyd => {
+                                let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                                (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                            }
+                            GgufFormat::Mfp4 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                                (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                            }
+                            GgufFormat::Hfp4 => {
+                                let m = if meta.shape.len() == 2 {
+                                    meta.shape[0]
+                                } else {
+                                    1
+                                };
+                                let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                                (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                            }
+                        }
+                    } else {
+                        // Non-256-aligned override target: Q8 fallback.
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    }
                 } else {
-                    // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
-                    let q = quantize_hfq6g256(&f32_data);
-                    (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
-                }
-            } else if (use_mq3g256 || use_mq2g256 || use_mq2g256_lloyd || use_mq3g256_lloyd || use_mq4g256_lloyd) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_mq4g256_lloyd {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
-                } else {
-                    // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_mq3g256_lloyd {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_mq2g256_lloyd {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
-                } else {
-                    // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
-                    let q = quantize_hfq2g128(&f32_data);
-                    (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-                }
-            } else if use_mq3g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ3G256, 256u32, "MQ3G256")
-                } else {
-                    // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_mq2g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let signs1 = gen_fwht_signs(42, 256);
-                    let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
-                    (q, QuantType::MQ2G256, 256u32, "MQ2G256")
-                } else {
-                    // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
-                    let q = quantize_hfq2g128(&f32_data);
-                    (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
-                }
-            } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_F16")
-            } else if use_hfq3g128 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 128 == 0 {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_hfq3g256 {
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq3g256(&f32_data);
-                    (q, QuantType::HFQ3G256, 256u32, "HFQ3G256")
-                } else {
-                    let q = quantize_hfq3g128(&f32_data);
-                    (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
-                }
-            } else if use_hfq4g256 && is_embed {
-                // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                } else {
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if use_hfq4g256 {
-                // Auto-select G128 vs G256 based on K dimension
-                // G256 preferred: better coalescing, fewer scale/zero overheads
-                // G128 only as fallback when K isn't divisible by 256
-                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
-                if k_dim % 256 == 0 {
-                    let q = quantize_hfq4g256(&f32_data);
-                    (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
-                } else if k_dim % 128 == 0 {
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                } else {
-                    // Pad to 128-element boundary
-                    let q = quantize_hfq4g128(&f32_data);
-                    (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
-                }
-            } else if this_q8 {
-                let q = quantize_q8f16(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q8_FP16")
-            } else if this_q4as8 {
-                let q = quantize_q4_as_q8(&f32_data);
-                (q, QuantType::Q8F16, 32u32, "Q4asQ8")
-            } else if this_q4k {
-                let q = quantize_q4k(&f32_data);
-                (q, QuantType::Q4K, 256u32, "Q4_K")
-            } else {
-                let q = quantize_q4f16_g64(&f32_data);
-                (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
-            }
-            }; // end K-map outer if-else
+                    // QuantLevel::Base — existing format-specific logic below
 
-            // Compute quantization error (skip for Q8 embeddings — always negligible)
-            let block_size = gs as usize;
-            let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
-            // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
-            let skip_error = !is_hfq4;
-            let n_blocks = if !skip_error { (n_elements + block_size - 1) / block_size } else { 0 };
-            for b in 0..n_blocks {
-                let start = b * block_size;
-                let end = (start + block_size).min(n_elements);
-                if is_hfq4 {
-                    // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
-                    let block_bytes = if block_size == 256 { 136 } else { 72 };
-                    let off = b * block_bytes;
-                    let scale = f32::from_le_bytes([quantized[off], quantized[off+1], quantized[off+2], quantized[off+3]]);
-                    let zero = f32::from_le_bytes([quantized[off+4], quantized[off+5], quantized[off+6], quantized[off+7]]);
-                    for i in 0..(end - start) {
-                        let byte_idx = i / 2;
-                        let nibble = if i % 2 == 0 { quantized[off + 8 + byte_idx] & 0xF } else { quantized[off + 8 + byte_idx] >> 4 };
-                        let dequant = scale * nibble as f32 + zero;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
-                    }
-                } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
-                    // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
-                    let off = b * 34;
-                    let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                    for i in 0..(end - start) {
-                        let qval = quantized[off + 2 + i] as i8;
-                        let dequant = scale * qval as f32;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
-                    }
-                } else {
-                    let off = b * 36;
-                    let scale = f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
-                    let min_val = f16_to_f32(u16::from_le_bytes([quantized[off + 2], quantized[off + 3]]));
-                    for i in 0..(end - start) {
-                        let byte_idx = if i < 32 { i } else { i - 32 };
-                        let nibble = if i < 32 {
-                            quantized[off + 4 + byte_idx] & 0xF
+                    // Choose quant format per tensor
+                    let this_q8 = if use_q4k_all {
+                        false // everything Q4_K
+                    } else if use_q4k_q8embed {
+                        name.contains("embed") || name.contains("lm_head") // only embed/output Q8
+                    } else if use_mixed || use_fast {
+                        is_q8_tensor(name)
+                    } else {
+                        use_q8 || use_q8hfq // 1D Q8HFQ tensors fall back to Q8F16
+                    };
+                    let this_q4as8 = use_fast && !this_q8; // FFN tensors in q8-fast mode
+                    let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
+
+                    // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
+                    // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
+                    let is_embed = name.contains("embed_tokens");
+
+                    if use_hfq_mixed {
+                        // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
+                        let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                        if !is_ffn {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
                         } else {
-                            quantized[off + 4 + byte_idx] >> 4
+                            let k_dim = if meta.shape.len() == 2 {
+                                meta.shape[1]
+                            } else {
+                                n_elements
+                            };
+                            if k_dim % 256 == 0 {
+                                let q = quantize_hfq4g256(&f32_data);
+                                (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                            } else {
+                                let q = quantize_hfq4g128(&f32_data);
+                                (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                            }
+                        }
+                    } else if use_hfq6 {
+                        // HFQ6-G256: all weights 6-bit, embeddings Q8
+                        if is_embed {
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        } else {
+                            let q = quantize_hfq6g256(&f32_data);
+                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                        }
+                    } else if (use_hfq2g256 || use_hfq2g128) && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_hfq2g128 {
+                        let q = quantize_hfq2g128(&f32_data);
+                        (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                    } else if use_hfq2g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
                         };
-                        let dequant = nibble as f32 * scale + min_val;
-                        let err = (dequant - f32_data[start + i]).abs();
-                        total_quant_error += err as f64;
-                        max_quant_error = max_quant_error.max(err);
+                        if k_dim % 256 == 0 {
+                            let q = quantize_hfq2g256(&f32_data);
+                            (q, QuantType::HFQ2G256, 256u32, "HFQ2G256")
+                        } else {
+                            // Fallback to HFQ4 for non-256-aligned
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq8g256 && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq8g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq8g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ8G256, 256u32, "MQ8G256")
+                        } else {
+                            // Fallback to Q8 for non-256-aligned
+                            let q = quantize_q8f16(&f32_data);
+                            (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                        }
+                    } else if q8_router && is_q8_tensor(name) {
+                        // Q8 router for MoE: keep mlp.gate.weight and
+                        // shared_expert_gate.weight at Q8 regardless of --format.
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq4g256 || use_mq4_mq6exp {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            // Phase A Stage A — AWQ pre-scaling, when --awq is enabled
+                            // AND we have imatrix data for this tensor AND the tensor
+                            // is on the AWQ whitelist (see `awq_eligible`). Mutates a
+                            // local copy of the weights so the original f32_data
+                            // returned by to_f32() is left intact for downstream
+                            // consumers (we don't currently have any here, but this
+                            // is hygienic).
+                            //
+                            // The `awq_eligible(name)` guard is critical: pre-scaling
+                            // weights whose runtime path lacks the inverse divide
+                            // produces `(W·s)·x ≠ W·x` and catastrophically corrupts
+                            // logits (KLD 0.67 → 13.5 measured on 0.8B Qwen3.5 before
+                            // this guard landed). See `docs/plans/awq_fix_claude.md`.
+                            //
+                            // Phase A Stage B — GPTQ on MQ4G256 (commit pending).
+                            // When --gptq is enabled AND we have a Hessian for this
+                            // tensor, route through `gptq::gptq_pipeline_mq4g256`
+                            // which does AWQ-Hessian-rescale + FWHT-similarity +
+                            // FWHT-rotate-weights + frozen-grids + column-sequential
+                            // OBS update + pack. Stacks cleanly with AWQ (the
+                            // pipeline takes AWQ scales as input). For non-AWQ
+                            // tensors (o_proj/out_proj/down_proj per the whitelist),
+                            // pass identity scales — Stage B widens GPTQ coverage to
+                            // all MQ4G256 tensors per GLM5 M5.
+                            let m_dim = meta.shape[0];
+                            // Step 1: AWQ pre-scaling (if eligible + enabled).
+                            let (working_weights, awq_scales_for_pipeline_f64) =
+                                if let (Some(alpha), Some(im_weights)) =
+                                    (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                                {
+                                    if awq_eligible(name) {
+                                        debug_assert_eq!(
+                                            im_weights.len(),
+                                            k_dim,
+                                            "imatrix length ({}) != K dim ({}) for {}",
+                                            im_weights.len(),
+                                            k_dim,
+                                            name
+                                        );
+                                        let scales = if AWQ_FORMULA.get().copied().unwrap_or(false)
+                                        {
+                                            let w_rms = compute_weight_rms_per_input(
+                                                &f32_data, m_dim, k_dim,
+                                            );
+                                            compute_awq_scales_autoawq(im_weights, &w_rms, alpha)
+                                        } else {
+                                            compute_awq_scales(im_weights, alpha)
+                                        };
+                                        awq_sidecar_scales = Some(scales.clone());
+                                        let mut scaled = f32_data.clone();
+                                        awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                        let scales_f64: Vec<f64> =
+                                            scales.iter().map(|&v| v as f64).collect();
+                                        (scaled, scales_f64)
+                                    } else {
+                                        // AWQ-ineligible: plain weights, identity scales.
+                                        (f32_data.clone(), vec![1.0_f64; k_dim])
+                                    }
+                                } else {
+                                    (f32_data.clone(), vec![1.0_f64; k_dim])
+                                };
+
+                            // Step 2: GPTQ (if --gptq enabled + Hessian present) or plain pack.
+                            let q = if let Some(sc) = GPTQ_HESSIAN.get() {
+                                // Strip ".weight" to match collect_hessian.py's key
+                                // convention (HFHS format spec §3.1).
+                                let h_key = name.strip_suffix(".weight").unwrap_or(name);
+                                if let Some(href) = sc.get(h_key, 0) {
+                                    if href.k != k_dim {
+                                        eprintln!(
+                                    "warning: GPTQ {h_key}: Hessian K={} != tensor K={k_dim}; skipping GPTQ for this tensor",
+                                    href.k
+                                );
+                                        quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                    } else {
+                                        // FP32 view of the K×K Hessian (promoted to FP64 inside the pipeline).
+                                        let h_unrot_f32: Vec<f32> =
+                                            href.iter_f64().map(|v| v as f32).collect();
+                                        match gptq::gptq_pipeline_mq4g256(
+                                            &working_weights,
+                                            m_dim,
+                                            k_dim,
+                                            &h_unrot_f32,
+                                            &awq_scales_for_pipeline_f64,
+                                            &signs1,
+                                            &signs2,
+                                            gptq_initial_damp,
+                                            gptq_max_damp_multiplier,
+                                            h_key,
+                                        ) {
+                                            Ok(packed) => packed,
+                                            Err(e) => {
+                                                eprintln!("warning: GPTQ failed for {name}: {e}; falling back to plain MQ4");
+                                                quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // No Hessian recorded for this tensor — happens
+                                    // for tensors the Python collector didn't hook
+                                    // (e.g. embedding layers, or arch additions not
+                                    // in GPTQ_TARGET_SUFFIXES). Plain MQ4 pack.
+                                    quantize_mq4g256(&working_weights, &signs1, &signs2)
+                                }
+                            } else {
+                                // --gptq not enabled — Stage A AWQ-only or plain MQ4.
+                                quantize_mq4g256(&working_weights, &signs1, &signs2)
+                            };
+                            (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                        } else {
+                            // Fallback to standard HFQ4-G128 for non-256-aligned
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_hfp4 && is_embed {
+                        // HFP4 embeddings stay Q8F16 (matches MQ4 / HFQ4 pattern — embedding lookup is
+                        // accuracy-sensitive, FP4 codes too lossy for vocab-sized tables).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_hfp4 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 32 == 0 && meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
+                            (q, QuantType::HFP4G32, 32u32, "HFP4G32")
+                        } else {
+                            // Fallback to HFQ4-G128 for non-32-aligned ragged dims (rare).
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mfp4 && is_embed {
+                        // MFP4 embeddings stay Q8F16 (same rationale as HFP4 / MQ4).
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mfp4 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 && meta.shape.len() == 2 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let m = meta.shape[0];
+                            let q = quantize_mfp4g32_2d(&f32_data, m, k_dim, &signs1, &signs2);
+                            (q, QuantType::MFP4G32, 32u32, "MFP4G32")
+                        } else {
+                            // Fallback to HFQ4-G128 for non-256-aligned ragged dims (rotation
+                            // requires 256-element segments). Matches MQ4's ragged fallback.
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq6g256 && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq6g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq6g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ6G256, 256u32, "MQ6G256")
+                        } else {
+                            // Fallback to HFQ6-G256 for non-256-aligned (no rotation)
+                            let q = quantize_hfq6g256(&f32_data);
+                            (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
+                        }
+                    } else if (use_mq3g256
+                        || use_mq2g256
+                        || use_mq2g256_lloyd
+                        || use_mq3g256_lloyd
+                        || use_mq4g256_lloyd)
+                        && is_embed
+                    {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_mq4g256_lloyd {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ4G256Lloyd, 256u32, "MQ4G256Lloyd")
+                        } else {
+                            // Fallback to HFQ4-G128 for non-256-aligned (no rotation).
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_mq3g256_lloyd {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
+                        } else {
+                            let q = quantize_hfq3g128(&f32_data);
+                            (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                        }
+                    } else if use_mq2g256_lloyd {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
+                        } else {
+                            // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
+                            let q = quantize_hfq2g128(&f32_data);
+                            (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                        }
+                    } else if use_mq3g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let mut scaled = f32_data.clone();
+                            let m_dim = if meta.shape.len() == 2 {
+                                meta.shape[0]
+                            } else {
+                                1
+                            };
+                            awq_sidecar_scales =
+                                maybe_apply_awq_pre_scale(name, &mut scaled, m_dim, k_dim);
+                            let q = quantize_mq3g256(&scaled, &signs1, &signs2);
+                            (q, QuantType::MQ3G256, 256u32, "MQ3G256")
+                        } else {
+                            // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
+                            let q = quantize_hfq3g128(&f32_data);
+                            (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                        }
+                    } else if use_mq2g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let signs1 = gen_fwht_signs(42, 256);
+                            let signs2 = gen_fwht_signs(1042, 256);
+                            let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                            (q, QuantType::MQ2G256, 256u32, "MQ2G256")
+                        } else {
+                            // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
+                            let q = quantize_hfq2g128(&f32_data);
+                            (q, QuantType::HFQ2G128, 128u32, "HFQ2G128")
+                        }
+                    } else if (use_hfq3g256 || use_hfq3g128) && is_embed {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_F16")
+                    } else if use_hfq3g128 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 128 == 0 {
+                            let q = quantize_hfq3g128(&f32_data);
+                            (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                        } else {
+                            let q = quantize_hfq3g128(&f32_data);
+                            (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                        }
+                    } else if use_hfq3g256 {
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let q = quantize_hfq3g256(&f32_data);
+                            (q, QuantType::HFQ3G256, 256u32, "HFQ3G256")
+                        } else {
+                            let q = quantize_hfq3g128(&f32_data);
+                            (q, QuantType::HFQ3G128, 128u32, "HFQ3G128")
+                        }
+                    } else if use_hfq4g256 && is_embed {
+                        // HFQ4 embeddings: half the size of Q8, same 18-VGPR lookup kernel
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let q = quantize_hfq4g256(&f32_data);
+                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if use_hfq4g256 {
+                        // Auto-select G128 vs G256 based on K dimension
+                        // G256 preferred: better coalescing, fewer scale/zero overheads
+                        // G128 only as fallback when K isn't divisible by 256
+                        let k_dim = if meta.shape.len() == 2 {
+                            meta.shape[1]
+                        } else {
+                            n_elements
+                        };
+                        if k_dim % 256 == 0 {
+                            let q = quantize_hfq4g256(&f32_data);
+                            (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
+                        } else if k_dim % 128 == 0 {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        } else {
+                            // Pad to 128-element boundary
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
+                    } else if this_q8 {
+                        let q = quantize_q8f16(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q8_FP16")
+                    } else if this_q4as8 {
+                        let q = quantize_q4_as_q8(&f32_data);
+                        (q, QuantType::Q8F16, 32u32, "Q4asQ8")
+                    } else if this_q4k {
+                        let q = quantize_q4k(&f32_data);
+                        (q, QuantType::Q4K, 256u32, "Q4_K")
+                    } else {
+                        let q = quantize_q4f16_g64(&f32_data);
+                        (q, QuantType::Q4F16G64, 64u32, "Q4_F16")
                     }
-                }
-                _n_quant_groups += 1;
-            }
+                }; // end K-map outer if-else
 
-            eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
-                name, meta.shape, n_elements,
-                raw_data.len() as f64 / 1024.0,
-                quantized.len() as f64 / 1024.0);
-
-            hfq_tensors.push(HfqTensor {
-                name: name.to_string(),
-                quant_type: qt,
-                shape: shape.clone(),
-                group_size: gs,
-                data: quantized,
-                spilled_len: 0,
-            });
-            // Phase A Stage A — emit AWQ scale sidecar tensor immediately
-            // after the parent weight. Naming convention:
-            // `<weight_name>.awq_scale` (strip the trailing `.weight` and
-            // append `.awq_scale.weight` so the runtime loader recognizes
-            // it as a 1D F16 tensor of length K). 1D shape [K]; runtime
-            // pairs it with the parent weight at model open.
-            if let Some(scales) = awq_sidecar_scales.take() {
-                let sidecar_name = match name.strip_suffix(".weight") {
-                    Some(stem) => format!("{stem}.awq_scale.weight"),
-                    None => format!("{name}.awq_scale.weight"),
+                // Compute quantization error (skip for Q8 embeddings — always negligible)
+                let block_size = gs as usize;
+                let is_hfq4 = label == "HFQ4G256" || label == "HFQ4G128";
+                // Only compute detailed error for HFQ4 tensors — Q8/HFQ6 error is negligible
+                let skip_error = !is_hfq4;
+                let n_blocks = if !skip_error {
+                    (n_elements + block_size - 1) / block_size
+                } else {
+                    0
                 };
-                let bytes = awq_scales_to_f16_bytes(&scales);
-                eprintln!("    AWQ:    {} [{}] (1D F16, {} B)",
-                    sidecar_name, scales.len(), bytes.len());
+                for b in 0..n_blocks {
+                    let start = b * block_size;
+                    let end = (start + block_size).min(n_elements);
+                    if is_hfq4 {
+                        // Both G128 (72B) and G256 (136B): [f32 scale][f32 zero][nibbles]
+                        let block_bytes = if block_size == 256 { 136 } else { 72 };
+                        let off = b * block_bytes;
+                        let scale = f32::from_le_bytes([
+                            quantized[off],
+                            quantized[off + 1],
+                            quantized[off + 2],
+                            quantized[off + 3],
+                        ]);
+                        let zero = f32::from_le_bytes([
+                            quantized[off + 4],
+                            quantized[off + 5],
+                            quantized[off + 6],
+                            quantized[off + 7],
+                        ]);
+                        for i in 0..(end - start) {
+                            let byte_idx = i / 2;
+                            let nibble = if i % 2 == 0 {
+                                quantized[off + 8 + byte_idx] & 0xF
+                            } else {
+                                quantized[off + 8 + byte_idx] >> 4
+                            };
+                            let dequant = scale * nibble as f32 + zero;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                    } else if label == "Q8_FP16" || label == "Q4asQ8" || label == "Q8_F16" {
+                        // NB: string match because this_q8/this_q4as8 are scoped inside Base block.
+                        let off = b * 34;
+                        let scale =
+                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
+                        for i in 0..(end - start) {
+                            let qval = quantized[off + 2 + i] as i8;
+                            let dequant = scale * qval as f32;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                    } else {
+                        let off = b * 36;
+                        let scale =
+                            f16_to_f32(u16::from_le_bytes([quantized[off], quantized[off + 1]]));
+                        let min_val = f16_to_f32(u16::from_le_bytes([
+                            quantized[off + 2],
+                            quantized[off + 3],
+                        ]));
+                        for i in 0..(end - start) {
+                            let byte_idx = if i < 32 { i } else { i - 32 };
+                            let nibble = if i < 32 {
+                                quantized[off + 4 + byte_idx] & 0xF
+                            } else {
+                                quantized[off + 4 + byte_idx] >> 4
+                            };
+                            let dequant = nibble as f32 * scale + min_val;
+                            let err = (dequant - f32_data[start + i]).abs();
+                            total_quant_error += err as f64;
+                            max_quant_error = max_quant_error.max(err);
+                        }
+                    }
+                    _n_quant_groups += 1;
+                }
+
+                eprintln!(
+                    "  {label:>8}: {} {:?} ({} elements, {:.1} KB → {:.1} KB)",
+                    name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    quantized.len() as f64 / 1024.0
+                );
+
                 hfq_tensors.push(HfqTensor {
-                    name: sidecar_name,
-                    quant_type: QuantType::F16,
-                    shape: vec![scales.len() as u32],
-                    group_size: 0,
-                    data: bytes,
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape: shape.clone(),
+                    group_size: gs,
+                    data: quantized,
                     spilled_len: 0,
                 });
-            }
+                // Phase A Stage A — emit AWQ scale sidecar tensor immediately
+                // after the parent weight. Naming convention:
+                // `<weight_name>.awq_scale` (strip the trailing `.weight` and
+                // append `.awq_scale.weight` so the runtime loader recognizes
+                // it as a 1D F16 tensor of length K). 1D shape [K]; runtime
+                // pairs it with the parent weight at model open.
+                if let Some(scales) = awq_sidecar_scales.take() {
+                    let sidecar_name = awq_sidecar_name(name);
+                    let bytes = awq_scales_to_f16_bytes(&scales);
+                    eprintln!(
+                        "    AWQ:    {} [{}] (1D F16, {} B)",
+                        sidecar_name,
+                        scales.len(),
+                        bytes.len()
+                    );
+                    hfq_tensors.push(HfqTensor {
+                        name: sidecar_name,
+                        quant_type: QuantType::F16,
+                        shape: vec![scales.len() as u32],
+                        group_size: 0,
+                        data: bytes,
+                        spilled_len: 0,
+                    });
+                }
             } // end else (non-Q8HFQ path)
         } else if is_vision && vision_quant == "hfq4" && n_elements >= 32 {
             // Quantize vision weights to HFQ4G256 (for speed-critical VL workloads)
             let f32_data = to_f32(raw_data, &meta.dtype);
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            let k_dim = if shape.len() == 2 { shape[1] as usize } else { n_elements };
+            let k_dim = if shape.len() == 2 {
+                shape[1] as usize
+            } else {
+                n_elements
+            };
             let (quantized, gs) = if k_dim % 256 == 0 {
                 (quantize_hfq4g256(&f32_data), 256u32)
             } else {
                 (quantize_hfq4g128(&f32_data), 128u32)
             };
-            let qt = if gs == 256 { QuantType::HFQ4G256 } else { QuantType::HFQ4G128 };
+            let qt = if gs == 256 {
+                QuantType::HFQ4G256
+            } else {
+                QuantType::HFQ4G128
+            };
             let label = if gs == 256 { "HFQ4G256" } else { "HFQ4G128" };
-            eprintln!("  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
-                name, meta.shape, n_elements,
-                raw_data.len() as f64 / 1024.0, quantized.len() as f64 / 1024.0);
+            eprintln!(
+                "  {label:>8}: {} {:?} ({} elements, {:.1} KB -> {:.1} KB) [vision]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                quantized.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: qt,
@@ -5362,8 +6348,13 @@ fn main() {
             // Store vision weights as original BF16 (zero precision loss)
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
-                name, meta.shape, n_elements, raw_data.len() as f64 / 1024.0);
+            eprintln!(
+                "  BF16:       {} {:?} ({} elements, {:.1} KB) [vision, lossless]",
+                name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
                 quant_type: QuantType::BF16,
@@ -5374,17 +6365,30 @@ fn main() {
             });
         } else if is_vision && vision_quant == "bf16" {
             // Non-BF16 source (F16/F32) — store as F16
-            let data = if meta.dtype == "F16" { raw_data.to_vec() } else {
+            let data = if meta.dtype == "F16" {
+                raw_data.to_vec()
+            } else {
                 let f32_vals = to_f32(raw_data, &meta.dtype);
-                f32_vals.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+                f32_vals
+                    .iter()
+                    .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                    .collect()
             };
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
-                name, meta.shape, data.len() as f64 / 1024.0);
+            eprintln!(
+                "  F16:        {} {:?} ({:.1} KB) [vision, bf16 fallback]",
+                name,
+                meta.shape,
+                data.len() as f64 / 1024.0
+            );
             hfq_tensors.push(HfqTensor {
-                name: name.to_string(), quant_type: QuantType::F16,
-                shape, group_size: 0, data, spilled_len: 0,
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data,
+                spilled_len: 0,
             });
         } else {
             // Keep as F16 (convert BF16 -> F16 if needed)
@@ -5393,13 +6397,15 @@ fn main() {
                 "BF16" => {
                     // BF16 → F32 → F16
                     let f32_vals = to_f32(raw_data, "BF16");
-                    f32_vals.iter()
+                    f32_vals
+                        .iter()
                         .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                         .collect()
                 }
                 "F32" => {
                     let f32_vals = to_f32(raw_data, "F32");
-                    f32_vals.iter()
+                    f32_vals
+                        .iter()
                         .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                         .collect()
                 }
@@ -5407,8 +6413,13 @@ fn main() {
             };
 
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
-            eprintln!("  F16:        {} {:?} ({} elements, {:.1} KB)",
-                name, meta.shape, n_elements, f16_data.len() as f64 / 1024.0);
+            eprintln!(
+                "  F16:        {} {:?} ({} elements, {:.1} KB)",
+                name,
+                meta.shape,
+                n_elements,
+                f16_data.len() as f64 / 1024.0
+            );
 
             hfq_tensors.push(HfqTensor {
                 name: name.to_string(),
@@ -5425,17 +6436,31 @@ fn main() {
     }
 
     // Summary
-    let total_bytes: usize = hfq_tensors.iter().map(|t| if t.spilled_len > 0 { t.spilled_len as usize } else { t.data.len() }).sum();
+    let total_bytes: usize = hfq_tensors
+        .iter()
+        .map(|t| {
+            if t.spilled_len > 0 {
+                t.spilled_len as usize
+            } else {
+                t.data.len()
+            }
+        })
+        .sum();
     let mean_quant_error = if quantized_params > 0 {
         total_quant_error / quantized_params as f64
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
-        eprintln!("  Skipped params:   {skipped_params} (mtp/visual — use --include-vision for VL)");
+        eprintln!("  Skipped params:   {skipped_params} (mtp/visual — use --include-mtp for MTP, --include-vision for VL)");
     }
     eprintln!("  Total params:     {total_params}");
-    eprintln!("  Quantized params: {quantized_params} ({:.1}%)", 100.0 * quantized_params as f64 / total_params as f64);
+    eprintln!(
+        "  Quantized params: {quantized_params} ({:.1}%)",
+        100.0 * quantized_params as f64 / total_params as f64
+    );
     eprintln!("  Mean quant error: {mean_quant_error:.8}");
     eprintln!("  Max quant error:  {max_quant_error:.8}");
     eprintln!("  Output size:      {:.1} MB", total_bytes as f64 / 1e6);
@@ -5450,12 +6475,22 @@ fn main() {
     // a Rust backtrace — write-step failures otherwise lose hours of GPTQ
     // Hessian work to an opaque `thread 'main' panicked` message. See
     // docs/plans/gptq_bug.md (2026-05-14 incident: 14 h of work lost).
-    if let Err(e) = write_hfq(output_path, arch_id, &metadata_json, &hfq_tensors, spill.as_mut()) {
+    if let Err(e) = write_hfq(
+        output_path,
+        arch_id,
+        &metadata_json,
+        &hfq_tensors,
+        spill.as_mut(),
+    ) {
         eprintln!("error: write_hfq failed for {}: {e}", output_path.display());
-        if let Some(s) = spill { s.cleanup(); }
+        if let Some(s) = spill {
+            s.cleanup();
+        }
         std::process::exit(1);
     }
-    if let Some(s) = spill { s.cleanup(); }
+    if let Some(s) = spill {
+        s.cleanup();
+    }
 
     let file_size = std::fs::metadata(output_path).unwrap().len();
     eprintln!("Done: {:.1} MB written", file_size as f64 / 1e6);
@@ -5503,8 +6538,14 @@ mod tests {
         assert_eq!(default_promote_target(GgufFormat::Mq3), GgufFormat::Mq6);
         assert_eq!(default_promote_target(GgufFormat::Mq4), GgufFormat::Mq6);
         assert_eq!(default_promote_target(GgufFormat::Mq6), GgufFormat::Mq6);
-        assert_eq!(default_promote_target(GgufFormat::Mq2Lloyd), GgufFormat::Mq6);
-        assert_eq!(default_promote_target(GgufFormat::Mq3Lloyd), GgufFormat::Mq6);
+        assert_eq!(
+            default_promote_target(GgufFormat::Mq2Lloyd),
+            GgufFormat::Mq6
+        );
+        assert_eq!(
+            default_promote_target(GgufFormat::Mq3Lloyd),
+            GgufFormat::Mq6
+        );
     }
 
     #[test]
@@ -5523,11 +6564,24 @@ mod tests {
     #[test]
     fn promote_pair_no_op_always_allowed() {
         // base == promote is always supported (identity promotion)
-        for fmt in [GgufFormat::Mq2, GgufFormat::Mq3, GgufFormat::Mq4, GgufFormat::Mq6,
-                    GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd,
-                    GgufFormat::Hfq4, GgufFormat::Hfq6,
-                    GgufFormat::Hfp4, GgufFormat::Mfp4] {
-            assert!(is_promote_pair_supported(fmt, fmt), "{:?} → {:?} should be allowed", fmt, fmt);
+        for fmt in [
+            GgufFormat::Mq2,
+            GgufFormat::Mq3,
+            GgufFormat::Mq4,
+            GgufFormat::Mq6,
+            GgufFormat::Mq2Lloyd,
+            GgufFormat::Mq3Lloyd,
+            GgufFormat::Hfq4,
+            GgufFormat::Hfq6,
+            GgufFormat::Hfp4,
+            GgufFormat::Mfp4,
+        ] {
+            assert!(
+                is_promote_pair_supported(fmt, fmt),
+                "{:?} → {:?} should be allowed",
+                fmt,
+                fmt
+            );
         }
     }
 
@@ -5546,16 +6600,40 @@ mod tests {
     #[test]
     fn promote_pair_lloyd_only_within_family() {
         // Lloyd → Lloyd allowed (the Future expansion target).
-        assert!(is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq3Lloyd));
+        assert!(is_promote_pair_supported(
+            GgufFormat::Mq2Lloyd,
+            GgufFormat::Mq3Lloyd
+        ));
         // Lloyd → non-Lloyd rejected — different codebooks, no runtime path.
-        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq3));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq4));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq2Lloyd, GgufFormat::Mq6));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq3Lloyd, GgufFormat::Mq4));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq3Lloyd, GgufFormat::Mq6));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq2Lloyd,
+            GgufFormat::Mq3
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq2Lloyd,
+            GgufFormat::Mq4
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq2Lloyd,
+            GgufFormat::Mq6
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq3Lloyd,
+            GgufFormat::Mq4
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq3Lloyd,
+            GgufFormat::Mq6
+        ));
         // non-Lloyd → Lloyd also rejected (would need Lloyd codebook fitting at runtime).
-        assert!(!is_promote_pair_supported(GgufFormat::Mq2, GgufFormat::Mq3Lloyd));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq3, GgufFormat::Mq3Lloyd));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq2,
+            GgufFormat::Mq3Lloyd
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq3,
+            GgufFormat::Mq3Lloyd
+        ));
     }
 
     #[test]
@@ -5564,17 +6642,32 @@ mod tests {
         assert!(!is_promote_pair_supported(GgufFormat::Mq6, GgufFormat::Mq3));
         assert!(!is_promote_pair_supported(GgufFormat::Mq6, GgufFormat::Mq4));
         assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Mq3));
-        assert!(!is_promote_pair_supported(GgufFormat::Hfq6, GgufFormat::Hfq4));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Hfq6,
+            GgufFormat::Hfq4
+        ));
     }
 
     #[test]
     fn promote_pair_cross_family_rejected() {
         // MQ ↔ HFQ ↔ FP4: different rotation families, runtime mixed-format
         // dispatch is only same-family-safe (post-#257). Reject.
-        assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Hfq6));
-        assert!(!is_promote_pair_supported(GgufFormat::Hfq4, GgufFormat::Mq6));
-        assert!(!is_promote_pair_supported(GgufFormat::Mq4, GgufFormat::Hfp4));
-        assert!(!is_promote_pair_supported(GgufFormat::Mfp4, GgufFormat::Mq6));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq4,
+            GgufFormat::Hfq6
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Hfq4,
+            GgufFormat::Mq6
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mq4,
+            GgufFormat::Hfp4
+        ));
+        assert!(!is_promote_pair_supported(
+            GgufFormat::Mfp4,
+            GgufFormat::Mq6
+        ));
     }
 
     #[test]
@@ -5632,7 +6725,11 @@ mod tests {
     fn kmap_promote_threading_default_mq6() {
         // Default promote (no --kmap-promote) keeps MQ4→MQ6 mapping
         let level = kmap_resolve_mode(
-            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq6,
+            "model.layers.0.mlp.down_proj.weight",
+            40,
+            false,
+            2,
+            GgufFormat::Mq6,
         );
         assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq6));
     }
@@ -5641,7 +6738,11 @@ mod tests {
     fn kmap_promote_threading_explicit_mq4() {
         // --kmap-promote mq4 on an MQ3 base: carries MQ4 in the variant
         let level = kmap_resolve_mode(
-            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq4,
+            "model.layers.0.mlp.down_proj.weight",
+            40,
+            false,
+            2,
+            GgufFormat::Mq4,
         );
         assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq4));
     }
@@ -5650,15 +6751,25 @@ mod tests {
     fn kmap_promote_threading_explicit_mq3() {
         // --kmap-promote mq3 on an MQ2 base: carries MQ3
         let level = kmap_resolve_mode(
-            "model.layers.0.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq3,
+            "model.layers.0.mlp.down_proj.weight",
+            40,
+            false,
+            2,
+            GgufFormat::Mq3,
         );
         assert_eq!(level, QuantLevel::Promote(GgufFormat::Mq3));
     }
 
     #[test]
     fn parse_layer_idx_safetensors_dense() {
-        assert_eq!(parse_layer_idx("model.layers.0.self_attn.q_proj.weight"), Some(0));
-        assert_eq!(parse_layer_idx("model.layers.63.mlp.gate_proj.weight"), Some(63));
+        assert_eq!(
+            parse_layer_idx("model.layers.0.self_attn.q_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_layer_idx("model.layers.63.mlp.gate_proj.weight"),
+            Some(63)
+        );
     }
 
     #[test]
@@ -5683,13 +6794,22 @@ mod tests {
 
     #[test]
     fn kmap_norms_are_f16() {
-        assert_eq!(kmap_resolve("model.layers.0.input_layernorm.weight", 64, false), QuantLevel::F16);
-        assert_eq!(kmap_resolve("model.layers.30.post_attention_layernorm.weight", 64, false), QuantLevel::F16);
+        assert_eq!(
+            kmap_resolve("model.layers.0.input_layernorm.weight", 64, false),
+            QuantLevel::F16
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.30.post_attention_layernorm.weight", 64, false),
+            QuantLevel::F16
+        );
     }
 
     #[test]
     fn kmap_embeds_are_q8() {
-        assert_eq!(kmap_resolve("model.embed_tokens.weight", 64, false), QuantLevel::Q8);
+        assert_eq!(
+            kmap_resolve("model.embed_tokens.weight", 64, false),
+            QuantLevel::Q8
+        );
         assert_eq!(kmap_resolve("lm_head.weight", 64, false), QuantLevel::Q8);
         assert_eq!(kmap_resolve("output.weight", 64, false), QuantLevel::Q8);
     }
@@ -5701,7 +6821,43 @@ mod tests {
             QuantLevel::Q8
         );
         assert_eq!(
-            kmap_resolve("model.language_model.layers.5.mlp.shared_expert_gate.weight", 64, true),
+            kmap_resolve(
+                "model.language_model.layers.5.mlp.shared_expert_gate.weight",
+                64,
+                true
+            ),
+            QuantLevel::Q8
+        );
+    }
+
+    #[test]
+    fn kmap_mtp_bridge_and_layers_promote() {
+        assert_eq!(
+            kmap_resolve("mtp.fc.weight", 64, true),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("mtp.layers.0.self_attn.q_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("mtp.layers.0.mlp.down_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+    }
+
+    #[test]
+    fn kmap_mtp_norm_router_and_embed_keep_safe_formats() {
+        assert_eq!(
+            kmap_resolve("mtp.pre_fc_norm_hidden.weight", 64, true),
+            QuantLevel::F16
+        );
+        assert_eq!(
+            kmap_resolve("mtp.layers.0.mlp.gate.weight", 64, true),
+            QuantLevel::Q8
+        );
+        assert_eq!(
+            kmap_resolve("mtp.embed_tokens.weight", 64, true),
             QuantLevel::Q8
         );
     }
@@ -5718,11 +6874,19 @@ mod tests {
     #[test]
     fn kmap_moe_expert_ffn_promote6() {
         assert_eq!(
-            kmap_resolve("model.language_model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, true),
+            kmap_resolve(
+                "model.language_model.layers.30.mlp.experts.5.gate_up_proj.weight",
+                64,
+                true
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve("model.language_model.layers.30.mlp.experts.5.down_proj.weight", 64, true),
+            kmap_resolve(
+                "model.language_model.layers.30.mlp.experts.5.down_proj.weight",
+                64,
+                true
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
     }
@@ -5730,60 +6894,149 @@ mod tests {
     #[test]
     fn kmap_edge_layers_dense_ffn_only() {
         // Dense: FFN in edge layers — promoted
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve("model.layers.0.mlp.gate_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.1.mlp.down_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.62.mlp.up_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.63.mlp.down_proj.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
         // Dense: attn in edge layers — NOT promoted
-        assert_eq!(kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.0.linear_attn.in_proj_qkv.weight", 64, false), QuantLevel::Base);
+        assert_eq!(
+            kmap_resolve("model.layers.0.self_attn.q_proj.weight", 64, false),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.63.self_attn.v_proj.weight", 64, false),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.0.linear_attn.in_proj_qkv.weight", 64, false),
+            QuantLevel::Base
+        );
     }
 
     #[test]
     fn kmap_edge_layers_moe_attn_and_ffn() {
         // MoE: both attn and FFN in edge layers — promoted
-        assert_eq!(kmap_resolve("model.language_model.layers.0.self_attn.q_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.language_model.layers.0.mlp.gate_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.language_model.layers.63.self_attn.v_proj.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve(
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                64,
+                true
+            ),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve(
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                64,
+                true
+            ),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                64,
+                true
+            ),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve(
+                "model.language_model.layers.63.self_attn.v_proj.weight",
+                64,
+                true
+            ),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
     }
 
     #[test]
     fn kmap_middle_layers_base() {
-        assert_eq!(kmap_resolve("model.layers.2.self_attn.q_proj.weight", 64, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.30.mlp.gate_proj.weight", 64, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.61.mlp.down_proj.weight", 64, false), QuantLevel::Base);
+        assert_eq!(
+            kmap_resolve("model.layers.2.self_attn.q_proj.weight", 64, false),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.30.mlp.gate_proj.weight", 64, false),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.61.mlp.down_proj.weight", 64, false),
+            QuantLevel::Base
+        );
     }
 
     #[test]
     fn kmap_edge_layers_small_model_24_layers() {
         // 24 layers: edge = 0,1 and 22,23
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 24, false), QuantLevel::Base);
-        assert_eq!(kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve("model.layers.0.mlp.gate_proj.weight", 24, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.1.mlp.gate_proj.weight", 24, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.2.mlp.gate_proj.weight", 24, false),
+            QuantLevel::Base
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.22.mlp.gate_proj.weight", 24, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.23.mlp.gate_proj.weight", 24, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
     }
 
     #[test]
     fn kmap_n_layers_zero_disables_edge() {
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 0, false), QuantLevel::Base);
+        assert_eq!(
+            kmap_resolve("model.layers.0.mlp.gate_proj.weight", 0, false),
+            QuantLevel::Base
+        );
     }
 
     #[test]
     fn kmap_edge_layers_tiny_model_3_layers() {
         // 3 layers: first-2 = {0,1}, last-2 = {1,2}. All layers promoted.
-        assert_eq!(kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve("model.layers.0.mlp.gate_proj.weight", 3, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.1.mlp.gate_proj.weight", 3, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("model.layers.2.mlp.gate_proj.weight", 3, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
     }
 
     #[test]
     fn kmap_expert_not_promoted_on_dense() {
         // "mlp.experts." in name but is_moe=false — should NOT trigger rule 4
         assert_eq!(
-            kmap_resolve("model.layers.30.mlp.experts.5.gate_up_proj.weight", 64, false),
+            kmap_resolve(
+                "model.layers.30.mlp.experts.5.gate_up_proj.weight",
+                64,
+                false
+            ),
             QuantLevel::Base
         );
     }
@@ -5791,14 +7044,29 @@ mod tests {
     #[test]
     fn kmap_gguf_names() {
         // GGUF edge-layer FFN (dense) — promoted
-        assert_eq!(kmap_resolve("blk.0.ffn_gate.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
-        assert_eq!(kmap_resolve("blk.63.ffn_gate.weight", 64, false), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve("blk.0.ffn_gate.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
+        assert_eq!(
+            kmap_resolve("blk.63.ffn_gate.weight", 64, false),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
         // GGUF edge-layer attn (dense) — NOT promoted
-        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, false), QuantLevel::Base);
+        assert_eq!(
+            kmap_resolve("blk.0.attn_q.weight", 64, false),
+            QuantLevel::Base
+        );
         // GGUF edge-layer attn (MoE) — promoted
-        assert_eq!(kmap_resolve("blk.0.attn_q.weight", 64, true), QuantLevel::Promote(GgufFormat::Mq6));
+        assert_eq!(
+            kmap_resolve("blk.0.attn_q.weight", 64, true),
+            QuantLevel::Promote(GgufFormat::Mq6)
+        );
         // GGUF middle-layer — base
-        assert_eq!(kmap_resolve("blk.30.ffn_gate.weight", 64, false), QuantLevel::Base);
+        assert_eq!(
+            kmap_resolve("blk.30.ffn_gate.weight", 64, false),
+            QuantLevel::Base
+        );
     }
 
     // ── Alternating mode tests ───────────────────────────────────────────
@@ -5814,7 +7082,7 @@ mod tests {
     #[test]
     fn positional_promote_stride3() {
         // Middle layers: every 3rd starting from idx 2
-        assert!(is_positional_promote(2, 40, 3));  // edge
+        assert!(is_positional_promote(2, 40, 3)); // edge
         assert!(!is_positional_promote(3, 40, 3));
         assert!(!is_positional_promote(4, 40, 3));
         assert!(is_positional_promote(5, 40, 3));
@@ -5827,15 +7095,33 @@ mod tests {
     fn kmap_alternating_moe_experts() {
         // MoE experts: promoted in positional layers, base in others
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.language_model.layers.0.mlp.experts.5.gate_up_proj.weight",
+                40,
+                true,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6) // edge layer
         );
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.language_model.layers.5.mlp.experts.5.gate_up_proj.weight",
+                40,
+                true,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6) // stride hit (5-2=3, 3%3==0)
         );
         assert_eq!(
-            kmap_resolve_mode("model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight", 40, true, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.language_model.layers.3.mlp.experts.5.gate_up_proj.weight",
+                40,
+                true,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base // not on stride
         );
     }
@@ -5844,20 +7130,44 @@ mod tests {
     fn kmap_alternating_ffn_down() {
         // ffn_down promoted in positional layers, base in others
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.0.mlp.down_proj.weight",
+                40,
+                false,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6) // edge
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.5.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.5.mlp.down_proj.weight",
+                40,
+                false,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6) // stride
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.3.mlp.down_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.3.mlp.down_proj.weight",
+                40,
+                false,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base // not on stride
         );
         // gate_proj NOT promoted in middle layers
         assert_eq!(
-            kmap_resolve_mode("model.layers.5.mlp.gate_proj.weight", 40, false, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.5.mlp.gate_proj.weight",
+                40,
+                false,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
     }
@@ -5866,7 +7176,13 @@ mod tests {
     fn kmap_alternating_n_layers_zero() {
         // With n_layers=0, alternating mode should return Base for everything
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.down_proj.weight", 0, false, 1, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.0.mlp.down_proj.weight",
+                0,
+                false,
+                1,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
     }
@@ -5893,16 +7209,34 @@ mod tests {
     #[test]
     fn kmap_typed_promotes_down_and_v() {
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 2, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.mlp.down_proj.weight",
+                40,
+                false,
+                2,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 2, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.self_attn.v_proj.weight",
+                40,
+                false,
+                2,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         // gate_proj stays base
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.gate_proj.weight", 40, false, 2, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.mlp.gate_proj.weight",
+                40,
+                false,
+                2,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
     }
@@ -5910,19 +7244,43 @@ mod tests {
     #[test]
     fn kmap_typed_lite_has_no_edge_blanket() {
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 3, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.mlp.down_proj.weight",
+                40,
+                false,
+                3,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 3, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.self_attn.v_proj.weight",
+                40,
+                false,
+                3,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.gate_proj.weight", 40, false, 3, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.0.mlp.gate_proj.weight",
+                40,
+                false,
+                3,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.linear_attn.in_proj_qkv.weight", 40, false, 3, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.0.linear_attn.in_proj_qkv.weight",
+                40,
+                false,
+                3,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
     }
@@ -5930,15 +7288,33 @@ mod tests {
     #[test]
     fn kmap_down_only_promotes_only_down() {
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.mlp.down_proj.weight", 40, false, 4, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.mlp.down_proj.weight",
+                40,
+                false,
+                4,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Promote(GgufFormat::Mq6)
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.15.self_attn.v_proj.weight", 40, false, 4, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.15.self_attn.v_proj.weight",
+                40,
+                false,
+                4,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
         assert_eq!(
-            kmap_resolve_mode("model.layers.0.mlp.gate_proj.weight", 40, false, 4, GgufFormat::Mq6),
+            kmap_resolve_mode(
+                "model.layers.0.mlp.gate_proj.weight",
+                40,
+                false,
+                4,
+                GgufFormat::Mq6
+            ),
             QuantLevel::Base
         );
     }

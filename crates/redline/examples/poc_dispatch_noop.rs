@@ -22,9 +22,16 @@ extern "C" __global__ void noop_kernel() {
 "#;
     std::fs::write("/tmp/redline_noop.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
-               "-o", "/tmp/redline_noop.hsaco", "/tmp/redline_noop.hip"])
-        .output().expect("hipcc");
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_noop.hsaco",
+            "/tmp/redline_noop.hip",
+        ])
+        .output()
+        .expect("hipcc");
     if !out.status.success() {
         eprintln!("hipcc failed: {}", String::from_utf8_lossy(&out.stderr));
         std::process::exit(1);
@@ -33,11 +40,23 @@ extern "C" __global__ void noop_kernel() {
     // Parse HSACO
     let module = HsacoModule::from_file("/tmp/redline_noop.hsaco").unwrap();
     let k = &module.kernels[0];
-    eprintln!("kernel: {} vgprs={} sgprs={} lds={} kernarg={} priv={}",
-        k.name, k.vgpr_count(), k.sgpr_count(), k.group_segment_size,
-        k.kernarg_size, k.private_segment_size);
-    eprintln!("pgm_rsrc1=0x{:08x} pgm_rsrc2=0x{:08x}", k.pgm_rsrc1, k.pgm_rsrc2);
-    eprintln!("kd_offset=0x{:x} code_offset=0x{:x}", k.kd_offset, k.code_offset);
+    eprintln!(
+        "kernel: {} vgprs={} sgprs={} lds={} kernarg={} priv={}",
+        k.name,
+        k.vgpr_count(),
+        k.sgpr_count(),
+        k.group_segment_size,
+        k.kernarg_size,
+        k.private_segment_size
+    );
+    eprintln!(
+        "pgm_rsrc1=0x{:08x} pgm_rsrc2=0x{:08x}",
+        k.pgm_rsrc1, k.pgm_rsrc2
+    );
+    eprintln!(
+        "kd_offset=0x{:x} code_offset=0x{:x}",
+        k.kd_offset, k.code_offset
+    );
 
     // Open GPU
     let dev = Device::open(None).unwrap();
@@ -49,7 +68,11 @@ extern "C" __global__ void noop_kernel() {
     let code_va = code_buf.gpu_addr + k.code_offset;
     let kd_va = code_buf.gpu_addr + k.kd_offset;
     eprintln!("code_buf base=0x{:x}", code_buf.gpu_addr);
-    eprintln!("code_va=0x{:x} (aligned to 256? {})", code_va, code_va & 0xFF == 0);
+    eprintln!(
+        "code_va=0x{:x} (aligned to 256? {})",
+        code_va,
+        code_va & 0xFF == 0
+    );
     eprintln!("kd_va=0x{:x}", kd_va);
 
     // Decode kernel_code_properties from the KD
@@ -66,13 +89,27 @@ extern "C" __global__ void noop_kernel() {
 
     // Count required user SGPRs
     let mut user_sgpr_count = 0u32;
-    if kcp & (1 << 0) != 0 { user_sgpr_count += 4; } // private seg buf
-    if kcp & (1 << 1) != 0 { user_sgpr_count += 2; } // dispatch ptr
-    if kcp & (1 << 2) != 0 { user_sgpr_count += 2; } // queue ptr
-    if kcp & (1 << 3) != 0 { user_sgpr_count += 2; } // kernarg ptr
-    if kcp & (1 << 4) != 0 { user_sgpr_count += 2; } // dispatch id
-    if kcp & (1 << 5) != 0 { user_sgpr_count += 2; } // flat scratch init
-    if kcp & (1 << 6) != 0 { user_sgpr_count += 1; } // private seg size
+    if kcp & (1 << 0) != 0 {
+        user_sgpr_count += 4;
+    } // private seg buf
+    if kcp & (1 << 1) != 0 {
+        user_sgpr_count += 2;
+    } // dispatch ptr
+    if kcp & (1 << 2) != 0 {
+        user_sgpr_count += 2;
+    } // queue ptr
+    if kcp & (1 << 3) != 0 {
+        user_sgpr_count += 2;
+    } // kernarg ptr
+    if kcp & (1 << 4) != 0 {
+        user_sgpr_count += 2;
+    } // dispatch id
+    if kcp & (1 << 5) != 0 {
+        user_sgpr_count += 2;
+    } // flat scratch init
+    if kcp & (1 << 6) != 0 {
+        user_sgpr_count += 1;
+    } // private seg size
     eprintln!("required user SGPRs: {}", user_sgpr_count);
 
     // Build PM4
@@ -106,7 +143,7 @@ extern "C" __global__ void noop_kernel() {
     // SET_SH_REG: COMPUTE_NUM_THREAD_X/Y/Z
     pm4.push(hdr(0x76, 4));
     pm4.push(0x0207);
-    pm4.push(1);  // 1 thread per group (noop kernel)
+    pm4.push(1); // 1 thread per group (noop kernel)
     pm4.push(1);
     pm4.push(1);
 

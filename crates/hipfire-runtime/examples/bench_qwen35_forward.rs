@@ -10,13 +10,15 @@
 //!   --extract  also extract 5 target hidden states per step (Phase 3 overhead check)
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("Build with --features deltanet"); }
+fn main() {
+    eprintln!("Build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::path::Path;
     use std::time::Instant;
 
@@ -39,36 +41,69 @@ fn main() {
 
     let max_seq = 2048;
     let mut kv_cache = llama::KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq,
-    ).unwrap();
-    let mut dn_state = DeltaNetState::new_with_quant(
-        &mut gpu, &config, qwen35::StateQuant::Q8,
-    ).unwrap();
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_seq,
+    )
+    .unwrap();
+    let mut dn_state =
+        DeltaNetState::new_with_quant(&mut gpu, &config, qwen35::StateQuant::Q8).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
     let sc = llama::SamplingConfig::text_thinking();
 
     // Optional hidden-state ring buffer for Phase 3 overhead measurement.
     let mut hidden_rb = if with_extract {
-        Some(hipfire_arch_qwen35::speculative::HiddenStateRingBuffer::new(
-            &mut gpu, config.n_layers, 5, config.dim, 32, 32,
-        ).unwrap())
+        Some(
+            hipfire_arch_qwen35::speculative::HiddenStateRingBuffer::new(
+                &mut gpu,
+                config.n_layers,
+                5,
+                config.dim,
+                32,
+                32,
+            )
+            .unwrap(),
+        )
     } else {
         None
     };
     if let Some(ref rb) = hidden_rb {
-        eprintln!("Hidden extraction: layers {:?} (n_layers={})",
-            rb.extract_layers, config.n_layers);
+        eprintln!(
+            "Hidden extraction: layers {:?} (n_layers={})",
+            rb.extract_layers, config.n_layers
+        );
     }
 
     // Warmup: 16 forwards at positions 0..16 (fills some KV).
     let warmup_tok: u32 = 1;
     for pos in 0..16 {
         if let Some(ref mut rb) = hidden_rb {
-            qwen35::forward_scratch_with_hidden(&mut gpu, &weights, &config, warmup_tok, pos,
-                &mut kv_cache, &mut dn_state, &scratch, rb).unwrap();
+            qwen35::forward_scratch_with_hidden(
+                &mut gpu,
+                &weights,
+                &config,
+                warmup_tok,
+                pos,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                rb,
+            )
+            .unwrap();
         } else {
-            qwen35::forward_scratch(&mut gpu, &weights, &config, warmup_tok, pos,
-                &mut kv_cache, &mut dn_state, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu,
+                &weights,
+                &config,
+                warmup_tok,
+                pos,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .unwrap();
         }
     }
     gpu.hip.device_synchronize().unwrap();
@@ -77,14 +112,35 @@ fn main() {
     let start = Instant::now();
     let rng_state: u32 = 0xDEAD_BEEFu32;
     let mut history: Vec<u32> = Vec::with_capacity(iters + 16);
-    for _ in 0..16 { history.push(warmup_tok); }
+    for _ in 0..16 {
+        history.push(warmup_tok);
+    }
     for i in 0..iters {
         if let Some(ref mut rb) = hidden_rb {
-            qwen35::forward_scratch_with_hidden(&mut gpu, &weights, &config, warmup_tok, 16 + i,
-                &mut kv_cache, &mut dn_state, &scratch, rb).unwrap();
+            qwen35::forward_scratch_with_hidden(
+                &mut gpu,
+                &weights,
+                &config,
+                warmup_tok,
+                16 + i,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                rb,
+            )
+            .unwrap();
         } else {
-            qwen35::forward_scratch(&mut gpu, &weights, &config, warmup_tok, 16 + i,
-                &mut kv_cache, &mut dn_state, &scratch).unwrap();
+            qwen35::forward_scratch(
+                &mut gpu,
+                &weights,
+                &config,
+                warmup_tok,
+                16 + i,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .unwrap();
         }
         if with_sample {
             let mut logits = gpu.download_f32(&scratch.logits).unwrap();
@@ -100,11 +156,13 @@ fn main() {
     let tok_per_s = iters as f64 / elapsed.as_secs_f64();
 
     let tag = match (with_sample, with_extract) {
-        (true, true)  => "forwards+sample+extract",
+        (true, true) => "forwards+sample+extract",
         (true, false) => "forwards+sample",
         (false, true) => "forwards+extract",
         (false, false) => "forwards",
     };
-    println!("{iters} {tag}: {:.1}ms total, {ms_per_tok:.2}ms/tok, {tok_per_s:.1} tok/s",
-        elapsed.as_millis());
+    println!(
+        "{iters} {tag}: {:.1}ms total, {ms_per_tok:.2}ms/tok, {tok_per_s:.1} tok/s",
+        elapsed.as_millis()
+    );
 }

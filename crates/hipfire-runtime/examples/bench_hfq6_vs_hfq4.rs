@@ -27,8 +27,16 @@ fn quantize_hfq4g256(f32_data: &[f32]) -> Vec<u8> {
         output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
         let actual_len = end - start;
         for i in 0..128 {
-            let lo = if 2*i < actual_len { ((group[2*i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let hi = if 2*i+1 < actual_len { ((group[2*i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let lo = if 2 * i < actual_len {
+                ((group[2 * i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let hi = if 2 * i + 1 < actual_len {
+                ((group[2 * i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             output[out_off + 8 + i] = lo.min(15) | (hi.min(15) << 4);
         }
     }
@@ -55,12 +63,28 @@ fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
         output[out_off + 4..out_off + 8].copy_from_slice(&min_val.to_le_bytes());
         let actual_len = end - start;
         for i in (0..256).step_by(4) {
-            let q0 = if i < actual_len { ((group[i] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q1 = if i + 1 < actual_len { ((group[i+1] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q2 = if i + 2 < actual_len { ((group[i+2] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
-            let q3 = if i + 3 < actual_len { ((group[i+3] - min_val) * inv_scale + 0.5) as u8 } else { 0 };
+            let q0 = if i < actual_len {
+                ((group[i] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q1 = if i + 1 < actual_len {
+                ((group[i + 1] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q2 = if i + 2 < actual_len {
+                ((group[i + 2] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
+            let q3 = if i + 3 < actual_len {
+                ((group[i + 3] - min_val) * inv_scale + 0.5) as u8
+            } else {
+                0
+            };
             let byte_off = 8 + (i / 4) * 3;
-            output[out_off + byte_off]     = q0.min(63) | (q1.min(63) << 6);
+            output[out_off + byte_off] = q0.min(63) | (q1.min(63) << 6);
             output[out_off + byte_off + 1] = (q1.min(63) >> 2) | (q2.min(63) << 4);
             output[out_off + byte_off + 2] = (q2.min(63) >> 4) | (q3.min(63) << 2);
         }
@@ -81,8 +105,12 @@ fn main() {
 
     for (name, m, k) in &shapes {
         let (m, k) = (*m, *k);
-        let w: Vec<f32> = (0..m*k).map(|i| ((i as f32 * 0.123) % 1.0) - 0.5).collect();
-        let x: Vec<f32> = (0..n*k).map(|i| ((i as f32 * 0.456) % 1.0) - 0.5).collect();
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.123) % 1.0) - 0.5)
+            .collect();
+        let x: Vec<f32> = (0..n * k)
+            .map(|i| ((i as f32 * 0.456) % 1.0) - 0.5)
+            .collect();
 
         let q4 = quantize_hfq4g256(&w);
         let q6 = quantize_hfq6g256(&w);
@@ -95,9 +123,11 @@ fn main() {
         // Warmup both kernels to compile / cache
         for _ in 0..3 {
             let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
-            gpu.gemm_hfq4g256_residual(&d_a4, &d_x, &d_y, m, k, n).unwrap();
+            gpu.gemm_hfq4g256_residual(&d_a4, &d_x, &d_y, m, k, n)
+                .unwrap();
             let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
-            gpu.gemm_hfq6g256_residual(&d_a6, &d_x, &d_y, m, k, n).unwrap();
+            gpu.gemm_hfq6g256_residual(&d_a6, &d_x, &d_y, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
 
@@ -106,7 +136,8 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..iters {
             let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
-            gpu.gemm_hfq4g256_residual(&d_a4, &d_x, &d_y, m, k, n).unwrap();
+            gpu.gemm_hfq4g256_residual(&d_a4, &d_x, &d_y, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t_hfq4 = t0.elapsed().as_secs_f64() / iters as f64 * 1000.0;
@@ -114,7 +145,8 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..iters {
             let d_y = gpu.upload_f32(&y_init, &[n * m]).unwrap();
-            gpu.gemm_hfq6g256_residual(&d_a6, &d_x, &d_y, m, k, n).unwrap();
+            gpu.gemm_hfq6g256_residual(&d_a6, &d_x, &d_y, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t_hfq6 = t0.elapsed().as_secs_f64() / iters as f64 * 1000.0;

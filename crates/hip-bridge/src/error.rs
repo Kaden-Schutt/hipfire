@@ -42,7 +42,11 @@ impl HipError {
                 if ptr.is_null() {
                     None
                 } else {
-                    Some(unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned())
+                    Some(
+                        unsafe { CStr::from_ptr(ptr) }
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
             })
             .unwrap_or_else(|| format!("error code {code}"));

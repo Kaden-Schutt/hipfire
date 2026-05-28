@@ -41,11 +41,7 @@ fn build_full_bank() -> DetectorBank {
 }
 
 fn run_fixture(name: &str) -> Vec<(&'static str, Verdict)> {
-    let path = format!(
-        "{}/tests/fixtures/{}",
-        env!("CARGO_MANIFEST_DIR"),
-        name
-    );
+    let path = format!("{}/tests/fixtures/{}", env!("CARGO_MANIFEST_DIR"), name);
     let raw = std::fs::read_to_string(&path).expect("read fixture");
     let events = parse_jsonl_events(&raw);
     assert!(!events.is_empty(), "fixture {} parsed to zero events", name);
@@ -121,5 +117,9 @@ fn agentic_corrupt_fires() {
     // Token-id attractor detectors must NOT fire on this fixture
     // (only 5 tokens, none repeating heavily).
     let aw = verdict_for(&v, "attractor_first_128");
-    assert!(!aw.is_fail() && !aw.is_warn(), "attractor_first_128 quiet, got {:?}", aw);
+    assert!(
+        !aw.is_fail() && !aw.is_warn(),
+        "attractor_first_128 quiet, got {:?}",
+        aw
+    );
 }

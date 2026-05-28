@@ -35,35 +35,57 @@ fn main() {
 
     macro_rules! bench {
         ($label:expr, $body:expr) => {{
-            for _ in 0..warmup { $body; }
+            for _ in 0..warmup {
+                $body;
+            }
             gpu.hip.device_synchronize().unwrap();
 
             let t = Instant::now();
-            for _ in 0..n_launches { $body; }
+            for _ in 0..n_launches {
+                $body;
+            }
             gpu.hip.device_synchronize().unwrap();
             let total = t.elapsed().as_secs_f64() * 1_000_000.0;
             let per_call = total / n_launches as f64;
-            eprintln!("[{:25}] {n_launches} launches in {total:7.1} µs → {per_call:5.2} µs/call", $label);
+            eprintln!(
+                "[{:25}] {n_launches} launches in {total:7.1} µs → {per_call:5.2} µs/call",
+                $label
+            );
         }};
     }
 
     // ─── Single kernel burst (each kernel back-to-back) ─
     eprintln!("\n--- Single-kernel bursts ---");
-    bench!("rmsnorm_f32", { gpu.rmsnorm_f32(&a, &weight, &scratch, 1e-6).unwrap(); });
-    bench!("mul_f32", { gpu.mul_f32(&a, &b, &c).unwrap(); });
-    bench!("add_inplace_f32", { gpu.add_inplace_f32(&a, &b).unwrap(); });
-    bench!("silu_mul_f32", { gpu.silu_mul_f32(&a, &b, &scratch).unwrap(); });
+    bench!("rmsnorm_f32", {
+        gpu.rmsnorm_f32(&a, &weight, &scratch, 1e-6).unwrap();
+    });
+    bench!("mul_f32", {
+        gpu.mul_f32(&a, &b, &c).unwrap();
+    });
+    bench!("add_inplace_f32", {
+        gpu.add_inplace_f32(&a, &b).unwrap();
+    });
+    bench!("silu_mul_f32", {
+        gpu.silu_mul_f32(&a, &b, &scratch).unwrap();
+    });
     #[cfg(feature = "deltanet")]
     {
-        bench!("sigmoid_f32", { gpu.sigmoid_f32(&scratch).unwrap(); });
-        bench!("scale_f32", { gpu.scale_f32(&a, 0.5).unwrap(); });
+        bench!("sigmoid_f32", {
+            gpu.sigmoid_f32(&scratch).unwrap();
+        });
+        bench!("scale_f32", {
+            gpu.scale_f32(&a, 0.5).unwrap();
+        });
     }
 
     // ─── Mixed dependent chain (mimics non-GEMV layer pattern) ─
     eprintln!("\n--- Mixed dependent chain (5 kernels per iteration) ---");
     bench!("mixed-5 dependent", {
         gpu.rmsnorm_f32(&a, &weight, &scratch, 1e-6).unwrap();
-        #[cfg(feature = "deltanet")] { gpu.sigmoid_f32(&scratch).unwrap(); }
+        #[cfg(feature = "deltanet")]
+        {
+            gpu.sigmoid_f32(&scratch).unwrap();
+        }
         gpu.mul_f32(&scratch, &b, &c).unwrap();
         gpu.add_inplace_f32(&c, &b).unwrap();
         gpu.silu_mul_f32(&a, &b, &scratch).unwrap();
@@ -72,12 +94,18 @@ fn main() {
     eprintln!("\n--- Mixed dependent chain (10 kernels per iteration) ---");
     bench!("mixed-10 dependent", {
         gpu.rmsnorm_f32(&a, &weight, &scratch, 1e-6).unwrap();
-        #[cfg(feature = "deltanet")] { gpu.sigmoid_f32(&scratch).unwrap(); }
+        #[cfg(feature = "deltanet")]
+        {
+            gpu.sigmoid_f32(&scratch).unwrap();
+        }
         gpu.mul_f32(&scratch, &b, &c).unwrap();
         gpu.add_inplace_f32(&c, &b).unwrap();
         gpu.silu_mul_f32(&a, &b, &scratch).unwrap();
         gpu.rmsnorm_f32(&scratch, &weight, &c, 1e-6).unwrap();
-        #[cfg(feature = "deltanet")] { gpu.sigmoid_f32(&c).unwrap(); }
+        #[cfg(feature = "deltanet")]
+        {
+            gpu.sigmoid_f32(&c).unwrap();
+        }
         gpu.mul_f32(&c, &b, &scratch).unwrap();
         gpu.add_inplace_f32(&scratch, &a).unwrap();
         gpu.silu_mul_f32(&a, &scratch, &c).unwrap();

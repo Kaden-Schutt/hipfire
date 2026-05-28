@@ -32,9 +32,10 @@
 //!   - a discoverable contract for adding a new arch ("implement this trait
 //!     and register your `arch_id`").
 
-use crate::qwen35::{config_from_hfq as qwen35_config_from_hfq,
-                    load_weights as qwen35_load_weights,
-                    DeltaNetState, Qwen35Config, Qwen35Weights};
+use crate::qwen35::{
+    config_from_hfq as qwen35_config_from_hfq, load_weights as qwen35_load_weights, DeltaNetState,
+    Qwen35Config, Qwen35Weights,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;

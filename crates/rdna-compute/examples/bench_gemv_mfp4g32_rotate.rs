@@ -20,12 +20,12 @@ fn main() {
     eprintln!("  arch={arch}");
 
     let shapes: Vec<(usize, usize, &str)> = vec![
-        (2048,  2048,  "qkv-q     M=2048 K=2048"),
-        (512,   2048,  "qkv-kv    M=512  K=2048"),
-        (11008, 2048,  "gate_up   M=11008 K=2048"),
-        (2048,  11008, "w_down    M=2048  K=11008"),
-        (4096,  2048,  "med       M=4096 K=2048"),
-        (1024,  2048,  "small     M=1024 K=2048"),
+        (2048, 2048, "qkv-q     M=2048 K=2048"),
+        (512, 2048, "qkv-kv    M=512  K=2048"),
+        (11008, 2048, "gate_up   M=11008 K=2048"),
+        (2048, 11008, "w_down    M=2048  K=11008"),
+        (4096, 2048, "med       M=4096 K=2048"),
+        (1024, 2048, "small     M=1024 K=2048"),
     ];
 
     let trials = 200;
@@ -36,7 +36,12 @@ fn main() {
         let row_bytes = 16 + (k / 32) * 17;
         let total_w_bytes = m * row_bytes;
 
-        let w = gpu.upload_raw(&synth(m, k, 0xAA00 | (m as u64) ^ (k as u64)), &[total_w_bytes]).unwrap();
+        let w = gpu
+            .upload_raw(
+                &synth(m, k, 0xAA00 | (m as u64) ^ (k as u64)),
+                &[total_w_bytes],
+            )
+            .unwrap();
         let x = gpu.alloc_tensor(&[k], DType::F32).unwrap();
         let y = gpu.alloc_tensor(&[m], DType::F32).unwrap();
         let x_rot = gpu.alloc_tensor(&[k], DType::F32).unwrap();
@@ -48,13 +53,15 @@ fn main() {
         // each launch — mimics the production case where each gemv has
         // freshly-written x (which is what blocks the v1 src_ptr cache).
         for _ in 0..warmup {
-            gpu.gemv_mfp4g32_with_rotate(&w, &x, &y, &x_rot, m, k).unwrap();
+            gpu.gemv_mfp4g32_with_rotate(&w, &x, &y, &x_rot, m, k)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
 
         let t = Instant::now();
         for _ in 0..trials {
-            gpu.gemv_mfp4g32_with_rotate(&w, &x, &y, &x_rot, m, k).unwrap();
+            gpu.gemv_mfp4g32_with_rotate(&w, &x, &y, &x_rot, m, k)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let us = t.elapsed().as_secs_f64() * 1e6 / trials as f64;
@@ -64,7 +71,16 @@ fn main() {
 }
 
 fn make_x(n: usize, seed: i64) -> Vec<f32> {
-    (0..n).map(|i| ((i as i64).wrapping_mul(seed.wrapping_add(0x91c2_a73d)).wrapping_add(seed) & 0xFFFFFF) as f32 * 1e-7 - 0.5).collect()
+    (0..n)
+        .map(|i| {
+            ((i as i64)
+                .wrapping_mul(seed.wrapping_add(0x91c2_a73d))
+                .wrapping_add(seed)
+                & 0xFFFFFF) as f32
+                * 1e-7
+                - 0.5
+        })
+        .collect()
 }
 
 fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
@@ -73,7 +89,9 @@ fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -100,9 +118,15 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
-    if exp == 0 { return sign; }
-    if exp >= 143 { return sign | 0x7C00; }
-    if exp <= 112 { return sign; }
+    if exp == 0 {
+        return sign;
+    }
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 112 {
+        return sign;
+    }
     let new_exp = (exp - 127 + 15) as u16;
     let new_mant = (mant >> 13) as u16;
     sign | (new_exp << 10) | new_mant

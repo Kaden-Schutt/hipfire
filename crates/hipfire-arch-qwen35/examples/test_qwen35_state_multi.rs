@@ -39,15 +39,18 @@ fn main() {
     );
 
     println!("\n── Qwen35ScratchSet::new_with_kv_max_multi ───────────────");
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096)
-        .expect("ScratchSet");
+    let scratch_set =
+        Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096).expect("ScratchSet");
     assert_eq!(scratch_set.per_device.len(), n_dev);
     for (dev_idx, scratch) in scratch_set.per_device.iter().enumerate() {
         let attr = gpus.devices[dev_idx]
             .hip
             .pointer_get_attributes(&scratch.x.buf)
             .expect("attr scratch.x");
-        println!("  per_device[{dev_idx}].x: attr.device={} (expect {dev_idx})", attr.device);
+        println!(
+            "  per_device[{dev_idx}].x: attr.device={} (expect {dev_idx})",
+            attr.device
+        );
         assert_eq!(attr.device, dev_idx as i32);
     }
 
@@ -119,7 +122,10 @@ fn main() {
             .hip
             .pointer_get_attributes(&dn.s_matrices[i].buf)
             .expect("attr dn s_matrix");
-        println!("  la {i}: dev_idx={dev_idx}, s_matrix.device={}", attr.device);
+        println!(
+            "  la {i}: dev_idx={dev_idx}, s_matrix.device={}",
+            attr.device
+        );
         assert_eq!(attr.device, dev_idx as i32);
     }
 

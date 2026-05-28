@@ -21,8 +21,8 @@
 //! 3. Pass the multi-GPU coherence gate.
 
 use hip_bridge::{
-    DeviceBuffer, Event, HipError, HipResult,
-    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    DeviceBuffer, Event, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -107,10 +107,16 @@ impl Gpus {
     pub fn init_layers(per_device: &[usize]) -> HipResult<Self> {
         let n_devices = per_device.len();
         if n_devices == 0 {
-            return Err(HipError::new(0, "init_layers: per_device must be non-empty"));
+            return Err(HipError::new(
+                0,
+                "init_layers: per_device must be non-empty",
+            ));
         }
         if per_device.contains(&0) {
-            return Err(HipError::new(0, "init_layers: each device must own ≥1 layer"));
+            return Err(HipError::new(
+                0,
+                "init_layers: each device must own ≥1 layer",
+            ));
         }
         let n_layers: usize = per_device.iter().sum();
         let device_ids = resolve_device_ids(n_devices)?;
@@ -190,7 +196,10 @@ impl Gpus {
                     all_ok = false;
                     continue;
                 }
-                match self.devices[i].hip.enable_peer_access(self.devices[j].device_id) {
+                match self.devices[i]
+                    .hip
+                    .enable_peer_access(self.devices[j].device_id)
+                {
                     Ok(()) => {}
                     // ffi.rs already converts 704 → Ok(()); this arm is
                     // belt-and-suspenders against ROCm versions where the
@@ -261,12 +270,15 @@ impl Gpus {
         let dst_dev_id = self.devices[dst_dev].device_id;
         match src_gpu.active_stream.as_ref() {
             Some(stream) => {
-                src_gpu.hip.memcpy_peer_async(
-                    dst, dst_dev_id, src, src_dev_id, n_bytes, stream,
-                )?;
+                src_gpu
+                    .hip
+                    .memcpy_peer_async(dst, dst_dev_id, src, src_dev_id, n_bytes, stream)?;
                 let event = src_gpu.hip.event_create()?;
                 match src_gpu.hip.event_record(&event, Some(stream)) {
-                    Ok(()) => Ok(BoundaryEvent { dst_dev, completion: Some(event) }),
+                    Ok(()) => Ok(BoundaryEvent {
+                        dst_dev,
+                        completion: Some(event),
+                    }),
                     Err(e) => {
                         let _ = src_gpu.hip.event_destroy(event);
                         Err(e)
@@ -278,8 +290,13 @@ impl Gpus {
                 // lands. No event needed — recording into the HIP null
                 // stream is fragile across ROCm versions; skip it and
                 // signal "already done" via completion: None.
-                src_gpu.hip.memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
-                Ok(BoundaryEvent { dst_dev, completion: None })
+                src_gpu
+                    .hip
+                    .memcpy_peer(dst, dst_dev_id, src, src_dev_id, n_bytes)?;
+                Ok(BoundaryEvent {
+                    dst_dev,
+                    completion: None,
+                })
             }
         }
     }
@@ -316,11 +333,7 @@ impl Gpus {
         wait_result.and(destroy_result)
     }
 
-    fn from_parts(
-        devices: Vec<Gpu>,
-        per_device: Vec<usize>,
-        n_layers: usize,
-    ) -> HipResult<Self> {
+    fn from_parts(devices: Vec<Gpu>, per_device: Vec<usize>, n_layers: usize) -> HipResult<Self> {
         debug_assert_eq!(per_device.iter().sum::<usize>(), n_layers);
         debug_assert_eq!(per_device.len(), devices.len());
         let n_devices = devices.len();

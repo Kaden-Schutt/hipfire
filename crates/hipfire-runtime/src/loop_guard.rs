@@ -49,9 +49,13 @@ impl LoopGuard {
     ///   inspect on each `check` call.
     pub fn from_env() -> Self {
         let ngram_threshold: usize = std::env::var("HIPFIRE_NGRAM_LOOP_THRESHOLD")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
         let ngram_window: usize = std::env::var("HIPFIRE_NGRAM_WINDOW")
-            .ok().and_then(|v| v.parse().ok()).unwrap_or(256);
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(256);
         Self::new(ngram_threshold, ngram_window)
     }
 

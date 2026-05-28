@@ -21,15 +21,14 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_scatter_permute_k8
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("memcpy_htod i32");
     t
 }
@@ -38,18 +37,17 @@ fn alloc_i32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
     let t = gpu
         .alloc_tensor(&[n * 4], DType::Raw)
         .expect("alloc_tensor i32");
-    gpu.hip
-        .memset(&t.buf, 0, n * 4)
-        .expect("memset zero");
+    gpu.hip.memset(&t.buf, 0, n * 4).expect("memset zero");
     t
 }
 
 fn download_i32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<i32> {
     let mut data = vec![0i32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh i32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh i32");
     data
 }
 
@@ -88,11 +86,7 @@ struct CpuRef {
     m_total: usize,
 }
 
-fn cpu_scatter(
-    topk_indices: &[i32],
-    num_experts: usize,
-    block_m: usize,
-) -> CpuRef {
+fn cpu_scatter(topk_indices: &[i32], num_experts: usize, block_m: usize) -> CpuRef {
     // Phase 1: raw histogram.
     let mut raw_counts = vec![0i32; num_experts];
     for &e in topk_indices {
@@ -286,9 +280,7 @@ fn run_case(
     block_m: usize,
     seed: u32,
 ) -> usize {
-    println!(
-        "\n=== {label}: N={n} K_TOP={k_top} E={num_experts} BLOCK_M={block_m} ==="
-    );
+    println!("\n=== {label}: N={n} K_TOP={k_top} E={num_experts} BLOCK_M={block_m} ===");
 
     let topk_indices_host = gen_topk_indices(n, k_top, num_experts, seed);
     let cpu_ref = cpu_scatter(&topk_indices_host, num_experts, block_m);

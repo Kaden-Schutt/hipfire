@@ -39,7 +39,9 @@ impl Detector for EosImmediate {
 
     fn observe(&mut self, ev: &Event<'_>) -> Option<Verdict> {
         match ev {
-            Event::Token { text, synthetic, .. } => {
+            Event::Token {
+                text, synthetic, ..
+            } => {
                 if !synthetic {
                     self.visible_bytes += text.len();
                 }

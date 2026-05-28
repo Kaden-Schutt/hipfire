@@ -273,8 +273,16 @@ pub fn extract_patches(chw: &[f32], h: usize, w: usize) -> Vec<f32> {
         3 * h * w,
         chw.len()
     );
-    assert_eq!(h % PATCH_SIZE, 0, "h={h} must be a multiple of PATCH_SIZE={PATCH_SIZE}");
-    assert_eq!(w % PATCH_SIZE, 0, "w={w} must be a multiple of PATCH_SIZE={PATCH_SIZE}");
+    assert_eq!(
+        h % PATCH_SIZE,
+        0,
+        "h={h} must be a multiple of PATCH_SIZE={PATCH_SIZE}"
+    );
+    assert_eq!(
+        w % PATCH_SIZE,
+        0,
+        "w={w} must be a multiple of PATCH_SIZE={PATCH_SIZE}"
+    );
     let grid_h = h / PATCH_SIZE;
     let grid_w = w / PATCH_SIZE;
     assert_eq!(
@@ -430,7 +438,11 @@ fn composite_rgba_on_white(rgba: &image::RgbaImage) -> image::RgbImage {
         let a = pix[3] as u32;
         let inv_a = 255 - a;
         let blend = |c: u8| ((c as u32 * a + 255 * inv_a) / 255) as u8;
-        out.put_pixel(x, y, image::Rgb([blend(pix[0]), blend(pix[1]), blend(pix[2])]));
+        out.put_pixel(
+            x,
+            y,
+            image::Rgb([blend(pix[0]), blend(pix[1]), blend(pix[2])]),
+        );
     }
     out
 }
@@ -451,7 +463,11 @@ mod tests {
         assert_eq!(w % IMAGE_FACTOR, 0, "w={w} is not a 28-multiple");
         // 100×3000 = 300_000 pixels, way under MAX_PIXELS=11_289_600,
         // so smart_resize rounds to nearest 28-multiple.
-        assert!(h * w <= MAX_PIXELS, "{h}×{w} = {} exceeds MAX_PIXELS", h * w);
+        assert!(
+            h * w <= MAX_PIXELS,
+            "{h}×{w} = {} exceeds MAX_PIXELS",
+            h * w
+        );
         assert!(h * w >= MIN_PIXELS, "{h}×{w} = {} below MIN_PIXELS", h * w);
     }
 
@@ -459,8 +475,7 @@ mod tests {
     fn smart_resize_rejects_extreme_aspect_ratio() {
         // 1×500 → ratio = 500, well over MAX_RATIO=200. Must error,
         // not silently produce a 28×28 or similar degenerate dim.
-        let err = smart_resize(1, 500)
-            .expect_err("AR=500 must trip the MAX_RATIO=200 guard");
+        let err = smart_resize(1, 500).expect_err("AR=500 must trip the MAX_RATIO=200 guard");
         assert!(
             err.contains("aspect ratio") && err.contains("200"),
             "unexpected error message: {err}"
@@ -553,18 +568,22 @@ mod tests {
         // is its tag, since the synthetic input is per-pixel-constant
         // within a single patch).
         let expected = [
-            0.0,       // (outer 0,0, inner 0,0) → py=0, px=0
-            1.0,       // (outer 0,0, inner 0,1) → py=0, px=1
-            1000.0,    // (outer 0,0, inner 1,0) → py=1, px=0
-            1001.0,    // (outer 0,0, inner 1,1) → py=1, px=1
-            2.0,       // (outer 0,1, inner 0,0) → py=0, px=2
-            3.0,       // (outer 0,1, inner 0,1) → py=0, px=3
-            1002.0,    // (outer 0,1, inner 1,0) → py=1, px=2
-            1003.0,    // (outer 0,1, inner 1,1) → py=1, px=3
+            0.0,    // (outer 0,0, inner 0,0) → py=0, px=0
+            1.0,    // (outer 0,0, inner 0,1) → py=0, px=1
+            1000.0, // (outer 0,0, inner 1,0) → py=1, px=0
+            1001.0, // (outer 0,0, inner 1,1) → py=1, px=1
+            2.0,    // (outer 0,1, inner 0,0) → py=0, px=2
+            3.0,    // (outer 0,1, inner 0,1) → py=0, px=3
+            1002.0, // (outer 0,1, inner 1,0) → py=1, px=2
+            1003.0, // (outer 0,1, inner 1,1) → py=1, px=3
         ];
         for (i, &want) in expected.iter().enumerate() {
             let got = patches[i * patch_elems];
-            let raster_would_give = if i < 4 { i as f32 } else { 1000.0 + (i - 4) as f32 };
+            let raster_would_give = if i < 4 {
+                i as f32
+            } else {
+                1000.0 + (i - 4) as f32
+            };
             assert_eq!(
                 got, want,
                 "patch[{i}] first element: expected {want}, got {got} \
@@ -588,9 +607,8 @@ mod tests {
                 for x in 0..w {
                     // Pixel value = c * 10000 + y * 100 + x — unique
                     // per (c, y, x) so any reordering is detectable.
-                    chw[c * h * w + y * w + x] = (c as f32) * 10000.0
-                        + (y as f32) * 100.0
-                        + (x as f32);
+                    chw[c * h * w + y * w + x] =
+                        (c as f32) * 10000.0 + (y as f32) * 100.0 + (x as f32);
                 }
             }
         }
@@ -664,7 +682,10 @@ mod tests {
             resized_w: 84,
         };
         assert_eq!(p.n_patches(), 24);
-        assert_eq!(p.n_visual_tokens(), 24 / (SPATIAL_MERGE_SIZE * SPATIAL_MERGE_SIZE));
+        assert_eq!(
+            p.n_visual_tokens(),
+            24 / (SPATIAL_MERGE_SIZE * SPATIAL_MERGE_SIZE)
+        );
     }
 
     #[test]

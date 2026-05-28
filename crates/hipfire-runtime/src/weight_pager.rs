@@ -67,10 +67,7 @@ pub enum WeightId {
         role: ExpertRole,
     },
     /// Always-on shared expert (one per layer).
-    SharedExpert {
-        layer: u16,
-        role: SharedRole,
-    },
+    SharedExpert { layer: u16, role: SharedRole },
     /// Per-layer router weight (small, always-resident in v0.1, but tracked
     /// here so future commits can page it for very large MoE configs).
     Router { layer: u16 },
@@ -246,7 +243,8 @@ impl PreadH2DTransport {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file.read_exact_at(&mut self.staging[..len], offset as u64)?;
+            self.file
+                .read_exact_at(&mut self.staging[..len], offset as u64)?;
         }
         #[cfg(not(unix))]
         {
@@ -266,13 +264,12 @@ impl Transport for PreadH2DTransport {
         gpu: &mut Gpu,
     ) -> HipResult<(GpuTensor, TransferHandle)> {
         // 1. Host: pread the bytes into our staging buffer.
-        self.pread_into_staging(hfq_offset, len)
-            .map_err(|e| {
-                hip_bridge::HipError::new(0, &format!(
-                    "pread {} bytes at offset {}: {}",
-                    len, hfq_offset, e
-                ))
-            })?;
+        self.pread_into_staging(hfq_offset, len).map_err(|e| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("pread {} bytes at offset {}: {}", len, hfq_offset, e),
+            )
+        })?;
         // 2. GPU: alloc + memcpy_htod via the existing rdna-compute helper.
         //    `dtype: Raw` because the pager doesn't care about element layout
         //    — that interpretation belongs to `WeightTensor` at the call site.
@@ -424,11 +421,7 @@ impl WeightPager {
     /// - Cold (registered but not resident) → if adding `id` would exceed
     ///   `config.vram_budget_bytes`, evict LRU residents until enough room.
     ///   Then fetch via transport, populate, track residency.
-    pub fn ensure_resident(
-        &mut self,
-        id: WeightId,
-        gpu: &mut Gpu,
-    ) -> Result<(), WeightPagerError> {
+    pub fn ensure_resident(&mut self, id: WeightId, gpu: &mut Gpu) -> Result<(), WeightPagerError> {
         if self.resident.contains_key(&id) {
             self.touch_lru(id);
             return Ok(());
@@ -455,7 +448,13 @@ impl WeightPager {
         }
         let (tensor, _handle) = self.transport.fetch(range.offset, range.len, gpu)?;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
-        self.resident.insert(id, Resident { tensor, bytes: need });
+        self.resident.insert(
+            id,
+            Resident {
+                tensor,
+                bytes: need,
+            },
+        );
         self.lru.push_back(id);
         if self.config.trace {
             eprintln!(
@@ -490,8 +489,16 @@ impl WeightPager {
         gpu: &mut Gpu,
     ) -> HipResult<()> {
         for &idx in top_indices {
-            let gate_up_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::GateUp };
-            let down_id = WeightId::Expert { layer, expert: idx, role: ExpertRole::Down };
+            let gate_up_id = WeightId::Expert {
+                layer,
+                expert: idx,
+                role: ExpertRole::GateUp,
+            };
+            let down_id = WeightId::Expert {
+                layer,
+                expert: idx,
+                role: ExpertRole::Down,
+            };
             let gate_up_tensor = self
                 .resident
                 .get(&gate_up_id)
@@ -504,8 +511,10 @@ impl WeightPager {
             let gate_up_ptr = gate_up_tensor.tensor.buf.as_ptr() as u64;
             let down_ptr = down_tensor.tensor.buf.as_ptr() as u64;
             let offset = (idx as usize) * 8;
-            gpu.hip.memcpy_htod_offset(&gate_up_ptrs.buf, offset, &gate_up_ptr.to_le_bytes())?;
-            gpu.hip.memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
+            gpu.hip
+                .memcpy_htod_offset(&gate_up_ptrs.buf, offset, &gate_up_ptr.to_le_bytes())?;
+            gpu.hip
+                .memcpy_htod_offset(&down_ptrs.buf, offset, &down_ptr.to_le_bytes())?;
         }
         Ok(())
     }
@@ -558,7 +567,10 @@ impl WeightPager {
                 // LRU without inserting into `resident`, or removed without
                 // updating LRU. In release this is a silent drop; debug
                 // builds catch the invariant violation.
-                debug_assert!(false, "weight_pager: LRU contained {id:?} but residency map did not");
+                debug_assert!(
+                    false,
+                    "weight_pager: LRU contained {id:?} but residency map did not"
+                );
             }
         }
         Ok(())
@@ -657,7 +669,11 @@ impl std::fmt::Display for WeightPagerError {
         match self {
             Self::NotRegistered(id) => write!(f, "weight not registered: {id:?}"),
             Self::Hip(e) => write!(f, "hip error: {e}"),
-            Self::BudgetExhausted { need_bytes, in_use, budget } => write!(
+            Self::BudgetExhausted {
+                need_bytes,
+                in_use,
+                budget,
+            } => write!(
                 f,
                 "weight pager: cannot evict to fit {need_bytes} bytes \
                  (in_use={in_use}, budget={budget}); raise vram_budget_bytes \
@@ -698,8 +714,16 @@ mod tests {
     #[test]
     fn weight_id_is_hashable() {
         let mut map = HashMap::new();
-        let a = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
-        let b = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::Down };
+        let a = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::GateUp,
+        };
+        let b = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::Down,
+        };
         map.insert(a, 1u32);
         map.insert(b, 2u32);
         assert_eq!(map.get(&a), Some(&1));
@@ -715,7 +739,10 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-test-{}.bin", std::process::id()));
         let payload: Vec<u8> = (0..1024u32).flat_map(|i| (i as u8).to_le_bytes()).collect();
-        std::fs::File::create(&path).unwrap().write_all(&payload).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&payload)
+            .unwrap();
 
         let mut t = PreadH2DTransport::open(&path).unwrap();
         // Read [256..768) — should match payload[256..768].
@@ -732,7 +759,10 @@ mod tests {
     fn pager_starts_empty() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-empty-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         assert_eq!(pager.registered_count(), 0);
         assert_eq!(pager.vram_used_bytes(), 0);
@@ -743,10 +773,16 @@ mod tests {
     fn register_then_get_returns_none_until_resident() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-reg-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
-        let mut pager =
-            WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
-        let id = WeightId::Expert { layer: 0, expert: 0, role: ExpertRole::GateUp };
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
+        let mut pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
+        let id = WeightId::Expert {
+            layer: 0,
+            expert: 0,
+            role: ExpertRole::GateUp,
+        };
         pager.register(id, ByteRange { offset: 0, len: 1 });
         assert_eq!(pager.registered_count(), 1);
         // Catalog hit, not yet resident → get returns None.
@@ -765,10 +801,16 @@ mod tests {
     fn would_fit_rejects_need_bigger_than_budget() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-budget-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(
             &path,
-            PagerConfig { vram_budget_bytes: 100, trace: false },
+            PagerConfig {
+                vram_budget_bytes: 100,
+                trace: false,
+            },
         )
         .unwrap();
         // need <= budget → ok
@@ -776,7 +818,11 @@ mod tests {
         assert!(pager.would_fit(100).is_ok());
         // need > budget → BudgetExhausted, even on an empty pager
         match pager.would_fit(1000) {
-            Err(WeightPagerError::BudgetExhausted { need_bytes, in_use, budget }) => {
+            Err(WeightPagerError::BudgetExhausted {
+                need_bytes,
+                in_use,
+                budget,
+            }) => {
                 assert_eq!(need_bytes, 1000);
                 assert_eq!(in_use, 0);
                 assert_eq!(budget, 100);
@@ -792,7 +838,10 @@ mod tests {
     fn would_fit_accepts_anything_when_budget_unlimited() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("hipfire-pager-unlim-{}.bin", std::process::id()));
-        std::fs::File::create(&path).unwrap().write_all(b"x").unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(b"x")
+            .unwrap();
         let pager = WeightPager::with_pread_transport(&path, PagerConfig::default()).unwrap();
         // Default is u64::MAX; even u64::MAX - 1 fits.
         assert!(pager.would_fit(u64::MAX - 1).is_ok());

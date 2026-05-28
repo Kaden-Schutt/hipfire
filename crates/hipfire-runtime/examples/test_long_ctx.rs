@@ -17,20 +17,24 @@
 //! Turns file format: one turn per line; blank lines are skipped.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache, SamplingConfig};
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
     use std::io::Write;
     use std::path::Path;
     use std::time::Instant;
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: test_long_ctx <model.mq4> [--turns-file <path>] [--max-gen N] [--no-think]");
+        eprintln!(
+            "Usage: test_long_ctx <model.mq4> [--turns-file <path>] [--max-gen N] [--no-think]"
+        );
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -40,10 +44,21 @@ fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--turns-file" => { turns_file = Some(args[i + 1].clone()); i += 2; }
-            "--max-gen"    => { max_gen = args[i + 1].parse().unwrap_or(512); i += 2; }
-            "--no-think"   => { no_think = true; i += 1; }
-            _ => { i += 1; }
+            "--turns-file" => {
+                turns_file = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--max-gen" => {
+                max_gen = args[i + 1].parse().unwrap_or(512);
+                i += 2;
+            }
+            "--no-think" => {
+                no_think = true;
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 
@@ -53,8 +68,12 @@ fn main() {
     // and 3 are short follow-ups that reference things from turn 1, so
     // coherence across the multi-turn KV cache shows up immediately.
     let turns: Vec<String> = if let Some(path) = turns_file {
-        std::fs::read_to_string(&path).expect("read turns file")
-            .lines().filter(|l| !l.trim().is_empty()).map(|s| s.to_string()).collect()
+        std::fs::read_to_string(&path)
+            .expect("read turns file")
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|s| s.to_string())
+            .collect()
     } else {
         vec![
             // Turn 1: long scenario + specific question.
@@ -84,16 +103,17 @@ Margery refuses to break the tie until she hears from the barge guild in Portsmo
 reply is two weeks late.\n\n\
 Question: based on this description, which council member would you expect to be the \
 strongest advocate for restoring the redirected creek back to the temple's garden, and why? \
-Give your reasoning in one short paragraph.".to_string(),
-
+Give your reasoning in one short paragraph."
+                .to_string(),
             // Turn 2: specific follow-up that requires remembering turn 1.
             "Good. Now: which council member seems least connected to the fire debate, and \
-why might that be a political weakness for them?".to_string(),
-
+why might that be a political weakness for them?"
+                .to_string(),
             // Turn 3: a reasoning follow-up that requires remembering both prior turns.
             "One more: if Elder Margery is still waiting on the barge guild reply when another \
 fire breaks out, whose position on the market rebuild gets strongest, and what changes about \
-it?".to_string(),
+it?"
+            .to_string(),
         ]
     };
 
@@ -103,7 +123,8 @@ it?".to_string(),
     // ── Load model ──────────────────────────────────────────────────────
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
@@ -111,8 +132,13 @@ it?".to_string(),
     // Size the KV cache for the sum of all turn prompts + generations, with slack.
     let max_seq = 8192usize;
     let mut kv_cache = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq,
-    ).unwrap();
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        max_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
 
@@ -137,7 +163,11 @@ it?".to_string(),
     let asst_tok = tokenizer.encode("assistant");
     let think_open = tokenizer.encode("<think>");
     let think_end_seq = tokenizer.encode("</think>");
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     // Hard cap on thinking tokens — matches infer.rs. Without this, a
     // thinking model happily spirals inside <think>...</think> without ever
     // emitting the close tag, especially at low sampling temperature.
@@ -149,8 +179,10 @@ it?".to_string(),
 
     println!("\n================================================================");
     println!("MODEL: {}", model_path);
-    println!("MAX_SEQ: {}  MAX_GEN/TURN: {}  SAMPLING: temp={} top_p={}",
-             max_seq, max_gen, temp, top_p);
+    println!(
+        "MAX_SEQ: {}  MAX_GEN/TURN: {}  SAMPLING: temp={} top_p={}",
+        max_seq, max_gen, temp, top_p
+    );
     println!("================================================================\n");
 
     for (turn_idx, turn_text) in turns.iter().enumerate() {
@@ -182,17 +214,33 @@ it?".to_string(),
         // ── Prefill ──
         let t_pf = Instant::now();
         qwen35::forward_prefill_batch(
-            &mut gpu, &weights, &config, &new_tokens, seq_pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-            None, None, None, None,
-        ).expect("prefill");
+            &mut gpu,
+            &weights,
+            &config,
+            &new_tokens,
+            seq_pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("prefill");
         let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
         let prefill_tok_s = new_tokens.len() as f64 / (prefill_ms / 1000.0);
         seq_pos += new_tokens.len();
         history.extend_from_slice(&new_tokens);
 
-        eprintln!("\n[turn {} prefill: {} tokens in {:.1} ms = {:.0} tok/s] (ctx={})",
-                 turn_idx + 1, new_tokens.len(), prefill_ms, prefill_tok_s, seq_pos);
+        eprintln!(
+            "\n[turn {} prefill: {} tokens in {:.1} ms = {:.0} tok/s] (ctx={})",
+            turn_idx + 1,
+            new_tokens.len(),
+            prefill_ms,
+            prefill_tok_s,
+            seq_pos
+        );
 
         // ── Decode ──
         println!("\n<<< TURN {} ASSISTANT:", turn_idx + 1);
@@ -208,15 +256,17 @@ it?".to_string(),
         for _ in 0..max_gen {
             generated.push(next_token);
             history.push(next_token);
-            if in_thinking { think_count += 1; }
+            if in_thinking {
+                think_count += 1;
+            }
 
             // Detect </think> as a TOKEN SEQUENCE (can be multi-token).
             // Same pattern as infer.rs.
-            let think_ended = in_thinking && (
-                think_count >= MAX_THINK_TOKENS ||
-                (generated.len() >= think_end_seq.len()
-                 && generated[generated.len() - think_end_seq.len()..] == think_end_seq[..])
-            );
+            let think_ended = in_thinking
+                && (think_count >= MAX_THINK_TOKENS
+                    || (generated.len() >= think_end_seq.len()
+                        && generated[generated.len() - think_end_seq.len()..]
+                            == think_end_seq[..]));
             if think_ended {
                 in_thinking = false;
             }
@@ -239,13 +289,24 @@ it?".to_string(),
             // termination. Breaking before forward_scratch leaves a gap at
             // the im_end position which corrupts the next turn's context.
             qwen35::forward_scratch(
-                &mut gpu, &weights, &config, next_token, seq_pos,
-                &mut kv_cache, &mut dn_state, &scratch,
-            ).expect("forward");
+                &mut gpu,
+                &weights,
+                &config,
+                next_token,
+                seq_pos,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .expect("forward");
             seq_pos += 1;
 
-            if next_token == config.eos_token { break; }
-            if Some(next_token) == im_end_token { break; }
+            if next_token == config.eos_token {
+                break;
+            }
+            if Some(next_token) == im_end_token {
+                break;
+            }
 
             logits = gpu.download_f32(&scratch.logits).unwrap();
             // Anti-repeat pipeline. apply_ngram_block is DISABLED across
@@ -267,7 +328,10 @@ it?".to_string(),
             // If we JUST forced out of thinking because of MAX_THINK_TOKENS,
             // inject the </think> token sequence into history so the model
             // actually sees it.
-            if think_count == MAX_THINK_TOKENS && in_thinking == false && !generated.ends_with(&think_end_seq) {
+            if think_count == MAX_THINK_TOKENS
+                && in_thinking == false
+                && !generated.ends_with(&think_end_seq)
+            {
                 // Append </think>\n as the next token(s). Simplest: force
                 // the next token to be the first token of </think>.
                 // (Multi-token </think> is handled by forward_scratching
@@ -276,7 +340,11 @@ it?".to_string(),
                 continue;
             }
 
-            let t = if in_thinking { sc.think_temp } else { sc.answer_temp };
+            let t = if in_thinking {
+                sc.think_temp
+            } else {
+                sc.answer_temp
+            };
             next_token = llama::sample_top_p(&logits, t, top_p);
 
             if seq_pos + 4 >= max_seq {
@@ -306,19 +374,35 @@ it?".to_string(),
             closing.extend_from_slice(&nl);
             for &tok in &closing {
                 qwen35::forward_scratch(
-                    &mut gpu, &weights, &config, tok, seq_pos,
-                    &mut kv_cache, &mut dn_state, &scratch,
-                ).expect("forward close");
+                    &mut gpu,
+                    &weights,
+                    &config,
+                    tok,
+                    seq_pos,
+                    &mut kv_cache,
+                    &mut dn_state,
+                    &scratch,
+                )
+                .expect("forward close");
                 seq_pos += 1;
                 history.push(tok);
             }
-            eprintln!("\n[turn {} force-closed ({} tokens appended)]",
-                     turn_idx + 1, closing.len());
+            eprintln!(
+                "\n[turn {} force-closed ({} tokens appended)]",
+                turn_idx + 1,
+                closing.len()
+            );
         }
 
         println!();
-        eprintln!("[turn {} decode: {} tokens in {:.1} ms = {:.0} tok/s] (ctx={})\n",
-                 turn_idx + 1, generated.len(), gen_ms, gen_tok_s, seq_pos);
+        eprintln!(
+            "[turn {} decode: {} tokens in {:.1} ms = {:.0} tok/s] (ctx={})\n",
+            turn_idx + 1,
+            generated.len(),
+            gen_ms,
+            gen_tok_s,
+            seq_pos
+        );
 
         let _ = rng_state; // unused; present for future sample API
     }

@@ -74,8 +74,7 @@ impl Detector for ToolcallShape {
             let body_clean = body_clean.trim();
 
             // JSON parse.
-            let parsed: serde_json::Result<serde_json::Value> =
-                serde_json::from_str(body_clean);
+            let parsed: serde_json::Result<serde_json::Value> = serde_json::from_str(body_clean);
             match parsed {
                 Err(e) => {
                     if self.hard.is_none() {
@@ -101,7 +100,8 @@ impl Detector for ToolcallShape {
         // Soft: tool_call appearing inside a <think>...</think> block.
         let in_think = Regex::new(r"(?s)<think>.*?<tool_call>.*?</think>").unwrap();
         if in_think.is_match(&self.buf) {
-            self.soft.push("tool_call emitted inside <think>".to_string());
+            self.soft
+                .push("tool_call emitted inside <think>".to_string());
         }
 
         if let Some(reason) = self.hard.take() {
@@ -134,23 +134,19 @@ mod tests {
 
     #[test]
     fn clean_tool_call_passes() {
-        let v = run(
-            r#"thinking is done.
+        let v = run(r#"thinking is done.
 <tool_call>
 {"name": "read", "arguments": {"path": "/tmp/x"}}
-</tool_call><|im_end|>"#,
-        );
+</tool_call><|im_end|>"#);
         assert!(matches!(v, Verdict::Ok), "got {:?}", v);
     }
 
     #[test]
     fn stacked_openers_hard_fail() {
-        let v = run(
-            r#"<tool_call>
+        let v = run(r#"<tool_call>
 <tool_call>
 {"name": "x", "arguments": {}}
-</tool_call>"#,
-        );
+</tool_call>"#);
         assert!(v.is_fail(), "got {:?}", v);
     }
 

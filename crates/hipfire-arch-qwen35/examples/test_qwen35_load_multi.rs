@@ -49,15 +49,27 @@ fn main() {
         .hip
         .pointer_get_attributes(&weights.output_norm.buf)
         .expect("attr output_norm");
-    println!("  output_norm: attr.device={} (expect {out_dev})", attr_norm.device);
-    assert_eq!(attr_norm.device, out_dev as i32, "output_norm must live on dev_last");
+    println!(
+        "  output_norm: attr.device={} (expect {out_dev})",
+        attr_norm.device
+    );
+    assert_eq!(
+        attr_norm.device, out_dev as i32,
+        "output_norm must live on dev_last"
+    );
 
     let attr_out = gpus.devices[out_dev]
         .hip
         .pointer_get_attributes(&weights.output.buf.buf)
         .expect("attr output");
-    println!("  output (lm_head): attr.device={} (expect {out_dev})", attr_out.device);
-    assert_eq!(attr_out.device, out_dev as i32, "output must live on dev_last");
+    println!(
+        "  output (lm_head): attr.device={} (expect {out_dev})",
+        attr_out.device
+    );
+    assert_eq!(
+        attr_out.device, out_dev as i32,
+        "output must live on dev_last"
+    );
 
     let probe_layers = [0usize, config.n_layers / 2, config.n_layers - 1];
     for &i in &probe_layers {

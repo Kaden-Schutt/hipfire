@@ -5,12 +5,14 @@
 //! Pure greedy token dump for byte-exact regression comparison.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, Qwen35Scratch};
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::{self, KvCache};
     use std::io::Write;
     use std::path::Path;
@@ -33,7 +35,8 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
     let config = qwen35::config_from_hfq(&hfq).expect("read config");
-    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
+    let tokenizer =
+        hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tok");
 
     let mut prompt_tokens: Vec<u32> = match mode.as_str() {
         "raw" => tokenizer.encode(&prompt_text),
@@ -70,10 +73,38 @@ fn main() {
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     eprintln!("greedy_dump: kv_mode={kv_mode}");
     let mut kv_cache = match kv_mode.as_str() {
-        "asym3" => KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym4" => KvCache::new_gpu_asym4(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        "asym2" => KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
-        _ => KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        "asym3" => KvCache::new_gpu_asym3(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "asym4" => KvCache::new_gpu_asym4(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        "asym2" => KvCache::new_gpu_asym2(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
+        _ => KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).unwrap();
@@ -88,10 +119,20 @@ fn main() {
     // exercises the batched prefill path directly — any future batching
     // regression in that function will be caught here.
     qwen35::forward_prefill_batch(
-        &mut gpu, &weights, &config, &prompt_tokens, 0,
-        &mut kv_cache, &mut dn_state, &scratch,
-        None, None, None, None,
-    ).expect("prefill forward failed");
+        &mut gpu,
+        &weights,
+        &config,
+        &prompt_tokens,
+        0,
+        &mut kv_cache,
+        &mut dn_state,
+        &scratch,
+        None,
+        None,
+        None,
+        None,
+    )
+    .expect("prefill forward failed");
 
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
@@ -100,17 +141,30 @@ fn main() {
 
     for step in 0..max_gen {
         let pos = prompt_tokens.len() - 1;
-        if pos >= kv_seq { break; }
+        if pos >= kv_seq {
+            break;
+        }
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch,
-        ).expect("forward failed");
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward failed");
         logits = gpu.download_f32(&scratch.logits).unwrap();
         next_token = llama::argmax(&logits);
         writeln!(out, "{next_token}").ok();
         prompt_tokens.push(next_token);
-        if next_token == config.eos_token { break; }
-        if step % 500 == 0 { eprintln!("  step {step:4}"); }
+        if next_token == config.eos_token {
+            break;
+        }
+        if step % 500 == 0 {
+            eprintln!("  step {step:4}");
+        }
     }
     eprintln!("done");
 }

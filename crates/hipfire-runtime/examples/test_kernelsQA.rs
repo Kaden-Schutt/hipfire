@@ -20,22 +20,70 @@ struct CaseDef {
 }
 
 const CASES: &[CaseDef] = &[
-    CaseDef { name: "alloc_free", timeout: Duration::from_secs(20) },
-    CaseDef { name: "upload_download_f32", timeout: Duration::from_secs(20) },
-    CaseDef { name: "add_inplace_f32", timeout: Duration::from_secs(20) },
-    CaseDef { name: "rmsnorm_f32", timeout: Duration::from_secs(20) },
-    CaseDef { name: "softmax_f32", timeout: Duration::from_secs(20) },
-    CaseDef { name: "attention_hd128_h8_kv2", timeout: Duration::from_secs(30) },
-    CaseDef { name: "attention_hd256_h16_kv4", timeout: Duration::from_secs(30) },
-    CaseDef { name: "attention_hd256_h10_kv2", timeout: Duration::from_secs(30) },
-    CaseDef { name: "q8_write_attn_hd128_kv8", timeout: Duration::from_secs(30) },
-    CaseDef { name: "q8_write_attn_hd256_kv4", timeout: Duration::from_secs(30) },
-    CaseDef { name: "q8_write_attn_hd256_kv2", timeout: Duration::from_secs(30) },
-    CaseDef { name: "gdn_q8_h32_hd128", timeout: Duration::from_secs(30) },
-    CaseDef { name: "gdn_q8_h16_hd128", timeout: Duration::from_secs(30) },
-    CaseDef { name: "vision_gemm_f16", timeout: Duration::from_secs(30) },
-    CaseDef { name: "vision_layernorm_batched", timeout: Duration::from_secs(30) },
-    CaseDef { name: "vision_transpose_f32", timeout: Duration::from_secs(30) },
+    CaseDef {
+        name: "alloc_free",
+        timeout: Duration::from_secs(20),
+    },
+    CaseDef {
+        name: "upload_download_f32",
+        timeout: Duration::from_secs(20),
+    },
+    CaseDef {
+        name: "add_inplace_f32",
+        timeout: Duration::from_secs(20),
+    },
+    CaseDef {
+        name: "rmsnorm_f32",
+        timeout: Duration::from_secs(20),
+    },
+    CaseDef {
+        name: "softmax_f32",
+        timeout: Duration::from_secs(20),
+    },
+    CaseDef {
+        name: "attention_hd128_h8_kv2",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "attention_hd256_h16_kv4",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "attention_hd256_h10_kv2",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "q8_write_attn_hd128_kv8",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "q8_write_attn_hd256_kv4",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "q8_write_attn_hd256_kv2",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "gdn_q8_h32_hd128",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "gdn_q8_h16_hd128",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "vision_gemm_f16",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "vision_layernorm_batched",
+        timeout: Duration::from_secs(30),
+    },
+    CaseDef {
+        name: "vision_transpose_f32",
+        timeout: Duration::from_secs(30),
+    },
 ];
 
 enum CaseOutcome {
@@ -129,15 +177,27 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
         match code {
             0 => {
                 passed += 1;
-                eprintln!("SUPERVISOR PASS {} ({:.0}ms)", case.name, start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "SUPERVISOR PASS {} ({:.0}ms)",
+                    case.name,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             x if x == SKIP_EXIT as i32 => {
                 skipped += 1;
-                eprintln!("SUPERVISOR SKIP {} ({:.0}ms)", case.name, start.elapsed().as_secs_f64() * 1000.0);
+                eprintln!(
+                    "SUPERVISOR SKIP {} ({:.0}ms)",
+                    case.name,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
             }
             124 => {
                 failed += 1;
-                eprintln!("SUPERVISOR FAIL {} timed out after {:.1}s", case.name, case.timeout.as_secs_f64());
+                eprintln!(
+                    "SUPERVISOR FAIL {} timed out after {:.1}s",
+                    case.name,
+                    case.timeout.as_secs_f64()
+                );
             }
             other => {
                 failed += 1;
@@ -234,7 +294,9 @@ fn alloc_free(expected_arch: Option<&str>) -> CaseOutcome {
     };
 
     match (|| -> Result<String, String> {
-        let tensor = gpu.alloc_tensor(&[1024], DType::F32).map_err(|e| e.to_string())?;
+        let tensor = gpu
+            .alloc_tensor(&[1024], DType::F32)
+            .map_err(|e| e.to_string())?;
         gpu.free_tensor(tensor).map_err(|e| e.to_string())?;
         Ok("allocated and released tensor".to_string())
     })() {
@@ -253,8 +315,14 @@ fn upload_download_f32(expected_arch: Option<&str>) -> CaseOutcome {
         let data = vec![1.0f32; 256];
         let tensor = gpu.upload_f32(&data, &[256]).map_err(|e| e.to_string())?;
         let back = gpu.download_f32(&tensor).map_err(|e| e.to_string())?;
-        ensure(back.len() == 256, format!("expected 256 values, got {}", back.len()))?;
-        ensure((back[0] - 1.0).abs() < 1e-6, format!("expected first value 1.0, got {}", back[0]))?;
+        ensure(
+            back.len() == 256,
+            format!("expected 256 values, got {}", back.len()),
+        )?;
+        ensure(
+            (back[0] - 1.0).abs() < 1e-6,
+            format!("expected first value 1.0, got {}", back[0]),
+        )?;
         gpu.free_tensor(tensor).map_err(|e| e.to_string())?;
         Ok(format!("round-tripped {} values", back.len()))
     })() {
@@ -270,11 +338,18 @@ fn add_inplace_f32(expected_arch: Option<&str>) -> CaseOutcome {
     };
 
     match (|| -> Result<String, String> {
-        let a = gpu.upload_f32(&vec![1.0f32; 64], &[64]).map_err(|e| e.to_string())?;
-        let b = gpu.upload_f32(&vec![2.0f32; 64], &[64]).map_err(|e| e.to_string())?;
+        let a = gpu
+            .upload_f32(&vec![1.0f32; 64], &[64])
+            .map_err(|e| e.to_string())?;
+        let b = gpu
+            .upload_f32(&vec![2.0f32; 64], &[64])
+            .map_err(|e| e.to_string())?;
         gpu.add_inplace_f32(&a, &b).map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&a).map_err(|e| e.to_string())?;
-        ensure((r[0] - 3.0).abs() < 1e-6, format!("expected 3.0, got {}", r[0]))?;
+        ensure(
+            (r[0] - 3.0).abs() < 1e-6,
+            format!("expected 3.0, got {}", r[0]),
+        )?;
         gpu.free_tensor(a).map_err(|e| e.to_string())?;
         gpu.free_tensor(b).map_err(|e| e.to_string())?;
         Ok(format!("result[0]={:.3}", r[0]))
@@ -291,12 +366,22 @@ fn rmsnorm_f32(expected_arch: Option<&str>) -> CaseOutcome {
     };
 
     match (|| -> Result<String, String> {
-        let x = gpu.upload_f32(&vec![1.0f32; 128], &[128]).map_err(|e| e.to_string())?;
-        let w = gpu.upload_f32(&vec![1.0f32; 128], &[128]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[128], DType::F32).map_err(|e| e.to_string())?;
-        gpu.rmsnorm_f32(&x, &w, &o, 1e-6).map_err(|e| e.to_string())?;
+        let x = gpu
+            .upload_f32(&vec![1.0f32; 128], &[128])
+            .map_err(|e| e.to_string())?;
+        let w = gpu
+            .upload_f32(&vec![1.0f32; 128], &[128])
+            .map_err(|e| e.to_string())?;
+        let o = gpu
+            .alloc_tensor(&[128], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.rmsnorm_f32(&x, &w, &o, 1e-6)
+            .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("rmsnorm produced non-finite value {}", r[0]))?;
+        ensure(
+            r[0].is_finite(),
+            format!("rmsnorm produced non-finite value {}", r[0]),
+        )?;
         gpu.free_tensor(x).map_err(|e| e.to_string())?;
         gpu.free_tensor(w).map_err(|e| e.to_string())?;
         gpu.free_tensor(o).map_err(|e| e.to_string())?;
@@ -314,7 +399,9 @@ fn softmax_f32(expected_arch: Option<&str>) -> CaseOutcome {
     };
 
     match (|| -> Result<String, String> {
-        let x = gpu.upload_f32(&vec![1.0f32; 32], &[1, 32]).map_err(|e| e.to_string())?;
+        let x = gpu
+            .upload_f32(&vec![1.0f32; 32], &[1, 32])
+            .map_err(|e| e.to_string())?;
         gpu.softmax_f32(&x).map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&x).map_err(|e| e.to_string())?;
         let sum: f32 = r.iter().sum();
@@ -327,25 +414,44 @@ fn softmax_f32(expected_arch: Option<&str>) -> CaseOutcome {
     }
 }
 
-fn attention_case(expected_arch: Option<&str>, n_heads: usize, n_kv: usize, hd: usize, seq: usize) -> CaseOutcome {
+fn attention_case(
+    expected_arch: Option<&str>,
+    n_heads: usize,
+    n_kv: usize,
+    hd: usize,
+    seq: usize,
+) -> CaseOutcome {
     let mut gpu = match init_gpu(expected_arch) {
         Ok(gpu) => gpu,
         Err(outcome) => return outcome,
     };
 
     match (|| -> Result<String, String> {
-        let q = gpu.upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
+        let q = gpu
+            .upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd])
+            .map_err(|e| e.to_string())?;
         let kv_dim = n_kv * hd;
-        let k = gpu.upload_f32(&vec![0.1f32; seq * kv_dim], &[seq * kv_dim]).map_err(|e| e.to_string())?;
-        let v = gpu.upload_f32(&vec![0.1f32; seq * kv_dim], &[seq * kv_dim]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
+        let k = gpu
+            .upload_f32(&vec![0.1f32; seq * kv_dim], &[seq * kv_dim])
+            .map_err(|e| e.to_string())?;
+        let v = gpu
+            .upload_f32(&vec![0.1f32; seq * kv_dim], &[seq * kv_dim])
+            .map_err(|e| e.to_string())?;
+        let o = gpu
+            .alloc_tensor(&[n_heads * hd], DType::F32)
+            .map_err(|e| e.to_string())?;
         let pos_buf = gpu.hip.malloc(4).map_err(|e| e.to_string())?;
         let pos_val = (seq - 1) as i32;
-        gpu.hip.memcpy_htod(&pos_buf, &pos_val.to_ne_bytes()).map_err(|e| e.to_string())?;
+        gpu.hip
+            .memcpy_htod(&pos_buf, &pos_val.to_ne_bytes())
+            .map_err(|e| e.to_string())?;
         gpu.attention_f32(&q, &k, &v, &o, &pos_buf, seq, n_heads, n_kv, hd, seq)
             .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("attention produced non-finite value {}", r[0]))?;
+        ensure(
+            r[0].is_finite(),
+            format!("attention produced non-finite value {}", r[0]),
+        )?;
         gpu.hip.free(pos_buf).map_err(|e| e.to_string())?;
         gpu.free_tensor(q).map_err(|e| e.to_string())?;
         gpu.free_tensor(k).map_err(|e| e.to_string())?;
@@ -371,27 +477,48 @@ fn q8_kv_case(expected_arch: Option<&str>, n_kv: usize, hd: usize) -> CaseOutcom
         let q8_bytes_per_pos = n_kv * q8_blocks * 34;
         let cache_bytes = seq * q8_bytes_per_pos;
         let cache_elems = (cache_bytes + 3) / 4;
-        let k_cache = gpu.zeros(&[cache_elems], DType::F32).map_err(|e| e.to_string())?;
-        let v_cache = gpu.zeros(&[cache_elems], DType::F32).map_err(|e| e.to_string())?;
+        let k_cache = gpu
+            .zeros(&[cache_elems], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let v_cache = gpu
+            .zeros(&[cache_elems], DType::F32)
+            .map_err(|e| e.to_string())?;
         let pos_buf = gpu.hip.malloc(4).map_err(|e| e.to_string())?;
 
         for p in 0..4 {
-            let kv_data = gpu.upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd]).map_err(|e| e.to_string())?;
+            let kv_data = gpu
+                .upload_f32(&vec![0.1f32; n_kv * hd], &[n_kv * hd])
+                .map_err(|e| e.to_string())?;
             let pv = p as i32;
-            gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| e.to_string())?;
-            gpu.kv_cache_write_q8_0(&k_cache, &kv_data, &pos_buf, n_kv, hd).map_err(|e| e.to_string())?;
-            gpu.kv_cache_write_q8_0(&v_cache, &kv_data, &pos_buf, n_kv, hd).map_err(|e| e.to_string())?;
+            gpu.hip
+                .memcpy_htod(&pos_buf, &pv.to_ne_bytes())
+                .map_err(|e| e.to_string())?;
+            gpu.kv_cache_write_q8_0(&k_cache, &kv_data, &pos_buf, n_kv, hd)
+                .map_err(|e| e.to_string())?;
+            gpu.kv_cache_write_q8_0(&v_cache, &kv_data, &pos_buf, n_kv, hd)
+                .map_err(|e| e.to_string())?;
             gpu.free_tensor(kv_data).map_err(|e| e.to_string())?;
         }
 
-        let q = gpu.upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
-        let pv = 3i32;
-        gpu.hip.memcpy_htod(&pos_buf, &pv.to_ne_bytes()).map_err(|e| e.to_string())?;
-        gpu.attention_q8_0_kv(&q, &k_cache, &v_cache, &o, &pos_buf, 4, n_heads, n_kv, hd, seq)
+        let q = gpu
+            .upload_f32(&vec![0.1f32; n_heads * hd], &[n_heads * hd])
             .map_err(|e| e.to_string())?;
+        let o = gpu
+            .alloc_tensor(&[n_heads * hd], DType::F32)
+            .map_err(|e| e.to_string())?;
+        let pv = 3i32;
+        gpu.hip
+            .memcpy_htod(&pos_buf, &pv.to_ne_bytes())
+            .map_err(|e| e.to_string())?;
+        gpu.attention_q8_0_kv(
+            &q, &k_cache, &v_cache, &o, &pos_buf, 4, n_heads, n_kv, hd, seq,
+        )
+        .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("q8 attention produced non-finite value {}", r[0]))?;
+        ensure(
+            r[0].is_finite(),
+            format!("q8 attention produced non-finite value {}", r[0]),
+        )?;
         gpu.hip.free(pos_buf).map_err(|e| e.to_string())?;
         gpu.free_tensor(q).map_err(|e| e.to_string())?;
         gpu.free_tensor(o).map_err(|e| e.to_string())?;
@@ -414,18 +541,39 @@ fn gdn_case(expected_arch: Option<&str>, n_heads: usize, hd: usize) -> CaseOutco
     match (|| -> Result<String, String> {
         let s_size = n_heads * hd * hd;
         let scale_size = n_heads * hd;
-        let s_q8 = gpu.zeros(&[s_size], DType::F32).map_err(|e| e.to_string())?;
-        let s_scales = gpu.upload_f32(&vec![1.0f32; scale_size], &[scale_size]).map_err(|e| e.to_string())?;
-        let q = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
-        let k = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
-        let v = gpu.upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd]).map_err(|e| e.to_string())?;
-        let alpha = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
-        let beta = gpu.upload_f32(&vec![0.5f32; n_heads], &[n_heads]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[n_heads * hd], DType::F32).map_err(|e| e.to_string())?;
-        gpu.gated_delta_net_q8(&q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd)
+        let s_q8 = gpu
+            .zeros(&[s_size], DType::F32)
             .map_err(|e| e.to_string())?;
+        let s_scales = gpu
+            .upload_f32(&vec![1.0f32; scale_size], &[scale_size])
+            .map_err(|e| e.to_string())?;
+        let q = gpu
+            .upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd])
+            .map_err(|e| e.to_string())?;
+        let k = gpu
+            .upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd])
+            .map_err(|e| e.to_string())?;
+        let v = gpu
+            .upload_f32(&vec![0.01f32; n_heads * hd], &[n_heads * hd])
+            .map_err(|e| e.to_string())?;
+        let alpha = gpu
+            .upload_f32(&vec![0.5f32; n_heads], &[n_heads])
+            .map_err(|e| e.to_string())?;
+        let beta = gpu
+            .upload_f32(&vec![0.5f32; n_heads], &[n_heads])
+            .map_err(|e| e.to_string())?;
+        let o = gpu
+            .alloc_tensor(&[n_heads * hd], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.gated_delta_net_q8(
+            &q, &k, &v, &alpha, &beta, &s_q8, &s_scales, &o, 1, n_heads, hd,
+        )
+        .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("gdn produced non-finite value {}", r[0]))?;
+        ensure(
+            r[0].is_finite(),
+            format!("gdn produced non-finite value {}", r[0]),
+        )?;
         for tensor in [q, k, v, alpha, beta, s_q8, s_scales, o] {
             gpu.free_tensor(tensor).map_err(|e| e.to_string())?;
         }
@@ -450,13 +598,26 @@ fn vision_gemm_f16(expected_arch: Option<&str>) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let (m, k, n) = (32usize, 64usize, 8usize);
         let w_data = vec![0u8; m * k * 2];
-        let w = gpu.upload_raw(&w_data, &[w_data.len()]).map_err(|e| e.to_string())?;
-        let x = gpu.upload_f32(&vec![1.0f32; n * k], &[n * k]).map_err(|e| e.to_string())?;
-        let y = gpu.alloc_tensor(&[m * n], DType::F32).map_err(|e| e.to_string())?;
-        gpu.gemm_f16(&w, &x, &y, m, k, n).map_err(|e| e.to_string())?;
+        let w = gpu
+            .upload_raw(&w_data, &[w_data.len()])
+            .map_err(|e| e.to_string())?;
+        let x = gpu
+            .upload_f32(&vec![1.0f32; n * k], &[n * k])
+            .map_err(|e| e.to_string())?;
+        let y = gpu
+            .alloc_tensor(&[m * n], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.gemm_f16(&w, &x, &y, m, k, n)
+            .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&y).map_err(|e| e.to_string())?;
-        ensure(r.len() == m * n, format!("expected {} outputs, got {}", m * n, r.len()))?;
-        ensure(r[0].is_finite(), format!("gemm produced non-finite value {}", r[0]))?;
+        ensure(
+            r.len() == m * n,
+            format!("expected {} outputs, got {}", m * n, r.len()),
+        )?;
+        ensure(
+            r[0].is_finite(),
+            format!("gemm produced non-finite value {}", r[0]),
+        )?;
         gpu.free_tensor(w).map_err(|e| e.to_string())?;
         gpu.free_tensor(x).map_err(|e| e.to_string())?;
         gpu.free_tensor(y).map_err(|e| e.to_string())?;
@@ -476,13 +637,25 @@ fn vision_layernorm_batched(expected_arch: Option<&str>) -> CaseOutcome {
     match (|| -> Result<String, String> {
         let batch = 4usize;
         let dim = 64usize;
-        let x = gpu.upload_f32(&vec![1.0f32; batch * dim], &[batch * dim]).map_err(|e| e.to_string())?;
-        let w = gpu.upload_f32(&vec![1.0f32; dim], &[dim]).map_err(|e| e.to_string())?;
-        let b = gpu.upload_f32(&vec![0.0f32; dim], &[dim]).map_err(|e| e.to_string())?;
-        let o = gpu.alloc_tensor(&[batch * dim], DType::F32).map_err(|e| e.to_string())?;
-        gpu.layernorm_batched(&x, &w, &b, &o, batch, dim, 1e-6).map_err(|e| e.to_string())?;
+        let x = gpu
+            .upload_f32(&vec![1.0f32; batch * dim], &[batch * dim])
+            .map_err(|e| e.to_string())?;
+        let w = gpu
+            .upload_f32(&vec![1.0f32; dim], &[dim])
+            .map_err(|e| e.to_string())?;
+        let b = gpu
+            .upload_f32(&vec![0.0f32; dim], &[dim])
+            .map_err(|e| e.to_string())?;
+        let o = gpu
+            .alloc_tensor(&[batch * dim], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.layernorm_batched(&x, &w, &b, &o, batch, dim, 1e-6)
+            .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&o).map_err(|e| e.to_string())?;
-        ensure(r[0].is_finite(), format!("layernorm produced non-finite value {}", r[0]))?;
+        ensure(
+            r[0].is_finite(),
+            format!("layernorm produced non-finite value {}", r[0]),
+        )?;
         gpu.free_tensor(x).map_err(|e| e.to_string())?;
         gpu.free_tensor(w).map_err(|e| e.to_string())?;
         gpu.free_tensor(b).map_err(|e| e.to_string())?;
@@ -504,11 +677,19 @@ fn vision_transpose_f32(expected_arch: Option<&str>) -> CaseOutcome {
         let rows = 4usize;
         let cols = 8usize;
         let data: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
-        let src = gpu.upload_f32(&data, &[rows * cols]).map_err(|e| e.to_string())?;
-        let dst = gpu.alloc_tensor(&[rows * cols], DType::F32).map_err(|e| e.to_string())?;
-        gpu.transpose_f32(&src, &dst, rows, cols).map_err(|e| e.to_string())?;
+        let src = gpu
+            .upload_f32(&data, &[rows * cols])
+            .map_err(|e| e.to_string())?;
+        let dst = gpu
+            .alloc_tensor(&[rows * cols], DType::F32)
+            .map_err(|e| e.to_string())?;
+        gpu.transpose_f32(&src, &dst, rows, cols)
+            .map_err(|e| e.to_string())?;
         let r = gpu.download_f32(&dst).map_err(|e| e.to_string())?;
-        ensure((r[1] - 8.0).abs() < 0.01, format!("expected r[1]=8.0, got {}", r[1]))?;
+        ensure(
+            (r[1] - 8.0).abs() < 0.01,
+            format!("expected r[1]=8.0, got {}", r[1]),
+        )?;
         gpu.free_tensor(src).map_err(|e| e.to_string())?;
         gpu.free_tensor(dst).map_err(|e| e.to_string())?;
         Ok(format!("r[0]={:.1} r[1]={:.1}", r[0], r[1]))

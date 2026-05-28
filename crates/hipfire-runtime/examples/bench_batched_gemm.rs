@@ -30,8 +30,8 @@ fn main() {
                 let off = r * row_bytes + g * 136;
                 let scale_bytes = 0.01f32.to_le_bytes();
                 let zero_bytes = (-0.005f32).to_le_bytes();
-                weight_data[off..off+4].copy_from_slice(&scale_bytes);
-                weight_data[off+4..off+8].copy_from_slice(&zero_bytes);
+                weight_data[off..off + 4].copy_from_slice(&scale_bytes);
+                weight_data[off + 4..off + 8].copy_from_slice(&zero_bytes);
                 for i in 0..64 {
                     weight_data[off + 8 + i] = 0x53; // nibbles: 3 and 5
                 }
@@ -51,12 +51,17 @@ fn main() {
         let y_gemv = gpu.download_f32(&d_y_gemv).unwrap();
         let y_gemm = gpu.download_f32(&d_y_gemm).unwrap();
 
-        let max_diff: f32 = y_gemv.iter().zip(y_gemm.iter())
+        let max_diff: f32 = y_gemv
+            .iter()
+            .zip(y_gemm.iter())
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         let any_nan = y_gemm.iter().any(|v| v.is_nan());
         eprintln!("  batch=1 correctness: max_diff={max_diff:.6e} nan={any_nan}");
-        assert!(max_diff < 1e-5, "GEMM batch=1 does not match GEMV! max_diff={max_diff}");
+        assert!(
+            max_diff < 1e-5,
+            "GEMM batch=1 does not match GEMV! max_diff={max_diff}"
+        );
         assert!(!any_nan, "GEMM produced NaN!");
 
         gpu.free_tensor(d_x).unwrap();
@@ -71,14 +76,18 @@ fn main() {
         let d_x1 = gpu.upload_f32(&vec![0.01f32; k], &[k]).unwrap();
         let d_y1 = gpu.zeros(&[m], rdna_compute::DType::F32).unwrap();
         // Warmup
-        for _ in 0..10 { gpu.gemv_hfq4g256(&d_a, &d_x1, &d_y1, m, k).unwrap(); }
+        for _ in 0..10 {
+            gpu.gemv_hfq4g256(&d_a, &d_x1, &d_y1, m, k).unwrap();
+        }
 
         let start = gpu.hip.event_create().unwrap();
         let stop = gpu.hip.event_create().unwrap();
 
         // Single GEMV timing
         gpu.hip.event_record(&start, None).unwrap();
-        for _ in 0..n_iters { gpu.gemv_hfq4g256(&d_a, &d_x1, &d_y1, m, k).unwrap(); }
+        for _ in 0..n_iters {
+            gpu.gemv_hfq4g256(&d_a, &d_x1, &d_y1, m, k).unwrap();
+        }
         gpu.hip.event_record(&stop, None).unwrap();
         gpu.hip.event_synchronize(&stop).unwrap();
         let ms_gemv = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();
@@ -90,10 +99,14 @@ fn main() {
             let d_xb = gpu.upload_f32(&vec![0.01f32; k * bs], &[bs, k]).unwrap();
             let d_yb = gpu.zeros(&[bs * m], rdna_compute::DType::F32).unwrap();
             // Warmup
-            for _ in 0..5 { gpu.gemm_hfq4g256(&d_a, &d_xb, &d_yb, m, k, bs).unwrap(); }
+            for _ in 0..5 {
+                gpu.gemm_hfq4g256(&d_a, &d_xb, &d_yb, m, k, bs).unwrap();
+            }
 
             gpu.hip.event_record(&start, None).unwrap();
-            for _ in 0..n_iters { gpu.gemm_hfq4g256(&d_a, &d_xb, &d_yb, m, k, bs).unwrap(); }
+            for _ in 0..n_iters {
+                gpu.gemm_hfq4g256(&d_a, &d_xb, &d_yb, m, k, bs).unwrap();
+            }
             gpu.hip.event_record(&stop, None).unwrap();
             gpu.hip.event_synchronize(&stop).unwrap();
             let ms_batch = gpu.hip.event_elapsed_ms(&start, &stop).unwrap();

@@ -10,7 +10,10 @@ use redline::dispatch::{CommandBuffer, DispatchQueue, FastDispatch, KernargBuild
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let iterations = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10_000u32);
+    let iterations = args
+        .get(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10_000u32);
 
     eprintln!("=== Redline Dispatch Benchmark ===");
     eprintln!("Iterations: {}\n", iterations);
@@ -36,17 +39,31 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 "#;
     std::fs::write("/tmp/redline_bench_va.hip", hip_src).unwrap();
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", &format!("--offload-arch={arch}"), "-O3",
-               "-o", "/tmp/redline_bench_va.hsaco", "/tmp/redline_bench_va.hip"])
-        .output().expect("hipcc");
-    assert!(out.status.success(), "hipcc: {}", String::from_utf8_lossy(&out.stderr));
+        .args([
+            "--genco",
+            &format!("--offload-arch={arch}"),
+            "-O3",
+            "-o",
+            "/tmp/redline_bench_va.hsaco",
+            "/tmp/redline_bench_va.hip",
+        ])
+        .output()
+        .expect("hipcc");
+    assert!(
+        out.status.success(),
+        "hipcc: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let module = dev.load_module_file("/tmp/redline_bench_va.hsaco").unwrap();
     let kernel = Kernel::find(&module, "vector_add").expect("kernel not found");
     let startup_total = t_start.elapsed();
 
-    eprintln!("[startup] device+queue: {:.2}ms, total (incl compile): {:.2}ms",
-        startup_device.as_secs_f64() * 1000.0, startup_total.as_secs_f64() * 1000.0);
+    eprintln!(
+        "[startup] device+queue: {:.2}ms, total (incl compile): {:.2}ms",
+        startup_device.as_secs_f64() * 1000.0,
+        startup_total.as_secs_f64() * 1000.0
+    );
 
     // Set up buffers (256 elements = 1KB)
     let n = 256u32;
@@ -61,21 +78,37 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     dev.upload(&b_buf, as_bytes(&b_data)).unwrap();
 
     let mut ka = KernargBuilder::new(28);
-    ka.write_ptr(0, a_buf.gpu_addr).write_ptr(8, b_buf.gpu_addr)
-      .write_ptr(16, c_buf.gpu_addr).write_u32(24, n);
+    ka.write_ptr(0, a_buf.gpu_addr)
+        .write_ptr(8, b_buf.gpu_addr)
+        .write_ptr(16, c_buf.gpu_addr)
+        .write_u32(24, n);
 
     // Warm up (first dispatch is always slower)
     for _ in 0..10 {
-        dq.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1],
-            ka.as_bytes(), &[&module.code_buf, &a_buf, &b_buf, &c_buf]).unwrap();
+        dq.dispatch(
+            &dev,
+            kernel,
+            [1, 1, 1],
+            [256, 1, 1],
+            ka.as_bytes(),
+            &[&module.code_buf, &a_buf, &b_buf, &c_buf],
+        )
+        .unwrap();
     }
 
     // --- Per-dispatch latency (includes submit + fence wait) ---
     let mut latencies = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t = std::time::Instant::now();
-        dq.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1],
-            ka.as_bytes(), &[&module.code_buf, &a_buf, &b_buf, &c_buf]).unwrap();
+        dq.dispatch(
+            &dev,
+            kernel,
+            [1, 1, 1],
+            [256, 1, 1],
+            ka.as_bytes(),
+            &[&module.code_buf, &a_buf, &b_buf, &c_buf],
+        )
+        .unwrap();
         latencies.push(t.elapsed());
     }
 
@@ -87,7 +120,10 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let min = to_us(latencies[0]);
     let max = to_us(*latencies.last().unwrap());
 
-    eprintln!("\n[per-dispatch] {} iterations, vector_add 256 elements:", iterations);
+    eprintln!(
+        "\n[per-dispatch] {} iterations, vector_add 256 elements:",
+        iterations
+    );
     eprintln!("  median: {:.1} µs", median);
     eprintln!("  mean:   {:.1} µs", mean);
     eprintln!("  p99:    {:.1} µs", p99);
@@ -98,13 +134,24 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let batch = 200u32;
     let t_batch = std::time::Instant::now();
     for _ in 0..batch {
-        dq.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1],
-            ka.as_bytes(), &[&module.code_buf, &a_buf, &b_buf, &c_buf]).unwrap();
+        dq.dispatch(
+            &dev,
+            kernel,
+            [1, 1, 1],
+            [256, 1, 1],
+            ka.as_bytes(),
+            &[&module.code_buf, &a_buf, &b_buf, &c_buf],
+        )
+        .unwrap();
     }
     let batch_time = t_batch.elapsed();
     let per_kernel = batch_time.as_secs_f64() * 1_000_000.0 / batch as f64;
-    eprintln!("\n[{}-dispatch sequential] total: {:.2}ms, per-kernel: {:.1} µs",
-        batch, batch_time.as_secs_f64() * 1000.0, per_kernel);
+    eprintln!(
+        "\n[{}-dispatch sequential] total: {:.2}ms, per-kernel: {:.1} µs",
+        batch,
+        batch_time.as_secs_f64() * 1000.0,
+        per_kernel
+    );
 
     // --- FastDispatch (optimized path: persistent mappings, no per-dispatch alloc) ---
     eprintln!("\n--- FastDispatch (optimized ioctl) ---");
@@ -112,18 +159,21 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 
     // Warm up
     for _ in 0..10 {
-        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes())
+            .unwrap();
     }
 
     let mut fast_latencies = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let t = std::time::Instant::now();
-        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes())
+            .unwrap();
         fast_latencies.push(t.elapsed());
     }
     fast_latencies.sort();
     let fast_median = to_us(fast_latencies[fast_latencies.len() / 2]);
-    let fast_mean = to_us(fast_latencies.iter().sum::<std::time::Duration>()) / fast_latencies.len() as f64;
+    let fast_mean =
+        to_us(fast_latencies.iter().sum::<std::time::Duration>()) / fast_latencies.len() as f64;
     let fast_p99 = to_us(fast_latencies[(fast_latencies.len() as f64 * 0.99) as usize]);
     let fast_min = to_us(fast_latencies[0]);
 
@@ -135,11 +185,15 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 
     let t_fast_batch = std::time::Instant::now();
     for _ in 0..200 {
-        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes()).unwrap();
+        fd.dispatch(&dev, kernel, [1, 1, 1], [256, 1, 1], ka.as_bytes())
+            .unwrap();
     }
     let fast_batch = t_fast_batch.elapsed();
-    eprintln!("[fast 200-dispatch] total: {:.2}ms, per-kernel: {:.1} µs",
-        fast_batch.as_secs_f64() * 1000.0, fast_batch.as_secs_f64() * 1_000_000.0 / 200.0);
+    eprintln!(
+        "[fast 200-dispatch] total: {:.2}ms, per-kernel: {:.1} µs",
+        fast_batch.as_secs_f64() * 1000.0,
+        fast_batch.as_secs_f64() * 1_000_000.0 / 200.0
+    );
 
     fd.destroy(&dev);
 
@@ -151,7 +205,18 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
 
         // Need separate kernarg slots for each dispatch (they all use same args but need distinct VAs)
         let chain_ka = dev.alloc_vram(64 * 1024).unwrap(); // 64KB for kernarg slots
-        let chain_fd = FastDispatch::new(&dev, &[&module.code_buf, &a_buf, &b_buf, &c_buf, &fence_buf, &chain_ka]).unwrap();
+        let chain_fd = FastDispatch::new(
+            &dev,
+            &[
+                &module.code_buf,
+                &a_buf,
+                &b_buf,
+                &c_buf,
+                &fence_buf,
+                &chain_ka,
+            ],
+        )
+        .unwrap();
 
         // Write same kernarg at 200 offsets (each 256 bytes apart)
         let mut ka_full = vec![0u8; 64 * 1024];
@@ -186,7 +251,12 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
                 dev.upload(&fence_buf, &vec![0u8; 4096]).unwrap();
                 let mut cb = CommandBuffer::new();
                 for i in 0..chain_count {
-                    cb.dispatch(kernel, [1, 1, 1], [256, 1, 1], chain_ka.gpu_addr + (i as u64 * 256));
+                    cb.dispatch(
+                        kernel,
+                        [1, 1, 1],
+                        [256, 1, 1],
+                        chain_ka.gpu_addr + (i as u64 * 256),
+                    );
                     if i < chain_count - 1 {
                         cb.barrier(fence_buf.gpu_addr + (i as u64 * 8), i + 1); // 8-byte spacing
                     }
@@ -194,7 +264,11 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
                 let t = std::time::Instant::now();
                 match chain_fd.submit_cmdbuf(&dev, &cb) {
                     Ok(()) => chain_latencies.push(t.elapsed()),
-                    Err(e) => { eprintln!("  chain {} FAILED at iter: {e}", chain_count); ok = false; break; }
+                    Err(e) => {
+                        eprintln!("  chain {} FAILED at iter: {e}", chain_count);
+                        ok = false;
+                        break;
+                    }
                 }
             }
             if ok && !chain_latencies.is_empty() {
@@ -202,8 +276,10 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
                 let med = chain_latencies[chain_latencies.len() / 2];
                 let total_ms = med.as_secs_f64() * 1000.0;
                 let per_kernel = med.as_secs_f64() * 1_000_000.0 / chain_count as f64;
-                eprintln!("[chain {}-dispatch] median: {:.2}ms, per-kernel: {:.2} µs",
-                    chain_count, total_ms, per_kernel);
+                eprintln!(
+                    "[chain {}-dispatch] median: {:.2}ms, per-kernel: {:.2} µs",
+                    chain_count, total_ms, per_kernel
+                );
                 if chain_count == 200 {
                     println!("BENCH_REDLINE_CHAIN_TOTAL_MS={:.2}", total_ms);
                     println!("BENCH_REDLINE_CHAIN_PER_KERNEL_US={:.2}", per_kernel);
@@ -222,7 +298,9 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let mut c_raw = vec![0u8; nbytes];
     dev.download(&c_buf, &mut c_raw).unwrap();
     let c: &[f32] = unsafe { std::slice::from_raw_parts(c_raw.as_ptr() as *const f32, n as usize) };
-    let bad = (0..n as usize).filter(|&i| (c[i] - (i as f32) * 3.0).abs() > 0.001).count();
+    let bad = (0..n as usize)
+        .filter(|&i| (c[i] - (i as f32) * 3.0).abs() > 0.001)
+        .count();
     eprintln!("\n[verify] vector_add: {}/{} correct", n as usize - bad, n);
 
     // --- Print machine-readable results ---
@@ -231,9 +309,15 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     println!("BENCH_REDLINE_P99_US={:.1}", p99);
     println!("BENCH_REDLINE_MIN_US={:.1}", min);
     println!("BENCH_REDLINE_MAX_US={:.1}", max);
-    println!("BENCH_REDLINE_BATCH_TOTAL_MS={:.2}", batch_time.as_secs_f64() * 1000.0);
+    println!(
+        "BENCH_REDLINE_BATCH_TOTAL_MS={:.2}",
+        batch_time.as_secs_f64() * 1000.0
+    );
     println!("BENCH_REDLINE_BATCH_PER_KERNEL_US={:.1}", per_kernel);
-    println!("BENCH_REDLINE_STARTUP_MS={:.2}", startup_device.as_secs_f64() * 1000.0);
+    println!(
+        "BENCH_REDLINE_STARTUP_MS={:.2}",
+        startup_device.as_secs_f64() * 1000.0
+    );
     println!("BENCH_REDLINE_RSS_KB={}", rss);
     println!("BENCH_REDLINE_FAST_MEDIAN_US={:.1}", fast_median);
     println!("BENCH_REDLINE_FAST_MEAN_US={:.1}", fast_mean);
@@ -248,9 +332,11 @@ fn as_bytes(v: &[f32]) -> &[u8] {
 }
 
 fn get_rss_kb() -> u64 {
-    std::fs::read_to_string("/proc/self/status").ok()
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
         .and_then(|s| {
-            s.lines().find(|l| l.starts_with("VmRSS:"))
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse().ok())
         })

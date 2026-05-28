@@ -52,9 +52,15 @@ fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     eprintln!("=== gemm_qkv_hfp4g32 ===");
     eprintln!("  q_m={q_m} k_m={k_m} v_m={v_m} K={k}");
 
-    let w_q = gpu.upload_raw(&synth(q_m, k, 0xAA), &[q_m * row_bytes]).unwrap();
-    let w_k = gpu.upload_raw(&synth(k_m, k, 0xBB), &[k_m * row_bytes]).unwrap();
-    let w_v = gpu.upload_raw(&synth(v_m, k, 0xCC), &[v_m * row_bytes]).unwrap();
+    let w_q = gpu
+        .upload_raw(&synth(q_m, k, 0xAA), &[q_m * row_bytes])
+        .unwrap();
+    let w_k = gpu
+        .upload_raw(&synth(k_m, k, 0xBB), &[k_m * row_bytes])
+        .unwrap();
+    let w_v = gpu
+        .upload_raw(&synth(v_m, k, 0xCC), &[v_m * row_bytes])
+        .unwrap();
 
     let max_n = *n_list.iter().max().unwrap();
     let x_host: Vec<f32> = make_x(max_n * k, 0x1111);
@@ -78,7 +84,9 @@ fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     for &n in n_list {
         let mut gemv_us = 0.0;
         for i in 0..n {
-            gpu.hip.memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k])).unwrap();
+            gpu.hip
+                .memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k]))
+                .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let t = Instant::now();
             gpu.gemv_hfp4g32(&w_q, &x_gemv, &y_q_1, q_m, k).unwrap();
@@ -86,17 +94,22 @@ fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
             gpu.gemv_hfp4g32(&w_v, &x_gemv, &y_v_1, v_m, k).unwrap();
             gpu.hip.device_synchronize().unwrap();
             gemv_us += t.elapsed().as_secs_f64() * 1e6;
-            gpu.hip.memcpy_dtod_at(&y_q_col.buf, i * q_m * 4, &y_q_1.buf, 0, q_m * 4).unwrap();
-            gpu.hip.memcpy_dtod_at(&y_k_col.buf, i * k_m * 4, &y_k_1.buf, 0, k_m * 4).unwrap();
-            gpu.hip.memcpy_dtod_at(&y_v_col.buf, i * v_m * 4, &y_v_1.buf, 0, v_m * 4).unwrap();
+            gpu.hip
+                .memcpy_dtod_at(&y_q_col.buf, i * q_m * 4, &y_q_1.buf, 0, q_m * 4)
+                .unwrap();
+            gpu.hip
+                .memcpy_dtod_at(&y_k_col.buf, i * k_m * 4, &y_k_1.buf, 0, k_m * 4)
+                .unwrap();
+            gpu.hip
+                .memcpy_dtod_at(&y_v_col.buf, i * v_m * 4, &y_v_1.buf, 0, v_m * 4)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t = Instant::now();
         gpu.gemm_qkv_hfp4g32(
-            &w_q, &w_k, &w_v, &x_gemm,
-            &y_q_gemm, &y_k_gemm, &y_v_gemm,
-            q_m, k_m, v_m, k, n,
-        ).unwrap();
+            &w_q, &w_k, &w_v, &x_gemm, &y_q_gemm, &y_k_gemm, &y_v_gemm, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let gemm_us = t.elapsed().as_secs_f64() * 1e6;
 
@@ -106,7 +119,9 @@ fn test_qkv(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
         let ok = ok_q && ok_k && ok_v;
         eprintln!(
             "  N={n:3}  gemv×N: {:8.1} µs   gemm×1: {:8.1} µs   speedup: {:5.2}x   [{}]",
-            gemv_us, gemm_us, gemv_us / gemm_us,
+            gemv_us,
+            gemm_us,
+            gemv_us / gemm_us,
             if ok { "PASS" } else { "FAIL" }
         );
         all_pass &= ok;
@@ -122,8 +137,12 @@ fn test_gate_up(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     eprintln!("\n=== gemm_gate_up_hfp4g32 ===");
     eprintln!("  gate_m={gate_m} up_m={up_m} K={k}");
 
-    let w_g = gpu.upload_raw(&synth(gate_m, k, 0xDD), &[gate_m * row_bytes]).unwrap();
-    let w_u = gpu.upload_raw(&synth(up_m, k, 0xEE), &[up_m * row_bytes]).unwrap();
+    let w_g = gpu
+        .upload_raw(&synth(gate_m, k, 0xDD), &[gate_m * row_bytes])
+        .unwrap();
+    let w_u = gpu
+        .upload_raw(&synth(up_m, k, 0xEE), &[up_m * row_bytes])
+        .unwrap();
 
     let max_n = *n_list.iter().max().unwrap();
     let x_host: Vec<f32> = make_x(max_n * k, 0x2222);
@@ -144,23 +163,28 @@ fn test_gate_up(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     for &n in n_list {
         let mut gemv_us = 0.0;
         for i in 0..n {
-            gpu.hip.memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k])).unwrap();
+            gpu.hip
+                .memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k]))
+                .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let t = Instant::now();
             gpu.gemv_hfp4g32(&w_g, &x_gemv, &y_g_1, gate_m, k).unwrap();
             gpu.gemv_hfp4g32(&w_u, &x_gemv, &y_u_1, up_m, k).unwrap();
             gpu.hip.device_synchronize().unwrap();
             gemv_us += t.elapsed().as_secs_f64() * 1e6;
-            gpu.hip.memcpy_dtod_at(&y_g_col.buf, i * gate_m * 4, &y_g_1.buf, 0, gate_m * 4).unwrap();
-            gpu.hip.memcpy_dtod_at(&y_u_col.buf, i * up_m * 4, &y_u_1.buf, 0, up_m * 4).unwrap();
+            gpu.hip
+                .memcpy_dtod_at(&y_g_col.buf, i * gate_m * 4, &y_g_1.buf, 0, gate_m * 4)
+                .unwrap();
+            gpu.hip
+                .memcpy_dtod_at(&y_u_col.buf, i * up_m * 4, &y_u_1.buf, 0, up_m * 4)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t = Instant::now();
         gpu.gemm_gate_up_hfp4g32(
-            &w_g, &w_u, &x_gemm,
-            &y_g_gemm, &y_u_gemm,
-            gate_m, up_m, k, n,
-        ).unwrap();
+            &w_g, &w_u, &x_gemm, &y_g_gemm, &y_u_gemm, gate_m, up_m, k, n,
+        )
+        .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let gemm_us = t.elapsed().as_secs_f64() * 1e6;
 
@@ -169,7 +193,9 @@ fn test_gate_up(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
         let ok = ok_g && ok_u;
         eprintln!(
             "  N={n:3}  gemv×N: {:8.1} µs   gemm×1: {:8.1} µs   speedup: {:5.2}x   [{}]",
-            gemv_us, gemm_us, gemv_us / gemm_us,
+            gemv_us,
+            gemm_us,
+            gemv_us / gemm_us,
             if ok { "PASS" } else { "FAIL" }
         );
         all_pass &= ok;
@@ -184,7 +210,9 @@ fn test_residual(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     eprintln!("\n=== gemm_hfp4g32_residual (+= semantics) ===");
     eprintln!("  M={m} K={k}");
 
-    let w = gpu.upload_raw(&synth(m, k, 0xFF), &[m * row_bytes]).unwrap();
+    let w = gpu
+        .upload_raw(&synth(m, k, 0xFF), &[m * row_bytes])
+        .unwrap();
 
     let max_n = *n_list.iter().max().unwrap();
     let x_host: Vec<f32> = make_x(max_n * k, 0x3333);
@@ -208,7 +236,9 @@ fn test_residual(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
         // Build the host-side reference: ref[b][r] = seed[b][r] + gemv(w, x[b])[r].
         let mut ref_host: Vec<f32> = vec![0.0; n * m];
         for i in 0..n {
-            gpu.hip.memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k])).unwrap();
+            gpu.hip
+                .memcpy_htod(&x_gemv.buf, bytes_of(&x_host[i * k..(i + 1) * k]))
+                .unwrap();
             gpu.hip.device_synchronize().unwrap();
             let t = Instant::now();
             gpu.gemv_hfp4g32(&w, &x_gemv, &y_1, m, k).unwrap();
@@ -219,19 +249,26 @@ fn test_residual(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
                 ref_host[i * m + r] = res_seed[i * m + r] + y_1_host[r];
             }
         }
-        gpu.hip.memcpy_htod(&y_col.buf, bytes_of(&ref_host)).unwrap();
+        gpu.hip
+            .memcpy_htod(&y_col.buf, bytes_of(&ref_host))
+            .unwrap();
         // Seed y_gemm with res_seed; the residual GEMM accumulates into it.
-        gpu.hip.memcpy_htod(&y_gemm.buf, bytes_of(&res_seed[..n * m])).unwrap();
+        gpu.hip
+            .memcpy_htod(&y_gemm.buf, bytes_of(&res_seed[..n * m]))
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let t = Instant::now();
-        gpu.gemm_hfp4g32_residual(&w, &x_gemm, &y_gemm, m, k, n).unwrap();
+        gpu.gemm_hfp4g32_residual(&w, &x_gemm, &y_gemm, m, k, n)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let gemm_us = t.elapsed().as_secs_f64() * 1e6;
 
         let ok = cmp_tol(gpu, &y_col, &y_gemm, n, m, "res");
         eprintln!(
             "  N={n:3}  gemv×N: {:8.1} µs   gemm×1: {:8.1} µs   speedup: {:5.2}x   [{}]",
-            gemv_us, gemm_us, gemv_us / gemm_us,
+            gemv_us,
+            gemm_us,
+            gemv_us / gemm_us,
             if ok { "PASS" } else { "FAIL" }
         );
         all_pass &= ok;
@@ -239,7 +276,14 @@ fn test_residual(gpu: &mut Gpu, n_list: &[usize], k: usize) -> bool {
     all_pass
 }
 
-fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: usize, label: &str) -> bool {
+fn cmp_tol(
+    gpu: &mut Gpu,
+    y_ref: &GpuTensor,
+    y_kernel: &GpuTensor,
+    n: usize,
+    m: usize,
+    label: &str,
+) -> bool {
     let r = gpu.download_f32(y_ref).unwrap();
     let k = gpu.download_f32(y_kernel).unwrap();
 
@@ -252,8 +296,12 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
             let r_v = r[b * m + row] as f64;
             let k_v = k[b * m + row] as f64;
             let abs = (r_v - k_v).abs();
-            if abs > max_abs { max_abs = abs; }
-            if r_v.abs() > max_abs_ref { max_abs_ref = r_v.abs(); }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if r_v.abs() > max_abs_ref {
+                max_abs_ref = r_v.abs();
+            }
         }
     }
     let tol_abs = 1e-3 * max_abs_ref.max(1e-4);
@@ -261,7 +309,9 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
         for row in 0..m {
             let r_v = r[b * m + row] as f64;
             let k_v = k[b * m + row] as f64;
-            if (r_v - k_v).abs() > tol_abs { bad += 1; }
+            if (r_v - k_v).abs() > tol_abs {
+                bad += 1;
+            }
         }
     }
 
@@ -281,7 +331,14 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
 
 fn make_x(n: usize, seed: i64) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as i64).wrapping_mul(seed.wrapping_add(0x91c2_a73d)).wrapping_add(seed) & 0xFFFFFF) as f32 * 1e-7 - 0.5)
+        .map(|i| {
+            ((i as i64)
+                .wrapping_mul(seed.wrapping_add(0x91c2_a73d))
+                .wrapping_add(seed)
+                & 0xFFFFFF) as f32
+                * 1e-7
+                - 0.5
+        })
         .collect()
 }
 
@@ -291,7 +348,9 @@ fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -318,9 +377,15 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
-    if exp == 0 { return sign; }
-    if exp >= 143 { return sign | 0x7C00; }
-    if exp <= 112 { return sign; }
+    if exp == 0 {
+        return sign;
+    }
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 112 {
+        return sign;
+    }
     let new_exp = (exp - 127 + 15) as u16;
     let new_mant = (mant >> 13) as u16;
     sign | (new_exp << 10) | new_mant

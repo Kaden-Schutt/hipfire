@@ -60,9 +60,18 @@ fn main() {
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
-            "--model" => { model = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--ref"   => { ref_path = Some(PathBuf::from(&argv[i + 1])); i += 2; }
-            "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
+            "--model" => {
+                model = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--ref" => {
+                ref_path = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--output" => {
+                output = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
                 if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
@@ -91,7 +100,10 @@ fn main() {
                 eprintln!("Usage: eval_hipfire_llama --model <path> --ref <path> --output <path> [--kv-mode q8] [--max-chunks N]");
                 std::process::exit(0);
             }
-            other => { eprintln!("unknown arg: {other}"); std::process::exit(1); }
+            other => {
+                eprintln!("unknown arg: {other}");
+                std::process::exit(1);
+            }
         }
     }
     let args = Args {
@@ -122,19 +134,21 @@ fn main() {
 
     // -------- load model via Architecture trait --------
     let mut hfq = HfqFile::open(&args.model).expect("open model");
-    let config = <Llama as Architecture>::config_from_hfq(&hfq)
-        .expect("read config");
+    let config = <Llama as Architecture>::config_from_hfq(&hfq).expect("read config");
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!(
         "eval_hipfire_llama: arch={} model={}",
-        gpu.arch, args.model.display()
+        gpu.arch,
+        args.model.display()
     );
     if gpu.arch.starts_with("gfx12") {
-        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+        unsafe {
+            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
+        }
         eprintln!("eval_hipfire_llama: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
     }
-    let weights = <Llama as Architecture>::load_weights(&mut hfq, &config, &mut gpu)
-        .expect("load weights");
+    let weights =
+        <Llama as Architecture>::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 
     // -------- read reference (HFKLDR β) header + tokens --------
     let ref_file = File::open(&args.ref_path).expect("open ref");
@@ -143,7 +157,8 @@ fn main() {
     let mut magic = [0u8; 8];
     ref_in.read_exact(&mut magic).expect("read ref magic");
     if &magic != b"HFKLDR\0\0" {
-        eprintln!("bad ref magic: {magic:?}"); std::process::exit(2);
+        eprintln!("bad ref magic: {magic:?}");
+        std::process::exit(2);
     }
     let mut hdr = [0u8; 24];
     ref_in.read_exact(&mut hdr).expect("read ref header");
@@ -154,7 +169,8 @@ fn main() {
     let top_k = u16::from_le_bytes(hdr[16..18].try_into().unwrap()) as usize;
     let _flags = u16::from_le_bytes(hdr[18..20].try_into().unwrap());
     if version != 1 {
-        eprintln!("unsupported ref version {version}"); std::process::exit(2);
+        eprintln!("unsupported ref version {version}");
+        std::process::exit(2);
     }
     if ref_n_vocab != config.vocab_size {
         eprintln!(
@@ -194,24 +210,44 @@ fn main() {
     let kv_max = n_ctx + 16;
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym4" => KvCache::new_gpu_asym4(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym3" => KvCache::new_gpu_asym3(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         "asym2" => KvCache::new_gpu_asym2(
-            &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max,
-        ).unwrap(),
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_max,
+        )
+        .unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };
     let scratch = <Llama as Architecture>::new_state(&mut gpu, &config).unwrap();
 
     // -------- per-chunk loop (per-token only) --------
     let mut mean_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
-    let mut p99_kld_per_seq:  Vec<f64> = Vec::with_capacity(n_chunk);
+    let mut p99_kld_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut mean_nll_per_seq: Vec<f64> = Vec::with_capacity(n_chunk);
     let mut block_buf = vec![0u8; per_token_block_bytes];
     let t0 = Instant::now();
@@ -225,29 +261,35 @@ fn main() {
                           scratch_logits: &rdna_compute::GpuTensor,
                           ref_in: &mut BufReader<File>,
                           block_buf: &mut [u8],
-                          actual_next: usize| -> (f64, Option<f64>) {
+                          actual_next: usize|
+     -> (f64, Option<f64>) {
         ref_in.read_exact(block_buf).expect("read ref block");
         let mut top_indices: Vec<u32> = Vec::with_capacity(top_k);
         let mut top_log_probs: Vec<f32> = Vec::with_capacity(top_k);
         for j in 0..top_k {
-            top_indices.push(u32::from_le_bytes(block_buf[j * 4..j * 4 + 4].try_into().unwrap()));
+            top_indices.push(u32::from_le_bytes(
+                block_buf[j * 4..j * 4 + 4].try_into().unwrap(),
+            ));
         }
         let lp_off = top_k * 4;
         for j in 0..top_k {
             top_log_probs.push(f32::from_le_bytes(
-                block_buf[lp_off + j * 4..lp_off + j * 4 + 4].try_into().unwrap(),
+                block_buf[lp_off + j * 4..lp_off + j * 4 + 4]
+                    .try_into()
+                    .unwrap(),
             ));
         }
         let resid_off = top_k * 8;
-        let sum_p_residual = f32::from_le_bytes(
-            block_buf[resid_off..resid_off + 4].try_into().unwrap()
-        );
+        let sum_p_residual =
+            f32::from_le_bytes(block_buf[resid_off..resid_off + 4].try_into().unwrap());
 
         let cand_logits = gpu.download_f32(scratch_logits).expect("download logits");
 
         let mut max_logit = f32::NEG_INFINITY;
         for &v in cand_logits.iter() {
-            if v > max_logit { max_logit = v; }
+            if v > max_logit {
+                max_logit = v;
+            }
         }
         let mut sum_exp = 0.0f64;
         for &v in cand_logits.iter() {
@@ -259,7 +301,9 @@ fn main() {
         let mut sum_p_cand_at_ref_top = 0.0f64;
         for j in 0..top_k {
             let ref_idx = top_indices[j] as usize;
-            if ref_idx >= cand_logits.len() { continue; }
+            if ref_idx >= cand_logits.len() {
+                continue;
+            }
             let log_p_ref = top_log_probs[j] as f64;
             let log_p_cand = (cand_logits[ref_idx] as f64) - log_z;
             let p_ref = log_p_ref.exp();
@@ -270,8 +314,7 @@ fn main() {
         let sum_p_residual_ref = sum_p_residual as f64;
         let sum_p_residual_cand = (1.0 - sum_p_cand_at_ref_top).max(0.0);
         if sum_p_residual_ref > 1e-9 && sum_p_residual_cand > 1e-9 {
-            kld_token += sum_p_residual_ref
-                * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
+            kld_token += sum_p_residual_ref * (sum_p_residual_ref.ln() - sum_p_residual_cand.ln());
         }
         debug_assert!(
             kld_token >= -1e-9,
@@ -296,17 +339,33 @@ fn main() {
 
         for pos in 0..(n_ctx - 1) {
             llama::forward_scratch_embed(
-                &mut gpu, &weights, &config, chunk_tokens[pos], pos, &scratch,
-            ).expect("forward_scratch_embed");
+                &mut gpu,
+                &weights,
+                &config,
+                chunk_tokens[pos],
+                pos,
+                &scratch,
+            )
+            .expect("forward_scratch_embed");
             llama::forward_scratch_compute(
-                &mut gpu, &weights, &config, pos, &mut kv_cache, &scratch,
-            ).expect("forward_scratch_compute");
+                &mut gpu,
+                &weights,
+                &config,
+                pos,
+                &mut kv_cache,
+                &scratch,
+            )
+            .expect("forward_scratch_compute");
             if pos < scoring_start {
                 continue;
             }
             let actual_next = chunk_tokens[pos + 1] as usize;
             let (kld, nll) = score_position(
-                &mut gpu, &scratch.logits, &mut ref_in, &mut block_buf, actual_next,
+                &mut gpu,
+                &scratch.logits,
+                &mut ref_in,
+                &mut block_buf,
+                actual_next,
             );
             chunk_klds.push(kld);
             if let Some(n) = nll {
@@ -320,7 +379,12 @@ fn main() {
                 let rate = total_scored_done as f64 / elapsed.max(1e-9);
                 eprint!(
                     "\r  chunk {:4}/{}  scored {:8}/{:8}  ({:5.1}%, {:.0} tok/s)   ",
-                    c + 1, effective_n_chunk, total_scored_done, total_scored, pct, rate
+                    c + 1,
+                    effective_n_chunk,
+                    total_scored_done,
+                    total_scored,
+                    pct,
+                    rate
                 );
             }
         }
@@ -338,7 +402,9 @@ fn main() {
         let p99 = sorted[p99_idx];
         let mean_nll = if chunk_nll_count > 0 {
             chunk_nll_sum / chunk_nll_count as f64
-        } else { f64::NAN };
+        } else {
+            f64::NAN
+        };
         mean_kld_per_seq.push(mean);
         p99_kld_per_seq.push(p99);
         mean_nll_per_seq.push(mean_nll);
@@ -360,9 +426,11 @@ fn main() {
     let mut out = BufWriter::new(out_file);
     out.write_all(b"HFKSEQ\0\0").unwrap();
     out.write_all(&2u32.to_le_bytes()).unwrap();
-    out.write_all(&(effective_n_chunk as u32).to_le_bytes()).unwrap();
+    out.write_all(&(effective_n_chunk as u32).to_le_bytes())
+        .unwrap();
     out.write_all(&0u32.to_le_bytes()).unwrap();
-    for ((m, p), n) in mean_kld_per_seq.iter()
+    for ((m, p), n) in mean_kld_per_seq
+        .iter()
         .zip(p99_kld_per_seq.iter())
         .zip(mean_nll_per_seq.iter())
     {
@@ -372,10 +440,13 @@ fn main() {
     }
     out.flush().unwrap();
 
-    let overall_mean: f64 = mean_kld_per_seq.iter().copied().sum::<f64>()
-        / mean_kld_per_seq.len() as f64;
-    let nll_finite: Vec<f64> = mean_nll_per_seq.iter().copied()
-        .filter(|x| x.is_finite()).collect();
+    let overall_mean: f64 =
+        mean_kld_per_seq.iter().copied().sum::<f64>() / mean_kld_per_seq.len() as f64;
+    let nll_finite: Vec<f64> = mean_nll_per_seq
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .collect();
     let overall_nll: f64 = if nll_finite.is_empty() {
         f64::NAN
     } else {

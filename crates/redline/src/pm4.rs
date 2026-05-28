@@ -87,9 +87,15 @@ impl AqlDispatchPacket {
         let header: u16 = (2 << 0)      // HSA_PACKET_TYPE_KERNEL_DISPATCH
                         | (1 << 8)       // barrier bit
                         | (2 << 9)       // acquire fence scope (agent)
-                        | (2 << 11);     // release fence scope (agent)
+                        | (2 << 11); // release fence scope (agent)
 
-        let ndims = if grid[2] > 1 { 3 } else if grid[1] > 1 { 2 } else { 1 };
+        let ndims = if grid[2] > 1 {
+            3
+        } else if grid[1] > 1 {
+            2
+        } else {
+            1
+        };
 
         Self {
             header,
@@ -111,9 +117,7 @@ impl AqlDispatchPacket {
     }
 
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe {
-            std::slice::from_raw_parts(self as *const _ as *const u8, 64)
-        }
+        unsafe { std::slice::from_raw_parts(self as *const _ as *const u8, 64) }
     }
 }
 
@@ -124,7 +128,9 @@ pub struct Pm4Builder {
 
 impl Pm4Builder {
     pub fn new() -> Self {
-        Self { dwords: Vec::with_capacity(256) }
+        Self {
+            dwords: Vec::with_capacity(256),
+        }
     }
 
     /// Emit PKT3 header

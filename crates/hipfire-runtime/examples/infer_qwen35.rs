@@ -13,13 +13,13 @@
 //! via `hipfire_runtime::loop_guard::LoopGuard`. The default keeps today's bare
 //! semantics so kernel/loading sanity probes are unchanged byte-for-byte.
 
+use hipfire_arch_qwen35::qwen35;
+use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::loop_guard::LoopGuard;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
-use hipfire_arch_qwen35::qwen35;
-use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::io::Write;
 use std::path::Path;
@@ -27,7 +27,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
-extern "C" fn handle_sigint(_: libc::c_int) { RUNNING.store(false, Ordering::SeqCst); }
+extern "C" fn handle_sigint(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
 
 /// Parse `--guards on|off` from argv WITHOUT consuming positional prompt
 /// args when the flag is absent. Returns (use_guards, prompt_args).
@@ -55,7 +57,9 @@ fn parse_guards_flag(args: &[String]) -> (bool, Vec<String>) {
 }
 
 fn main() {
-    unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+    }
     let args: Vec<String> = std::env::args().collect();
     let model_path = args.get(1).unwrap_or_else(|| {
         eprintln!("Usage: infer_qwen35 <model.hfq> [--guards on|off] [prompt...]");
@@ -77,11 +81,17 @@ fn main() {
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
     let config = qwen35::config_from_hfq(&hfq).expect("failed to read Qwen3.5 config");
-    eprintln!("Config: dim={}, layers={}, heads={}, vocab={}", config.dim, config.n_layers, config.n_heads, config.vocab_size);
+    eprintln!(
+        "Config: dim={}, layers={}, heads={}, vocab={}",
+        config.dim, config.n_layers, config.n_heads, config.vocab_size
+    );
 
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .unwrap_or_else(|_| {
-            let gguf = hipfire_runtime::gguf::GgufFile::open(Path::new("/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf")).expect("need GGUF for tokenizer");
+            let gguf = hipfire_runtime::gguf::GgufFile::open(Path::new(
+                "/home/kaden/llama.cpp/models/Qwen3-0.6B-Q8_0.gguf",
+            ))
+            .expect("need GGUF for tokenizer");
             hipfire_runtime::tokenizer::Tokenizer::from_gguf(&gguf).expect("tokenizer failed")
         });
 
@@ -130,21 +140,58 @@ fn main() {
         }
         prompt_tokens
     };
-    eprintln!("Prompt: \"{}\" ({} tokens)", prompt_text, prompt_tokens.len());
+    eprintln!(
+        "Prompt: \"{}\" ({} tokens)",
+        prompt_text,
+        prompt_tokens.len()
+    );
 
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init failed");
     eprintln!("Loading weights...");
-    let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
+    let weights =
+        qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("failed to load weights");
 
     let kv_seq = 2048usize;
     let kv_mode = std::env::var("HIPFIRE_KV_MODE").unwrap_or_else(|_| "q8".to_string());
     let mut kv_cache = match kv_mode.as_str() {
-        "givens4" => { eprintln!("KV cache: givens4"); llama::KvCache::new_gpu_asym3(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
-        "givens2" => { eprintln!("KV cache: givens2"); llama::KvCache::new_gpu_asym2(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap() }
-        _ => llama::KvCache::new_gpu_q8(&mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq).unwrap(),
+        "givens4" => {
+            eprintln!("KV cache: givens4");
+            llama::KvCache::new_gpu_asym3(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap()
+        }
+        "givens2" => {
+            eprintln!("KV cache: givens2");
+            llama::KvCache::new_gpu_asym2(
+                &mut gpu,
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap()
+        }
+        _ => llama::KvCache::new_gpu_q8(
+            &mut gpu,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
     };
     let mut dn_state = if std::env::var("FP32_STATE").is_ok() {
-        DeltaNetState::new_with_quant(&mut gpu, &config, hipfire_arch_qwen35::qwen35::StateQuant::FP32).unwrap()
+        DeltaNetState::new_with_quant(
+            &mut gpu,
+            &config,
+            hipfire_arch_qwen35::qwen35::StateQuant::FP32,
+        )
+        .unwrap()
     } else {
         DeltaNetState::new(&mut gpu, &config).unwrap()
     };
@@ -171,20 +218,34 @@ fn main() {
     let use_gpu_topk = std::env::var("HIPFIRE_GPU_TOPK").ok().as_deref() == Some("1");
     let sample_compare = std::env::var("HIPFIRE_SAMPLE_COMPARE").ok().as_deref() == Some("1");
     if (use_gpu_topk || sample_compare) && !use_guards {
-        eprintln!("sampler: gpu_topk={} compare={}", use_gpu_topk, sample_compare);
+        eprintln!(
+            "sampler: gpu_topk={} compare={}",
+            use_gpu_topk, sample_compare
+        );
     }
-    const TOPK: usize = 1024;  // 256 threads × top-4 each
-    // Single 8 KB device buffer laid out as [1024 × u32 indices | 1024 × f32 values]
-    // so the whole top-K candidate set downloads in one memcpy_dtoh call.
-    let topk_buf = gpu.alloc_tensor(&[2 * TOPK], rdna_compute::DType::F32).unwrap();
-    let mut topk_host = vec![0u8; 2 * TOPK * 4];  // reused across steps
+    const TOPK: usize = 1024; // 256 threads × top-4 each
+                              // Single 8 KB device buffer laid out as [1024 × u32 indices | 1024 × f32 values]
+                              // so the whole top-K candidate set downloads in one memcpy_dtoh call.
+    let topk_buf = gpu
+        .alloc_tensor(&[2 * TOPK], rdna_compute::DType::F32)
+        .unwrap();
+    let mut topk_host = vec![0u8; 2 * TOPK * 4]; // reused across steps
 
     // Sequential prefill
     let t1 = Instant::now();
     let mut logits = vec![0.0f32; config.vocab_size];
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, token, pos, &mut kv_cache, &mut dn_state, &scratch)
-            .expect("forward failed");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward failed");
         if !use_guards {
             // Bare path needs the host-side logits for CPU sampling.
             // The guards path defers the D2H to the sampler module.
@@ -192,14 +253,26 @@ fn main() {
         }
     }
     let prefill_ms = t1.elapsed().as_millis();
-    eprintln!("Prefill: {}ms ({} tokens, {:.0} tok/s)", prefill_ms, prompt_tokens.len(),
-        prompt_tokens.len() as f64 / (prefill_ms as f64 / 1000.0));
+    eprintln!(
+        "Prefill: {}ms ({} tokens, {:.0} tok/s)",
+        prefill_ms,
+        prompt_tokens.len(),
+        prompt_tokens.len() as f64 / (prefill_ms as f64 / 1000.0)
+    );
 
     // Detect special tokens
     let think_end_id = tokenizer.encode("</think>");
-    let think_end_token = if think_end_id.len() == 1 { Some(think_end_id[0]) } else { None };
+    let think_end_token = if think_end_id.len() == 1 {
+        Some(think_end_id[0])
+    } else {
+        None
+    };
     let im_end_id = tokenizer.encode("<|im_end|>");
-    let im_end_token = if im_end_id.len() == 1 { Some(im_end_id[0]) } else { None };
+    let im_end_token = if im_end_id.len() == 1 {
+        Some(im_end_id[0])
+    } else {
+        None
+    };
 
     let sc = llama::SamplingConfig::text_thinking();
     let max_gen = 2048;
@@ -285,9 +358,15 @@ fn main() {
             }
         }
 
-        if next_token == config.eos_token { break; }
-        if im_end_token == Some(next_token) { break; }
-        if !RUNNING.load(Ordering::Relaxed) { break; }
+        if next_token == config.eos_token {
+            break;
+        }
+        if im_end_token == Some(next_token) {
+            break;
+        }
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
 
         // N-gram loop detector (guards on only). When the streamed
         // tokens trigger the LoopGuard, force EOS — same shape as the
@@ -313,10 +392,23 @@ fn main() {
         }
 
         let pos = prompt_tokens.len() + generated.len() - 1;
-        qwen35::forward_scratch(&mut gpu, &weights, &config, next_token, pos, &mut kv_cache, &mut dn_state, &scratch)
-            .expect("forward failed");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward failed");
 
-        let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
+        let temp = if in_thinking {
+            sc.think_temp
+        } else {
+            sc.answer_temp
+        };
 
         next_token = if use_guards {
             // Route through the production sampler module. Mirrors the
@@ -351,11 +443,17 @@ fn main() {
             let mut cand_vals = vec![0.0f32; TOPK];
             for i in 0..TOPK {
                 cand_ids[i] = u32::from_ne_bytes([
-                    topk_host[i*4], topk_host[i*4+1], topk_host[i*4+2], topk_host[i*4+3],
+                    topk_host[i * 4],
+                    topk_host[i * 4 + 1],
+                    topk_host[i * 4 + 2],
+                    topk_host[i * 4 + 3],
                 ]);
                 let v_off = TOPK * 4 + i * 4;
                 cand_vals[i] = f32::from_ne_bytes([
-                    topk_host[v_off], topk_host[v_off+1], topk_host[v_off+2], topk_host[v_off+3],
+                    topk_host[v_off],
+                    topk_host[v_off + 1],
+                    topk_host[v_off + 2],
+                    topk_host[v_off + 3],
                 ]);
             }
 
@@ -366,24 +464,43 @@ fn main() {
                 // GPU-assisted path (advances RNG)
                 let mut cand_vals_gpu = cand_vals.clone();
                 let gpu_tok = llama::sample_top_p_from_candidates(
-                    &cand_ids, &mut cand_vals_gpu, &token_history,
-                    sc.repeat_window, sc.repeat_penalty, temp, sc.top_p,
+                    &cand_ids,
+                    &mut cand_vals_gpu,
+                    &token_history,
+                    sc.repeat_window,
+                    sc.repeat_penalty,
+                    temp,
+                    sc.top_p,
                 );
                 let rng_after_gpu = llama::sampler_rng_snapshot();
 
                 // Restore and run full-CPU path
                 llama::sampler_rng_restore(rng_before);
                 logits = gpu.download_f32(&scratch.logits).unwrap();
-                llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
+                llama::apply_repeat_penalty(
+                    &mut logits,
+                    &token_history,
+                    sc.repeat_window,
+                    sc.repeat_penalty,
+                );
                 let cpu_tok = llama::sample_top_p(&logits, temp, sc.top_p);
                 let rng_after_cpu = llama::sampler_rng_snapshot();
 
                 if cpu_tok != gpu_tok || rng_after_cpu != rng_after_gpu {
-                    eprintln!("\n!! SAMPLE_COMPARE divergence at step {}: cpu={} gpu={} (pos={})",
-                        generated.len(), cpu_tok, gpu_tok, pos);
+                    eprintln!(
+                        "\n!! SAMPLE_COMPARE divergence at step {}: cpu={} gpu={} (pos={})",
+                        generated.len(),
+                        cpu_tok,
+                        gpu_tok,
+                        pos
+                    );
                     eprintln!("   rng state: before={rng_before:#x} after_gpu={rng_after_gpu:#x} after_cpu={rng_after_cpu:#x}");
                     // Show the top-128 candidate set + which of them the CPU's top-20 came from
-                    let mut sorted: Vec<(u32, f32)> = cand_ids.iter().copied().zip(cand_vals.iter().copied()).collect();
+                    let mut sorted: Vec<(u32, f32)> = cand_ids
+                        .iter()
+                        .copied()
+                        .zip(cand_vals.iter().copied())
+                        .collect();
                     sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
                     eprintln!("   gpu top-8 candidates (by raw logit):");
                     for (i, (tok, val)) in sorted.iter().take(8).enumerate() {
@@ -395,13 +512,23 @@ fn main() {
                 gpu_tok
             } else {
                 llama::sample_top_p_from_candidates(
-                    &cand_ids, &mut cand_vals, &token_history,
-                    sc.repeat_window, sc.repeat_penalty, temp, sc.top_p,
+                    &cand_ids,
+                    &mut cand_vals,
+                    &token_history,
+                    sc.repeat_window,
+                    sc.repeat_penalty,
+                    temp,
+                    sc.top_p,
                 )
             }
         } else {
             logits = gpu.download_f32(&scratch.logits).unwrap();
-            llama::apply_repeat_penalty(&mut logits, &token_history, sc.repeat_window, sc.repeat_penalty);
+            llama::apply_repeat_penalty(
+                &mut logits,
+                &token_history,
+                sc.repeat_window,
+                sc.repeat_penalty,
+            );
             llama::sample_top_p(&logits, temp, sc.top_p)
         };
     }
@@ -418,6 +545,15 @@ fn main() {
     }
 
     let gen_ms = t2.elapsed().as_millis();
-    let tok_s = if gen_ms > 0 { generated.len() as f64 / (gen_ms as f64 / 1000.0) } else { 0.0 };
-    eprintln!("\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===", generated.len(), gen_ms, tok_s);
+    let tok_s = if gen_ms > 0 {
+        generated.len() as f64 / (gen_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===",
+        generated.len(),
+        gen_ms,
+        tok_s
+    );
 }

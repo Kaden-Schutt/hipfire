@@ -26,13 +26,13 @@
 // `cargo build --no-default-features` working and matches the gating that
 // was on `engine::qwen35` pre-Phase-2.
 #[cfg(feature = "deltanet")]
-pub mod qwen35;
-#[cfg(feature = "deltanet")]
-pub mod speculative;
+pub mod arch;
 #[cfg(feature = "deltanet")]
 pub mod pflash;
 #[cfg(feature = "deltanet")]
-pub mod arch;
+pub mod qwen35;
+#[cfg(feature = "deltanet")]
+pub mod speculative;
 
 #[cfg(feature = "deltanet")]
 pub use arch::Qwen35;

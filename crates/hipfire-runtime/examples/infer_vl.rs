@@ -5,18 +5,20 @@
 //! Qwen3.5-VL inference: image + text question → text answer.
 //! Usage: infer_vl <model.hfq> <image.png> [question...]
 
-use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::qwen35::DeltaNetState;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::llama;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
-extern "C" fn handle_sigint(_: libc::c_int) { RUNNING.store(false, Ordering::SeqCst); }
+extern "C" fn handle_sigint(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
+}
 
 const IMAGE_SIZE: usize = 448;
 const IMAGE_PAD_ID: u32 = 248056;
@@ -24,7 +26,9 @@ const VISION_START_ID: u32 = 248053;
 const VISION_END_ID: u32 = 248054;
 
 fn main() {
-    unsafe { libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t); }
+    unsafe {
+        libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage: infer_vl <model.hfq> <image.png> [question...]");
@@ -32,9 +36,23 @@ fn main() {
     }
     let no_think = args.iter().any(|a| a == "--no-think");
     let filtered: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
-    let model_path = filtered.get(1).unwrap_or_else(|| { eprintln!("Usage: infer_vl <model.hfq> <image.png> [--no-think] [question...]"); std::process::exit(1); });
-    let image_path = filtered.get(2).unwrap_or_else(|| { eprintln!("Usage: infer_vl <model.hfq> <image.png> [--no-think] [question...]"); std::process::exit(1); });
-    let question = if filtered.len() > 3 { filtered[3..].iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") } else { "Describe this image.".to_string() };
+    let model_path = filtered.get(1).unwrap_or_else(|| {
+        eprintln!("Usage: infer_vl <model.hfq> <image.png> [--no-think] [question...]");
+        std::process::exit(1);
+    });
+    let image_path = filtered.get(2).unwrap_or_else(|| {
+        eprintln!("Usage: infer_vl <model.hfq> <image.png> [--no-think] [question...]");
+        std::process::exit(1);
+    });
+    let question = if filtered.len() > 3 {
+        filtered[3..]
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    } else {
+        "Describe this image.".to_string()
+    };
 
     eprintln!("=== hipfire Qwen3.5-VL inference ===");
     eprintln!("Model: {model_path}");
@@ -45,17 +63,25 @@ fn main() {
     // through the `Architecture` trait for both Qwen35 (text) and
     // Qwen35Vl (vision). Forward calls (`qwen35::forward_scratch`,
     // `qwen35_vl::vision_forward`) stay direct static dispatch.
-    use hipfire_runtime::arch::Architecture;
     use hipfire_arch_qwen35::Qwen35;
     use hipfire_arch_qwen35_vl::Qwen35Vl;
+    use hipfire_runtime::arch::Architecture;
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("failed to parse HFQ");
-    let text_config = <Qwen35 as Architecture>::config_from_hfq(&hfq)
-        .expect("failed to read text config");
-    let vision_config = <Qwen35Vl as Architecture>::config_from_hfq(&hfq)
-        .expect("failed to read vision config");
-    eprintln!("Text: dim={}, layers={}, vocab={}", text_config.dim, text_config.n_layers, text_config.vocab_size);
-    eprintln!("Vision: hidden={}, layers={}, heads={}, patch={}",
-        vision_config.hidden_size, vision_config.num_layers, vision_config.num_heads, vision_config.patch_size);
+    let text_config =
+        <Qwen35 as Architecture>::config_from_hfq(&hfq).expect("failed to read text config");
+    let vision_config =
+        <Qwen35Vl as Architecture>::config_from_hfq(&hfq).expect("failed to read vision config");
+    eprintln!(
+        "Text: dim={}, layers={}, vocab={}",
+        text_config.dim, text_config.n_layers, text_config.vocab_size
+    );
+    eprintln!(
+        "Vision: hidden={}, layers={}, heads={}, patch={}",
+        vision_config.hidden_size,
+        vision_config.num_layers,
+        vision_config.num_heads,
+        vision_config.patch_size
+    );
 
     // Load tokenizer
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
@@ -67,17 +93,26 @@ fn main() {
         Path::new(image_path),
         vision_config.patch_size,
         vision_config.spatial_merge_size,
-    ).unwrap_or_else(|e| panic!("{e}"));
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let grid_h = img_h / vision_config.patch_size;
     let grid_w = img_w / vision_config.patch_size;
     let n_patches = grid_h * grid_w;
-    let n_visual_tokens = n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
-    eprintln!("Image: {}x{} → {}x{} patches → {} visual tokens", img_w, img_h, grid_h, grid_w, n_visual_tokens);
+    let n_visual_tokens =
+        n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
+    eprintln!(
+        "Image: {}x{} → {}x{} patches → {} visual tokens",
+        img_w, img_h, grid_h, grid_w, n_visual_tokens
+    );
 
     // Extract patches for vision encoder
     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels, 3, img_h, img_w,
-        vision_config.patch_size, vision_config.temporal_patch_size,
+        &pixels,
+        3,
+        img_h,
+        img_w,
+        vision_config.patch_size,
+        vision_config.temporal_patch_size,
         vision_config.spatial_merge_size,
     );
 
@@ -86,15 +121,23 @@ fn main() {
 
     // Load vision weights (GPU-side for fast inference)
     eprintln!("Loading vision weights...");
-    let vision_weights = <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vision_config, &mut gpu)
-        .expect("failed to load vision weights");
+    let vision_weights =
+        <Qwen35Vl as Architecture>::load_weights(&mut hfq, &vision_config, &mut gpu)
+            .expect("failed to load vision weights");
 
     // Run vision encoder (GPU linear layers + CPU attention).
     // Forward = direct static call, not trait-dispatched (see arch.rs).
     eprintln!("Running vision encoder...");
     let t_vis = Instant::now();
-    let visual_tokens = qwen35_vl::vision_forward(&mut gpu, &vision_weights, &vision_config, &patches, grid_h, grid_w)
-        .expect("vision forward failed");
+    let visual_tokens = qwen35_vl::vision_forward(
+        &mut gpu,
+        &vision_weights,
+        &vision_config,
+        &patches,
+        grid_h,
+        grid_w,
+    )
+    .expect("vision forward failed");
     eprintln!("Vision encoder: {:.1}s", t_vis.elapsed().as_secs_f32());
     assert_eq!(visual_tokens.len(), n_visual_tokens * text_config.dim);
 
@@ -103,7 +146,14 @@ fn main() {
         .expect("failed to load text weights");
 
     let kv_seq = 2048usize;
-    let mut kv_cache = llama::KvCache::new_gpu(&mut gpu, text_config.n_layers, text_config.n_kv_heads, text_config.head_dim, kv_seq).unwrap();
+    let mut kv_cache = llama::KvCache::new_gpu(
+        &mut gpu,
+        text_config.n_layers,
+        text_config.n_kv_heads,
+        text_config.head_dim,
+        kv_seq,
+    )
+    .unwrap();
     let mut dn_state = DeltaNetState::new(&mut gpu, &text_config).unwrap();
 
     // Build prompt with vision tokens:
@@ -132,7 +182,12 @@ fn main() {
     prompt_tokens.extend_from_slice(&asst_tok);
     prompt_tokens.extend_from_slice(&nl);
 
-    eprintln!("Prompt: {} tokens ({} visual + {} text)", prompt_tokens.len(), n_visual_tokens, prompt_tokens.len() - n_visual_tokens);
+    eprintln!(
+        "Prompt: {} tokens ({} visual + {} text)",
+        prompt_tokens.len(),
+        n_visual_tokens,
+        prompt_tokens.len() - n_visual_tokens
+    );
 
     // Zero-alloc scratch buffers (pre-allocated once, reused every token)
     let sc = llama::SamplingConfig::vl_thinking();
@@ -145,23 +200,54 @@ fn main() {
     let mut visual_idx = 0usize;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
         if token == IMAGE_PAD_ID && visual_idx < n_visual_tokens {
-            let emb = &visual_tokens[visual_idx * text_config.dim..(visual_idx + 1) * text_config.dim];
-            qwen35::forward_scratch_embed(&mut gpu, &weights, &text_config, emb, pos, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch_embed failed");
+            let emb =
+                &visual_tokens[visual_idx * text_config.dim..(visual_idx + 1) * text_config.dim];
+            qwen35::forward_scratch_embed(
+                &mut gpu,
+                &weights,
+                &text_config,
+                emb,
+                pos,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .expect("forward_scratch_embed failed");
             visual_idx += 1;
         } else {
-            qwen35::forward_scratch(&mut gpu, &weights, &text_config, token, pos, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch failed");
+            qwen35::forward_scratch(
+                &mut gpu,
+                &weights,
+                &text_config,
+                token,
+                pos,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .expect("forward_scratch failed");
         }
     }
     let prefill_ms = t_pf.elapsed().as_millis();
-    eprintln!("Prefill: {}ms ({} tokens, {:.0} tok/s)", prefill_ms, prompt_tokens.len(),
-        prompt_tokens.len() as f64 / (prefill_ms as f64 / 1000.0));
+    eprintln!(
+        "Prefill: {}ms ({} tokens, {:.0} tok/s)",
+        prefill_ms,
+        prompt_tokens.len(),
+        prompt_tokens.len() as f64 / (prefill_ms as f64 / 1000.0)
+    );
 
     // Generation with zero-alloc forward + GPU sampling + dual-temp thinking
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     let think_end_id = tokenizer.encode("</think>");
-    let think_end_token = if think_end_id.len() == 1 { Some(think_end_id[0]) } else { None };
+    let think_end_token = if think_end_id.len() == 1 {
+        Some(think_end_id[0])
+    } else {
+        None
+    };
     let max_gen = 2048;
 
     // Optionally append <think>\n for thinking mode
@@ -170,8 +256,17 @@ fn main() {
     if !no_think {
         let think_tokens = tokenizer.encode("<think>\n");
         for (i, &t) in think_tokens.iter().enumerate() {
-            qwen35::forward_scratch(&mut gpu, &weights, &text_config, t, prompt_tokens.len() + i, &mut kv_cache, &mut dn_state, &scratch)
-                .expect("forward_scratch failed");
+            qwen35::forward_scratch(
+                &mut gpu,
+                &weights,
+                &text_config,
+                t,
+                prompt_tokens.len() + i,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+            )
+            .expect("forward_scratch failed");
         }
         prefill_len = prompt_tokens.len() + think_tokens.len();
         in_thinking = true;
@@ -184,7 +279,11 @@ fn main() {
     // First token: download logits from scratch, apply n-gram block, sample on CPU
     let mut logits = gpu.download_f32(&scratch.logits).unwrap();
     llama::apply_ngram_block(&mut logits, &prompt_tokens);
-    let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
+    let temp = if in_thinking {
+        sc.think_temp
+    } else {
+        sc.answer_temp
+    };
     let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
 
     let t_gen = Instant::now();
@@ -197,27 +296,52 @@ fn main() {
         generated.push(next_token);
         token_history.push(next_token);
 
-        if in_thinking { think_count += 1; }
+        if in_thinking {
+            think_count += 1;
+        }
 
         if in_thinking && (think_end_token == Some(next_token) || think_count >= max_think) {
             in_thinking = false;
             eprint!("</think>\n");
         } else {
             let text = tokenizer.decode(&[next_token]);
-            if in_thinking { eprint!("{text}"); }
-            else { print!("{text}"); std::io::stdout().flush().ok(); }
+            if in_thinking {
+                eprint!("{text}");
+            } else {
+                print!("{text}");
+                std::io::stdout().flush().ok();
+            }
         }
 
-        if next_token == text_config.eos_token { break; }
-        if im_end_token == Some(next_token) { break; }
-        if !RUNNING.load(Ordering::Relaxed) { break; }
+        if next_token == text_config.eos_token {
+            break;
+        }
+        if im_end_token == Some(next_token) {
+            break;
+        }
+        if !RUNNING.load(Ordering::Relaxed) {
+            break;
+        }
 
         let pos = prefill_len + generated.len() - 1;
-        let temp = if in_thinking { sc.think_temp } else { sc.answer_temp };
+        let temp = if in_thinking {
+            sc.think_temp
+        } else {
+            sc.answer_temp
+        };
 
         // Zero-alloc forward — logits land in scratch.logits on GPU
-        qwen35::forward_scratch(&mut gpu, &weights, &text_config, next_token, pos,
-            &mut kv_cache, &mut dn_state, &scratch).expect("forward_scratch failed");
+        qwen35::forward_scratch(
+            &mut gpu,
+            &weights,
+            &text_config,
+            next_token,
+            pos,
+            &mut kv_cache,
+            &mut dn_state,
+            &scratch,
+        )
+        .expect("forward_scratch failed");
 
         // N-gram block (requires CPU roundtrip — TODO: GPU kernel)
         // Disabled for perf measurement — re-enable after implementing GPU n-gram kernel
@@ -227,7 +351,9 @@ fn main() {
             let logits_bytes: &[u8] = unsafe {
                 std::slice::from_raw_parts(logits.as_ptr() as *const u8, logits.len() * 4)
             };
-            gpu.hip.memcpy_htod(&scratch.logits.buf, logits_bytes).unwrap();
+            gpu.hip
+                .memcpy_htod(&scratch.logits.buf, logits_bytes)
+                .unwrap();
         }
 
         // GPU sampling
@@ -235,18 +361,37 @@ fn main() {
         let hist_slice = &token_history[hist_start..];
         let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
         if !hist_bytes.is_empty() {
-            gpu.hip.memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes).unwrap();
+            gpu.hip
+                .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
+                .unwrap();
         }
-        let (tok, rng) = gpu.sample_top_p(
-            &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,
-            text_config.vocab_size, temp, sc.top_p, rng_state,
-            hist_slice.len(), sc.repeat_penalty,
-        ).expect("sample_top_p failed");
+        let (tok, rng) = gpu
+            .sample_top_p(
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                text_config.vocab_size,
+                temp,
+                sc.top_p,
+                rng_state,
+                hist_slice.len(),
+                sc.repeat_penalty,
+            )
+            .expect("sample_top_p failed");
         next_token = tok;
         rng_state = rng;
     }
 
     let gen_ms = t_gen.elapsed().as_millis();
-    let tok_s = if gen_ms > 0 { generated.len() as f64 / (gen_ms as f64 / 1000.0) } else { 0.0 };
-    eprintln!("\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===", generated.len(), gen_ms, tok_s);
+    let tok_s = if gen_ms > 0 {
+        generated.len() as f64 / (gen_ms as f64 / 1000.0)
+    } else {
+        0.0
+    };
+    eprintln!(
+        "\n\n=== Done: {} tokens in {}ms ({:.1} tok/s) ===",
+        generated.len(),
+        gen_ms,
+        tok_s
+    );
 }

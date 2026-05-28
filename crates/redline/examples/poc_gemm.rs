@@ -14,10 +14,16 @@ fn main() {
 
     // Compile
     let out = std::process::Command::new("hipcc")
-        .args(["--genco", "--offload-arch=gfx1010", "-O3",
-               "-o", "/tmp/redline_gemm.hsaco",
-               "kernels/src/gemm_f32.hip"])
-        .output().expect("hipcc");
+        .args([
+            "--genco",
+            "--offload-arch=gfx1010",
+            "-O3",
+            "-o",
+            "/tmp/redline_gemm.hsaco",
+            "kernels/src/gemm_f32.hip",
+        ])
+        .output()
+        .expect("hipcc");
     if !out.status.success() {
         eprintln!("hipcc failed:\n{}", String::from_utf8_lossy(&out.stderr));
         std::process::exit(1);
@@ -25,9 +31,18 @@ fn main() {
 
     let module = HsacoModule::from_file("/tmp/redline_gemm.hsaco").unwrap();
     let k = &module.kernels[0];
-    eprintln!("kernel: {} vgprs={} sgprs={} lds={} kernarg={}",
-        k.name, k.vgpr_count(), k.sgpr_count(), k.group_segment_size, k.kernarg_size);
-    eprintln!("pgm_rsrc1=0x{:08x} pgm_rsrc2=0x{:08x}", k.pgm_rsrc1, k.pgm_rsrc2);
+    eprintln!(
+        "kernel: {} vgprs={} sgprs={} lds={} kernarg={}",
+        k.name,
+        k.vgpr_count(),
+        k.sgpr_count(),
+        k.group_segment_size,
+        k.kernarg_size
+    );
+    eprintln!(
+        "pgm_rsrc1=0x{:08x} pgm_rsrc2=0x{:08x}",
+        k.pgm_rsrc1, k.pgm_rsrc2
+    );
 
     // Open GPU
     let dev = Device::open(None).unwrap();
@@ -89,17 +104,33 @@ fn main() {
     // Count user SGPRs
     let mut user_sgpr_count = 0u32;
     let mut user_sgpr_idx = 0u32; // where to place kernarg ptr
-    if kcp & (1 << 0) != 0 { user_sgpr_count += 4; } // private seg buf
-    if kcp & (1 << 1) != 0 { user_sgpr_count += 2; } // dispatch ptr
-    if kcp & (1 << 2) != 0 { user_sgpr_count += 2; } // queue ptr
+    if kcp & (1 << 0) != 0 {
+        user_sgpr_count += 4;
+    } // private seg buf
+    if kcp & (1 << 1) != 0 {
+        user_sgpr_count += 2;
+    } // dispatch ptr
+    if kcp & (1 << 2) != 0 {
+        user_sgpr_count += 2;
+    } // queue ptr
     user_sgpr_idx = user_sgpr_count; // kernarg ptr starts after the above
-    if kcp & (1 << 3) != 0 { user_sgpr_count += 2; } // kernarg ptr
-    if kcp & (1 << 4) != 0 { user_sgpr_count += 2; } // dispatch id
-    if kcp & (1 << 5) != 0 { user_sgpr_count += 2; } // flat scratch init
-    if kcp & (1 << 6) != 0 { user_sgpr_count += 1; } // private seg size
+    if kcp & (1 << 3) != 0 {
+        user_sgpr_count += 2;
+    } // kernarg ptr
+    if kcp & (1 << 4) != 0 {
+        user_sgpr_count += 2;
+    } // dispatch id
+    if kcp & (1 << 5) != 0 {
+        user_sgpr_count += 2;
+    } // flat scratch init
+    if kcp & (1 << 6) != 0 {
+        user_sgpr_count += 1;
+    } // private seg size
 
-    eprintln!("kernel_code_properties=0x{:04x} user_sgprs={} kernarg_at_sgpr={}",
-        kcp, user_sgpr_count, user_sgpr_idx);
+    eprintln!(
+        "kernel_code_properties=0x{:04x} user_sgprs={} kernarg_at_sgpr={}",
+        kcp, user_sgpr_count, user_sgpr_idx
+    );
 
     // Build PM4
     let mut pm4: Vec<u32> = Vec::new();
@@ -165,7 +196,12 @@ fn main() {
     pm4.push(1); // groups Z = 1
     pm4.push(di);
 
-    eprintln!("PM4: {} dwords, grid=[{},{},1] block=[32,1,1]", pm4.len(), m, n);
+    eprintln!(
+        "PM4: {} dwords, grid=[{},{},1] block=[32,1,1]",
+        pm4.len(),
+        m,
+        n
+    );
 
     // Submit
     let ib_buf = dev.alloc_vram(4096).unwrap();
@@ -173,24 +209,36 @@ fn main() {
     dev.upload(&ib_buf, &ib_bytes).unwrap();
 
     eprintln!("Dispatching GEMM {}x{}x{} ...", m, k_dim, n);
-    match queue.submit_and_wait(&dev, &ib_buf, pm4.len() as u32,
-        &[&ib_buf, &code_buf, &a_buf, &b_buf, &y_buf, &ka_buf])
-    {
+    match queue.submit_and_wait(
+        &dev,
+        &ib_buf,
+        pm4.len() as u32,
+        &[&ib_buf, &code_buf, &a_buf, &b_buf, &y_buf, &ka_buf],
+    ) {
         Ok(()) => eprintln!("GPU returned"),
-        Err(e) => { eprintln!("FAILED: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("FAILED: {e}");
+            std::process::exit(1);
+        }
     }
 
     // Verify
     let mut y_raw = vec![0u8; y_size];
     dev.download(&y_buf, &mut y_raw).unwrap();
-    let y: &[f32] = unsafe { std::slice::from_raw_parts(y_raw.as_ptr() as *const f32, (m * n) as usize) };
+    let y: &[f32] =
+        unsafe { std::slice::from_raw_parts(y_raw.as_ptr() as *const f32, (m * n) as usize) };
 
     let mut bad = 0;
     for i in 0..(m * n) as usize {
         let err = (y[i] - expected[i]).abs();
         let tol = expected[i].abs() * 0.01 + 0.001; // 1% relative + small absolute
         if err > tol {
-            if bad < 5 { eprintln!("  [{i}] got={:.6} exp={:.6} err={:.6}", y[i], expected[i], err); }
+            if bad < 5 {
+                eprintln!(
+                    "  [{i}] got={:.6} exp={:.6} err={:.6}",
+                    y[i], expected[i], err
+                );
+            }
             bad += 1;
         }
     }
@@ -198,12 +246,18 @@ fn main() {
     if bad == 0 {
         eprintln!("\n╔════════════════════════════════════════════════════════╗");
         eprintln!("║  REDLINE: MATMUL KERNEL EXECUTED VIA BARE DRM         ║");
-        eprintln!("║  gemm_f32: {}x{}x{} = {} elements correct{} ║",
-            m, k_dim, n, m*n, " ".repeat(16 - format!("{}x{}x{}", m, k_dim, n).len()));
+        eprintln!(
+            "║  gemm_f32: {}x{}x{} = {} elements correct{} ║",
+            m,
+            k_dim,
+            n,
+            m * n,
+            " ".repeat(16 - format!("{}x{}x{}", m, k_dim, n).len())
+        );
         eprintln!("║  No HIP runtime. No Vulkan. Pure libdrm_amdgpu.       ║");
         eprintln!("╚════════════════════════════════════════════════════════╝");
     } else {
-        eprintln!("{bad}/{} wrong", m*n);
+        eprintln!("{bad}/{} wrong", m * n);
         eprintln!("Y = {:?}", y);
         eprintln!("expected = {:?}", &expected);
     }

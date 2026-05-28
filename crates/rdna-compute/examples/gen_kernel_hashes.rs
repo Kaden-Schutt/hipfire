@@ -22,11 +22,14 @@ fn hash_source(source: &str, arch: &str) -> String {
 
 fn main() {
     let src_dir = Path::new("kernels/src");
-    assert!(src_dir.is_dir(), "Run from repo root (kernels/src/ not found)");
+    assert!(
+        src_dir.is_dir(),
+        "Run from repo root (kernels/src/ not found)"
+    );
 
     // Read turbo_common preamble (prepended to turbo kernels by ensure_turbo_kernel)
-    let turbo_common = std::fs::read_to_string(src_dir.join("turbo_common.hip"))
-        .unwrap_or_default();
+    let turbo_common =
+        std::fs::read_to_string(src_dir.join("turbo_common.hip")).unwrap_or_default();
 
     // Collect all generic kernel sources (skip arch-specific variants like *.gfx1100.hip)
     let mut kernel_sources: Vec<(String, String)> = Vec::new();
@@ -71,7 +74,9 @@ fn main() {
     kernel_sources.sort_by(|a, b| a.0.cmp(&b.0));
     rdna2_variant_sources.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let archs = ["gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201"];
+    let archs = [
+        "gfx906", "gfx1010", "gfx1030", "gfx1100", "gfx1200", "gfx1201",
+    ];
 
     let mut written = 0;
     let mut skipped = 0;

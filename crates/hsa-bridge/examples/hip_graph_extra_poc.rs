@@ -38,8 +38,17 @@ type HipGraphExec = *mut c_void;
 struct DirectHip {
     _lib: Library,
     fn_module_launch_kernel: unsafe extern "C" fn(
-        HipFunction, u32, u32, u32, u32, u32, u32, u32, HipStream,
-        *mut *mut c_void, *mut *mut c_void,
+        HipFunction,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        HipStream,
+        *mut *mut c_void,
+        *mut *mut c_void,
     ) -> u32,
 }
 
@@ -49,13 +58,25 @@ impl DirectHip {
         let fn_module_launch_kernel = unsafe {
             let sym: libloading::Symbol<
                 unsafe extern "C" fn(
-                    HipFunction, u32, u32, u32, u32, u32, u32, u32, HipStream,
-                    *mut *mut c_void, *mut *mut c_void,
+                    HipFunction,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    u32,
+                    HipStream,
+                    *mut *mut c_void,
+                    *mut *mut c_void,
                 ) -> u32,
             > = lib.get(b"hipModuleLaunchKernel").unwrap();
             *sym.into_raw()
         };
-        Self { _lib: lib, fn_module_launch_kernel }
+        Self {
+            _lib: lib,
+            fn_module_launch_kernel,
+        }
     }
 }
 
@@ -142,8 +163,12 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         unsafe {
             (direct.fn_module_launch_kernel)(
                 kernel_handle(&kernel),
-                ((n + 255) / 256) as u32, 1, 1,
-                256, 1, 1,
+                ((n + 255) / 256) as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
                 0,
                 stream,
                 std::ptr::null_mut(),
@@ -193,12 +218,18 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
     let bad = (0..n as usize)
         .filter(|&i| (graph_out[i] - reference[i]).abs() > 1e-3)
         .count();
-    eprintln!("  graph replay vs reference: {}/{} match", n as usize - bad, n);
+    eprintln!(
+        "  graph replay vs reference: {}/{} match",
+        n as usize - bad,
+        n
+    );
     if bad > 0 {
         for i in 0..8 {
             eprintln!(
                 "    [{i}] graph={} ref={} delta={}",
-                graph_out[i], reference[i], graph_out[i] - reference[i]
+                graph_out[i],
+                reference[i],
+                graph_out[i] - reference[i]
             );
         }
         std::process::exit(1);
@@ -255,9 +286,8 @@ __global__ void vector_add(const float* a, const float* b, float* c, int n) {
         hip.stream_synchronize(&stream_n).unwrap();
         let mut c_check = vec![0u8; nbytes];
         hip.memcpy_dtoh(&mut c_check, &c_buf).unwrap();
-        let cf: &[f32] = unsafe {
-            std::slice::from_raw_parts(c_check.as_ptr() as *const f32, n as usize)
-        };
+        let cf: &[f32] =
+            unsafe { std::slice::from_raw_parts(c_check.as_ptr() as *const f32, n as usize) };
         let bad = (0..n as usize)
             .filter(|&i| (cf[i] - (i as f32) * 3.0).abs() > 1e-3)
             .count();
@@ -329,14 +359,20 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
             ])
             .output()
             .expect("hipcc");
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     let mul_hsaco = std::fs::read("/tmp/hip_graph_mul.hsaco").unwrap();
     let sa_hsaco = std::fs::read("/tmp/hip_graph_sa.hsaco").unwrap();
     let mul_module = hip.module_load_data(&mul_hsaco).unwrap();
     let sa_module = hip.module_load_data(&sa_hsaco).unwrap();
     let mul_kernel = hip.module_get_function(&mul_module, "vector_mul").unwrap();
-    let sa_kernel = hip.module_get_function(&sa_module, "vector_scale_add").unwrap();
+    let sa_kernel = hip
+        .module_get_function(&sa_module, "vector_scale_add")
+        .unwrap();
 
     // Build helper closures for each kernel — same kernarg layout (32 bytes).
     // We need separate kernarg buffers per kernel since the values differ.
@@ -349,18 +385,24 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
     let mut sz_mul: usize = 32;
     let mut sz_sa: usize = 32;
     let mut extra_add: Vec<*mut c_void> = vec![
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, ka_add.as_mut_ptr() as *mut c_void,
-        HIP_LAUNCH_PARAM_BUFFER_SIZE, &mut sz_add as *mut _ as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        ka_add.as_mut_ptr() as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        &mut sz_add as *mut _ as *mut c_void,
         HIP_LAUNCH_PARAM_END,
     ];
     let mut extra_mul: Vec<*mut c_void> = vec![
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, ka_mul.as_mut_ptr() as *mut c_void,
-        HIP_LAUNCH_PARAM_BUFFER_SIZE, &mut sz_mul as *mut _ as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        ka_mul.as_mut_ptr() as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        &mut sz_mul as *mut _ as *mut c_void,
         HIP_LAUNCH_PARAM_END,
     ];
     let mut extra_sa: Vec<*mut c_void> = vec![
-        HIP_LAUNCH_PARAM_BUFFER_POINTER, ka_sa.as_mut_ptr() as *mut c_void,
-        HIP_LAUNCH_PARAM_BUFFER_SIZE, &mut sz_sa as *mut _ as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_POINTER,
+        ka_sa.as_mut_ptr() as *mut c_void,
+        HIP_LAUNCH_PARAM_BUFFER_SIZE,
+        &mut sz_sa as *mut _ as *mut c_void,
         HIP_LAUNCH_PARAM_END,
     ];
 
@@ -369,8 +411,16 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
         unsafe {
             (direct2.fn_module_launch_kernel)(
                 kernel_handle(&kernel),
-                ((n + 255) / 256) as u32, 1, 1, 256, 1, 1, 0, s,
-                std::ptr::null_mut(), extra_add.as_mut_ptr(),
+                ((n + 255) / 256) as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                s,
+                std::ptr::null_mut(),
+                extra_add.as_mut_ptr(),
             )
         }
     };
@@ -378,8 +428,16 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
         unsafe {
             (direct2.fn_module_launch_kernel)(
                 kernel_handle(&mul_kernel),
-                ((n + 255) / 256) as u32, 1, 1, 256, 1, 1, 0, s,
-                std::ptr::null_mut(), extra_mul.as_mut_ptr(),
+                ((n + 255) / 256) as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                s,
+                std::ptr::null_mut(),
+                extra_mul.as_mut_ptr(),
             )
         }
     };
@@ -387,8 +445,16 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
         unsafe {
             (direct2.fn_module_launch_kernel)(
                 kernel_handle(&sa_kernel),
-                ((n + 255) / 256) as u32, 1, 1, 256, 1, 1, 0, s,
-                std::ptr::null_mut(), extra_sa.as_mut_ptr(),
+                ((n + 255) / 256) as u32,
+                1,
+                1,
+                256,
+                1,
+                1,
+                0,
+                s,
+                std::ptr::null_mut(),
+                extra_sa.as_mut_ptr(),
             )
         }
     };
@@ -400,9 +466,15 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
         for _ in 0..30 {
             for i in 0..n_kernels {
                 match i % 3 {
-                    0 => { let _ = launch_add(stream_handle(&stream_m)); }
-                    1 => { let _ = launch_mul(stream_handle(&stream_m)); }
-                    _ => { let _ = launch_sa(stream_handle(&stream_m)); }
+                    0 => {
+                        let _ = launch_add(stream_handle(&stream_m));
+                    }
+                    1 => {
+                        let _ = launch_mul(stream_handle(&stream_m));
+                    }
+                    _ => {
+                        let _ = launch_sa(stream_handle(&stream_m));
+                    }
                 }
             }
         }
@@ -413,9 +485,15 @@ __global__ void vector_scale_add(const float* a, const float* b, float* c, int n
         for _ in 0..replays {
             for i in 0..n_kernels {
                 match i % 3 {
-                    0 => { let _ = launch_add(stream_handle(&stream_m)); }
-                    1 => { let _ = launch_mul(stream_handle(&stream_m)); }
-                    _ => { let _ = launch_sa(stream_handle(&stream_m)); }
+                    0 => {
+                        let _ = launch_add(stream_handle(&stream_m));
+                    }
+                    1 => {
+                        let _ = launch_mul(stream_handle(&stream_m));
+                    }
+                    _ => {
+                        let _ = launch_sa(stream_handle(&stream_m));
+                    }
                 }
             }
         }

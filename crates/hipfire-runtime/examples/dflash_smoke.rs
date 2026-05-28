@@ -74,7 +74,8 @@ fn main() {
     eprintln!("weights loaded in {:.2}s", t0.elapsed().as_secs_f64());
 
     let t1 = Instant::now();
-    let mut scratch = DflashScratch::new(&mut gpu, &cfg, block_size, ctx_len).expect("alloc scratch");
+    let mut scratch =
+        DflashScratch::new(&mut gpu, &cfg, block_size, ctx_len).expect("alloc scratch");
     eprintln!("scratch allocated in {:.3}s", t1.elapsed().as_secs_f64());
 
     // Synthesize a deterministic input: seeded noise for noise_embedding and
@@ -125,9 +126,12 @@ fn main() {
     eprintln!("output shape: [{rows}, {cols}]  (len={})", out.len());
     let finite_count = out.iter().take(1024).filter(|v| v.is_finite()).count();
     eprintln!("first-1024 finite: {finite_count}/1024");
-    let (mn, mx) = out.iter().take(1024).fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &v| {
-        (mn.min(v), mx.max(v))
-    });
+    let (mn, mx) = out
+        .iter()
+        .take(1024)
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(mn, mx), &v| {
+            (mn.min(v), mx.max(v))
+        });
     eprintln!("first-1024 min/max: {mn:.6e} / {mx:.6e}");
 
     if finite_count < 1024 {

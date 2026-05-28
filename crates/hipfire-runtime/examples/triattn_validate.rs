@@ -19,15 +19,19 @@
 //! GPU kernel.
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("build with --features deltanet"); }
+fn main() {
+    eprintln!("build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
-    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, LayerType, Qwen35Scratch};
     use hipfire_runtime::tokenizer::Tokenizer;
-    use hipfire_runtime::triattn::{self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters};
+    use hipfire_runtime::triattn::{
+        self, BandCenter, TriAttnCalibState, TriAttnCapture, TriAttnCenters,
+    };
     use std::path::Path;
     use std::time::Instant;
 
@@ -61,15 +65,42 @@ fn main() {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--sidecar" => { sidecar_path = Some(args[i + 1].clone()); i += 2; }
-            "--corpus" => { corpus_path = Some(args[i + 1].clone()); i += 2; }
-            "--max-tokens" => { max_tokens = args[i + 1].parse().unwrap(); i += 2; }
-            "--chunk-len" => { chunk_len = args[i + 1].parse().unwrap(); i += 2; }
-            "--val-prompt" => { validation_prompt = args[i + 1].clone(); i += 2; }
-            "--load-sidecar" => { load_sidecar = true; i += 1; }
-            "--gpu-calib" => { gpu_calib = true; i += 1; }
-            "--cpu-calib" => { gpu_calib = false; i += 1; }
-            s if !s.starts_with("--") && model_path.is_none() => { model_path = Some(s.to_string()); i += 1; }
+            "--sidecar" => {
+                sidecar_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--corpus" => {
+                corpus_path = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--max-tokens" => {
+                max_tokens = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--chunk-len" => {
+                chunk_len = args[i + 1].parse().unwrap();
+                i += 2;
+            }
+            "--val-prompt" => {
+                validation_prompt = args[i + 1].clone();
+                i += 2;
+            }
+            "--load-sidecar" => {
+                load_sidecar = true;
+                i += 1;
+            }
+            "--gpu-calib" => {
+                gpu_calib = true;
+                i += 1;
+            }
+            "--cpu-calib" => {
+                gpu_calib = false;
+                i += 1;
+            }
+            s if !s.starts_with("--") && model_path.is_none() => {
+                model_path = Some(s.to_string());
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg: {other}\nUsage: triattn_validate <model.mq4> [--sidecar PATH] [--corpus TXT] [--max-tokens N] [--chunk-len N] [--val-prompt STR] [--load-sidecar] [--gpu-calib | --cpu-calib]");
                 std::process::exit(1);
@@ -101,11 +132,18 @@ fn main() {
         "The Constitution of the United States was ratified in 1788.",
         "Shakespeare wrote thirty-seven plays and over a hundred sonnets.",
         "Pythagoras proved that a squared plus b squared equals c squared.",
-    ].iter().map(|s| s.to_string()).collect();
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let calibration_chunks: Vec<String> = if let Some(path) = &corpus_path {
         let text = std::fs::read_to_string(path).expect("read corpus");
         // Chunk by paragraphs first, then merge small paragraphs up to chunk_len.
-        let paras: Vec<&str> = text.split("\n\n").map(|p| p.trim()).filter(|p| !p.is_empty()).collect();
+        let paras: Vec<&str> = text
+            .split("\n\n")
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .collect();
         let mut out: Vec<String> = Vec::new();
         for p in paras {
             // Very rough token estimate: 4 chars/token. Keep chunks comfortably
@@ -118,7 +156,9 @@ fn main() {
                 let mut cur = String::new();
                 for s in p.split(". ") {
                     let s_trim = s.trim();
-                    if s_trim.is_empty() { continue; }
+                    if s_trim.is_empty() {
+                        continue;
+                    }
                     let cand_len = (cur.len() + s_trim.len() + 2) / 4;
                     if cand_len > chunk_len && !cur.is_empty() {
                         out.push(cur.trim().to_string());
@@ -127,7 +167,9 @@ fn main() {
                     cur.push_str(s_trim);
                     cur.push_str(". ");
                 }
-                if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+                if !cur.trim().is_empty() {
+                    out.push(cur.trim().to_string());
+                }
             }
         }
         eprintln!("corpus: {} chunks from {path}", out.len());
@@ -164,8 +206,13 @@ fn main() {
 
     let kv_seq = 512usize;
     let mut kv = KvCache::new_gpu_q8(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_seq,
-    ).expect("kv q8");
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        kv_seq,
+    )
+    .expect("kv q8");
     let mut dn = DeltaNetState::new(&mut gpu, &config).expect("dn");
     let scratch = Qwen35Scratch::new(&mut gpu, &config, 128).expect("scratch");
 
@@ -175,14 +222,21 @@ fn main() {
         let c = TriAttnCenters::load(Path::new(&sidecar_path)).expect("load sidecar");
         eprintln!(
             "loaded: n_layers={} n_heads={} n_bands={} head_dim={}",
-            c.n_layers, c.n_heads, c.n_bands(), c.head_dim,
+            c.n_layers,
+            c.n_heads,
+            c.n_bands(),
+            c.head_dim,
         );
         c
     } else {
         eprintln!(
             "calibration: {} prompts, {} FA layers × {} heads × {} bands",
             calibration_prompts.len(),
-            config.layer_types.iter().filter(|t| **t == LayerType::FullAttention).count(),
+            config
+                .layer_types
+                .iter()
+                .filter(|t| **t == LayerType::FullAttention)
+                .count(),
             config.n_heads,
             config.head_dim / 2,
         );
@@ -195,15 +249,22 @@ fn main() {
             eprintln!("calibration path: GPU (kernel triattn_accumulate_f32) [opt-in]");
             let gpu_state = triattn::TriAttnCalibStateGpu::new(
                 &mut gpu,
-                config.n_layers, config.n_heads, config.head_dim,
-                config.rope_theta, config.partial_rotary_factor,
-            ).expect("alloc GPU calib state");
+                config.n_layers,
+                config.n_heads,
+                config.head_dim,
+                config.rope_theta,
+                config.partial_rotary_factor,
+            )
+            .expect("alloc GPU calib state");
             triattn::install_tap_gpu(gpu_state);
         } else {
             eprintln!("calibration path: CPU (--cpu-calib)");
             let calib_state = TriAttnCalibState::new(
-                config.n_layers, config.n_heads, config.head_dim,
-                config.rope_theta, config.partial_rotary_factor,
+                config.n_layers,
+                config.n_heads,
+                config.head_dim,
+                config.rope_theta,
+                config.partial_rotary_factor,
             );
             triattn::install_tap(calib_state);
         }
@@ -242,35 +303,46 @@ fn main() {
                 // Oversize by 2× to absorb short chunks (ChatML system
                 // turns are often 30-100 tokens, well under max_eff).
                 let take = (est.saturating_mul(2)).min(calibration_prompts.len() - start);
-                if take == 0 { break; }
+                if take == 0 {
+                    break;
+                }
                 let end = start + take;
                 let mut new_chunks: Vec<Vec<u32>> = calibration_prompts[start..end]
                     .par_iter()
                     .map(|p| {
                         let s: &str = if p.len() > max_chars {
                             let mut bend = max_chars;
-                            while bend > 0 && !p.is_char_boundary(bend) { bend -= 1; }
+                            while bend > 0 && !p.is_char_boundary(bend) {
+                                bend -= 1;
+                            }
                             &p[..bend]
                         } else {
                             &p[..]
                         };
                         let mut t = tok.encode(s);
-                        if t.len() > max_eff { t.truncate(max_eff); }
+                        if t.len() > max_eff {
+                            t.truncate(max_eff);
+                        }
                         t
                     })
                     .collect();
                 start = end;
                 for toks in new_chunks.drain(..) {
                     let effective = toks.len().min(max_eff);
-                    if effective == 0 { continue; }
+                    if effective == 0 {
+                        continue;
+                    }
                     covered = covered.saturating_add(effective);
                     acc.push(toks);
-                    if covered >= max_tokens { break; }
+                    if covered >= max_tokens {
+                        break;
+                    }
                 }
             }
             acc
         };
-        let covered_tokens = prompt_tokens.iter()
+        let covered_tokens = prompt_tokens
+            .iter()
             .map(|t| t.len().min(kv_seq.saturating_sub(4)))
             .sum::<usize>();
         let pretok_ms = pretok_t0.elapsed().as_secs_f64() * 1000.0;
@@ -288,25 +360,49 @@ fn main() {
         'outer: for (pi, tokens) in prompt_tokens.iter().enumerate() {
             let chunk_t0 = Instant::now();
             let memset_t0 = Instant::now();
-            for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-            for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-            for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-            for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-            for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+            for buf in kv.k_gpu.iter() {
+                let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size());
+            }
+            for buf in kv.v_gpu.iter() {
+                let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size());
+            }
+            for t in &dn.s_matrices {
+                let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+            }
+            for t in &dn.s_scales {
+                let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+            }
+            for t in &dn.conv_states {
+                let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+            }
             let memset_ms = memset_t0.elapsed().as_secs_f64() * 1000.0;
             let max_len = tokens.len().min(kv_seq.saturating_sub(4));
             let remaining = max_tokens.saturating_sub(total_tokens);
             let take_len = max_len.min(remaining);
-            if take_len == 0 { break 'outer; }
+            if take_len == 0 {
+                break 'outer;
+            }
             let fwd_t0 = Instant::now();
             qwen35::forward_prefill_batch(
-                &mut gpu, &weights, &config, &tokens[..take_len], 0,
-                &mut kv, &mut dn, &scratch,
-                None, None, None, None,
-            ).expect("calib batched forward");
+                &mut gpu,
+                &weights,
+                &config,
+                &tokens[..take_len],
+                0,
+                &mut kv,
+                &mut dn,
+                &scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("calib batched forward");
             // Force the device to drain so the timing reflects real GPU work,
             // not just queued kernels — Phase 1 attribution depends on this.
-            if calib_profile { let _ = gpu.hip.device_synchronize(); }
+            if calib_profile {
+                let _ = gpu.hip.device_synchronize();
+            }
             let forward_ms = fwd_t0.elapsed().as_secs_f64() * 1000.0;
             let total_ms = chunk_t0.elapsed().as_secs_f64() * 1000.0;
             total_tokens += take_len;
@@ -315,9 +411,16 @@ fn main() {
                     "[CALIB_PROFILE] {pi},{take_len},{memset_ms:.3},{forward_ms:.3},{total_ms:.3},{total_tokens}",
                 );
             } else if pi % 10 == 0 || pi + 1 == calibration_prompts.len() {
-                eprintln!("  chunk {}/{}: cumulative {} tokens", pi + 1, calibration_prompts.len(), total_tokens);
+                eprintln!(
+                    "  chunk {}/{}: cumulative {} tokens",
+                    pi + 1,
+                    calibration_prompts.len(),
+                    total_tokens
+                );
             }
-            if total_tokens >= max_tokens { break 'outer; }
+            if total_tokens >= max_tokens {
+                break 'outer;
+            }
         }
         let calib_loop_ms = calib_t0.elapsed().as_secs_f64() * 1000.0;
 
@@ -347,11 +450,21 @@ fn main() {
     // ── Phase 2: Full capture on validation prompt ─────────────────────
     // Fresh KV + DN state so the captured Qs line up with token positions
     // starting at 0.
-    for buf in kv.k_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-    for buf in kv.v_gpu.iter() { let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size()); }
-    for t in &dn.s_matrices { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-    for t in &dn.s_scales { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
-    for t in &dn.conv_states { let _ = gpu.hip.memset(&t.buf, 0, t.buf.size()); }
+    for buf in kv.k_gpu.iter() {
+        let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size());
+    }
+    for buf in kv.v_gpu.iter() {
+        let _ = gpu.hip.memset(&buf.buf, 0, buf.buf.size());
+    }
+    for t in &dn.s_matrices {
+        let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+    }
+    for t in &dn.s_scales {
+        let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+    }
+    for t in &dn.conv_states {
+        let _ = gpu.hip.memset(&t.buf, 0, t.buf.size());
+    }
 
     // Destroy any cached hipGraph from Phase 1. The TriAttn capture tap
     // does synchronous D2H copies (gpu::download_f32) which are incompatible
@@ -371,9 +484,9 @@ fn main() {
         // D2H copy inside the TriAttn capture tap).
         gpu.ar_forward_warmed_up = false;
         qwen35::forward_scratch(
-            &mut gpu, &weights, &config, *tid, pos,
-            &mut kv, &mut dn, &scratch,
-        ).expect("val forward");
+            &mut gpu, &weights, &config, *tid, pos, &mut kv, &mut dn, &scratch,
+        )
+        .expect("val forward");
         triattn::capture_finish_token();
     }
     let capture = triattn::take_capture().expect("capture still installed");
@@ -397,7 +510,9 @@ fn main() {
         let mut per_layer_r: Vec<f32> = Vec::new();
         for (fa_pos, &layer_idx) in capture.layer_ids_per_token[last].iter().enumerate() {
             // Ignore layers that aren't FA (those arrays are empty).
-            if capture.q_samples[last][fa_pos].is_empty() { continue; }
+            if capture.q_samples[last][fa_pos].is_empty() {
+                continue;
+            }
             let q_last = &capture.q_samples[last][fa_pos];
             assert_eq!(q_last.len(), config.n_heads * config.head_dim);
 
@@ -413,9 +528,13 @@ fn main() {
                 let mut actual = Vec::with_capacity(val_len);
 
                 for i in 0..val_len {
-                    if capture.k_samples[i].is_empty() { continue; }
+                    if capture.k_samples[i].is_empty() {
+                        continue;
+                    }
                     let k_row = &capture.k_samples[i][fa_pos];
-                    if k_row.is_empty() { continue; }
+                    if k_row.is_empty() {
+                        continue;
+                    }
                     let k_head = &k_row[h_kv * config.head_dim..(h_kv + 1) * config.head_dim];
 
                     // Ground truth: dot product of post-RoPE Q and post-RoPE K
@@ -423,13 +542,16 @@ fn main() {
                     // so correlation of logits ≈ correlation of softmaxed).
                     let k_post = apply_rope(k_head, i as f32, d_rot, config.rope_theta);
                     let mut dot = 0.0f32;
-                    for d in 0..config.head_dim { dot += q_post[d] * k_post[d]; }
+                    for d in 0..config.head_dim {
+                        dot += q_post[d] * k_post[d];
+                    }
                     actual.push(dot);
 
                     // TriAttn prediction (post-RoPE path, uses stored post-RoPE K).
                     let centers_slice = center_slice(&centers, layer_idx, h);
                     let k_post_bands = triattn::kpost_per_band(&k_post);
-                    let s = triattn::s_total(centers_slice, &k_post_bands, p_q, |f| centers.omega(f));
+                    let s =
+                        triattn::s_total(centers_slice, &k_post_bands, p_q, |f| centers.omega(f));
                     predicted.push(s);
                 }
 
@@ -438,8 +560,13 @@ fn main() {
             }
 
             let mean_r: f32 = per_head_r.iter().sum::<f32>() / per_head_r.len() as f32;
-            let (min_r, max_r) = per_head_r.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &r| (lo.min(r), hi.max(r)));
-            let pct_above_05 = per_head_r.iter().filter(|&&r| r > 0.5).count() as f32 * 100.0 / per_head_r.len() as f32;
+            let (min_r, max_r) = per_head_r
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &r| {
+                    (lo.min(r), hi.max(r))
+                });
+            let pct_above_05 = per_head_r.iter().filter(|&&r| r > 0.5).count() as f32 * 100.0
+                / per_head_r.len() as f32;
             eprintln!(
                 "layer {layer_idx:2}: r̄={mean_r:.3}  [{min_r:.3}, {max_r:.3}]  {pct_above_05:.0}% of heads > 0.5",
             );
@@ -492,11 +619,14 @@ fn main() {
                 }
             }
         }
-        if mrls.is_empty() { return; }
+        if mrls.is_empty() {
+            return;
+        }
         mrls.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mean: f32 = mrls.iter().sum::<f32>() / mrls.len() as f32;
         let median = mrls[mrls.len() / 2];
-        let pct_above_095 = mrls.iter().filter(|&&r| r > 0.95).count() as f32 * 100.0 / mrls.len() as f32;
+        let pct_above_095 =
+            mrls.iter().filter(|&&r| r > 0.95).count() as f32 * 100.0 / mrls.len() as f32;
         eprintln!(
             "Mean Resultant Length R_f across all (layer, head, band): mean={mean:.3}, median={median:.3}, {pct_above_095:.1}% > 0.95",
         );

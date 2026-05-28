@@ -12,7 +12,7 @@
 //! Run:
 //!   cargo run --release -p rdna-compute --example test_moe_grouped_mmq_gfx12
 
-use rdna_compute::{Gpu, GpuTensor, DType};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 fn lcg(state: &mut u32) -> u32 {
     *state = state.wrapping_mul(1103515245).wrapping_add(12345);
@@ -28,9 +28,8 @@ fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
 }
 
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len()], DType::F32)
         .expect("alloc_tensor f32");
@@ -39,9 +38,8 @@ fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
 }
 
 fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     let t = gpu
         .alloc_tensor(&[data.len() * 4], DType::Raw)
         .expect("alloc_tensor i32");
@@ -50,9 +48,8 @@ fn upload_i32(gpu: &mut Gpu, data: &[i32]) -> GpuTensor {
 }
 
 fn upload_u64(gpu: &mut Gpu, data: &[u64]) -> GpuTensor {
-    let bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8)
-    };
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 8) };
     let t = gpu
         .alloc_tensor(&[data.len() * 8], DType::Raw)
         .expect("alloc_tensor u64");
@@ -68,10 +65,11 @@ fn alloc_f32_zeros(gpu: &mut Gpu, n: usize) -> GpuTensor {
 
 fn download_f32(gpu: &Gpu, tensor: &GpuTensor, n: usize) -> Vec<f32> {
     let mut data = vec![0f32; n];
-    let bytes: &mut [u8] = unsafe {
-        std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4)
-    };
-    gpu.hip.memcpy_dtoh(bytes, &tensor.buf).expect("memcpy_dtoh f32");
+    let bytes: &mut [u8] =
+        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip
+        .memcpy_dtoh(bytes, &tensor.buf)
+        .expect("memcpy_dtoh f32");
     data
 }
 
@@ -123,7 +121,10 @@ fn run_case(
     rtol: f32,
     atol: f32,
 ) {
-    println!("=== {} | M={} K={} m_total={} E={} ===", label, m, k, m_total, num_experts);
+    println!(
+        "=== {} | M={} K={} m_total={} E={} ===",
+        label, m, k, m_total, num_experts
+    );
     assert!(m % 16 == 0, "M must be a multiple of 16");
     assert!(m_total % 16 == 0, "m_total must be a multiple of 16");
     assert!(k % 256 == 0, "K must be a multiple of 256");
@@ -131,7 +132,10 @@ fn run_case(
     let mut gpu = Gpu::init().expect("Gpu::init");
     let arch = gpu.arch.clone();
     if !arch.starts_with("gfx12") {
-        println!("  SKIP — arch {} is not gfx12; i8 MMQ MoE grouped kernel only registered for gfx12", arch);
+        println!(
+            "  SKIP — arch {} is not gfx12; i8 MMQ MoE grouped kernel only registered for gfx12",
+            arch
+        );
         return;
     }
 
@@ -171,10 +175,11 @@ fn run_case(
         &y_fp16,
         m,
         k,
-        1,       // x_row_div
+        1, // x_row_div
         m_total,
         m_total, // x_src_rows
-    ).expect("FP16 kernel launch");
+    )
+    .expect("FP16 kernel launch");
     gpu.hip.device_synchronize().expect("sync after FP16");
     std::env::remove_var("HIPFIRE_MOE_GROUPED_I8");
 
@@ -191,7 +196,8 @@ fn run_case(
         1,
         m_total,
         m_total,
-    ).expect("i8 MMQ kernel launch");
+    )
+    .expect("i8 MMQ kernel launch");
     gpu.hip.device_synchronize().expect("sync after i8 MMQ");
 
     let y_fp16_v = download_f32(&gpu, &y_fp16, m_total * m);
@@ -207,8 +213,14 @@ fn run_case(
     for (i, (a, b)) in y_fp16_v.iter().zip(y_i8_v.iter()).enumerate() {
         let d = (a - b).abs();
         let r = if a.abs() > 1e-6 { d / a.abs() } else { d };
-        if d > max_abs { max_abs = d; argmax_abs = i; }
-        if r > max_rel { max_rel = r; argmax_rel = i; }
+        if d > max_abs {
+            max_abs = d;
+            argmax_abs = i;
+        }
+        if r > max_rel {
+            max_rel = r;
+            argmax_rel = i;
+        }
         sum_sq_err += (d as f64) * (d as f64);
         sum_sq_ref += (*a as f64) * (*a as f64);
     }
@@ -248,11 +260,41 @@ fn main() {
     // one Q8_1 block).
     run_case("toy", 16, 512, 16, 1, 0xDEAD_BEEF, 0xCAFE_BABE, 0.03, 0.01);
     // Small: 2 experts, 2 tile_y, M=64 K=512 m_total=32.
-    run_case("small", 64, 512, 32, 2, 0x1234_5678, 0x8765_4321, 0.03, 0.01);
+    run_case(
+        "small",
+        64,
+        512,
+        32,
+        2,
+        0x1234_5678,
+        0x8765_4321,
+        0.03,
+        0.01,
+    );
     // Medium: 4 experts, 4 tile_y, M=128 K=1024 m_total=64.
-    run_case("medium", 128, 1024, 64, 4, 0x0F0F_0F0F, 0xF0F0_F0F0, 0.03, 0.01);
+    run_case(
+        "medium",
+        128,
+        1024,
+        64,
+        4,
+        0x0F0F_0F0F,
+        0xF0F0_F0F0,
+        0.03,
+        0.01,
+    );
     // A3B-shaped slice: M=768 (per-expert gate_up/2), K=7168, m_total=256.
-    run_case("a3b-slice", 768, 7168, 256, 8, 0x4242_4242, 0x2424_2424, 0.03, 0.01);
+    run_case(
+        "a3b-slice",
+        768,
+        7168,
+        256,
+        8,
+        0x4242_4242,
+        0x2424_2424,
+        0.03,
+        0.01,
+    );
 
     println!("\nAll cases PASS.");
 }

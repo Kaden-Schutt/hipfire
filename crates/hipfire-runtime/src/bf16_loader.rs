@@ -144,10 +144,20 @@ pub fn load_bf16_model(_gpu: &mut Gpu, model_dir: &Path) -> HipResult<TrunkBF16>
 #[allow(dead_code)]
 pub fn is_gptq_target(name: &str) -> bool {
     const TARGETS: &[&str] = &[
-        "q_proj", "k_proj", "v_proj", "qkv_proj",
-        "o_proj", "out_proj",
-        "gate_proj", "up_proj", "down_proj", "gate_up_proj",
-        "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b",
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "gate_up_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
         "gate",
     ];
     // Strip a trailing `.weight` (HF safetensors stores Linear weights
@@ -189,8 +199,12 @@ mod tests {
 
     #[test]
     fn gptq_target_recognizes_deltanet_projections() {
-        assert!(is_gptq_target("model.layers.0.linear_attn.in_proj_qkv.weight"));
-        assert!(is_gptq_target("model.layers.0.linear_attn.in_proj_z.weight"));
+        assert!(is_gptq_target(
+            "model.layers.0.linear_attn.in_proj_qkv.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.layers.0.linear_attn.in_proj_z.weight"
+        ));
         assert!(is_gptq_target("model.layers.0.linear_attn.out_proj.weight"));
     }
 }

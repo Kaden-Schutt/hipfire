@@ -6,12 +6,14 @@
 //! Usage: hipfire-run <model.hfq> [--system "prompt"] [--kv givens4|givens2]
 
 #[cfg(not(feature = "deltanet"))]
-fn main() { eprintln!("Build with --features deltanet"); }
+fn main() {
+    eprintln!("Build with --features deltanet");
+}
 
 #[cfg(feature = "deltanet")]
 fn main() {
-    use hipfire_runtime::hfq::HfqFile;
     use hipfire_arch_qwen35::qwen35;
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama;
     use std::io::Write;
     use std::path::Path;
@@ -65,17 +67,45 @@ fn main() {
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
-            "--system" | "-s" => { i += 1; system_prompt = Some(args[i].clone()); }
-            "--kv" => { i += 1; kv_mode_str = args[i].clone(); }
-            "--fp32-state" => { state_quant = qwen35::StateQuant::FP32; }
-            "--q8-state" => { state_quant = qwen35::StateQuant::Q8; }
-            "--q4-state" => { state_quant = qwen35::StateQuant::Q4; }
-            "--temp" => { i += 1; temp = args[i].parse().unwrap_or(0.3); }
-            "--max-seq" => { i += 1; max_seq = args[i].parse().unwrap_or(4096); }
-            "--draft-model" => { i += 1; draft_model = Some(args[i].clone()); }
-            "--speculative" => { speculative = true; }
-            "--spec-k" => { i += 1; spec_k = args[i].parse().unwrap_or(4).max(1); }
-            "--no-penalty" => { no_penalty = true; }
+            "--system" | "-s" => {
+                i += 1;
+                system_prompt = Some(args[i].clone());
+            }
+            "--kv" => {
+                i += 1;
+                kv_mode_str = args[i].clone();
+            }
+            "--fp32-state" => {
+                state_quant = qwen35::StateQuant::FP32;
+            }
+            "--q8-state" => {
+                state_quant = qwen35::StateQuant::Q8;
+            }
+            "--q4-state" => {
+                state_quant = qwen35::StateQuant::Q4;
+            }
+            "--temp" => {
+                i += 1;
+                temp = args[i].parse().unwrap_or(0.3);
+            }
+            "--max-seq" => {
+                i += 1;
+                max_seq = args[i].parse().unwrap_or(4096);
+            }
+            "--draft-model" => {
+                i += 1;
+                draft_model = Some(args[i].clone());
+            }
+            "--speculative" => {
+                speculative = true;
+            }
+            "--spec-k" => {
+                i += 1;
+                spec_k = args[i].parse().unwrap_or(4).max(1);
+            }
+            "--no-penalty" => {
+                no_penalty = true;
+            }
             _ => {}
         }
         i += 1;
@@ -95,11 +125,16 @@ fn main() {
     eprintln!("KV cache: {kv_mode_str}");
     let target_kv_mode = KvMode::Q8;
     let target_cfg = ModelSlotConfig {
-        max_seq, kv_mode: target_kv_mode, repeat_window: 128, state_quant,
+        max_seq,
+        kv_mode: target_kv_mode,
+        repeat_window: 128,
+        state_quant,
     };
     let mut target_slot = ModelSlot::load(&mut gpu, Path::new(model_path), "target", target_cfg)
         .expect("failed to load target model");
-    let tokenizer = target_slot.load_tokenizer().expect("failed to load tokenizer");
+    let tokenizer = target_slot
+        .load_tokenizer()
+        .expect("failed to load tokenizer");
 
     // Optional draft model slot (Phase 1 of speculative decode). Validated for
     // tokenizer compatibility, smoke-tested, then parked. The REPL still runs
@@ -121,7 +156,9 @@ fn main() {
             .expect("failed to load draft model");
 
         // Tokenizer compatibility check (vocab size + probe round-trip).
-        let draft_tok = slot.load_tokenizer().expect("draft has no tokenizer in HFQ metadata");
+        let draft_tok = slot
+            .load_tokenizer()
+            .expect("draft has no tokenizer in HFQ metadata");
         assert_eq!(
             tokenizer.vocab_size(), draft_tok.vocab_size(),
             "tokenizer mismatch: target vocab={} draft vocab={} — speculative decode requires identical vocabularies",
@@ -129,13 +166,15 @@ fn main() {
         );
         let probe = "<|im_start|>user\nHello world\n<|im_end|>";
         assert_eq!(
-            tokenizer.encode(probe), draft_tok.encode(probe),
+            tokenizer.encode(probe),
+            draft_tok.encode(probe),
             "tokenizer merge rules diverge between target and draft"
         );
 
         // Smoke test: 8 forward passes with a placeholder token. Must produce finite logits.
         for pos in 0..8 {
-            slot.forward(&mut gpu, 1u32, pos).expect("draft smoke-test forward failed");
+            slot.forward(&mut gpu, 1u32, pos)
+                .expect("draft smoke-test forward failed");
         }
         let draft_logits = gpu.download_f32(&slot.scratch.logits).unwrap();
         let draft_ok = draft_logits.iter().take(1024).all(|x| x.is_finite());
@@ -173,10 +212,27 @@ fn main() {
         );
     }
 
-    eprintln!("Model: {} layers, dim={}, vocab={}", target_slot.config.n_layers, target_slot.config.dim, target_slot.config.vocab_size);
-    eprintln!("GPU: {} ({:.1} GB VRAM)", gpu.arch, gpu.hip.get_vram_info().map(|(_, t)| t as f64 / 1e9).unwrap_or(0.0));
+    eprintln!(
+        "Model: {} layers, dim={}, vocab={}",
+        target_slot.config.n_layers, target_slot.config.dim, target_slot.config.vocab_size
+    );
+    eprintln!(
+        "GPU: {} ({:.1} GB VRAM)",
+        gpu.arch,
+        gpu.hip
+            .get_vram_info()
+            .map(|(_, t)| t as f64 / 1e9)
+            .unwrap_or(0.0)
+    );
     if let Some(ref s) = system_prompt {
-        eprintln!("System: {}", if s.len() > 60 { format!("{}...", &s[..60]) } else { s.clone() });
+        eprintln!(
+            "System: {}",
+            if s.len() > 60 {
+                format!("{}...", &s[..60])
+            } else {
+                s.clone()
+            }
+        );
     }
     eprintln!("Type /help for commands. Ctrl+C to quit.\n");
 
@@ -186,7 +242,11 @@ fn main() {
     let nl = tokenizer.encode("\n");
     let user_tok = tokenizer.encode("user");
     let asst_tok = tokenizer.encode("assistant");
-    let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+    let im_end_token = if im_end.len() == 1 {
+        Some(im_end[0])
+    } else {
+        None
+    };
     let sc = llama::SamplingConfig::text_thinking();
 
     let mut seq_pos: usize = 0;
@@ -204,9 +264,13 @@ fn main() {
         std::io::stdout().flush().unwrap();
 
         let mut input = String::new();
-        if stdin.read_line(&mut input).unwrap() == 0 { break; } // EOF
+        if stdin.read_line(&mut input).unwrap() == 0 {
+            break;
+        } // EOF
         let input = input.trim();
-        if input.is_empty() { continue; }
+        if input.is_empty() {
+            continue;
+        }
         let input_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(input);
         let input: &str = &input_norm;
         if std::env::var("HIPFIRE_PROMPT_TOKEN_HEAT").ok().as_deref() == Some("1") {
@@ -221,7 +285,9 @@ fn main() {
                 conversation_tokens.clear();
                 total_tokens = 0;
                 target_slot.reset_state(&mut gpu);
-                if let Some(ref mut d) = draft_slot { d.reset_state(&mut gpu); }
+                if let Some(ref mut d) = draft_slot {
+                    d.reset_state(&mut gpu);
+                }
                 eprintln!("Conversation reset.\n");
                 continue;
             }
@@ -239,7 +305,9 @@ fn main() {
                 if spec_active && spec_stats.cycles > 0 {
                     eprintln!(
                         "Speculative: {} cycles, tau={:.2} (accepted/cycle), committed/cycle={:.2}",
-                        spec_stats.cycles, spec_stats.tau(), spec_stats.mean_committed()
+                        spec_stats.cycles,
+                        spec_stats.tau(),
+                        spec_stats.mean_committed()
                     );
                     eprint!("  acceptance histogram: ");
                     for (i, &c) in spec_stats.acceptance_hist.iter().enumerate() {
@@ -260,7 +328,9 @@ fn main() {
             seq_pos = 0;
             conversation_tokens.clear();
             target_slot.reset_state(&mut gpu);
-            if let Some(ref mut d) = draft_slot { d.reset_state(&mut gpu); }
+            if let Some(ref mut d) = draft_slot {
+                d.reset_state(&mut gpu);
+            }
         }
 
         // Build ChatML tokens for this turn
@@ -320,7 +390,8 @@ fn main() {
                               conversation_tokens: &mut Vec<u32>,
                               in_thinking: &mut bool,
                               thinking_shown: &mut bool,
-                              generated: &mut usize| -> bool {
+                              generated: &mut usize|
+         -> bool {
             *generated += 1;
             conversation_tokens.push(tok);
             let text = tokenizer.decode(&[tok]);
@@ -353,20 +424,36 @@ fn main() {
             let draft_ref = draft_slot.as_mut().unwrap();
             'outer: loop {
                 let pos = seq_pos + generated;
-                if pos + spec_k + 1 >= max_seq { break; }
+                if pos + spec_k + 1 >= max_seq {
+                    break;
+                }
 
                 let step = hipfire_arch_qwen35::speculative::spec_step_greedy(
-                    &mut gpu, &mut target_slot, draft_ref, pos, spec_k, ts, ds,
-                ).unwrap();
+                    &mut gpu,
+                    &mut target_slot,
+                    draft_ref,
+                    pos,
+                    spec_k,
+                    ts,
+                    ds,
+                )
+                .unwrap();
                 spec_stats.record(&step);
 
                 for tok in &step.committed {
                     let stop = emit_token(
-                        *tok, &mut conversation_tokens,
-                        &mut in_thinking, &mut thinking_shown, &mut generated,
+                        *tok,
+                        &mut conversation_tokens,
+                        &mut in_thinking,
+                        &mut thinking_shown,
+                        &mut generated,
                     );
-                    if stop { break 'outer; }
-                    if generated >= 2048 { break 'outer; }
+                    if stop {
+                        break 'outer;
+                    }
+                    if generated >= 2048 {
+                        break 'outer;
+                    }
                 }
             }
         } else {
@@ -375,19 +462,33 @@ fn main() {
             let mut next_token = llama::sample_top_p(&logits, temp, sc.top_p);
             loop {
                 let stop = emit_token(
-                    next_token, &mut conversation_tokens,
-                    &mut in_thinking, &mut thinking_shown, &mut generated,
+                    next_token,
+                    &mut conversation_tokens,
+                    &mut in_thinking,
+                    &mut thinking_shown,
+                    &mut generated,
                 );
-                if stop { break; }
-                if generated >= 2048 { break; }
+                if stop {
+                    break;
+                }
+                if generated >= 2048 {
+                    break;
+                }
 
                 let pos = seq_pos + generated - 1;
-                if pos >= max_seq { break; }
+                if pos >= max_seq {
+                    break;
+                }
                 target_slot.forward(&mut gpu, next_token, pos).unwrap();
                 logits = gpu.download_f32(&target_slot.scratch.logits).unwrap();
                 if !no_penalty {
                     llama::apply_ngram_block(&mut logits, &conversation_tokens);
-                    llama::apply_repeat_penalty(&mut logits, &conversation_tokens, sc.repeat_window, sc.repeat_penalty);
+                    llama::apply_repeat_penalty(
+                        &mut logits,
+                        &conversation_tokens,
+                        sc.repeat_window,
+                        sc.repeat_penalty,
+                    );
                 }
                 next_token = llama::sample_top_p(&logits, temp, sc.top_p);
             }
@@ -403,10 +504,16 @@ fn main() {
         if spec_active && spec_stats.cycles > 0 {
             eprintln!(
                 "\n\x1b[2m({} tokens, {:.1} tok/s | spec: {} cycles, tau={:.2})\x1b[0m\n",
-                generated, tok_s, spec_stats.cycles, spec_stats.tau()
+                generated,
+                tok_s,
+                spec_stats.cycles,
+                spec_stats.tau()
             );
         } else {
-            eprintln!("\n\x1b[2m({} tokens, {:.1} tok/s)\x1b[0m\n", generated, tok_s);
+            eprintln!(
+                "\n\x1b[2m({} tokens, {:.1} tok/s)\x1b[0m\n",
+                generated, tok_s
+            );
         }
     }
 

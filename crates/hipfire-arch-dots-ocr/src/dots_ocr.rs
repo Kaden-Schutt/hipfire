@@ -139,40 +139,64 @@ fn parse_vision_config(metadata_json: &str) -> Option<DotsVisionConfig> {
     let vc = meta.get("config")?.get("vision_config")?;
     let defaults = DotsVisionConfig::dots_ocr_defaults();
 
-    let embed_dim = vc.get("embed_dim").and_then(|v| v.as_u64())
+    let embed_dim = vc
+        .get("embed_dim")
+        .and_then(|v| v.as_u64())
         .or_else(|| vc.get("hidden_size").and_then(|v| v.as_u64()))
         .map(|v| v as usize)
         .unwrap_or(defaults.embed_dim);
-    let num_attention_heads = vc.get("num_attention_heads").and_then(|v| v.as_u64())
+    let num_attention_heads = vc
+        .get("num_attention_heads")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.num_attention_heads);
-    let num_hidden_layers = vc.get("num_hidden_layers").and_then(|v| v.as_u64())
+    let num_hidden_layers = vc
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
         .or_else(|| vc.get("depth").and_then(|v| v.as_u64()))
         .map(|v| v as usize)
         .unwrap_or(defaults.num_hidden_layers);
-    let head_dim = vc.get("head_dim").and_then(|v| v.as_u64())
+    let head_dim = vc
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(embed_dim / num_attention_heads);
-    let intermediate_size = vc.get("intermediate_size").and_then(|v| v.as_u64())
+    let intermediate_size = vc
+        .get("intermediate_size")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.intermediate_size);
-    let patch_size = vc.get("patch_size").and_then(|v| v.as_u64())
+    let patch_size = vc
+        .get("patch_size")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.patch_size);
-    let spatial_merge_size = vc.get("spatial_merge_size").and_then(|v| v.as_u64())
+    let spatial_merge_size = vc
+        .get("spatial_merge_size")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.spatial_merge_size);
-    let temporal_patch_size = vc.get("temporal_patch_size").and_then(|v| v.as_u64())
+    let temporal_patch_size = vc
+        .get("temporal_patch_size")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.temporal_patch_size);
-    let num_channels = vc.get("num_channels").and_then(|v| v.as_u64())
+    let num_channels = vc
+        .get("num_channels")
+        .and_then(|v| v.as_u64())
         .map(|v| v as usize)
         .unwrap_or(defaults.num_channels);
-    let use_bias = vc.get("use_bias").and_then(|v| v.as_bool())
+    let use_bias = vc
+        .get("use_bias")
+        .and_then(|v| v.as_bool())
         .unwrap_or(defaults.use_bias);
-    let post_norm = vc.get("post_norm").and_then(|v| v.as_bool())
+    let post_norm = vc
+        .get("post_norm")
+        .and_then(|v| v.as_bool())
         .unwrap_or(defaults.post_norm);
-    let rms_norm_eps = vc.get("rms_norm_eps").and_then(|v| v.as_f64())
+    let rms_norm_eps = vc
+        .get("rms_norm_eps")
+        .and_then(|v| v.as_f64())
         .map(|v| v as f32)
         .unwrap_or(defaults.rms_norm_eps);
     // Post-merger output dim — must match the text decoder's embedding
@@ -188,7 +212,9 @@ fn parse_vision_config(metadata_json: &str) -> Option<DotsVisionConfig> {
     //   3. `config.text_config.hidden_size` — last resort for
     //      hypothetical nested-config layouts.
     //   4. defaults.out_hidden_size (1536).
-    let out_hidden_size = vc.get("out_hidden_size").and_then(|v| v.as_u64())
+    let out_hidden_size = vc
+        .get("out_hidden_size")
+        .and_then(|v| v.as_u64())
         .or_else(|| vc.get("hidden_size").and_then(|v| v.as_u64()))
         .or_else(|| {
             meta.get("config")?
@@ -336,11 +362,7 @@ pub struct DotsOcrWeights {
 
 impl DotsOcrWeights {
     /// Load both text and vision weights from a dots.ocr HFQ file.
-    pub fn load(
-        hfq: &mut HfqFile,
-        cfg: &DotsOcrConfig,
-        gpu: &mut Gpu,
-    ) -> Result<Self, String> {
+    pub fn load(hfq: &mut HfqFile, cfg: &DotsOcrConfig, gpu: &mut Gpu) -> Result<Self, String> {
         let text = Qwen2Weights::load(hfq, &cfg.text, gpu)?;
         let vision = load_vision_weights(hfq, &cfg.vision, gpu)
             .map_err(|e| format!("dots-ocr: load_vision_weights failed: {e:?}"))?;
@@ -397,13 +419,18 @@ pub fn load_vision_weights(
     //
     // n_elements = h * patch_dim for the GEMM shape `[h, patch_dim]`.
     let patch_embed_w = load_f16_or_dequant(
-        hfq, gpu, "vision_tower.patch_embed.patchifier.proj.weight", h * patch_dim,
+        hfq,
+        gpu,
+        "vision_tower.patch_embed.patchifier.proj.weight",
+        h * patch_dim,
     )?;
-    let patch_embed_b = load_bias_f32(
-        hfq, gpu, "vision_tower.patch_embed.patchifier.proj.bias", h,
-    )?;
+    let patch_embed_b =
+        load_bias_f32(hfq, gpu, "vision_tower.patch_embed.patchifier.proj.bias", h)?;
     let patch_embed_norm = load_norm_weight_raw(
-        hfq, gpu, "vision_tower.patch_embed.patchifier.norm.weight", h,
+        hfq,
+        gpu,
+        "vision_tower.patch_embed.patchifier.norm.weight",
+        h,
     )?;
 
     // ── blocks ────────────────────────────────────────────────────
@@ -422,19 +449,26 @@ pub fn load_vision_weights(
         // concatenate the F16 bytes (= row-wise concat in matrix-
         // shape since rows are independent in row-major storage).
         let fc13_proj = load_f16_or_dequant_concat_rows(
-            hfq, gpu,
+            hfq,
+            gpu,
             &format!("{p}.mlp.fc1.weight"),
             &format!("{p}.mlp.fc3.weight"),
-            intermediate * h, intermediate * h,
+            intermediate * h,
+            intermediate * h,
         )?;
         let fc2 = load_f16_or_dequant(hfq, gpu, &format!("{p}.mlp.fc2.weight"), h * intermediate)?;
-        blocks.push(DotsVisionBlockWeights { norm1_w, qkv_w, proj_w, norm2_w, fc13_proj, fc2 });
+        blocks.push(DotsVisionBlockWeights {
+            norm1_w,
+            qkv_w,
+            proj_w,
+            norm2_w,
+            fc13_proj,
+            fc2,
+        });
     }
 
     // ── post-trunk norm + merger ──────────────────────────────────
-    let post_trunk_norm = load_norm_weight_raw(
-        hfq, gpu, "vision_tower.post_trunk_norm.weight", h,
-    )?;
+    let post_trunk_norm = load_norm_weight_raw(hfq, gpu, "vision_tower.post_trunk_norm.weight", h)?;
     eprintln!("  loading vision merger");
     // ln_q is a LayerNorm, NOT an RMSNorm — but `load_norm_weight_raw`
     // is just "F16/F32 bytes → f32 upload, no offset". Same shape, fine
@@ -443,14 +477,23 @@ pub fn load_vision_weights(
     let merger_ln_w = load_norm_weight_raw(hfq, gpu, "vision_tower.merger.ln_q.weight", h)?;
     let merger_ln_b = load_bias_f32(hfq, gpu, "vision_tower.merger.ln_q.bias", h)?;
     let merger_fc1_w = load_f16_or_dequant(
-        hfq, gpu, "vision_tower.merger.mlp.0.weight", merge_dim * merge_dim,
+        hfq,
+        gpu,
+        "vision_tower.merger.mlp.0.weight",
+        merge_dim * merge_dim,
     )?;
     let merger_fc1_b = load_bias_f32(hfq, gpu, "vision_tower.merger.mlp.0.bias", merge_dim)?;
     let merger_fc2_w = load_f16_or_dequant(
-        hfq, gpu, "vision_tower.merger.mlp.2.weight", cfg.out_hidden_size * merge_dim,
+        hfq,
+        gpu,
+        "vision_tower.merger.mlp.2.weight",
+        cfg.out_hidden_size * merge_dim,
     )?;
     let merger_fc2_b = load_bias_f32(
-        hfq, gpu, "vision_tower.merger.mlp.2.bias", cfg.out_hidden_size,
+        hfq,
+        gpu,
+        "vision_tower.merger.mlp.2.bias",
+        cfg.out_hidden_size,
     )?;
 
     Ok(DotsVisionWeights {
@@ -479,17 +522,31 @@ pub fn load_vision_weights(
 /// TODO(transformer-extraction): pull this + the qwen2 + qwen35
 /// variants into `hipfire_runtime::transformer::norm` during the
 /// consolidation PR.
-fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+fn load_norm_weight_raw(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    n: usize,
+) -> HipResult<GpuTensor> {
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         qt => panic!("dots-ocr: expected F16/F32 for norm {name}, got qt={qt}"),
     };
     assert_eq!(
-        f32_data.len(), n,
-        "dots-ocr: norm {name} has {} elements, expected {n}", f32_data.len(),
+        f32_data.len(),
+        n,
+        "dots-ocr: norm {name} has {} elements, expected {n}",
+        f32_data.len(),
     );
     gpu.upload_f32(&f32_data, &[n])
 }
@@ -501,16 +558,25 @@ fn load_norm_weight_raw(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> H
 ///
 /// TODO(transformer-extraction): see norm helper.
 fn load_bias_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         qt => panic!("dots-ocr: expected F16/F32 for bias {name}, got qt={qt}"),
     };
     assert_eq!(
-        f32_data.len(), n,
-        "dots-ocr: bias {name} has {} elements, expected {n}", f32_data.len(),
+        f32_data.len(),
+        n,
+        "dots-ocr: bias {name} has {} elements, expected {n}",
+        f32_data.len(),
     );
     gpu.upload_f32(&f32_data, &[n])
 }
@@ -537,15 +603,18 @@ fn load_f16_or_dequant(
     name: &str,
     n_elements: usize,
 ) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
     match info.quant_type {
         1 => {
             // F16 — upload directly.
             assert_eq!(
-                data.len(), 2 * n_elements,
+                data.len(),
+                2 * n_elements,
                 "dots-ocr: {name} F16 has {} bytes, expected 2 * {n_elements} = {}",
-                data.len(), 2 * n_elements,
+                data.len(),
+                2 * n_elements,
             );
             gpu.upload_raw(&data, &[n_elements])
         }
@@ -609,14 +678,18 @@ fn load_f16_or_dequant_concat_rows(
     // GPU upload doesn't silently produce a shape-mismatched fc13_proj
     // and either crash or, worse, read into the next tensor's allocation.
     assert_eq!(
-        bytes_a.len(), 2 * n_elements_a,
+        bytes_a.len(),
+        2 * n_elements_a,
         "dots-ocr: {name_a} dequant produced {} f16 bytes, expected {}",
-        bytes_a.len(), 2 * n_elements_a,
+        bytes_a.len(),
+        2 * n_elements_a,
     );
     assert_eq!(
-        bytes_b.len(), 2 * n_elements_b,
+        bytes_b.len(),
+        2 * n_elements_b,
         "dots-ocr: {name_b} dequant produced {} f16 bytes, expected {}",
-        bytes_b.len(), 2 * n_elements_b,
+        bytes_b.len(),
+        2 * n_elements_b,
     );
     let mut combined = Vec::with_capacity(bytes_a.len() + bytes_b.len());
     combined.extend_from_slice(&bytes_a);
@@ -628,14 +701,18 @@ fn load_f16_or_dequant_concat_rows(
 /// stream (little-endian per-element). Returns the f16 buffer ready
 /// for `gpu.upload_raw`.
 fn dequant_to_f16_bytes(hfq: &HfqFile, name: &str, n_elements: usize) -> Vec<u8> {
-    let (info, data) = hfq.tensor_data_vec(name)
+    let (info, data) = hfq
+        .tensor_data_vec(name)
         .unwrap_or_else(|| panic!("dots-ocr: tensor not found: {name}"));
     match info.quant_type {
         1 => {
             // F16 — already F16, just hand back the bytes.
             assert_eq!(
-                data.len(), 2 * n_elements,
-                "dots-ocr: {name} F16 has {} bytes, expected {}", data.len(), 2 * n_elements,
+                data.len(),
+                2 * n_elements,
+                "dots-ocr: {name} F16 has {} bytes, expected {}",
+                data.len(),
+                2 * n_elements,
             );
             data.to_vec()
         }
@@ -644,12 +721,18 @@ fn dequant_to_f16_bytes(hfq: &HfqFile, name: &str, n_elements: usize) -> Vec<u8>
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
-            f32_data.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
         6 | 7 => {
             let group_size = info.group_size as usize;
             let f32_data = dequant_hfq4(&data, n_elements, group_size);
-            f32_data.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect()
+            f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
         }
         qt => panic!("dots-ocr: dequant_to_f16_bytes does not support quant_type {qt} for {name}"),
     }
@@ -674,14 +757,18 @@ fn dequant_hfq4(data: &[u8], n_elements: usize, group_size: usize) -> Vec<f32> {
     let n_groups = n_elements.div_ceil(group_size);
     for g in 0..n_groups {
         let off = g * block_size;
-        if off + 8 > data.len() { break; }
+        if off + 8 > data.len() {
+            break;
+        }
         let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         let zero = f32::from_le_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]);
         let nibbles = &data[off + 8..(off + block_size).min(data.len())];
         let base = g * group_size;
         for i in 0..group_size.min(n_elements.saturating_sub(base)) {
             let byte_idx = i / 2;
-            if byte_idx >= nibbles.len() { break; }
+            if byte_idx >= nibbles.len() {
+                break;
+            }
             let nibble = if i % 2 == 0 {
                 nibbles[byte_idx] & 0xF
             } else {
@@ -870,22 +957,30 @@ pub fn vision_forward(
     // attend to patches from image B (vit_attention_opt is dense, not
     // cu_seqlens-aware).
     assert_eq!(
-        patches.numel(), n_patches * patch_dim,
+        patches.numel(),
+        n_patches * patch_dim,
         "dots-ocr: vision_forward expects patches.numel() == n_patches * patch_dim \
          ({n_patches} * {patch_dim} = {}), got {}. \
          If you're batching multiple images, call vision_forward once per image; \
          see the multi-image-attention-leakage note on the function header.",
-        n_patches * patch_dim, patches.numel(),
+        n_patches * patch_dim,
+        patches.numel(),
     );
     assert_eq!(
-        grid_h % sms, 0,
+        grid_h % sms,
+        0,
         "dots-ocr: grid_h={grid_h} must be a multiple of spatial_merge_size={sms}",
     );
     assert_eq!(
-        grid_w % sms, 0,
+        grid_w % sms,
+        0,
         "dots-ocr: grid_w={grid_w} must be a multiple of spatial_merge_size={sms}",
     );
-    assert_eq!(n_heads * head_dim, h, "dots-ocr: n_heads * head_dim must equal embed_dim");
+    assert_eq!(
+        n_heads * head_dim,
+        h,
+        "dots-ocr: n_heads * head_dim must equal embed_dim"
+    );
 
     let t0 = std::time::Instant::now();
     eprintln!(
@@ -905,14 +1000,16 @@ pub fn vision_forward(
         std::fs::create_dir_all(d).map_err(|e| {
             hip_bridge::HipError::new(0, &format!("dump_dir mkdir {}: {e}", d.display()))
         })?;
-        eprintln!("  HIPFIRE_DOTS_OCR_DUMP_DIR={} — will dump per-stage tensors", d.display());
+        eprintln!(
+            "  HIPFIRE_DOTS_OCR_DUMP_DIR={} — will dump per-stage tensors",
+            d.display()
+        );
     }
     let dump_stage = |gpu: &Gpu, t: &GpuTensor, name: &str, shape: &[usize]| -> HipResult<()> {
         if let Some(d) = dump_dir.as_ref() {
             let data = gpu.download_f32(t)?;
-            write_npy_f32(&d.join(format!("{name}.npy")), &data, shape).map_err(|e| {
-                hip_bridge::HipError::new(0, &format!("npy write {name}: {e}"))
-            })?;
+            write_npy_f32(&d.join(format!("{name}.npy")), &data, shape)
+                .map_err(|e| hip_bridge::HipError::new(0, &format!("npy write {name}: {e}")))?;
             eprintln!("    dump: {name}.npy ({}×{} f32)", shape[0], shape[1]);
         }
         Ok(())
@@ -933,33 +1030,59 @@ pub fn vision_forward(
     // `[embed_dim, patch_dim]` linear (verified during load).
     let trace_pre = std::env::var("HIPFIRE_DOTS_OCR_TRACE").ok().as_deref() == Some("1");
     let dump_stats = |gpu: &Gpu, t: &GpuTensor, label: &str| -> HipResult<()> {
-        if !trace_pre { return Ok(()); }
+        if !trace_pre {
+            return Ok(());
+        }
         let data = gpu.download_f32(t)?;
         let n = data.len();
         let nan = data.iter().filter(|x| x.is_nan()).count();
         let inf = data.iter().filter(|x| x.is_infinite()).count();
-        let mean: f64 = data.iter().filter(|x| x.is_finite()).map(|&x| x as f64).sum::<f64>()
+        let mean: f64 = data
+            .iter()
+            .filter(|x| x.is_finite())
+            .map(|&x| x as f64)
+            .sum::<f64>()
             / (n - nan - inf).max(1) as f64;
-        let (mn, mx) = data.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
-            if x.is_finite() { (a.min(x), b.max(x)) } else { (a, b) }
-        });
+        let (mn, mx) = data
+            .iter()
+            .fold((f32::INFINITY, f32::NEG_INFINITY), |(a, b), &x| {
+                if x.is_finite() {
+                    (a.min(x), b.max(x))
+                } else {
+                    (a, b)
+                }
+            });
         eprintln!(
             "    stats[{label}]: n={n} mean={mean:+.4} range=[{mn:+.3}, {mx:+.3}] nan={nan} inf={inf}"
         );
         Ok(())
     };
-    if trace_pre { eprintln!("  trace: about to patch_embed linear"); gpu.hip.device_synchronize()?; }
+    if trace_pre {
+        eprintln!("  trace: about to patch_embed linear");
+        gpu.hip.device_synchronize()?;
+    }
     dump_stats(gpu, patches, "patches_in")?;
     let mut x = linear_f16(
-        gpu, &weights.patch_embed_w, patches, &weights.patch_embed_b,
-        h, patch_dim, n_patches,
+        gpu,
+        &weights.patch_embed_w,
+        patches,
+        &weights.patch_embed_b,
+        h,
+        patch_dim,
+        n_patches,
     )?;
-    if trace_pre { eprintln!("  trace: after patch_embed linear"); gpu.hip.device_synchronize()?; }
+    if trace_pre {
+        eprintln!("  trace: after patch_embed linear");
+        gpu.hip.device_synchronize()?;
+    }
     dump_stats(gpu, &x, "patch_embed_linear")?;
     // patch_embed_norm is RMSNorm (the patchifier carries one).
     let normed = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
     gpu.rmsnorm_f32(&x, &weights.patch_embed_norm, &normed, eps)?;
-    if trace_pre { eprintln!("  trace: after patch_embed RMSNorm"); gpu.hip.device_synchronize()?; }
+    if trace_pre {
+        eprintln!("  trace: after patch_embed RMSNorm");
+        gpu.hip.device_synchronize()?;
+    }
     dump_stats(gpu, &normed, "patch_embed_norm")?;
     gpu.free_tensor(x)?;
     x = normed;
@@ -969,7 +1092,9 @@ pub fn vision_forward(
     // bf16-truncating at every block boundary (after each residual add).
     // Optional via env var so it can be A/B tested.
     let bf16_residual = std::env::var("HIPFIRE_DOTS_OCR_BF16_RESIDUAL")
-        .ok().as_deref() == Some("1");
+        .ok()
+        .as_deref()
+        == Some("1");
     if bf16_residual {
         gpu.bf16_round_trip_f32(&x)?;
     }
@@ -1006,11 +1131,15 @@ pub fn vision_forward(
         };
     }
 
-    if trace { eprintln!("  trace: entering 42-block loop"); }
+    if trace {
+        eprintln!("  trace: entering 42-block loop");
+    }
     for li in 0..cfg.num_hidden_layers {
         let lw = &weights.blocks[li];
         let trace_block_li = trace && li == 0;
-        if trace_block_li { eprintln!("  block {li}: start"); }
+        if trace_block_li {
+            eprintln!("  block {li}: start");
+        }
 
         // Per-kernel sync timing macro (block 0 only). Returns the elapsed
         // ms since the previous `tic` (or the loop top if first call).
@@ -1025,13 +1154,18 @@ pub fn vision_forward(
                 }
             };
         }
-        if trace_block_li { tic = std::time::Instant::now(); }
+        if trace_block_li {
+            tic = std::time::Instant::now();
+        }
 
         // 2a. RMSNorm pre-attn.
         let xn = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
         gpu.rmsnorm_f32(&x, &lw.norm1_w, &xn, eps)?;
         toc!(gpu, "norm1 rmsnorm");
-        if trace_block_li { dump_stats(gpu, &xn, "b0_xn (post-norm1)")?; tic = std::time::Instant::now(); }
+        if trace_block_li {
+            dump_stats(gpu, &xn, "b0_xn (post-norm1)")?;
+            tic = std::time::Instant::now();
+        }
 
         // 2b. Fused QKV GEMM (no bias). yt[3h, n] → transpose → qkv[n, 3h]
         // interleaved (Q, K, V stacked along the 3h axis).
@@ -1042,15 +1176,25 @@ pub fn vision_forward(
         // exact) but the small remaining drift may flip softmax winners
         // — bf16-trunc collapses our F32 output to the exact bf16 bits
         // HF would have at this point.
-        if bf16_residual { gpu.bf16_round_trip_f32(&qkv)?; }
+        if bf16_residual {
+            gpu.bf16_round_trip_f32(&qkv)?;
+        }
         toc!(gpu, "qkv GEMM");
-        if trace_block_li { dump_stats(gpu, &qkv, "b0_qkv")?; tic = std::time::Instant::now(); }
+        if trace_block_li {
+            dump_stats(gpu, &qkv, "b0_qkv")?;
+            tic = std::time::Instant::now();
+        }
         // Dump QKV linear output for direct HF diff. Shape is
         // [n_patches, 3 * hidden] interleaved (Q | K | V along the
         // 3h axis). Lets us isolate whether the bug is in the QKV
         // linear or downstream (RoPE / attention compute).
         if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
-            dump_stage(gpu, &qkv, &format!("block_{li:02}_qkv"), &[n_patches, qkv_dim])?;
+            dump_stage(
+                gpu,
+                &qkv,
+                &format!("block_{li:02}_qkv"),
+                &[n_patches, qkv_dim],
+            )?;
         }
 
         // 2c. Split interleaved QKV into three separate Q, K, V buffers
@@ -1077,8 +1221,7 @@ pub fn vision_forward(
 
         // 2d. 2-D RoPE on Q and K (in-place, separate buffers).
         gpu.rope_2d_halfsplit_f32(
-            &q_buf, &k_buf, &cos_table, &sin_table,
-            n_patches, n_heads, n_heads, head_dim,
+            &q_buf, &k_buf, &cos_table, &sin_table, n_patches, n_heads, n_heads, head_dim,
         )?;
         toc!(gpu, "rope_2d");
         if trace_block_li {
@@ -1122,8 +1265,7 @@ pub fn vision_forward(
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
             gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
             gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
-                &q_buf, &k_f16, &v_f16, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
+                &q_buf, &k_f16, &v_f16, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
             gpu.free_tensor(k_f16)?;
             gpu.free_tensor(v_f16)?;
@@ -1133,37 +1275,41 @@ pub fn vision_forward(
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
             gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
             gpu.attention_dflash_wmma_n128_f16kv_f32(
-                &q_buf, &k_f16, &v_f16, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
+                &q_buf, &k_f16, &v_f16, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
             gpu.free_tensor(k_f16)?;
             gpu.free_tensor(v_f16)?;
         } else if head_dim % 16 == 0 && head_dim <= 128 && n_patches >= 32 {
             gpu.attention_dflash_wmma_m32_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
+                &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
         } else if head_dim % 16 == 0 {
             gpu.attention_dflash_wmma_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
+                &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
         } else {
             gpu.attention_dflash_f32(
-                &q_buf, &k_buf, &v_buf, &attn,
-                n_patches, n_patches, n_heads, n_heads, head_dim,
+                &q_buf, &k_buf, &v_buf, &attn, n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;
         }
         // Dump pre-proj attention output so we can compare to numpy
         // F32 reference (which doesn't include proj).
         if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
-            dump_stage(gpu, &attn, &format!("block_{li:02}_attn_pre_proj"), &[n_patches, h])?;
+            dump_stage(
+                gpu,
+                &attn,
+                &format!("block_{li:02}_attn_pre_proj"),
+                &[n_patches, h],
+            )?;
         }
         gpu.free_tensor(q_buf)?;
         gpu.free_tensor(k_buf)?;
         gpu.free_tensor(v_buf)?;
         toc!(gpu, "attention_dflash");
-        if trace_block_li { dump_stats(gpu, &attn, "b0_attn")?; tic = std::time::Instant::now(); }
+        if trace_block_li {
+            dump_stats(gpu, &attn, "b0_attn")?;
+            tic = std::time::Instant::now();
+        }
 
         // 2f. Output projection (no bias) + residual.
         let proj = linear_f16_no_bias(gpu, &lw.proj_w, &attn, h, h, n_patches)?;
@@ -1173,11 +1319,18 @@ pub fn vision_forward(
         // VisionAttention.forward — includes the self.proj projection,
         // before the residual is added).
         if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
-            dump_stage(gpu, &proj, &format!("block_{li:02}_attn_out"), &[n_patches, h])?;
+            dump_stage(
+                gpu,
+                &proj,
+                &format!("block_{li:02}_attn_out"),
+                &[n_patches, h],
+            )?;
         }
         gpu.add_inplace_f32(&x, &proj)?;
         gpu.free_tensor(proj)?;
-        if bf16_residual { gpu.bf16_round_trip_f32(&x)?; }
+        if bf16_residual {
+            gpu.bf16_round_trip_f32(&x)?;
+        }
         toc!(gpu, "residual1 (add)");
 
         // 2g. RMSNorm pre-MLP.
@@ -1222,7 +1375,9 @@ pub fn vision_forward(
         toc!(gpu, "fc2 GEMM");
         gpu.add_inplace_f32(&x, &fc2_y)?;
         gpu.free_tensor(fc2_y)?;
-        if bf16_residual { gpu.bf16_round_trip_f32(&x)?; }
+        if bf16_residual {
+            gpu.bf16_round_trip_f32(&x)?;
+        }
         toc!(gpu, "residual2 (add)");
 
         if trace {
@@ -1233,7 +1388,12 @@ pub fn vision_forward(
             gpu.hip.device_synchronize()?;
         }
         if li % 7 == 0 || li == cfg.num_hidden_layers - 1 {
-            eprintln!("  vision block {}/{} done ({:.2}s)", li + 1, cfg.num_hidden_layers, t0.elapsed().as_secs_f32());
+            eprintln!(
+                "  vision block {}/{} done ({:.2}s)",
+                li + 1,
+                cfg.num_hidden_layers,
+                t0.elapsed().as_secs_f32()
+            );
         }
         if trace_pre && (li == 0 || li == 1 || li == 41) {
             dump_stats(gpu, &x, &format!("block_{li:02}_out"))?;
@@ -1266,8 +1426,13 @@ pub fn vision_forward(
     let merger_eps = 1e-6f32;
     let normed_merger = gpu.alloc_tensor(&[n_patches, h], DType::F32)?;
     gpu.layernorm_batched(
-        &post, &weights.merger_ln_w, &weights.merger_ln_b, &normed_merger,
-        n_patches, h, merger_eps,
+        &post,
+        &weights.merger_ln_w,
+        &weights.merger_ln_b,
+        &normed_merger,
+        n_patches,
+        h,
+        merger_eps,
     )?;
     gpu.free_tensor(post)?;
 
@@ -1282,8 +1447,13 @@ pub fn vision_forward(
 
     // 4a. mlp.0: linear(merge_dim → merge_dim) + bias, then GELU.
     let m1 = linear_f16(
-        gpu, &weights.merger_fc1_w, &normed_merger, &weights.merger_fc1_b,
-        merge_dim, merge_dim, n_merged,
+        gpu,
+        &weights.merger_fc1_w,
+        &normed_merger,
+        &weights.merger_fc1_b,
+        merge_dim,
+        merge_dim,
+        n_merged,
     )?;
     gpu.free_tensor(normed_merger)?;
     // dots.ocr uses exact GELU (PyTorch nn.GELU default). We currently
@@ -1294,15 +1464,21 @@ pub fn vision_forward(
 
     // 4b. mlp.2: linear(merge_dim → out_hidden_size) + bias.
     let m2 = linear_f16(
-        gpu, &weights.merger_fc2_w, &m1, &weights.merger_fc2_b,
-        cfg.out_hidden_size, merge_dim, n_merged,
+        gpu,
+        &weights.merger_fc2_w,
+        &m1,
+        &weights.merger_fc2_b,
+        cfg.out_hidden_size,
+        merge_dim,
+        n_merged,
     )?;
     gpu.free_tensor(m1)?;
 
     gpu.hip.device_synchronize()?;
     eprintln!(
         "  vision merger done: {n_merged} merged tokens × {} dims ({:.2}s)",
-        cfg.out_hidden_size, t0.elapsed().as_secs_f32(),
+        cfg.out_hidden_size,
+        t0.elapsed().as_secs_f32(),
     );
     dump_stage(gpu, &m2, "merger", &[n_merged, cfg.out_hidden_size])?;
     Ok(m2)
@@ -1318,29 +1494,31 @@ fn write_npy_f32(path: &std::path::Path, data: &[f32], shape: &[usize]) -> std::
     // including the 10-byte preamble (magic + version + header_len).
     let mut shape_str = String::from("(");
     for (i, &s) in shape.iter().enumerate() {
-        if i > 0 { shape_str.push_str(", "); }
+        if i > 0 {
+            shape_str.push_str(", ");
+        }
         shape_str.push_str(&s.to_string());
     }
-    if shape.len() == 1 { shape_str.push(','); }
+    if shape.len() == 1 {
+        shape_str.push(',');
+    }
     shape_str.push(')');
-    let header = format!(
-        "{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}"
-    );
+    let header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape_str}, }}");
     // Pre-pad so (10 + header.len()) is a multiple of 16, then add `\n`.
     let preamble = 10;
     let mut padded = header;
-    while (preamble + padded.len() + 1) % 16 != 0 { padded.push(' '); }
+    while (preamble + padded.len() + 1) % 16 != 0 {
+        padded.push(' ');
+    }
     padded.push('\n');
     let header_len = padded.len() as u16;
 
     f.write_all(b"\x93NUMPY")?;
-    f.write_all(&[1u8, 0u8])?;                       // version 1.0
+    f.write_all(&[1u8, 0u8])?; // version 1.0
     f.write_all(&header_len.to_le_bytes())?;
     f.write_all(padded.as_bytes())?;
     // Cast &[f32] to &[u8] for the data section.
-    let bytes = unsafe {
-        std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4)
-    };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     f.write_all(bytes)?;
     Ok(())
 }

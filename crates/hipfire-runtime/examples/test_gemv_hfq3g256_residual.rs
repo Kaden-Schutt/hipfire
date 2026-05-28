@@ -54,9 +54,8 @@ fn main() {
         gpu.add_inplace_f32(&d_y_ref, &d_y_tmp).unwrap();
 
         let mut y_ref = vec![0.0f32; m];
-        let y_ref_bytes = unsafe {
-            std::slice::from_raw_parts_mut(y_ref.as_mut_ptr() as *mut u8, m * 4)
-        };
+        let y_ref_bytes =
+            unsafe { std::slice::from_raw_parts_mut(y_ref.as_mut_ptr() as *mut u8, m * 4) };
         gpu.hip
             .memcpy_dtoh(y_ref_bytes, unsafe { &d_y_ref.buf })
             .unwrap();
@@ -67,9 +66,8 @@ fn main() {
             .unwrap();
 
         let mut y_test = vec![0.0f32; m];
-        let y_test_bytes = unsafe {
-            std::slice::from_raw_parts_mut(y_test.as_mut_ptr() as *mut u8, m * 4)
-        };
+        let y_test_bytes =
+            unsafe { std::slice::from_raw_parts_mut(y_test.as_mut_ptr() as *mut u8, m * 4) };
         gpu.hip
             .memcpy_dtoh(y_test_bytes, unsafe { &d_y_test.buf })
             .unwrap();

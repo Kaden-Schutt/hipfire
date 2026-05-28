@@ -42,7 +42,12 @@ fn run_single_gpu(path: &str) -> Vec<u32> {
     let mut gpu = Gpu::init().expect("Gpu::init");
     let weights = qwen35::load_weights(&mut hfq, &config, &mut gpu).expect("load_weights");
     let mut kv = KvCache::new_gpu_asym3_capped(
-        &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, 4096, 4096,
+        &mut gpu,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        4096,
+        4096,
     )
     .expect("kv");
     let mut dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::Q8).expect("dn");
@@ -51,8 +56,10 @@ fn run_single_gpu(path: &str) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(N_TOKENS);
     let mut tok = PROMPT_TOKEN;
     for pos in 0..N_TOKENS {
-        qwen35::forward_scratch(&mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch)
-            .expect("forward_scratch");
+        qwen35::forward_scratch(
+            &mut gpu, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch,
+        )
+        .expect("forward_scratch");
         let logits = gpu.download_f32(&scratch.logits).expect("download logits");
         tok = argmax(&logits);
         tokens.push(tok);
@@ -74,17 +81,20 @@ fn run_multi_gpu(path: &str) -> Vec<u32> {
     let hfq = HfqFile::open(Path::new(path)).expect("open hfq");
     let config = qwen35::config_from_hfq(&hfq).expect("config");
     let mut gpus = Gpus::init_uniform(2, config.n_layers).expect("init_uniform");
-    let weights =
-        qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
-    let scratch_set = Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096)
-        .expect("scratch_set");
+    let weights = qwen35::load_weights_multi(&hfq, &config, &mut gpus).expect("load_weights_multi");
+    let scratch_set =
+        Qwen35ScratchSet::new_with_kv_max_multi(&mut gpus, &config, 64, 4096).expect("scratch_set");
     let mut kv = KvCache::new_gpu_asym3_capped_multi(
-        &mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, 4096, 4096,
+        &mut gpus,
+        config.n_layers,
+        config.n_kv_heads,
+        config.head_dim,
+        4096,
+        4096,
     )
     .expect("kv multi");
     let (mut dn, _la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8)
-            .expect("dn multi");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("dn multi");
     let _ = gpus.enable_peer_all().expect("enable_peer_all");
 
     let dev_last = gpus.output_device;
@@ -92,7 +102,14 @@ fn run_multi_gpu(path: &str) -> Vec<u32> {
     let mut tok = PROMPT_TOKEN;
     for pos in 0..N_TOKENS {
         qwen35::forward_scratch_multi(
-            &mut gpus, &weights, &config, tok, pos, &mut kv, &mut dn, &scratch_set,
+            &mut gpus,
+            &weights,
+            &config,
+            tok,
+            pos,
+            &mut kv,
+            &mut dn,
+            &scratch_set,
         )
         .expect("forward_scratch_multi");
         let s_last = &scratch_set.per_device[dev_last];
@@ -110,11 +127,17 @@ fn main() {
 
     println!("── PP=1 forward ──────────────────────────────────────────");
     let tokens_pp1 = run_single_gpu(&path);
-    println!("PP=1 tokens (first 20): {:?}", &tokens_pp1[..20.min(tokens_pp1.len())]);
+    println!(
+        "PP=1 tokens (first 20): {:?}",
+        &tokens_pp1[..20.min(tokens_pp1.len())]
+    );
 
     println!("\n── PP=2 forward ──────────────────────────────────────────");
     let tokens_pp2 = run_multi_gpu(&path);
-    println!("PP=2 tokens (first 20): {:?}", &tokens_pp2[..20.min(tokens_pp2.len())]);
+    println!(
+        "PP=2 tokens (first 20): {:?}",
+        &tokens_pp2[..20.min(tokens_pp2.len())]
+    );
 
     println!("\n── parity check ──────────────────────────────────────────");
     if tokens_pp1 == tokens_pp2 {
@@ -133,8 +156,14 @@ fn main() {
             "first diff at idx {i}: PP=1={} PP=2={}",
             tokens_pp1[i], tokens_pp2[i]
         );
-        println!("PP=1 around: {:?}", &tokens_pp1[i.saturating_sub(2)..(i + 5).min(N_TOKENS)]);
-        println!("PP=2 around: {:?}", &tokens_pp2[i.saturating_sub(2)..(i + 5).min(N_TOKENS)]);
+        println!(
+            "PP=1 around: {:?}",
+            &tokens_pp1[i.saturating_sub(2)..(i + 5).min(N_TOKENS)]
+        );
+        println!(
+            "PP=2 around: {:?}",
+            &tokens_pp2[i.saturating_sub(2)..(i + 5).min(N_TOKENS)]
+        );
     }
     eprintln!("\npp_parity: FAIL");
     std::process::exit(1);

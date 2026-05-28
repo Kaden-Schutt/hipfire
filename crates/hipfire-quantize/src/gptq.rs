@@ -37,7 +37,7 @@
 //! All linear algebra is FP64 (per Claude M2 + GLM5 M2 reviews) — FP32
 //! Cholesky on K=12288 with cond=1e6+ has zero effective precision.
 
-#![cfg_attr(not(test), allow(dead_code))]  // suppress until main.rs wires it
+#![cfg_attr(not(test), allow(dead_code))] // suppress until main.rs wires it
 
 use faer::linalg::solvers::{DenseSolveCore, Solve};
 use faer::{Mat, Side};
@@ -83,7 +83,13 @@ pub fn quantize_mq4_element_with_clamp(w: f64, scale: f64, min_val: f64) -> (f64
     }
     let inv_scale = 1.0 / scale;
     let q_raw = ((w - min_val) * inv_scale + 0.5).floor();
-    let clamp_state: i8 = if q_raw < 0.0 { -1 } else if q_raw > 15.0 { 1 } else { 0 };
+    let clamp_state: i8 = if q_raw < 0.0 {
+        -1
+    } else if q_raw > 15.0 {
+        1
+    } else {
+        0
+    };
     let q = q_raw.clamp(0.0, 15.0);
     (q * scale + min_val, clamp_state)
 }
@@ -240,22 +246,25 @@ pub fn compute_damped_inv_cholesky_upper(
                 //   x[j] = 1 / L[j, j]
                 //   x[i] = -(Σ_{m=j..i} L[i, m] · x[m]) / L[i, i]   for i > j
                 let l_mat_ref = &l_mat;
-                let l_inv_cols: Vec<Vec<f64>> = (0..k).into_par_iter().map(|j| {
-                    let mut col = vec![0.0_f64; k];
-                    let l_jj = l_mat_ref[(j, j)];
-                    if l_jj <= 0.0 {
-                        return col;  // defensive: should not happen after successful LLT
-                    }
-                    col[j] = 1.0 / l_jj;
-                    for i in (j + 1)..k {
-                        let mut s = 0.0;
-                        for m in j..i {
-                            s += l_mat_ref[(i, m)] * col[m];
+                let l_inv_cols: Vec<Vec<f64>> = (0..k)
+                    .into_par_iter()
+                    .map(|j| {
+                        let mut col = vec![0.0_f64; k];
+                        let l_jj = l_mat_ref[(j, j)];
+                        if l_jj <= 0.0 {
+                            return col; // defensive: should not happen after successful LLT
                         }
-                        col[i] = -s / l_mat_ref[(i, i)];
-                    }
-                    col
-                }).collect();
+                        col[j] = 1.0 / l_jj;
+                        for i in (j + 1)..k {
+                            let mut s = 0.0;
+                            for m in j..i {
+                                s += l_mat_ref[(i, m)] * col[m];
+                            }
+                            col[i] = -s / l_mat_ref[(i, i)];
+                        }
+                        col
+                    })
+                    .collect();
 
                 // Step 3: materialize H_inv = L_inv^T · L_inv (symmetric, K×K).
                 //
@@ -266,25 +275,31 @@ pub fn compute_damped_inv_cholesky_upper(
                 // L_inv[m, j] != 0 only when m >= j; intersection m >= max(i,j).
                 // Result is symmetric. Per-row parallel via rayon.
                 let l_inv_cols_ref = &l_inv_cols;
-                let h_inv_upper_rows: Vec<Vec<f64>> = (0..k).into_par_iter().map(|i| {
-                    let mut row = vec![0.0_f64; k];
-                    for j in i..k {  // upper triangle (incl. diagonal)
-                        let mut s = 0.0_f64;
-                        // m ranges over max(i,j)=j .. k (since j >= i in this loop)
-                        for m in j..k {
-                            s += l_inv_cols_ref[i][m] * l_inv_cols_ref[j][m];
+                let h_inv_upper_rows: Vec<Vec<f64>> = (0..k)
+                    .into_par_iter()
+                    .map(|i| {
+                        let mut row = vec![0.0_f64; k];
+                        for j in i..k {
+                            // upper triangle (incl. diagonal)
+                            let mut s = 0.0_f64;
+                            // m ranges over max(i,j)=j .. k (since j >= i in this loop)
+                            for m in j..k {
+                                s += l_inv_cols_ref[i][m] * l_inv_cols_ref[j][m];
+                            }
+                            row[j] = s;
                         }
-                        row[j] = s;
-                    }
-                    row
-                }).collect();
+                        row
+                    })
+                    .collect();
 
                 let mut h_inv = Mat::<f64>::zeros(k, k);
                 for i in 0..k {
                     for j in i..k {
                         let v = h_inv_upper_rows[i][j];
                         h_inv[(i, j)] = v;
-                        if i != j { h_inv[(j, i)] = v; }
+                        if i != j {
+                            h_inv[(j, i)] = v;
+                        }
                     }
                 }
 
@@ -307,7 +322,9 @@ pub fn compute_damped_inv_cholesky_upper(
                         // outer Cholesky uses — caller falls back to plain
                         // MQ4 RTN for this tensor (see main.rs:4336-4339).
                         return Err(CholeskyError::SingularEvenWithMaxDamp {
-                            max_damp: damp, k, diag_mean,
+                            max_damp: damp,
+                            k,
+                            diag_mean,
                         });
                     }
                 };
@@ -315,7 +332,7 @@ pub fn compute_damped_inv_cholesky_upper(
                 let mut u = Mat::<f64>::zeros(k, k);
                 for j in 0..k {
                     for i in 0..=j {
-                        u[(i, j)] = l_hi_view[(j, i)];  // transpose: U[i,j] = L_HI[j,i]
+                        u[(i, j)] = l_hi_view[(j, i)]; // transpose: U[i,j] = L_HI[j,i]
                     }
                 }
 
@@ -402,13 +419,13 @@ pub fn diag_condition_lower_bound(h: &Mat<f64>, damp: f64) -> f64 {
 ///
 /// This is the FWHT half of the Hessian transformation chain
 /// (Topic 1 + Topic 2 of the v2 plan).
-pub fn fwht_similarity_per_256(
-    h: &mut Mat<f64>,
-    signs1: &[f64],
-    signs2: &[f64],
-) {
+pub fn fwht_similarity_per_256(h: &mut Mat<f64>, signs1: &[f64], signs2: &[f64]) {
     let k = h.nrows();
-    assert_eq!(h.nrows(), h.ncols(), "FWHT similarity requires square matrix");
+    assert_eq!(
+        h.nrows(),
+        h.ncols(),
+        "FWHT similarity requires square matrix"
+    );
     assert!(k % 256 == 0, "K={k} must be divisible by 256");
     assert_eq!(signs1.len(), 256);
     assert_eq!(signs2.len(), 256);
@@ -577,7 +594,11 @@ pub fn pack_mq4g256_from_rotated_f64(weights: &[f64], grids: &[BlockGrid]) -> Ve
         let grid = grids[b];
         let scale_f32 = grid.scale as f32;
         let min_f32 = grid.min_val as f32;
-        let inv_scale = if grid.scale > 0.0 { 1.0 / grid.scale } else { 0.0 };
+        let inv_scale = if grid.scale > 0.0 {
+            1.0 / grid.scale
+        } else {
+            0.0
+        };
 
         let out_off = b * block_bytes;
         output[out_off..out_off + 4].copy_from_slice(&scale_f32.to_le_bytes());
@@ -619,8 +640,8 @@ pub fn gptq_pipeline_mq4g256(
     weights_f32: &[f32],
     m: usize,
     k: usize,
-    h_unrot_f32: &[f32],     // K*K row-major
-    awq_scales: &[f64],      // length K; pass [1.0; K] for non-AWQ
+    h_unrot_f32: &[f32], // K*K row-major
+    awq_scales: &[f64],  // length K; pass [1.0; K] for non-AWQ
     signs1_f32: &[f32],
     signs2_f32: &[f32],
     initial_damp: f64,
@@ -683,7 +704,11 @@ pub fn gptq_pipeline_mq4g256(
 /// pattern in `quantize_mq4g256`.
 pub fn compute_frozen_block_grids(weights_flat: &[f64]) -> Vec<BlockGrid> {
     let n = weights_flat.len();
-    assert_eq!(n % 256, 0, "weight buffer length {n} must be divisible by 256");
+    assert_eq!(
+        n % 256,
+        0,
+        "weight buffer length {n} must be divisible by 256"
+    );
     let n_blocks = n / 256;
     let mut grids = Vec::with_capacity(n_blocks);
     for b in 0..n_blocks {
@@ -691,8 +716,12 @@ pub fn compute_frozen_block_grids(weights_flat: &[f64]) -> Vec<BlockGrid> {
         let mut min_val = f64::INFINITY;
         let mut max_val = f64::NEG_INFINITY;
         for &v in block {
-            if v < min_val { min_val = v; }
-            if v > max_val { max_val = v; }
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
         }
         let range = max_val - min_val;
         let scale = if range > 0.0 { range / 15.0 } else { 1.0 };
@@ -725,7 +754,11 @@ pub fn weight_mode_actorder(h_diag: &[f64]) -> Vec<usize> {
     let mut perm: Vec<usize> = (0..k).collect();
     // Sort indices by descending diag(H). Stable to keep deterministic order
     // for tied diagonals (matters for unit-test reproducibility).
-    perm.sort_by(|&a, &b| h_diag[b].partial_cmp(&h_diag[a]).unwrap_or(std::cmp::Ordering::Equal));
+    perm.sort_by(|&a, &b| {
+        h_diag[b]
+            .partial_cmp(&h_diag[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     perm
 }
 
@@ -799,7 +832,10 @@ pub fn gptq_column_sequential(
     // Schur-complement Hessian — exactly the textbook GPTQ correction.
     // See `compute_damped_inv_cholesky_upper` doc for the full math.
     let (u, effective_damp) = compute_damped_inv_cholesky_upper(
-        h_target, Some(&perm), initial_damp, max_damp_multiplier,
+        h_target,
+        Some(&perm),
+        initial_damp,
+        max_damp_multiplier,
     )?;
 
     // Working copy of the post-quantize "residual" weights. We need to
@@ -891,7 +927,9 @@ pub fn gptq_column_sequential(
     eprintln!(
         "[gptq-clamp] {tensor_name} M={m} K={k_dim} elements={total} \
          clamps={}/{} ({:.3}%)  above={cab}  below={cbe}",
-        cab + cbe, total, pct,
+        cab + cbe,
+        total,
+        pct,
     );
 
     Ok(effective_damp)
@@ -907,12 +945,12 @@ mod tests {
     fn quantize_mq4_element_rounds_to_grid() {
         // Grid: 16 values 0, 0.25, 0.5, ..., 3.75 (scale=0.25, min_val=0)
         assert_eq!(quantize_mq4_element(0.0, 0.25, 0.0), 0.0);
-        assert_eq!(quantize_mq4_element(0.1, 0.25, 0.0), 0.0);    // rounds down
-        assert_eq!(quantize_mq4_element(0.15, 0.25, 0.0), 0.25);  // rounds up (>= 0.125)
+        assert_eq!(quantize_mq4_element(0.1, 0.25, 0.0), 0.0); // rounds down
+        assert_eq!(quantize_mq4_element(0.15, 0.25, 0.0), 0.25); // rounds up (>= 0.125)
         assert_eq!(quantize_mq4_element(3.5, 0.25, 0.0), 3.5);
         assert_eq!(quantize_mq4_element(3.74, 0.25, 0.0), 3.75);
-        assert_eq!(quantize_mq4_element(10.0, 0.25, 0.0), 3.75);  // clamp to 15
-        assert_eq!(quantize_mq4_element(-1.0, 0.25, 0.0), 0.0);   // clamp to 0
+        assert_eq!(quantize_mq4_element(10.0, 0.25, 0.0), 3.75); // clamp to 15
+        assert_eq!(quantize_mq4_element(-1.0, 0.25, 0.0), 0.0); // clamp to 0
     }
 
     /// Asymmetric grid: `min_val` shifts the entire bucket array.
@@ -922,16 +960,18 @@ mod tests {
         assert_eq!(quantize_mq4_element(-1.0, 0.125, -1.0), -1.0);
         assert_eq!(quantize_mq4_element(0.0, 0.125, -1.0), 0.0);
         assert_eq!(quantize_mq4_element(0.875, 0.125, -1.0), 0.875);
-        assert_eq!(quantize_mq4_element(1.5, 0.125, -1.0), 0.875);  // clamp
-        assert_eq!(quantize_mq4_element(-1.5, 0.125, -1.0), -1.0);  // clamp
+        assert_eq!(quantize_mq4_element(1.5, 0.125, -1.0), 0.875); // clamp
+        assert_eq!(quantize_mq4_element(-1.5, 0.125, -1.0), -1.0); // clamp
     }
 
     /// Cholesky on a tiny SPD matrix: H = [[4, 2], [2, 3]] → L = [[2, 0], [1, √2]].
     #[test]
     fn cholesky_succeeds_on_spd() {
         let h = Mat::<f64>::from_fn(2, 2, |i, j| match (i, j) {
-            (0, 0) => 4.0, (0, 1) => 2.0,
-            (1, 0) => 2.0, (1, 1) => 3.0,
+            (0, 0) => 4.0,
+            (0, 1) => 2.0,
+            (1, 0) => 2.0,
+            (1, 1) => 3.0,
             _ => unreachable!(),
         });
         let (l, damp) = cholesky_with_adaptive_damping(&h, 0.0, 1.0).unwrap();
@@ -939,13 +979,20 @@ mod tests {
         // not literally zero — that floor exists to prevent the damp=0
         // infinite-loop on singular inputs. Cosmetic shift; the Cholesky
         // result is unchanged to FP precision.
-        assert!(damp < 1e-14, "SPD damp should be at the ε·diag_mean floor, got {damp}");
+        assert!(
+            damp < 1e-14,
+            "SPD damp should be at the ε·diag_mean floor, got {damp}"
+        );
         // L[0][0] = sqrt(4) = 2.0
         assert!((l[(0, 0)] - 2.0).abs() < 1e-12, "L[0][0] = {}", l[(0, 0)]);
         // L[1][0] = 2 / 2 = 1.0
         assert!((l[(1, 0)] - 1.0).abs() < 1e-12, "L[1][0] = {}", l[(1, 0)]);
         // L[1][1] = sqrt(3 - 1) = sqrt(2)
-        assert!((l[(1, 1)] - 2.0_f64.sqrt()).abs() < 1e-12, "L[1][1] = {}", l[(1, 1)]);
+        assert!(
+            (l[(1, 1)] - 2.0_f64.sqrt()).abs() < 1e-12,
+            "L[1][1] = {}",
+            l[(1, 1)]
+        );
         // Above-diag entries should be zero
         assert_eq!(l[(0, 1)], 0.0);
     }
@@ -984,7 +1031,11 @@ mod tests {
         apply_awq_rescaling(&mut h, &[2.0, 2.0, 2.0]);
         for i in 0..3 {
             for j in 0..3 {
-                assert!((h[(i, j)] - 1.0).abs() < 1e-12, "H[{i},{j}] = {}", h[(i, j)]);
+                assert!(
+                    (h[(i, j)] - 1.0).abs() < 1e-12,
+                    "H[{i},{j}] = {}",
+                    h[(i, j)]
+                );
             }
         }
     }
@@ -1002,8 +1053,12 @@ mod tests {
         }
         let trace_before: f64 = (0..k).map(|i| h[(i, i)]).sum();
 
-        let signs1: Vec<f64> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
-        let signs2: Vec<f64> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs1: Vec<f64> = (0..256)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs2: Vec<f64> = (0..256)
+            .map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         fwht_similarity_per_256(&mut h, &signs1, &signs2);
 
         let trace_after: f64 = (0..k).map(|i| h[(i, i)]).sum();
@@ -1071,7 +1126,7 @@ mod tests {
     #[test]
     fn gptq_identity_hessian_equals_rtn() {
         let m = 4;
-        let k = 256;  // one frozen-block per row
+        let k = 256; // one frozen-block per row
         let weights_orig: Vec<f64> = (0..m * k).map(|i| (i as f64) * 0.01).collect();
         let frozen = compute_frozen_block_grids(&weights_orig);
 
@@ -1079,10 +1134,15 @@ mod tests {
         let h = Mat::<f64>::identity(k, k);
 
         let mut weights = weights_orig.clone();
-        let damp = gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0, "test:identity_H").unwrap();
+        let damp =
+            gptq_column_sequential(&mut weights, &h, m, k, &frozen, 0.0, 1.0, "test:identity_H")
+                .unwrap();
         // Identity H trivially Cholesky'd — effective damp lands on the
         // ε·diag_mean=ε floor from clamped_initial_damp, not literally 0.
-        assert!(damp < 1e-14, "identity H damp should be at the ε floor, got {damp}");
+        assert!(
+            damp < 1e-14,
+            "identity H damp should be at the ε floor, got {damp}"
+        );
 
         // Compare to plain RTN on the same weights+grids.
         let mut rtn = weights_orig.clone();
@@ -1155,8 +1215,12 @@ mod tests {
         let dot_before: f64 = (0..k).map(|i| a_orig[i] * b_orig[i]).sum();
 
         // Use deterministic ±1 sign tables (asymmetric — like the real kernel).
-        let signs1: Vec<f64> = (0..256).map(|i| if i % 3 == 0 { 1.0 } else { -1.0 }).collect();
-        let signs2: Vec<f64> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs1: Vec<f64> = (0..256)
+            .map(|i| if i % 3 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs2: Vec<f64> = (0..256)
+            .map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
 
         let mut a = a_orig.clone();
         let mut b = b_orig.clone();
@@ -1184,13 +1248,27 @@ mod tests {
 
         // H = I (k×k), AWQ scales = 1.0 → entire pipeline reduces to
         // FWHT → frozen grids → RTN → pack.
-        let h_unrot: Vec<f32> = (0..k * k).map(|i| if i / k == i % k { 1.0 } else { 0.0 }).collect();
+        let h_unrot: Vec<f32> = (0..k * k)
+            .map(|i| if i / k == i % k { 1.0 } else { 0.0 })
+            .collect();
         let awq_scales = vec![1.0_f64; k];
-        let signs1: Vec<f32> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
-        let signs2: Vec<f32> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs1: Vec<f32> = (0..256)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs2: Vec<f32> = (0..256)
+            .map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
 
         let gptq_packed = gptq_pipeline_mq4g256(
-            &weights_f32, m, k, &h_unrot, &awq_scales, &signs1, &signs2, 1e-6, 1.0,
+            &weights_f32,
+            m,
+            k,
+            &h_unrot,
+            &awq_scales,
+            &signs1,
+            &signs2,
+            1e-6,
+            1.0,
             "test:pipeline_identity",
         )
         .expect("identity-H pipeline should not need damping");
@@ -1205,7 +1283,10 @@ mod tests {
         let rtn_packed = pack_mq4g256_from_rotated_f64(&rotated_f64, &grids);
 
         assert_eq!(gptq_packed.len(), rtn_packed.len(), "byte-length mismatch");
-        assert_eq!(gptq_packed, rtn_packed, "GPTQ with identity-H should byte-equal plain rotated RTN");
+        assert_eq!(
+            gptq_packed, rtn_packed,
+            "GPTQ with identity-H should byte-equal plain rotated RTN"
+        );
     }
 
     /// **GPTQ reconstruction test:** for a well-conditioned diagonal-dominant H,
@@ -1235,9 +1316,13 @@ mod tests {
         // Diagonal-dominant Hessian with one channel (100) heavily weighted.
         let h = Mat::<f64>::from_fn(k, k, |i, j| {
             if i == j {
-                if i == 100 { 100.0 } else { 1.0 }
+                if i == 100 {
+                    100.0
+                } else {
+                    1.0
+                }
             } else {
-                0.001  // small off-diagonals to give GPTQ something to do
+                0.001 // small off-diagonals to give GPTQ something to do
             }
         });
 
@@ -1254,7 +1339,8 @@ mod tests {
 
         // GPTQ.
         let mut gptq = weights_orig.clone();
-        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0, "test:improves_aw").unwrap();
+        gptq_column_sequential(&mut gptq, &h, m, k, &frozen, 1e-6, 1.0, "test:improves_aw")
+            .unwrap();
 
         // Activation-weighted error: sum over (i,j,k) of (w[i,j]-w_q[i,j]) * H[j,k] * (w[i,k]-w_q[i,k]).
         // Approximate via per-channel diagonal (the dominant term):
@@ -1287,7 +1373,7 @@ mod tests {
     /// at zero forever and this call never returned.
     #[test]
     fn cholesky_terminates_on_singular_h_with_zero_initial_damp() {
-        let h = Mat::<f64>::from_fn(4, 4, |_i, _j| 1.0);  // rank-1, singular
+        let h = Mat::<f64>::from_fn(4, 4, |_i, _j| 1.0); // rank-1, singular
         let (_l, damp) = cholesky_with_adaptive_damping(&h, 0.0, 1.0)
             .expect("must terminate with successful damp on rank-1 H");
         assert!(damp > 0.0, "damp must be > 0 to make singular H invertible");
@@ -1303,9 +1389,15 @@ mod tests {
     #[test]
     fn compute_damped_inv_cholesky_upper_satisfies_identity() {
         let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
-            (0, 0) => 4.0, (0, 1) => 1.0, (0, 2) => 0.5,
-            (1, 0) => 1.0, (1, 1) => 3.0, (1, 2) => 0.25,
-            (2, 0) => 0.5, (2, 1) => 0.25, (2, 2) => 2.0,
+            (0, 0) => 4.0,
+            (0, 1) => 1.0,
+            (0, 2) => 0.5,
+            (1, 0) => 1.0,
+            (1, 1) => 3.0,
+            (1, 2) => 0.25,
+            (2, 0) => 0.5,
+            (2, 1) => 0.25,
+            (2, 2) => 2.0,
             _ => unreachable!(),
         });
         let (u, damp) = compute_damped_inv_cholesky_upper(&h, None, 0.01, 1.0).unwrap();
@@ -1313,7 +1405,12 @@ mod tests {
         // U is upper-triangular: U[i, j] = 0 for i > j.
         for i in 0..3 {
             for j in 0..i {
-                assert_eq!(u[(i, j)], 0.0, "U should be upper-tri: U[{i},{j}]={}", u[(i, j)]);
+                assert_eq!(
+                    u[(i, j)],
+                    0.0,
+                    "U should be upper-tri: U[{i},{j}]={}",
+                    u[(i, j)]
+                );
             }
         }
 
@@ -1323,7 +1420,7 @@ mod tests {
             for j in 0..3 {
                 let mut s = 0.0;
                 for k in 0..3 {
-                    s += u[(k, i)] * u[(k, j)];  // U^T · U
+                    s += u[(k, i)] * u[(k, j)]; // U^T · U
                 }
                 utu[i][j] = s;
             }
@@ -1331,7 +1428,9 @@ mod tests {
 
         // (H + damp·I) · utu should be I.
         let mut a = h.clone();
-        for i in 0..3 { a[(i, i)] += damp; }
+        for i in 0..3 {
+            a[(i, i)] += damp;
+        }
         for i in 0..3 {
             for j in 0..3 {
                 let mut s = 0.0;
@@ -1376,7 +1475,8 @@ mod tests {
         for i in 0..4 {
             for j in (i + 1)..4 {
                 let avg = 0.5 * (hs[(i, j)] + hs[(j, i)]);
-                hs[(i, j)] = avg; hs[(j, i)] = avg;
+                hs[(i, j)] = avg;
+                hs[(j, i)] = avg;
             }
         }
         let damp = 1e-8;
@@ -1384,7 +1484,9 @@ mod tests {
 
         // Reference H_inv via (H + damp·I)^-1 from an independent path.
         let mut a = hs.clone();
-        for i in 0..4 { a[(i, i)] += damp; }
+        for i in 0..4 {
+            a[(i, i)] += damp;
+        }
         let l = a.llt(Side::Lower).unwrap();
         let identity = Mat::<f64>::identity(4, 4);
         let h_inv = l.solve(&identity);
@@ -1436,12 +1538,18 @@ mod tests {
     #[test]
     fn compute_damped_inv_cholesky_upper_with_permutation() {
         let h = Mat::<f64>::from_fn(3, 3, |i, j| match (i, j) {
-            (0, 0) => 4.0, (0, 1) => 1.0, (0, 2) => 0.5,
-            (1, 0) => 1.0, (1, 1) => 3.0, (1, 2) => 0.25,
-            (2, 0) => 0.5, (2, 1) => 0.25, (2, 2) => 2.0,
+            (0, 0) => 4.0,
+            (0, 1) => 1.0,
+            (0, 2) => 0.5,
+            (1, 0) => 1.0,
+            (1, 1) => 3.0,
+            (1, 2) => 0.25,
+            (2, 0) => 0.5,
+            (2, 1) => 0.25,
+            (2, 2) => 2.0,
             _ => unreachable!(),
         });
-        let perm = vec![2_usize, 0, 1];  // arbitrary permutation
+        let perm = vec![2_usize, 0, 1]; // arbitrary permutation
         let (u, damp) = compute_damped_inv_cholesky_upper(&h, Some(&perm), 0.01, 1.0).unwrap();
 
         // Build H_perm = P^T H P + damp·I (the matrix Cholesky operated on).
@@ -1451,7 +1559,9 @@ mod tests {
                 h_perm[(i, j)] = h[(perm[i], perm[j])];
             }
         }
-        for i in 0..3 { h_perm[(i, i)] += damp; }
+        for i in 0..3 {
+            h_perm[(i, i)] += damp;
+        }
 
         // (P^T H P + damp·I) · (U^T · U) should be I.
         for i in 0..3 {
@@ -1460,7 +1570,7 @@ mod tests {
                 for k in 0..3 {
                     let mut utu_kj = 0.0;
                     for m in 0..3 {
-                        utu_kj += u[(m, k)] * u[(m, j)];  // U^T · U
+                        utu_kj += u[(m, k)] * u[(m, j)]; // U^T · U
                     }
                     s += h_perm[(i, k)] * utu_kj;
                 }
@@ -1487,9 +1597,11 @@ mod tests {
         for i in 0..4 {
             for j in 0..4 {
                 assert_eq!(
-                    h[(i, j)], h[(j, i)],
+                    h[(i, j)],
+                    h[(j, i)],
                     "after symmetrize: [{i},{j}] = {}, [{j},{i}] = {}",
-                    h[(i, j)], h[(j, i)]
+                    h[(i, j)],
+                    h[(j, i)]
                 );
             }
         }
@@ -1514,8 +1626,12 @@ mod tests {
         }
         let trace_before: f64 = (0..k).map(|i| h[(i, i)]).sum();
 
-        let signs1: Vec<f64> = (0..256).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
-        let signs2: Vec<f64> = (0..256).map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let signs1: Vec<f64> = (0..256)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let signs2: Vec<f64> = (0..256)
+            .map(|i| if (i / 4) % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         fwht_similarity_per_256(&mut h, &signs1, &signs2);
         symmetrize_in_place(&mut h);
 

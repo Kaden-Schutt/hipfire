@@ -37,10 +37,10 @@ fn main() {
     // production AWQ A3B shape that triggered this port: M=2048 K=4096
     // batch=256 (attention wo @ batch=prompt).
     let shapes: Vec<(usize, usize, &str)> = vec![
-        ( 16,   256, "tiny"),
-        ( 32,   512, "small"),
-        ( 64,   512, "medium"),
-        (512,  1024, "medium-wide"),
+        (16, 256, "tiny"),
+        (32, 512, "small"),
+        (64, 512, "medium"),
+        (512, 1024, "medium-wide"),
         (2048, 4096, "production AWQ A3B wo (M=2048 K=4096)"),
     ];
     let batches: Vec<usize> = vec![1, 16, 32, 64, 128, 256];
@@ -58,30 +58,41 @@ fn main() {
         let d_x = gpu.upload_f32(&x_host, &[max_n, k]).unwrap();
 
         // Residual seed — non-zero so we actually test += vs =.
-        let r_host: Vec<f32> = (0..max_n * m).map(|i| ((i % 13) as f32 - 6.0) * 0.01).collect();
+        let r_host: Vec<f32> = (0..max_n * m)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.01)
+            .collect();
 
         for &n in &batches {
             let x_n = d_x.sub_offset(0, n * k);
 
             // Test path: seed Y with residual, run fused gfx12 WMMA kernel.
             let d_y_test = gpu.upload_f32(&r_host[..n * m], &[n, m]).unwrap();
-            gpu.gemm_hfq6g256_residual_wmma_gfx12(&d_a, &x_n, &d_y_test, m, k, n).unwrap();
+            gpu.gemm_hfq6g256_residual_wmma_gfx12(&d_a, &x_n, &d_y_test, m, k, n)
+                .unwrap();
 
             // Ref path: seed Y with same residual, run validated FP16 kernel.
             // (Both paths take FP32 X — the WMMA wrapper converts to FP16
             // internally via ensure_fp16_x; this fp16 ref does the same.)
             let d_y_ref = gpu.upload_f32(&r_host[..n * m], &[n, m]).unwrap();
-            gpu.gemm_hfq6g256_residual_fp16(&d_a, &x_n, &d_y_ref, m, k, n).unwrap();
+            gpu.gemm_hfq6g256_residual_fp16(&d_a, &x_n, &d_y_ref, m, k, n)
+                .unwrap();
 
-            let s = compare(&gpu.download_f32(&d_y_test).unwrap(),
-                            &gpu.download_f32(&d_y_ref).unwrap());
+            let s = compare(
+                &gpu.download_f32(&d_y_test).unwrap(),
+                &gpu.download_f32(&d_y_ref).unwrap(),
+            );
             // Pass criterion: FP16-ref ULP-band check.
             //   mean_rel < 2.5e-3  : test_gemm_q8_residual_wmma precedent
             //   max_rel  < 6.0e-2  : FP16-ref accumulation ULPs at K=4096
             //   max_abs/max_ref < 5e-3 : drift-vs-magnitude (kernel-bug catch)
             let drift = s.max_abs / s.max_ref.max(1e-6);
             let pass = s.mean_rel < 2.5e-3 && s.max_rel < 6e-2 && drift < 5e-3;
-            let mark = if pass { "PASS" } else { total_fail += 1; "FAIL" };
+            let mark = if pass {
+                "PASS"
+            } else {
+                total_fail += 1;
+                "FAIL"
+            };
             eprintln!(
                 "  N={n:4}  {mark}   max_abs={:.2e}  mean_rel={:.2e}  max_rel={:.2e}  drift={:.2e}",
                 s.max_abs, s.mean_rel, s.max_rel, drift
@@ -92,7 +103,12 @@ fn main() {
     std::process::exit(if total_fail == 0 { 0 } else { 1 });
 }
 
-struct Stats { max_abs: f64, max_ref: f64, mean_rel: f64, max_rel: f64 }
+struct Stats {
+    max_abs: f64,
+    max_ref: f64,
+    mean_rel: f64,
+    max_rel: f64,
+}
 fn compare(a: &[f32], b: &[f32]) -> Stats {
     let max_ref_f = b.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
     // Only compare cells where |ref| is meaningfully non-zero.
@@ -101,10 +117,16 @@ fn compare(a: &[f32], b: &[f32]) -> Stats {
     let mut max_abs = 0.0f64;
     for (x, y) in a.iter().zip(b.iter()) {
         let abs = (x - y).abs() as f64;
-        if abs > max_abs { max_abs = abs; }
+        if abs > max_abs {
+            max_abs = abs;
+        }
         if y.abs() > thr {
             let r = abs / y.abs() as f64;
-            sum += r; if r > max_r { max_r = r; } n += 1;
+            sum += r;
+            if r > max_r {
+                max_r = r;
+            }
+            n += 1;
         }
     }
     Stats {

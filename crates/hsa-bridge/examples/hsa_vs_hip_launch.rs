@@ -99,20 +99,32 @@ fn main() {
 
     // ─── 4. Set up HSA path ──────────────────────────────────────────────
     let queue = agent.create_queue(1024).expect("create_queue");
-    eprintln!("[hsa] queue size={} doorbell=0x{:x}", queue.size(), queue.doorbell());
+    eprintln!(
+        "[hsa] queue size={} doorbell=0x{:x}",
+        queue.size(),
+        queue.doorbell()
+    );
 
     // Kernarg pool lives on the CPU agent (host-pinned, GPU-readable).
     let cpu_agent = hsa.find_cpu_agent().expect("find_cpu_agent");
     let kernarg_pool = cpu_agent.find_kernarg_pool().expect("kernarg pool");
-    let device_pool = agent.find_coarse_grained_pool().expect("device pool (coarse)");
+    let device_pool = agent
+        .find_coarse_grained_pool()
+        .expect("device pool (coarse)");
 
     let hsa_a = device_pool.allocate(nbytes).unwrap();
     let hsa_b = device_pool.allocate(nbytes).unwrap();
     let hsa_c = device_pool.allocate(nbytes).unwrap();
     // Coarse-grained device memory is GPU-only by default; allow CPU writes too.
-    device_pool.allow_access(&[&cpu_agent, &agent], hsa_a).unwrap();
-    device_pool.allow_access(&[&cpu_agent, &agent], hsa_b).unwrap();
-    device_pool.allow_access(&[&cpu_agent, &agent], hsa_c).unwrap();
+    device_pool
+        .allow_access(&[&cpu_agent, &agent], hsa_a)
+        .unwrap();
+    device_pool
+        .allow_access(&[&cpu_agent, &agent], hsa_b)
+        .unwrap();
+    device_pool
+        .allow_access(&[&cpu_agent, &agent], hsa_c)
+        .unwrap();
     unsafe {
         std::ptr::copy_nonoverlapping(a_data.as_ptr() as *const u8, hsa_a, nbytes);
         std::ptr::copy_nonoverlapping(b_data.as_ptr() as *const u8, hsa_b, nbytes);
@@ -133,7 +145,9 @@ fn main() {
     // (KERNARG_INIT flag, fine-grained system memory). Explicitly allow the GPU
     // to read it — without this we get a GPU page fault on the kernarg load.
     let kernarg = kernarg_pool.allocate(kernel.kernarg_size as usize).unwrap();
-    kernarg_pool.allow_access(&[&cpu_agent, &agent], kernarg).unwrap();
+    kernarg_pool
+        .allow_access(&[&cpu_agent, &agent], kernarg)
+        .unwrap();
     eprintln!(
         "[hsa] addrs: a=0x{:x} b=0x{:x} c=0x{:x} kernarg=0x{:x}",
         hsa_a as usize, hsa_b as usize, hsa_c as usize, kernarg as usize,
@@ -223,14 +237,8 @@ fn main() {
         n
     );
     if hip_bad != 0 || hsa_bad != 0 {
-        eprintln!(
-            "  HIP first 4: {:?}",
-            &hip_floats[..4]
-        );
-        eprintln!(
-            "  HSA first 4: {:?}",
-            &hsa_floats[..4]
-        );
+        eprintln!("  HIP first 4: {:?}", &hip_floats[..4]);
+        eprintln!("  HSA first 4: {:?}", &hsa_floats[..4]);
         std::process::exit(1);
     }
 
@@ -332,7 +340,11 @@ fn main() {
             for i in 0..burst {
                 let idx = base_idx + i as u64;
                 let slot = queue.packet_slot(idx);
-                let completion = if i == burst - 1 { signal.raw_handle() } else { 0 };
+                let completion = if i == burst - 1 {
+                    signal.raw_handle()
+                } else {
+                    0
+                };
                 build_dispatch_packet(
                     slot,
                     &kernel,
@@ -365,17 +377,26 @@ fn main() {
     let hsa_med = median_us(&hsa_lat);
     eprintln!("\n[summary]");
     eprintln!("  HIP single dispatch:  {hip_med:6.2} µs");
-    eprintln!("  HSA single dispatch:  {hsa_med:6.2} µs   ({:.2}x vs HIP)", hip_med / hsa_med);
+    eprintln!(
+        "  HSA single dispatch:  {hsa_med:6.2} µs   ({:.2}x vs HIP)",
+        hip_med / hsa_med
+    );
     if let Some(&(_, hip_best)) = hip_burst_results
         .iter()
         .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
     {
-        eprintln!("  HIP burst (best):     {hip_best:6.2} µs   ({:.2}x vs HIP single)", hip_med / hip_best);
+        eprintln!(
+            "  HIP burst (best):     {hip_best:6.2} µs   ({:.2}x vs HIP single)",
+            hip_med / hip_best
+        );
         if let Some(&(_, hsa_best)) = burst_results
             .iter()
             .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
         {
-            eprintln!("  HSA burst (best):     {hsa_best:6.2} µs   ({:.2}x vs HIP burst)", hip_best / hsa_best);
+            eprintln!(
+                "  HSA burst (best):     {hsa_best:6.2} µs   ({:.2}x vs HIP burst)",
+                hip_best / hsa_best
+            );
         }
     }
 }

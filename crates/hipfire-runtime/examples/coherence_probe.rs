@@ -236,15 +236,10 @@ fn spawn_daemon(daemon: &PathBuf) -> Result<DaemonChild, String> {
 }
 
 fn send(d: &mut DaemonChild, msg: &serde_json::Value) -> Result<(), String> {
-    let stdin = d
-        .stdin
-        .as_mut()
-        .ok_or("daemon stdin already closed")?;
+    let stdin = d.stdin.as_mut().ok_or("daemon stdin already closed")?;
     let line = serde_json::to_string(msg).map_err(|e| format!("encode: {}", e))?;
     writeln!(stdin, "{}", line).map_err(|e| format!("write daemon: {}", e))?;
-    stdin
-        .flush()
-        .map_err(|e| format!("flush daemon: {}", e))?;
+    stdin.flush().map_err(|e| format!("flush daemon: {}", e))?;
     Ok(())
 }
 
@@ -255,7 +250,10 @@ where
     let mut line = String::new();
     loop {
         line.clear();
-        let n = d.stdout.read_line(&mut line).map_err(|e| format!("read: {}", e))?;
+        let n = d
+            .stdout
+            .read_line(&mut line)
+            .map_err(|e| format!("read: {}", e))?;
         if n == 0 {
             return Err("daemon closed stdout unexpectedly".into());
         }
@@ -314,9 +312,10 @@ fn drive_generate(
         "max_tokens": args.max_tokens.unwrap_or(200),
     });
     if let Some(sys) = system {
-        req.as_object_mut()
-            .unwrap()
-            .insert("system".to_string(), serde_json::Value::String(sys.to_string()));
+        req.as_object_mut().unwrap().insert(
+            "system".to_string(),
+            serde_json::Value::String(sys.to_string()),
+        );
     }
     send(d, &req)?;
 
@@ -377,10 +376,7 @@ fn drive_generate(
                 }
             }
             "done" => {
-                let total_tokens = v
-                    .get("tokens")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(0) as usize;
+                let total_tokens = v.get("tokens").and_then(|x| x.as_u64()).unwrap_or(0) as usize;
                 let wall_ms = t_start.elapsed().as_millis() as u64;
                 let ttft = ttft_ms.unwrap_or(wall_ms);
                 let ev = Event::Done {
@@ -396,8 +392,14 @@ fn drive_generate(
                 // Daemon-authoritative perf metrics from the done event.
                 // Default to 0 if absent (older daemons / non-Qwen35 paths).
                 let daemon_prefill_ms = v.get("prefill_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_prefill_tok_s = v.get("prefill_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
-                let daemon_decode_tok_s = v.get("decode_tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
+                let daemon_prefill_tok_s = v
+                    .get("prefill_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
+                let daemon_decode_tok_s = v
+                    .get("decode_tok_s")
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or(0.0);
                 let daemon_ttft_ms = v.get("ttft_ms").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 let daemon_tok_s = v.get("tok_s").and_then(|x| x.as_f64()).unwrap_or(0.0);
                 done_stats = DoneStats {
@@ -540,11 +542,7 @@ fn run() -> Result<i32, String> {
             .map(|s| format!(" + {}", s))
             .unwrap_or_default()
     );
-    let combined_for_md5 = format!(
-        "{}\n----\n{}",
-        system.as_deref().unwrap_or(""),
-        prompt
-    );
+    let combined_for_md5 = format!("{}\n----\n{}", system.as_deref().unwrap_or(""), prompt);
     let md5 = prompt_md5(combined_for_md5.as_bytes());
 
     let daemon = find_daemon_binary()?;

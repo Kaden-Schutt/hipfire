@@ -93,7 +93,9 @@ impl EosFilter {
         // for stop_at (an early shorter match must not preempt a
         // longer one starting at the same offset).
         let mut config = config;
-        config.holdback_prefixes.sort_by(|a, b| b.len().cmp(&a.len()));
+        config
+            .holdback_prefixes
+            .sort_by(|a, b| b.len().cmp(&a.len()));
         config.stop_at.sort_by(|a, b| b.len().cmp(&a.len()));
         Self {
             config,
@@ -244,10 +246,7 @@ impl EosFilter {
                     // re-scanning from 0. The bytes between the old
                     // `emitted` and the prefix start are inside the
                     // think block and stay un-emitted.
-                    let cut = trailing_prefix_start(
-                        &self.state.buf[self.state.emitted..],
-                        CLOSE,
-                    );
+                    let cut = trailing_prefix_start(&self.state.buf[self.state.emitted..], CLOSE);
                     self.state.emitted += cut;
                     return;
                 }
@@ -276,7 +275,9 @@ impl EosFilter {
                     let opener_start = self.state.emitted + idx;
                     // Drain the opener bytes (`<think>`) from the
                     // buffer so they never appear in the emit slice.
-                    self.state.buf.drain(opener_start..opener_start + OPEN.len());
+                    self.state
+                        .buf
+                        .drain(opener_start..opener_start + OPEN.len());
                     // Mark the think state. `emitted` does not move:
                     // the pre-opener bytes are still pending.
                     self.state.in_think = true;
@@ -465,20 +466,14 @@ mod tests {
         // First two bytes — incomplete codepoint — Hold.
         assert_eq!(f.observe(&smile[..2]), FilterAction::Hold);
         // Remaining two bytes — Emit the full 4-byte codepoint.
-        assert_eq!(
-            f.observe(&smile[2..]),
-            FilterAction::Emit(smile.to_vec())
-        );
+        assert_eq!(f.observe(&smile[2..]), FilterAction::Emit(smile.to_vec()));
     }
 
     #[test]
     fn think_open_holds_until_close() {
         let mut f = EosFilter::new(cfg_strip_think());
         // Pre-think prose flushes immediately.
-        assert_eq!(
-            f.observe(b"hello "),
-            FilterAction::Emit(b"hello ".to_vec())
-        );
+        assert_eq!(f.observe(b"hello "), FilterAction::Emit(b"hello ".to_vec()));
         // Opening tag + reasoning content — held.
         assert_eq!(f.observe(b"<think>reasoning"), FilterAction::Hold);
         assert_eq!(f.observe(b" more"), FilterAction::Hold);
@@ -496,19 +491,13 @@ mod tests {
         // Closer in its own observe call.
         assert_eq!(f.observe(b"</think>"), FilterAction::Hold);
         // Subsequent prose must flow normally.
-        assert_eq!(
-            f.observe(b" world"),
-            FilterAction::Emit(b" world".to_vec())
-        );
+        assert_eq!(f.observe(b" world"), FilterAction::Emit(b" world".to_vec()));
     }
 
     #[test]
     fn stop_at_full_match_returns_stop() {
         let mut f = EosFilter::new(cfg_im_end());
-        assert_eq!(
-            f.observe(b"hi"),
-            FilterAction::Emit(b"hi".to_vec())
-        );
+        assert_eq!(f.observe(b"hi"), FilterAction::Emit(b"hi".to_vec()));
         assert_eq!(f.observe(b"<|im_end|>"), FilterAction::Stop);
     }
 
@@ -544,10 +533,7 @@ mod tests {
         // Without reset the next bytes would still be held.
         f.reset();
         // After reset, behaves as freshly constructed.
-        assert_eq!(
-            f.observe(b"clean"),
-            FilterAction::Emit(b"clean".to_vec())
-        );
+        assert_eq!(f.observe(b"clean"), FilterAction::Emit(b"clean".to_vec()));
     }
 
     #[test]

@@ -28,19 +28,27 @@ fn main() {
         eprintln!("\n========== shape {} x {} ==========", m, k);
 
         // Deterministic pseudo-random weights and input (reproducible across runs)
-        let f32_weights: Vec<f32> = (0..m * k).map(|i| fract_sin(i as f32 * 0.731f32 + 1.337f32)).collect();
-        let x: Vec<f32> = (0..k).map(|i| fract_sin(i as f32 * 0.513f32 + 2.719f32)).collect();
+        let f32_weights: Vec<f32> = (0..m * k)
+            .map(|i| fract_sin(i as f32 * 0.731f32 + 1.337f32))
+            .collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| fract_sin(i as f32 * 0.513f32 + 2.719f32))
+            .collect();
 
         // ---- MQ3 ----
         let mq3_bytes = quantize_mq3g256(&f32_weights, k);
-        let y_mq3_cpu = cpu_reference_mq(&mq3_bytes, &x, m, k, 104, 3, |scale, zero, q| scale * q as f32 + zero);
+        let y_mq3_cpu = cpu_reference_mq(&mq3_bytes, &x, m, k, 104, 3, |scale, zero, q| {
+            scale * q as f32 + zero
+        });
         let y_mq3_gpu = gpu_mq_gemv(&mut gpu, &mq3_bytes, &x, m, k, rdna_compute::DType::MQ3G256);
         let (ok3, max_err3, mean_err3) = compare("MQ3", &y_mq3_cpu, &y_mq3_gpu);
         any_fail |= !ok3;
 
         // ---- MQ2 ----
         let mq2_bytes = quantize_mq2g256(&f32_weights, k);
-        let y_mq2_cpu = cpu_reference_mq(&mq2_bytes, &x, m, k, 72, 2, |scale, zero, q| scale * q as f32 + zero);
+        let y_mq2_cpu = cpu_reference_mq(&mq2_bytes, &x, m, k, 72, 2, |scale, zero, q| {
+            scale * q as f32 + zero
+        });
         let y_mq2_gpu = gpu_mq_gemv(&mut gpu, &mq2_bytes, &x, m, k, rdna_compute::DType::MQ2G256);
         let (ok2, max_err2, mean_err2) = compare("MQ2", &y_mq2_cpu, &y_mq2_gpu);
         any_fail |= !ok2;
@@ -82,7 +90,12 @@ fn compare(name: &str, cpu: &[f32], gpu: &[f32]) -> (bool, f32, f32) {
     let status = if ok { "PASS" } else { "FAIL" };
     eprintln!(
         "  {:<6} {}  max_err={:.6e}  mean_err={:.6e}  bit_exact={}/{}",
-        name, status, max_err, mean_err, bit_exact, cpu.len()
+        name,
+        status,
+        max_err,
+        mean_err,
+        bit_exact,
+        cpu.len()
     );
     (ok, max_err, mean_err)
 }
@@ -112,8 +125,18 @@ fn cpu_reference_mq(
 
         for g in 0..groups_per_row {
             let g_off = row_off + g * group_bytes;
-            let scale = f32::from_le_bytes([bytes[g_off], bytes[g_off + 1], bytes[g_off + 2], bytes[g_off + 3]]);
-            let zero = f32::from_le_bytes([bytes[g_off + 4], bytes[g_off + 5], bytes[g_off + 6], bytes[g_off + 7]]);
+            let scale = f32::from_le_bytes([
+                bytes[g_off],
+                bytes[g_off + 1],
+                bytes[g_off + 2],
+                bytes[g_off + 3],
+            ]);
+            let zero = f32::from_le_bytes([
+                bytes[g_off + 4],
+                bytes[g_off + 5],
+                bytes[g_off + 6],
+                bytes[g_off + 7],
+            ]);
             let data = &bytes[g_off + 8..g_off + group_bytes];
 
             let base_idx = g * 256;
@@ -178,7 +201,11 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     (0..n)
         .map(|_| {
             state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
-            if (state >> 16) & 1 == 1 { 1.0f32 } else { -1.0f32 }
+            if (state >> 16) & 1 == 1 {
+                1.0f32
+            } else {
+                -1.0f32
+            }
         })
         .collect()
 }
@@ -250,7 +277,9 @@ fn gpu_rotate_x_mq(gpu: &mut rdna_compute::Gpu, x: &[f32], k: usize) -> Vec<f32>
     gpu.rotate_x_mq(&d_x, &d_xr, k).unwrap();
     let mut out = vec![0.0f32; k];
     let out_bytes = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, k * 4) };
-    gpu.hip.memcpy_dtoh(out_bytes, unsafe { &d_xr.buf }).unwrap();
+    gpu.hip
+        .memcpy_dtoh(out_bytes, unsafe { &d_xr.buf })
+        .unwrap();
     out
 }
 

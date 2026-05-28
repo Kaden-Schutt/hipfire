@@ -37,9 +37,15 @@ fn main() {
     let v_m: usize = 512;
     let row_bytes = 16 + (k / 32) * 17;
 
-    let w_q = gpu.upload_raw(&synth(q_m, k, 0xAA), &[q_m * row_bytes]).unwrap();
-    let w_k = gpu.upload_raw(&synth(k_m, k, 0xBB), &[k_m * row_bytes]).unwrap();
-    let w_v = gpu.upload_raw(&synth(v_m, k, 0xCC), &[v_m * row_bytes]).unwrap();
+    let w_q = gpu
+        .upload_raw(&synth(q_m, k, 0xAA), &[q_m * row_bytes])
+        .unwrap();
+    let w_k = gpu
+        .upload_raw(&synth(k_m, k, 0xBB), &[k_m * row_bytes])
+        .unwrap();
+    let w_v = gpu
+        .upload_raw(&synth(v_m, k, 0xCC), &[v_m * row_bytes])
+        .unwrap();
 
     let max_n = *n_list.iter().max().unwrap();
     let x_host: Vec<f32> = make_x(max_n * k, 0x1111);
@@ -62,10 +68,9 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
         let t = Instant::now();
         gpu.gemm_qkv_hfp4g32_wmma_gfx12(
-            &w_q, &w_k, &w_v, &x_gemm,
-            &y_q_ref, &y_k_ref, &y_v_ref,
-            q_m, k_m, v_m, k, n,
-        ).unwrap();
+            &w_q, &w_k, &w_v, &x_gemm, &y_q_ref, &y_k_ref, &y_v_ref, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let f16_us = t.elapsed().as_secs_f64() * 1e6;
 
@@ -73,10 +78,9 @@ fn main() {
         gpu.hip.device_synchronize().unwrap();
         let t = Instant::now();
         gpu.gemm_qkv_hfp4g32_wmma_fp8_gfx12(
-            &w_q, &w_k, &w_v, &x_gemm,
-            &y_q_fp8, &y_k_fp8, &y_v_fp8,
-            q_m, k_m, v_m, k, n,
-        ).unwrap();
+            &w_q, &w_k, &w_v, &x_gemm, &y_q_fp8, &y_k_fp8, &y_v_fp8, q_m, k_m, v_m, k, n,
+        )
+        .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let fp8_us = t.elapsed().as_secs_f64() * 1e6;
 
@@ -86,7 +90,9 @@ fn main() {
         let ok = ok_q && ok_k && ok_v;
         eprintln!(
             "  N={n:3}  fp16: {:8.1} µs   fp8: {:8.1} µs   speedup: {:5.2}x   [{}]",
-            f16_us, fp8_us, f16_us / fp8_us,
+            f16_us,
+            fp8_us,
+            f16_us / fp8_us,
             if ok { "PASS" } else { "FAIL" }
         );
         all_pass &= ok;
@@ -99,7 +105,14 @@ fn main() {
     eprintln!("\n=== ALL PASS ===");
 }
 
-fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: usize, label: &str) -> bool {
+fn cmp_tol(
+    gpu: &mut Gpu,
+    y_ref: &GpuTensor,
+    y_kernel: &GpuTensor,
+    n: usize,
+    m: usize,
+    label: &str,
+) -> bool {
     let r = gpu.download_f32(y_ref).unwrap();
     let k = gpu.download_f32(y_kernel).unwrap();
 
@@ -113,8 +126,12 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
             let r_v = r[b * m + row] as f64;
             let k_v = k[b * m + row] as f64;
             let abs = (r_v - k_v).abs();
-            if abs > max_abs { max_abs = abs; }
-            if r_v.abs() > max_abs_ref { max_abs_ref = r_v.abs(); }
+            if abs > max_abs {
+                max_abs = abs;
+            }
+            if r_v.abs() > max_abs_ref {
+                max_abs_ref = r_v.abs();
+            }
             sum_sq_err += (r_v - k_v) * (r_v - k_v);
             sum_sq_ref += r_v * r_v;
         }
@@ -127,7 +144,9 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
         for row in 0..m {
             let r_v = r[b * m + row] as f64;
             let k_v = k[b * m + row] as f64;
-            if (r_v - k_v).abs() > tol_abs { bad += 1; }
+            if (r_v - k_v).abs() > tol_abs {
+                bad += 1;
+            }
         }
     }
 
@@ -147,7 +166,14 @@ fn cmp_tol(gpu: &mut Gpu, y_ref: &GpuTensor, y_kernel: &GpuTensor, n: usize, m: 
 
 fn make_x(n: usize, seed: i64) -> Vec<f32> {
     (0..n)
-        .map(|i| ((i as i64).wrapping_mul(seed.wrapping_add(0x91c2_a73d)).wrapping_add(seed) & 0xFFFFFF) as f32 * 1e-7 - 0.5)
+        .map(|i| {
+            ((i as i64)
+                .wrapping_mul(seed.wrapping_add(0x91c2_a73d))
+                .wrapping_add(seed)
+                & 0xFFFFFF) as f32
+                * 1e-7
+                - 0.5
+        })
         .collect()
 }
 
@@ -157,7 +183,9 @@ fn synth(m: usize, k: usize, seed: u64) -> Vec<u8> {
     let mut out = vec![0u8; m * row_bytes];
     let mut state = seed;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) as u32
     };
     for row in 0..m {
@@ -184,9 +212,15 @@ fn f32_to_f16_bits(x: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7F_FFFF;
-    if exp == 0 { return sign; }
-    if exp >= 143 { return sign | 0x7C00; }
-    if exp <= 112 { return sign; }
+    if exp == 0 {
+        return sign;
+    }
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 112 {
+        return sign;
+    }
     let new_exp = (exp - 127 + 15) as u16;
     let new_mant = (mant >> 13) as u16;
     sign | (new_exp << 10) | new_mant
