@@ -6599,6 +6599,17 @@ fn ffn_batched(
     let use_grouped =
         batch_size >= gate_threshold && std::env::var("HIPFIRE_DEEPSEEK4_MOE_GROUPED").as_deref() != Ok("0");
 
+    // Down-weight prefetch (shared across grouped + scalar paths).
+    // OnceLock so the env is read once and the log message fires once.
+    // Down-weight prefetch (default OFF — gate_up GEMM already warms L2 for
+    // down GEMM's early tiles, and L2 is too small to hold more than ~4
+    // expert slabs. Measured 0.0% improvement at ctx=1024 on gfx1151.
+    // Opt in via HIPFIRE_DEEPSEEK4_MOE_PREFETCH_DOWN=1 for further testing.
+    static PREFETCH_DOWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let prefetch_down = *PREFETCH_DOWN.get_or_init(|| {
+        std::env::var("HIPFIRE_DEEPSEEK4_MOE_PREFETCH_DOWN").as_deref() == Ok("1")
+    });
+
     if use_grouped {
         const BLOCK_M: usize = 16;
         let m_total_max = batch_size * k_top + n_exp * BLOCK_M;
@@ -6741,6 +6752,18 @@ fn ffn_batched(
         )
         .map_err(|e| format!("rotate_x_mq_batched grouped routed l{layer_idx}: {e:?}"))?;
 
+        // Prefetch down weights into L2 while rotate output is still hot.
+        if prefetch_down {
+            gpu.prefetch_expert_slabs(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                m_total_max,
+                BLOCK_M,
+                128,
+            )
+            .map_err(|e| format!("prefetch_expert_slabs gate_up l{layer_idx}: {e:?}"))?;
+        }
+
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
@@ -6848,6 +6871,18 @@ fn ffn_batched(
             batch_size * k_top,
         )
         .map_err(|e| format!("rotate_x_mq_batched routed l{layer_idx}: {e:?}"))?;
+
+        // Prefetch down weights: same logic as the grouped path above.
+        if prefetch_down {
+            gpu.prefetch_expert_slabs(
+                w2_ptrs,
+                &pbs.moe_topk_indices_batch,
+                batch_size * k_top,
+                1,
+                128,
+            )
+            .map_err(|e| format!("prefetch_expert_slabs scalar l{layer_idx}: {e:?}"))?;
+        }
 
         // 14. Routed expert down. Two paths:
         //   - Deterministic (default): expanded write to [B×K_TOP×hidden] +

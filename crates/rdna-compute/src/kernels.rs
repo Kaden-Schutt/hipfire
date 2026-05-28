@@ -1203,6 +1203,12 @@ pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
 pub const MOE_SCATTER_FUSED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_scatter_fused_k8.hip");
 
+/// Software-prefetch: reads the first cache line of each active expert's
+/// weight slab into L2, so a downstream GEMM finds them hot. Used between
+/// gate_up + rotate and the down GEMM in ffn_batched.
+pub const PREFETCH_EXPERT_SLABS_SRC: &str =
+    include_str!("../../../kernels/src/prefetch_expert_slabs.hip");
+
 /// LA-layer fusion: fused L2-norm(Q) + scale(Q) + L2-norm(K) +
 /// repeat-interleave(Q,K). Replaces fused_qk_l2_norm_scale_f32_batched
 /// + repeat_interleave_qk_f32_batched. Saves 1 launch per LA layer.
