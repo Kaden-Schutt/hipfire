@@ -40,13 +40,14 @@ description = "Inference orchestrator for RDNA GPUs"
 # block below) which serves both as documentation of which features
 # each example needs and as the gate for downstream library consumers
 # who attempt to build examples through their own build script.
-default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr", "deltanet"]
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-dots-ocr", "deltanet"]
 deltanet = ["rdna-compute/deltanet"]
 arch-qwen35 = []
 arch-qwen35-vl = []
 arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
+arch-minimax = []
 arch-dots-ocr = []
 
 [dependencies]
@@ -96,6 +97,7 @@ hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
@@ -111,7 +113,7 @@ hipfire-atlas = { path = "../hipfire-atlas" }
 
 [[example]]
 name = "daemon"
-required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-dots-ocr"]
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-minimax", "arch-dots-ocr"]
 
 [[example]]
 name = "hfq_split"

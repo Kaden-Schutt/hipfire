@@ -309,11 +309,14 @@ fn tensor_to_f32_with_optional_fp8_scale(
         let (smeta, sbytes) = st_files[*sfi]
             .tensor_data(sname)
             .unwrap_or_else(|| panic!("FP8 scale tensor missing: {sname}"));
-        assert_eq!(smeta.dtype, "F8_E8M0",
-            "expected F8_E8M0 scale for {name}, got {}", smeta.dtype);
-        return dequantize_e4m3_ue8m0_to_f32(
-            raw_data, &meta.shape, sbytes, &smeta.shape,
-        );
+        if smeta.dtype == "F8_E8M0" {
+            return dequantize_e4m3_ue8m0_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+        } else if smeta.dtype == "F32" {
+            // MiniMax-M2: e4m3 + F32 block-[128,128] weight_scale_inv (multiply).
+            return dequantize_e4m3_f32scale_to_f32(raw_data, &meta.shape, sbytes, &smeta.shape);
+        } else {
+            panic!("expected F8_E8M0 or F32 scale for {name}, got {}", smeta.dtype);
+        }
     }
     if meta.dtype == "I8" {
         panic!("tensor {name} has dtype I8 but no .scale sibling registered \
@@ -432,6 +435,46 @@ fn dequantize_e4m3_ue8m0_to_f32(
                     let c = sc_j * block_cols + dj;
                     let b = weight_bytes[r * cols + c];
                     out[r * cols + c] = e4m3_to_f32(b) * scale;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Dequantize FP8 E4M3 weights paired with an F32 block-[128,128]
+/// `weight_scale_inv` (MiniMax-M2 / DeepSeek-V3 fp8 block quant). Dequant is
+/// MULTIPLY: `out = e4m3_to_f32(b) * scale` (the stored scale ≈ amax/448 per
+/// block, verified ~5e-4 on the real checkpoint). Scale tile is [rows/sr, cols/sc]
+/// = [128, 128] on MiniMax.
+fn dequantize_e4m3_f32scale_to_f32(
+    weight_bytes: &[u8],
+    weight_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+) -> Vec<f32> {
+    assert_eq!(weight_shape.len(), 2, "expected 2D weight, got {:?}", weight_shape);
+    assert_eq!(scale_shape.len(), 2, "expected 2D scale, got {:?}", scale_shape);
+    let (rows, cols) = (weight_shape[0], weight_shape[1]);
+    let (sr, sc) = (scale_shape[0], scale_shape[1]);
+    assert_eq!(weight_bytes.len(), rows * cols, "weight byte count mismatch");
+    assert_eq!(scale_bytes.len(), sr * sc * 4, "f32 scale byte count mismatch");
+    assert!(rows % sr == 0 && cols % sc == 0,
+            "scale shape {:?} doesn't tile weight shape {:?}", scale_shape, weight_shape);
+    let block_rows = rows / sr;
+    let block_cols = cols / sc;
+    let mut out = vec![0.0f32; rows * cols];
+    for sr_i in 0..sr {
+        for sc_j in 0..sc {
+            let so = (sr_i * sc + sc_j) * 4;
+            let scale = f32::from_le_bytes([
+                scale_bytes[so], scale_bytes[so + 1], scale_bytes[so + 2], scale_bytes[so + 3],
+            ]);
+            for di in 0..block_rows {
+                let r = sr_i * block_rows + di;
+                for dj in 0..block_cols {
+                    let c = sc_j * block_cols + dj;
+                    out[r * cols + c] = e4m3_to_f32(weight_bytes[r * cols + c]) * scale;
                 }
             }
         }
@@ -3673,6 +3716,10 @@ fn awq_eligible(name: &str) -> bool {
         // correctness. `router.weight` would be a non-HF naming an
         // arch might choose; kept for safety.
         || name.ends_with("mlp.gate.weight")
+        // MiniMax-M2 MoE router (block_sparse_moe.gate.weight). Same intent
+        // as mlp.gate.weight: q8_router (set for is_minimax via is_moe_like)
+        // keeps the router at Q8 so HFQ4 noise can't flip top-k selection.
+        || name.ends_with("block_sparse_moe.gate.weight")
         || name.ends_with("router.weight");
     if f1_only { return f1_match; }
     let f2_match =
@@ -4842,7 +4889,13 @@ fn main() {
     // the standard 2D quant path; the routing fan-out into top-k experts
     // happens at forward time, not quant time.
     let is_deepseek4 = arch_id == 9;
-    let is_moe_like = is_moe || is_deepseek4;
+    // MiniMax-M2 (arch_id=10): MoE like DeepSeek V4, ships per-expert pre-split
+    // 2D tensors (`...block_sparse_moe.experts.E.{w1,w2,w3}.weight`). Quantized
+    // as HFQ4G256 (the only 4-bit format with a complete indexed-MoE GEMV
+    // kernel family). Raw HF tensor names are written verbatim (no rename);
+    // the hipfire loader looks them up.
+    let is_minimax = arch_id == 10;
+    let is_moe_like = is_moe || is_deepseek4 || is_minimax;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -4850,6 +4903,9 @@ fn main() {
     }
     if is_deepseek4 {
         eprintln!("  DeepSeek V4 detected — per-expert tensors ship pre-split; quantizing each as 2D weight.");
+    }
+    if is_minimax {
+        eprintln!("  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight.");
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -4934,6 +4990,13 @@ fn main() {
     let mut fp8_scale_for: HashMap<String, (usize, String)> = HashMap::new();
     for (fi, st) in st_files.iter().enumerate() {
         for name in st.tensor_names() {
+            // MiniMax-M2 FP8: `<w>.weight` (e4m3) + `<w>.weight_scale_inv` (F32
+            // block-[128,128] scale). Strip the longer suffix FIRST.
+            if let Some(stem) = name.strip_suffix(".weight_scale_inv") {
+                let w_name = format!("{stem}.weight");
+                fp8_scale_for.insert(w_name, (fi, name.to_string()));
+                continue;
+            }
             if let Some(stem) = name.strip_suffix(".scale") {
                 // Sibling weight name (drop `.scale`, add `.weight`).
                 let w_name = format!("{stem}.weight");
@@ -5234,6 +5297,79 @@ fn main() {
                 continue;
             }
             // Fall through to standard path for non-MQ2 formats.
+        }
+
+        // ── MiniMax-M2 router: keep Q8 ─────────────────────────────────────────
+        // The MoE router (`block_sparse_moe.gate.weight`) is precision-sensitive
+        // (4-bit noise flips top-k on borderline tokens) but must NOT be F16:
+        // weight_gemv's F16 arm dispatches gemm_f16_batched_lmhead, which is a
+        // WMMA lm-head kernel that produces garbage for the router's tiny m
+        // (=n_exp). Q8 (gemv_q8_0) is well-behaved at any m and ~0.4% noise.
+        if is_minimax && name.ends_with("block_sparse_moe.gate.weight") {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files);
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (router Q8)", "Q8-MM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::Q8F16,
+                shape, group_size: 32, data: q, spilled_len: 0,
+            });
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
+        }
+
+        // ── MiniMax-M2 per-expert pre-split path ───────────────────────────────
+        // Experts ship as 2D `...block_sparse_moe.experts.E.{w1,w2,w3}.weight`
+        // (F32 in the tiny oracle; FP8 e4m3 + F32 weight_scale_inv in the 229B
+        // ckpt — handled transparently by tensor_to_f32_with_optional_fp8_scale).
+        // Quantize each as MQ4G256 (FWHT-pre-rotated 4-bit): byte-compatible with
+        // the gemv_hfq4g256_moe_* indexed kernels — passing FWHT-rotated input to
+        // those kernels is mathematically equivalent to gemv_mq4g256 (the exact
+        // path qwen35's MoE uses). This IS the user-facing "mq4" format. Names
+        // are written verbatim; the loader fuses w1||w3 into the gate_up blob.
+        if is_minimax
+            && name.contains(".block_sparse_moe.experts.")
+            && name.ends_with(".weight")
+            && meta.shape.len() == 2
+        {
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files);
+            let k = meta.shape[1];
+            if k % 256 == 0 {
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                // Expert format by --format: mq2-lloyd (MQ2G256Lloyd, hipx sub-4-bit
+                // target — has deepseek4 indexed-MoE kernels), mq6 (oracle check /
+                // HIPFIRE_MINIMAX_EXPERT_MQ6), else mq4 (MQ4G256, default + validated).
+                let mm_mq6 = use_mq6g256 || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
+                let mm_mq2l = use_mq2g256_lloyd || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
+                let (q, qt, label) = if mm_mq2l {
+                    (quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2), QuantType::MQ2G256Lloyd, "MQ2L-MM")
+                } else if mm_mq6 {
+                    (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-MM")
+                } else {
+                    (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4-MM")
+                };
+                let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+                eprintln!("  {label:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(),
+                    quant_type: qt,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            // k not %256 → fall through to standard path (real MiniMax inter=1536,
+            // hidden=3072 are both %256, so this only guards degenerate tinies).
         }
 
         if is_moe

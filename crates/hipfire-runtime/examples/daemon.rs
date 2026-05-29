@@ -28,6 +28,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_arch_deepseek4 as deepseek4;
+use hipfire_arch_minimax as minimax;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -617,6 +618,17 @@ struct LoadedModel {
     /// file scan (e.g. `<stem>-mtp.*`) or bundled MTP detection. Used by
     /// `mtp_mode = "auto"` to decide whether to enable spec-decode.
     mtp_weights_present: bool,
+    // MiniMax-M2 state (arch_id=10 — hipfire-arch-minimax). Mixtral-style
+    // MoE: GQA + per-layer QK-norm + partial RoPE + sigmoid-bias top-k
+    // routing, no shared expert. KV cache lives inside MiniMaxState; no
+    // separate field. NO PrefillBatchScratch — prefill is the per-token
+    // `decode_step` loop. None on every other arch path.
+    minimax_config: Option<hipfire_arch_minimax::MiniMaxConfig>,
+    minimax_weights: Option<hipfire_arch_minimax::MiniMaxWeights>,
+    minimax_state: Option<hipfire_arch_minimax::MiniMaxState>,
+    /// Cached EOS token id resolved at load time. Falls back to 1 if the
+    /// tokenizer lacks the special-token entry.
+    minimax_eos_tok: u32,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the
@@ -1035,6 +1047,7 @@ fn main() {
                             7 => "qwen2",
                             8 => "dots-ocr",
                             9 => "deepseek4",
+                            10 => "minimax_m2",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -1046,6 +1059,8 @@ fn main() {
                             (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
+                        } else if let Some(ref c) = m.minimax_config {
+                            (c.hidden_size, c.num_hidden_layers, c.vocab_size)
                         } else { (0, 0, 0) };
 
                         // Apply MTP config from load-message params.
@@ -1271,7 +1286,12 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                let (default_temp, default_top_p) = if m.arch_id == 9 || m.arch_id == 10 {
+                    // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
+                    // MoE models that fall into block-level attractors under
+                    // pure greedy. Default to the HF-recommended sampling
+                    // (temp=1.0, top_p=1.0); explicit per-request values
+                    // still override.
                     (1.0_f64, 1.0_f64)
                 } else {
                     (0.3_f64, 0.8_f64)
@@ -1541,6 +1561,10 @@ fn main() {
                         // rather than jumping straight back to replay.
                         gpu.invalidate_graph_state();
                     }
+                    // arch_id=10 (MiniMax-M2): clear KV cursor between turns.
+                    // No captured hipGraph on this path, so no graph
+                    // invalidation needed.
+                    if let Some(ref mut s) = m.minimax_state { s.reset(); }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1588,6 +1612,7 @@ fn main() {
                     6 => "qwen3_5_moe",
                     7 => "qwen2",
                     9 => "deepseek4",
+                    10 => "minimax_m2",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1664,6 +1689,9 @@ fn main() {
                 // and the per-step scratch share `Qwen2State`. Reset its position
                 // cursor here so bench_prefill measures cold prefill.
                 if let Some(ref mut s) = m.qwen2_state { s.reset(); }
+                // MiniMax-M2 (arch_id=10): same — KV cache + scratch share
+                // MiniMaxState; reset its cursor for a cold prefill bench.
+                if let Some(ref mut s) = m.minimax_state { s.reset(); }
 
                 // Flush any residual GPU work so it doesn't bleed into the
                 // measured interval, then time forward_prefill_batch + a
@@ -1706,6 +1734,24 @@ fn main() {
                     let mut ok = true;
                     for (i, &tok) in synthetic.iter().enumerate() {
                         if deepseek4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        ).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 10 {
+                    // MiniMax-M2 warm-pass: per-token decode_step over the
+                    // synthetic prompt. Saturates the GQA + QK-norm + RoPE +
+                    // MoE kernel set before any user-facing generate. This
+                    // IS the production prefill shape (no batched kernel).
+                    let config = m.minimax_config.as_ref().unwrap();
+                    let weights = m.minimax_weights.as_ref().unwrap();
+                    let state = m.minimax_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if minimax::forward::decode_step(
                             config, weights, state, &mut gpu, tok, i as u32,
                         ).is_err() {
                             ok = false;
@@ -2075,6 +2121,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2121,6 +2168,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
             dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2184,6 +2232,70 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
             deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
             mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 10 {
+        // MiniMax-M2 (hipfire-arch-minimax). Standalone bring-up — no
+        // eviction, no DFlash drafter, no PFlash, no VL, no spec-decode.
+        // The Architecture trait gives us config + weights + state in three
+        // calls; prefill + decode both go through the per-token
+        // `minimax::forward::decode_step` in the generate hot path. There
+        // is NO PrefillBatchScratch (no batched prefill kernel).
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=10 (MiniMax-M2). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=10 (MiniMax-M2). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        if pp > 1 {
+            return Err("pipeline-parallel (pp>1) not supported on arch_id=10 (MiniMax-M2).".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <minimax::MiniMaxM2 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <minimax::MiniMaxM2 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        // Size the KV cache to the requested window (the trait's new_state
+        // caps at 8192; honour the caller's max_seq when it's larger/smaller).
+        let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
+            .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
+        // Resolve EOS via the tokenizer. MiniMax-M2 uses the standard
+        // ChatML-ish `<|im_end|>`; fall back to common alternates, then 1.
+        let eos_tok: u32 = {
+            let try_one = |s: &str| -> Option<u32> {
+                let ids = tokenizer.encode(s);
+                if ids.len() == 1 { Some(ids[0]) } else { None }
+            };
+            try_one("<|im_end|>")
+                .or_else(|| try_one("</s>"))
+                .or_else(|| try_one("<|endoftext|>"))
+                .unwrap_or(1)
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: Some(config), minimax_weights: Some(weights), minimax_state: Some(state),
+            minimax_eos_tok: eos_tok,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2373,6 +2485,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
@@ -2407,6 +2520,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
             mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2503,6 +2617,10 @@ fn load_model_safetensors(
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             mtp_weights_present: false,
+            minimax_config: None,
+            minimax_weights: None,
+            minimax_state: None,
+            minimax_eos_tok: 0,
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2573,6 +2691,10 @@ fn load_model_safetensors(
         mtp_mode: "auto".to_string(),
         mtp_k: 3,
         mtp_weights_present: false,
+        minimax_config: None,
+        minimax_weights: None,
+        minimax_state: None,
+        minimax_eos_tok: 0,
         vision_config: None,
         vision_weights: None,
         tokenizer: Some(tokenizer),
@@ -2708,13 +2830,14 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
-            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
-            dots_ocr_config: None, dots_ocr_weights: None,
-            vision_config: None, vision_weights: None,
-            tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
-            conversation_tokens: Vec::new(),
+        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+        minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
+        dots_ocr_config: None, dots_ocr_weights: None,
+        vision_config: None, vision_weights: None,
+        tokenizer: Some(tokenizer),
+        seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+        conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
@@ -2823,6 +2946,13 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // eviction.
     if let Some(s) = m.deepseek4_state { s.free_gpu(gpu); }
     if let Some(pbs) = m.deepseek4_pbs { pbs.free_gpu(gpu); }
+    // MiniMax-M2 (arch_id=10): MiniMaxState / MiniMaxWeights expose no
+    // free_gpu in the scaffold, so they drop here without returning their
+    // device tensors to the pool. KNOWN LEAK on load/unload churn — there
+    // is no eviction wired for arch_id=10 yet, so the model stays resident
+    // for the daemon's lifetime in the bring-up scope. Add free_gpu to the
+    // minimax crate + explicit frees here when eviction lands.
+    let _ = (&m.minimax_state, &m.minimax_weights);
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
@@ -4080,6 +4210,22 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         generate_deepseek4(
             m, gpu, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, think_mode, tools, messages_history,
+        );
+        return;
+    }
+    if m.arch_id == 10 {
+        // arch_id=10 (MiniMax-M2). Minimal AR bring-up — same shape as the
+        // qwen2 / deepseek4 short-circuits above. PFlash / DFlash / VL /
+        // multi-GPU / sampler-budget / grammar / tools-execution all bypass.
+        // We honour `system_prompt`, `temp`, `top_p`, and (via JinjaChatFrame)
+        // `messages_history` + `tools` rendering; spec-decode / MTP / grammar
+        // are out of scope for the scaffold.
+        let _ = (budget_alert_at_tok, budget_alert_text, assistant_prefix,
+                 pflash_state, pflash_cfg, repeat_penalty, repeat_window,
+                 think_mode);
+        generate_minimax(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, max_think_tokens, tools, messages_history,
         );
         return;
     }
@@ -6193,6 +6339,246 @@ fn generate_qwen2(
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_ms":{},"total_ms":{}}}"#,
+        id, generated_count, tok_s, prefill_ms, total_ms,
+    );
+    let _ = stdout.flush();
+}
+
+/// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
+///
+/// Mirrors `generate_qwen2`'s shape (prefill = per-token loop, decode =
+/// per-token loop, JSONL `token` / `done` events) with two differences:
+///
+///   1. Prompt build goes through `JinjaChatFrame` when `HIPFIRE_JINJA_CHAT=1`
+///      and the model carries a chat_template (so MiniMax-M2's own ChatML-ish
+///      template + `tools` / `messages` reach the upstream Jinja branches),
+///      falling back to the hand-rolled `ChatFrame::Plain` scaffold otherwise.
+///   2. `minimax::forward::decode_step` returns the full logits `Vec<f32>`
+///      (the state does NOT stash a greedy next-token), so sampling runs
+///      host-side via `deepseek4::sampling::sample_token` on that vector.
+///
+/// Out of scope for the scaffold (and intentionally NOT wired): spec-decode,
+/// MTP, grammar-constrained decoding, tool-call parsing/execution, repeat
+/// penalty, multi-GPU, eviction/prefix-cache. Correctness first.
+#[allow(clippy::too_many_arguments)]
+fn generate_minimax(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+    if m.minimax_config.is_none() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"minimax_config missing on arch_id=10 generate"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    // ── Prompt build (same two-path branch as the qwen35 AR path) ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+            };
+            let render_result = if tools.is_some() || messages_history.is_some() {
+                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+                let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                    Some(h) => h,
+                    None => {
+                        let mut v = Vec::new();
+                        if let Some(sys) = system_prompt {
+                            v.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: sys.to_string(),
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                            });
+                        }
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_string(),
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                        });
+                        synthesized = v;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(messages_slice, tools, None)
+            } else {
+                frame.render()
+            };
+            match render_result {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        raw: false,
+                    }
+                    .build()
+                }
+            }
+        } else {
+            hipfire_runtime::prompt_frame::ChatFrame {
+                tokenizer,
+                system: system_prompt,
+                user: prompt,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                raw: false,
+            }
+            .build()
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.minimax_eos_tok;
+
+    // Capacity guard. No eviction on arch_id=10 — reset the KV cursor when
+    // the requested run would overflow the budget. (max_seq + n_tokens live
+    // on the state.)
+    let overflow = {
+        let state = m.minimax_state.as_ref().unwrap();
+        state.n_tokens + prompt_ids.len() + max_tokens > state.max_seq
+    };
+    if overflow {
+        let (n, cap) = {
+            let state = m.minimax_state.as_ref().unwrap();
+            (state.n_tokens, state.max_seq)
+        };
+        eprintln!(
+            "[daemon] arch_id=10 context full ({n}/{cap}) — resetting MiniMaxState",
+        );
+        m.minimax_state.as_mut().unwrap().reset();
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prefill: decode_step per prompt token. Disjoint field borrows of
+    // `m` (config / weights / state) let us also push to
+    // `m.conversation_tokens` in the same scope (same pattern as
+    // generate_qwen2). The LAST decode_step's logits are the predictions
+    // for the first generated token. ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let cfg = m.minimax_config.as_ref().unwrap();
+        let weights = m.minimax_weights.as_ref().unwrap();
+        let state = m.minimax_state.as_mut().unwrap();
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = t0.elapsed().as_millis();
+
+    // ── Decode loop. Sample host-side from the running logits vector.
+    // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
+    // Seed the PRNG from wall-clock nanos so successive same-prompt runs
+    // don't lock-step (greedy is still deterministic). ──
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15);
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+        // Sample next token from the most recent logits.
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if next_tok == eos_tok {
+            break;
+        }
+
+        // Emit the text fragment. Build through serde_json so a user-supplied
+        // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        // Advance one step on the freshly sampled token.
+        let step = {
+            let cfg = m.minimax_config.as_ref().unwrap();
+            let weights = m.minimax_weights.as_ref().unwrap();
+            let state = m.minimax_state.as_mut().unwrap();
+            let position = state.n_tokens as u32;
+            minimax::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.minimax_state.as_ref().unwrap().n_tokens;
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
         (generated_count as f64 * 1000.0) / decode_ms as f64
     } else {
         0.0

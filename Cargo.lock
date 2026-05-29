@@ -171,6 +171,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-minimax"
+version = "0.2.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-qwen2"
 version = "0.2.0"
 dependencies = [
@@ -253,6 +264,7 @@ dependencies = [
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
  "hipfire-arch-llama",
+ "hipfire-arch-minimax",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
