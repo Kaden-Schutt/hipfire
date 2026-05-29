@@ -196,6 +196,74 @@ impl ShardConfig {
         }
     }
 
+    // ── DeltaNet (LinearAttention) head ranges (Stage 3c) ──────────────
+    //
+    // DeltaNet shards by VALUE head; KEY/QUERY heads follow the GQA
+    // repeat-interleave ratio `n_value_heads / n_key_heads`. The wqkv output
+    // is `[q(k_dim) | k(k_dim) | v(v_dim)]` so the column shard takes local
+    // KEY heads from the q+k blocks and local VALUE heads from the v block.
+
+    /// Validate DeltaNet head geometry: both head counts split evenly and the
+    /// value/key ratio is preserved per rank (so GQA repeat-interleave still
+    /// works on the local shard). Call once at load.
+    pub fn validate_deltanet(&self, n_value_heads: usize, n_key_heads: usize) -> Result<(), String> {
+        if n_value_heads % self.tp_size != 0 {
+            return Err(format!(
+                "validate_deltanet: linear_num_value_heads ({n_value_heads}) not divisible by tp_size ({})",
+                self.tp_size
+            ));
+        }
+        if n_key_heads == 0 || n_key_heads % self.tp_size != 0 {
+            return Err(format!(
+                "validate_deltanet: linear_num_key_heads ({n_key_heads}) not divisible by tp_size ({})",
+                self.tp_size
+            ));
+        }
+        // Ratio preserved: (n_value/tp) / (n_key/tp) == n_value / n_key.
+        if n_value_heads % n_key_heads != 0 {
+            return Err(format!(
+                "validate_deltanet: n_value_heads ({n_value_heads}) not a multiple of \
+                 n_key_heads ({n_key_heads}) — GQA ratio undefined"
+            ));
+        }
+        let ratio = n_value_heads / n_key_heads;
+        let local_ratio = (n_value_heads / self.tp_size) / (n_key_heads / self.tp_size);
+        if local_ratio != ratio {
+            return Err(format!(
+                "validate_deltanet: per-rank value/key ratio {local_ratio} != global {ratio} \
+                 (tp_size={} splits the GQA group)",
+                self.tp_size
+            ));
+        }
+        Ok(())
+    }
+
+    /// Value heads owned per rank (`n_value_heads / tp_size`).
+    #[inline]
+    pub fn dn_value_heads_per_rank(&self, n_value_heads: usize) -> usize {
+        n_value_heads / self.tp_size
+    }
+
+    /// Key heads owned per rank (`n_key_heads / tp_size`).
+    #[inline]
+    pub fn dn_key_heads_per_rank(&self, n_key_heads: usize) -> usize {
+        n_key_heads / self.tp_size
+    }
+
+    /// Half-open VALUE-head range owned by `rank`.
+    #[inline]
+    pub fn dn_value_head_range(&self, rank: usize, n_value_heads: usize) -> Range<usize> {
+        let vpr = n_value_heads / self.tp_size;
+        (rank * vpr)..((rank + 1) * vpr)
+    }
+
+    /// Half-open KEY-head range owned by `rank` (q + k blocks of wqkv).
+    #[inline]
+    pub fn dn_key_head_range(&self, rank: usize, n_key_heads: usize) -> Range<usize> {
+        let kpr = n_key_heads / self.tp_size;
+        (rank * kpr)..((rank + 1) * kpr)
+    }
+
     // ── Weight-matrix sub-ranges (row-major quant blobs) ───────────────
 
     /// Row range of the gated `wq` (`[n_heads·head_dim·2, dim]`) owned by
@@ -344,6 +412,45 @@ mod tests {
         // wo cols: 4 heads × 256 = 1024 cols/rank.
         assert_eq!(s.wo_col_range(0, 8, 256), 0..1024);
         assert_eq!(s.wo_col_range(1, 8, 256), 1024..2048);
+    }
+
+    #[test]
+    fn deltanet_ranges_27b_tp2() {
+        // 27B-3.6: linear_num_key_heads=16, linear_num_value_heads=48 (ratio 3).
+        let s = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        s.validate_deltanet(48, 16).unwrap();
+        assert_eq!(s.dn_value_heads_per_rank(48), 24);
+        assert_eq!(s.dn_key_heads_per_rank(16), 8);
+        assert_eq!(s.dn_value_head_range(0, 48), 0..24);
+        assert_eq!(s.dn_value_head_range(1, 48), 24..48);
+        assert_eq!(s.dn_key_head_range(0, 16), 0..8);
+        assert_eq!(s.dn_key_head_range(1, 16), 8..16);
+        // ratio preserved: 24/8 == 48/16 == 3.
+    }
+
+    #[test]
+    fn deltanet_ranges_tp4_and_08b() {
+        // 27B tp=4: 12 value + 4 key/rank, ratio 3 preserved.
+        let s4 = ShardConfig::new(4, true, 0, ExpertAssign::Stride).unwrap();
+        s4.validate_deltanet(48, 16).unwrap();
+        assert_eq!(s4.dn_value_heads_per_rank(48), 12);
+        assert_eq!(s4.dn_key_heads_per_rank(16), 4);
+        // 0.8B: 16 value + 16 key (ratio 1), tp=2 → 8+8.
+        let s2 = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        s2.validate_deltanet(16, 16).unwrap();
+        assert_eq!(s2.dn_value_heads_per_rank(16), 8);
+        assert_eq!(s2.dn_key_heads_per_rank(16), 8);
+    }
+
+    #[test]
+    fn deltanet_validate_rejects_split_gqa_group() {
+        // Hypothetical: n_value=48, n_key=16, tp=8 → 6 value + 2 key (ratio 3 ok),
+        // but tp=16 would give 3 value + 1 key (ratio 3 ok too). A bad case:
+        // n_value=4, n_key=4, tp=2 → 2+2 ratio 1 ok. Force a ratio break:
+        // n_value=6, n_key=4 is not a clean multiple → undefined ratio.
+        let s = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        assert!(s.validate_deltanet(6, 4).is_err()); // 6 % 4 != 0
+        assert!(s.validate_deltanet(48, 3).is_err()); // 3 not divisible by tp=2
     }
 
     #[test]

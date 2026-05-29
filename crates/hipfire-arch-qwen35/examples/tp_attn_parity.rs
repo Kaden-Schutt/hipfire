@@ -235,8 +235,11 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         // must match run_single_gpu_opt. DeltaNet state is full (replicated).
         let state_q8 = state_is_q8();
         kvs.push(make_kv(&mut gpus.devices[r], &configs[r]));
+        // DeltaNet recurrent state sized from the per-rank config: LOCAL value
+        // heads in --slice mode (3c), full otherwise. Must match the head
+        // counts run_dn_layer_body computes from configs[r].
         dns.push(DeltaNetState::new_with_quant(
-            &mut gpus.devices[r], &config, if state_q8 { StateQuant::Q8 } else { StateQuant::FP32 },
+            &mut gpus.devices[r], &configs[r], if state_q8 { StateQuant::Q8 } else { StateQuant::FP32 },
         ).unwrap());
         if !slice {
             // mask[r]: 1.0 on this rank's local Q-heads over the full

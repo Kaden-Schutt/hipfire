@@ -1242,9 +1242,36 @@ fn slice_quant_cols(
     out
 }
 
+/// Multi-range column-parallel slice: concatenates the contiguous row
+/// sub-ranges `ranges` of an `[m × k]` row-major quant blob (each range is a
+/// `slice_quant_rows`). For the DeltaNet `wqkv` shard, whose output is
+/// `[q(k_dim) | k(k_dim) | v(v_dim)]`: take this rank's KEY heads from the q
+/// block and the k block, and its VALUE heads from the v block — 3 sub-ranges.
+/// `k` (input dim) is unchanged; the new output dim is the sum of the ranges.
+fn slice_quant_rows_multi(data: &[u8], m: usize, ranges: &[(usize, usize)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for &(m0, m1) in ranges {
+        out.extend_from_slice(&slice_quant_rows(data, m, m0, m1));
+    }
+    out
+}
+
+/// Gather contiguous element sub-ranges of a full F32 `GpuTensor` into a new,
+/// smaller F32 `GpuTensor` (download → concat → upload). Used to slice the
+/// DeltaNet F32 per-head weights to this rank's heads: `conv1d.weight`
+/// channels (`[q|k|v]` × kernel) and the per-value-head `a_log`/`dt_bias`.
+fn gather_f32_ranges(gpu: &mut Gpu, full: &GpuTensor, ranges: &[(usize, usize)]) -> HipResult<GpuTensor> {
+    let data = gpu.download_f32(full)?;
+    let mut out = Vec::new();
+    for &(a, b) in ranges {
+        out.extend_from_slice(&data[a..b]);
+    }
+    gpu.upload_f32(&out, &[out.len()])
+}
+
 #[cfg(test)]
 mod tp_slice_tests {
-    use super::{quant_group_size, slice_quant_cols, slice_quant_rows};
+    use super::{quant_group_size, slice_quant_cols, slice_quant_rows, slice_quant_rows_multi};
 
     // Synthetic [m × k] quant blob: `group_bytes` bytes per group, byte value
     // encodes (row, group, offset) so slices are checkable.
@@ -1299,6 +1326,24 @@ mod tp_slice_tests {
     fn group_sizes_known() {
         assert_eq!(quant_group_size(13), 256); // MQ4G256
         assert_eq!(quant_group_size(7), 128); // HFQ4G128
+    }
+
+    #[test]
+    fn rows_multi_concats_subranges() {
+        // wqkv-like: m=12 rows = q[0,4) | k[4,8) | v[8,12); rank takes q[0,2),
+        // k[4,6), v[8,11) -> concat in that order.
+        let (m, k, gs, gb) = (12usize, 256usize, 256usize, 136usize);
+        let data = synth(m, k, gs, gb);
+        let rb = (k / gs) * gb;
+        let ranges = [(0usize, 2usize), (4, 6), (8, 11)];
+        let out = slice_quant_rows_multi(&data, m, &ranges);
+        assert_eq!(out.len(), (2 + 2 + 3) * rb);
+        // verify each sub-block matches the original rows in order
+        let mut off = 0;
+        for &(a, b) in &ranges {
+            assert_eq!(&out[off..off + (b - a) * rb], &data[a * rb..b * rb]);
+            off += (b - a) * rb;
+        }
     }
 
     #[test]
@@ -3367,11 +3412,14 @@ fn paro_load_f32(
     gpu.upload_f32(&v, &[n])
 }
 
-/// TP weight-slice spec for `load_weight_tensor_sliced` (Stage 3b).
+/// TP weight-slice spec for `load_weight_tensor_sliced` (Stage 3b/3c).
 #[derive(Clone, Copy)]
-enum WSlice {
+enum WSlice<'a> {
     /// Column-parallel: keep output rows `[m0, m1)` (contiguous byte range).
     Rows(usize, usize),
+    /// Column-parallel, multiple contiguous output-row sub-ranges concatenated
+    /// (DeltaNet wqkv `[q|k|v]` shard). Input dim unchanged.
+    RowsMulti(&'a [(usize, usize)]),
     /// Row-parallel: keep input columns `[c0, c1)` (group-aligned restride).
     Cols(usize, usize),
 }
@@ -3383,7 +3431,7 @@ enum WSlice {
 /// (input dim unchanged) and sliced to `[c0..c1)` by a row-parallel (Cols)
 /// slice (27B-3.x mq4-awq exercises this; 0.8B mq4 has none).
 fn load_weight_tensor_sliced(
-    hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize, slice: WSlice,
+    hfq: &HfqFile, gpu: &Gpu, name: &str, m: usize, k: usize, slice: WSlice<'_>,
 ) -> HipResult<WeightTensor> {
     // Use the pread path (NOT tensor_data): load_weights drops the mmap on
     // unix, and load_weights_tp calls us afterwards. `tensor_data_pread`
@@ -3407,6 +3455,11 @@ fn load_weight_tensor_sliced(
             .unwrap_or_else(|| panic!("tensor vanished mid-load: {candidate}"));
         match slice {
             WSlice::Rows(m0, m1) => (slice_quant_rows(&buf[..], m, m0, m1), m1 - m0, k),
+            WSlice::RowsMulti(ranges) => (
+                slice_quant_rows_multi(&buf[..], m, ranges),
+                ranges.iter().map(|&(a, b)| b - a).sum(),
+                k,
+            ),
             WSlice::Cols(c0, c1) => {
                 let gs = quant_group_size(qt);
                 (slice_quant_cols(&buf[..], m, k, c0, c1, gs), m, c1 - c0)
@@ -3425,7 +3478,8 @@ fn load_weight_tensor_sliced(
             sc_info.quant_type
         );
         let (e0, e1) = match slice {
-            WSlice::Rows(_, _) => (0, k),
+            // Column-parallel (Rows/RowsMulti): input dim unchanged → full [k].
+            WSlice::Rows(_, _) | WSlice::RowsMulti(_) => (0, k),
             WSlice::Cols(c0, c1) => (c0, c1),
         };
         let f32_scale: Vec<f32> = sc_buf[e0 * 2..e1 * 2]
@@ -3539,6 +3593,90 @@ pub fn load_weights_tp(
         free_full(gpu, std::mem::replace(&mut l.w_gate, new_wg))?;
         free_full(gpu, std::mem::replace(&mut l.w_up, new_wu))?;
         free_full(gpu, std::mem::replace(&mut l.w_down, new_wd))?;
+    }
+
+    // ── DeltaNet (LinearAttention) layers — Stage 3c: shard attention + the
+    //    recurrent state. wqkv [q|k|v] → local KEY heads (q,k blocks) + local
+    //    VALUE heads (v block); wz/w_alpha/w_beta/a_log/dt_bias by value head;
+    //    conv1d.weight by channel; wo row-parallel by value head. The DeltaNet
+    //    dense FFN stays FULL (replicated) in 3c-A. norm_weight is shared.
+    shard
+        .validate_deltanet(config.linear_num_value_heads, config.linear_num_key_heads)
+        .map_err(|e| HipError::new(0, &format!("load_weights_tp: {e}")))?;
+    let (nk, nv) = (config.linear_num_key_heads, config.linear_num_value_heads);
+    let (kvd, vvd) = (config.linear_key_head_dim, config.linear_value_head_dim);
+    let dn_k_dim = nk * kvd;
+    let dn_v_dim = nv * vvd;
+    let dn_qkv_dim = 2 * dn_k_dim + dn_v_dim;
+    let kernel = config.conv_kernel_dim;
+    let kr = shard.dn_key_head_range(rank, nk);
+    let vr = shard.dn_value_head_range(rank, nv);
+    // wqkv output rows: q block [0,k_dim), k block [k_dim,2k_dim), v block
+    // [2k_dim, 2k_dim+v_dim). Local KEY heads from q+k, local VALUE heads from v.
+    let wqkv_ranges = [
+        (kr.start * kvd, kr.end * kvd),
+        (dn_k_dim + kr.start * kvd, dn_k_dim + kr.end * kvd),
+        (2 * dn_k_dim + vr.start * vvd, 2 * dn_k_dim + vr.end * vvd),
+    ];
+    // conv1d.weight is [qkv_dim × kernel] flat → the same channel ranges × kernel.
+    let conv_ranges = [
+        (wqkv_ranges[0].0 * kernel, wqkv_ranges[0].1 * kernel),
+        (wqkv_ranges[1].0 * kernel, wqkv_ranges[1].1 * kernel),
+        (wqkv_ranges[2].0 * kernel, wqkv_ranges[2].1 * kernel),
+    ];
+    let vh_range = [(vr.start, vr.end)]; // a_log / dt_bias (one per value head)
+
+    for (layer_idx, lw) in weights.layers.iter_mut().enumerate() {
+        let LayerWeights::DeltaNet(l) = lw else { continue };
+        let p = format!("layers.{layer_idx}");
+        let wqkv = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"),
+            dn_qkv_dim, dim, WSlice::RowsMulti(&wqkv_ranges),
+        )?;
+        let wz = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"),
+            dn_v_dim, dim, WSlice::Rows(vr.start * vvd, vr.end * vvd),
+        )?;
+        let wa = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"),
+            nv, dim, WSlice::Rows(vr.start, vr.end),
+        )?;
+        let wb = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"),
+            nv, dim, WSlice::Rows(vr.start, vr.end),
+        )?;
+        let wo = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"),
+            dim, dn_v_dim, WSlice::Cols(vr.start * vvd, vr.end * vvd),
+        )?;
+        let conv = gather_f32_ranges(gpu, &l.conv_weight, &conv_ranges)?;
+        let alog = gather_f32_ranges(gpu, &l.a_log, &vh_range)?;
+        let dtb = gather_f32_ranges(gpu, &l.dt_bias, &vh_range)?;
+        // DeltaNet dense FFN (3c-B): same col/col/row split as FA, reusing the
+        // local ffn range [ffn0, ffn1).
+        let wg = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.gate_proj.weight"),
+            config.hidden_dim, dim, WSlice::Rows(ffn0, ffn1),
+        )?;
+        let wu = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.up_proj.weight"),
+            config.hidden_dim, dim, WSlice::Rows(ffn0, ffn1),
+        )?;
+        let wd = load_weight_tensor_sliced(
+            hfq, gpu, &format!("{p}.mlp.down_proj.weight"),
+            dim, config.hidden_dim, WSlice::Cols(ffn0, ffn1),
+        )?;
+        free_full(gpu, std::mem::replace(&mut l.wqkv, wqkv))?;
+        free_full(gpu, std::mem::replace(&mut l.wz, wz))?;
+        free_full(gpu, std::mem::replace(&mut l.w_alpha, wa))?;
+        free_full(gpu, std::mem::replace(&mut l.w_beta, wb))?;
+        free_full(gpu, std::mem::replace(&mut l.wo, wo))?;
+        free_full(gpu, std::mem::replace(&mut l.w_gate, wg))?;
+        free_full(gpu, std::mem::replace(&mut l.w_up, wu))?;
+        free_full(gpu, std::mem::replace(&mut l.w_down, wd))?;
+        let _ = gpu.free_tensor(std::mem::replace(&mut l.conv_weight, conv));
+        let _ = gpu.free_tensor(std::mem::replace(&mut l.a_log, alog));
+        let _ = gpu.free_tensor(std::mem::replace(&mut l.dt_bias, dtb));
     }
     Ok(weights)
 }
@@ -13038,111 +13176,80 @@ fn run_fa_ffn_gate_up(
     layer_idx: usize,
     s: &Qwen35Scratch,
 ) -> HipResult<()> {
-    let layer = match &weights.layers[layer_idx] {
-        LayerWeights::FullAttn(l) => l,
+    let (w_gate, w_up, ffn_norm) = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => (&l.w_gate, &l.w_up, &l.ffn_norm),
+        LayerWeights::DeltaNet(l) => (&l.w_gate, &l.w_up, &l.ffn_norm),
         _ => unreachable!(),
     };
 
     // FFN: fused rmsnorm + rotate for w_gate/w_up.
     let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.w_gate,
-        &s.x,
-        &layer.ffn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
+        gpu, w_gate, &s.x, ffn_norm, &s.tmp, &s.x_rot, config.norm_eps,
     )?;
-    let dt_g = layer.w_gate.gpu_dtype;
-    let same_dtype = layer.w_up.gpu_dtype == dt_g;
+    let dt_g = w_gate.gpu_dtype;
+    let same_dtype = w_up.gpu_dtype == dt_g;
     let fused_gu_mq4 = same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
     let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
     let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
     let fused_gu_paro4t = same_dtype
         && dt_g == DType::PARO4G128T
-        && layer.w_gate.m == layer.w_up.m
-        && layer.w_gate.k == layer.w_up.k
-        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        && w_gate.m == w_up.m
+        && w_gate.k == w_up.k
+        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED").map(|v| v != "0").unwrap_or(true);
     // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
     let fused_gu_hfq6 = same_dtype
         && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
         && gpu.arch_caps.gemv_dp4a_enabled();
     if fused_gu_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_hfq4g256(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
+            &w_gate.buf, &w_up.buf,
             eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
+            &s.gate_ffn, &s.up,
+            w_gate.m, w_up.m,
+            w_gate.k,
         )?;
     } else if fused_gu_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_mq3g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
+            &w_gate.buf, &w_up.buf,
             eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
+            &s.gate_ffn, &s.up,
+            w_gate.m, w_up.m,
+            w_gate.k,
         )?;
     } else if fused_gu_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_mq4g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
+            &w_gate.buf, &w_up.buf,
             eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
+            &s.gate_ffn, &s.up,
+            w_gate.m, w_up.m,
+            w_gate.k,
         )?;
     } else if fused_gu_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
+        let eff_x = match x_rot { Some(xr) => xr, None => &s.tmp };
         gpu.fused_gate_up_hfq6g256_dp4a(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
+            &w_gate.buf, &w_up.buf,
             eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
+            &s.gate_ffn, &s.up,
+            w_gate.m, w_up.m,
+            w_gate.k,
         )?;
     } else if fused_gu_paro4t {
         gpu.fused_gate_up_paro4g128t(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
+            &w_gate.buf,
+            &w_up.buf,
             &s.tmp,
             &s.gate_ffn,
             &s.up,
             &s.x_rot,
-            layer.w_gate.m,
-            layer.w_gate.k,
+            w_gate.m,
+            w_gate.k,
         )?;
     } else {
-        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
+        weight_gemv_prerotated(gpu, w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
+        weight_gemv_prerotated(gpu, w_up, &s.tmp, x_rot, &s.up)?;
     }
     Ok(())
 }
@@ -13190,6 +13297,74 @@ fn run_fa_ffn_body_sharded(
     Ok(())
 }
 
+
+/// Phase selector for `run_dn_layer_body` under TP (Stage 3c).
+/// - `Full`: single-GPU — attention + wo residual into s.x + FFN.
+/// - `Attn`: attention, then PARTIAL wo into s.o (NON-residual) and
+///   return before the FFN; the caller all-reduces s.o and adds it to s.x.
+/// - `Ffn`: run only the FFN (full, residual) on the all-reduced s.x.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DnPhase {
+    Full,
+    Attn,
+    Ffn,
+    /// Sharded FFN (3c-B): partial w_down into s.o (NON-residual); caller
+    /// all-reduces s.o and adds it to s.x.
+    FfnShard,
+}
+
+/// DeltaNet FFN tail (rmsnorm+rotate gate/up → fused gate/up → SwiGLU +
+/// w_down residual into s.x), extracted from `run_dn_layer_body` so the TP
+/// `DnPhase::Ffn` path can run it on the already-all-reduced residual.
+/// Byte-identical to the previously-inline DeltaNet FFN.
+/// DeltaNet FFN tail — residual into s.x. Used by single-GPU `Full` and the
+/// replicated-FFN TP `DnPhase::Ffn` path. Reuses the generalized
+/// `run_fa_ffn_gate_up` (handles DeltaNet layers).
+fn run_dn_ffn_body(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+) -> HipResult<()> {
+    run_fa_ffn_gate_up(gpu, weights, config, layer_idx, s)?;
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::DeltaNet(l) => l,
+        _ => unreachable!(),
+    };
+    weight_gemv_swiglu_residual(
+        gpu, &layer.w_down, &s.gate_ffn, &s.up, &s.ffn_hidden, &s.x,
+    )?;
+    if let Some(ref rb) = hidden_rb {
+        if let Some(slot) = rb.extract_slot(layer_idx) {
+            rb.write_at_head(gpu, slot, &s.x)?;
+        }
+    }
+    trace_finite_if_enabled(gpu, &format!("layer {layer_idx} LinearAttention residual"), &s.x)?;
+    Ok(())
+}
+
+/// Sharded DeltaNet FFN tail (Stage 3c-B) — gate/up on the local ffn slice →
+/// SwiGLU → PARTIAL column-sliced w_down into s.o (NON-residual). Caller
+/// all-reduces s.o across ranks and adds it to s.x. Mirrors
+/// `run_fa_ffn_body_sharded`.
+fn run_dn_ffn_body_sharded(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    run_fa_ffn_gate_up(gpu, weights, config, layer_idx, s)?;
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::DeltaNet(l) => l,
+        _ => unreachable!(),
+    };
+    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+    weight_gemv(gpu, &layer.w_down, &s.ffn_hidden, &s.o)?;
+    Ok(())
+}
 /// DeltaNet (LinearAttention) layer body, extracted verbatim from the
 /// inline arm of `forward_scratch_layers` so the TP orchestrator can run
 /// it replicated on every rank (DeltaNet is not sharded — see
@@ -13206,7 +13381,16 @@ pub fn run_dn_layer_body(
     dn_state: &mut DeltaNetState,
     s: &Qwen35Scratch,
     hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    dn_phase: DnPhase,
 ) -> HipResult<()> {
+    // TP FFN-only phase: s.x already holds the all-reduced attention residual;
+    // skip the gated-delta-net (it ran in the Attn phase) and run just the FFN.
+    if let DnPhase::Ffn = dn_phase {
+        return run_dn_ffn_body(gpu, weights, config, layer_idx, s, hidden_rb);
+    }
+    if let DnPhase::FfnShard = dn_phase {
+        return run_dn_ffn_body_sharded(gpu, weights, config, layer_idx, s);
+    }
     let layer = match &weights.layers[layer_idx] {
         LayerWeights::DeltaNet(l) => l,
         _ => unreachable!(),
@@ -13481,149 +13665,20 @@ pub fn run_dn_layer_body(
     if layer_idx == 0 {
         trace_finite_if_enabled(gpu, "layer 0 LA gated norm", &s.dn_normed)?;
     }
-    // Fused wo GEMV + residual add: s.x += layer.wo * s.dn_normed
+    // wo. TP `Attn`: PARTIAL wo into s.o (NON-residual) — caller all-reduces
+    // s.o across ranks and adds it to s.x; return before the FFN. `Full`
+    // (single-GPU): fused wo GEMV + residual add into s.x, then the FFN.
+    if let DnPhase::Attn = dn_phase {
+        weight_gemv(gpu, &layer.wo, &s.dn_normed, &s.o)?;
+        return Ok(());
+    }
     weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
     if layer_idx == 0 {
         trace_finite_if_enabled(gpu, "layer 0 LA wo residual", &s.x)?;
     }
 
-    // FFN: fused rmsnorm + rotate for w_gate/w_up.
-    let x_rot = fused_rmsnorm_rotate_for_mq(
-        gpu,
-        &layer.w_gate,
-        &s.x,
-        &layer.ffn_norm,
-        &s.tmp,
-        &s.x_rot,
-        config.norm_eps,
-    )?;
-    if layer_idx == 0 {
-        trace_finite_if_enabled(gpu, "layer 0 FFN norm", &s.tmp)?;
-    }
-    // Cross-arch fast path: fused gate+up in one launch. Works
-    // for both MQ4 (x_rot Some) and HF4 (x_rot None → s.tmp).
-    let dt_g = layer.w_gate.gpu_dtype;
-    let same_dtype = layer.w_up.gpu_dtype == dt_g;
-    let fused_gu_mq4 =
-        same_dtype && (dt_g == DType::MQ4G256 || dt_g == DType::HFQ4G256);
-    let fused_gu_lloyd_mq3 = same_dtype && dt_g == DType::MQ3G256Lloyd;
-    let fused_gu_lloyd_mq4 = same_dtype && dt_g == DType::MQ4G256Lloyd;
-    let fused_gu_paro4t = same_dtype
-        && dt_g == DType::PARO4G128T
-        && layer.w_gate.m == layer.w_up.m
-        && layer.w_gate.k == layer.w_up.k
-        && std::env::var("HIPFIRE_PARO_GATE_UP_FUSED")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-    // Phase A.1c (gfx906): fused dp4a path for HFQ6/MQ6 weights.
-    let fused_gu_hfq6 = same_dtype
-        && (dt_g == DType::MQ6G256 || dt_g == DType::HFQ6G256)
-        && gpu.arch_caps.gemv_dp4a_enabled();
-    if fused_gu_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_hfq4g256(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_lloyd_mq3 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq3g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_lloyd_mq4 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_mq4g256_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_hfq6 {
-        let eff_x = match x_rot {
-            Some(xr) => xr,
-            None => &s.tmp,
-        };
-        gpu.fused_gate_up_hfq6g256_dp4a(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            eff_x,
-            &s.gate_ffn,
-            &s.up,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-        )?;
-    } else if fused_gu_paro4t {
-        gpu.fused_gate_up_paro4g128t(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &s.tmp,
-            &s.gate_ffn,
-            &s.up,
-            &s.x_rot,
-            layer.w_gate.m,
-            layer.w_gate.k,
-        )?;
-    } else {
-        weight_gemv_prerotated(gpu, &layer.w_gate, &s.tmp, x_rot, &s.gate_ffn)?;
-        weight_gemv_prerotated(gpu, &layer.w_up, &s.tmp, x_rot, &s.up)?;
-    }
-    if layer_idx == 0 {
-        trace_finite_if_enabled(gpu, "layer 0 FFN gate", &s.gate_ffn)?;
-        trace_finite_if_enabled(gpu, "layer 0 FFN up", &s.up)?;
-    }
-    // Fused SwiGLU + w_down residual GEMV:
-    //   MQ4: fused_silu_rotate(gate,up) + gemv_residual(w_down, rotated, x)
-    //   HF4: silu_mul + weight_gemv_residual (unchanged)
-    weight_gemv_swiglu_residual(
-        gpu,
-        &layer.w_down,
-        &s.gate_ffn,
-        &s.up,
-        &s.ffn_hidden,
-        &s.x,
-    )?;
-    if layer_idx == 0 {
-        trace_finite_if_enabled(gpu, "layer 0 FFN residual", &s.x)?;
-    }
+    run_dn_ffn_body(gpu, weights, config, layer_idx, s, hidden_rb)?;
 
-    if let Some(ref rb) = hidden_rb {
-        if let Some(slot) = rb.extract_slot(layer_idx) {
-            rb.write_at_head(gpu, slot, &s.x)?;
-        }
-    }
-
-    trace_finite_if_enabled(
-        gpu,
-        &format!("layer {layer_idx} LinearAttention residual"),
-        &s.x,
-    )?;
     Ok(())
 }
 
@@ -13807,7 +13862,7 @@ fn forward_scratch_layers(
             (LayerWeights::DeltaNet(_), LayerType::LinearAttention) => {
                 run_dn_layer_body(
                     gpu, weights, config, layer_idx, delta_layer_idx,
-                    dn_state, s, hidden_rb.as_deref_mut(),
+                    dn_state, s, hidden_rb.as_deref_mut(), DnPhase::Full,
                 )?;
                 delta_layer_idx += 1;
             }
@@ -15100,7 +15155,41 @@ pub fn local_attn_config(config: &Qwen35Config, shard: &ShardConfig) -> Qwen35Co
     let mut c = config.clone();
     c.n_heads = shard.q_heads_per_rank(config.n_heads);
     c.n_kv_heads = shard.kv_heads_per_rank(config.n_kv_heads);
+    // Stage 3c: DeltaNet value/key heads shard too (drives run_dn_layer_body
+    // head counts + DeltaNetState/scratch sizing). `hidden_dim` stays FULL:
+    // in 3c-A the DeltaNet FFN runs replicated-full and shares the FFN scratch;
+    // the FA FFN (sharded) writes its local-ffn prefix into that full scratch.
+    c.linear_num_value_heads = shard.dn_value_heads_per_rank(config.linear_num_value_heads);
+    c.linear_num_key_heads = shard.dn_key_heads_per_rank(config.linear_num_key_heads);
+    // 3c-B: both FA and DeltaNet FFN are sharded, so the FFN scratch
+    // (gate_ffn/up/ffn_hidden) can shrink to local ffn. (In 3c-A this stayed
+    // full because the DeltaNet FFN ran replicated-full.)
+    c.hidden_dim = config.hidden_dim / shard.tp_size;
     c
+}
+
+/// All-reduce each rank's partial contribution in `s.o` across ranks and add
+/// it into the residual `s.x`. Everything (the producing GEMV, the RCCL
+/// all-reduce, and this add) runs on each rank's `active_stream`, so stream
+/// ordering + RCCL's internal cross-rank coordination are sufficient — NO host
+/// `device_synchronize`/`stream_synchronize` is needed. (The earlier per-layer
+/// `device_synchronize` was a debugging artifact from when the FA kernels were
+/// wrongly believed to run on the default stream; it was a full GPU drain per
+/// layer-op and the dominant TP decode overhead.)
+fn tp_allreduce_add(
+    gpus: &mut Gpus,
+    scratches: &[Qwen35Scratch],
+    tp: usize,
+    dim: usize,
+) -> HipResult<()> {
+    let refs: Vec<&_> = scratches.iter().map(|s| &s.o.buf).collect();
+    gpus.all_reduce_sum_f32(&refs, dim)?;
+    for r in 0..tp {
+        gpus.devices[r].bind_thread()?;
+        let (x, o) = (&scratches[r].x, &scratches[r].o);
+        gpus.devices[r].add_f32(x, o, x)?;
+    }
+    Ok(())
 }
 
 /// Tensor-parallel single-token forward across `tp` ranks. Handles BOTH TP
@@ -15195,13 +15284,42 @@ pub fn forward_scratch_tp(
     for layer_idx in 0..cfg0.n_layers {
         match cfg0.layer_types[layer_idx] {
             LayerType::LinearAttention => {
-                // DeltaNet: replicated on every rank, no all-reduce.
-                for r in 0..tp {
-                    gpus.devices[r].bind_thread()?;
-                    run_dn_layer_body(
-                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
-                        delta_layer_idx, &mut dn_states[r], &scratches[r], None,
-                    )?;
+                if !sharded {
+                    // Replicated (Stage 3): full DeltaNet on every rank, no all-reduce.
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_dn_layer_body(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            delta_layer_idx, &mut dn_states[r], &scratches[r], None,
+                            DnPhase::Full,
+                        )?;
+                    }
+                } else {
+                    // Sharded (3c): per-rank local-value-head gated-delta-net +
+                    // attention partial wo → all-reduce → add, then sharded FFN
+                    // partial w_down → all-reduce → add (mirrors the FA path).
+                    // a. DeltaNet attention → partial wo into scratches[r].o.
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_dn_layer_body(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            delta_layer_idx, &mut dn_states[r], &scratches[r], None,
+                            DnPhase::Attn,
+                        )?;
+                    }
+                    // b. all-reduce the partial wo (s.o) + residual add into s.x.
+                    tp_allreduce_add(gpus, scratches, tp, dim)?;
+                    // c. DeltaNet FFN (sharded): partial w_down → s.o per rank.
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_dn_layer_body(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            delta_layer_idx, &mut dn_states[r], &scratches[r], None,
+                            DnPhase::FfnShard,
+                        )?;
+                    }
+                    // d. 2nd all-reduce (FFN partial) + add into s.x.
+                    tp_allreduce_add(gpus, scratches, tp, dim)?;
                 }
                 delta_layer_idx += 1;
             }
@@ -15215,28 +15333,10 @@ pub fn forward_scratch_tp(
                         FaPhase::TpAttn { mask: fa_masks.map(|m| &m[r]) },
                     )?;
                 }
-                // b. FA kernels run on the default stream; the all-reduce reads
-                //    s.o on the active stream — fully sync each rank first.
-                for r in 0..tp {
-                    gpus.devices[r].bind_thread()?;
-                    gpus.devices[r].hip.device_synchronize()?;
-                }
-                // c. All-reduce the partial wo contributions across ranks →
-                //    each scratches[r].o now holds the full attention output.
-                let refs: Vec<&_> = scratches.iter().map(|s| &s.o.buf).collect();
-                gpus.all_reduce_sum_f32(&refs, dim)?;
-                // d. Residual update s.x += s.o (full attention contribution).
-                for r in 0..tp {
-                    gpus.devices[r].bind_thread()?;
-                    gpus.devices[r].hip.stream_synchronize(
-                        gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
-                            HipError::new(0, "forward_scratch_tp: rank has no active_stream")
-                        })?,
-                    )?;
-                    let (x, o) = (&scratches[r].x, &scratches[r].o);
-                    gpus.devices[r].add_f32(x, o, x)?;
-                }
-                // e. FFN. Sharded (3b): each rank's TpFfnShard writes a partial
+                // b. All-reduce the partial wo (s.o) across ranks + residual
+                //    add into s.x (all on each rank's active_stream).
+                tp_allreduce_add(gpus, scratches, tp, dim)?;
+                // c. FFN. Sharded (3b): each rank's TpFfnShard writes a partial
                 //    w_down into s.o → 2nd all-reduce → add into s.x. Replicated
                 //    (Stage 3): TpFfn runs the full FFN residual into s.x (every
                 //    rank identical, no all-reduce).
@@ -15249,20 +15349,8 @@ pub fn forward_scratch_tp(
                             FaPhase::TpFfnShard,
                         )?;
                     }
-                    for r in 0..tp {
-                        gpus.devices[r].bind_thread()?;
-                        gpus.devices[r].hip.device_synchronize()?;
-                    }
-                    let refs: Vec<&_> = scratches.iter().map(|s| &s.o.buf).collect();
-                    gpus.all_reduce_sum_f32(&refs, dim)?;
-                    for r in 0..tp {
-                        gpus.devices[r].bind_thread()?;
-                        gpus.devices[r].hip.stream_synchronize(
-                            gpus.devices[r].active_stream.as_ref().unwrap(),
-                        )?;
-                        let (x, o) = (&scratches[r].x, &scratches[r].o);
-                        gpus.devices[r].add_f32(x, o, x)?;
-                    }
+                    // 2nd all-reduce (FFN partial w_down) + add into s.x.
+                    tp_allreduce_add(gpus, scratches, tp, dim)?;
                 } else {
                     for r in 0..tp {
                         gpus.devices[r].bind_thread()?;
