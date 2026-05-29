@@ -107,6 +107,15 @@ fn main() {
 
     if no_profile {
         let (prefill_ms, logits) = run_prefill(&mut state, &mut gpu);
+        {
+            // Correctness probe for MoE-kernel A/B (e.g. HIPFIRE_DEEPSEEK4_MOE_N32):
+            // n32 should be bit-identical to the 4w path. argmax + sum + max over
+            // the final-position vocab logits is a cheap full-output checksum.
+            let am = hipfire_arch_deepseek4::spec_decode::logits_argmax(&logits);
+            let s: f64 = logits.iter().map(|&v| v as f64).sum();
+            let mx = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("PREFILL_CHECK argmax={am} logit_sum={s:.4} logit_max={mx:.6} n={}", logits.len());
+        }
         let prefill_tok_s = prefill_len as f64 * 1000.0 / prefill_ms.max(1.0);
         eprintln!(
             "real prefill: {prefill_ms:.1}ms ({prefill_tok_s:.1} tok/s)"
