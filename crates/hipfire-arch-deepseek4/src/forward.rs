@@ -6628,12 +6628,7 @@ fn ffn_batched(
         // Default ON for gfx11+ (measured 83.8% vs 43.4% L2 hit, -9% kernel
         // time on gfx1151). Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0.
         // Shape gate: gate_up M=2*im must be multiple of 64, K=hidden of 256.
-        // 8w override (experimental; opt in via HIPFIRE_DEEPSEEK4_MOE_8W=1).
-        // M must be a multiple of 128; falls through to 4w otherwise.
-        let use_lloyd_8w = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1")
-            && (2 * im) % 128 == 0
-            && hidden % 256 == 0;
-        let use_lloyd_4w = !use_lloyd_8w && match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
             .as_deref()
         {
             Ok("0") => false,
@@ -6644,21 +6639,7 @@ fn ffn_batched(
         // MMQ-style preload (default ON for 4w; opt out via =0).
         let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
             .as_deref() != Ok("0");
-        if use_lloyd_8w {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
-                gate_up_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.ffn_x_rot_batch,
-                &pbs.moe_y_gate_up_grouped,
-                2 * im,
-                hidden,
-                k_top,
-                m_total_max,
-                batch_size,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w gate_up l{layer_idx}: {e:?}"))?;
-        } else if use_mmqload {
+        if use_mmqload {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6764,10 +6745,7 @@ fn ffn_batched(
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
         // Same 4w default as the gate_up GEMM above.
-        let use_lloyd_8w_down = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1")
-            && hidden % 128 == 0
-            && im % 256 == 0;
-        let use_lloyd_4w_down = !use_lloyd_8w_down && match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
             .as_deref()
         {
             Ok("0") => false,
@@ -6777,21 +6755,7 @@ fn ffn_batched(
           && im % 256 == 0;
         let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
             .as_deref() != Ok("0");
-        if use_lloyd_8w_down {
-            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
-                w2_ptrs,
-                &pbs.moe_expert_tile_ids,
-                &pbs.moe_sorted_slot_index,
-                &pbs.moe_rot_batch,
-                &pbs.moe_y_down_grouped,
-                hidden,
-                im,
-                1,
-                m_total_max,
-                batch_size * k_top,
-            )
-            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w down l{layer_idx}: {e:?}"))?;
-        } else if use_mmqload_down {
+        if use_mmqload_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,
