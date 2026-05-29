@@ -2884,6 +2884,11 @@ pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.hip");
 
+/// 8-warp variant: 128×16 M-tile, 256 threads. Double B-fragment reuse
+/// vs the 4w (64×16) variant. Default OFF — opt in via env for testing.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2.hip");
+
 /// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
