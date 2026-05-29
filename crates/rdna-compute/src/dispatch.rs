@@ -16387,57 +16387,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
-    /// Software-prefetch: read first cache line of each active expert's weight
-    /// slab into L2. Call between gate_up GEMM and down GEMM in ffn_batched
-    /// so the down GEMM finds its weights hot (reduces HBM-level cache misses).
-    ///
-    /// `expert_tile_ids` is `[m_total / block_m]` i32 from the scatter — each
-    /// entry is an expert ID (or -1 sentinel for padding). The kernel skips
-    /// negative entries and touches `prefetch_bytes` at each valid expert.
-    pub fn prefetch_expert_slabs(
-        &mut self,
-        expert_ptrs: &GpuTensor,
-        expert_tile_ids: &GpuTensor,
-        m_total: usize,
-        block_m: usize,
-        prefetch_bytes: usize,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_kernel(
-            "prefetch_expert_slabs",
-            kernels::PREFETCH_EXPERT_SLABS_SRC,
-            "prefetch_expert_slabs",
-        )?;
-        let ep = expert_ptrs.buf.as_ptr();
-        let tp = expert_tile_ids.buf.as_ptr();
-        let n_ids = (m_total / block_m) as i32;
-        let pb = prefetch_bytes as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &ep as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &n_ids as *const _ as *mut c_void,
-            &pb as *const _ as *mut c_void,
-        ];
-        // Single wave32 — one read per thread per 32 tile IDs.
-        let grid = [(n_ids as u32 + 31) / 32, 1, 1];
-        let bytes = prefetch_bytes * (m_total / block_m);
-        let timer = crate::profile::begin_timer(
-            &self.hip, "elementwise", "prefetch_expert_slabs", bytes,
-        );
-        let result = self.launch_maybe_blob(
-            "prefetch_expert_slabs",
-            grid, [32, 1, 1], 0, &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ep); b.push_ptr(tp);
-                b.push_i32(n_ids); b.push_i32(pb);
-                b
-            },
-        );
-        if let Some(t) = timer { t.finish(&self.hip); }
-        result
-    }
-
     /// Path 2 down combine. Per (token, m) iterates K_TOP slots via
     /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
     /// `x_residual`. No atomic contention (each (token, m) is owned by
