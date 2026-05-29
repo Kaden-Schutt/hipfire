@@ -4983,6 +4983,11 @@ fn main() {
         // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
         // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
         "minimax_m2" => 10,
+        // LFM2.5-MoE (LiquidAI): hybrid 18 short-conv + 6 GQA-attn layers; 2 dense
+        // SwiGLU MLP + 22 top-4 MoE layers; sigmoid + expert_bias routing. bf16
+        // source, per-expert pre-split w1/w2/w3 (like minimax). Conv filter +
+        // expert_bias stay high precision. Crate hipfire-arch-lfm2moe.
+        "lfm2_moe" => 11,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -5012,7 +5017,11 @@ fn main() {
     // kernel family). Raw HF tensor names are written verbatim (no rename);
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
-    let is_moe_like = is_moe || is_deepseek4 || is_minimax;
+    // LFM2.5-MoE (arch_id 11): per-expert pre-split 2D experts (like minimax),
+    // bf16 source. Conv-block + dense-MLP + router + expert_bias get dedicated
+    // ingest branches; routed experts → MQ4G256, everything else → Q8.
+    let is_lfm2moe = arch_id == 11;
+    let is_moe_like = is_moe || is_deepseek4 || is_minimax || is_lfm2moe;
     // Q8 router: always on for MoE-class models.
     let q8_router = is_moe_like || q8_router_flag;
     if is_moe {
@@ -5023,6 +5032,9 @@ fn main() {
     }
     if is_minimax {
         eprintln!("  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight.");
+    }
+    if is_lfm2moe {
+        eprintln!("  LFM2.5-MoE detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed) → Q8.");
     }
 
     // Extract layer count for K-map edge-layer promotion.
@@ -5437,6 +5449,71 @@ fn main() {
                 continue;
             }
             // Fall through to standard path for non-MQ2 formats.
+        }
+
+        // ── LFM2.5-MoE ingest (arch_id 11) ─────────────────────────────────────
+        // Routed experts → MQ4G256 (FWHT-pre-rotated 4-bit, byte-compatible with
+        // the indexed gemv_hfq4g256_moe_* kernels given FWHT-rotated input — the
+        // exact path the forward uses). expert_bias → raw F32 (tiny, precision-
+        // sensitive, added for top-k SELECTION only). Everything else (router
+        // gate, attn q/k/v/out_proj, conv in/out_proj, conv depthwise filter,
+        // dense w1/w2/w3, all norms, tied embed/lm_head) → Q8 (qt=3 Q8F16), which
+        // the loader maps to Q8_0 / embedding_lookup_q8. The dense+attn+conv
+        // params are a small fraction of an A1B model, so Q8 is free quality.
+        if is_lfm2moe {
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            if name.contains(".feed_forward.experts.")
+                && (name.ends_with(".w1.weight")
+                    || name.ends_with(".w2.weight")
+                    || name.ends_with(".w3.weight"))
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
+                    "MQ4-LFM", name, meta.shape,
+                    raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+            if name.ends_with(".feed_forward.expert_bias") {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let mut bytes = Vec::with_capacity(f32_data.len() * 4);
+                for v in &f32_data { bytes.extend_from_slice(&v.to_le_bytes()); }
+                eprintln!("  {:>8}: {} {:?} (expert_bias F32)", "F32-LFM", name, meta.shape);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::F32,
+                    shape, group_size: 1, data: bytes, spilled_len: 0,
+                });
+                st_files[*file_idx].drop_tensor_pages(name);
+                continue;
+            }
+            // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
+            // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
+            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                name, raw_data, meta, &fp8_scale_for, &st_files);
+            let q = quantize_q8f16(&f32_data);
+            eprintln!("  {:>8}: {} {:?} (Q8)", "Q8-LFM", name, meta.shape);
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(), quant_type: QuantType::Q8F16,
+                shape, group_size: 32, data: q, spilled_len: 0,
+            });
+            quantized_params += n_elements as u64;
+            st_files[*file_idx].drop_tensor_pages(name);
+            continue;
         }
 
         // ── MiniMax-M2 router: keep Q8 ─────────────────────────────────────────
