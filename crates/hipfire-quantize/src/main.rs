@@ -4814,6 +4814,11 @@ fn main() {
         // path yet; tensor names ship in DeepSeek V4's native shape (split w1/w2/w3,
         // per-expert) and are translated when the forward bring-up lands.
         "deepseek_v4" => 9,
+        // MiniMax-M2 (Mixtral-style MoE): GQA + per-layer QK-norm + partial
+        // rotate_half RoPE; 256 routed experts top-8 sigmoid+e_score_bias, no
+        // shared expert; FP8 E4M3 + F32 weight_scale_inv block-128 storage;
+        // split per-expert w1/w3/w2 (like deepseek_v4). Crate hipfire-arch-minimax.
+        "minimax_m2" => 10,
         other => { eprintln!("Warning: unknown architecture '{other}', treating as llama"); 0 }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
