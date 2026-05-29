@@ -482,20 +482,27 @@ fn main() {
             let mut moe_layers = 0usize;
             let mut first_count: Option<usize> = None;
             let mut all_match = true;
+            // Stage 3f: also capture a MoE-layer attention dim (FullAttnMoe wq.m
+            // output rows; DeltaNetMoe wo.k input cols) — halved when
+            // HIPFIRE_EP_SHARD_ATTN is set (sharded attn), full otherwise (3e).
+            let mut fa_wq_m: Option<usize> = None;
+            let mut dn_wo_k: Option<usize> = None;
             for lw in &w.layers {
                 let experts = match lw {
-                    qwen35::LayerWeights::DeltaNetMoe(l) => &l.ffn.experts,
-                    qwen35::LayerWeights::FullAttnMoe(l) => &l.ffn.experts,
+                    qwen35::LayerWeights::DeltaNetMoe(l) => { dn_wo_k.get_or_insert(l.wo.k); &l.ffn.experts }
+                    qwen35::LayerWeights::FullAttnMoe(l) => { fa_wq_m.get_or_insert(l.wq.m); &l.ffn.experts }
                     _ => continue,
                 };
                 moe_layers += 1;
                 first_count.get_or_insert(experts.len());
                 if experts.len() != config.num_experts / TP { all_match = false; }
             }
+            let shard_attn = std::env::var_os("HIPFIRE_EP_SHARD_ATTN").is_some();
             println!(
-                "  rank {r}: {moe_layers} MoE layers, experts/layer={} {}",
+                "  rank {r}: {moe_layers} MoE layers, experts/layer={} {} | attn: FullAttnMoe wq.m={:?} DeltaNetMoe wo.k={:?} (shard_attn={})",
                 first_count.unwrap_or(0),
                 if all_match && first_count == Some(config.num_experts / TP) { "✓" } else { "✗ MISMATCH" },
+                fa_wq_m, dn_wo_k, shard_attn,
             );
             assert!(all_match, "rank {r}: some MoE layer not compacted to {} experts", config.num_experts / TP);
             assert_eq!(first_count, Some(config.num_experts / TP), "rank {r}: expert count wrong");

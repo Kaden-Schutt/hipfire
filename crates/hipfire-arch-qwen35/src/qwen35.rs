@@ -1182,6 +1182,10 @@ fn load_norm_weight_raw(
 /// group boundaries.
 fn quant_group_size(quant_type: u8) -> usize {
     match quant_type {
+        // Q8F16 / Q8_0-like: 34 bytes per 32 elements (2-byte f16 scale + 32×int8),
+        // independent per-group → column-sliceable on 32-elem boundaries. A3B
+        // keeps the attention out_proj at Q8 (3f shards it; the dense 27B used MQ4).
+        3 => 32,
         // *G128 families (HFQ4G128, HFQ3G128, PARO4G128, PARO4G128T)
         7 | 12 | 28 | 29 => 128,
         // *G256 families (HFQ4/6/3/2, MQ8/6/4/3/2, MQ3/2/4-Lloyd)
@@ -1326,6 +1330,7 @@ mod tp_slice_tests {
     fn group_sizes_known() {
         assert_eq!(quant_group_size(13), 256); // MQ4G256
         assert_eq!(quant_group_size(7), 128); // HFQ4G128
+        assert_eq!(quant_group_size(3), 32); // Q8F16 (Q8_0-like) — A3B attn out_proj (3f)
     }
 
     #[test]
@@ -3677,6 +3682,52 @@ pub fn load_weights_tp(
         let _ = gpu.free_tensor(std::mem::replace(&mut l.conv_weight, conv));
         let _ = gpu.free_tensor(std::mem::replace(&mut l.a_log, alog));
         let _ = gpu.free_tensor(std::mem::replace(&mut l.dt_bias, dtb));
+    }
+
+    // ── Stage 3f (HIPFIRE_EP_SHARD_ATTN): shard the MoE-layer ATTENTION ──
+    // 3e replicates MoE-layer attention (full on every rank — the dense bulk of
+    // A3B decode bandwidth). 3f slices it exactly like the dense FA/DN loops
+    // above (the decode-bandwidth win, mirroring 3c's +11%), reusing the SAME
+    // precomputed ranges + slicer fns. The MoE FFN (router/shared full, experts
+    // EP-sharded by `shard_moe_experts` below) is untouched here. Gated so 3e's
+    // VALIDATED replicated-attn path stays default until the 3f sharded-attn
+    // FORWARD lands (this loader change is inert without it — see tp-3f doc).
+    let shard_moe_attn = std::env::var_os("HIPFIRE_EP_SHARD_ATTN").is_some();
+    if shard_moe_attn {
+        for (layer_idx, lw) in weights.layers.iter_mut().enumerate() {
+            let p = format!("layers.{layer_idx}");
+            match lw {
+                LayerWeights::FullAttnMoe(l) => {
+                    let new_wq = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_out_dim, dim, WSlice::Rows(wq_rows.start, wq_rows.end))?;
+                    let new_wk = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, dim, WSlice::Rows(kv_r0, kv_r1))?;
+                    let new_wv = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, dim, WSlice::Rows(kv_r0, kv_r1))?;
+                    let new_wo = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), dim, attn_dim, WSlice::Cols(wo_cols.start, wo_cols.end))?;
+                    free_full(gpu, std::mem::replace(&mut l.wq, new_wq))?;
+                    free_full(gpu, std::mem::replace(&mut l.wk, new_wk))?;
+                    free_full(gpu, std::mem::replace(&mut l.wv, new_wv))?;
+                    free_full(gpu, std::mem::replace(&mut l.wo, new_wo))?;
+                }
+                LayerWeights::DeltaNetMoe(l) => {
+                    let wqkv = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.linear_attn.in_proj_qkv.weight"), dn_qkv_dim, dim, WSlice::RowsMulti(&wqkv_ranges))?;
+                    let wz = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.linear_attn.in_proj_z.weight"), dn_v_dim, dim, WSlice::Rows(vr.start * vvd, vr.end * vvd))?;
+                    let wa = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.linear_attn.in_proj_a.weight"), nv, dim, WSlice::Rows(vr.start, vr.end))?;
+                    let wb = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.linear_attn.in_proj_b.weight"), nv, dim, WSlice::Rows(vr.start, vr.end))?;
+                    let wo = load_weight_tensor_sliced(hfq, gpu, &format!("{p}.linear_attn.out_proj.weight"), dim, dn_v_dim, WSlice::Cols(vr.start * vvd, vr.end * vvd))?;
+                    let conv = gather_f32_ranges(gpu, &l.conv_weight, &conv_ranges)?;
+                    let alog = gather_f32_ranges(gpu, &l.a_log, &vh_range)?;
+                    let dtb = gather_f32_ranges(gpu, &l.dt_bias, &vh_range)?;
+                    free_full(gpu, std::mem::replace(&mut l.wqkv, wqkv))?;
+                    free_full(gpu, std::mem::replace(&mut l.wz, wz))?;
+                    free_full(gpu, std::mem::replace(&mut l.w_alpha, wa))?;
+                    free_full(gpu, std::mem::replace(&mut l.w_beta, wb))?;
+                    free_full(gpu, std::mem::replace(&mut l.wo, wo))?;
+                    let _ = gpu.free_tensor(std::mem::replace(&mut l.conv_weight, conv));
+                    let _ = gpu.free_tensor(std::mem::replace(&mut l.a_log, alog));
+                    let _ = gpu.free_tensor(std::mem::replace(&mut l.dt_bias, dtb));
+                }
+                _ => continue,
+            }
+        }
     }
 
     // ── Stage 3e: expert-parallel MoE sharding (A3B) ───────────────────
