@@ -3678,7 +3678,106 @@ pub fn load_weights_tp(
         let _ = gpu.free_tensor(std::mem::replace(&mut l.a_log, alog));
         let _ = gpu.free_tensor(std::mem::replace(&mut l.dt_bias, dtb));
     }
+
+    // ── Stage 3e: expert-parallel MoE sharding (A3B) ───────────────────
+    // The FullAttn/DeltaNet slice loops above SKIP the *Moe layer variants
+    // (their `let ... else { continue }`), so an A3B model reaches here with
+    // its attention + router + shared expert FULL (replicated — EP v1) and all
+    // `num_experts` routed experts resident. Shard the routed experts: free the
+    // non-owned ones (the memory win) + rebuild each layer's device pointer
+    // table (owned → real ptr, non-owned → a shared zeroed buffer). See
+    // `docs/plans/tp-3e-ep-moe.md` and `shard_moe_experts`.
+    let n_exp = config.num_experts;
+    if n_exp > 0 {
+        shard
+            .validate_moe(n_exp)
+            .map_err(|e| HipError::new(0, &format!("load_weights_tp: {e}")))?;
+        for lw in weights.layers.iter_mut() {
+            let ffn = match lw {
+                LayerWeights::DeltaNetMoe(l) => &mut l.ffn,
+                LayerWeights::FullAttnMoe(l) => &mut l.ffn,
+                _ => continue,
+            };
+            shard_moe_experts(gpu, ffn, shard, rank, n_exp)?;
+        }
+    }
+
     Ok(weights)
+}
+
+/// Stage 3e EP-MoE: shard a MoE layer's routed experts to `rank`. Frees the
+/// non-owned experts (the memory win), compacts owned to the front of
+/// `ffn.experts` (so `experts[0]` stays a valid shared-AWQ representative for
+/// `moe_ffn_decode_impl`'s `fused_silu_mul_rotate_mq_batched_for`), and rebuilds
+/// the `[2·n_exp]` device pointer tables: owned global id → its (compacted)
+/// buffer ptr; **non-owned → a shared ZEROED gate_up buffer**. Zeroed HFQ4 bytes
+/// dequant to 0 (symmetric quant, f16 scale 0x0000 = +0.0) → the non-owned
+/// expert's gate_up output is 0 → silu·mul = 0 → rot = 0 → down output 0, so it
+/// contributes nothing through `moe_down_combine` WITHOUT any masking kernel.
+/// (The non-owned down ptr is irrelevant — its input rot is already 0 — so it
+/// reuses `experts[0].down`.) Router / shared expert / attention stay full
+/// (replicated in EP v1). The zero buffer is leaked for v1 (lives until context
+/// teardown) to avoid threading a lifetime field through `Qwen35Weights`.
+fn shard_moe_experts(
+    gpu: &mut Gpu,
+    ffn: &mut MoeFfnWeights,
+    shard: &ShardConfig,
+    rank: usize,
+    n_exp: usize,
+) -> HipResult<()> {
+    debug_assert_eq!(
+        ffn.experts.len(), n_exp,
+        "shard_moe_experts expects a full-loaded expert Vec (paged EP is unsupported in v1)",
+    );
+    // Free non-owned experts; compact owned to the front, recording global→local.
+    let old = std::mem::take(&mut ffn.experts);
+    let mut compacted: Vec<ExpertWeights> = Vec::with_capacity(shard.experts_per_rank(n_exp));
+    let mut local_of_global = vec![usize::MAX; n_exp];
+    for (e, ew) in old.into_iter().enumerate() {
+        if shard.owns_expert(rank, e) {
+            local_of_global[e] = compacted.len();
+            compacted.push(ew);
+        } else {
+            let _ = gpu.free_tensor(ew.gate_up.buf);
+            if let Some(s) = ew.gate_up.awq_scale { let _ = gpu.free_tensor(s); }
+            let _ = gpu.free_tensor(ew.down.buf);
+            if let Some(s) = ew.down.awq_scale { let _ = gpu.free_tensor(s); }
+        }
+    }
+    assert!(
+        !compacted.is_empty(),
+        "shard_moe_experts: rank {rank} owns no experts (n_exp={n_exp}, tp={})",
+        shard.tp_size,
+    );
+
+    // Shared zeroed gate_up buffer for non-owned slots (same byte size as a real
+    // expert's gate_up). LEAKED (mem::forget) so the ptr stays valid for the
+    // model's lifetime without a Qwen35Weights field — v1 TODO: own it properly.
+    let gu_bytes = compacted[0].gate_up.buf.buf.size();
+    let zero_gu = gpu.zeros(&[gu_bytes / 4], DType::F32)?;
+    let dummy_gu = zero_gu.buf.as_ptr() as u64;
+    let dummy_dn = compacted[0].down.buf.buf.as_ptr() as u64; // rot=0 ⇒ output 0 regardless
+    std::mem::forget(zero_gu);
+
+    // Rebuild the [2·n_exp] u64 pointer tables (8 B/ptr = 2 F32 slots).
+    let mut gu = vec![0u64; n_exp];
+    let mut dn = vec![0u64; n_exp];
+    for e in 0..n_exp {
+        if shard.owns_expert(rank, e) {
+            let li = local_of_global[e];
+            gu[e] = compacted[li].gate_up.buf.buf.as_ptr() as u64;
+            dn[e] = compacted[li].down.buf.buf.as_ptr() as u64;
+        } else {
+            gu[e] = dummy_gu;
+            dn[e] = dummy_dn;
+        }
+    }
+    let gu_b: Vec<u8> = gu.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    let dn_b: Vec<u8> = dn.iter().flat_map(|p| p.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&ffn.expert_gate_up_ptrs.buf, &gu_b)?;
+    gpu.hip.memcpy_htod(&ffn.expert_down_ptrs.buf, &dn_b)?;
+    ffn.experts = compacted;
+    Ok(())
 }
 
 pub fn load_weights_paroquant(

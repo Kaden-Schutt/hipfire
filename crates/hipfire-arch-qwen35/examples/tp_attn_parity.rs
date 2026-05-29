@@ -449,6 +449,53 @@ fn main() {
     let prompt_tokens = build_prompt_tokens(&tokenizer);
     drop(hfq);
 
+    // Stage 3e EP-MoE LOADER smoke test (HIPFIRE_PARITY_MOE_LOADTEST=1): load the
+    // (A3B) model via load_weights_tp on each rank and verify routed experts are
+    // sharded (compacted to num_experts/tp per layer) without crashing. Tests the
+    // loader in isolation — the EP forward (forward_scratch_tp MoE arms) is a
+    // separate step; this does NOT run a forward.
+    if std::env::var("HIPFIRE_PARITY_MOE_LOADTEST").is_ok() {
+        let mut hfq = HfqFile::open(Path::new(&path)).expect("open hfq");
+        let config = qwen35::config_from_hfq(&hfq).expect("config");
+        println!("=== Stage 3e EP-MoE loader smoke test ===");
+        println!(
+            "model: num_experts={} num_experts_per_tok={} tp={TP}, expect {} experts/layer/rank",
+            config.num_experts, config.num_experts_per_tok, config.num_experts / TP,
+        );
+        assert!(config.num_experts > 0, "MOE_LOADTEST needs an MoE model (num_experts>0)");
+        // tp_kv_replicate=true: A3B attention KV heads may not divide tp; EP v1
+        // replicates attention anyway, so KV replication is the right setting.
+        let shard = ShardConfig::new(TP, true, config.num_experts, ExpertAssign::Stride).unwrap();
+        let mut gpus = Gpus::init_tp(TP, config.n_layers).expect("init_tp");
+        for r in 0..TP {
+            gpus.devices[r].bind_thread().unwrap();
+            let w = qwen35::load_weights_tp(&mut hfq, &config, &mut gpus.devices[r], &shard, r)
+                .expect("load_weights_tp (A3B EP)");
+            let mut moe_layers = 0usize;
+            let mut first_count: Option<usize> = None;
+            let mut all_match = true;
+            for lw in &w.layers {
+                let experts = match lw {
+                    qwen35::LayerWeights::DeltaNetMoe(l) => &l.ffn.experts,
+                    qwen35::LayerWeights::FullAttnMoe(l) => &l.ffn.experts,
+                    _ => continue,
+                };
+                moe_layers += 1;
+                first_count.get_or_insert(experts.len());
+                if experts.len() != config.num_experts / TP { all_match = false; }
+            }
+            println!(
+                "  rank {r}: {moe_layers} MoE layers, experts/layer={} {}",
+                first_count.unwrap_or(0),
+                if all_match && first_count == Some(config.num_experts / TP) { "✓" } else { "✗ MISMATCH" },
+            );
+            assert!(all_match, "rank {r}: some MoE layer not compacted to {} experts", config.num_experts / TP);
+            assert_eq!(first_count, Some(config.num_experts / TP), "rank {r}: expert count wrong");
+        }
+        println!("\ntp_attn_parity (MoE loader): PASS — A3B experts sharded {}-way, non-owned freed + dummy-filled ptr table.", TP);
+        return;
+    }
+
     println!("=== TP=2 ↔ TP=1 full-model parity (Stage 3 acceptance) ===");
     println!("prompt: {PROMPT:?}  (prompt_len={}, N_DECODE={N_DECODE})", prompt_tokens.len());
     println!(

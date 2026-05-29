@@ -264,6 +264,36 @@ impl ShardConfig {
         (rank * kpr)..((rank + 1) * kpr)
     }
 
+    // ── Expert parallelism (Stage 3e — EP-MoE) ─────────────────────────
+    //
+    // All-reduce EP: each rank loads + computes ONLY its owned experts (see
+    // `owns_expert` / `experts_on_rank` below, Stage 5) into a `[N×dim]`
+    // partial, then the partials are all-reduced. See `docs/plans/tp-3e-ep-moe.md`.
+
+    /// Routed experts owned per rank (`n_experts / tp_size`). Dense model
+    /// (`expert_to_rank` empty) → `n_experts` (single owner).
+    #[inline]
+    pub fn experts_per_rank(&self, n_experts: usize) -> usize {
+        if self.expert_to_rank.is_empty() {
+            n_experts
+        } else {
+            n_experts / self.tp_size
+        }
+    }
+
+    /// Validate the MoE expert split: `n_experts` must be divisible by
+    /// `tp_size` (v1 requires balanced expert blocks — `new` already enforces
+    /// this when constructed with `n_experts`; this re-checks at the call site).
+    pub fn validate_moe(&self, n_experts: usize) -> Result<(), String> {
+        if n_experts % self.tp_size != 0 {
+            return Err(format!(
+                "validate_moe: n_experts ({n_experts}) not divisible by tp_size ({})",
+                self.tp_size
+            ));
+        }
+        Ok(())
+    }
+
     // ── Weight-matrix sub-ranges (row-major quant blobs) ───────────────
 
     /// Row range of the gated `wq` (`[n_heads·head_dim·2, dim]`) owned by
@@ -470,5 +500,69 @@ mod tests {
         }
         assert_eq!(covered, full);
         assert_eq!(prev_end, full);
+    }
+
+    // ── Stage 3e EP-MoE expert ownership ──────────────────────────────
+
+    #[test]
+    fn experts_per_rank_splits_evenly() {
+        let s = ShardConfig::new(2, true, 256, ExpertAssign::Stride).unwrap();
+        assert_eq!(s.experts_per_rank(256), 128);
+        let s4 = ShardConfig::new(4, true, 256, ExpertAssign::Contiguous).unwrap();
+        assert_eq!(s4.experts_per_rank(256), 64);
+        // dense model → single owner gets all
+        let dense = ShardConfig::new(2, true, 0, ExpertAssign::Stride).unwrap();
+        assert_eq!(dense.experts_per_rank(0), 0);
+    }
+
+    #[test]
+    fn stride_assignment_ownership_and_local_ids() {
+        let s = ShardConfig::new(2, true, 256, ExpertAssign::Stride).unwrap();
+        // Stride: expert e → rank e % 2. Rank 0 owns evens, rank 1 owns odds.
+        assert!(s.owns_expert(0, 0) && s.owns_expert(0, 2) && s.owns_expert(0, 254));
+        assert!(s.owns_expert(1, 1) && s.owns_expert(1, 3) && s.owns_expert(1, 255));
+        assert!(!s.owns_expert(0, 1) && !s.owns_expert(1, 0));
+        let r0 = s.experts_on_rank(0);
+        let r1 = s.experts_on_rank(1);
+        assert_eq!(r0.len(), 128);
+        assert_eq!(r1.len(), 128);
+        assert_eq!(r0[0], 0);
+        assert_eq!(r0[1], 2);
+        assert_eq!(r1[0], 1);
+        // every expert owned by exactly one rank (partition)
+        for e in 0..256 {
+            assert_eq!(s.owns_expert(0, e) as usize + s.owns_expert(1, e) as usize, 1);
+        }
+    }
+
+    #[test]
+    fn contiguous_assignment_blocks() {
+        let s = ShardConfig::new(4, true, 256, ExpertAssign::Contiguous).unwrap();
+        // Contiguous: rank r owns [r*64, (r+1)*64).
+        assert!(s.owns_expert(0, 0) && s.owns_expert(0, 63) && !s.owns_expert(0, 64));
+        assert!(s.owns_expert(3, 192) && s.owns_expert(3, 255) && !s.owns_expert(3, 191));
+        let ids = s.experts_on_rank(2);
+        assert_eq!(ids.first(), Some(&128));
+        assert_eq!(ids.last(), Some(&191));
+        assert_eq!(ids.len(), 64);
+    }
+
+    #[test]
+    fn validate_moe_divisibility() {
+        let s2 = ShardConfig::new(2, true, 256, ExpertAssign::Stride).unwrap();
+        assert!(s2.validate_moe(256).is_ok());
+        // 100 experts on 3 ranks is unbalanced.
+        let s3 = ShardConfig::new(3, true, 0, ExpertAssign::Stride).unwrap();
+        assert!(s3.validate_moe(100).is_err());
+        assert!(s3.validate_moe(255).is_ok());
+    }
+
+    #[test]
+    fn dense_model_no_experts() {
+        // Dense (no experts): expert_to_rank empty → owns_expert false, no ids.
+        let s = ShardConfig::new(2, true, 0, ExpertAssign::Stride).unwrap();
+        assert!(!s.owns_expert(0, 5));
+        assert!(!s.owns_expert(1, 5));
+        assert!(s.experts_on_rank(0).is_empty());
     }
 }
