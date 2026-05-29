@@ -384,23 +384,35 @@ migrates one call site:
   (currently 3.00); tok/s ≥ pp2-ar (currently 16.9) — should beat
   pp2-ar by τ-mediated multiplier minus replay overhead; VRAM matches
   audit projection (gfx906 free of MTP head + scratch ~1 GB).
-  
-  **Future work — GDN-tape fast-path replay under PP** (deferred from
-  v1 5d-i): two viable approaches:
+
+  > **⚠️ OUTCOME (2026-05-29):** 5d-ii shipped (commit `0c0889d4`),
+  > coherent, τ parity (~3.15). But the "should beat pp2-ar" tok/s
+  > prediction was **FALSIFIED** and the fast-path future-work below is
+  > **CLOSED, not deferred.** See "Stage 2b outcome" section at the end
+  > of this doc + experiments/hetero-gfx906/{13,14,15} + devlog
+  > 2026-05-29 mtp-vs-ar-uplift.
+
+  **Future work — GDN-tape fast-path replay under PP** — ❌ **CLOSED
+  2026-05-29; do NOT pursue.** (Was: deferred from v1 5d-i, two
+  approaches.) Both rest on a wrong abstraction; recorded for history:
   1. **Mirror LA conv weights to output_device** at PP+MTP load
-     time. The conv_weight tensor is tiny (~few MB per LA layer,
-     ~150 MB total for qwen3.6-27b's 48 LA layers). Adds load-time
-     VRAM cost on output_device but eliminates the ~10 ms × ~2/3
-     cycle penalty (recovers ~6 ms/cycle ≈ +20% tok/s at τ=3).
-     Mirror happens once at load; replay reads output_device's copy.
-  2. **PP-aware replay_gdn that dispatches per-layer to the owning
-     band's gpu.** Threads `gpus: &mut Gpus` into `replay_gdn_inner`
-     and selects `gpu = &mut gpus.devices[band_for_la_layer(layer_idx)]`
-     per iteration. Adds peer copies for `dn_state.conv_states` rows
-     between bands (since conv_states is allocated once per layer
-     and `replay_gdn` mutates it). Higher complexity than option (1)
-     and similar perf ceiling — option (1) is the recommended path
-     when the v1 penalty becomes the bottleneck worth removing.
+     time. ATTEMPTED as 5d-iii; compiled+ran but produced τ drift
+     (3.00 → 2.86) with no tok/s gain, and was REVERTED to e6a25615.
+     Root cause: the conv_weight mirror is insufficient —
+     `replay_gdn_inner` also touches `dn_state.conv_states /
+     s_matrices / s_scales`, which are allocated PER-BAND on the owning
+     band, not output_device. Peer access masks the wrong-device reads
+     (no panic) → PCIe coherence drift → τ regression.
+  2. **PP-aware replay_gdn dispatching per-layer to the owning band.**
+     Not attempted; same per-band dn_state problem, higher complexity.
+
+  **Why both are wrong (reference-engine finding):** llama.cpp
+  (`common/speculative.cpp`) and vLLM (`v1/spec_decode/`) BOTH avoid
+  replaying the trunk's recurrent/conv state on the draft path entirely
+  — the MTP head consumes only the final hidden state, and draft state
+  is re-derived fresh each cycle (llama.cpp `accept()` does not roll
+  back ctx_dft recurrent state). If MTP-under-PP decode perf is ever
+  revisited, the correct lever is no-replay rollback, not conv-mirroring.
 - **5e (DFlash delegate):** add `Path::DFlashSingle` arm that
   decomposes `GenerateCtx` into the args `generate_dflash` expects
   and wraps-and-returns. ~10 LOC. Per user decision: `generate_dflash`
@@ -508,3 +520,55 @@ chatml-frame regression).
 | Eviction "disable at load" | Already refused for pp>1; for pp=1+MTP carry defensive code |
 | Step 3 decision gate | Move to step 4 (step 3 can't actually fail) |
 | User-decision flags at execution | All three decisions LOCKED 2026-05-28: Option A + unify + bypass |
+
+## Stage 2b outcome (2026-05-29) — SHIPPED, but PpMtp is a long-ctx play, not a decode-speed play
+
+**Status: steps 0a–5d-ii landed** (commits `8989aaf4`..`e6a25615` on
+`fix/q8-batched-masked-no-lds-cap`; not yet on master, no PR open). The
+unification + `SpecPath::PpMtp` arm work and emit `spec_path:"pp-mtp"`.
+
+**Measured perf (qwen3.6-27b.mq4, gfx906+gfx1031, q8 KV, LRU prompt
+md5 b385bda5fdf47185ab32ca7acabbf057, byte-identical across cells):**
+
+| path | decode tok/s | τ | source |
+|---|---|---|---|
+| single-gpu AR | 19.4 | — | devlog 2026-05-29 mtp-vs-ar |
+| single-gpu MTP | 22.4 | 3.15 | devlog 2026-05-29 mtp-vs-ar |
+| pp2-ar | 17.6 | — | note 14 |
+| **PpMtp (48,16)** | **13.9** | 3.11 | note 14 |
+| PpMtp (56,8 peak) | 14.2 | 3.15 | note 14 |
+
+**PpMtp (14.2) is BELOW pp2-ar (17.6) and BELOW single-gpu AR (19.4).**
+The "should beat pp2-ar" prediction failed. Two structural causes (note
+14): the fully-serialized PP boundary in
+`forward_prefill_batch_multi_with_caps` (no compute overlap), plus the
+2nd boundary cross on the ~65%-firing rollback replay (v1's forced
+`tape_captured=false`). The fast-path that would kill the 2nd cross is
+the closed future-work above.
+
+**Levers investigated, with verdicts:**
+- **Opt 2 (layer-split rebalance, note 14):** free, but peaks at 56,8 =
+  14.2 (~+2% over 48,16) then regresses. Cannot close the gap.
+- **Opt 1 / B.2b (boundary pipelining):** gated on the B.2a overlap
+  microbench (note 15, `examples/pp_overlap_microbench.rs`). Result:
+  cross-device overlap is REAL but the pure-overlap ceiling at the
+  VRAM-feasible 48,16 split is only ~1.19× (1.69× at the infeasible
+  32,32 balance). gfx1031's 12 GiB forces the imbalance; serialized
+  decode wants gfx906-heavy while pipelining wants balance — they fight.
+  **Verdict: do not build B.2b on this pair.** See merry-giggling-conway.md.
+- **Opt 3 (no-replay rollback):** the architecturally-correct lever per
+  the reference engines; not yet built. Would kill the 2nd boundary
+  cross. Candidate next step IF MTP-under-PP decode perf is revisited.
+- **Single-gpu MTP itself is only 1.15× over AR** (devlog 2026-05-29):
+  τ=3.15 but ~37% τ→wall efficiency. Verify IS batched on gfx906
+  (traced via `prefill_batch_pbs_eligible`; MIN_BATCH=2, MQ4 in the
+  always-ok set). The loss is per-cycle host-sync in the K-step chain —
+  exactly what open PR #352 (device-resident MTP token chain + GPU-side
+  accept) targets. Better leverage than bespoke gfx906 MTP work.
+
+**Bottom line:** PpMtp's justification is the ~1.7× longer ctx ceiling
+(178k→302k, note 13) where single-gpu OOMs — NOT decode throughput.
+`pick_path` already prefers single-gpu where the model fits. Ship 56,8
+as the PpMtp default split. Treat decode-perf parity with single-gpu as
+out of reach on this VRAM-skewed pair without a fast interconnect (e.g.
+2× gfx906 + xGMI, or a balanced matched pair).
