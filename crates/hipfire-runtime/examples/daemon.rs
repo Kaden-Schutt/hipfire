@@ -607,6 +607,16 @@ struct LoadedModel {
     /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
     /// the special-token entry.
     deepseek4_eos_tok: u32,
+    /// MTP config — parsed from load-message params, read at generate time.
+    /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
+    /// but the namespace is intentionally not deepseek4-specific.
+    mtp_mode: String,
+    /// Draft tokens per spec-decode window (1-10, default 3).
+    mtp_k: usize,
+    /// Whether MTP head weights were found at load time. Set by the sibling-
+    /// file scan (e.g. `<stem>-mtp.*`) or bundled MTP detection. Used by
+    /// `mtp_mode = "auto"` to decide whether to enable spec-decode.
+    mtp_weights_present: bool,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the
@@ -868,6 +878,14 @@ fn main() {
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
+                // MTP speculative decode config. `mtp_mode` gates weight
+                // discovery at load time (off=skip, on=error-if-missing,
+                // auto=scan+log). `mtp_k` sets the draft window size.
+                let mtp_mode = msg.get("params").and_then(|p| p.get("mtp_mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("auto").to_string();
+                let mtp_k: usize = msg.get("params").and_then(|p| p.get("mtp_k"))
+                    .and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
                 // Accepted here; the generate loop will honor it in the
@@ -1010,7 +1028,7 @@ fn main() {
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
-                    Ok(m) => {
+                    Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
@@ -1029,6 +1047,18 @@ fn main() {
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
                         } else { (0, 0, 0) };
+
+                        // Apply MTP config from load-message params.
+                        m.mtp_mode = mtp_mode;
+                        m.mtp_k = mtp_k;
+                        // Detect whether MTP weights are present in the loaded
+                        // model (DeepSeek V4 only today). Used by mtp_mode=auto
+                        // to decide whether to enable spec-decode at generate time.
+                        m.mtp_weights_present = m.deepseek4_weights
+                            .as_ref()
+                            .and_then(|w| w.mtp_layer.as_ref())
+                            .is_some();
+
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
                         // Pins the GPU at high sclk/mclk so the first `generate`
@@ -2044,6 +2074,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2089,6 +2120,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2151,6 +2183,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
             deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2339,6 +2372,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
@@ -2372,6 +2406,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
             deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2465,6 +2500,9 @@ fn load_model_safetensors(
             deepseek4_state: None,
             deepseek4_pbs: None,
             deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2532,6 +2570,9 @@ fn load_model_safetensors(
         deepseek4_state: None,
         deepseek4_pbs: None,
         deepseek4_eos_tok: 0,
+        mtp_mode: "auto".to_string(),
+        mtp_k: 3,
+        mtp_weights_present: false,
         vision_config: None,
         vision_weights: None,
         tokenizer: Some(tokenizer),
@@ -2667,12 +2708,13 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
-        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
-        dots_ocr_config: None, dots_ocr_weights: None,
-        vision_config: None, vision_weights: None,
-        tokenizer: Some(tokenizer),
-        seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
-        conversation_tokens: Vec::new(),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
@@ -5299,11 +5341,29 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
     }
 
-    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE").ok().as_deref() == Some("1");
+    // Triaged config resolution for MTP speculative decode.
+    // Priority: 1. legacy env var → 2. generic env var → 3. stored config → default.
+    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or_else(|| {
+            match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present)
+                }
+            }
+        });
     let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(3);
+        .or_else(|| {
+            std::env::var("HIPFIRE_MTP_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(m.mtp_k);
 
     let t0 = Instant::now();
 
