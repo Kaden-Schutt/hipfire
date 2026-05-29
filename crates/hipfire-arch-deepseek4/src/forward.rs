@@ -6639,7 +6639,24 @@ fn ffn_batched(
         // MMQ-style preload (default ON for 4w; opt out via =0).
         let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
             .as_deref() != Ok("0");
-        if use_mmqload {
+        // Barrier-free nosync variant (opt in via =1).
+        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        if use_nosync {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6755,7 +6772,23 @@ fn ffn_batched(
           && im % 256 == 0;
         let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
             .as_deref() != Ok("0");
-        if use_mmqload_down {
+        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        if use_nosync_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,
