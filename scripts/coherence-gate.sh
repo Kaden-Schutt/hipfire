@@ -100,6 +100,12 @@ SHORT_TESTS=(
     # drift between bit-widths is comparable.
     "qwen3.5-9b.mq3|reason-mq3|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
     "qwen3.5-27b.mq3|cap-mq3-27b|What is the capital of France? Answer in one short sentence.|80"
+    # LFM2.5-8B-A1B (arch_id 11, hipfire-arch-lfm2moe): hybrid 18 short-conv + 6
+    # GQA-attn mixers, 2 dense SwiGLU + 22 top-4 MoE FFN layers. Exercises the
+    # NEW conv1d_gated_decode kernel + per-head QK-norm + full-dim RoPE +
+    # sigmoid-bias top-4 MoE GEMV path. Skipped if the model file is absent.
+    "lfm2.5-8b-a1b.mq4|lfm2-cap|What is the capital of France? Answer in one short sentence.|80"
+    "lfm2.5-8b-a1b.mq4|lfm2-reason|If a train travels 60 km in 45 minutes, what is its speed in km/h?|160"
     # MQ3-Lloyd coverage (PR #115 — research-gated format, --allow-mq3-lloyd
     # at quantize time only; no runtime gate). 4B + 9B exercise the K4 +
     # fp32-LDS-codebook gfx1100 kernel + tail-rotation logic. Runs anywhere
