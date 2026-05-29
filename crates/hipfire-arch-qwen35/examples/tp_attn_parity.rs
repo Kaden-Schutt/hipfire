@@ -198,10 +198,17 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
     // --slice (HIPFIRE_PARITY_SLICE=1): Stage 3b — per-rank sliced weights
     // (load_weights_tp), local-head config, local kv, no masks. Otherwise:
     // Stage 3 — replicated full weights + per-rank head masks.
-    let slice = std::env::var("HIPFIRE_PARITY_SLICE").is_ok();
+    // Stage 3e EP-MoE: an MoE model (num_experts>0) ALWAYS uses load_weights_tp
+    // (which shards routed experts) but the FULL config — EP v1 replicates
+    // attention, so heads/hidden are NOT sliced. KV replicated (attention full).
+    let is_moe = config.num_experts > 0;
+    let slice = std::env::var("HIPFIRE_PARITY_SLICE").is_ok() || is_moe;
 
-    let shard = ShardConfig::new(TP, false, config.num_experts, ExpertAssign::Stride).unwrap();
+    let shard = ShardConfig::new(TP, is_moe, config.num_experts, ExpertAssign::Stride).unwrap();
     shard.validate(config.n_heads, config.n_kv_heads).unwrap();
+    if is_moe {
+        shard.validate_moe(config.num_experts).unwrap();
+    }
 
     let mut gpus = Gpus::init_tp(TP, config.n_layers).expect("init_tp");
     for dev in gpus.devices.iter_mut() {
@@ -210,10 +217,11 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
         dev.active_stream = Some(st);
     }
 
-    // Per-rank config: LOCAL (sliced heads) in --slice mode, else the global
-    // config replicated. Drives scratch/kv sizing + forward_scratch_tp.
+    // Per-rank config: LOCAL (sliced heads) for dense --slice (3b/3c); FULL for
+    // dense-replicated (Stage 3) AND for MoE EP (attention replicated, experts
+    // sharded by the loader). Drives scratch/kv/dn sizing + forward_scratch_tp.
     let configs: Vec<qwen35::Qwen35Config> = (0..TP)
-        .map(|_| if slice { qwen35::local_attn_config(&config, &shard) } else { config.clone() })
+        .map(|_| if slice && !is_moe { qwen35::local_attn_config(&config, &shard) } else { config.clone() })
         .collect();
 
     // Per-rank weights/scratch/kv/dn. In --slice mode `weights[r]` is this

@@ -5043,7 +5043,7 @@ fn moe_ffn_decode(
         topk_weights: &topk_weights,
         down_expanded: &down_expanded,
     };
-    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false);
+    let result = moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, false);
 
     for t in [
         router_logits,
@@ -5114,7 +5114,7 @@ fn moe_ffn_decode_with_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, false)
 }
 
 /// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
@@ -5131,7 +5131,38 @@ fn moe_ffn_decode_with_scratch_prerotated(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true)
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, false)
+}
+
+/// Stage 3e EP-MoE wrappers — same as the two above but expose `skip_shared`
+/// (passed to `moe_ffn_decode_impl`). The EP forward calls these with
+/// `x_residual = s.o` (a pre-zeroed `[dim]` partial) and `skip_shared = rank != 0`
+/// so the routed-expert sum (+ rank-0's shared expert) lands in the partial,
+/// which the caller all-reduces and adds into the residual.
+fn moe_ffn_decode_with_scratch_ep(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    scratch: &Qwen35Scratch,
+    skip_shared: bool,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(scratch);
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, false, skip_shared)
+}
+
+fn moe_ffn_decode_with_scratch_prerotated_ep(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    x_norm: &GpuTensor,
+    x_residual: &GpuTensor,
+    config: &Qwen35Config,
+    scratch: &Qwen35Scratch,
+    skip_shared: bool,
+) -> HipResult<()> {
+    let refs = MoeScratchRef::from_scratch(scratch);
+    moe_ffn_decode_impl(gpu, ffn, x_norm, x_residual, config, &refs, true, skip_shared)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -5144,6 +5175,12 @@ fn moe_ffn_decode_impl(
     config: &Qwen35Config,
     s: &MoeScratchRef<'_>,
     x_rot_prerotated: bool,
+    // Stage 3e EP-MoE: when true, SKIP the shared-expert down (the part that
+    // writes into `x_residual`). The router + top-K still run. Used so only
+    // rank 0 contributes the (replicated, always-on) shared expert to the
+    // all-reduced routed partial — every other rank's partial is routed-only.
+    // Default callers pass `false` (full single-GPU behavior, unchanged).
+    skip_shared: bool,
 ) -> HipResult<()> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
@@ -5391,38 +5428,44 @@ fn moe_ffn_decode_impl(
     // the 4-way fused GEMV — sigmoid is applied internally by
     // `gemv_hfq4g256_residual_sigmoid_scaled_gpu`, eliminating the separate
     // 1-elem `sigmoid_f32` launch (~40 saved per forward on A3B).
-    if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
-        gpu.ensure_mq_signs()?;
-        let x_rot_alias = GpuTensor {
-            buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
-            shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
-            dtype: DType::F32,
-        };
-        // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
-        fused_silu_mul_rotate_mq_for(
-            gpu,
-            &ffn.shared_expert.down,
-            &shared_gate,
-            &shared_up,
-            &x_rot_alias,
-            smi,
-        )?;
-        gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
-            &ffn.shared_expert.down.buf,
-            &x_rot_alias,
-            x_residual,
-            scalar_buf,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-        )?;
-    } else {
-        // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
-        gpu.sigmoid_f32(scalar_buf)?;
-        // Non-MQ fallback: pre-2a-ii path.
-        let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
-        gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
-        weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
-        gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
+    //
+    // Stage 3e EP: `skip_shared` (ranks > 0) skips the shared-expert DOWN — the
+    // only part that writes into `x_residual`. Rank 0 keeps it so the always-on
+    // shared expert is counted exactly once in the all-reduced routed partial.
+    if !skip_shared {
+        if ffn.shared_expert.down.gpu_dtype == DType::MQ4G256 {
+            gpu.ensure_mq_signs()?;
+            let x_rot_alias = GpuTensor {
+                buf: unsafe { gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias() },
+                shape: vec![gpu.scratch.mq_x_rot.as_ref().unwrap().buf.size() / 4],
+                dtype: DType::F32,
+            };
+            // F2: AWQ-aware silu_mul+rotate for the shared-expert down input.
+            fused_silu_mul_rotate_mq_for(
+                gpu,
+                &ffn.shared_expert.down,
+                &shared_gate,
+                &shared_up,
+                &x_rot_alias,
+                smi,
+            )?;
+            gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu(
+                &ffn.shared_expert.down.buf,
+                &x_rot_alias,
+                x_residual,
+                scalar_buf,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+            )?;
+        } else {
+            // Non-MQ fallback path still needs the separate sigmoid + scaled-add.
+            gpu.sigmoid_f32(scalar_buf)?;
+            // Non-MQ fallback: pre-2a-ii path.
+            let shared_hid = slice_f32_view(ffn_hidden, 0, smi);
+            gpu.silu_mul_f32(&shared_gate, &shared_up, &shared_hid)?;
+            weight_gemv(gpu, &ffn.shared_expert.down, &shared_hid, ffn_out)?;
+            gpu.scaled_add_inplace_gpu_scalar_f32(x_residual, ffn_out, scalar_buf)?;
+        }
     }
 
     // ── 4. Top-K routed experts ──
@@ -13259,6 +13302,181 @@ pub fn run_fa_layer_body(
     run_fa_ffn_body(gpu, weights, config, layer_idx, s)
 }
 
+// ─── Stage 3e EP-MoE forward helpers (decode) ──────────────────────────────
+//
+// A3B layers are DeltaNetMoe / FullAttnMoe: identical attention to the dense
+// DeltaNet / FullAttn, MoE FFN instead of dense. EP v1 runs the attention
+// REPLICATED on every rank (full weights/config → s.x stays in sync) and shards
+// only the routed experts (loader frees non-owned + dummy-fills the ptr table).
+// These lean helpers mirror `run_dn_layer_body` / `run_fa_layer_body`'s mq4
+// attention into `s.x` (no FFN — the MoE FFN is `run_moe_ffn_ep`). Field names
+// match the dense structs, so this is the dense attention verbatim.
+
+/// Replicated DeltaNet attention for a `DeltaNetMoe` layer → `s.x` (mq4 path).
+#[allow(clippy::too_many_arguments)]
+fn run_dn_moe_attn(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    delta_layer_idx: usize,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::DeltaNetMoe(l) => l,
+        _ => unreachable!(),
+    };
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let x_rot = fused_rmsnorm_rotate_for_mq(
+        gpu, &layer.wqkv, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+    )?;
+    // Per-weight prerotated GEMV (robust to MIXED dtypes). The fused
+    // `fused_qkvza_hfq4g256` assumes wqkv/wz/w_beta/w_alpha are ALL HFQ4/MQ4 —
+    // but A3B's tiny w_alpha/w_beta (`[n_v_heads, dim]`) are NOT MQ4, so the
+    // fused kernel misreads them as HFQ4 and produces NaN. `weight_gemv_prerotated`
+    // dispatches per weight (x_rot feeds MQ weights pre-rotated; s.tmp the rest).
+    let _ = x_rot.is_some(); // x_rot validity asserted by weight_gemv_prerotated per weight
+    weight_gemv_prerotated(gpu, &layer.wqkv, &s.tmp, x_rot, &s.dn_qkv)?;
+    weight_gemv_prerotated(gpu, &layer.wz, &s.tmp, x_rot, &s.dn_z)?;
+    weight_gemv_prerotated(gpu, &layer.w_beta, &s.tmp, x_rot, &s.dn_beta)?;
+    weight_gemv_prerotated(gpu, &layer.w_alpha, &s.tmp, x_rot, &s.dn_alpha)?;
+    gpu.fused_sigmoid_alpha_gate_f32(&s.dn_beta, &s.dn_alpha, &layer.dt_bias, &layer.a_log, n_v_heads)?;
+    gpu.conv1d_silu_split_f32(
+        &s.dn_q_raw, &s.dn_k_raw, &s.dn_v, &s.dn_qkv, &layer.conv_weight,
+        &dn_state.conv_states[delta_layer_idx], k_dim, v_dim,
+    )?;
+    gpu.fused_qk_l2_norm_scale_f32(
+        &s.dn_q_raw, &s.dn_k_raw, config.linear_num_key_heads, hd,
+        1.0 / (hd as f32).sqrt(), config.norm_eps,
+    )?;
+    if config.linear_num_key_heads < n_v_heads {
+        let ratio = n_v_heads / config.linear_num_key_heads;
+        gpu.repeat_interleave_qk_f32(&s.dn_q_raw, &s.dn_k_raw, &s.dn_q, &s.dn_k, config.linear_num_key_heads, ratio, hd)?;
+    } else {
+        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+    }
+    match dn_state.quant {
+        StateQuant::FP32 => gpu.gated_delta_net_f32(
+            &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx], &s.dn_attn_out,
+            1, n_v_heads, config.linear_value_head_dim,
+        )?,
+        StateQuant::Q8 => gpu.gated_delta_net_q8(
+            &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx], &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+            1, n_v_heads, config.linear_value_head_dim,
+        )?,
+        StateQuant::Q4 => gpu.gated_delta_net_q4(
+            &s.dn_q, &s.dn_k, &s.dn_v, &s.dn_alpha, &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx], &dn_state.s_scales[delta_layer_idx], &s.dn_attn_out,
+            1, n_v_heads, config.linear_value_head_dim,
+        )?,
+    }
+    gpu.gated_norm_f32(&s.dn_attn_out, &s.dn_z, &layer.norm_weight, &s.dn_normed,
+        n_v_heads, config.linear_value_head_dim, config.norm_eps)?;
+    weight_gemv_residual(gpu, &layer.wo, &s.dn_normed, &s.x)?;
+    Ok(())
+}
+
+/// Replicated FullAttn attention for a `FullAttnMoe` layer → `s.x` (mq4 weights,
+/// q8 or f32 KV). Mirrors `run_fa_layer_body`'s q8 flash dispatch (the 3c gotcha).
+fn run_fa_moe_attn(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttnMoe(l) => l,
+        _ => unreachable!(),
+    };
+    let x_rot = fused_rmsnorm_rotate_for_mq(
+        gpu, &layer.wq, &s.x, &layer.attn_norm, &s.tmp, &s.x_rot, config.norm_eps,
+    )?;
+    // Per-weight prerotated GEMV (robust to mixed dtypes — mirror run_fa_layer_body's
+    // fallback rather than assuming the fused all-HFQ4 wq/wk/wv kernel).
+    weight_gemv_prerotated(gpu, &layer.wq, &s.tmp, x_rot, &s.fa_q_full)?;
+    weight_gemv_prerotated(gpu, &layer.wk, &s.tmp, x_rot, &s.fa_k)?;
+    weight_gemv_prerotated(gpu, &layer.wv, &s.tmp, x_rot, &s.fa_v)?;
+    gpu.deinterleave_f32(&s.fa_q_full, &s.fa_q, &s.fa_gate, config.n_heads, config.head_dim)?;
+    gpu.rmsnorm_batched(&s.fa_q, &layer.q_norm, &s.fa_q, config.n_heads, config.head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&s.fa_k, &layer.k_norm, &s.fa_k, config.n_kv_heads, config.head_dim, config.norm_eps)?;
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32(&s.fa_q, &s.fa_k, &s.pos_buf,
+        config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta)?;
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    if kv_cache.quant_q8 {
+        gpu.kv_cache_write_q8_0(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        gpu.kv_cache_write_q8_0(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, config.n_kv_heads, config.head_dim)?;
+        let use_flash = gpu.capture_mode || s.flash_mode == 2
+            || (s.flash_mode == 1 && pos + 1 >= 2048) || pos + 1 > 15000;
+        if use_flash {
+            gpu.attention_flash_q8_0(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap, &s.flash_partials)?;
+        } else {
+            gpu.attention_q8_0_kv(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+                &s.fa_attn_out, &s.pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim,
+                kv_cache.physical_cap)?;
+        }
+    } else {
+        gpu.kv_cache_write(&kv_cache.k_gpu[layer_idx], &s.fa_k, &s.pos_buf, kv_dim)?;
+        gpu.kv_cache_write(&kv_cache.v_gpu[layer_idx], &s.fa_v, &s.pos_buf, kv_dim)?;
+        gpu.attention_f32(&s.fa_q, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+            &s.fa_attn_out, &s.pos_buf, pos + 1, config.n_heads, config.n_kv_heads, config.head_dim,
+            kv_cache.physical_cap)?;
+    }
+    gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    weight_gemv_residual(gpu, &layer.wo, &s.fa_attn_out, &s.x)?;
+    Ok(())
+}
+
+/// Stage 3e EP-MoE FFN: zero `s.o`, then run the MoE FFN with `skip_shared`
+/// into `s.o` (the routed-expert partial). Each rank computes only its OWNED
+/// experts (non-owned dummy-filled to 0 by the loader); rank 0 also adds the
+/// shared expert. Caller all-reduces `s.o` and adds it to `s.x`. Mirrors the
+/// inline MoE-arm rmsnorm(+rotate) dispatch.
+fn run_moe_ffn_ep(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    s: &Qwen35Scratch,
+    skip_shared: bool,
+) -> HipResult<()> {
+    let (ffn, ffn_norm) = match &weights.layers[layer_idx] {
+        LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+        LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+        _ => unreachable!(),
+    };
+    // Zero the partial s.o (the MoE FFN ADDS into it). On the active stream.
+    {
+        let stream = gpu.active_stream.as_ref().ok_or_else(|| {
+            HipError::new(0, "run_moe_ffn_ep: rank has no active_stream")
+        })?;
+        gpu.hip.memset_async(&s.o.buf, 0, s.o.buf.size(), stream)?;
+    }
+    if ffn_all_mq4_for_moe(ffn) {
+        gpu.fused_rmsnorm_rotate_mq(
+            &s.x, ffn_norm, s.moe_x_rot.as_ref().expect("MoE scratch (moe_x_rot)"),
+            config.dim, config.norm_eps,
+        )?;
+        moe_ffn_decode_with_scratch_prerotated_ep(gpu, ffn, &s.x, &s.o, config, s, skip_shared)?;
+    } else {
+        gpu.rmsnorm_f32(&s.x, ffn_norm, &s.tmp, config.norm_eps)?;
+        moe_ffn_decode_with_scratch_ep(gpu, ffn, &s.tmp, &s.o, config, s, skip_shared)?;
+    }
+    Ok(())
+}
+
 /// FFN half of a FullAttn layer (RMSNorm → fused gate/up → SwiGLU-down
 /// residual into s.x). Split out of `run_fa_layer_body` so the TP path can
 /// insert an all-reduce between the `wo` projection and the FFN. Byte-
@@ -15483,6 +15701,22 @@ pub fn local_attn_config(config: &Qwen35Config, shard: &ShardConfig) -> Qwen35Co
     c
 }
 
+/// EP-MoE debug (HIPFIRE_EP_DEBUG=1): sync rank 0 + download `s.x`, report
+/// non-finite count + max|finite| for the first few layers. Localizes the first
+/// NaN-producing layer/phase. No-op unless the env is set.
+fn ep_dbg_nan(gpus: &mut Gpus, scratches: &[Qwen35Scratch], layer_idx: usize, tag: &str) -> HipResult<()> {
+    if layer_idx >= 6 || std::env::var_os("HIPFIRE_EP_DEBUG").is_none() {
+        return Ok(());
+    }
+    gpus.devices[0].bind_thread()?;
+    gpus.devices[0].hip.device_synchronize()?;
+    let xs = gpus.devices[0].download_f32(&scratches[0].x)?;
+    let nonfinite = xs.iter().filter(|v| !v.is_finite()).count();
+    let maxabs = xs.iter().filter(|v| v.is_finite()).fold(0f32, |m, &v| m.max(v.abs()));
+    eprintln!("[ep-dbg] L{layer_idx} {tag}: nonfinite={nonfinite}/{} maxabs={maxabs:.3e}", xs.len());
+    Ok(())
+}
+
 /// All-reduce each rank's partial contribution in `s.o` across ranks and add
 /// it into the residual `s.x`. Everything (the producing GEMV, the RCCL
 /// all-reduce, and this add) runs on each rank's `active_stream`, so stream
@@ -15619,6 +15853,8 @@ pub fn forward_scratch_tp(
         gpu.hip.memcpy_htod_async(&s.pos_buf, &pos_bytes, stream)?;
     }
 
+    ep_dbg_nan(gpus, scratches, 0, "EMBED (pre-loop)")?;
+
     // 2. Layer loop. delta_layer_idx / kv_layer_idx advance identically on
     //    every rank (replicated layer assignment).
     let mut delta_layer_idx = 0usize;
@@ -15626,6 +15862,30 @@ pub fn forward_scratch_tp(
     for layer_idx in 0..cfg0.n_layers {
         match cfg0.layer_types[layer_idx] {
             LayerType::LinearAttention => {
+                // Stage 3e EP-MoE: DeltaNetMoe layer. Replicated DeltaNet
+                // attention → s.x (identical per rank), then expert-sharded MoE
+                // FFN → s.o partial → all-reduce → add into s.x.
+                if matches!(&weights[0].layers[layer_idx], LayerWeights::DeltaNetMoe(_)) {
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_dn_moe_attn(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            delta_layer_idx, &mut dn_states[r], &scratches[r],
+                        )?;
+                    }
+                    ep_dbg_nan(gpus, scratches, layer_idx, "DNMoe post-attn")?;
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_moe_ffn_ep(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            &scratches[r], r != 0,
+                        )?;
+                    }
+                    tp_allreduce_add(gpus, scratches, tp, dim)?;
+                    ep_dbg_nan(gpus, scratches, layer_idx, "DNMoe post-ffn")?;
+                    delta_layer_idx += 1;
+                    continue;
+                }
                 if !sharded {
                     // Replicated (Stage 3): full DeltaNet on every rank, no all-reduce.
                     for r in 0..tp {
@@ -15666,6 +15926,29 @@ pub fn forward_scratch_tp(
                 delta_layer_idx += 1;
             }
             LayerType::FullAttention => {
+                // Stage 3e EP-MoE: FullAttnMoe layer. Replicated FullAttn
+                // attention → s.x, then expert-sharded MoE FFN → s.o → all-reduce.
+                if matches!(&weights[0].layers[layer_idx], LayerWeights::FullAttnMoe(_)) {
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_fa_moe_attn(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            pos, &mut kv_caches[r], &scratches[r],
+                        )?;
+                    }
+                    ep_dbg_nan(gpus, scratches, layer_idx, "FAMoe post-attn")?;
+                    for r in 0..tp {
+                        gpus.devices[r].bind_thread()?;
+                        run_moe_ffn_ep(
+                            &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                            &scratches[r], r != 0,
+                        )?;
+                    }
+                    tp_allreduce_add(gpus, scratches, tp, dim)?;
+                    ep_dbg_nan(gpus, scratches, layer_idx, "FAMoe post-ffn")?;
+                    kv_layer_idx += 1;
+                    continue;
+                }
                 // a. Sharded attention → partial wo into scratches[r].o (s.x untouched).
                 for r in 0..tp {
                     gpus.devices[r].bind_thread()?;
