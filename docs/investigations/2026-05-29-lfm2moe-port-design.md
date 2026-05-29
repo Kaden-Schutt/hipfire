@@ -184,10 +184,32 @@ Validated default stays Q8-proj (cosine ≥0.999, 241 tok/s); fast variant ships
 > matched full-256-tok logs. **Rule reaffirmed: no tok/s claim without a matched
 > full-length run you can point to; EOS-truncated runs are invalid for tok/s.**
 
-### Further levers (untried; cut launch COUNT, not just bytes — see NEXT-STEPS)
-compile-time-K3 conv (drop the runtime-K loop / a launch), conv-gate/proj fusion,
-MoE down+combine fusion, MQ6-proj middle-ground, prefill batching. Re-validate
-cosine + coherence after each.
+### Tested NEGATIVE: compile-time-K3 conv specialization — no-op (+0.25%, within noise)
+
+Hypothesis (and an earlier mis-framing in NEXT-STEPS): a compile-time-K=3
+`conv1d_gated_decode_k3_f32` (fully unrolled 3-tap conv + 2-slot roll, no
+runtime-K loop / `win[]` array) would speed the 18 conv layers. Implemented,
+dispatched on `kernel_size==3`, verified **bit-identical** (tiny-oracle min_cos
+0.99910, same as generic). Matched A/B (same binary, byte-identical prompt, 5×
+256-tok, fresh process, gfx1201): **242.1 vs 241.5 tok/s = +0.25%, within the
+±1% noise band — no measurable speedup.**
+
+Why: the conv kernel is a single tiny launch (1 thread/channel, ~5 float reads +
+3 FMAs) — it's launch/latency-bound, not ALU-bound, so unrolling 3 taps changes
+nothing at the wall-clock level. The framing of "K3 = launch-count reducer" was
+wrong: it's ONE already-single launch; unrolling is a body micro-op below the
+floor on a ~330-launch-per-token decode. **Reverted** (no benefit, adds a 2nd
+kernel + dispatch branch) — kept only as this negative-result log entry.
+
+### Genuinely-untried levers that DO cut launch count (higher effort)
+The real decode bound at batch=1 is launch overhead (~330 launches/tok). Levers
+that reduce COUNT, not bytes: rmsnorm→gemv fusion (needs Q8 fused kernels — the
+existing fused-rmsnorm-rotate is MQ-only), MoE down+combine fusion (an hfq4
+residual-scaled down like the MQ2-Lloyd path has, but none exists for hfq4 yet),
+HIP graph capture of the per-token kernel sequence (amortize launch cost), and
+batched prefill. The bandwidth lever (proj-MQ4, +7.2%) is the only cheap win
+found. All require cosine + coherence re-validation; MQ6-proj is an untried
+middle-ground on the bandwidth axis.
 
 ## Open items
 1. KLD/PPL of proj-MQ4 (and any future quant) vs the Q8 model on a calibration

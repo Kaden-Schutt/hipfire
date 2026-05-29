@@ -43,21 +43,33 @@ make default: KLD/PPL vs Q8 first. See design doc "PERF TUNING".
 (Measurement note: an early "+18%" was an EOS-truncation artifact and a "WASH"
 was a fabricated number — corrected; the +7.2% is from grep-able matched logs.)
 
-### 1. Perf: further tuning (task #9, ongoing) — baseline 241 tok/s (Q8) / 259 (proj-MQ4)
-Decode is bandwidth-bound but launch-overhead matters at batch=1. Levers that cut
-LAUNCH COUNT (not just bytes):
-- **Warm baseline first** (per CLAUDE.md perf rules): `HIPFIRE_DPM_WARMUP_SECS=10`,
-  fresh process, byte-identical prompt + md5, median of 3–5. Within-session band
-  on gfx11/12 is ±1–3%; treat ≥5% as real.
-- **rocprof attribution** on a decode run to find the hot kernels. Likely suspects:
-  the 18× conv layers (each = in_proj gemv + conv + out_proj gemv), the 22× MoE
-  blocks (router + 2 indexed GEMVs + combine), the 6× attention.
-- **conv kernel occupancy** — use the `gfx-kernel-metadata` skill on
-  `conv1d_gated_decode.hsaco` (VGPR/SGPR/LDS/spill). It's channel-parallel, 1
-  thread/channel, 256 block — probably fine, but verify zero spills and that the
-  `win[KMAX=8]` local array doesn't force VGPR pressure (K=3 only needs win[3]).
-  Consider a compile-time-K specialization (`conv1d_gated_decode_k3`) to drop the
-  bounds loop, like qwen35's compile-time-K4 conv1d_decode.
+### TESTED NEGATIVE — compile-time-K3 conv: no-op (+0.25%, within noise), reverted
+Implemented `conv1d_gated_decode_k3_f32` (unrolled 3-tap, no runtime-K loop /
+win[] array), dispatched on K==3, verified bit-identical (tiny cosine 0.99910).
+Matched A/B (5× 256-tok, fresh process): **242.1 vs 241.5 tok/s = +0.25%, within
+noise.** The conv kernel is launch/latency-bound (one tiny single launch, ~3
+FMAs), not ALU-bound — unrolling buys nothing. "K3 = launch-count reducer" was a
+mis-framing: it's one already-single launch. Reverted (complexity for no gain).
+See design doc "Tested NEGATIVE" for detail. **Do not re-attempt.**
+
+### 1. Perf: further tuning (task #9) — baseline 241 tok/s (Q8) / 259 (proj-MQ4 opt-in)
+Real decode bound at batch=1 is launch OVERHEAD (~330 launches/tok), not the conv
+body. Levers that genuinely cut launch COUNT (all higher-effort, all need cosine
++ coherence re-validation):
+- **HIP graph capture** of the per-token kernel sequence — amortize per-launch
+  cost across the ~330 launches; likely the biggest single decode lever.
+- **rmsnorm→gemv fusion** for the Q8 path (the existing fused-rmsnorm-rotate is
+  MQ-only; a Q8 fused variant would remove 1 launch × 24 layers).
+- **MoE down+combine fusion** — an hfq4 residual-scaled-down kernel (the
+  MQ2-Lloyd path already fuses these; no hfq4 equivalent yet) removes 1 launch ×
+  22 layers.
+- **Bandwidth axis**: proj-MQ4 (+7.2%, shipped opt-in); MQ6-proj untried
+  middle-ground (less quality loss, ~half the saving).
+- **Prefill batching** (large win for long prompts; needs batched conv1d scan +
+  batched attn/MoE — substantial).
+Always: warm first (`HIPFIRE_DPM_WARMUP_SECS=10`, fresh process, byte-identical
+prompt, median of ≥3 MATCHED full-length runs — NOT EOS-truncated). Treat ≥5% as
+real; re-validate cosine + coherence after every gain.
 - **Fuse the conv gates into in_proj/out_proj** if the 3 conv launches/layer show
   up hot — e.g. a fused in_proj+gate or out_proj-residual (minimax's MoE uses
   `weight_gemv_residual` fusion; conv out_proj already does).
