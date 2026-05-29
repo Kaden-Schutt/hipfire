@@ -274,6 +274,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-deepseek4",
  "hipfire-arch-dots-ocr",
+ "hipfire-arch-lfm2moe",
  "hipfire-arch-llama",
  "hipfire-arch-minimax",
  "hipfire-arch-qwen2",
