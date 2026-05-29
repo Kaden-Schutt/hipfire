@@ -193,7 +193,10 @@ fn decode_step_inner(
         )
         .map_err(|e| format!("minimax L{l}: silu_mul_rotate: {e:?}"))?;
 
-        match edt {
+        // Down dispatches on the DOWN proj's own dtype (may differ from gate_up:
+        // e.g. gate_up=mq2-lloyd + down=mq4, since down carries ~24x the energy).
+        let ddt = layer.experts[0].down.gpu_dtype;
+        match ddt {
             DType::MQ4G256 | DType::HFQ4G256 => {
                 gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
                     &layer.expert_down_ptrs, &state.topk_indices, &state.rot_batch,

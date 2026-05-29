@@ -5463,12 +5463,17 @@ fn main() {
                         let alpha = AWQ_ALPHA.get().copied().unwrap_or(0.55);
                         let entry = mm_awq_cache.entry(layer_n)
                             .or_insert_with(|| minimax_layer_awq_scales(gg, layer_n, alpha));
-                        if let Some((s_gu, s_dn)) = entry.as_ref() {
-                            let scale = if name.ends_with(".w2.weight") { s_dn } else { s_gu };
-                            if scale.len() == k {
-                                awq_pre_scale_weights(&mut f32_data, m, k, scale);
-                            } else {
-                                eprintln!("  minimax AWQ L{layer_n}: scale len {} != k {} ({name}); skipped", scale.len(), k);
+                        if let Some((s_gu, _s_dn)) = entry.as_ref() {
+                            // gate/up-AWQ ONLY: down-AWQ (shared s_down) is harmful for MoE
+                            // (per-expert down-input saliency differs), AND the loader divides
+                            // only the gate_up input — so pre-scaling w2 would leave an
+                            // uncancelled scale. Leave w2 unscaled; emit only the gate_up sidecar.
+                            if !name.ends_with(".w2.weight") {
+                                if s_gu.len() == k {
+                                    awq_pre_scale_weights(&mut f32_data, m, k, s_gu);
+                                } else {
+                                    eprintln!("  minimax AWQ L{layer_n}: s_gu len {} != k {} ({name}); skipped", s_gu.len(), k);
+                                }
                             }
                             if mm_awq_emitted.insert(layer_n) {
                                 let p = name.split(".block_sparse_moe.").next().unwrap();
@@ -5477,12 +5482,7 @@ fn main() {
                                     quant_type: QuantType::F16, shape: vec![s_gu.len() as u32],
                                     group_size: 0, data: awq_scales_to_f16_bytes(s_gu), spilled_len: 0,
                                 });
-                                hfq_tensors.push(HfqTensor {
-                                    name: format!("{p}.block_sparse_moe.awq_scale_down.weight"),
-                                    quant_type: QuantType::F16, shape: vec![s_dn.len() as u32],
-                                    group_size: 0, data: awq_scales_to_f16_bytes(s_dn), spilled_len: 0,
-                                });
-                                eprintln!("  AWQ-MM: emitted shared expert scales for L{layer_n}");
+                                eprintln!("  AWQ-MM: emitted gate_up scale for L{layer_n}");
                             }
                         }
                     }
@@ -5503,7 +5503,22 @@ fn main() {
                 let mm_layer = minimax_layer_index(name);
                 let promote_mq6 = mm_layer.map_or(false, |l| minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ6", l));
                 let promote_mq4 = mm_layer.map_or(false, |l| minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ4", l));
-                let (q, qt, label) = if promote_mq6 {
+                // Per-projection promotion: the down proj (w2) sees ~24x the
+                // activation magnitude of gate/up (the SwiGLU intermediate), so its
+                // 2-bit error dominates the block output. HIPFIRE_MINIMAX_DOWN_FORMAT=
+                // {mq6,mq4,mq3-lloyd} promotes ONLY w2, keeping w1/w3 at the base.
+                // The forward dispatches down on its own dtype, so they can differ.
+                let down_fmt = if name.ends_with(".w2.weight") {
+                    std::env::var("HIPFIRE_MINIMAX_DOWN_FORMAT").ok()
+                } else { None };
+                let (q, qt, label) = if let Some(df) = down_fmt.as_deref() {
+                    match df {
+                        "mq6" => (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-DN"),
+                        "mq4" => (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4-DN"),
+                        "mq3-lloyd" => (quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2), QuantType::MQ3G256Lloyd, "MQ3L-DN"),
+                        _ => (quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2), QuantType::MQ2G256Lloyd, "MQ2L-DN"),
+                    }
+                } else if promote_mq6 {
                     (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-PROMO")
                 } else if promote_mq4 {
                     (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4-PROMO")
