@@ -179,6 +179,11 @@ fn decode_step_inner(
                     &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
                     &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top)
                 .map_err(|e| format!("minimax L{l}: gate_up mq2l: {e:?}"))?,
+            DType::MQ3G256Lloyd => gpu
+                .deepseek4_gemv_mq3g256_lloyd_moe_gate_up_indexed(
+                    &layer.expert_gate_up_ptrs, &state.topk_indices, &state.ffn_x_rot,
+                    &state.gate_batch, &state.up_batch, 2 * inter, hidden, k_top)
+                .map_err(|e| format!("minimax L{l}: gate_up mq3l: {e:?}"))?,
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }
 
@@ -213,6 +218,13 @@ fn decode_step_inner(
                     &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights,
                     &state.rot_batch, &state.h, hidden, inter, k_top)
                     .map_err(|e| format!("minimax L{l}: down mq2l: {e:?}"))?;
+            }
+            DType::MQ3G256Lloyd => {
+                // Fused down + weighted residual accumulate (no separate combine).
+                gpu.deepseek4_gemv_mq3g256_lloyd_moe_down_residual_scaled_indexed(
+                    &layer.expert_down_ptrs, &state.topk_indices, &state.topk_weights,
+                    &state.rot_batch, &state.h, hidden, inter, k_top)
+                    .map_err(|e| format!("minimax L{l}: down mq3l: {e:?}"))?;
             }
             other => return Err(format!("minimax L{l}: unsupported expert dtype {other:?}")),
         }

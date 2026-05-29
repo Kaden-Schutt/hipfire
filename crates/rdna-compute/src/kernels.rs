@@ -2611,6 +2611,16 @@ pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
 pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
 
+/// MQ3-Lloyd MoE indexed family: routed-experts gate_up + down with
+/// device-side topk routing + per-expert pointer table. Mirrors the
+/// MQ2-Lloyd MoE indexed kernels (3-bit + 8-entry codebook, 112 B/group).
+/// X must be FWHT-pre-rotated by the caller.
+pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip");
+
 /// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
 /// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
 /// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that
