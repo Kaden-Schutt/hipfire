@@ -319,6 +319,121 @@ fn run_tp(path: &str, prompt_tokens: &[u32], forced: &[u32]) -> (Vec<u32>, Vec<V
     (tokens, all_logits)
 }
 
+// ── Stage 3d: batched-TP PREFILL parity + timing ──────────────────────────
+//
+// `run_prefill(path, tokens, tp)`: batched prefill via `forward_prefill_chunk_tp`.
+//   tp=1 → fair single-GPU baseline (Full-phase bodies, NO all-reduce).
+//   tp≥2 → sharded (sliced weights + local config + 2 all-reduces/layer).
+// Same kernels both ways — tp just slices — so it's an apples-to-apples bench.
+// Returns rank-0 LAST-token logits + prints prefill tok/s. Warms (kernel cache
+// + DPM) with a throwaway prefill, then resets dn so the measured run starts at
+// state=0 / pos=0 (KV slots are overwritten by the measured prefill).
+fn run_prefill(path: &str, prompt_tokens: &[u32], tp: usize) -> Vec<f32> {
+    let mut hfq = HfqFile::open(Path::new(path)).expect("open hfq");
+    let config = qwen35::config_from_hfq(&hfq).expect("config");
+    let dim = config.dim;
+    let n = prompt_tokens.len();
+    // Floor max_batch at 16: a batched GEMM can over-read/write to its tile
+    // boundary (BLOCK_M up to 16); a 1-row pbs HIP-700s. The chunk still
+    // processes only `n` rows — extra capacity is unused scratch.
+    let pb_batch = n.max(16);
+
+    let shard = ShardConfig::new(tp, false, config.num_experts, ExpertAssign::Stride).unwrap();
+    shard.validate(config.n_heads, config.n_kv_heads).unwrap();
+
+    let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
+    for dev in gpus.devices.iter_mut() {
+        dev.bind_thread().expect("bind");
+        let st = dev.hip.stream_create().expect("stream");
+        dev.active_stream = Some(st);
+    }
+
+    // tp=1 → FULL weights + FULL config on 1 GPU (the batched single-GPU
+    // baseline). tp≥2 → per-rank SLICED weights + local config (the sharded
+    // path). Both run forward_prefill_chunk_tp's batched bodies; tp=1 takes the
+    // Full phase (no all-reduce). Using the production full loader at tp=1
+    // avoids exercising load_weights_tp's degenerate tp=1 slice ranges.
+    let configs: Vec<qwen35::Qwen35Config> =
+        (0..tp).map(|_| if tp == 1 { config.clone() } else { qwen35::local_attn_config(&config, &shard) }).collect();
+
+    let mut weights = Vec::with_capacity(tp);
+    let mut scratches = Vec::with_capacity(tp);
+    let mut kvs = Vec::with_capacity(tp);
+    let mut dns = Vec::with_capacity(tp);
+    let mut pbs_vec = Vec::with_capacity(tp);
+    let mut partials = Vec::with_capacity(tp);
+    for r in 0..tp {
+        gpus.devices[r].bind_thread().unwrap();
+        weights.push(if tp == 1 {
+            qwen35::load_weights(&mut hfq, &config, &mut gpus.devices[r]).unwrap()
+        } else {
+            qwen35::load_weights_tp(&mut hfq, &config, &mut gpus.devices[r], &shard, r).unwrap()
+        });
+        scratches.push(Qwen35Scratch::new(&mut gpus.devices[r], &configs[r], 128).unwrap());
+        kvs.push(make_kv(&mut gpus.devices[r], &configs[r]));
+        // Prefill is ALWAYS q8 DeltaNet state: the batched chunk kernel
+        // `gated_delta_net_q8_batch_seq` reads the q8 layout (s_q8 int8 +
+        // s_scales) and there is no fp32 batched variant (fp32 state OOB-reads
+        // s_scales — faults at full head count). Production prefill is q8 state
+        // too (DeltaNetState defaults to Q8). The HIPFIRE_PARITY_STATE knob
+        // only applies to the single-token DECODE parity path.
+        dns.push(DeltaNetState::new_with_quant(
+            &mut gpus.devices[r], &configs[r], StateQuant::Q8,
+        ).unwrap());
+        pbs_vec.push(qwen35::PrefillBatchScratch::new(&mut gpus.devices[r], &configs[r], pb_batch).unwrap());
+        // partial sized at pb_batch (not n): the wo/w_down GEMM can write to a
+        // tile boundary past row n; the all-reduce/add only touch the live n·dim.
+        partials.push(gpus.devices[r].zeros(&[pb_batch * dim], rdna_compute::DType::F32).unwrap());
+    }
+
+    // Warm, then reset dn for a clean measured run (state=0, pos=0).
+    qwen35::forward_prefill_chunk_tp(
+        &mut gpus, &shard, &weights, &configs, prompt_tokens, 0,
+        &mut kvs, &mut dns, &pbs_vec, &partials, &scratches,
+    ).expect("warm prefill_tp");
+    gpus.devices[0].bind_thread().unwrap();
+    gpus.devices[0].hip.device_synchronize().unwrap();
+    for r in 0..tp {
+        gpus.devices[r].bind_thread().unwrap();
+        dns[r].reset(&mut gpus.devices[r]);
+    }
+
+    let t = std::time::Instant::now();
+    qwen35::forward_prefill_chunk_tp(
+        &mut gpus, &shard, &weights, &configs, prompt_tokens, 0,
+        &mut kvs, &mut dns, &pbs_vec, &partials, &scratches,
+    ).expect("prefill_tp");
+    // forward_prefill_chunk_tp device-synchronizes rank 0 before returning.
+    let secs = t.elapsed().as_secs_f64();
+    eprintln!(
+        "[timing] TP={} ({}) prefill: {:.1} tok/s ({} tok / {:.4}s)",
+        tp, if tp == 1 { "baseline, 1 GPU" } else { "3d sharded" },
+        n as f64 / secs, n, secs,
+    );
+
+    gpus.devices[0].bind_thread().unwrap();
+    let logits = gpus.devices[0].download_f32(&scratches[0].logits).expect("download logits");
+
+    // Teardown: free every per-rank allocation + drain the pool so this call
+    // leaves VRAM clean. Otherwise the leftover (~15 GB of 27B weights) makes
+    // the NEXT run_prefill's init_tp preflight_vram trip on the device imbalance
+    // and eventually OOM as allocations accumulate across the 4 bench calls.
+    for r in (0..tp).rev() {
+        gpus.devices[r].bind_thread().unwrap();
+        if let Some(st) = gpus.devices[r].active_stream.take() {
+            let _ = gpus.devices[r].hip.stream_destroy(st);
+        }
+        if let Some(p) = partials.pop() { let _ = gpus.devices[r].free_tensor(p); }
+        if let Some(pb) = pbs_vec.pop() { pb.free_gpu(&mut gpus.devices[r]); }
+        if let Some(s) = scratches.pop() { s.free_gpu(&mut gpus.devices[r]); }
+        if let Some(d) = dns.pop() { d.free_gpu(&mut gpus.devices[r]); }
+        if let Some(k) = kvs.pop() { k.free_gpu(&mut gpus.devices[r]); }
+        if let Some(w) = weights.pop() { w.free_gpu(&mut gpus.devices[r]); }
+        gpus.devices[r].drain_pool();
+    }
+    logits
+}
+
 fn main() {
     // Deterministic reduction (matches pp_parity / coherence gates).
     std::env::set_var("HIPFIRE_DETERMINISTIC", "1");
@@ -388,6 +503,88 @@ fn main() {
         println!("REF(null-stream) vs REF(active-stream): worst rel Δ = {worst:.3e} (step {worst_step}), argmax mismatches = {mism}/{}", rt_ns.len());
         println!("  null-stream first 12: {:?}", &rt_ns[..12.min(rt_ns.len())]);
         println!("  active-stream first 12: {:?}", &rt_st[..12.min(rt_st.len())]);
+        return;
+    }
+
+    // Stage 3d: batched-TP PREFILL parity + timing. HIPFIRE_PARITY_PREFILL=1
+    // runs single-chunk prefill on 1 GPU (forward_prefill_batch) vs TP=2
+    // (forward_prefill_chunk_tp). HIPFIRE_PARITY_PREFILL_LEN=L tiles/truncates
+    // the prompt to L tokens for a meatier perf datapoint (token VALUES don't
+    // affect compute cost or parity — both paths see the identical sequence).
+    //
+    // TWO-TIER gate (the batched chunk kernel `gated_delta_net_q8_batch_seq`
+    // is q8-ONLY — no fp32 batched variant — so it quantizes the recurrent
+    // state internally over the N-step chunk regardless of the STORED state
+    // dtype; this amplifies TP's unavoidable ~1e-7 all-reduce reassociation to
+    // ~1e-3 at N≥2, argmax-stable — the 3c "q8 state amplifies TP" finding in
+    // the prefill chunk):
+    //   • N=1 sub-check exercises the FULL sharding pipeline (sliced weights,
+    //     all-reduces, FA+DeltaNet) with no chunk compounding → the
+    //     fp32-equivalent sharding-MATH gate, must be clean (< REL_TOL ~1e-6).
+    //   • N=L run: assert argmax match (output correctness); rel is q8-chunk
+    //     amplification (informational, grows with L, NOT a sharding bug).
+    if std::env::var("HIPFIRE_PARITY_PREFILL").is_ok() {
+        // The bench reloads the model per (tp, length) call; tp=1 loads full
+        // weights on 1 GPU while tp=2 loads slices on 2 — a deliberately uneven
+        // VRAM profile across the bench's fresh Gpus instances. Relax init_tp's
+        // uniform-VRAM preflight (it guards real multi-GPU serving, not a bench).
+        if std::env::var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB").is_err() {
+            std::env::set_var("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB", "64");
+        }
+        // Closure: run baseline (tp=1) + TP (tp=2) prefill at the given tokens.
+        let parity_at = |toks: &[u32]| -> (f32, u32, u32) {
+            let r = run_prefill(&path, toks, 1);
+            let t = run_prefill(&path, toks, 2);
+            let rmax = r.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+            let mut mab = 0.0f32;
+            for (x, y) in r.iter().zip(t.iter()) { mab = mab.max((x - y).abs()); }
+            (mab / (rmax + 1e-12), argmax(&r), argmax(&t))
+        };
+
+        let pt: Vec<u32> = match std::env::var("HIPFIRE_PARITY_PREFILL_LEN").ok().and_then(|s| s.parse::<usize>().ok()) {
+            Some(l) if l > 0 => (0..l).map(|i| prompt_tokens[i % prompt_tokens.len()]).collect(),
+            _ => prompt_tokens.clone(),
+        };
+        println!("\n=== Stage 3d: batched-TP PREFILL parity + timing ===");
+        println!(
+            "prefill_len={} (one chunk), KV={}, DeltaNet-state=q8 (forced — batched chunk kernel requires q8 state)",
+            pt.len(), kv_mode(),
+        );
+
+        // ── Tier 1: N=1 sharding-math gate (must be clean) ──
+        println!("\n── N=1 sharding-math gate (full sliced pipeline, no chunk compounding) ──");
+        let (rel1, am1r, am1t) = parity_at(&[pt[0]]);
+        println!("N=1 last-token rel Δ = {rel1:.3e} (tol {REL_TOL:.0e}); argmax ref={am1r} tp={am1t} {}",
+            if am1r == am1t { "✓" } else { "✗" });
+        assert!(rel1 < REL_TOL, "N=1 sharding-math parity FAILED: {rel1:.3e} ≥ {REL_TOL:.0e} — the SLICING/all-reduce math is wrong");
+        assert_eq!(am1r, am1t, "N=1 argmax parity FAILED");
+
+        // ── Tier 2: N=L perf-length run (argmax-strict; rel = q8-chunk amplification) ──
+        println!("\n── N={} prefill (perf + argmax; rel reflects q8 chunk-recurrence) ──", pt.len());
+        println!("\n── TP=1 reference prefill (forward_prefill_batch) ──");
+        let ref_logits = run_prefill(&path, &pt, 1);
+        println!("\n── TP=2 sharded prefill (forward_prefill_chunk_tp) ──");
+        let tp_logits = run_prefill(&path, &pt, 2);
+        let ref_max = ref_logits.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        let mut max_abs = 0.0f32;
+        for (x, y) in ref_logits.iter().zip(tp_logits.iter()) {
+            max_abs = max_abs.max((x - y).abs());
+        }
+        let rel = max_abs / (ref_max + 1e-12);
+        let am_ref = argmax(&ref_logits);
+        let am_tp = argmax(&tp_logits);
+        // Gross-error tripwire: q8-chunk amplification is ~1e-3; anything past
+        // 1e-1 means a real bug, not quantization.
+        const Q8_CHUNK_TRIP: f32 = 1e-1;
+        println!("\n── prefill parity (last-token logits) ──");
+        println!("last-token max rel logit Δ = {rel:.3e}  (q8-chunk amplification; N=1 math gate was {rel1:.3e})");
+        println!(
+            "last-token argmax: ref={am_ref} tp={am_tp}  {}",
+            if am_ref == am_tp { "✓ match" } else { "✗ MISMATCH" },
+        );
+        assert!(rel < Q8_CHUNK_TRIP, "prefill rel {rel:.3e} ≥ {Q8_CHUNK_TRIP:.0e} — too large for q8-chunk amplification, likely a real bug");
+        assert_eq!(am_ref, am_tp, "prefill argmax parity FAILED");
+        println!("\ntp_attn_parity (prefill): PASS  (N=1 math gate {rel1:.3e} < {REL_TOL:.0e}; N={} argmax match, rel {rel:.3e})", pt.len());
         return;
     }
 

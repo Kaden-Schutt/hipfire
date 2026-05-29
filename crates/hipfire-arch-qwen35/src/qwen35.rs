@@ -13297,6 +13297,222 @@ fn run_fa_ffn_body_sharded(
     Ok(())
 }
 
+/// Batched FullAttn layer body for TP PREFILL (Stage 3d) — mq4 weights + q8 KV.
+/// Focused subset of `forward_prefill_chunk`'s FA arm (no tree-verify / triattn
+/// tap / asym-KV / hidden-extract). With sliced weights + a local config the
+/// batched kernels emit LOCAL outputs for free; phases mirror the single-token
+/// `run_fa_layer_body`:
+/// - `Full`: wo + FFN residual into `pbs.x_batch` (standalone validation vs
+///   `forward_prefill_batch`).
+/// - `TpAttn`: attention (local heads), PARTIAL wo into `partial` `[N×dim]`
+///   (NON-residual), return; caller all-reduces `partial` + adds into x_batch.
+/// - `TpFfnShard`: FFN gate/up, PARTIAL w_down into `partial`.
+/// `max_ctx_len` = max(pos+1) over the batch (short-prefill q8 attention path).
+#[allow(clippy::too_many_arguments)]
+fn run_fa_layer_batched(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    kv_cache: &mut llama::KvCache,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    max_ctx_len: usize,
+    partial: &GpuTensor,
+    phase: FaPhase,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::FullAttn(l) => l,
+        _ => unreachable!(),
+    };
+    let dim = config.dim;
+
+    // FFN-only phases: x_batch already holds the all-reduced attention residual.
+    if matches!(phase, FaPhase::TpFfn | FaPhase::TpFfnShard) {
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
+        )?;
+        gpu.gemm_gate_up_hfq4g256(
+            &layer.w_gate.buf, &layer.w_up.buf, &pbs.x_rot_batch,
+            &pbs.gate_ffn_batch, &pbs.up_batch, layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+        )?;
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu, &layer.w_down, &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, config.hidden_dim, n,
+        )?;
+        if let FaPhase::TpFfnShard = phase {
+            gpu.gemm_hfq4g256(&layer.w_down.buf, &pbs.ffn_hidden_batch, partial, layer.w_down.m, layer.w_down.k, n)?;
+        } else {
+            gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        }
+        return Ok(());
+    }
+
+    // Attention preamble.
+    fused_rmsnorm_rotate_mq_batched_for(
+        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wq, &pbs.x_rot_batch, dim, config.norm_eps, n,
+    )?;
+    gpu.gemm_qkv_hfq4g256(
+        &layer.wq.buf, &layer.wk.buf, &layer.wv.buf, &pbs.x_rot_batch,
+        &pbs.fa_q_full_batch, &pbs.fa_k_batch, &pbs.fa_v_batch,
+        layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k, n,
+    )?;
+    gpu.deinterleave_f32_batched(
+        &pbs.fa_q_full_batch, &pbs.fa_q_batch, &pbs.fa_gate_batch, config.n_heads, config.head_dim, n,
+    )?;
+    gpu.rmsnorm_batched(&pbs.fa_q_batch, &layer.q_norm, &pbs.fa_q_batch, n * config.n_heads, config.head_dim, config.norm_eps)?;
+    gpu.rmsnorm_batched(&pbs.fa_k_batch, &layer.k_norm, &pbs.fa_k_batch, n * config.n_kv_heads, config.head_dim, config.norm_eps)?;
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32_batched(
+        &pbs.fa_q_batch, &pbs.fa_k_batch, &pbs.positions,
+        config.n_heads, config.n_kv_heads, config.head_dim, n_rot, config.rope_theta, n,
+    )?;
+    gpu.kv_cache_write_q8_0_batched(&kv_cache.k_gpu[layer_idx], &pbs.fa_k_batch, &pbs.positions, config.n_kv_heads, config.head_dim, n)?;
+    gpu.kv_cache_write_q8_0_batched(&kv_cache.v_gpu[layer_idx], &pbs.fa_v_batch, &pbs.positions, config.n_kv_heads, config.head_dim, n)?;
+    gpu.attention_q8_0_kv_batched_masked(
+        &pbs.fa_q_batch, &kv_cache.k_gpu[layer_idx], &kv_cache.v_gpu[layer_idx],
+        &pbs.fa_attn_out_batch, &pbs.positions, config.n_heads, config.n_kv_heads, config.head_dim,
+        kv_cache.physical_cap, max_ctx_len, n, None, 0, 0,
+    )?;
+    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+
+    // wo: rotate (MQ4, AWQ-aware) then gemm. TpAttn → partial; else residual.
+    rotate_x_mq_batched_for(gpu, &layer.wo, &pbs.fa_attn_out_batch, &pbs.fa_attn_out_rot_batch, layer.wo.k, n)?;
+    if let FaPhase::TpAttn { .. } = phase {
+        gpu.gemm_hfq4g256(&layer.wo.buf, &pbs.fa_attn_out_rot_batch, partial, layer.wo.m, layer.wo.k, n)?;
+        return Ok(());
+    }
+    gpu.gemm_hfq4g256_residual(&layer.wo.buf, &pbs.fa_attn_out_rot_batch, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+
+    // Full: FFN residual into x_batch.
+    fused_rmsnorm_rotate_mq_batched_for(gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n)?;
+    gpu.gemm_gate_up_hfq4g256(
+        &layer.w_gate.buf, &layer.w_up.buf, &pbs.x_rot_batch,
+        &pbs.gate_ffn_batch, &pbs.up_batch, layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+    )?;
+    fused_silu_mul_rotate_mq_batched_for(gpu, &layer.w_down, &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, config.hidden_dim, n)?;
+    gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+    Ok(())
+}
+
+/// Batched DeltaNet (LinearAttention) layer body for the TP prefill path
+/// (Stage 3d). Lean mq4-only mirror of `run_dn_layer_body` (single-token) and
+/// `run_fa_layer_batched` (batched FA). Every kernel covers all N tokens; the
+/// gated-delta-net + recurrent S-matrix run on the LOCAL value heads (local
+/// config + sliced weights + per-rank `DeltaNetState`). No DFlash tape / tree
+/// variants (prefill-TP parity bench has neither). Phases:
+/// - `Full`: attention + wo residual into x_batch + FFN residual (verify vs prod).
+/// - `Attn`: attention through PARTIAL wo into `partial` (non-residual), return.
+/// - `Ffn`: replicated FFN, residual into x_batch.
+/// - `FfnShard`: sharded FFN, PARTIAL w_down into `partial` (non-residual), return.
+#[allow(clippy::too_many_arguments)]
+fn run_dn_layer_batched(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    delta_layer_idx: usize,
+    dn_state: &mut DeltaNetState,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    partial: &GpuTensor,
+    phase: DnPhase,
+) -> HipResult<()> {
+    let layer = match &weights.layers[layer_idx] {
+        LayerWeights::DeltaNet(l) => l,
+        _ => unreachable!(),
+    };
+    let dim = config.dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let _ = v_dim;
+
+    // FFN-only phases: x_batch already holds the all-reduced attention residual.
+    if matches!(phase, DnPhase::Ffn | DnPhase::FfnShard) {
+        fused_rmsnorm_rotate_mq_batched_for(
+            gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n,
+        )?;
+        gpu.gemm_gate_up_hfq4g256(
+            &layer.w_gate.buf, &layer.w_up.buf, &pbs.x_rot_batch,
+            &pbs.gate_ffn_batch, &pbs.up_batch, layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+        )?;
+        fused_silu_mul_rotate_mq_batched_for(
+            gpu, &layer.w_down, &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, config.hidden_dim, n,
+        )?;
+        if let DnPhase::FfnShard = phase {
+            gpu.gemm_hfq4g256(&layer.w_down.buf, &pbs.ffn_hidden_batch, partial, layer.w_down.m, layer.w_down.k, n)?;
+        } else {
+            gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+        }
+        return Ok(());
+    }
+
+    // Attention preamble: rmsnorm (+ FWHT rotate, AWQ-aware for wqkv) → 4-way proj.
+    fused_rmsnorm_rotate_mq_batched_for(
+        gpu, &pbs.x_batch, &layer.attn_norm, &layer.wqkv, &pbs.x_rot_batch, dim, config.norm_eps, n,
+    )?;
+    gpu.gemm_qkvza_hfq4g256(
+        &layer.wqkv.buf, &layer.wz.buf, &layer.w_beta.buf, &layer.w_alpha.buf,
+        &pbs.x_rot_batch,
+        &pbs.dn_qkv_batch, &pbs.dn_z_batch, &pbs.dn_beta_batch, &pbs.dn_alpha_batch,
+        layer.wqkv.m, layer.wz.m, layer.w_beta.m, layer.w_alpha.m,
+        layer.wqkv.k, n,
+    )?;
+    gpu.fused_sigmoid_alpha_gate_f32_batched(
+        &pbs.dn_beta_batch, &pbs.dn_alpha_batch, &layer.dt_bias, &layer.a_log, n_v_heads, n,
+    )?;
+    // conv1d (linear, no tree) → q_raw/k_raw/v.
+    gpu.conv1d_silu_split_f32_n(
+        &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_v_batch,
+        &pbs.dn_qkv_batch, &layer.conv_weight, &dn_state.conv_states[delta_layer_idx],
+        k_dim, v_dim, n,
+    )?;
+    // L2-norm(Q)/scale + L2-norm(K) (+ repeat-interleave when key<value heads).
+    if config.linear_num_key_heads < n_v_heads {
+        let ratio = n_v_heads / config.linear_num_key_heads;
+        gpu.fused_qk_l2_norm_scale_interleave_f32_batched(
+            &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch, &pbs.dn_q_batch, &pbs.dn_k_batch,
+            config.linear_num_key_heads, ratio, hd,
+            1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+        )?;
+    } else {
+        gpu.fused_qk_l2_norm_scale_f32_batched(
+            &pbs.dn_q_raw_batch, &pbs.dn_k_raw_batch,
+            config.linear_num_key_heads, hd, 1.0 / (hd as f32).sqrt(), config.norm_eps, n,
+        )?;
+        gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
+    }
+    // Chunked gated delta net (advances dn_state.s_matrices in place).
+    gpu.gated_delta_net_q8_batch_seq(
+        &pbs.dn_q_batch, &pbs.dn_k_batch, &pbs.dn_v_batch,
+        &pbs.dn_alpha_batch, &pbs.dn_beta_batch,
+        &dn_state.s_matrices[delta_layer_idx], &dn_state.s_scales[delta_layer_idx],
+        &pbs.dn_attn_out_batch, n, n_v_heads, config.linear_value_head_dim,
+    )?;
+    gpu.gated_norm_f32_batched(
+        &pbs.dn_attn_out_batch, &pbs.dn_z_batch, &layer.norm_weight, &pbs.dn_normed_batch,
+        n_v_heads, config.linear_value_head_dim, config.norm_eps, n,
+    )?;
+    // wo: rotate (MQ4, AWQ-aware) then gemm. Attn → partial; else residual.
+    rotate_x_mq_batched_for(gpu, &layer.wo, &pbs.dn_normed_batch, &pbs.dn_normed_rot_batch, layer.wo.k, n)?;
+    if let DnPhase::Attn = phase {
+        gpu.gemm_hfq4g256(&layer.wo.buf, &pbs.dn_normed_rot_batch, partial, layer.wo.m, layer.wo.k, n)?;
+        return Ok(());
+    }
+    gpu.gemm_hfq4g256_residual(&layer.wo.buf, &pbs.dn_normed_rot_batch, &pbs.x_batch, layer.wo.m, layer.wo.k, n)?;
+
+    // Full: FFN residual into x_batch.
+    fused_rmsnorm_rotate_mq_batched_for(gpu, &pbs.x_batch, &layer.ffn_norm, &layer.w_gate, &pbs.x_rot_batch, dim, config.norm_eps, n)?;
+    gpu.gemm_gate_up_hfq4g256(
+        &layer.w_gate.buf, &layer.w_up.buf, &pbs.x_rot_batch,
+        &pbs.gate_ffn_batch, &pbs.up_batch, layer.w_gate.m, layer.w_up.m, layer.w_gate.k, n,
+    )?;
+    fused_silu_mul_rotate_mq_batched_for(gpu, &layer.w_down, &pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch, config.hidden_dim, n)?;
+    gpu.gemm_hfq4g256_residual(&layer.w_down.buf, &pbs.ffn_hidden_batch, &pbs.x_batch, layer.w_down.m, layer.w_down.k, n)?;
+    Ok(())
+}
 
 /// Phase selector for `run_dn_layer_body` under TP (Stage 3c).
 /// - `Full`: single-GPU — attention + wo residual into s.x + FFN.
@@ -15192,6 +15408,33 @@ fn tp_allreduce_add(
     Ok(())
 }
 
+/// Batched analog of `tp_allreduce_add` for the prefill-TP path (Stage 3d):
+/// all-reduce each rank's `[N×dim]` partial buffer (`partials[r]`, the output
+/// of a column-sharded `wo`/`w_down` over all N tokens) across ranks and add
+/// the first `count = n·dim` elements into that rank's batched residual
+/// `pbs[r].x_batch`. Same lean-sync discipline as the single-token helper —
+/// the producing GEMM, the RCCL all-reduce, and the add all run on each rank's
+/// `active_stream`, so stream ordering + RCCL coordination suffice (NO host
+/// `device_synchronize`). `partials` / `x_batch` are sized `[max_batch·dim]`;
+/// only the live `n·dim` prefix is reduced + added.
+fn tp_allreduce_add_batched(
+    gpus: &mut Gpus,
+    pbs: &[PrefillBatchScratch],
+    partials: &[GpuTensor],
+    tp: usize,
+    count: usize,
+) -> HipResult<()> {
+    let refs: Vec<&_> = partials.iter().map(|p| &p.buf).collect();
+    gpus.all_reduce_sum_f32(&refs, count)?;
+    for r in 0..tp {
+        gpus.devices[r].bind_thread()?;
+        let x_n = pbs[r].x_batch.sub_offset(0, count);
+        let p_n = partials[r].sub_offset(0, count);
+        gpus.devices[r].add_inplace_f32(&x_n, &p_n)?;
+    }
+    Ok(())
+}
+
 /// Tensor-parallel single-token forward across `tp` ranks. Handles BOTH TP
 /// modes via the per-rank `configs` + optional `fa_masks`:
 ///
@@ -15372,6 +15615,170 @@ pub fn forward_scratch_tp(
         let gpu = &mut gpus.devices[0];
         gpu.bind_thread()?;
         let s = &scratches[0];
+        gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, cfg0.norm_eps)?;
+        weight_gemv(gpu, &weights[0].output, &s.tmp, &s.logits)?;
+        gpu.hip.device_synchronize()?;
+    }
+    Ok(())
+}
+
+/// Tensor-parallel BATCHED prefill across `tp` ranks (Stage 3d). The batched
+/// analog of `forward_scratch_tp`: processes a chunk of `tokens` (all N at
+/// once) with FA + DeltaNet layers fully sharded (sliced weights from
+/// `load_weights_tp` + per-rank `local_attn_config`), the partial `wo`/`w_down`
+/// landing in `partials[r]` (`[max_batch·dim]`), all-reduced + added into
+/// `pbs[r].x_batch`. This is where TP should actually win: the GEMMs are
+/// compute-bound and shard cleanly, and the 2 all-reduces/layer amortize over
+/// N tokens (vs the single-token decode path where they amortize over 1).
+///
+/// Requirements (caller-side):
+/// - `gpus.devices[r].active_stream = Some(stream)` on every rank.
+/// - `weights` = per-rank slices (`load_weights_tp`), `configs[r] =
+///   local_attn_config(global, shard)`, `kv_caches[r]`/`dn_states[r]`/`pbs[r]`
+///   all sized for `configs[r]`'s LOCAL heads/hidden_dim.
+/// - `partials[r]` = a `[max_batch·dim]` f32 scratch (full residual dim — `wo`
+///   and `w_down` outputs are full dim even when input-sharded).
+/// - `scratches[0]` (a single-token `Qwen35Scratch`) supplies `.x`/`.tmp`/
+///   `.logits` for the rank-0 last-token lm_head.
+/// - Embeddings must be HFQ4G256 or Q8_0 (the batched embedding kernels).
+///
+/// Only dense FullAttn + DeltaNet are handled (MoE A3B reaches the batched
+/// bodies' `unreachable!`). Lean-sync (no per-layer device_synchronize).
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_chunk_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    pbs: &[PrefillBatchScratch],
+    partials: &[GpuTensor],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    let tp = shard.tp_size;
+    let cfg0 = &configs[0];
+    let dim = cfg0.dim;
+    let n = tokens.len();
+    let dim_row_bytes = dim * 4;
+    let max_ctx_len = start_pos + n;
+    debug_assert!(n > 0);
+    debug_assert!(n <= pbs[0].max_batch);
+
+    // TP=1 runs THIS path's own batched bodies in `Full` phase (no all-reduce)
+    // rather than delegating to `forward_prefill_chunk` — so tp=1 and tp=2 use
+    // the IDENTICAL kernels (the fair prefill baseline), and we avoid the
+    // production arm's standalone-pbs N=1 OOB. The layer loop branches on
+    // `tp == 1` below; embedding/positions/final-logits are shared.
+
+    // 1. Embed tokens + upload positions per rank (replicated; identical
+    //    x_batch since embedding weights are tied/identical across ranks).
+    //    Synchronous H2D uploads complete on the host before the embedding
+    //    kernel launches on active_stream, so no stream hazard (unlike the
+    //    single-token pos_buf, which used an async copy needing the stream).
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let tokens_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+    };
+    let positions_host: Vec<i32> = (0..n).map(|i| (start_pos + i) as i32).collect();
+    let positions_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    for r in 0..tp {
+        let gpu = &mut gpus.devices[r];
+        gpu.bind_thread()?;
+        gpu.hip.memcpy_htod(&pbs[r].tokens.buf, tokens_bytes)?;
+        match weights[r].embd_format {
+            EmbeddingFormat::HFQ4G256 =>
+                gpu.embedding_lookup_hfq4g256_batched(&weights[r].token_embd, &pbs[r].x_batch, &pbs[r].tokens, n, dim)?,
+            EmbeddingFormat::Q8_0 =>
+                gpu.embedding_lookup_q8_batched(&weights[r].token_embd, &pbs[r].x_batch, &pbs[r].tokens, n, dim)?,
+            _ => panic!("forward_prefill_chunk_tp: embedding format must be HFQ4G256 or Q8_0"),
+        }
+        gpu.hip.memcpy_htod(&pbs[r].positions.buf, positions_bytes)?;
+    }
+
+    // 2. Layer loop. DeltaNet + FullAttn both sharded: Attn→AR→add→FfnShard→
+    //    AR→add. delta_layer_idx advances identically on every rank.
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..cfg0.n_layers {
+        match cfg0.layer_types[layer_idx] {
+            LayerType::LinearAttention => {
+                if tp == 1 {
+                    // Baseline: full DeltaNet (residual into x_batch), no all-reduce.
+                    gpus.devices[0].bind_thread()?;
+                    run_dn_layer_batched(
+                        &mut gpus.devices[0], &weights[0], &configs[0], layer_idx,
+                        delta_layer_idx, &mut dn_states[0], &pbs[0], n, &partials[0],
+                        DnPhase::Full,
+                    )?;
+                    delta_layer_idx += 1;
+                    continue;
+                }
+                for r in 0..tp {
+                    gpus.devices[r].bind_thread()?;
+                    run_dn_layer_batched(
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                        delta_layer_idx, &mut dn_states[r], &pbs[r], n, &partials[r],
+                        DnPhase::Attn,
+                    )?;
+                }
+                tp_allreduce_add_batched(gpus, pbs, partials, tp, n * dim)?;
+                for r in 0..tp {
+                    gpus.devices[r].bind_thread()?;
+                    run_dn_layer_batched(
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                        delta_layer_idx, &mut dn_states[r], &pbs[r], n, &partials[r],
+                        DnPhase::FfnShard,
+                    )?;
+                }
+                tp_allreduce_add_batched(gpus, pbs, partials, tp, n * dim)?;
+                delta_layer_idx += 1;
+            }
+            LayerType::FullAttention => {
+                if tp == 1 {
+                    // Baseline: full FA (residual into x_batch), no all-reduce.
+                    gpus.devices[0].bind_thread()?;
+                    run_fa_layer_batched(
+                        &mut gpus.devices[0], &weights[0], &configs[0], layer_idx,
+                        &mut kv_caches[0], &pbs[0], n, max_ctx_len, &partials[0],
+                        FaPhase::Full,
+                    )?;
+                    continue;
+                }
+                for r in 0..tp {
+                    gpus.devices[r].bind_thread()?;
+                    run_fa_layer_batched(
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                        &mut kv_caches[r], &pbs[r], n, max_ctx_len, &partials[r],
+                        FaPhase::TpAttn { mask: None },
+                    )?;
+                }
+                tp_allreduce_add_batched(gpus, pbs, partials, tp, n * dim)?;
+                for r in 0..tp {
+                    gpus.devices[r].bind_thread()?;
+                    run_fa_layer_batched(
+                        &mut gpus.devices[r], &weights[r], &configs[r], layer_idx,
+                        &mut kv_caches[r], &pbs[r], n, max_ctx_len, &partials[r],
+                        FaPhase::TpFfnShard,
+                    )?;
+                }
+                tp_allreduce_add_batched(gpus, pbs, partials, tp, n * dim)?;
+            }
+        }
+    }
+
+    // 3. Final norm + last-token logits on rank 0 (legacy last-token path,
+    //    mirrors forward_prefill_chunk's `do_lm_head` legacy branch). Sync so
+    //    logits are host-visible after this call returns.
+    {
+        let gpu = &mut gpus.devices[0];
+        gpu.bind_thread()?;
+        let s = &scratches[0];
+        let last = n - 1;
+        gpu.memcpy_dtod_at_auto(&s.x.buf, 0, &pbs[0].x_batch.buf, last * dim_row_bytes, dim_row_bytes)?;
         gpu.rmsnorm_f32(&s.x, &weights[0].output_norm, &s.tmp, cfg0.norm_eps)?;
         weight_gemv(gpu, &weights[0].output, &s.tmp, &s.logits)?;
         gpu.hip.device_synchronize()?;
