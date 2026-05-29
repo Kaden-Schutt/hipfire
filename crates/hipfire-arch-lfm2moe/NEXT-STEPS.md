@@ -5,7 +5,7 @@ hipfire — see LICENSE and NOTICE in the project root.
 -->
 # LFM2.5-8B-A1B (arch_id 11) — status & next steps
 
-## Status: forward VALIDATED, real model COHERENT, decode ~250 tok/s (gfx1201)
+## Status: forward VALIDATED, real model COHERENT, decode 241 tok/s (Q8) / 259 tok/s (proj-MQ4 opt-in) on gfx1201
 
 Shipped on branch `lfm2moe/impl` (off `minimax/m2.7-impl`):
 
@@ -33,9 +33,19 @@ experts) vs HF `Lfm2MoeForCausalLM`; real mq4 model coherent through the daemon
 
 ## Next steps (priority order)
 
-### 1. Perf: profile + tune decode (task #9)
-Current ~250 tok/s is correctness-first (per-token prefill, no batching, no fusion
-beyond what minimax reuses). To push max perf on gfx1201:
+### 0. DONE — proj-MQ4 perf lever (+7.2%, opt-in): `HIPFIRE_LFM2_PROJ_MQ4=1`
+4-bit-ing the dense projections (conv in/out_proj, attn q/k/v/out, dense MLP)
+gives **258.8 vs 241.5 tok/s = +7.2%** on matched full-256-tok runs (6 runs each,
+±0.1%), real model coherent (Paris / 80 km/h). OFF by default due to a quality
+cost (tiny-oracle cosine 0.94 < 0.99 4-bit gate — quant noise, milder on the real
+wide projections). Fast variant model: `~/.hipfire/models/lfm2.5-8b-a1b.mq4p`. To
+make default: KLD/PPL vs Q8 first. See design doc "PERF TUNING".
+(Measurement note: an early "+18%" was an EOS-truncation artifact and a "WASH"
+was a fabricated number — corrected; the +7.2% is from grep-able matched logs.)
+
+### 1. Perf: further tuning (task #9, ongoing) — baseline 241 tok/s (Q8) / 259 (proj-MQ4)
+Decode is bandwidth-bound but launch-overhead matters at batch=1. Levers that cut
+LAUNCH COUNT (not just bytes):
 - **Warm baseline first** (per CLAUDE.md perf rules): `HIPFIRE_DPM_WARMUP_SECS=10`,
   fresh process, byte-identical prompt + md5, median of 3–5. Within-session band
   on gfx11/12 is ±1–3%; treat ≥5% as real.
