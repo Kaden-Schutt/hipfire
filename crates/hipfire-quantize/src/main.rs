@@ -2270,6 +2270,94 @@ fn quantize_mq2g256_lloyd(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> V
     output
 }
 
+/// Ternary "MQ1.58" probe: K=3 Lloyd-placed codebook packed into the MQ2-Lloyd
+/// container (slot 3 = duplicate of slot 2, never indexed) so it runs on the
+/// existing MQ2G256Lloyd kernel with NO new kernel. Measures sub-2-bit
+/// *information* (3 levels = log2(3) ≈ 1.58 bit) coherence; storage stays
+/// 72 B/group (true 1.58-bpw packing — 5 ternary/byte — is a mechanical
+/// follow-up once coherence is established). Gated by HIPFIRE_LLOYD_K3=1 on the
+/// `--format mq2lloyd` path. Output DType = MQ2G256Lloyd (kernel-agnostic to K).
+fn quantize_mq2g256_lloyd_k3(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
+    use rayon::prelude::*;
+    let group_size = 256;
+    let block_bytes = 72;
+    let n = f32_data.len();
+    let n_blocks = (n + group_size - 1) / group_size;
+    let mut output = vec![0u8; n_blocks * block_bytes];
+    output
+        .par_chunks_mut(block_bytes)
+        .enumerate()
+        .for_each(|(b, out_chunk)| {
+            let start = b * group_size;
+            let end = (start + group_size).min(n);
+            let actual_len = end - start;
+            let mut group = [0.0f32; 256];
+            group[..actual_len].copy_from_slice(&f32_data[start..end]);
+            cpu_fwht_256(&mut group, signs1, signs2);
+
+            let mut sorted: [f32; 256] = group;
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let percentile = |frac: f32| -> f32 {
+                let idx = ((frac * 255.0).round() as usize).min(255);
+                sorted[idx]
+            };
+            // 3 centroids: ~1/6, 1/2, 5/6 percentiles.
+            let mut cb: [f32; 3] = [percentile(0.167), percentile(0.5), percentile(0.833)];
+            let range = sorted[255] - sorted[0];
+            let mut indices = [0u8; 256];
+            if range > 0.0 {
+                let max_iter = 8;
+                let mut prev = [0u8; 256];
+                for it in 0..max_iter {
+                    let mut sums = [0.0f64; 3];
+                    let mut counts = [0u32; 3];
+                    let mut changed = 0u32;
+                    for i in 0..256 {
+                        let w = group[i];
+                        let mut best = 0usize;
+                        let mut best_d = (w - cb[0]).abs();
+                        for k in 1..3 {
+                            let d = (w - cb[k]).abs();
+                            if d < best_d { best_d = d; best = k; }
+                        }
+                        if it == 0 || prev[i] != best as u8 { changed += 1; }
+                        prev[i] = best as u8;
+                        indices[i] = best as u8;
+                        sums[best] += w as f64;
+                        counts[best] += 1;
+                    }
+                    if it > 0 && changed == 0 { break; }
+                    for k in 0..3 {
+                        if counts[k] > 0 { cb[k] = (sums[k] / counts[k] as f64) as f32; }
+                    }
+                }
+            }
+            // Sort the 3 centroids ascending; remap indices.
+            let mut order: [usize; 3] = [0, 1, 2];
+            order.sort_by(|&a, &b| cb[a].partial_cmp(&cb[b]).unwrap_or(std::cmp::Ordering::Equal));
+            let mut sorted_cb = [0.0f32; 3];
+            let mut inv: [u8; 3] = [0; 3];
+            for new_idx in 0..3 {
+                sorted_cb[new_idx] = cb[order[new_idx]];
+                inv[order[new_idx]] = new_idx as u8;
+            }
+            for i in 0..256 { indices[i] = inv[indices[i] as usize]; }
+            // Header: slots 0..2 = the 3 centroids; slot 3 = dup of slot 2 (never indexed).
+            let header = [sorted_cb[0], sorted_cb[1], sorted_cb[2], sorted_cb[2]];
+            for k in 0..4 {
+                let bits = f32_to_fp16_bits(header[k]);
+                out_chunk[2 * k]     = (bits & 0xFF) as u8;
+                out_chunk[2 * k + 1] = (bits >> 8) as u8;
+            }
+            for i in 0..64 {
+                let mut byte_val = 0u8;
+                for j in 0..4 { byte_val |= (indices[4 * i + j] & 0x3) << (j * 2); }
+                out_chunk[8 + i] = byte_val;
+            }
+        });
+    output
+}
+
 /// Inverse FWHT for MQ-family dequantization (sibling of cpu_fwht_256).
 fn cpu_inv_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     assert!(x.len() == 256);
@@ -3390,6 +3478,16 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
 ///     tensor wasn't exercised by the calibration corpus).
 fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
     let im = IMATRIX.get()?;
+    // `load_imatrix` keys the map by the imatrix FILE's tensor names (`.in_sum2`
+    // stripped). hipfire's `collect_imatrix` emits *safetensors* names
+    // (`model.language_model.layers.N.linear_attn.in_proj_qkv.weight`), so try the
+    // direct safetensors name FIRST — this was the AWQ no-op: the map is
+    // safetensors-keyed but we only tried the GGML-converted name, which always
+    // missed (and 27B-3.6 hybrid linear_attn names don't round-trip anyway).
+    // Fall back to the GGML name for llama.cpp-style (blk.*) imatrices.
+    if let Some(v) = im.get(safetensors_name) {
+        return Some(v.as_slice());
+    }
     let ggml_name = safetensors_to_ggml_name(safetensors_name)?;
     im.get(&ggml_name).map(|v| v.as_slice())
 }
@@ -3440,7 +3538,17 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     let mut log_s_raw = Vec::with_capacity(k);
     let mut sum_log: f64 = 0.0;
     for &v in in_sum2 {
-        let v_clamped = (v as f64).max(1e-12);
+        // Floor dead channels to 1e-12 (NaN also maps here: f64::max returns the
+        // non-NaN arg) AND cap non-finite / pathologically-large values to a
+        // finite ceiling. An inf in_sum2 — f32 overflow during imatrix
+        // collection, which the 27B tier1 imatrix actually contains — would
+        // otherwise make this tensor's `mean_log = inf`, and then `l - mean_log`
+        // = inf - inf = NaN for the inf channel. That NaN survives the output
+        // clamp below (f32::clamp propagates NaN), poisoning the F16 sidecar and
+        // NaN'ing the whole forward (37747 such values measured pre-fix).
+        // Capping the input keeps mean_log finite; the output clamp then bounds
+        // the final scale. 1e30 is well inside f64 range (ln ≈ 69).
+        let v_clamped = (v as f64).max(1e-12).min(1e30);
         let log_s = half_alpha * v_clamped.ln();   // log(v^(alpha/2)) = (alpha/2) * log(v)
         log_s_raw.push(log_s);
         sum_log += log_s;
@@ -3449,8 +3557,26 @@ fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
 
     // Step 3: subtract mean in log space, then exp back. After this,
     // geo_mean(s) = exp(0) = 1.0 exactly (within floating-point precision).
+    //
+    // Step 4 (CRITICAL — f16 safety): clamp to an f16-representable,
+    // non-exploding range. The geo-mean is 1.0 by construction, so the bulk
+    // of channels sit near 1; only pathological outliers reach the rails —
+    // dead channels floored to 1e-12, or hot channels with huge activation
+    // sums. Without this, exp() overflows to f32 inf and/or the F16 sidecar
+    // under/overflows, and the inference-time `x / awq_scale` divide produces
+    // inf → NaN. (Verified via dump_awq_scales on the 27B tier1 imatrix:
+    // 49293 scales underflowed to 0.0 and 37747 stored as inf/NaN pre-clamp,
+    // which NaN'd the whole forward — KLD 0.0 / PPL NaN on gfx11.)
+    //
+    // The SAME clamped vector is used for both the weight pre-scale (W*s) and
+    // the emitted sidecar (x/s at inference), so the cancellation stays exact;
+    // clamping only limits how aggressively pathological channels redistribute
+    // quant difficulty. Real AWQ scales live in ~[0.2, 5]; [1e-2, 1e2] keeps
+    // all genuine signal while removing the representability blow-ups.
+    const AWQ_SCALE_MIN: f32 = 1e-2;
+    const AWQ_SCALE_MAX: f32 = 1e2;
     log_s_raw.into_iter()
-        .map(|l| ((l - mean_log).exp()) as f32)
+        .map(|l| ((l - mean_log).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
         .collect()
 }
 
@@ -5804,7 +5930,24 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                    // AWQ × MQ3-Lloyd composition (MQ3G256Lloyd is forward-path-ready +
+                    // now in supports_awq_sidecar). Pre-scale by imatrix, then Lloyd-fit.
+                    let q = if let (Some(alpha), Some(im_weights))
+                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        if awq_eligible(name) {
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            quantize_mq3g256_lloyd(&scaled, &signs1, &signs2)
+                        } else {
+                            quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2)
+                        }
+                    } else {
+                        quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2)
+                    };
                     (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256Lloyd")
                 } else {
                     let q = quantize_hfq3g128(&f32_data);
@@ -5815,7 +5958,27 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2);
+                    // AWQ × MQ2-Lloyd (MQ2G256Lloyd is in supports_awq_sidecar): pre-scale
+                    // by imatrix first, then Lloyd-fit (K=4, or K=3-ternary under the flag).
+                    let awq_scaled: Option<Vec<f32>> = if let (Some(alpha), Some(im_weights))
+                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        if awq_eligible(name) {
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            Some(scaled)
+                        } else { None }
+                    } else { None };
+                    let data: &[f32] = awq_scaled.as_deref().unwrap_or(&f32_data);
+                    // HIPFIRE_LLOYD_K3=1 → ternary "MQ1.58" (3-level codebook, reuses kernel).
+                    let q = if std::env::var("HIPFIRE_LLOYD_K3").ok().as_deref() == Some("1") {
+                        quantize_mq2g256_lloyd_k3(data, &signs1, &signs2)
+                    } else {
+                        quantize_mq2g256_lloyd(data, &signs1, &signs2)
+                    };
                     (q, QuantType::MQ2G256Lloyd, 256u32, "MQ2G256Lloyd")
                 } else {
                     // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
@@ -5827,7 +5990,27 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq3g256(&f32_data, &signs1, &signs2);
+                    // AWQ pre-scaling for MQ3 base body (mirrors the MQ4 base arm).
+                    // MQ3G256 is on DType::supports_awq_sidecar, so the runtime applies
+                    // the inverse divide via rotate_x_mq. Without this, `--format mq3
+                    // --awq` was a silent no-op on body tensors (md5(mq3-awq)==md5(mq3)).
+                    // awq_eligible gates to tensors whose runtime path has the inverse.
+                    let q = if let (Some(alpha), Some(im_weights))
+                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        if awq_eligible(name) {
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            quantize_mq3g256(&scaled, &signs1, &signs2)
+                        } else {
+                            quantize_mq3g256(&f32_data, &signs1, &signs2)
+                        }
+                    } else {
+                        quantize_mq3g256(&f32_data, &signs1, &signs2)
+                    };
                     (q, QuantType::MQ3G256, 256u32, "MQ3G256")
                 } else {
                     // Fallback to HFQ3-G128 for non-256-aligned (no rotation)
@@ -5839,7 +6022,25 @@ fn main() {
                 if k_dim % 256 == 0 {
                     let signs1 = gen_fwht_signs(42, 256);
                     let signs2 = gen_fwht_signs(1042, 256);
-                    let q = quantize_mq2g256(&f32_data, &signs1, &signs2);
+                    // AWQ × plain MQ2 (MQ2G256 now in supports_awq_sidecar). Pre-scale by
+                    // imatrix, then quantize. (Plain MQ2 collapses uncalibrated; AWQ is the
+                    // test of whether activation-aware scaling rescues uniform 2-bit.)
+                    let q = if let (Some(alpha), Some(im_weights))
+                        = (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        if awq_eligible(name) {
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            quantize_mq2g256(&scaled, &signs1, &signs2)
+                        } else {
+                            quantize_mq2g256(&f32_data, &signs1, &signs2)
+                        }
+                    } else {
+                        quantize_mq2g256(&f32_data, &signs1, &signs2)
+                    };
                     (q, QuantType::MQ2G256, 256u32, "MQ2G256")
                 } else {
                     // Fallback to HFQ2-G128 for non-256-aligned (no rotation)
