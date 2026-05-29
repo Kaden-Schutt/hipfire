@@ -900,6 +900,17 @@ pub struct DeepseekV4State {
     /// Head HC combined-streams output `[hidden]` F32 → output_norm → lm_head.
     pub head_hc_out: Option<rdna_compute::GpuTensor>,
 
+    /// Batched verify lm_head scratch (spec-decode). The lm_head weight is
+    /// `[vocab, hidden]` (~565 MB Q8) and the GEMV is pure weight-BW-bound;
+    /// the old per-position loop re-read it K times per window. These cache
+    /// the staging buffers so the verifier reads it ONCE per window:
+    ///   `head_norm_batch`   — per-position pre-lm_head normed acts `[K, hidden]` F32
+    ///   `head_x_f16`        — F16-staged GEMM input `[K*hidden]`
+    ///   `head_logits_batch` — `[K, vocab]` logits from the single batched GEMV
+    pub head_norm_batch: Option<rdna_compute::GpuTensor>,
+    pub head_x_f16: Option<rdna_compute::GpuTensor>,
+    pub head_logits_batch: Option<rdna_compute::GpuTensor>,
+
     /// Monotonic position counter — how many tokens this session has
     /// processed. Used to compute the SWA cache slot (`pos % window`)
     /// and number of valid cached positions.
@@ -991,6 +1002,9 @@ impl DeepseekV4State {
             wo_a_out_rot: None,
             head_hc_pre: None,
             head_hc_out: None,
+            head_norm_batch: None,
+            head_x_f16: None,
+            head_logits_batch: None,
             n_tokens: 0,
             _scaffold: (),
         })
