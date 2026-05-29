@@ -25,4 +25,6 @@ pub mod forward;
 pub mod minimax;
 
 pub use arch::MiniMaxM2;
-pub use minimax::{MiniMaxConfig, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights};
+pub use minimax::{
+    MiniMaxConfig, MiniMaxExpertWeights, MiniMaxLayerWeights, MiniMaxState, MiniMaxWeights,
+};
