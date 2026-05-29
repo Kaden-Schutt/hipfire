@@ -3052,7 +3052,10 @@ struct TensorSpill {
 
 impl TensorSpill {
     fn new(dir: &Path) -> std::io::Result<Self> {
-        let path = dir.join(".hipfire_quant_spill.tmp");
+        // PID-unique so concurrent quantize runs in the same output dir don't
+        // share a spill path (a sibling run's Drop would otherwise delete this
+        // run's spill file → write_hfq NotFound panic).
+        let path = dir.join(format!(".hipfire_quant_spill.{}.tmp", std::process::id()));
         let file = std::io::BufWriter::with_capacity(
             4 * 1024 * 1024,
             File::create(&path)?,
@@ -3526,8 +3529,20 @@ fn load_imatrix(path: &Path) -> HashMap<String, Vec<f32>> {
         skipped_moe,
     );
     if total_entries == 0 {
-        eprintln!("error: imatrix file contains no usable .in_sum2 entries");
-        std::process::exit(1);
+        if skipped_moe > 0 {
+            // MoE-only imatrix (e.g. MiniMax routed experts): no 1D dense
+            // entries for the legacy dense-AWQ table, but the file IS valid.
+            // The MiniMax AWQ-on-experts path reads the raw imatrix GGUF
+            // (imatrix_gguf) directly, so an empty dense table is harmless —
+            // dense tensors just fall back to non-imatrix quantization.
+            eprintln!(
+                "imatrix: 0 dense entries, {skipped_moe} MoE multi-matrix entries — \
+                 dense table empty (MoE-only imatrix; expert AWQ uses the raw GGUF)"
+            );
+        } else {
+            eprintln!("error: imatrix file contains no usable .in_sum2 entries");
+            std::process::exit(1);
+        }
     }
     map
 }
@@ -3585,6 +3600,62 @@ fn imatrix_weights_for(safetensors_name: &str) -> Option<&'static [f32]> {
 ///
 /// Cost: O(K). For 9B Qwen3.5 ~32 calls × ~4096 elements = ~131K ops total
 /// across the whole quantize. Negligible.
+/// Parse the layer index N from a MiniMax expert tensor name
+/// `…layers.N.block_sparse_moe.experts.E.wX.weight`.
+fn minimax_layer_index(name: &str) -> Option<usize> {
+    let after = name.split(".layers.").nth(1)?;
+    after.split('.').next()?.parse::<usize>().ok()
+}
+
+/// True if layer `l` falls in the comma-separated range list held in env `var`
+/// (e.g. "12-45,50,55-60"; inclusive ranges or bare singles). Unset/empty →
+/// false. Drives per-layer mixed-precision expert promotion for MiniMax.
+fn minimax_layer_in_env_set(var: &str, l: usize) -> bool {
+    let spec = match std::env::var(var) { Ok(v) => v, Err(_) => return false };
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() { continue; }
+        if let Some((a, b)) = tok.split_once('-') {
+            if let (Ok(a), Ok(b)) = (a.trim().parse::<usize>(), b.trim().parse::<usize>()) {
+                if l >= a.min(b) && l <= a.max(b) { return true; }
+            }
+        } else if let Ok(n) = tok.parse::<usize>() {
+            if l == n { return true; }
+        }
+    }
+    false
+}
+
+/// Shared-per-layer AWQ scales for MiniMax routed experts from an imatrix GGUF.
+/// Aggregates per-expert activation energy (in_sum2) across ALL experts of
+/// layer `n` into one shared per-input-channel scale: gate(w1)/up(w3) share the
+/// MoE-input channels (s_gate_up, len hidden); down(w2) uses the intermediate
+/// channels (s_down, len inter). The forward applies these via experts[0], so
+/// one scale per layer is exactly what the runtime consumes. None if absent.
+fn minimax_layer_awq_scales(
+    gguf: &gguf_input::GgufFile, n: usize, alpha: f32,
+) -> Option<(Vec<f32>, Vec<f32>)> {
+    let agg = |kind: &str| -> Option<Vec<f32>> {
+        let nm = format!("blk.{n}.ffn_{kind}_exps.weight.in_sum2");
+        let t = gguf.tensors.iter().find(|t| t.name == nm)?;
+        if t.shape.len() != 2 { return None; }
+        let k = t.shape[0]; let n_exp = t.shape[1];
+        let flat: Vec<f32> = gguf.tensor_data(t).chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        if flat.len() != k * n_exp { return None; }
+        let mut a = vec![0.0f32; k];
+        for e in 0..n_exp { let off = e * k; for j in 0..k { a[j] += flat[off + j]; } }
+        Some(a)
+    };
+    let g = agg("gate")?;
+    let gu: Vec<f32> = match agg("up") {
+        Some(u) if u.len() == g.len() => g.iter().zip(&u).map(|(a, b)| a + b).collect(),
+        _ => g.clone(),
+    };
+    let d = agg("down")?;
+    Some((compute_awq_scales(&gu, alpha), compute_awq_scales(&d, alpha)))
+}
+
 fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     let k = in_sum2.len();
     debug_assert!(k > 0, "empty imatrix vector");
@@ -5164,6 +5235,9 @@ fn main() {
         eprintln!("  [filter] --include-prefix {p:?} — only tensors with this prefix will be ingested");
     }
     let mut skipped_params = 0u64;
+    // MiniMax AWQ: shared-per-layer expert scales, cached + sidecars emitted once.
+    let mut mm_awq_cache: std::collections::HashMap<usize, Option<(Vec<f32>, Vec<f32>)>> = std::collections::HashMap::new();
+    let mut mm_awq_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if let Some(ref p) = include_prefix {
@@ -5375,10 +5449,44 @@ fn main() {
             && name.ends_with(".weight")
             && meta.shape.len() == 2
         {
-            let f32_data = tensor_to_f32_with_optional_fp8_scale(
+            let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name, raw_data, meta, &fp8_scale_for, &st_files);
             let k = meta.shape[1];
+            let m = meta.shape[0];
             if k % 256 == 0 {
+                // AWQ shared-per-layer pre-scaling of the routed experts (--awq +
+                // --imatrix). w1/w3 use s_gate_up (MoE-input channels), w2 uses
+                // s_down (intermediate channels). Math W·s @ x/s = W·x is exact;
+                // the forward divides the activation by experts[0]'s scale.
+                if awq_enabled {
+                    if let (Some(layer_n), Some(gg)) = (minimax_layer_index(name), imatrix_gguf.as_ref()) {
+                        let alpha = AWQ_ALPHA.get().copied().unwrap_or(0.55);
+                        let entry = mm_awq_cache.entry(layer_n)
+                            .or_insert_with(|| minimax_layer_awq_scales(gg, layer_n, alpha));
+                        if let Some((s_gu, s_dn)) = entry.as_ref() {
+                            let scale = if name.ends_with(".w2.weight") { s_dn } else { s_gu };
+                            if scale.len() == k {
+                                awq_pre_scale_weights(&mut f32_data, m, k, scale);
+                            } else {
+                                eprintln!("  minimax AWQ L{layer_n}: scale len {} != k {} ({name}); skipped", scale.len(), k);
+                            }
+                            if mm_awq_emitted.insert(layer_n) {
+                                let p = name.split(".block_sparse_moe.").next().unwrap();
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"),
+                                    quant_type: QuantType::F16, shape: vec![s_gu.len() as u32],
+                                    group_size: 0, data: awq_scales_to_f16_bytes(s_gu), spilled_len: 0,
+                                });
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!("{p}.block_sparse_moe.awq_scale_down.weight"),
+                                    quant_type: QuantType::F16, shape: vec![s_dn.len() as u32],
+                                    group_size: 0, data: awq_scales_to_f16_bytes(s_dn), spilled_len: 0,
+                                });
+                                eprintln!("  AWQ-MM: emitted shared expert scales for L{layer_n}");
+                            }
+                        }
+                    }
+                }
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 // Expert format by --format: mq2-lloyd (MQ2G256Lloyd, hipx sub-4-bit
@@ -5386,7 +5494,22 @@ fn main() {
                 // HIPFIRE_MINIMAX_EXPERT_MQ6), else mq4 (MQ4G256, default + validated).
                 let mm_mq6 = use_mq6g256 || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ6").is_some();
                 let mm_mq2l = use_mq2g256_lloyd || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ2L").is_some();
-                let (q, qt, label) = if mm_mq2l {
+                let mm_mq3l = use_mq3g256_lloyd || std::env::var_os("HIPFIRE_MINIMAX_EXPERT_MQ3L").is_some();
+                // Per-layer mixed-precision promotion. HIPFIRE_MINIMAX_PROMOTE_MQ4 /
+                // _MQ6 hold comma-separated layer ranges ("12-45,50") whose experts are
+                // forced UP to MQ4 / MQ6 regardless of the base --format. The forward
+                // dispatches expert dtype per-layer (experts[0].gpu_dtype), so the model
+                // carries an MQ2-Lloyd base with MQ4 on the quant-sensitive middle layers.
+                let mm_layer = minimax_layer_index(name);
+                let promote_mq6 = mm_layer.map_or(false, |l| minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ6", l));
+                let promote_mq4 = mm_layer.map_or(false, |l| minimax_layer_in_env_set("HIPFIRE_MINIMAX_PROMOTE_MQ4", l));
+                let (q, qt, label) = if promote_mq6 {
+                    (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-PROMO")
+                } else if promote_mq4 {
+                    (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4-PROMO")
+                } else if mm_mq3l {
+                    (quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2), QuantType::MQ3G256Lloyd, "MQ3L-MM")
+                } else if mm_mq2l {
                     (quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2), QuantType::MQ2G256Lloyd, "MQ2L-MM")
                 } else if mm_mq6 {
                     (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-MM")

@@ -165,6 +165,20 @@ fn load_norm(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Resul
         .map_err(|e| format!("minimax: upload norm {name}: {e:?}"))
 }
 
+/// Load a MiniMax AWQ shared-scale sidecar (1D F16, length k) → F32 GpuTensor.
+fn load_mm_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let (qt, data) = read_tensor(hfq, name).ok()?;
+    if qt != 1 { return None; } // 1 = F16
+    if data.len() != k * 2 {
+        eprintln!("minimax AWQ sidecar {name}: {} bytes != {} (k*2); skipping", data.len(), k * 2);
+        return None;
+    }
+    let f32_data: Vec<f32> = data.chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
+}
+
 /// Load a quantized 2D weight → WeightTensor, tagging gpu_dtype from quant_type.
 fn load_wt(
     hfq: &HfqFile,
@@ -284,11 +298,22 @@ impl MiniMaxWeights {
                 let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
                 let mut gate_up_bytes = w1;
                 gate_up_bytes.extend_from_slice(&w3);
-                let gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * inter, hidden)
+                let mut gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * inter, hidden)
                     .map_err(|e2| format!("minimax: fuse gate_up L{l}E{e}: {e2}"))?;
                 let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                let down = wt_from_raw(gpu, qt2, &w2, hidden, inter)
+                let mut down = wt_from_raw(gpu, qt2, &w2, hidden, inter)
                     .map_err(|e2| format!("minimax: down L{l}E{e}: {e2}"))?;
+                if e == 0 {
+                    gate_up.awq_scale = load_mm_awq_scale(
+                        hfq, gpu, &format!("{p}.block_sparse_moe.awq_scale_gate_up.weight"), hidden);
+                    if std::env::var_os("HIPFIRE_MINIMAX_ENABLE_DOWN_AWQ").is_some() { // down-AWQ harmful (shared s_down bad approx); opt-in
+                        down.awq_scale = load_mm_awq_scale(
+                            hfq, gpu, &format!("{p}.block_sparse_moe.awq_scale_down.weight"), inter);
+                    }
+                    if gate_up.awq_scale.is_some() {
+                        eprintln!("minimax: AWQ scales attached at L{l} (expert-0 representative)");
+                    }
+                }
                 experts.push(MiniMaxExpertWeights { gate_up, down });
             }
 
