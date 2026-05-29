@@ -6636,7 +6636,24 @@ fn ffn_batched(
             _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
         } && (2 * im) % 64 == 0
           && hidden % 256 == 0;
-        if use_lloyd_4w {
+        // Barrier-free nosync variant (opt in via =1).
+        let use_nosync = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        if use_nosync {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_nosync(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 gate_up_ptrs,
                 &pbs.moe_expert_tile_ids,
@@ -6736,7 +6753,23 @@ fn ffn_batched(
             _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
         } && hidden % 64 == 0
           && im % 256 == 0;
-        if use_lloyd_4w_down {
+        let use_nosync_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        if use_nosync_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_nosync(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
+        } else if use_lloyd_4w_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 w2_ptrs,
                 &pbs.moe_expert_tile_ids,

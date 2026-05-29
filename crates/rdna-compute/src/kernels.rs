@@ -2872,6 +2872,11 @@ pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0_multirow.hip");
 
+/// Barrier-free 4-warp MoE grouped MQ2-Lloyd WMMA GEMM. Eliminates
+/// __syncthreads() and LDS X staging. Each wave loads X directly from
+/// global memory.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_nosync.hip");
 /// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
