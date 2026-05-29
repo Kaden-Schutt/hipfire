@@ -5460,6 +5460,47 @@ fn main() {
                 st_files[*file_idx].drop_tensor_pages(name);
                 continue;
             }
+            // Perf lever (HIPFIRE_LFM2_PROJ_MQ4=1): route the dense 2D linears —
+            // conv in/out_proj, attn q/k/v/out_proj, dense MLP w1/w2/w3 (experts
+            // already MQ4 above) — to MQ4G256 instead of Q8. Decode on this A1B
+            // model is weight-bandwidth-bound; these projections are ~30% of
+            // per-token weight reads, so 4-bit-ing them is the cleanest tok/s
+            // lever. weight_gemv's MQ4G256 arm FWHT-rotates the input internally,
+            // so the forward path needs no change. Router, expert_bias, all norms,
+            // the depthwise conv filter, and the tied embed/lm_head stay Q8
+            // (precision-sensitive / tiny). OFF by default — flip on only after
+            // the tiny-oracle cosine (≥0.99) + coherence gate confirm it.
+            if std::env::var_os("HIPFIRE_LFM2_PROJ_MQ4").is_some()
+                && meta.shape.len() == 2
+                && meta.shape[1] % 256 == 0
+                && (name.ends_with(".conv.in_proj.weight")
+                    || name.ends_with(".conv.out_proj.weight")
+                    || name.ends_with(".self_attn.q_proj.weight")
+                    || name.ends_with(".self_attn.k_proj.weight")
+                    || name.ends_with(".self_attn.v_proj.weight")
+                    || name.ends_with(".self_attn.out_proj.weight")
+                    || name.ends_with(".feed_forward.w1.weight")
+                    || name.ends_with(".feed_forward.w2.weight")
+                    || name.ends_with(".feed_forward.w3.weight"))
+            {
+                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files);
+                let signs1 = gen_fwht_signs(42, 256);
+                let signs2 = gen_fwht_signs(1042, 256);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!("  {:>8}: {} {:?} (proj MQ4)", "MQ4P-LFM", name, meta.shape);
+                hfq_tensors.push(HfqTensor {
+                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    shape, group_size: 256, data: q, spilled_len: 0,
+                });
+                quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
+                st_files[*file_idx].drop_tensor_pages(name);
+                if let Some(ref mut s) = spill {
+                    maybe_spill(&mut hfq_tensors, s, 2 * 1024 * 1024 * 1024);
+                }
+                continue;
+            }
+
             // All remaining LFM2 tensors → Q8 (qt=3). quantize_q8f16 handles any
             // 1D/2D/3D shape elementwise (conv.conv.weight is [hidden,1,K]).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
