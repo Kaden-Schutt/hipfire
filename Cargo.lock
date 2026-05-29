@@ -162,6 +162,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-lfm2moe"
+version = "0.1.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-llama"
 version = "0.2.0"
 dependencies = [
