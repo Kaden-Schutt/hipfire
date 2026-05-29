@@ -1248,6 +1248,53 @@ impl Gpu {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Convert F32 X to the shared FP16 scratch on every call. Use this when
+    /// the source pointer is stable but the contents change between launches.
+    fn convert_fp16_x_uncached(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        self.ensure_kernel(
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+
+        let needed = n_elems * 2;
+        if self.fp16_x_scratch_bytes < needed {
+            self.fp16_x_scratch = Some(self.hip.malloc(needed)?);
+            self.fp16_x_scratch_bytes = needed;
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+
+        let in_ptr = x.buf.as_ptr();
+        let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
+        let n_val = n_elems as i32;
+        let mut in_ptr_m = in_ptr;
+        let mut out_ptr_m = out_ptr;
+        let mut n_val_m = n_val;
+        let mut conv_params: Vec<*mut c_void> = vec![
+            &mut in_ptr_m as *mut _ as *mut c_void,
+            &mut out_ptr_m as *mut _ as *mut c_void,
+            &mut n_val_m as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_elems + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "convert_f32_to_f16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut conv_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(in_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        self.fp16_x_source_ptr = in_ptr;
+
+        Ok(out_ptr)
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16
@@ -30594,6 +30641,219 @@ impl Gpu {
         result
     }
 
+    /// `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2` with N_TILE=32 tile-pairing:
+    /// each block processes two consecutive 16-slot tiles and, when both map to
+    /// the same expert (the common case after the expert-sorted scatter),
+    /// decodes the per-warp MQ2-Lloyd A-fragment ONCE for two WMMAs — halving
+    /// the dominant dequant ALU per token. `grid.y` halves to `(m_total/16+1)/2`;
+    /// scatter (BLOCK_M=16) and the slot-indexed `Y_grouped` layout are unchanged.
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        // Each block handles TWO 16-slot tiles → halve the slot-tile grid dim.
+        let slot_tiles = (((m_total + 15) / 16 + 1) / 2) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// `gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2` with the per-weight MQ2
+    /// dequant done via f16 cndmask selects instead of int→f32→f16 — bit-exact,
+    /// shorter dependency chain, identical geometry/LDS/occupancy. Same grid as
+    /// the 4w baseline.
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_CND_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+    /// 8-warp (M_TILE=128) variant of the grouped MQ2-Lloyd GEMM. Shares the
+    /// staged X across 8 warps (half the X-load traffic per M-row vs the 4w).
+    /// 256-thread block, grid.x = (m+127)/128; slot-tile grid unchanged.
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 127) / 128) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
+
     /// y = A_q8_0 * x (quantized GEMV for Q8_0)
     /// F16-weight × F32-input GEMV. y[m] = W_f16[m, k] @ x_f32[k].
     /// Keeps full F32 input precision — use this for full-precision F16
@@ -32795,6 +33055,76 @@ impl Gpu {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn deepseek4_attn_swa_topk_direct_batched_f32(
+        &mut self,
+        q: &GpuTensor,
+        swa_k: &GpuTensor,
+        swa_v: &GpuTensor,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        attn_sink: &GpuTensor,
+        n_valid_swa_arr: &GpuTensor,
+        n_active_topk_arr: &GpuTensor,
+        attn_out: &GpuTensor,
+        n_heads: i32,
+        head_dim: i32,
+        swa_window: i32,
+        topk_window: i32,
+        n_compressed: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_attn_swa_topk_direct_batched",
+            kernels::V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC,
+            "deepseek4_attn_swa_topk_direct_batched_f32",
+        )?;
+        let func = &self.functions["deepseek4_attn_swa_topk_direct_batched_f32"];
+        let qp = q.buf.as_ptr();
+        let kp = swa_k.buf.as_ptr();
+        let vp = swa_v.buf.as_ptr();
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let sp = attn_sink.buf.as_ptr();
+        let nvp = n_valid_swa_arr.buf.as_ptr();
+        let nap = n_active_topk_arr.buf.as_ptr();
+        let op = attn_out.buf.as_ptr();
+        let mut nh = n_heads;
+        let mut hd = head_dim;
+        let mut sw = swa_window;
+        let mut tw = topk_window;
+        let mut nc = n_compressed;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &nvp as *const _ as *mut c_void,
+            &nap as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sw as *mut _ as *mut c_void,
+            &mut tw as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// DeepSeek V4 indexer-extended SWA attention. Reads from the SWA ring
     /// buffer (`swa_k/v` [n_kv=1, head_dim, swa_window]) AND the
     /// indexer-gathered top-K K/V (`topk_k/v` [n_kv=1, head_dim,
@@ -33687,6 +34017,32 @@ impl Gpu {
         k: i32,
         batch_size: i32,
     ) -> HipResult<()> {
+        // DeepSeek V4 prefill shape on gfx1151 (G=8, M=1024, K=4096,
+        // B=1024): strided WMMA is ~10x faster than the scalar per-row
+        // kernel. Env keeps a one-command fallback for bisects.
+        let default_wmma = self.arch == "gfx1151" && k % 32 == 0 && m >= 64 && batch_size >= 64;
+        let use_wmma = std::env::var("HIPFIRE_DEEPSEEK4_WO_Q8_WMMA")
+            .map(|s| s != "0")
+            .unwrap_or(default_wmma);
+        if use_wmma && k % 32 == 0 {
+            return self.wo_per_group_batched_q8_0_wmma_4w(
+                wo_a, x_in, y_out, g, m, k, batch_size,
+            );
+        }
+        self.wo_per_group_batched_q8_0_1w(wo_a, x_in, y_out, g, m, k, batch_size)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0_1w(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 32 * 34] bytes (Q8_0-packed)
+        x_in: &GpuTensor,    // [B, G, K] plain F32 (no FWHT)
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
             "wo_per_group_batched_q8_0",
@@ -33722,7 +34078,6 @@ impl Gpu {
         }
     }
 
-    /// Multi-row Q8_0 variant (Lever 1). Same contract as
     /// `wo_per_group_batched_q8_0` but one block processes R output rows,
     /// hoisting x loads across rows. Grid = [ceil(M/R), B, G].
     /// `rows_per_block` must be 2 or 4.
@@ -33774,6 +34129,80 @@ impl Gpu {
             )
         }
     }
+
+    /// Atomic-free MQ2-Lloyd MoE down GEMV (K4-unrolled). Writes per-
+    /// (token, krank) expert outputs to `expert_outputs[N × K_TOP × M]`
+    /// — no atomicAdd. Pair with `moe_down_combine_k8_batched` to fold
+    /// K_TOP outputs into x_residual deterministically.
+    ///
+    /// Same grid/block as the residual_scaled K4 variant, so this is a
+    /// drop-in replacement for the scalar-path down GEMV when temp=0
+    /// reproducibility is required.
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn wo_per_group_batched_q8_0_wmma_4w(
+        &mut self,
+        wo_a: &GpuTensor,    // [G * M * K / 32 * 34] bytes (Q8_0-packed)
+        x_in: &GpuTensor,    // [B, G, K] plain F32 or F16
+        y_out: &GpuTensor,   // [B, G, M]
+        g: i32,
+        m: i32,
+        k: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "wo_per_group_batched_q8_0_wmma_4w: K must divide 32");
+        self.ensure_kernel(
+            "wo_per_group_batched_q8_0_wmma_4w",
+            kernels::WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC,
+            "wo_per_group_batched_q8_0_wmma_4w",
+        )?;
+        let xp_owned = x_in.buf.as_ptr();
+        let mut xp = if matches!(x_in.dtype, DType::F16) {
+            xp_owned
+        } else {
+            // Production prefill reuses the same x_in tensor pointer every
+            // layer with new contents, so pointer-keyed conversion caching
+            // would read stale FP16 here.
+            self.convert_fp16_x_uncached(x_in, batch_size as usize * g as usize * k as usize)?
+        };
+        let func = &self.functions["wo_per_group_batched_q8_0_wmma_4w"];
+        let mut wp = wo_a.buf.as_ptr();
+        let mut yp = y_out.buf.as_ptr();
+        let mut g_i = g;
+        let mut m_i = m;
+        let mut k_i = k;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut wp as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut g_i as *mut _ as *mut c_void,
+            &mut m_i as *mut _ as *mut c_void,
+            &mut k_i as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [((m + 63) / 64) as u32, ((batch_size + 63) / 64) as u32, g as u32],
+                [128, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Atomic-free MQ2-Lloyd MoE down GEMV (K4-unrolled). Writes per-
+    /// (token, krank) expert outputs to `expert_outputs[N × K_TOP × M]`
+    /// — no atomicAdd. Pair with `moe_down_combine_k8_batched` to fold
+    /// K_TOP outputs into x_residual deterministically.
+    ///
+    /// Same grid/block as the residual_scaled K4 variant, so this is a
+    /// drop-in replacement for the scalar-path down GEMV when temp=0
+    /// reproducibility is required.
+    #[allow(clippy::too_many_arguments)]
 
     /// Atomic-free MQ2-Lloyd MoE down GEMV (K4-unrolled). Writes per-
     /// (token, krank) expert outputs to `expert_outputs[N × K_TOP × M]`

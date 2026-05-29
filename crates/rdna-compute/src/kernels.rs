@@ -2623,6 +2623,15 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
 
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip");
+
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_CND_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd.hip");
+
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2.hip");
+
 /// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
 /// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
 pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");
@@ -2883,6 +2892,10 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC: &str =
 pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip");
 
+/// WMMA Q8_0 GEMM for DeepSeek V4 O-LoRA's strided `[B, G, *]` layout.
+pub const WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_wmma_4w.hip");
+
 /// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
@@ -2968,6 +2981,10 @@ pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
 /// position has its own SWA / top-K K/V slices and valid-count scalars.
 pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched.hip");
+
+/// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
 
 /// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
 /// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
