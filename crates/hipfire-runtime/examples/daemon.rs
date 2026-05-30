@@ -2944,7 +2944,11 @@ fn resolve_chat_template(hfq: &hipfire_runtime::hfq::HfqFile, model_path: &str) 
     }
 
     // 3. HFQ-embedded.
-    hfq.chat_template()
+    let tpl = hfq.chat_template();
+    if tpl.is_some() {
+        eprintln!("[chat_template] using HFQ-embedded tokenizer_config.chat_template");
+    }
+    tpl
 }
 
 fn parse_state_quant(

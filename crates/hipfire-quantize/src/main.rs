@@ -4829,10 +4829,35 @@ fn main() {
     } else {
         None
     };
-    let tokenizer_config = match chat_template_override {
+    let mut tokenizer_config = match chat_template_override {
         Some(template) => Some(tokenizer_config_with_chat_template(tokenizer_config, template)),
         None => tokenizer_config,
     };
+
+    // Fallback: many recent models (MiniMax-M2, newer Qwen/Gemma) ship the Jinja
+    // chat template as a separate `chat_template.jinja` rather than inside
+    // tokenizer_config.json. The daemon reads `tokenizer_config.chat_template`
+    // from the embedded HFQ metadata (see resolve_chat_template / hfq.chat_template),
+    // so fold the sidecar in when tokenizer_config has no usable template —
+    // otherwise serve runs raw with no chat formatting.
+    {
+        let has_tpl = tokenizer_config
+            .as_ref()
+            .and_then(|v| v.get("chat_template"))
+            .and_then(|t| t.as_str())
+            .map(|t| !t.trim().is_empty())
+            .unwrap_or(false);
+        let jinja_path = input_dir.join("chat_template.jinja");
+        if !has_tpl && jinja_path.exists() {
+            if let Ok(tpl) = std::fs::read_to_string(&jinja_path) {
+                let obj = tokenizer_config.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(map) = obj.as_object_mut() {
+                    map.insert("chat_template".into(), serde_json::Value::String(tpl));
+                    eprintln!("  chat_template: folded chat_template.jinja into tokenizer_config metadata");
+                }
+            }
+        }
+    }
 
     // Read generation_config.json. HF stores some sampler-side defaults
     // here (eos_token_id, pad_token_id, bos_token_id, do_sample, etc.)
