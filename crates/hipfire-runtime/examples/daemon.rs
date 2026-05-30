@@ -1893,7 +1893,11 @@ fn resolve_chat_template(
     }
 
     // 3. HFQ-embedded.
-    hfq.chat_template()
+    let tpl = hfq.chat_template();
+    if tpl.is_some() {
+        eprintln!("[chat_template] using HFQ-embedded tokenizer_config.chat_template");
+    }
+    tpl
 }
 
 fn parse_state_quant(mode: Option<&str>) -> Result<hipfire_arch_qwen35::qwen35::StateQuant, String> {
