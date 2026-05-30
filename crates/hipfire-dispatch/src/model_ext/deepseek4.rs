@@ -6,6 +6,8 @@
 // for the GEMM/GEMV portions; the custom kernels (compressor pool, ring write,
 // overlap concat, APE add) are called directly on Gpu.
 
+#![cfg(any())]
+
 use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GemvFamily, GemvParams, GemvVariant, WeightRef};

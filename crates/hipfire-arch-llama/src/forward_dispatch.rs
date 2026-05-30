@@ -2,13 +2,14 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Dispatch-based forward pass — proof of concept for [`RotationFamily`].
+//! Dispatch-based forward pass — replaces ALL inline GEMV calls in the
+//! LLaMA forward pass with [`GemvFamily::run`] / [`GemvFamily::run_auto`] dispatch.
 //!
 //! When `feature = "new-dispatch"` is active, this module provides
 //! `forward_scratch_layers` which replaces inline rotation calls with
-//! [`RotationFamily::run`] dispatch via `RotationVariant::WithRmsnorm`.
-//! Everything else (attention, KV cache, sampling) delegates to the same
-//! code paths as the runtime's `llama::forward_scratch_layers`.
+//! [`RotationFamily::run`] dispatch via `RotationVariant::WithRmsnorm` and
+//! replaces ALL inline `llama::weight_gemv*` calls with
+//! [`GemvFamily::run`] / [`GemvFamily::run_auto`] dispatch.
 //!
 //! Build: `cargo check -p hipfire-arch-llama --features new-dispatch`
 
@@ -16,40 +17,42 @@ use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu};
 
 use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::{GemvFamily, GemvParams, WeightRef};
 use hipfire_dispatch::families::rotation::{RotationFamily, RotationParams};
-use hipfire_dispatch::types::RotationVariant;
-use hipfire_runtime::llama::{self, ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
+use hipfire_dispatch::types::{dtype_needs_fwht, GemvVariant, RotationVariant};
+use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 
-/// Returns `true` when `dtype` requires FWHT rotation before GEMV.
-fn needs_mq_rotation(dtype: DType) -> bool {
-    matches!(
-        dtype,
-        DType::MQ4G256
-            | DType::MQ6G256
-            | DType::MQ3G256
-            | DType::MQ2G256
-            | DType::MQ2G256Lloyd
-            | DType::MQ3G256Lloyd
-            | DType::MQ4G256Lloyd
-            | DType::MFP4G32
-    )
-}
-
-/// Dispatch-aware layer loop that replaces inline rotation calls with
-/// [`RotationFamily::run`].
+/// Dispatch-aware layer loop that replaces inline rotation AND GEMV calls
+/// with [`RotationFamily::run`] and [`GemvFamily::run`]/[`GemvFamily::run_auto`] dispatch.
 ///
 /// Signature matches [`hipfire_runtime::llama::forward_scratch_layers`].
 ///
 /// # Rotation dispatch
 ///
 /// When the weight's [`DType`] is an MQ-family format requiring FWHT
-/// rotation (see [`needs_mq_rotation`]), this function uses
+/// rotation (see [`dtype_needs_fwht`]), this function uses
 /// [`RotationFamily::run`] with [`RotationVariant::WithRmsnorm`] to fuse
 /// RMSNorm + FWHT into a single kernel launch, reading from `scratch.x`
 /// and writing the rotated activation to `scratch.x_rot`.
 ///
+/// The subsequent GEMV call uses [`GemvFamily::run_auto`] with the
+/// already-rotated `scratch.x_rot` as the input `x`.
+///
 /// For non-MQ dtypes, the original split path is used: `rmsnorm_f32`
-/// into `scratch.tmp`, then `weight_gemv` without pre-rotation.
+/// into `scratch.tmp`, then a [`GemvFamily::run_auto`] GEMV.
+///
+/// # GEMV dispatch
+///
+/// All 12 inline `weight_gemv*` calls are replaced with [`GemvFamily::run_auto`]
+/// (which auto-selects Plain vs Prerotated based on [`dtype_needs_fwht`]):
+///
+/// | Projection | Notes |
+/// |---|---|
+/// | Q / K / V | `run_auto` selects Plain or Prerotated per dtype |
+/// | O | always Plain (via `run_auto`) |
+/// | Gate / Up | `run_auto` selects Plain or Prerotated per dtype |
+/// | Down | `run` with `WithResidual` (not handled by `run_auto`) |
+/// | Output (logits) | always Plain (via `run_auto`) |
 pub fn forward_scratch_layers(
     gpu: &mut Gpu,
     weights: &LlamaWeights,
@@ -65,6 +68,7 @@ pub fn forward_scratch_layers(
 ) -> HipResult<(u32, u32)> {
     let ctx = DispatchCtx::new(gpu);
     let rotation = RotationFamily::new();
+    let gemv = GemvFamily::new();
 
     let n_heads = config.n_heads;
     let n_kv_heads = config.n_kv_heads;
@@ -81,9 +85,7 @@ pub fn forward_scratch_layers(
                 &scratch.tmp, &scratch.q, &scratch.k, &scratch.v,
                 layer.wq.m, layer.wk.m, layer.wv.m, layer.wq.k,
             )?;
-        } else if needs_mq_rotation(layer.wq.gpu_dtype) {
-            // Dispatch: fused RMSNorm + FWHT rotation via RotationFamily.
-            // Reads from scratch.x, writes rotated result to scratch.x_rot.
+        } else if dtype_needs_fwht(layer.wq.gpu_dtype) {
             rotation.run(&ctx, gpu, RotationParams {
                 x: &scratch.x,
                 x_up: None,
@@ -96,20 +98,26 @@ pub fn forward_scratch_layers(
                 batch_size: 1,
                 variant: RotationVariant::WithRmsnorm,
             })?;
-            llama::weight_gemv_prerotated(
-                gpu, &layer.wq, &scratch.tmp, Some(&scratch.x_rot), &scratch.q,
-            )?;
-            llama::weight_gemv_prerotated(
-                gpu, &layer.wk, &scratch.tmp, Some(&scratch.x_rot), &scratch.k,
-            )?;
-            llama::weight_gemv_prerotated(
-                gpu, &layer.wv, &scratch.tmp, Some(&scratch.x_rot), &scratch.v,
-            )?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wq.buf, dtype: layer.wq.gpu_dtype, m: layer.wq.m, k: layer.wq.k,
+            }, &scratch.x_rot, &scratch.q)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wk.buf, dtype: layer.wk.gpu_dtype, m: layer.wk.m, k: layer.wk.k,
+            }, &scratch.x_rot, &scratch.k)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wv.buf, dtype: layer.wv.gpu_dtype, m: layer.wv.m, k: layer.wv.k,
+            }, &scratch.x_rot, &scratch.v)?;
         } else {
             gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
-            llama::weight_gemv(gpu, &layer.wq, &scratch.tmp, &scratch.q)?;
-            llama::weight_gemv(gpu, &layer.wk, &scratch.tmp, &scratch.k)?;
-            llama::weight_gemv(gpu, &layer.wv, &scratch.tmp, &scratch.v)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wq.buf, dtype: layer.wq.gpu_dtype, m: layer.wq.m, k: layer.wq.k,
+            }, &scratch.tmp, &scratch.q)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wk.buf, dtype: layer.wk.gpu_dtype, m: layer.wk.m, k: layer.wk.k,
+            }, &scratch.tmp, &scratch.k)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.wv.buf, dtype: layer.wv.gpu_dtype, m: layer.wv.m, k: layer.wv.k,
+            }, &scratch.tmp, &scratch.v)?;
         }
 
         // ── QK norm (optional per config) ───────────────────
@@ -229,7 +237,9 @@ pub fn forward_scratch_layers(
         }
 
         // ── Attention output projection + residual ─────────
-        llama::weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
+        gemv.run_auto(&ctx, gpu, &WeightRef {
+            buf: &layer.wo.buf, dtype: layer.wo.gpu_dtype, m: layer.wo.m, k: layer.wo.k,
+        }, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
         // ── FFN path ────────────────────────────────────────
@@ -239,8 +249,7 @@ pub fn forward_scratch_layers(
                 &scratch.tmp, &scratch.gate, &scratch.up,
                 layer.w_gate.m, layer.w_up.m, layer.w_gate.k,
             )?;
-        } else if needs_mq_rotation(layer.w_gate.gpu_dtype) {
-            // Dispatch: fused RMSNorm + FWHT rotation via RotationFamily.
+        } else if dtype_needs_fwht(layer.w_gate.gpu_dtype) {
             rotation.run(&ctx, gpu, RotationParams {
                 x: &scratch.x,
                 x_up: None,
@@ -253,27 +262,40 @@ pub fn forward_scratch_layers(
                 batch_size: 1,
                 variant: RotationVariant::WithRmsnorm,
             })?;
-            llama::weight_gemv_prerotated(
-                gpu, &layer.w_gate, &scratch.tmp, Some(&scratch.x_rot), &scratch.gate,
-            )?;
-            llama::weight_gemv_prerotated(
-                gpu, &layer.w_up, &scratch.tmp, Some(&scratch.x_rot), &scratch.up,
-            )?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.w_gate.buf, dtype: layer.w_gate.gpu_dtype, m: layer.w_gate.m, k: layer.w_gate.k,
+            }, &scratch.x_rot, &scratch.gate)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.w_up.buf, dtype: layer.w_up.gpu_dtype, m: layer.w_up.m, k: layer.w_up.k,
+            }, &scratch.x_rot, &scratch.up)?;
         } else {
             gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
-            llama::weight_gemv(gpu, &layer.w_gate, &scratch.tmp, &scratch.gate)?;
-            llama::weight_gemv(gpu, &layer.w_up, &scratch.tmp, &scratch.up)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.w_gate.buf, dtype: layer.w_gate.gpu_dtype, m: layer.w_gate.m, k: layer.w_gate.k,
+            }, &scratch.tmp, &scratch.gate)?;
+            gemv.run_auto(&ctx, gpu, &WeightRef {
+                buf: &layer.w_up.buf, dtype: layer.w_up.gpu_dtype, m: layer.w_up.m, k: layer.w_up.k,
+            }, &scratch.tmp, &scratch.up)?;
         }
 
         // ── SwiGLU + down projection + residual ─────────────
         gpu.silu_mul_f32(&scratch.gate, &scratch.up, &scratch.ffn_hidden)?;
-        llama::weight_gemv(gpu, &layer.w_down, &scratch.ffn_hidden, &scratch.ffn_out)?;
-        gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
+        gemv.run(&ctx, gpu, &GemvParams {
+            w: &WeightRef { buf: &layer.w_down.buf, dtype: layer.w_down.gpu_dtype, m: layer.w_down.m, k: layer.w_down.k },
+            x: &scratch.ffn_hidden,
+            y: &scratch.ffn_out,
+            variant: GemvVariant::WithResidual,
+            residual: Some(&scratch.x),
+            gate: None,
+            up: None,
+        })?;
     }
 
     // ── Final norm + logits + sampling ──────────────────────
     gpu.rmsnorm_f32(&scratch.x, &weights.output_norm, &scratch.tmp, config.norm_eps)?;
-    llama::weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+    gemv.run_auto(&ctx, gpu, &WeightRef {
+        buf: &weights.output.buf, dtype: weights.output.gpu_dtype, m: weights.output.m, k: weights.output.k,
+    }, &scratch.tmp, &scratch.logits)?;
 
     gpu.sample_top_p(
         &scratch.logits, &scratch.sample_buf, &scratch.repeat_buf,

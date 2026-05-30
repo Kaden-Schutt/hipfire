@@ -253,6 +253,7 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+#[cfg(feature = "from-hip-error")]
 impl From<DispatchError> for hip_bridge::HipError {
     fn from(e: DispatchError) -> Self {
         hip_bridge::HipError::new(0, &e.to_string())
@@ -383,34 +384,49 @@ impl KernelKey {
         use GemvVariant::*;
         match variant {
             Plain => {
-                match dtype {
+                let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
                     | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
                     | MFP4G32 | PARO4G128 | PARO4G128T | ParoQ4G128 => {
                         &[PipelineOp::RotateFwht, PipelineOp::Gemv]
                     }
                     _ => &[PipelineOp::Gemv],
-                }
+                };
+                steps
             }
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
-                match dtype {
+                let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd
                     | PARO4G128 | PARO4G128T => {
                         &[PipelineOp::RotateFwht, PipelineOp::Gemv, PipelineOp::ResidualAdd]
                     }
                     _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
-                }
+                };
+                steps
             }
             WithSwiGLUResidual => {
-                match dtype {
+                let steps: &[PipelineOp] = match dtype {
                     MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd
                     | PARO4G128 | PARO4G128T => {
                         &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
                     }
                     _ => &[PipelineOp::SiluMul, PipelineOp::Gemv, PipelineOp::ResidualAdd],
-                }
+                };
+                steps
             }
         }
     }
+}
+
+/// Whether a DType requires FWHT-rotated activations before GEMV.
+/// Replaces per-model `needs_mq_rotation` / `weight_needs_fwht` helpers.
+pub fn dtype_needs_fwht(dtype: DType) -> bool {
+    use DType::*;
+    matches!(
+        dtype,
+        MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
+            | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+            | MFP4G32 | PARO4G128 | PARO4G128T | ParoQ4G128
+    )
 }

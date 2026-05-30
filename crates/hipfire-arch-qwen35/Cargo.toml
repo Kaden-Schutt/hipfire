@@ -6,7 +6,7 @@ license.workspace = true
 description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 
 [features]
-new-dispatch = ["hipfire-dispatch"]
+new-dispatch = ["hipfire-dispatch/from-hip-error"]
 # Enable hybrid DeltaNet + speculative decoding paths. Currently always-on
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
