@@ -5511,7 +5511,15 @@ fn main() {
             // the depthwise conv filter, and the tied embed/lm_head stay Q8
             // (precision-sensitive / tiny). OFF by default — flip on only after
             // the tiny-oracle cosine (≥0.99) + coherence gate confirm it.
-            if std::env::var_os("HIPFIRE_LFM2_PROJ_MQ4").is_some()
+            // MQ6 variant (HIPFIRE_LFM2_PROJ_MQ6=1) is the lower-quality-loss
+            // middle ground: 6-bit projections keep ~half the MQ4 bandwidth
+            // saving but at much lower KLD (MQ4-proj measured mean KL ≈0.96 nats
+            // vs Q8 on this model — large; MQ6 should be far smaller). If both
+            // flags are set, MQ6 wins (the safer of the two). 200 B/group vs
+            // MQ4's 136 B/group vs Q8's ~34 B/group-equivalent.
+            let proj_mq6 = std::env::var_os("HIPFIRE_LFM2_PROJ_MQ6").is_some();
+            let proj_mq4 = std::env::var_os("HIPFIRE_LFM2_PROJ_MQ4").is_some();
+            if (proj_mq6 || proj_mq4)
                 && meta.shape.len() == 2
                 && meta.shape[1] % 256 == 0
                 && (name.ends_with(".conv.in_proj.weight")
@@ -5528,10 +5536,15 @@ fn main() {
                     name, raw_data, meta, &fp8_scale_for, &st_files);
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
-                eprintln!("  {:>8}: {} {:?} (proj MQ4)", "MQ4P-LFM", name, meta.shape);
+                let (q, qt, tag) = if proj_mq6 {
+                    (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6P-LFM")
+                } else {
+                    (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4P-LFM")
+                };
+                eprintln!("  {:>8}: {} {:?} (proj {})", tag, name, meta.shape,
+                    if proj_mq6 { "MQ6" } else { "MQ4" });
                 hfq_tensors.push(HfqTensor {
-                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    name: name.to_string(), quant_type: qt,
                     shape, group_size: 256, data: q, spilled_len: 0,
                 });
                 quantized_params += (meta.shape[0] * meta.shape[1]) as u64;

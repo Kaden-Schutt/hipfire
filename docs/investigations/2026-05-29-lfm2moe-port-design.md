@@ -202,18 +202,88 @@ floor on a ~330-launch-per-token decode. **Reverted** (no benefit, adds a 2nd
 kernel + dispatch branch) — kept only as this negative-result log entry.
 
 ### Genuinely-untried levers that DO cut launch count (higher effort)
-The real decode bound at batch=1 is launch overhead (~330 launches/tok). Levers
-that reduce COUNT, not bytes: rmsnorm→gemv fusion (needs Q8 fused kernels — the
-existing fused-rmsnorm-rotate is MQ-only), MoE down+combine fusion (an hfq4
-residual-scaled down like the MQ2-Lloyd path has, but none exists for hfq4 yet),
-HIP graph capture of the per-token kernel sequence (amortize launch cost), and
-batched prefill. The bandwidth lever (proj-MQ4, +7.2%) is the only cheap win
-found. All require cosine + coherence re-validation; MQ6-proj is an untried
-middle-ground on the bandwidth axis.
+### Decode profile (rocprofv3, gfx1201, 2026-05-30) — BANDWIDTH-bound, not launch-bound
+
+A real kernel trace (`rocprofv3 --kernel-trace`, 64-tok decode) corrected two
+earlier *assumptions* that turned out wrong:
+- **Launch overhead is NOT the dominant cost.** Decode region is ~70% GPU-busy /
+  ~27% inter-kernel launch-idle (of busy+idle) — not the "~55% idle / ~330
+  launches as the bound" earlier hand-waved. ~377 kernels/tok, but they're
+  mostly busy.
+- **The MoE topk kernel is cheap** (`deepseek4_moe_topk_bias_aware_f32` = 1.9%,
+  grid 32×32) — NOT a hot spot.
+- **The real hot kernel is `gemv_q8_0` = 49.5% of decode GPU time** (the dense Q8
+  projections), then the two MoE 4-bit expert GEMVs (gate_up 17.7% + down 12.4%
+  = 30%). Decode is **weight-bandwidth-bound on the dense projections.**
+
+**Consequence: HIP graph capture is NOT the big lever** it was assumed to be — it
+only attacks the ~27% launch-idle, and qwen35 already disabled AR-forward graph
+capture (`qwen35.rs` `use_graph=false`) over a ROCm kernarg-bake attractor bug.
+The bandwidth axis (4-bit-ing the hot `gemv_q8_0` projections) is where the real
+decode time is — which is exactly the proj-quant lever below.
+
+Other launch-COUNT levers (rmsnorm→gemv fusion, MoE down+combine fusion, batched
+prefill) remain available but target the smaller idle fraction, not the 80% the
+GEMVs occupy.
+
+### Projection-quant bandwidth sweep (KLD, gfx1201, 2026-05-30) — SETTLED
+
+Measured via `examples/kld_logits` over 44 positions (self-KL control
+mq4-vs-mq4 = 0.000000, so the harness is exact), plus matched decode + coherence.
+
+**Reference matters: KL is anchored on the BF16 SOURCE, not on Q8.** Q8 has its
+own quant error, so a Q8-referenced KL hides the real picture. The bf16 reference
+logits come from HF `Lfm2MoeForCausalLM` (CPU, one causal forward over the same
+44 token ids); `scripts/bf16_ref.py` workflow.
+
+**KL(bf16 ‖ candidate)** — the absolute quality vs ground truth:
+
+| variant | proj quant | mean KL | top-1 agree vs bf16 | decode tok/s | coherence |
+|---------|-----------|---------|---------------------|-------------|-----------|
+| mq4 (default) | Q8 | **0.841** | **88.6%** | 241.1 | ✅ |
+| mq6p | MQ6 | 0.916 | 81.8% | **240.0 (≈0%)** | ❌ loop (tok-443 attractor) |
+| mq4p | MQ4 | 1.100 | 79.5% | 258.8 (+7.2%) | ⚠️ passes gate, high KLD |
+
+(KL is uniform across positions — excl-pos0 mean = 0.830 ≈ all = 0.841 — so it's
+genuine quant spread, not a measurement edge effect.)
+
+**The key finding (only visible with bf16 as reference):** the dominant quality
+cost is the **4-bit experts** (MQ4G256, shared by ALL three variants) — the Q8
+default is already ~0.84 nats / 11% top-1-disagreement from bf16. The dense
+**projections are secondary**: Q8→MQ6→MQ4 adds only +0.08 / +0.26 nats on top.
+
+**Conclusions (unchanged from the Q8-ref pass, now better-grounded):**
+1. **proj-MQ4 stays OPT-IN** — +7.2% real, but it's the worst quality (1.10 nats,
+   79.5% top-1) and adds the most projection damage. Not default.
+2. **proj-MQ6 REJECTED** — dead end: **no speedup** (240.0 vs 241.1, MQ6G256 proj
+   GEMV isn't bandwidth-winning at batch=1) AND degrades quality into an outright
+   loop on "capital of France". Worse than Q8 on every axis.
+3. **Q8 projections (current default) is correct** — best quality, full speed.
+4. **The real quality lever is the EXPERTS, not the projections.** A future
+   higher-precision-expert variant (mq6 experts) would cut the 0.84 baseline far
+   more than any projection change; that's the open quality question, traded
+   against VRAM/bandwidth.
+
+**Caveat (honest):** the absolute 0.84-nat baseline may include some
+hipfire-GPU-vs-HF-CPU numerical drift beyond pure quantization (the tiny-oracle
+cosine ≥0.999 and passing coherence confirm the arch is correct, so it's not a
+bug; separating pure-quant from kernel-drift would need a tiny-oracle run in
+logit-KL space). The RELATIVE ordering and the experts-dominate conclusion are
+robust to any such constant offset.
+
+Tooling added (uncommitted, for review): `examples/kld_logits.rs` (per-position
+KL between two models or `--dump` one model's logits; arch_id 11 wired) +
+quantizer `HIPFIRE_LFM2_PROJ_MQ6=1` (mirrors `HIPFIRE_LFM2_PROJ_MQ4`, routes
+dense projections to MQ6G256) + the bf16-reference KL workflow.
 
 ## Open items
-1. KLD/PPL of proj-MQ4 (and any future quant) vs the Q8 model on a calibration
-   set, to decide whether proj-MQ4 (or a mixed mq4/mq6) can become default.
+1. ~~KLD/PPL of proj-MQ4 vs Q8~~ **DONE 2026-05-30** (bf16-referenced table
+   above): Q8 default 0.84 nats / 88.6% top-1 vs bf16 (experts dominate);
+   proj-MQ4 1.10 / 79.5% → stays opt-in; proj-MQ6 no-speedup+loop → rejected; Q8
+   default confirmed best. A default-able *decode* win needs a NEW projection
+   format (faster than Q8 at batch=1 AND lower-KLD than MQ4) or the launch-count
+   fusion levers; the bigger *quality* lever is higher-precision EXPERTS (mq6),
+   traded against VRAM/bandwidth — still open.
 2. Prefill is per-token `decode_step` (correctness-first); a batched prefill
    kernel set would speed long-context ingestion (needs batched conv1d scan +
    batched attn/MoE).
