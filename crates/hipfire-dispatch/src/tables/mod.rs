@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+pub mod gemv_table;
+pub mod rotation_table;
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 use crate::context::DispatchCtx;

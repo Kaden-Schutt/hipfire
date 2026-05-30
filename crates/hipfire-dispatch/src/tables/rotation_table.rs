@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+use crate::types::*;
+use crate::tables::KernelRegistry;
+
+fn noop() {}
+
+/// Populate the registry with rotation kernel variants.
+pub fn populate(registry: &KernelRegistry) {
+    macro_rules! reg {
+        ($key:ident, $arch:expr, $steps:expr, $awq:expr) => {
+            registry.register(KernelVariant {
+                key: KernelKey::$key,
+                fn_ptr: noop,
+                arch_required: $arch,
+                shape_gate: None,
+                steps: $steps,
+                has_awq: $awq,
+            });
+        };
+    }
+
+    // RotateMq — plain FWHT rotation
+    reg!(RotateMq, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
+    reg!(RotateMqAwq, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
+    reg!(RotateMqBatched, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
+    reg!(RotateMqAwqBatched, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
+
+    // RmsnormRotateMq — fused RMSNorm + FWHT rotation
+    reg!(RmsnormRotateMq, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
+    reg!(RmsnormRotateMqAwq, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
+    reg!(RmsnormRotateMqBatched, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
+    reg!(RmsnormRotateMqAwqBatched, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
+
+    // SiluMulRotateMq — fused SwiGLU + FWHT rotation
+    reg!(SiluMulRotateMq, ArchPredicate::Always, &[PipelineOp::SiluMulRotate], false);
+    reg!(SiluMulRotateMqAwq, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::SiluMulRotate], true);
+
+    // RmsnormF32 — plain RMSNorm, no rotation (utility entry)
+    reg!(RmsnormF32, ArchPredicate::Always, &[], false);
+}
