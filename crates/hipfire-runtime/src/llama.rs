@@ -3858,9 +3858,23 @@ impl KvCache {
         gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_fwht3_capped_filtered(
+            gpu, is_kv_layer, n_kv_heads, head_dim, max_seq_len, max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht3 — layer-filtered (skips non-KV layers) with an
+    /// explicit `physical_cap` for TriAttention/CASK eviction. Default path has
+    /// `physical_cap == max_seq_len` (no eviction). Byte layout identical to
+    /// `asym3_capped_filtered`; rotation primitive is signed-FWHT-256.
+    pub fn new_gpu_fwht3_capped_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim == 256, "fwht3 currently requires head_dim=256 (Qwen 3.5)");
         assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + (head_dim * 3) / 8;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
@@ -4000,9 +4014,22 @@ impl KvCache {
         gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_fwht2_capped_filtered(
+            gpu, is_kv_layer, n_kv_heads, head_dim, max_seq_len, max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht2 — layer-filtered with explicit `physical_cap`
+    /// for TriAttention/CASK eviction. Byte layout identical to
+    /// `asym2_capped`; rotation primitive is signed-FWHT-128.
+    pub fn new_gpu_fwht2_capped_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim == 128 || head_dim == 256, "fwht2 requires head_dim=128 or 256");
         assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + head_dim / 4;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
