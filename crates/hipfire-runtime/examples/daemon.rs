@@ -2276,14 +2276,22 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // caps at 8192; honour the caller's max_seq when it's larger/smaller).
         let state = minimax::MiniMaxState::new_with_max_seq(gpu, &config, max_seq)
             .map_err(|e| format!("minimax: MiniMaxState::new_with_max_seq failed: {e}"))?;
-        // Resolve EOS via the tokenizer. MiniMax-M2 uses the standard
-        // ChatML-ish `<|im_end|>`; fall back to common alternates, then 1.
+        // Resolve EOS via the tokenizer. MiniMax-M2 does NOT use ChatML —
+        // its end-of-turn marker is the added token `[e~[` (id 200020 in the
+        // 200k vocab; tokenizer_config.json eos_token = `[e~[`,
+        // generation_config.json eos_token_id = 200020). The earlier ChatML
+        // probes (`<|im_end|>` etc.) are absent from this vocab and silently
+        // fell back to token 1, so generate_minimax never hit EOS: every turn
+        // ran to max_tokens and the model spammed `[e~[` trying to end the
+        // turn. Probe the real marker first; keep the ChatML fallbacks for
+        // safety on any future tokenizer variant.
         let eos_tok: u32 = {
             let try_one = |s: &str| -> Option<u32> {
                 let ids = tokenizer.encode(s);
                 if ids.len() == 1 { Some(ids[0]) } else { None }
             };
-            try_one("<|im_end|>")
+            try_one("[e~[")
+                .or_else(|| try_one("<|im_end|>"))
                 .or_else(|| try_one("</s>"))
                 .or_else(|| try_one("<|endoftext|>"))
                 .unwrap_or(1)
@@ -6398,6 +6406,11 @@ fn generate_minimax(
     }
 
     // ── Prompt build (same two-path branch as the qwen35 AR path) ──
+    // `primed_think` records whether the rendered prompt actually ended with
+    // the MiniMax `<think>` generation-primer, so we only re-emit the opener
+    // (below) when the model truly begins inside the reasoning block. A jinja
+    // render failure that falls back to the Plain frame leaves it false.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
@@ -6441,7 +6454,10 @@ fn generate_minimax(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<think>");
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in minimax path ({e}) — falling back to Plain");
                     hipfire_runtime::prompt_frame::ChatFrame {
@@ -6522,6 +6538,25 @@ fn generate_minimax(
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+
+    // MiniMax-M2's chat template unconditionally primes the assistant turn
+    // with `<think>\n` (chat_template.jinja generation-prompt block), so the
+    // model's GENERATED tokens begin *inside* the reasoning block and it only
+    // ever emits the closing `</think>`. Every downstream `<think>` consumer —
+    // the serve reasoning_content/content split, the run/chat-path stripper,
+    // and the history `stripThinkingInline` — keys on a LEADING `<think>` and
+    // so never engages, leaking the chain-of-thought into `message.content`.
+    // The primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only, not pushed to state) so the assistant message is a
+    // well-formed `<think>...</think>...` block for every consumer.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": "<think>\n"}),
+        );
+        let _ = stdout.flush();
+    }
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
