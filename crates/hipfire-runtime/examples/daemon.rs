@@ -6522,16 +6522,40 @@ fn generate_minimax(
         let cfg = m.minimax_config.as_ref().unwrap();
         let weights = m.minimax_weights.as_ref().unwrap();
         let state = m.minimax_state.as_mut().unwrap();
-        let mut position = state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
-                Ok(logits) => last_logits = logits,
-                Err(e) => {
-                    emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                    return;
+        // Batched prefill: process the prompt in chunks of <=64 tokens through
+        // the batched verify forward (one weight read per chunk vs one
+        // decode_step per token) → much lower TTFT. Validated byte-identical to
+        // the sequential path (cosine 1.0). DEFAULT ON when every layer's expert
+        // dtypes have batched kernels; the pre-check routes unsupported tiers
+        // (MQ3-Lloyd etc.) to the sequential path to avoid a mid-pass error.
+        // Force off with HIPFIRE_MINIMAX_BATCH_PREFILL=0.
+        let batch_prefill = std::env::var_os("HIPFIRE_MINIMAX_BATCH_PREFILL")
+            .map_or(true, |v| v != "0")
+            && minimax::forward::forward_batch_supported(weights);
+        if batch_prefill && !prompt_ids.is_empty() {
+            let mut pos = state.n_tokens;
+            for chunk in prompt_ids.chunks(64) {
+                match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("minimax batch prefill failed: {e:?}"));
+                        return;
+                    }
                 }
+                pos += chunk.len();
             }
-            position += 1;
+        } else {
+            let mut position = state.n_tokens as u32;
+            for &tok in &prompt_ids {
+                match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
+                        return;
+                    }
+                }
+                position += 1;
+            }
         }
     }
     for &tok in &prompt_ids {
@@ -6602,7 +6626,9 @@ fn generate_minimax(
             let weights = m.minimax_weights.as_ref().unwrap();
             let state = m.minimax_state.as_mut().unwrap();
             let position = state.n_tokens as u32;
-            minimax::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            // hipGraph decode (gfx11/gfx12 default; HIPFIRE_MINIMAX_GRAPH=0 to
+            // force eager). First call warms up eager, then captures + replays.
+            minimax::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, position)
         };
         match step {
             Ok(logits) => last_logits = logits,

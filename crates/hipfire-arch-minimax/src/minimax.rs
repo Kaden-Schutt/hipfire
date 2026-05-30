@@ -408,8 +408,19 @@ impl MiniMaxWeights {
 pub struct MiniMaxState {
     pub kv: KvCache,
     pub pos_buf: hip_bridge::DeviceBuffer, // device i32 position scalar
+    /// Stable host source for the device position scalar. The hipGraph decode
+    /// path captures a `memcpy_htod_auto` from these bytes; the captured node
+    /// re-reads this heap-stable `Box` on every replay (see
+    /// `decode_step_with_graph`). Updated host-side before each `graph_launch`.
+    pub pos_host: Box<[i32]>,
     pub max_seq: usize,
     pub n_tokens: usize,
+    /// hipGraph warmup gate: the first decode after a fresh load runs eager
+    /// (no capture) to JIT-compile kernels + settle DPM, then the next call
+    /// captures. Survives turn resets (the graph stays valid for the same
+    /// model — only weight pointers + device buffers are baked, and those are
+    /// stable across turns).
+    pub ar_warmed_up: bool,
 
     // attention scratch
     pub tmp: GpuTensor,    // [hidden] rmsnorm(h)
@@ -493,8 +504,10 @@ impl MiniMaxState {
         Ok(MiniMaxState {
             kv,
             pos_buf,
+            pos_host: vec![0i32; 1].into_boxed_slice(),
             max_seq,
             n_tokens: 0,
+            ar_warmed_up: false,
             tmp: alloc(gpu, hidden, "tmp")?,
             x_rot: alloc(gpu, hidden, "x_rot")?,
             fa_q: alloc(gpu, q_dim, "fa_q")?,
