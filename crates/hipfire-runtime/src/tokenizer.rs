@@ -1391,9 +1391,21 @@ pub fn strip_trailing_line_ws(s: &str) -> String {
 /// disabled; `Cow::Owned` only on actual rewrite. Each step in the pipeline
 /// is itself a no-op fast-path when its trigger pattern is absent.
 pub fn maybe_normalize_prompt(s: &str) -> std::borrow::Cow<'_, str> {
+    // Default ON. Explicit "0" / "false" / "off" opts out (parsed once in
+    // RuntimeConfig::from_env). Delegates to the flag-parameterized core so the
+    // pipeline is unit-testable without the memoized `config::get()` singleton.
+    normalize_prompt_with(s, crate::config::get().normalize_prompt)
+}
+
+/// Core prompt-normalization pipeline, parameterized on the enable flag.
+/// `maybe_normalize_prompt` is the production entry point; tests call this
+/// directly with an explicit flag. (The global `config::get()` is a memoized
+/// `OnceLock`, so toggling `HIPFIRE_NORMALIZE_PROMPT` per-call can't drive it
+/// in a shared test process — that mismatch is what silently broke the
+/// opt-out tests until CI surfaced it.)
+fn normalize_prompt_with(s: &str, enabled: bool) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
-    // Default ON. Explicit "0" / "false" / "off" / "no" opts out.
-    if !crate::config::get().normalize_prompt {
+    if !enabled {
         return Cow::Borrowed(s);
     }
 
@@ -1833,18 +1845,12 @@ mod sp_tests {
 mod prompt_norm_tests {
     use super::*;
 
-    // Tests below read `HIPFIRE_NORMALIZE_PROMPT` (a process-global env var)
-    // via `maybe_normalize_prompt`, and several set/remove it. cargo runs unit
-    // tests on parallel threads within one process, so without serialization
-    // they race — one test's set/remove_var clobbers another's expected state
-    // mid-assertion (observed as flakes in clean CI). Any test that touches the
-    // env var must hold `env_guard()` for its whole body; the pure-function
-    // tests do not. Poison-tolerant so one failing test doesn't cascade.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
-    }
+    // The flag-routing tests below call `normalize_prompt_with(s, enabled)`
+    // directly instead of toggling `HIPFIRE_NORMALIZE_PROMPT` and going through
+    // `maybe_normalize_prompt`. The env var is consumed once by the memoized
+    // `config::get()` singleton, so per-call toggling can't drive it in a
+    // shared test process — testing the parameterized core keeps these
+    // deterministic and parallel-safe.
 
     #[test]
     fn collapse_three_to_two() {
@@ -1900,34 +1906,28 @@ mod prompt_norm_tests {
     }
 
     #[test]
-    fn default_on_collapses_when_env_unset() {
-        let _env = env_guard();
-        // Default flipped to ON 2026-04-26 — env unset → still collapses.
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+    fn enabled_collapses_newline_runs() {
+        // Enabled (the production default) → `\n{3,}` collapses to `\n\n`.
         let s = "a\n\n\nb";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert!(matches!(out, std::borrow::Cow::Owned(_)));
         assert_eq!(out.as_ref(), "a\n\nb");
     }
 
     #[test]
-    fn explicit_zero_opts_out() {
-        let _env = env_guard();
-        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
+    fn disabled_passes_through_borrowed() {
+        // Opt-out (HIPFIRE_NORMALIZE_PROMPT=0 → enabled=false) → input untouched.
         let s = "a\n\n\nb";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, false);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\n\nb");
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
     }
 
     #[test]
     fn cow_borrowed_when_no_runs() {
-        let _env = env_guard();
-        // Even with default-ON, no `\n{3,}` runs means no rewrite needed.
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+        // Even enabled, no `\n{3,}` runs means no rewrite needed → Borrowed.
         let s = "a\n\nb"; // already single-blank
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), "a\n\nb");
     }
@@ -2108,55 +2108,45 @@ mod prompt_norm_tests {
 
     #[test]
     fn pipeline_crlf_and_trailing_ws() {
-        let _env = env_guard();
         // Windows-pasted snippet with trailing whitespace.
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "def foo():   \r\n    return 1   \r\n";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert_eq!(out.as_ref(), "def foo():\n    return 1\n");
     }
 
     #[test]
     fn pipeline_blank_line_indent_then_collapse() {
-        let _env = env_guard();
         // Indented blank line between top-level defs:
         //   "a\n    \n\nb" — line 2 is whitespace-only, lines 2-3 form a `\n\n\n`
         //   run after stripping. Collapse should reduce to `\n\n`.
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "a\n    \n\nb";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert_eq!(out.as_ref(), "a\n\nb");
     }
 
     #[test]
     fn pipeline_nbsp_in_prose() {
-        let _env = env_guard();
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Use\u{00A0}foo()\u{00A0}for\u{00A0}this.";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert_eq!(out.as_ref(), "Use foo() for this.");
     }
 
     #[test]
     fn pipeline_clean_input_is_borrowed() {
-        let _env = env_guard();
         // No CRLF, no NBSP, no trailing ws, no \n{3,} — must stay Borrowed.
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
         let s = "Plain prompt.\nSecond line.\n\nThird paragraph.\n";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, true);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
     }
 
     #[test]
     fn pipeline_explicit_opt_out_skips_all_rules() {
-        let _env = env_guard();
-        // Opt-out must skip CRLF/NBSP/trailing-ws too, not just newline collapse.
-        std::env::set_var("HIPFIRE_NORMALIZE_PROMPT", "0");
+        // Opt-out (enabled=false) must skip CRLF/NBSP/trailing-ws too, not just
+        // newline collapse.
         let s = "a\r\nb\u{00A0}c   \nd\n\n\ne";
-        let out = maybe_normalize_prompt(s);
+        let out = normalize_prompt_with(s, false);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
-        std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
     }
 }
