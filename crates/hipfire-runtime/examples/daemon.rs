@@ -1313,8 +1313,15 @@ fn main() {
                 // model. Pick arch-shaped defaults so a vanilla
                 // `/v1/chat/completions` POST (no sampling fields) works on
                 // both. Explicit per-request values still override either.
-                let (default_temp, default_top_p) = if m.arch_id == 9 || m.arch_id == 10 || m.arch_id == 11 {
-                    // DeepSeek V4 (9) + MiniMax-M2 (10) + LFM2.5-MoE (11): quantized instruct
+                let (default_temp, default_top_p) = if m.arch_id == 11 {
+                    // LFM2.5-MoE (11): Liquid's model card recommends specific
+                    // sampling — temperature=0.2, top_p=0.80 (+ repetition_penalty
+                    // 1.05, set below). Use those exact values, not the generic
+                    // MoE-instruct (temp=1.0) default — they're tuned for this
+                    // model and keep it on-distribution.
+                    (0.2_f64, 0.80_f64)
+                } else if m.arch_id == 9 || m.arch_id == 10 {
+                    // DeepSeek V4 (9) + MiniMax-M2 (10): quantized instruct
                     // MoE models that fall into block-level attractors under
                     // pure greedy. Default to the HF-recommended sampling
                     // (temp=1.0, top_p=1.0); explicit per-request values
@@ -1337,7 +1344,10 @@ fn main() {
                 // Root cause writeup: issue #258 comment "Bug B root cause"
                 // and docs/investigations/2026-05-15-9b-reasoning-loop/.
                 // Clients can still opt in to a non-1.0 value per request.
-                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                // LFM2.5-MoE (arch_id 11): Liquid's card recommends
+                // repetition_penalty=1.05; default to it (others stay 1.0/off).
+                let default_repeat_penalty = if m.arch_id == 11 { 1.05_f64 } else { 1.0_f64 };
+                let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(default_repeat_penalty) as f32;
                 // OpenAI-compatible `reasoning_effort` (also accept our custom
                 // `thinking_mode` alias) — only consumed by arch_id=9 today.
                 // Default = NonThink, matching the safe HF chat frame.
