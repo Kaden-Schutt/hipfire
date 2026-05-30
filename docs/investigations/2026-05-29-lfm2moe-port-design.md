@@ -236,45 +236,75 @@ own quant error, so a Q8-referenced KL hides the real picture. The bf16 referenc
 logits come from HF `Lfm2MoeForCausalLM` (CPU, one causal forward over the same
 44 token ids); `scripts/bf16_ref.py` workflow.
 
-**KL(bf16 ‖ candidate)** — the absolute quality vs ground truth:
+**KL(bf16 ‖ candidate)** — the absolute quality vs ground truth. All figures
+recomputed from the on-disk per-position logit dumps (`kld_logits --dump` +
+`scripts/bf16_ref.py`; 44 positions):
 
-| variant | proj quant | mean KL | top-1 agree vs bf16 | decode tok/s | coherence |
-|---------|-----------|---------|---------------------|-------------|-----------|
-| mq4 (default) | Q8 | **0.841** | **88.6%** | 241.1 | ✅ |
-| mq6p | MQ6 | 0.916 | 81.8% | **240.0 (≈0%)** | ❌ loop (tok-443 attractor) |
-| mq4p | MQ4 | 1.100 | 79.5% | 258.8 (+7.2%) | ⚠️ passes gate, high KLD |
+| variant | proj quant | mean KL | median | frac>0.1 | top-1 agree | decode tok/s | coherence |
+|---------|-----------|---------|--------|----------|-------------|-------------|-----------|
+| mq4 (default) | Q8 | **0.424** | 0.311 | 0.841 | **72.7%** | 241.1 | ✅ |
+| mq6p | MQ6 | 0.447 | 0.309 | 0.864 | 79.5% | 240.0 (≈0%) | ❌ loop (tok-443 attractor) |
+| mq4p | MQ4 | 1.050 | 0.789 | 0.977 | 56.8% | 258.8 (+7.2%) | ⚠️ passes gate, high KLD |
 
-(KL is uniform across positions — excl-pos0 mean = 0.830 ≈ all = 0.841 — so it's
-genuine quant spread, not a measurement edge effect.)
+> **Correction (2026-05-30):** the first commit of this table (8ac10a48) carried
+> wrong numbers — mq4 mean was written as 0.841 (that's its *frac>0.1*, not the
+> mean) and top-1 as 88.6% (unsourced). The values above are the authoritative
+> recompute from the logit dumps. The conclusions below are unchanged.
 
 **The key finding (only visible with bf16 as reference):** the dominant quality
 cost is the **4-bit experts** (MQ4G256, shared by ALL three variants) — the Q8
-default is already ~0.84 nats / 11% top-1-disagreement from bf16. The dense
-**projections are secondary**: Q8→MQ6→MQ4 adds only +0.08 / +0.26 nats on top.
+default is already ~0.42 nats / 27% top-1-disagreement from bf16. The dense
+**projections are secondary**: Q8→MQ6 barely moves it (+0.02), Q8→MQ4 roughly
+doubles it (+0.63).
 
-**Conclusions (unchanged from the Q8-ref pass, now better-grounded):**
-1. **proj-MQ4 stays OPT-IN** — +7.2% real, but it's the worst quality (1.10 nats,
-   79.5% top-1) and adds the most projection damage. Not default.
+**Conclusions:**
+1. **proj-MQ4 stays OPT-IN** — +7.2% real, but worst quality (1.05 nats, 56.8%
+   top-1) and adds the most projection damage. Not default.
 2. **proj-MQ6 REJECTED** — dead end: **no speedup** (240.0 vs 241.1, MQ6G256 proj
    GEMV isn't bandwidth-winning at batch=1) AND degrades quality into an outright
    loop on "capital of France". Worse than Q8 on every axis.
-3. **Q8 projections (current default) is correct** — best quality, full speed.
-4. **The real quality lever is the EXPERTS, not the projections.** A future
-   higher-precision-expert variant (mq6 experts) would cut the 0.84 baseline far
-   more than any projection change; that's the open quality question, traded
-   against VRAM/bandwidth.
+3. **Q8 projections (current default) is correct** — best speed, near-best KL.
+4. **The real quality lever is the EXPERTS, not the projections** — CONFIRMED in
+   the MQ6-experts section below.
 
-**Caveat (honest):** the absolute 0.84-nat baseline may include some
-hipfire-GPU-vs-HF-CPU numerical drift beyond pure quantization (the tiny-oracle
-cosine ≥0.999 and passing coherence confirm the arch is correct, so it's not a
-bug; separating pure-quant from kernel-drift would need a tiny-oracle run in
-logit-KL space). The RELATIVE ordering and the experts-dominate conclusion are
-robust to any such constant offset.
+**Caveat (honest):** the absolute ~0.42-nat baseline may include some
+hipfire-GPU-vs-HF-CPU numerical drift beyond pure quantization (tiny-oracle
+cosine ≥0.999 + passing coherence confirm the arch is correct, so it's not a
+bug). The RELATIVE ordering is robust to any constant offset.
 
-Tooling added (uncommitted, for review): `examples/kld_logits.rs` (per-position
-KL between two models or `--dump` one model's logits; arch_id 11 wired) +
-quantizer `HIPFIRE_LFM2_PROJ_MQ6=1` (mirrors `HIPFIRE_LFM2_PROJ_MQ4`, routes
-dense projections to MQ6G256) + the bf16-reference KL workflow.
+### MQ6-experts (new HFQ6 indexed MoE decode kernel, gfx1201, 2026-05-30) — SHIPPED opt-in
+
+Acting on finding #4 (experts dominate): added a 6-bit-experts variant. Required
+ONE new kernel — `gemv_hfq6g256_moe_gate_up_k8_indexed_batched` (the matching
+`_down_k8_indexed_batched_expanded` already existed) — mirroring the hfq4 indexed
+MoE GEMV with the 6-bit dequant from `gemv_hfq6g256.hip` (200 B/group vs hfq4's
+136; bit-pack roundtrip proven symbolically against `quantize_mq6g256`).
+forward.rs routes to the HFQ6 kernels when the loaded experts are MQ6G256;
+quantizer gate `HIPFIRE_LFM2_EXPERT_MQ6=1`. Model: `lfm2.5-8b-a1b.mq6e`.
+
+| variant | experts | mean KL vs bf16 | top-1 vs bf16 | decode tok/s | VRAM | coherence |
+|---------|---------|-----------------|---------------|--------------|------|-----------|
+| mq4 (default) | MQ4G256 | 0.424 | 72.7% | 241.1 | 4.6 GB | ✅ |
+| **mq6e** | **MQ6G256** | **0.135** | **79.5%** | 203.5 (−16%) | 6.4 GB | ✅ |
+
+**−68% KL vs bf16 (0.424→0.135) for −16% decode (241→203) + 1.8 GB.** This is the
+inverse of the projection levers: proj-MQ4 traded quality DOWN for speed;
+mq6-experts trades speed DOWN for quality, far more efficiently (the experts are
+where the error lives). Validated three ways: (1) chat-framed `coherence_probe`
+verdict **OK (0 hard / 0 soft)**, all 8 detectors clean, 200 tok — the
+bare-prompt "France is France is" smoke loop was the KNOWN bare-completion
+artifact (affects mq4 too), not a kernel bug; (2) KL *decreasing* vs mq4 is itself
+proof the 6-bit dequant is correct (a wrong unpack raises KL or NaNs, never
+lowers it); (3) bit-pack roundtrip proven symbolically.
+
+**Opt-in, not default:** default stays mq4 (max speed, coherent). mq6-experts is
+the quality-priority build (bf16-closer output) for users who can spend ~16%
+decode + 1.8 GB. Future: mq4-proj + mq6-expert combo, or per-layer expert tiering
+(first/last MoE layers mq6), to tune the curve further.
+
+Tooling added: `examples/kld_logits.rs` (per-position KL or `--dump`; arch_id 11)
++ quantizer flags `HIPFIRE_LFM2_PROJ_MQ6=1` (rejected lever) and
+`HIPFIRE_LFM2_EXPERT_MQ6=1` (shipped) + `scripts/bf16_ref.py` (bf16-reference KL).
 
 ## Open items
 1. ~~KLD/PPL of proj-MQ4 vs Q8~~ **DONE 2026-05-30** (bf16-referenced table

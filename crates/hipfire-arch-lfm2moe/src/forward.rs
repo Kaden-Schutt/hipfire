@@ -23,7 +23,7 @@ use crate::lfm2moe::{Ffn, Lfm2MoeState, Lfm2MoeWeights, Mixer};
 use hipfire_runtime::llama::{
     fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
 };
-use rdna_compute::Gpu;
+use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.
 pub fn decode_step(
@@ -221,18 +221,38 @@ fn decode_step_inner(
                 .map_err(|e| format!("lfm2moe L{l}: topk: {e:?}"))?;
 
                 // gate_up (rotated input, batched k_top) → silu·mul·rotate → down → combine.
-                gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                    &m.expert_gate_up_ptrs,
-                    &state.topk_indices,
-                    &state.ffn_x_rot,
-                    &state.gate_batch,
-                    &state.up_batch,
-                    2 * moe_inter,
-                    hidden,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: gate_up: {e:?}"))?;
+                // Experts are uniform per layer (gate_up/down share dtype). MQ6G256
+                // experts use the HFQ6 (200 B/group, 6-bit) indexed kernels; MQ4G256
+                // (default) uses the HFQ4 (136 B/group, 4-bit) siblings. Both consume
+                // the same FWHT-rotated `ffn_x_rot` — only the weight dequant differs.
+                let experts_mq6 = m.experts[0].gate_up.gpu_dtype == DType::MQ6G256;
+                if experts_mq6 {
+                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs,
+                        &state.topk_indices,
+                        &state.ffn_x_rot,
+                        &state.gate_batch,
+                        &state.up_batch,
+                        2 * moe_inter,
+                        hidden,
+                        k_top,
+                        1,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: gate_up(mq6): {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
+                        &m.expert_gate_up_ptrs,
+                        &state.topk_indices,
+                        &state.ffn_x_rot,
+                        &state.gate_batch,
+                        &state.up_batch,
+                        2 * moe_inter,
+                        hidden,
+                        k_top,
+                        1,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: gate_up: {e:?}"))?;
+                }
 
                 fused_silu_mul_rotate_mq_batched_for(
                     gpu,
@@ -245,17 +265,31 @@ fn decode_step_inner(
                 )
                 .map_err(|e| format!("lfm2moe L{l}: silu_mul_rotate: {e:?}"))?;
 
-                gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                    &m.expert_down_ptrs,
-                    &state.topk_indices,
-                    &state.rot_batch,
-                    &state.down_expanded,
-                    hidden,
-                    moe_inter,
-                    k_top,
-                    1,
-                )
-                .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
+                if experts_mq6 {
+                    gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs,
+                        &state.topk_indices,
+                        &state.rot_batch,
+                        &state.down_expanded,
+                        hidden,
+                        moe_inter,
+                        k_top,
+                        1,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: down(mq6): {e:?}"))?;
+                } else {
+                    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                        &m.expert_down_ptrs,
+                        &state.topk_indices,
+                        &state.rot_batch,
+                        &state.down_expanded,
+                        hidden,
+                        moe_inter,
+                        k_top,
+                        1,
+                    )
+                    .map_err(|e| format!("lfm2moe L{l}: down: {e:?}"))?;
+                }
 
                 gpu.moe_down_combine_k8_batched(
                     &state.down_expanded,

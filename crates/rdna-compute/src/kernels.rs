@@ -967,6 +967,14 @@ pub const GIVENS_ROTATE_TO_SRC: &str =
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
 
+/// N-batched indexed MoE gate_up GEMV for HFQ6G256-layout routed experts.
+/// HFQ6G256 counterpart to `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC`;
+/// same kernarg signature + grid (M, K_TOP, N) + gate/up output split, only
+/// the per-group dequant differs (200 B/group, 6-bit). Pairs with the HFQ6
+/// expanded down kernel for the batched LFM2.5-MoE decode path.
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip");
+
 /// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
 /// (combine is dtype-independent — operates on the f32 expanded buffer).
