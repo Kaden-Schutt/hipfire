@@ -51,7 +51,6 @@ fn register_plain(registry: &KernelRegistry) {
         };
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::Plain),
@@ -78,7 +77,6 @@ fn register_prerotated(registry: &KernelRegistry) {
         };
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::Prerotated),
@@ -106,7 +104,6 @@ fn register_residual(registry: &KernelRegistry) {
         };
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::WithResidual),
@@ -134,7 +131,6 @@ fn register_swiglu_residual(registry: &KernelRegistry) {
         };
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: KernelKey::dtype_arch_predicate(dtype),
             shape_gate: None,
             steps: KernelKey::gemv_steps(dtype, GemvVariant::WithSwiGLUResidual),
@@ -143,4 +139,3 @@ fn register_swiglu_residual(registry: &KernelRegistry) {
     }
 }
 
-fn fn_placeholder() {}
