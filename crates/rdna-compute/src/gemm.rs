@@ -7308,9 +7308,18 @@ impl Gpu {
                 Some("2tile") => ("gemm_gate_up_hfq4g256_wmma_2tile",
                                   kernels::GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC,
                                   32, 64),
-                _            => ("gemm_gate_up_hfq4g256_wmma",
-                                 kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-                                 16, 32),
+                _            => {
+                    let def = if self.arch.starts_with("gfx1151") || self.arch.starts_with("gfx1150") {
+                        ("gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+                         kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC,
+                         16, 32)
+                    } else {
+                        ("gemm_gate_up_hfq4g256_wmma_ldscoop",
+                         kernels::GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC,
+                         16, 32)
+                    };
+                    def
+                },
             };
         self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
