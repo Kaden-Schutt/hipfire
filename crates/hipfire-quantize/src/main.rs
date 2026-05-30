@@ -5469,8 +5469,54 @@ fn main() {
                 && meta.shape.len() == 2
                 && meta.shape[1] % 256 == 0
             {
-                let f32_data = tensor_to_f32_with_optional_fp8_scale(
+                let mut f32_data = tensor_to_f32_with_optional_fp8_scale(
                     name, raw_data, meta, &fp8_scale_for, &st_files);
+                let k = meta.shape[1];
+                let m = meta.shape[0];
+                // AWQ shared-per-layer pre-scaling of the routed experts (--awq +
+                // --imatrix), full port of minimax 3c676d00's BOTH-projection
+                // behavior: gate(w1)/up(w3) get s_gate_up (MoE-input channels,
+                // len hidden=2048 = w1/w3 k); down(w2) gets s_down (intermediate
+                // channels, len moe_inter=1792 = w2 k). Math W·s @ x/s = W·x is
+                // exact for each. The forward divides the gate_up input via
+                // experts[0].gate_up.awq_scale (rotate_x_mq_for) AND divides the
+                // post-SwiGLU intermediate via experts[0].down.awq_scale
+                // (fused_silu_mul_rotate_mq_batched_for) — both already AWQ-aware.
+                // down (w2) is the most quant-sensitive proj (~24x the activation
+                // magnitude of gate/up), so AWQ-ing it is the whole point. The
+                // imatrix uses the SAME blk.N.ffn_{gate,up,down}_exps naming, so
+                // minimax_layer_awq_scales applies verbatim.
+                if awq_enabled {
+                    if let (Some(layer_n), Some(gg)) = (minimax_layer_index(name), imatrix_gguf.as_ref()) {
+                        let alpha = AWQ_ALPHA.get().copied().unwrap_or(0.55);
+                        let entry = mm_awq_cache.entry(layer_n)
+                            .or_insert_with(|| minimax_layer_awq_scales(gg, layer_n, alpha));
+                        if let Some((s_gu, s_dn)) = entry.as_ref() {
+                            // Per-projection scale: w2 uses s_down (its k = moe_inter),
+                            // w1/w3 use s_gate_up (their k = hidden). Each scale's len
+                            // must match the tensor's input dim; skip+warn on mismatch.
+                            let scale = if name.ends_with(".w2.weight") { s_dn } else { s_gu };
+                            if scale.len() == k {
+                                awq_pre_scale_weights(&mut f32_data, m, k, scale);
+                            } else {
+                                eprintln!("  lfm2 AWQ L{layer_n}: scale len {} != k {} ({name}); skipped", scale.len(), k);
+                            }
+                            if mm_awq_emitted.insert(layer_n) {
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!("model.layers.{layer_n}.feed_forward.awq_scale_gate_up.weight"),
+                                    quant_type: QuantType::F16, shape: vec![s_gu.len() as u32],
+                                    group_size: 0, data: awq_scales_to_f16_bytes(s_gu), spilled_len: 0,
+                                });
+                                hfq_tensors.push(HfqTensor {
+                                    name: format!("model.layers.{layer_n}.feed_forward.awq_scale_down.weight"),
+                                    quant_type: QuantType::F16, shape: vec![s_dn.len() as u32],
+                                    group_size: 0, data: awq_scales_to_f16_bytes(s_dn), spilled_len: 0,
+                                });
+                                eprintln!("  AWQ-LFM: emitted gate_up + down scales for L{layer_n}");
+                            }
+                        }
+                    }
+                }
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
                 // expert family choice: mq6 (HFQ6G256-compatible 6-bit, 200 B/group,
