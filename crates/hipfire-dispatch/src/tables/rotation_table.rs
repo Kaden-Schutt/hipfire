@@ -2,15 +2,12 @@
 use crate::types::*;
 use crate::tables::KernelRegistry;
 
-fn noop() {}
-
 /// Populate the registry with rotation kernel variants.
 pub fn populate(registry: &KernelRegistry) {
     macro_rules! reg {
         ($key:ident, $arch:expr, $steps:expr, $awq:expr) => {
             registry.register(KernelVariant {
                 key: KernelKey::$key,
-                fn_ptr: noop,
                 arch_required: $arch,
                 shape_gate: None,
                 steps: $steps,

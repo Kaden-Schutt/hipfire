@@ -15,7 +15,6 @@ pub fn populate(registry: &KernelRegistry) {
     for &(key, arch) in qkv_variants {
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: arch,
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
@@ -34,7 +33,6 @@ pub fn populate(registry: &KernelRegistry) {
     for &(key, arch) in qkvza_variants {
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: arch,
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
@@ -54,7 +52,6 @@ pub fn populate(registry: &KernelRegistry) {
     for &(key, arch) in gate_up_variants {
         registry.register(KernelVariant {
             key,
-            fn_ptr: fn_placeholder,
             arch_required: arch,
             shape_gate: None,
             steps: &[PipelineOp::Gemv],
@@ -63,4 +60,3 @@ pub fn populate(registry: &KernelRegistry) {
     }
 }
 
-fn fn_placeholder() {}

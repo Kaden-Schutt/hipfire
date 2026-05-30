@@ -14,9 +14,10 @@
 //! design rationale; PR 11 just adds a second implementation of the
 //! same trait surface for LLaMA-family bring-up.
 
+use hip_bridge::HipResult;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::{self, HfqFile};
-use hipfire_runtime::llama::{ForwardScratch, LlamaConfig, LlamaWeights};
+use hipfire_runtime::llama::{ForwardScratch, KvCache, LlamaConfig, LlamaWeights};
 use rdna_compute::Gpu;
 
 /// Type marker for the LLaMA family — covers `arch_id = 0` (LLaMA /
@@ -98,8 +99,7 @@ impl Architecture for Llama {
 //
 //   #[cfg(feature = "new-dispatch")]
 //   fn forward(...) -> HipResult<...> {
-//       let dispatch = ModelDispatch::new(gpu);
-//       dispatch.forward_scratch_layers(gpu, weights, config, pos, ...)
+//       ModelDispatch::new(gpu).forward_scratch_layers(gpu, weights, config, pos, ...)
 //   }
 //
 //   #[cfg(not(feature = "new-dispatch"))]
@@ -107,11 +107,64 @@ impl Architecture for Llama {
 //       llama::forward_scratch_layers(gpu, weights, config, pos, ...)
 //   }
 //
-// The `ModelDispatch` struct lives in the dispatch crate and wraps all
+// The `ModelDispatch` struct (to be created in a follow-up) wraps all
 // 6 families: rotation, gemv, gemm, fused_qkv, attention, moe.
-// Each family select kernel variant via (DType, variant, arch_caps),
+// Each family selects kernel variant via (DType, variant, arch_caps),
 // and the pipeline runner handles FWHT rotation, AWQ scaling, residual
 // fusion automatically.
 //
+// Phase 1 proof of concept — see `crate::forward_dispatch` for the
+// concrete RotationFamily integration.
+//
 // See `.opencode/plans/2026-05-30-hipfire-dispatch.md` for the full
 // design and migration phases.
+//
+// ── Phase 1: RotationFamily integration ──────────────────────────
+
+impl Llama {
+    /// Forward pass — new-dispatch variant when the feature is active.
+    ///
+    /// Creates the dispatch context and delegates to the rotation-aware
+    /// forward path in [`crate::forward_dispatch`]. Everything outside
+    /// the rotation calls (attention, KV cache, sampling) is unchanged.
+    #[cfg(feature = "new-dispatch")]
+    pub fn forward_scratch_layers(
+        gpu: &mut Gpu,
+        weights: &LlamaWeights,
+        config: &LlamaConfig,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        scratch: &ForwardScratch,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        crate::forward_dispatch::forward_scratch_layers(
+            gpu, weights, config, pos, kv_cache, scratch,
+            temperature, top_p, rng_state, repeat_window, repeat_penalty,
+        )
+    }
+
+    /// Forward pass — legacy path (always available).
+    #[cfg(not(feature = "new-dispatch"))]
+    pub fn forward_scratch_layers(
+        gpu: &mut Gpu,
+        weights: &LlamaWeights,
+        config: &LlamaConfig,
+        pos: usize,
+        kv_cache: &mut KvCache,
+        scratch: &ForwardScratch,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+    ) -> HipResult<(u32, u32)> {
+        crate::llama::forward_scratch_layers(
+            gpu, weights, config, pos, kv_cache, scratch,
+            temperature, top_p, rng_state, repeat_window, repeat_penalty,
+        )
+    }
+}

@@ -209,7 +209,6 @@ pub enum ShapePredicate {
 
 pub struct KernelVariant {
     pub key: KernelKey,
-    pub fn_ptr: KernelFn,
     pub arch_required: ArchPredicate,
     pub shape_gate: Option<ShapePredicate>,
     pub steps: &'static [PipelineOp],
@@ -260,7 +259,7 @@ impl From<DispatchError> for hip_bridge::HipError {
     }
 }
 
-pub type KernelFn = fn();
+
 
 impl KernelKey {
     pub fn for_gemv(dtype: DType, variant: GemvVariant, _has_awq: bool) -> Result<Self, DispatchError> {
