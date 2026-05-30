@@ -254,6 +254,12 @@ impl std::fmt::Display for DispatchError {
 
 impl std::error::Error for DispatchError {}
 
+impl From<DispatchError> for hip_bridge::HipError {
+    fn from(e: DispatchError) -> Self {
+        hip_bridge::HipError::new(0, &e.to_string())
+    }
+}
+
 pub type KernelFn = fn();
 
 impl KernelKey {
@@ -293,6 +299,119 @@ impl KernelKey {
                 family: "gemv", variant: "unknown",
                 arch: "", quant: "",
             }),
+        }
+    }
+
+    pub fn for_gemv_prerotated(dtype: DType) -> Result<Self, DispatchError> {
+        use DType::*;
+        match dtype {
+            MQ4G256 => Ok(Self::GemvMq4G256Prerotated),
+            MQ3G256 => Ok(Self::GemvMq3G256Prerotated),
+            MQ2G256 => Ok(Self::GemvMq2G256Prerotated),
+            MQ6G256 => Ok(Self::GemvMq6G256Prerotated),
+            MQ8G256 => Ok(Self::GemvMq8G256Prerotated),
+            MQ2G256Lloyd => Ok(Self::GemvMq2G256LloydPrerotated),
+            MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydPrerotated),
+            MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydPrerotated),
+            MFP4G32 => Ok(Self::GemvMfp4G32Prerotated),
+            _ => Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "prerotated",
+                arch: "", quant: "",
+            }),
+        }
+    }
+
+    pub fn for_gemv_residual(dtype: DType) -> Result<Self, DispatchError> {
+        use DType::*;
+        match dtype {
+            HFQ4G256 => Ok(Self::GemvHfq4G256Residual),
+            HFQ3G256 => Ok(Self::GemvHfq3G256Residual),
+            HFQ6G256 => Ok(Self::GemvHfq6G256Residual),
+            MQ4G256 => Ok(Self::GemvMq4G256Residual),
+            MQ3G256 => Ok(Self::GemvMq3G256Residual),
+            MQ6G256 => Ok(Self::GemvMq6G256Residual),
+            MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydResidual),
+            MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydResidual),
+            PARO4G128 => Ok(Self::GemvParo4G128Residual),
+            PARO4G128T => Ok(Self::GemvParo4G128TResidual),
+            _ => Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "residual",
+                arch: "", quant: "",
+            }),
+        }
+    }
+
+    pub fn for_gemv_swiglu_residual(dtype: DType) -> Result<Self, DispatchError> {
+        use DType::*;
+        match dtype {
+            HFQ4G256 => Ok(Self::GemvHfq4G256SwiGLUResidual),
+            HFQ3G256 => Ok(Self::GemvHfq3G256SwiGLUResidual),
+            HFQ6G256 => Ok(Self::GemvHfq6G256SwiGLUResidual),
+            MQ4G256 => Ok(Self::GemvMq4G256SwiGLUResidual),
+            MQ3G256 => Ok(Self::GemvMq3G256SwiGLUResidual),
+            MQ6G256 => Ok(Self::GemvMq6G256SwiGLUResidual),
+            MQ3G256Lloyd => Ok(Self::GemvMq3G256LloydSwiGLUResidual),
+            MQ4G256Lloyd => Ok(Self::GemvMq4G256LloydSwiGLUResidual),
+            PARO4G128 => Ok(Self::GemvParo4G128SwiGLUResidual),
+            PARO4G128T => Ok(Self::GemvParo4G128TSwiGLUResidual),
+            _ => Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "swiglu_residual",
+                arch: "", quant: "",
+            }),
+        }
+    }
+
+    /// Architecture predicate required for a given DType's GEMV kernels.
+    pub fn dtype_arch_predicate(dtype: DType) -> ArchPredicate {
+        use DType::*;
+        match dtype {
+            F32 | F16 | Q8_0 | Q4K | Q6K | Q4F16G64 | Q4F16G32 => ArchPredicate::Always,
+            HFQ4G256 | HFQ4G128 | HFQ2G256 | HFQ2G128
+            | MQ4G256 | MQ4G128 | MQ2G256 | MQ8G256
+            | HFP4G32 | MFP4G32
+            | PARO4G128 | PARO4G128T | ParoQ4G128 => ArchPredicate::HasDp4a,
+            HFQ3G256 | HFQ3G128 => ArchPredicate::HasSdot4,
+            MQ3G256 => ArchPredicate::HasWmmaW32,
+            MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
+            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWmmaW32,
+            Q8HFQ | Raw => ArchPredicate::Always,
+        }
+    }
+
+    /// Pipeline steps required for a given (DType, GemvVariant) pair.
+    pub fn gemv_steps(dtype: DType, variant: GemvVariant) -> &'static [PipelineOp] {
+        use DType::*;
+        use GemvVariant::*;
+        match variant {
+            Plain => {
+                match dtype {
+                    MQ4G256 | MQ4G128 | MQ3G256 | MQ2G256 | MQ6G256 | MQ8G256
+                    | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
+                    | MFP4G32 | PARO4G128 | PARO4G128T | ParoQ4G128 => {
+                        &[PipelineOp::RotateFwht, PipelineOp::Gemv]
+                    }
+                    _ => &[PipelineOp::Gemv],
+                }
+            }
+            Prerotated => &[PipelineOp::Gemv],
+            WithResidual => {
+                match dtype {
+                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd
+                    | PARO4G128 | PARO4G128T => {
+                        &[PipelineOp::RotateFwht, PipelineOp::Gemv, PipelineOp::ResidualAdd]
+                    }
+                    _ => &[PipelineOp::Gemv, PipelineOp::ResidualAdd],
+                }
+            }
+            WithSwiGLUResidual => {
+                match dtype {
+                    MQ4G256 | MQ3G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd
+                    | PARO4G128 | PARO4G128T => {
+                        &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
+                    }
+                    _ => &[PipelineOp::SiluMul, PipelineOp::Gemv, PipelineOp::ResidualAdd],
+                }
+            }
         }
     }
 }
