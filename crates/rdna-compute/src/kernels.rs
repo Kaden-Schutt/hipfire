@@ -149,6 +149,10 @@ pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma.gfx1151.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_nosync.hip");
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_GFX1151_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_nosync.gfx1151.hip");
 
 /// Phase D-B: 16×64 output tile per WG (4 batch sub-tiles share A_reg decode).
 /// Same shape as `_wmma`; only the per-WG output fanout and grid differ.
@@ -171,6 +175,11 @@ pub const GEMM_QKV_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
 pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4.gfx1151.hip");
+
+/// Barrier-free nosync variant of the MQ4-Lloyd fuse gate+up wmma mb4.
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.hip");
+/// gfx1151 K4 barrier-free variant.
+pub const GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync.gfx1151.hip");
 
 /// Returns the MQ4G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch.
@@ -299,6 +308,19 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static st
     }
 }
 
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_nosync_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_NOSYNC_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_nosync_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA gate_up nosync: unsupported arch {arch}."
+        ),
+    }
+}
+
 /// Phase D experiment selector for residual mb2 (16×32 output tile).
 pub fn gemm_mq4g256_lloyd_residual_wmma_mb2_for_arch(
     caps: &ArchCaps,
@@ -363,6 +385,19 @@ pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_for_arch(
         _ => {
             panic!("MQ4-Lloyd WMMA mb4 gate_up: unsupported arch {arch}. Phase D-B is gfx11-only.")
         }
+    }
+}
+
+pub fn gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1151" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_GFX1151_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_k4_gfx1151"),
+        "gfx1100" | "gfx1101" | "gfx1102" =>
+            (GEMM_GATE_UP_MQ4G256_LLOYD_WMMA_MB4_NOSYNC_SRC, "gemm_gate_up_mq4g256_lloyd_wmma_mb4_nosync_rdna3"),
+        _ => panic!(
+            "MQ4-Lloyd WMMA mb4 gate_up nosync: unsupported arch {arch}."
+        ),
     }
 }
 
