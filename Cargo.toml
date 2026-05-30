@@ -16,6 +16,7 @@ members = [
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",
+    "crates/hipfire-dispatch",
 ]
 
 [workspace.package]

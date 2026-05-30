@@ -1,0 +1,298 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+use rdna_compute::DType;
+
+// ── Pipeline composition ──────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum PipelineOp {
+    RotateFwht,
+    AwqDivide,
+    Gemv,
+    GemvResidual,
+    SiluMul,
+    SiluMulRotate,
+    ResidualAdd,
+}
+
+// ── Variant enums ─────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum GemvVariant {
+    Plain,
+    Prerotated,
+    WithResidual,
+    WithSwiGLUResidual,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum FusedQkvVariant {
+    Qkv,
+    Qkvza,
+    GateUp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum AttentionVariant {
+    Decode,
+    Prefill,
+    FlashDecode,
+    FlashPrefill,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum MoeVariant {
+    IndexedGateUp,
+    IndexedDown,
+    GroupedGemm,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum RotationVariant {
+    Plain,
+    WithRmsnorm,
+    WithSwiGLU,
+}
+
+// ── Flat kernel key enum ──────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum KernelKey {
+    // GEMV plain
+    GemvF32,
+    GemvF16,
+    GemvQ8_0,
+    GemvQ4K,
+    GemvQ6K,
+    GemvHfq4G256,
+    GemvHfq4G128,
+    GemvHfq3G256,
+    GemvHfq3G128,
+    GemvHfq2G256,
+    GemvHfq2G128,
+    GemvHfq6G256,
+    GemvMq4G256,
+    GemvMq4G128,
+    GemvMq3G256,
+    GemvMq2G256,
+    GemvMq6G256,
+    GemvMq8G256,
+    GemvMq2G256Lloyd,
+    GemvMq3G256Lloyd,
+    GemvMq4G256Lloyd,
+    GemvMfp4G32,
+    GemvHfp4G32,
+    GemvParo4G128,
+    GemvParo4G128T,
+    GemvParoQ4G128,
+    GemvQ4F16G64,
+    GemvQ4F16G32,
+    // GEMV prerotated
+    GemvMq4G256Prerotated,
+    GemvMq3G256Prerotated,
+    GemvMq2G256Prerotated,
+    GemvMq6G256Prerotated,
+    GemvMq8G256Prerotated,
+    GemvMq2G256LloydPrerotated,
+    GemvMq3G256LloydPrerotated,
+    GemvMq4G256LloydPrerotated,
+    GemvMfp4G32Prerotated,
+    // GEMV residual
+    GemvHfq4G256Residual,
+    GemvHfq3G256Residual,
+    GemvHfq6G256Residual,
+    GemvMq4G256Residual,
+    GemvMq3G256Residual,
+    GemvMq6G256Residual,
+    GemvMq3G256LloydResidual,
+    GemvMq4G256LloydResidual,
+    GemvParo4G128Residual,
+    GemvParo4G128TResidual,
+    // GEMV SwiGLU + residual
+    GemvHfq4G256SwiGLUResidual,
+    GemvHfq3G256SwiGLUResidual,
+    GemvHfq6G256SwiGLUResidual,
+    GemvMq4G256SwiGLUResidual,
+    GemvMq3G256SwiGLUResidual,
+    GemvMq6G256SwiGLUResidual,
+    GemvMq3G256LloydSwiGLUResidual,
+    GemvMq4G256LloydSwiGLUResidual,
+    GemvParo4G128SwiGLUResidual,
+    GemvParo4G128TSwiGLUResidual,
+    // GEMM
+    GemmHfq4G256,
+    GemmHfq4G128,
+    GemmQ8_0BatchedChunked,
+    GemmQ8_0Wmma,
+    GemmQ8_0Wmma4W,
+    GemmHfq4G256Wmma,
+    GemmF16XF16Wmma,
+    GemmF32RegisterTiled,
+    // Fused QKV
+    FusedQkvHfq4G256,
+    FusedQkvMq3G256Lloyd,
+    FusedQkvMq4G256Lloyd,
+    FusedQkvHfq6G256,
+    FusedQkvParo4G128T,
+    FusedQkvQ4K,
+    // Fused QKVZA (linear attention)
+    FusedQkvzaHfq4G256,
+    FusedQkvzaMq3G256Lloyd,
+    FusedQkvzaMq4G256Lloyd,
+    FusedQkvzaHfq6G256,
+    FusedQkvzaParo4G128T,
+    // Fused Gate+Up
+    FusedGateUpHfq4G256,
+    FusedGateUpMq3G256Lloyd,
+    FusedGateUpMq4G256Lloyd,
+    FusedGateUpHfq6G256,
+    FusedGateUpParo4G128T,
+    FusedGateUpQ4K,
+    // Rotation
+    RotateMq,
+    RotateMqAwq,
+    RotateMqBatched,
+    RotateMqAwqBatched,
+    RmsnormRotateMq,
+    RmsnormRotateMqAwq,
+    RmsnormRotateMqBatched,
+    RmsnormRotateMqAwqBatched,
+    SiluMulRotateMq,
+    SiluMulRotateMqAwq,
+    RmsnormF32,
+    // MoE
+    MoeIndexedGateUpLloyd,
+    MoeIndexedDownLloyd,
+    MoeGroupedGemm,
+    MoeGroupedI8,
+    // Attention
+    AttnFlashAsym4,
+    AttnFlashAsym4Fwht,
+    AttnFlashAsym3,
+    AttnFlashAsym3Fwht,
+    AttnFlashAsym2,
+    AttnFlashAsym2Fwht,
+    AttnFlashQ8_0,
+    AttnGqaFused,
+    AttnF32,
+    // KV Cache Write
+    KvWriteAsym4,
+    KvWriteAsym4Fwht,
+    KvWriteAsym3,
+    KvWriteAsym3Fwht,
+    KvWriteAsym2,
+    KvWriteAsym2Fwht,
+    KvWriteQ8_0,
+    KvWriteF32,
+}
+
+// ── Arch gating ──────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub enum ArchPredicate {
+    Always,
+    HasWmmaW32,
+    HasWmmaW32Gfx12,
+    HasDp4a,
+    HasSdot4,
+    HasMmq,
+    HasCdna3LdsGemv,
+}
+
+#[derive(Clone, Debug)]
+pub enum ShapePredicate {
+    BatchGt(usize),
+    HeadDimEq(usize),
+    MLt(usize),
+}
+
+// ── Registry entry ───────────────────────────────────
+
+pub struct KernelVariant {
+    pub key: KernelKey,
+    pub fn_ptr: KernelFn,
+    pub arch_required: ArchPredicate,
+    pub shape_gate: Option<ShapePredicate>,
+    pub steps: &'static [PipelineOp],
+    pub has_awq: bool,
+}
+
+// ── Error ────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum DispatchError {
+    UnsupportedVariant {
+        family: &'static str,
+        variant: &'static str,
+        arch: &'static str,
+        quant: &'static str,
+    },
+    MissingImpl {
+        key: KernelKey,
+    },
+    NotFound {
+        key: KernelKey,
+    },
+    EmptyEntry {
+        key: KernelKey,
+    },
+    Hip(String),
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedVariant { family, variant, arch, quant } => {
+                write!(f, "unsupported {family}.{variant} for {arch}/{quant}")
+            }
+            Self::MissingImpl { key } => write!(f, "no implementation for {key:?}"),
+            Self::NotFound { key } => write!(f, "kernel not registered: {key:?}"),
+            Self::EmptyEntry { key } => write!(f, "kernel registry entry empty: {key:?}"),
+            Self::Hip(msg) => write!(f, "HIP error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+pub type KernelFn = fn();
+
+impl KernelKey {
+    pub fn for_gemv(dtype: DType, variant: GemvVariant, _has_awq: bool) -> Result<Self, DispatchError> {
+        use DType::*;
+        use GemvVariant::*;
+        match (dtype, variant) {
+            (F32, Plain) => Ok(Self::GemvF32),
+            (F16, Plain) => Ok(Self::GemvF16),
+            (Q8_0, Plain) => Ok(Self::GemvQ8_0),
+            (Q4K, Plain) => Ok(Self::GemvQ4K),
+            (Q6K, Plain) => Ok(Self::GemvQ6K),
+            (HFQ4G256, Plain) => Ok(Self::GemvHfq4G256),
+            (HFQ4G128, Plain) => Ok(Self::GemvHfq4G128),
+            (HFQ3G256, Plain) => Ok(Self::GemvHfq3G256),
+            (HFQ3G128, Plain) => Ok(Self::GemvHfq3G128),
+            (HFQ2G256, Plain) => Ok(Self::GemvHfq2G256),
+            (HFQ2G128, Plain) => Ok(Self::GemvHfq2G128),
+            (HFQ6G256, Plain) => Ok(Self::GemvHfq6G256),
+            (MQ4G256, Plain) => Ok(Self::GemvMq4G256),
+            (MQ4G128, Plain) => Ok(Self::GemvMq4G128),
+            (MQ3G256, Plain) => Ok(Self::GemvMq3G256),
+            (MQ2G256, Plain) => Ok(Self::GemvMq2G256),
+            (MQ6G256, Plain) => Ok(Self::GemvMq6G256),
+            (MQ8G256, Plain) => Ok(Self::GemvMq8G256),
+            (MQ2G256Lloyd, Plain) => Ok(Self::GemvMq2G256Lloyd),
+            (MQ3G256Lloyd, Plain) => Ok(Self::GemvMq3G256Lloyd),
+            (MQ4G256Lloyd, Plain) => Ok(Self::GemvMq4G256Lloyd),
+            (MFP4G32, Plain) => Ok(Self::GemvMfp4G32),
+            (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
+            (PARO4G128, Plain) => Ok(Self::GemvParo4G128),
+            (PARO4G128T, Plain) => Ok(Self::GemvParo4G128T),
+            (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
+            (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
+            (Q4F16G32, Plain) => Ok(Self::GemvQ4F16G32),
+            _ => Err(DispatchError::UnsupportedVariant {
+                family: "gemv", variant: "unknown",
+                arch: "", quant: "",
+            }),
+        }
+    }
+}
