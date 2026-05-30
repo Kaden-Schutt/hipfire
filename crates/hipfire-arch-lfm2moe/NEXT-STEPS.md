@@ -33,6 +33,19 @@ experts) vs HF `Lfm2MoeForCausalLM`; real mq4 model coherent through the daemon
 
 ## Next steps (priority order)
 
+### 0. DONE — MQ6-experts QUALITY lever (opt-in): `HIPFIRE_LFM2_EXPERT_MQ6=1`
+rocprofv3 showed decode is BANDWIDTH-bound (gemv_q8_0 = 49.5%); bf16-referenced
+KLD showed the 4-bit EXPERTS (not the projections) dominate the quality gap. So
+added 6-bit experts via a new HFQ6 indexed MoE GEMV kernel
+(`gemv_hfq6g256_moe_gate_up_k8_indexed_batched`; the `_down_*_expanded` sibling
+already existed) + forward routing on MQ6G256 expert dtype + quantizer flag.
+Model `lfm2.5-8b-a1b.mq6e`: **KL vs bf16 0.424→0.135 (−68%), top-1 72.7→79.5%,
+for −16% decode (241→203 tok/s) + 1.8 GB VRAM (4.6→6.4).** Coherent (chat-framed
+coherence_probe verdict OK, 0 hard/0 soft). Opt-in; default stays mq4 (max speed).
+See design doc "MQ6-experts". NOTE: the bare-prompt `infer_lfm2moe` smoke loops
+("France is France is") — that's the documented bare-completion artifact (mq4
+does it too), NOT a kernel bug; validate coherence via the daemon/ChatFrame.
+
 ### 0. DONE — proj-MQ4 perf lever (+7.2%, opt-in): `HIPFIRE_LFM2_PROJ_MQ4=1`
 4-bit-ing the dense projections (conv in/out_proj, attn q/k/v/out, dense MLP)
 gives **258.8 vs 241.5 tok/s = +7.2%** on matched full-256-tok runs (6 runs each,

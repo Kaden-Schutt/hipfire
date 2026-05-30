@@ -5473,12 +5473,22 @@ fn main() {
                     name, raw_data, meta, &fp8_scale_for, &st_files);
                 let signs1 = gen_fwht_signs(42, 256);
                 let signs2 = gen_fwht_signs(1042, 256);
-                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                // expert family choice: mq6 (HFQ6G256-compatible 6-bit, 200 B/group,
+                // opt-in via HIPFIRE_LFM2_EXPERT_MQ6 for higher quality), else mq4
+                // (MQ4G256, 136 B/group, default + validated). Mirrors minimax's
+                // HIPFIRE_MINIMAX_EXPERT_MQ6 idiom. The forward routes to the HFQ6
+                // indexed gemv kernels when it sees MQ6G256 experts.
+                let expert_mq6 = std::env::var_os("HIPFIRE_LFM2_EXPERT_MQ6").is_some();
+                let (q, qt, tag) = if expert_mq6 {
+                    (quantize_mq6g256(&f32_data, &signs1, &signs2), QuantType::MQ6G256, "MQ6-LFM")
+                } else {
+                    (quantize_mq4g256(&f32_data, &signs1, &signs2), QuantType::MQ4G256, "MQ4-LFM")
+                };
                 eprintln!("  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
-                    "MQ4-LFM", name, meta.shape,
+                    tag, name, meta.shape,
                     raw_data.len() as f64 / 1024.0, q.len() as f64 / 1024.0);
                 hfq_tensors.push(HfqTensor {
-                    name: name.to_string(), quant_type: QuantType::MQ4G256,
+                    name: name.to_string(), quant_type: qt,
                     shape, group_size: 256, data: q, spilled_len: 0,
                 });
                 quantized_params += (meta.shape[0] * meta.shape[1]) as u64;
