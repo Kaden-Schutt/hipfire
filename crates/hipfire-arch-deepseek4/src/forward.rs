@@ -6699,9 +6699,12 @@ fn ffn_batched(
             _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
         } && (2 * im) % 64 == 0
           && hidden % 256 == 0;
-        // MMQ-style index-pack preload (#356, default ON for 4w; opt out via =0).
+        // MMQ-style index-pack preload (#356). Reverted to OPT-IN: the preload
+        // hoisted only 8 of 16 weight packs, decoding half the MQ2 weights wrong
+        // → long-context attractor on DS4 mq2lloyd (root-caused by @nwoolmer on
+        // gfx1151; the corrected kernel measured flat, so no reason to default it).
         let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() != Ok("0");
+            .as_deref() == Ok("1");
         // Barrier-free nosync variant (#356, opt in via =1).
         let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
             .as_deref() == Ok("1");
@@ -6887,8 +6890,9 @@ fn ffn_batched(
             _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
         } && hidden % 64 == 0
           && im % 256 == 0;
+        // Opt-in (see use_mmqload above — same #356 long-context attractor).
         let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
-            .as_deref() != Ok("0");
+            .as_deref() == Ok("1");
         let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
             .as_deref() == Ok("1");
         // n32_env / cnd_env / eightw_env reused from the gate_up block above.
