@@ -52,6 +52,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # GitHub token used to post the review comment. Passing the workflow
+          # token directly avoids the OIDC / Claude-GitHub-App token exchange
+          # (no app install, no `id-token: write` needed). The job permissions
+          # above grant exactly what it needs (pull-requests / issues: write).
+          github_token: ${{ github.token }}
           # Read-only toolset — the agent inspects the diff and docs; it cannot
           # edit files or push. The action posts the review comment itself via
           # the GitHub token, not through a model tool.
