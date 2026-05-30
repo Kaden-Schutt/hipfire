@@ -5019,7 +5019,7 @@ fn main() {
     } else {
         None
     };
-    let tokenizer_config = match chat_template_override {
+    let mut tokenizer_config = match chat_template_override {
         Some(template) => Some(tokenizer_config_with_chat_template(tokenizer_config, template)),
         None => tokenizer_config,
     };

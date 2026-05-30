@@ -2478,6 +2478,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
                 qwen2_config: None, qwen2_weights: None, qwen2_state: None,
                 deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+                mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
                 minimax_config: None, minimax_weights: None, minimax_state: None, minimax_eos_tok: 0,
                 lfm2moe_config: Some(config), lfm2moe_weights: Some(weights), lfm2moe_state: Some(state),
                 lfm2moe_eos_tok: eos_tok,
