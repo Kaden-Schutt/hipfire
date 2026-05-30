@@ -6,14 +6,10 @@ license.workspace = true
 description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
 
 [features]
-# LLaMA-family arches (LLaMA, Mistral, plain Qwen3) are dense and use
-# pure full attention. None of the arch's bring-up wiring needs the
-# DeltaNet hybrid path, so no feature flag is required. The runtime
-# crate's `deltanet` feature only gates Qwen3.5 hybrid types and
-# leaves the LLaMA-arch surface untouched, which is what this crate
-# binds to.
+new-dispatch = ["hipfire-dispatch"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

@@ -166,6 +166,7 @@ name = "hipfire-arch-llama"
 version = "0.2.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
 ]
@@ -185,6 +186,7 @@ name = "hipfire-arch-qwen35"
 version = "0.2.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "rdna-compute",
  "serde",
@@ -236,7 +238,6 @@ name = "hipfire-dispatch"
 version = "0.2.0"
 dependencies = [
  "hip-bridge",
- "hipfire-runtime",
  "rdna-compute",
 ]
 
