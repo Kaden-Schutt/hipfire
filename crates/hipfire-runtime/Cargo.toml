@@ -49,6 +49,7 @@ arch-qwen2 = []
 arch-deepseek4 = []
 arch-dots-ocr = []
 
+# New dispatch layer — opt in via this feature. Removes old inline dispatch.
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }

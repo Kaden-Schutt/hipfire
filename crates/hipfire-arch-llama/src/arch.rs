@@ -88,3 +88,30 @@ impl Architecture for Llama {
     // policy through the trait can populate these (LLaMA: no
     // strip_think, no Qwen-specific blocked tokens).
 }
+
+// ── Dispatch integration ─────────────────────────────────────────
+// When `feature = "new-dispatch"` is active, the crate builds with
+// hipfire-dispatch and uses its centralized kernel selection tables
+// instead of the inline match-on-DType trees in llama.rs.
+//
+// Migration pattern for each model forward function:
+//
+//   #[cfg(feature = "new-dispatch")]
+//   fn forward(...) -> HipResult<...> {
+//       let dispatch = ModelDispatch::new(gpu);
+//       dispatch.forward_scratch_layers(gpu, weights, config, pos, ...)
+//   }
+//
+//   #[cfg(not(feature = "new-dispatch"))]
+//   fn forward(...) -> HipResult<...> {
+//       llama::forward_scratch_layers(gpu, weights, config, pos, ...)
+//   }
+//
+// The `ModelDispatch` struct lives in the dispatch crate and wraps all
+// 6 families: rotation, gemv, gemm, fused_qkv, attention, moe.
+// Each family select kernel variant via (DType, variant, arch_caps),
+// and the pipeline runner handles FWHT rotation, AWQ scaling, residual
+// fusion automatically.
+//
+// See `.opencode/plans/2026-05-30-hipfire-dispatch.md` for the full
+// design and migration phases.
