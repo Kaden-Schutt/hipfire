@@ -3798,8 +3798,8 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
       label: "kv_cache",
-      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+      desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
+      options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
     },
     flash_mode: {
       label: "flash_mode",
@@ -5806,7 +5806,7 @@ Examples:
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",
