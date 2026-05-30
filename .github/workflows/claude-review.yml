@@ -1,0 +1,100 @@
+name: Claude PR Review
+
+# Tier 2 of the validation pipeline: an in-repo agent that reviews each PR
+# against hipfire's contribution rules and posts one comment. It is GPU-free —
+# it reads the diff + the repo's own docs and reasons about them; it does NOT
+# build, run kernels, or verify coherence/perf. Those are GPU-bound and handled
+# by the self-hosted GPU gates (Tier 3). Review-only: the agent gets read +
+# PR-comment access and never write/commit access.
+#
+# Auth: a Claude Pro/Max subscription via CLAUDE_CODE_OAUTH_TOKEN. Generate it
+# with `claude setup-token` (Claude v1.0.44+), then:
+#     gh secret set CLAUDE_CODE_OAUTH_TOKEN
+# To use metered API billing instead, set ANTHROPIC_API_KEY and swap the input
+# below. Until a credential secret exists the review step skips and the job is a
+# green no-op — safe to merge before the secret is added.
+#
+# Fork PRs: GitHub withholds secrets from fork-originated `pull_request` runs,
+# so the token is empty there and the review skips. The auto-review therefore
+# covers branches pushed to THIS repo (collaborators). Outside/fork PRs get the
+# agent review once a maintainer brings the branch in-repo — the same trust
+# boundary the Tier-3 GPU gates use (never run untrusted PR code with secrets).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Claude review (advisory)
+    runs-on: ubuntu-latest
+    # secrets are unavailable on fork PRs, so HAS_TOKEN is false there → skip.
+    env:
+      HAS_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN != '' }}
+    steps:
+      - name: Checkout
+        if: ${{ env.HAS_TOKEN == 'true' }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Claude review
+        if: ${{ env.HAS_TOKEN == 'true' }}
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Read-only toolset — the agent inspects the diff and docs; it cannot
+          # edit files or push. The action posts the review comment itself via
+          # the GitHub token, not through a model tool.
+          claude_args: |
+            --max-turns 20
+            --allowedTools Read,Grep,Glob
+          prompt: |
+            You are the first-pass PR reviewer for hipfire, an RDNA-native LLM
+            inference engine in Rust. Your job is to SHORTEN human review, not
+            replace it. Be concise and high-signal: surface only findings that
+            matter. If the PR is clean, say so briefly.
+
+            First read CLAUDE.md and CONTRIBUTING.md in the repo root — they are
+            the source of truth for the project's rules. Review the PR diff
+            against them.
+
+            You CANNOT verify GPU behavior on this runner (no GPU): never claim a
+            kernel is correct, coherent, or faster. Instead, flag what the GPU
+            gates must verify (the self-hosted runner runs test_kernels /
+            coherence-gate / speed-gate).
+
+            Check the following, and comment only when something is off:
+            - Perf claims: any tok/s, τ, or speedup MUST cite a prompt md5 AND a
+              binary md5, and cross-commit claims must use
+              scripts/probe_commits.sh (fresh process). Flag perf claims missing
+              these — they are unreproducible per docs/methodology.
+            - Gates: if the diff touches kernels / dispatch / forward pass /
+              quant / fusion / rotation / rmsnorm / sampling / spec-decode, the
+              PR should state coherence-gate.sh was run (and
+              coherence-gate-dflash.sh if spec-decode touched). Perf-relevant →
+              speed-gate.sh. Flag missing gate evidence.
+            - SPDX: new source files need an SPDX header (Apache-2.0 default) and
+              a "Copyright (c) <year> <author>" line. Flag new files missing it.
+            - No Python in the inference hot path (runtime / arch / compute
+              crates). Python is fine for tooling, benchmarks, offline analysis.
+              Flag Python added to the hot path.
+            - Prompt-structure sensitivity: flag benchmark prompts embedded as
+              heredocs in scripts (must be committed files), or perf comparisons
+              that aren't byte-identical prompts.
+            - General correctness: real bugs, footguns, unsafe misuse, panics on
+              user input. Skip nits and style — clippy/fmt cover those.
+
+            Post ONE PR comment. Lead with a one-line verdict — LGTM / Minor /
+            Needs work — then bullet the findings with file:line where possible.
+            End with a "GPU gates still required:" line naming which gates a
+            maintainer must run before merge, based on what the diff touched.
