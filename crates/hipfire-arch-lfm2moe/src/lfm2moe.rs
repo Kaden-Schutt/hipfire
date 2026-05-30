@@ -28,6 +28,25 @@ fn read_tensor(hfq: &HfqFile, name: &str) -> Result<(u8, Vec<u8>), String> {
     Ok((info.quant_type, data))
 }
 
+/// Load an LFM2 AWQ shared gate_up-scale sidecar (1D F16, length k) → F32
+/// GpuTensor. Mirror of minimax `load_mm_awq_scale`. Returns None if the
+/// sidecar is absent or malformed, so non-AWQ models load cleanly (the
+/// attached `awq_scale` stays None and `rotate_x_mq_for` takes the plain path).
+fn load_lfm2_awq_scale(hfq: &HfqFile, gpu: &mut Gpu, name: &str, k: usize) -> Option<GpuTensor> {
+    let (qt, data) = read_tensor(hfq, name).ok()?;
+    if qt != 1 { return None; } // 1 = F16
+    if data.len() != k * 2 {
+        eprintln!("lfm2moe AWQ sidecar {name}: {} bytes != {} (k*2); skipping", data.len(), k * 2);
+        return None;
+    }
+    let f32_data: Vec<f32> = data
+        .chunks_exact(2)
+        .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+        .collect();
+    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    gpu.upload_raw(&f32_bytes, &[f32_data.len()]).ok()
+}
+
 /// Load a 1D/raw F16/F32 vector → F32 GpuTensor with the given shape.
 /// LFM2 uses STANDARD RMSNorm (`weight * x̂`, no +1 offset — verified against
 /// Lfm2MoeRMSNorm), so no offset is baked in. Also used for the depthwise conv
@@ -271,11 +290,36 @@ impl Lfm2MoeWeights {
                     let (_qt3, w3) = read_tensor(hfq, &format!("{ep}.w3.weight"))?;
                     let mut gate_up_bytes = w1;
                     gate_up_bytes.extend_from_slice(&w3);
-                    let gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
+                    let mut gate_up = wt_from_raw(gpu, qt1, &gate_up_bytes, 2 * moe_inter, hidden)
                         .map_err(|e2| format!("lfm2moe: fuse gate_up L{l}E{e}: {e2}"))?;
                     let (qt2, w2) = read_tensor(hfq, &format!("{ep}.w2.weight"))?;
-                    let down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
+                    let mut down = wt_from_raw(gpu, qt2, &w2, hidden, moe_inter)
                         .map_err(|e2| format!("lfm2moe: down L{l}E{e}: {e2}"))?;
+                    // AWQ scales: shared per layer, emitted once on expert 0 by the
+                    // quantizer (full port of minimax 3c676d00 BOTH-projection AWQ).
+                    // Attach the gate_up scale (len hidden) to expert 0's gate_up and
+                    // the down scale (len moe_inter) to expert 0's down; the forward
+                    // reads both from experts[0] and divides x/s in the unrotated
+                    // basis via the AWQ-aware rotate_x_mq_for (gate_up input) and
+                    // fused_silu_mul_rotate_mq_batched_for (post-SwiGLU intermediate
+                    // for down). down (w2) is the most quant-sensitive proj, so its
+                    // AWQ is the whole point. No-op on non-AWQ files.
+                    if e == 0 {
+                        gate_up.awq_scale = load_lfm2_awq_scale(
+                            hfq, gpu,
+                            &format!("{p}.feed_forward.awq_scale_gate_up.weight"),
+                            hidden);
+                        if gate_up.awq_scale.is_some() {
+                            eprintln!("lfm2moe: AWQ gate_up scale attached at {p} (expert-0 representative)");
+                        }
+                        down.awq_scale = load_lfm2_awq_scale(
+                            hfq, gpu,
+                            &format!("{p}.feed_forward.awq_scale_down.weight"),
+                            moe_inter);
+                        if down.awq_scale.is_some() {
+                            eprintln!("lfm2moe: AWQ down scale attached at {p} (expert-0 representative)");
+                        }
+                    }
                     experts.push(ExpertWeights { gate_up, down });
                 }
                 let gu_bytes: Vec<u8> = experts
