@@ -216,15 +216,47 @@ earlier *assumptions* that turned out wrong:
   projections), then the two MoE 4-bit expert GEMVs (gate_up 17.7% + down 12.4%
   = 30%). Decode is **weight-bandwidth-bound on the dense projections.**
 
-**Consequence: HIP graph capture is NOT the big lever** it was assumed to be — it
-only attacks the ~27% launch-idle, and qwen35 already disabled AR-forward graph
-capture (`qwen35.rs` `use_graph=false`) over a ROCm kernarg-bake attractor bug.
-The bandwidth axis (4-bit-ing the hot `gemv_q8_0` projections) is where the real
-decode time is — which is exactly the proj-quant lever below.
+**Consequence (SUPERSEDED — see "Bandwidth ceiling measured" below):** an earlier
+draft here claimed "HIP graph capture is NOT the big lever" on the reasoning that
+decode is bandwidth-bound and graph capture only attacks the ~27% launch-idle.
+**That conclusion was wrong** — the direct bandwidth measurement below shows
+decode uses only ~47% of the card's real bandwidth, so it is NOT saturating the
+bus; the launch/occupancy axis (graph capture + fusion) IS the lever after all.
 
 Other launch-COUNT levers (rmsnorm→gemv fusion, MoE down+combine fusion, batched
-prefill) remain available but target the smaller idle fraction, not the 80% the
-GEMVs occupy.
+prefill) target that same ~47%-utilization gap.
+
+### Bandwidth ceiling MEASURED (gfx1201, 2026-05-30): 632 GB/s, decode uses ~47%
+
+Motivated by a real-world report that an RTX 3090 outperforms the R9700 on this
+model. Investigated directly rather than by assumption:
+
+- **R9700 real sustained bandwidth** (hand-rolled HIP microbench, large-buffer
+  grid-stride read; rocprof HW counters are broken on navi4x so this is the only
+  way): **632 GB/s READ** (stable across 2 GB and 4 GB buffers — not cache),
+  ~565 GB/s copy. The DPM mclk table tops out at 1258 MHz.
+- **LFM2 decode (mq4)** = 241 tok/s ≈ **311 GB/s achieved = ~47% of the 632
+  ceiling.** Decode is bandwidth-*sensitive* but NOT bandwidth-*saturated*.
+- **DPM pin test (FALSIFIED a hypothesis):** forcing
+  `power_dpm_force_performance_level=high` (mclk pinned to the 1258 MHz top)
+  gave **224 tok/s — SLOWER than auto's 241.** So mid-decode DPM down-clocking is
+  NOT the bottleneck; the auto governor is already at the better operating point.
+  (Restored to `auto` after.)
+- **Bandwidth sensitivity ladder** (tok/s rises monotonically as bytes/token
+  falls): mq6e (most bytes) 203 < mq4 241 < mq4p (fewest) 259.
+
+**Conclusion:** decode only reaches ~47% of bandwidth because it is
+latency/occupancy-bound per launch — 377 tiny kernels/token with ~27%
+inter-kernel idle, so the bus is never kept busy. The "3090 beats R9700" gap is
+roughly half hardware (GDDR6X ~936 GB/s vs our measured 632) and half our own
+software leaving bandwidth on the floor. The real lever to close it is the
+**launch/occupancy axis** — HIP graph capture (amortize the 377 launches/token)
++ kernel fusion — NOT bandwidth (HW-capped) and NOT DPM (pinning hurt). Lifting
+utilization 47%→~70% would be ~+50% tok/s (241→~360), which would flip the
+comparison. Caveat: qwen35 has AR-forward graph capture disabled
+(`use_graph=false`) on an older ROCm over a kernarg-bake attractor; we are on
+gfx1201 + custom ROCm, so it is worth re-testing here (with coherence-gating) —
+that is the recommended next perf task.
 
 ### Projection-quant bandwidth sweep (KLD, gfx1201, 2026-05-30) — SETTLED
 
