@@ -83,12 +83,15 @@ validation target = Strix Halo via `ssh hipx`.
   localmaxxing run hit 103 GB there). Device 0 is an RX 5700 XT (gfx1010, RDNA1,
   7 GB, **no WMMA**). NB: `free -g` shows ~30 GB — that is the *host/CPU*
   partition (kfd node 0), **not** the iGPU pool; don't size MiniMax against it.
-- **Tier fit on device 1 (~96 GB carveout, ~103 GB with GTT):**
+- **Tier fit on device 1 (~96 GB carveout; the 103 GB total is GTT-inclusive but
+  `hipMalloc` only reaches the carveout). Footprint ≈ file + small overhead ONLY
+  after the expert-packing fix (68c1b808); pre-fix it was ~1.35× file and NOTHING
+  fit (mq2-lloyd OOM'd at L46). Sizes below are post-fix:**
   | tier | size | fits hipx? |
   |---|---|---|
-  | mq2 | 79 GB | ✅ comfortable |
-  | mq2-lloyd | 86 GB | ✅ comfortable |
-  | mq3 | 102 GB | ⚠️ GTT-edge, tight with KV/scratch |
+  | mq2 | 79 GB | ✅ (footprint ≈ 80 GB) |
+  | mq2-lloyd | 86 GB | ✅ **verified loads + runs, 23.6 tok/s** |
+  | mq3 | 102 GB | ❌ exceeds 96 GB carveout |
   | mq3-lloyd | 109 GB | ❌ exceeds |
   | mq4 | 124 GB | ❌ exceeds |
 - **What hipx CAN do:** full e2e RDNA coherence + perf for **mq2 + mq2-lloyd**.
@@ -126,8 +129,24 @@ deterministic across the two archs).
 
 This validates the **forward/decode path** (GEMV, Lloyd MoE decode incl. the
 MQ3-Lloyd port, MQ4 MoE, Q8 attention, rmsnorm, rope, qk-norm) on real RDNA3.5.
-It does **not** touch the WMMA grouped-prefill kernels (still the gap). Full-model
-e2e coherence on gfx1151 (mq2-lloyd, 86 GB, fits the 103 GB) is the next step.
+It does **not** touch the WMMA grouped-prefill kernels (still the gap).
+
+### Full-model e2e on gfx1151 + the expert-packing fix (commit 68c1b808)
+
+The first full-tier load OOM'd: mq2-lloyd's 86 GB **file** had a ~114 GB
+**resident** footprint (~1.35×), exceeding the 96 GB carveout (`hipMalloc` caps
+there; the extra ~7 GB to 103 GB is GTT, which device allocations don't reach).
+Root cause: the loader did a separate `upload_raw`/hipMalloc **per expert** —
+~31.7k tiny allocations, each rounded up to HIP's allocation granularity → ~20 GB
+of pure fragmentation. Fixed by adopting deepseek4's `upload_layer_routed_experts`
+pattern (pack all experts of a layer into ONE blob + a base+e*stride pointer
+table; bit-identical output, validated above). Footprint now ≈ file + small
+overhead.
+
+**After the fix, mq2-lloyd (86 GB) loads and runs on gfx1151:** correct
+Rayleigh-scattering answer, full `<think>` then clean two-sentence reply, clean
+EOS (270/320 tok), **23.6 tok/s** decode. First real-model MiniMax run on RDNA
+hardware. The fix shrinks footprint on every box (mi300 serve too).
 
 ## Bottom line
 
