@@ -1,7 +1,8 @@
 # MiniMax-M2.7 — RDNA3+ WMMA kernel coverage & the MQ3-Lloyd gap
 
-**Status (2026-05-30):** MiniMax-M2.7 is *correctness-portable* to RDNA3+ today,
-but GEMV-bound in prefill. Fast RDNA prefill needs two things: (1) a batched
+**Status (2026-05-30):** MiniMax-M2.7's forward path is **empirically validated on
+RDNA3.5 (gfx1151 / Strix Halo)** — see "Empirical RDNA validation" below. It is
+correctness-portable but GEMV-bound in prefill. Fast RDNA prefill needs two things: (1) a batched
 forward, and (2) grouped-WMMA MoE GEMM. There is exactly **one** new-kernel gap
 (MQ3-Lloyd grouped). RDNA e2e validation is partly reachable today — hipx
 (Strix Halo gfx1151, 96 GB) fits the mq2 / mq2-lloyd tiers — but the larger
@@ -99,6 +100,34 @@ validation target = Strix Halo via `ssh hipx`.
   it is **microbench-only** (steps 1–3 above use tiny synthetic E=1 tensors —
   VRAM is irrelevant). Full gate/up e2e + the mq4 tier need a larger RDNA VRAM
   pool or multi-GPU PP — no such RDNA config in the fleet today. Flagged.
+
+## Empirical RDNA validation (2026-05-30)
+
+First real run of MiniMax-M2.7 kernels on RDNA hardware — the tiny random-weight
+oracle (`scripts/gen_tiny_minimax.py`: 2 layers, hidden 256, 16 experts/top-8),
+`dump_minimax_hidden_states` pinned to **hipx HIP device 1 = gfx1151** (runtime
+reported "GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.2)"), compared with
+`compare_hidden_states.py`.
+
+**Correctness — gfx1151 hidden states vs the PyTorch oracle (per-layer cosine):**
+
+| tiny tier | kernels exercised | mean cos | min cos |
+|---|---|---|---|
+| tiny-mq3 | **MQ3-Lloyd MoE decode (the ported kernel)** | 0.99944 | 0.99857 |
+| tiny-tpl | MQ4 MoE | 0.99873 | 0.99617 |
+| tiny-dnmq4 | MQ2-Lloyd + MQ4 mixed | 0.99899 | 0.99653 |
+
+All ~0.999 — the quantization band, matching the impl validation on gfx942.
+
+**Cross-arch parity — gfx1151 vs gfx942 (CDNA3), identical inputs:** `mq3` and
+`dnmq4` both **cos = 1.000000, diff_rms = 0.0** — bit-identical between
+RDNA3.5/wave32 and CDNA3/wave64 (f32-MAC GEMV + Lloyd codebook dequant are
+deterministic across the two archs).
+
+This validates the **forward/decode path** (GEMV, Lloyd MoE decode incl. the
+MQ3-Lloyd port, MQ4 MoE, Q8 attention, rmsnorm, rope, qk-norm) on real RDNA3.5.
+It does **not** touch the WMMA grouped-prefill kernels (still the gap). Full-model
+e2e coherence on gfx1151 (mq2-lloyd, 86 GB, fits the 103 GB) is the next step.
 
 ## Bottom line
 
