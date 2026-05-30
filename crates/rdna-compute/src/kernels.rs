@@ -2885,6 +2885,23 @@ pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
 pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");
 
+/// Multi-row Q8_0 variant (Lever 1). Same contract as the single-row
+/// `wo_per_group_batched_q8_0` but with block processing R output rows
+/// and hoisting x loads across rows. Grid = [ceil(M/R), B, G].
+pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_multirow.hip");
+
+/// MMQ-style preload variant of the 4-warp MoE grouped MQ2-Lloyd kernel.
+/// Pre-loads all 8 index packs per K-group before the inner loop so the
+/// hardware prefetcher starts on the second cache line earlier.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.hip");
+
+/// Barrier-free variant of the mmqload kernel. Eliminates __syncthreads()
+/// and LDS X staging. Each wave loads X directly from global memory.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip");
+
 /// WMMA Q8_0 GEMM for DeepSeek V4 O-LoRA's strided `[B, G, *]` layout.
 pub const WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0_wmma_4w.hip");

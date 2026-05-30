@@ -5451,16 +5451,34 @@ fn attention_block_batched_swa_only(
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. attn_out_raw_batch
             // is [B, n_heads * head_dim] viewable as [B, G, per_group_in].
-            gpu.wo_per_group_batched_q8_0(
-                wo_a,
-                &pbs.attn_out_raw_batch,
-                &pbs.wo_a_out_batch,
-                n_groups as i32,
-                o_lora_rank as i32,
-                per_group_in as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            // Multi-row variant if HIPFIRE_DEEPSEEK4_WO_MULTIROW=2 or 4.
+            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .unwrap_or(0);
+            if mr == 0 {
+                gpu.wo_per_group_batched_q8_0(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.wo_per_group_batched_q8_0_multirow(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                    mr,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
+            }
         }
         DType::Raw => {
             // MQ4G256 (HFQ4-packed weights, FWHT-rotated input).
@@ -6256,16 +6274,33 @@ fn attention_block_batched_mixed(
         DType::Q8_0 => {
             // Q8_0 contract: plain (non-FWHT) input. Same layout
             // assumption as the swa-only sibling.
-            gpu.wo_per_group_batched_q8_0(
-                wo_a,
-                &pbs.attn_out_raw_batch,
-                &pbs.wo_a_out_batch,
-                n_groups as i32,
-                o_lora_rank as i32,
-                per_group_in as i32,
-                batch_size as i32,
-            )
-            .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            let mr: i32 = std::env::var("HIPFIRE_DEEPSEEK4_WO_MULTIROW")
+                .ok().and_then(|v| v.parse().ok()).filter(|&r| r == 2 || r == 4)
+                .unwrap_or(0);
+            if mr == 0 {
+                gpu.wo_per_group_batched_q8_0(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0 l{layer_idx}: {e:?}"))?;
+            } else {
+                gpu.wo_per_group_batched_q8_0_multirow(
+                    wo_a,
+                    &pbs.attn_out_raw_batch,
+                    &pbs.wo_a_out_batch,
+                    n_groups as i32,
+                    o_lora_rank as i32,
+                    per_group_in as i32,
+                    batch_size as i32,
+                    mr,
+                )
+                .map_err(|e| format!("wo_per_group_batched_q8_0_multirow l{layer_idx}: {e:?}"))?;
+            }
         }
         DType::Raw => {
             gpu.wo_per_group_batched_hfq4g256(
@@ -6648,32 +6683,39 @@ fn ffn_batched(
         // Grouped gate_up GEMM: M = 2*im (gate||up concat), K = hidden.
         // x_row_div = k_top because X is per-token ffn_x_rot_batch [B, K].
         //
-        // 4-warp 64×16 variant: bit-exact vs the single-warp baseline
-        // (`bench_mq2g256_lloyd_moe_4w` max_abs=0 across all V4F MoE cells).
-        // Default ON for gfx1151 grouped prefill shapes after an end-to-end
-        // 2K-token V4F sweep measured 34.69s → 31.94s (+8.6%). Keep the
-        // explicit env override for quick A/B and for non-Halo arch bring-up:
-        //   HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0  force baseline
-        //   HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=1  force 4w when shape-valid
-        let lloyd_4w_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W").ok();
-        let lloyd_4w_default = gpu.arch == "gfx1151";
-        let lloyd_4w_requested = match lloyd_4w_env.as_deref() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => lloyd_4w_default,
-        };
-        let use_lloyd_4w = lloyd_4w_requested
-            && (2 * im) % 64 == 0
-            && hidden % 256 == 0;
-        // Lever 1 (opt-in HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on
-        // the 4w kernel — decode the MQ2-Lloyd A-fragment once per same-expert
-        // tile pair, amortizing the dequant ALU across 2 token sub-tiles.
+        // RECONCILED (#355 + #356) MQ2-Lloyd grouped MoE dispatch.
+        // 4-warp 64×16 variant (gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2) is
+        // the default ON for gfx11+ — #356 broadened the gate from gfx1151-only
+        // (#355) to gfx11||gfx12 (measured 83.8% vs 43.4% L2 hit, -9% kernel
+        // time on gfx1151). [REVIEWER NOTE: the broader gfx11||gfx12 default
+        // gate is #356's; #355 shipped gfx1151-only. Confirm on gfx11 dGPU.]
+        // Opt out via HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W=0. Shape gate: gate_up
+        // M=2*im must be a multiple of 64, K=hidden a multiple of 256.
+        let use_lloyd_4w = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && (2 * im) % 64 == 0
+          && hidden % 256 == 0;
+        // MMQ-style index-pack preload (#356, default ON for 4w; opt out via =0).
+        let use_mmqload = use_lloyd_4w && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() != Ok("0");
+        // Barrier-free nosync variant (#356, opt in via =1).
+        let use_nosync = use_mmqload && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        // Research levers from #355 (all opt-in, default OFF). When set they
+        // take precedence over the mmqload/nosync default path.
+        // Lever 1 (HIPFIRE_DEEPSEEK4_MOE_N32=1): N_TILE=32 tile-pairing on the
+        // 4w kernel — decode the MQ2-Lloyd A-fragment once per same-expert tile
+        // pair, amortizing the dequant ALU across 2 token sub-tiles.
         let n32_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_N32").as_deref() == Ok("1");
-        // Lever 2 (opt-in HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the
-        // n16 4w kernel — shorter dependency chain, same occupancy.
+        // Lever 2 (HIPFIRE_DEEPSEEK4_MOE_CND=1): cndmask dequant on the n16 4w
+        // kernel — shorter dependency chain, same occupancy.
         let cnd_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_CND").as_deref() == Ok("1");
-        // Lever 3 (opt-in HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares
-        // staged X across 8 warps; same occupancy as 4w, ~half X-load traffic).
+        // Lever 3 (HIPFIRE_DEEPSEEK4_MOE_8W=1): 8-warp variant (shares staged X
+        // across 8 warps; same occupancy as 4w, ~half X-load traffic).
         let eightw_env = std::env::var("HIPFIRE_DEEPSEEK4_MOE_8W").as_deref() == Ok("1");
         if use_lloyd_4w && n32_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
@@ -6717,6 +6759,34 @@ fn ffn_batched(
                 batch_size,
             )
             .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_nosync {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync gate_up l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                gate_up_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.ffn_x_rot_batch,
+                &pbs.moe_y_gate_up_grouped,
+                2 * im,
+                hidden,
+                k_top,
+                m_total_max,
+                batch_size,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload gate_up l{layer_idx}: {e:?}"))?;
         } else if use_lloyd_4w {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 gate_up_ptrs,
@@ -6808,10 +6878,20 @@ fn ffn_batched(
         // Grouped down GEMM: M = hidden, K = im. x_row_div = 1 because
         // moe_rot_batch is [B × k_top, im] flat — sorted_slot_index[s]
         // already yields the row index directly (b*k_top + krank).
-        // Same 4w shape gate as the gate_up GEMM above.
-        let use_lloyd_4w_down = lloyd_4w_requested
-            && hidden % 64 == 0
-            && im % 256 == 0;
+        // RECONCILED (#355 + #356): same 4w default + levers as gate_up above.
+        let use_lloyd_4w_down = match std::env::var("HIPFIRE_DEEPSEEK4_MOE_LLOYD_4W")
+            .as_deref()
+        {
+            Ok("0") => false,
+            Ok("1") => true,
+            _ => (gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12"))
+        } && hidden % 64 == 0
+          && im % 256 == 0;
+        let use_mmqload_down = use_lloyd_4w_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_MMQLOAD")
+            .as_deref() != Ok("0");
+        let use_nosync_down = use_mmqload_down && std::env::var("HIPFIRE_DEEPSEEK4_MOE_NOSYNC")
+            .as_deref() == Ok("1");
+        // n32_env / cnd_env / eightw_env reused from the gate_up block above.
         if use_lloyd_4w_down && n32_env {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
                 w2_ptrs,
@@ -6854,6 +6934,34 @@ fn ffn_batched(
                 batch_size * k_top,
             )
             .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_8w_k2 down l{layer_idx}: {e:?}"))?;
+        } else if use_nosync_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_nosync down l{layer_idx}: {e:?}"))?;
+        } else if use_mmqload_down {
+            gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+                w2_ptrs,
+                &pbs.moe_expert_tile_ids,
+                &pbs.moe_sorted_slot_index,
+                &pbs.moe_rot_batch,
+                &pbs.moe_y_down_grouped,
+                hidden,
+                im,
+                1,
+                m_total_max,
+                batch_size * k_top,
+            )
+            .map_err(|e| format!("gemm_mq2g256_lloyd_moe_grouped_mmqload down l{layer_idx}: {e:?}"))?;
         } else if use_lloyd_4w_down {
             gpu.gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
                 w2_ptrs,
