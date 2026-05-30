@@ -28,10 +28,6 @@ permissions:
   contents: read
   pull-requests: write
   issues: write
-  # OIDC token so the action can exchange it for a token from the installed
-  # Claude GitHub App — the review then posts under the Claude app identity
-  # instead of github-actions[bot].
-  id-token: write
 
 concurrency:
   group: claude-review-${{ github.event.pull_request.number }}
@@ -56,13 +52,14 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Force the OIDC / Claude-GitHub-App path. The action DEFAULTS
-          # github_token to the workflow token (→ github-actions[bot]); just
-          # omitting the input isn't enough. Setting it empty makes the action
-          # exchange the OIDC token (id-token: write above) for a token from the
-          # installed Claude app, so the review posts as claude[bot].
-          # (CLAUDE_CODE_OAUTH_TOKEN still handles Anthropic/model auth.)
-          github_token: ""
+          # Posts via the workflow GITHUB_TOKEN, so the comment author shows as
+          # github-actions[bot] (the body is still clearly attributed to Claude).
+          # Making the author literally claude[bot] requires Anthropic's GitHub
+          # OIDC federation (the anthropic_federation_* inputs + Claude Console
+          # setup) or the /install-github-app-generated workflow — an app install
+          # alone doesn't change comment authorship. Left as optional follow-up;
+          # the review content is identical either way.
+          github_token: ${{ github.token }}
           # Post the review as a tracking comment (tag mode). Without this the
           # automatic agent-mode run produces output with nowhere to land
           # ("No buffered inline comments") and posts nothing.
