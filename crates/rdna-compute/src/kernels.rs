@@ -557,6 +557,10 @@ pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma.gfx12.hip");
 pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma_mb4.hip");
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma_nosync.hip");
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync.hip");
 
 /// Returns the MQ3G256Lloyd WMMA residual GEMM kernel source AND module name for
 /// the given arch. Mirrors `gemm_hfq3g256_residual_wmma_for_arch`'s arch matrix.
@@ -648,6 +652,17 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(caps: &ArchCaps) -> (&'static st
     }
 }
 
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_NOSYNC_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_nosync_rdna3"),
+        _ => panic!(
+            "MQ3-Lloyd WMMA gate_up nosync: unsupported arch {arch}."
+        ),
+    }
+}
+
 /// MQ3-Lloyd fused mb4 selectors (gfx11 only).
 pub fn gemm_qkvza_mq3g256_lloyd_wmma_mb4_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
     let arch = caps.arch();
@@ -679,6 +694,15 @@ pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_for_arch(
             "gemm_gate_up_mq3g256_lloyd_wmma_mb4_rdna3",
         ),
         _ => panic!("MQ3-Lloyd WMMA mb4 gate_up: unsupported arch {arch}. gfx11-only."),
+    }
+}
+
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
+    let arch = caps.arch();
+    match arch {
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_MB4_NOSYNC_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_mb4_nosync_rdna3"),
+        _ => panic!("MQ3-Lloyd WMMA mb4 gate_up nosync: unsupported arch {arch}."),
     }
 }
 /// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
