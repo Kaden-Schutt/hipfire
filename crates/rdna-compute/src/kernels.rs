@@ -1576,6 +1576,10 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_K4_SRC: &str =
 // closer to 60-70%. Opt-in via HIPFIRE_GATE_UP_VARIANT=ldscoop.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop.hip");
+/// Barrier-free variant of the LDSCOOP kernel. Each warp loads its own
+/// weights and X from global directly, eliminating __syncthreads().
+pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_ldscoop_nosync.hip");
 // 2tile variant: 32 rows × 16 cols output tile per block, 64 threads
 // (2 wave32). Halves grid in M-dim (1728 → 864 blocks at M=27648),
 // amortizing per-block X-tile (FP16 batch matrix) loads across both
@@ -3389,9 +3393,6 @@ pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
 /// Multi-row Q8_0 variant (Lever 1). Same contract as the single-row
 /// `wo_per_group_batched_q8_0` but with block processing R output rows
 /// and hoisting x loads across rows. Grid = [ceil(M/R), B, G].
-pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
-    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_multirow.hip");
-
 /// MMQ-style preload variant of the 4-warp MoE grouped MQ2-Lloyd kernel.
 /// Pre-loads all 8 index packs per K-group before the inner loop so the
 /// hardware prefetcher starts on the second cache line earlier.
@@ -3408,6 +3409,10 @@ pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str = i
 pub const WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC: &str =
     include_str!("../../../kernels/src/wo_per_group_batched_q8_0_wmma_4w.hip");
 
+/// Barrier-free nosync variant of the MoE grouped mmqload kernel.
+/// Removes LDS X staging + __syncthreads(); each warp loads X from global.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip");
 /// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
 /// bias-aware top-K + normalize + route_scale, one block per batch row.
 pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
