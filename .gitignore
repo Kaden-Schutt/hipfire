@@ -70,6 +70,7 @@ cli/CLAUDE.md
 # Training artifacts (draft ckpts, converted hfq, prompt files, logs)
 .dflash-runs/
 artifacts/
+Quantization/
 .codeinsight
 .codeinsight+research/
 .local-bench-scratch/
