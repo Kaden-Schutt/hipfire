@@ -61,13 +61,18 @@ jobs:
           # automatic agent-mode run produces output with nowhere to land
           # ("No buffered inline comments") and posts nothing.
           track_progress: "true"
-          # Leave the action's comment tools available so it can post; block
-          # file mutation and shell so the agent can review but never edit or
-          # execute code. (Runs only on trusted in-repo branches — fork PRs
-          # skip for lack of secrets — so read + comment is the whole job.)
+          # Denylist (not an allowlist): an allowlist would also have to name
+          # the action's internal comment-posting tools — whose names aren't a
+          # stable public contract under track_progress — and omitting them is
+          # what made an earlier run post nothing. So instead we leave the
+          # comment tools available and explicitly block everything that lets
+          # the agent change state or reach out: file mutation (Edit/Write/
+          # MultiEdit/NotebookEdit), shell (Bash), the web (WebSearch/WebFetch),
+          # and sub-agent spawning (Agent). Net: read the diff + post a comment,
+          # nothing else. Runs only on trusted in-repo branches (fork PRs skip).
           claude_args: |
             --max-turns 20
-            --disallowedTools Edit,Write,MultiEdit,NotebookEdit,Bash
+            --disallowedTools Edit,Write,MultiEdit,NotebookEdit,Bash,WebSearch,WebFetch,Agent
           prompt: |
             You are the first-pass PR reviewer for hipfire, an RDNA-native LLM
             inference engine in Rust. Your job is to SHORTEN human review, not
