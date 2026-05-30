@@ -48,6 +48,26 @@ for measured speedups. Per-model override is the most common knob:
 `hipfire config qwen3.5:9b set dflash_mode off` if your workload is
 mostly long-form prose.
 
+## Speculative decode (MTP)
+
+| Key | Default | Values | Notes |
+|---|---|---|---|
+| `mtp_mode` | auto | off / on / auto | MTP spec-decode using the model's built-in Multi-Token Prediction head. `auto` enables when MTP weights are present. Currently applies to DeepSeek V4 (arch_id=9). |
+| `mtp_k` | 3 | 1–10 | Draft tokens per spec-decode window. Higher = more parallelism, lower acceptance probability per draft step. |
+
+`auto` discovers MTP weights from `<model>-mtp.*` sibling files (e.g.
+`deepseek-v4-flash-mtp.mq2lloyd` alongside the main `.mq2lloyd`). Set `off`
+to skip the sibling scan entirely and use plain AR decode.
+
+Per-model override:
+```bash
+hipfire config deepseek-v4-flash-mtp:latest set mtp_mode on
+hipfire config deepseek-v4-flash-mtp:latest set mtp_k 5
+```
+
+Legacy env vars `HIPFIRE_DEEPSEEK4_SPEC_DECODE` and `HIPFIRE_DEEPSEEK4_SPEC_K`
+continue to work and take precedence over config values.
+
 ## Attention
 
 | Key | Default | Values |
