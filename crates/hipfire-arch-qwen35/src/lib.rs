@@ -27,6 +27,8 @@
 // was on `engine::qwen35` pre-Phase-2.
 #[cfg(feature = "deltanet")]
 pub mod qwen35;
+#[cfg(all(feature = "deltanet", feature = "new-dispatch"))]
+pub mod forward_dispatch;
 #[cfg(feature = "deltanet")]
 pub mod speculative;
 #[cfg(feature = "deltanet")]

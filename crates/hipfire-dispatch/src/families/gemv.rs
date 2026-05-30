@@ -73,6 +73,29 @@ impl GemvFamily {
         self.registry.resolve(key, ctx)
     }
 
+    /// Run a GEMV with automatic variant selection.
+    ///
+    /// Picks `Prerotated` when `dtype_needs_fwht(w.dtype)`, `Plain` otherwise.
+    /// Replaces per-model `gemv_prerotated_or_plain` / `dispatch_gemv` helpers.
+    pub fn run_auto(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        w: &WeightRef,
+        x: &GpuTensor,
+        y: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        let variant = if crate::types::dtype_needs_fwht(w.dtype) {
+            GemvVariant::Prerotated
+        } else {
+            GemvVariant::Plain
+        };
+        self.run(ctx, gpu, &GemvParams {
+            w, x, y, variant,
+            residual: None, gate: None, up: None,
+        })
+    }
+
     /// Run a GEMV operation.
     ///
     /// Validates arch compatibility via `resolve()`, then dispatches to the

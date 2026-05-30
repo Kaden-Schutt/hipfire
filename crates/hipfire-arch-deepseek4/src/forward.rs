@@ -101,10 +101,17 @@ mod env_cache {
 /// rotations into `ffn_x_rot` / `silu_rot` / `q_lat_rot` / etc. are
 /// DEAD WORK (kernel runs, output never read). Use this to skip them.
 #[inline]
+#[cfg(not(feature = "new-dispatch"))]
 pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
     !matches!(weight.dtype, DType::F32 | DType::F16 | DType::Q8_0)
 }
 
+#[cfg(feature = "new-dispatch")]
+pub(crate) fn weight_needs_fwht(weight: &GpuTensor) -> bool {
+    hipfire_dispatch::types::dtype_needs_fwht(weight.dtype)
+}
+
+#[cfg(not(feature = "new-dispatch"))]
 fn gemv_auto(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -114,30 +121,13 @@ fn gemv_auto(
     m: usize,
     k: usize,
 ) -> Result<(), String> {
-    // Dispatch by GpuTensor.dtype (set by upload_quant_or_f16):
-    //   F32  — F16-source weight, decoded at upload (legacy decode-only path).
-    //   F16  — F16-source kept native. Uses gemm_f16_x_f16_wmma at B=1.
-    //   Q8_0 — Q8F16-source (antirez attn/shared quant). Use plain input.
-    //   else (Raw) — MQ4G256 default. Use FWHT-rotated input.
     match weight.dtype {
         DType::F32 => gpu
             .gemv_f32(weight, x_plain, y)
             .map_err(|e| format!("gemv_f32: {e:?}")),
-        // F16: gemv_f16_xf32 keeps F32 input precision (reads F16 weight,
-        // casts in-loop, F32 multiply-accumulate). The earlier
-        // gemv_f16_x_decode path converted F32→F16 input before WMMA,
-        // losing ~13 mantissa bits — made F16 measure worse than Q8 for
-        // downstream tasks. Removed.
         DType::F16 => gpu
             .gemv_f16_xf32(weight, x_plain, y, m, k)
             .map_err(|e| format!("gemv_f16_xf32: {e:?}")),
-        // Q8 decode (B=1) stays on the scalar `gemv_q8_0` kernel. Empirically
-        // measured: the WMMA path at B=1 wastes 15/16 of the 16×16 output
-        // tile on unused N-axis columns, while scalar gemv_q8_0 produces
-        // exactly 1 output per thread with no wasted work. Result: WMMA at
-        // B=1 is 30% SLOWER than scalar for Q8 on gfx1151 (measured
-        // 2026-05-20). The batched path (gemv_auto_batched_wmma) does
-        // benefit and IS WMMA by default.
         DType::Q8_0 => gpu
             .gemv_q8_0(weight, x_plain, y, m, k)
             .map_err(|e| format!("gemv_q8_0: {e:?}")),
@@ -145,6 +135,25 @@ fn gemv_auto(
             .gemv_mq4g256_prerotated(weight, x_rotated, y, m, k)
             .map_err(|e| format!("gemv_mq4g256_prerotated: {e:?}")),
     }
+}
+
+#[cfg(feature = "new-dispatch")]
+fn gemv_auto(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated: &GpuTensor,
+    x_plain: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+) -> Result<(), String> {
+    use crate::forward_dispatch::ForwardDispatch;
+    use std::sync::OnceLock;
+
+    static FD: OnceLock<ForwardDispatch> = OnceLock::new();
+    let fd = FD.get_or_init(|| ForwardDispatch::new(gpu));
+    let x = if weight_needs_fwht(weight) { x_rotated } else { x_plain };
+    fd.dispatch_gemv(gpu, weight, x, y, m, k)
 }
 
 /// Batched twin of `gemv_auto` for Phase B2 chunk forward.
@@ -170,6 +179,7 @@ fn gemv_auto(
 /// sequential gemv_auto call against the same weight; per-row outputs
 /// match within FMA-order ε.
 #[allow(dead_code, clippy::too_many_arguments)]
+#[cfg(not(feature = "new-dispatch"))]
 fn gemv_auto_batched(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -191,6 +201,26 @@ fn gemv_auto_batched(
         batch_size,
         /*x_f16_scratch=*/ None,
     )
+}
+
+#[cfg(feature = "new-dispatch")]
+fn gemv_auto_batched(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated_batch: &GpuTensor,
+    x_plain_batch: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> Result<(), String> {
+    use crate::forward_dispatch::ForwardDispatch;
+    use std::sync::OnceLock;
+
+    static FD: OnceLock<ForwardDispatch> = OnceLock::new();
+    let fd = FD.get_or_init(|| ForwardDispatch::new(gpu));
+    let x = if weight_needs_fwht(weight) { x_rotated_batch } else { x_plain_batch };
+    fd.dispatch_gemv_batched(gpu, weight, x, y, batch_size, m, k)
 }
 
 /// `gemv_auto_batched` plus an opt-in WMMA path. When `x_f16_scratch`
@@ -215,6 +245,7 @@ fn dump_buf(gpu: &mut Gpu, tag: &str, buf: &rdna_compute::GpuTensor) {
     }
 }
 
+#[cfg(not(feature = "new-dispatch"))]
 fn gemv_auto_batched_wmma(
     gpu: &mut Gpu,
     weight: &GpuTensor,
@@ -320,6 +351,21 @@ fn gemv_auto_batched_wmma(
                 .map_err(|e| format!("gemm_hfq4g256: {e:?}"))
         }
     }
+}
+
+#[cfg(feature = "new-dispatch")]
+fn gemv_auto_batched_wmma(
+    gpu: &mut Gpu,
+    weight: &GpuTensor,
+    x_rotated_batch: &GpuTensor,
+    x_plain_batch: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+    _x_f16_scratch: Option<&GpuTensor>,
+) -> Result<(), String> {
+    gemv_auto_batched(gpu, weight, x_rotated_batch, x_plain_batch, y, m, k, batch_size)
 }
 
 /// DeepSeek V4 Compressor decode step (phase 3b scaffold — not yet wired).

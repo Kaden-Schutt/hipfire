@@ -2908,7 +2908,7 @@ fn moe_ffn_decode(
 /// All gate-side + routed MoE weights are MQ4G256 — the precondition for
 /// the prerotated fast path where the caller can fuse rmsnorm+FWHT via
 /// `fused_rmsnorm_rotate_mq` and call `moe_ffn_decode_with_scratch_prerotated`.
-fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
+pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
     ffn.router.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert_gate.gpu_dtype == DType::MQ4G256
         && ffn.shared_expert.gate.gpu_dtype == DType::MQ4G256
@@ -2940,7 +2940,7 @@ fn moe_ffn_has_mq3(ffn: &MoeFfnWeights) -> bool {
 /// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
 /// be populated (done automatically by `Qwen35Scratch::new` when config
 /// indicates a MoE model). Safe to call under hipGraph stream capture.
-fn moe_ffn_decode_with_scratch(
+pub(crate) fn moe_ffn_decode_with_scratch(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
     x_norm: &GpuTensor,
@@ -2957,7 +2957,7 @@ fn moe_ffn_decode_with_scratch(
 /// (e.g. via a fused `fused_rmsnorm_rotate_mq` launch at the call site).
 /// For all-MQ4 MoE layers this saves one launch per layer by eliding the
 /// internal `rotate_x_mq`. On non-MQ4 layers this flag is ignored.
-fn moe_ffn_decode_with_scratch_prerotated(
+pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
     x_norm: &GpuTensor,
@@ -5318,7 +5318,7 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         || fp4_with_wmma
 }
 
-fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
+pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
     if std::env::var_os("HIPFIRE_QWEN35_FINITE_TRACE").is_none() {
         return Ok(());
     }
