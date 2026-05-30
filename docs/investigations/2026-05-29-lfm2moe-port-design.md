@@ -245,18 +245,32 @@ model. Investigated directly rather than by assumption:
 - **Bandwidth sensitivity ladder** (tok/s rises monotonically as bytes/token
   falls): mq6e (most bytes) 203 < mq4 241 < mq4p (fewest) 259.
 
-**Conclusion:** decode only reaches ~47% of bandwidth because it is
-latency/occupancy-bound per launch — 377 tiny kernels/token with ~27%
-inter-kernel idle, so the bus is never kept busy. The "3090 beats R9700" gap is
-roughly half hardware (GDDR6X ~936 GB/s vs our measured 632) and half our own
-software leaving bandwidth on the floor. The real lever to close it is the
-**launch/occupancy axis** — HIP graph capture (amortize the 377 launches/token)
-+ kernel fusion — NOT bandwidth (HW-capped) and NOT DPM (pinning hurt). Lifting
-utilization 47%→~70% would be ~+50% tok/s (241→~360), which would flip the
-comparison. Caveat: qwen35 has AR-forward graph capture disabled
-(`use_graph=false`) on an older ROCm over a kernarg-bake attractor; we are on
-gfx1201 + custom ROCm, so it is worth re-testing here (with coherence-gating) —
-that is the recommended next perf task.
+**Conclusion:** decode only reaches ~47% of bandwidth because the GEMV kernels
+are occupancy/latency-bound — not enough in-flight memory requests to saturate
+the bus. The "3090 beats R9700" gap is roughly half hardware (GDDR6X ~936 GB/s
+vs our measured 632) and half our own software leaving bandwidth on the floor.
+
+### Graph capture MEASURED (gfx1201, 2026-05-30): +3.4%, NOT the projected +50%
+
+I first guessed HIP graph capture would recover the ~27% inter-kernel idle for
+~+50% tok/s. **That guess was wrong** — measured result is **+3.4%** (240.3 →
+248.5 tok/s, matched). Implemented + validated (opt-in `HIPFIRE_LFM2_GRAPH=1`,
+commit 0de1e122): correct on gfx1201 — tiny-oracle cosine ≥0.999, byte-identical
+logits parity (cos=1.0, 0/8 argmax mismatch), greedy token-ids match on/off,
+coherence verdict OK; the qwen35 ROCm kernarg-snapshot attractor that forced
+`use_graph=false` there does NOT reproduce on gfx1201. But the gain is small.
+
+**Why the guess was wrong, and what it reveals:** the ~27% trace "idle" mostly
+*overlaps* kernel execution rather than being recoverable wall-time, so
+amortizing the 377 launches/token only buys a few percent. Crucially, graph
+capture recovering ~none of the 53% un-utilized bandwidth PROVES the
+un-utilization is **not** launch-gap-driven — it's the GEMV kernels themselves
+being occupancy/latency-bound. So the real remaining software lever is **GEMV
+occupancy** (VGPR pressure / `__launch_bounds__` / waves-in-flight on the hot
+`gemv_q8_0` + the indexed MoE expert GEMVs), NOT launch count or fusion. That is
+the recommended next perf task — kernel-level; use the `gfx-kernel-metadata`
+skill to read VGPR/LDS/occupancy and tune. Levers stackable today (both opt-in):
+proj-MQ4 (+7.2%, bandwidth, quality cost) + graph capture (+3.4%, launch, free).
 
 ### Projection-quant bandwidth sweep (KLD, gfx1201, 2026-05-30) — SETTLED
 
