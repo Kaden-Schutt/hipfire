@@ -25532,9 +25532,22 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void,
             &mut ms as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
         ];
-        let block_size = (seq_len_hint.max(head_dim) as u32).next_power_of_two().min(256);
+        // hipGraph capture: `block_size` and `shared_mem` are launch-time host
+        // scalars baked into the captured node. They are sized by `seq_len_hint`
+        // (= current position + 1) on the direct path, which would lock a
+        // captured graph to its capture position and under-allocate scores[] on
+        // replay at a later position. Under capture, size both to `max_seq` so
+        // ONE captured graph replays correctly at EVERY later position: the
+        // kernel recomputes `seq_len = pos_buf[0]+1` from the DEVICE pos buffer
+        // (updated direct before each replay) and self-adjusts its internal
+        // scores[]/q_sh offsets — only the *allocated* shared-mem must be large
+        // enough, and `max_seq` always is. block_size strides safely at any
+        // nthreads, so the larger capture value stays correct. Mirrors the
+        // `if self.capture_mode { max_tiles }` pattern used elsewhere here.
+        let sizing_seq = if self.capture_mode { max_seq } else { seq_len_hint };
+        let block_size = (sizing_seq.max(head_dim) as u32).next_power_of_two().min(256);
         // Extra shared mem for Q head vector preloaded into shared memory
-        let shared_mem = ((seq_len_hint + block_size as usize + head_dim) * 4) as u32;
+        let shared_mem = ((sizing_seq + block_size as usize + head_dim) * 4) as u32;
         let bytes = crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
         let result = self.launch_maybe_blob(

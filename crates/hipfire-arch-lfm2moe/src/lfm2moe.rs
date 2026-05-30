@@ -378,6 +378,10 @@ pub struct Lfm2MoeState {
     /// One rolling [hidden, K-1] f32 ring buffer per conv layer (zero-init).
     pub conv_states: Vec<GpuTensor>,
     pub pos_buf: hip_bridge::DeviceBuffer, // device i32 position scalar
+    /// hipGraph (HIPFIRE_LFM2_GRAPH) warmup latch: false until the first
+    /// decode runs direct (so kernel JIT / lazy alloc happen outside any
+    /// stream capture). Unused when the graph path is disabled.
+    pub graph_warmed_up: bool,
     pub max_seq: usize,
     pub n_tokens: usize,
 
@@ -471,6 +475,7 @@ impl Lfm2MoeState {
             kv,
             conv_states,
             pos_buf,
+            graph_warmed_up: false,
             max_seq,
             n_tokens: 0,
             h: alloc(gpu, hidden, "h")?,

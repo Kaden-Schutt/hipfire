@@ -26,6 +26,11 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.
+///
+/// Routes to the hipGraph capture/replay path when `HIPFIRE_LFM2_GRAPH=1`
+/// (default OFF → exact prior behavior). The graph path amortizes the ~377
+/// per-token kernel launches by replaying a single captured graph; see
+/// `decode_step_with_graph`.
 pub fn decode_step(
     cfg: &Lfm2MoeConfig,
     weights: &Lfm2MoeWeights,
@@ -34,9 +39,22 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+    if graph_enabled() {
+        return decode_step_with_graph(cfg, weights, state, gpu, token_id, position);
+    }
     decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("lfm2moe: download logits: {e:?}"))
+}
+
+/// `HIPFIRE_LFM2_GRAPH=1` opt-in switch. Default OFF (unset / "0") →
+/// byte-identical to the legacy per-launch decode path. Parsed once.
+fn graph_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENV: OnceLock<bool> = OnceLock::new();
+    *ENV.get_or_init(|| {
+        matches!(std::env::var("HIPFIRE_LFM2_GRAPH").ok().as_deref(), Some("1"))
+    })
 }
 
 /// Decode one token, appending each layer's post-residual hidden state
@@ -62,6 +80,41 @@ fn decode_step_inner(
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
+    capture: Option<&mut [Vec<f32>]>,
+) -> Result<(), String> {
+    let hidden = cfg.hidden_size;
+
+    // Device position scalar (i32) for rope / kv-write / attention.
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
+
+    // Embedding lookup → residual stream h (Q8 table).
+    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
+        .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
+
+    decode_step_layers_and_head(cfg, weights, state, gpu, position, capture)
+}
+
+/// Per-layer mixer/FFN stack + final norm + lm_head. Reads the residual
+/// stream `state.h` (already seeded by the embedding lookup) and the device
+/// position scalar `state.pos_buf` (already staged); writes `state.logits`.
+///
+/// This is the hipGraph-captureable region: it issues only kernel launches
+/// that read STABLE device buffers and (on the MoE path) compute their
+/// topk/positions on-device, so a single capture replays correctly at every
+/// later position once `state.pos_buf` is refreshed. The per-token-varying
+/// embedding lookup (token_id is a kernarg) and the `pos_buf` htod are the
+/// caller's responsibility OUTSIDE the captured region.
+///
+/// `capture` (oracle dumper) is incompatible with hipGraph capture — it issues
+/// a sync `download_f32` per layer. The graph path always passes `None`.
+fn decode_step_layers_and_head(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    position: u32,
     mut capture: Option<&mut [Vec<f32>]>,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
@@ -74,15 +127,6 @@ fn decode_step_inner(
     let eps = cfg.rms_norm_eps;
     let seq_len = position as usize + 1;
     let capture_postmixer = std::env::var_os("HIPFIRE_LFM2_CAPTURE_POSTMIXER").is_some();
-
-    // Device position scalar (i32) for rope / kv-write / attention.
-    gpu.hip
-        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
-        .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
-
-    // Embedding lookup → residual stream h (Q8 table).
-    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
-        .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
 
     for (l, layer) in weights.layers.iter().enumerate() {
         // ── Mixer block (pre-norm) ──────────────────────────────────────────
@@ -321,4 +365,102 @@ fn decode_step_inner(
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("lfm2moe: lm_head: {e}"))?;
     Ok(())
+}
+
+/// hipGraph-amortized decode_step. Opt-in via `HIPFIRE_LFM2_GRAPH=1`
+/// (default OFF → exact `decode_step_inner` behavior). Mirrors the working
+/// DeepSeek-V4 integration (`decode_step_with_graph`).
+///
+/// Three-state machine driven by `state.graph_warmed_up` and `gpu.graph_exec`:
+///   1. !warmed_up                 → direct dispatch once (so kernel JIT and
+///                                    any lazy hipMalloc happen OUTSIDE the
+///                                    captured region), set the flag.
+///   2. warmed_up && no graph      → embedding+pos direct, then capture the
+///                                    layer loop + head, instantiate, launch
+///                                    once for this position's output.
+///   3. graph instantiated         → embedding+pos direct, then `graph_launch`
+///                                    re-runs the captured ops which re-read
+///                                    `state.pos_buf` (refreshed below) and the
+///                                    KV / conv-state / topk device buffers.
+///
+/// Per-token-varying values handled OUTSIDE the captured region:
+///   * `token_id` — baked into `embedding_lookup_q8`'s kernarg, so the
+///     embedding lookup runs DIRECT each token (writes `state.h`); the
+///     captured region begins at layer 0's rmsnorm reading `state.h`.
+///   * `position` — staged into the STABLE device buffer `state.pos_buf` via a
+///     direct `memcpy_htod` before each `graph_launch`; every captured kernel
+///     (rope/kv-write/attention) reads `pos_buf` from the device, so replay at
+///     a new position is correct without re-capture. The attention kernel's
+///     launch-baked `block_size`/`shared_mem` are sized to `max_seq` under
+///     capture (see `attention_q8_0_kv` in dispatch.rs), so one capture
+///     replays correctly at every later position.
+///
+/// `state.n_tokens` is advanced here to match `decode_step_inner` semantics.
+pub fn decode_step_with_graph(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    let hidden = cfg.hidden_size;
+
+    // ── Warmup phase: direct dispatch, no capture ──────────────────────────
+    // Run the legacy path once so inline JIT / lazy scratch alloc happen
+    // before any stream capture (capturing a hipMalloc errors).
+    if !state.graph_warmed_up {
+        state.graph_warmed_up = true;
+        decode_step_inner(cfg, weights, state, gpu, token_id, position, None)?;
+        return gpu
+            .download_f32(&state.logits)
+            .map_err(|e| format!("lfm2moe: download logits (graph warmup): {e:?}"));
+    }
+
+    // Capture/replay needs an explicit (non-null) stream.
+    if gpu.active_stream.is_none() {
+        let s = gpu
+            .hip
+            .stream_create()
+            .map_err(|e| format!("lfm2moe: stream_create: {e:?}"))?;
+        gpu.active_stream = Some(s);
+    }
+
+    // Per-token-varying ops, DIRECT (outside the captured region).
+    // pos_buf: refreshed each token; the captured kernels re-read it on replay.
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod pos (graph): {e:?}"))?;
+    // embedding lookup: token_id is a kernarg → must run per-token, not captured.
+    gpu.embedding_lookup_q8(&weights.embed, &state.h, token_id, hidden)
+        .map_err(|e| format!("lfm2moe: embed lookup (graph): {e:?}"))?;
+
+    if gpu.graph_exec.is_none() {
+        // ── Capture phase ──────────────────────────────────────────────────
+        gpu.begin_graph_capture()
+            .map_err(|e| format!("lfm2moe: begin_graph_capture: {e:?}"))?;
+        decode_step_layers_and_head(cfg, weights, state, gpu, position, None)?;
+        gpu.end_graph_capture()
+            .map_err(|e| format!("lfm2moe: end_graph_capture: {e:?}"))?;
+        // Recorded, not executed — launch once so this position's logits are real.
+        gpu.graph_launch()
+            .map_err(|e| format!("lfm2moe: graph_launch (capture-end): {e:?}"))?;
+        eprintln!(
+            "[LFM2.5-MoE hipGraph] captured forward — {} kernarg blobs retained",
+            gpu.capture_blobs.len()
+        );
+        // decode_step_layers_and_head set n_tokens; capture-end launch ran it.
+    } else {
+        // ── Replay phase ────────────────────────────────────────────────────
+        gpu.graph_launch()
+            .map_err(|e| format!("lfm2moe: graph_launch (replay): {e:?}"))?;
+        // Mirror decode_step_layers_and_head's `state.n_tokens = position + 1`,
+        // which the replayed graph does NOT execute (it is host-side state).
+        state.n_tokens = position as usize + 1;
+    }
+
+    // Logits download outside the captured region (sync D2H on the null stream;
+    // completes after the captured kernels finish on the captured stream).
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("lfm2moe: download logits (graph): {e:?}"))
 }
