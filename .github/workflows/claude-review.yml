@@ -57,12 +57,17 @@ jobs:
           # (no app install, no `id-token: write` needed). The job permissions
           # above grant exactly what it needs (pull-requests / issues: write).
           github_token: ${{ github.token }}
-          # Read-only toolset — the agent inspects the diff and docs; it cannot
-          # edit files or push. The action posts the review comment itself via
-          # the GitHub token, not through a model tool.
+          # Post the review as a tracking comment (tag mode). Without this the
+          # automatic agent-mode run produces output with nowhere to land
+          # ("No buffered inline comments") and posts nothing.
+          track_progress: "true"
+          # Leave the action's comment tools available so it can post; block
+          # file mutation and shell so the agent can review but never edit or
+          # execute code. (Runs only on trusted in-repo branches — fork PRs
+          # skip for lack of secrets — so read + comment is the whole job.)
           claude_args: |
             --max-turns 20
-            --allowedTools Read,Grep,Glob
+            --disallowedTools Edit,Write,MultiEdit,NotebookEdit,Bash
           prompt: |
             You are the first-pass PR reviewer for hipfire, an RDNA-native LLM
             inference engine in Rust. Your job is to SHORTEN human review, not
