@@ -232,6 +232,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-dispatch"
+version = "0.2.0"
+dependencies = [
+ "hipfire-runtime",
+ "rdna-compute",
+]
+
+[[package]]
 name = "hipfire-quantize"
 version = "0.2.0"
 dependencies = [

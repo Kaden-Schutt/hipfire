@@ -1,0 +1,17 @@
+[package]
+name = "hipfire-dispatch"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rdna-compute = { path = "../rdna-compute" }
+hipfire-runtime = { path = "../hipfire-runtime", optional = true }
+
+[features]
+default = []
+new-rotation = []
+new-gemv = ["hipfire-runtime"]
+new-gemm = ["hipfire-runtime"]
+new-fused-qkv = ["hipfire-runtime"]
+new-attention = ["hipfire-runtime"]
+new-moe = ["hipfire-runtime"]
