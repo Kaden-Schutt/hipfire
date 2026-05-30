@@ -56,11 +56,13 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # No github_token here on purpose: omitting it lets the action exchange
-          # the workflow OIDC token (id-token: write above) for a token from the
-          # installed Claude GitHub App, so the review posts under the Claude app
-          # identity rather than github-actions[bot]. (CLAUDE_CODE_OAUTH_TOKEN
-          # still handles Anthropic/model auth — separate from the GitHub side.)
+          # Force the OIDC / Claude-GitHub-App path. The action DEFAULTS
+          # github_token to the workflow token (→ github-actions[bot]); just
+          # omitting the input isn't enough. Setting it empty makes the action
+          # exchange the OIDC token (id-token: write above) for a token from the
+          # installed Claude app, so the review posts as claude[bot].
+          # (CLAUDE_CODE_OAUTH_TOKEN still handles Anthropic/model auth.)
+          github_token: ""
           # Post the review as a tracking comment (tag mode). Without this the
           # automatic agent-mode run produces output with nowhere to land
           # ("No buffered inline comments") and posts nothing.
