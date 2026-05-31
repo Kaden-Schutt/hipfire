@@ -24128,6 +24128,99 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         Ok(())
     }
 
+    /// Adaptive-KV V transcode: re-quantize a V cache (all positions of one FA
+    /// layer) from q8_0 → lloyd4. Reads the 272 B/head q8 record from `src`,
+    /// dequantizes to normal space, FWHT-rotates 256-wide, quantizes to
+    /// TURBO_C4_256, writes the 132 B/head lloyd4 record to `dst`. The caller
+    /// passes `src` = a scratch copy of the layer and `dst` = the layer buffer
+    /// (non-aliasing) to stay crash- and overlap-safe; aliasing `dst==src` is
+    /// only safe if dst stride <= src stride AND no position's dst region
+    /// overlaps a higher-address position's still-unread src region (not true
+    /// for q8→lloyd4 at p=0/1 — use a scratch). signs1/signs2 are the 256-wide
+    /// FWHT signs (same as the lloyd V-write path).
+    pub fn transcode_v_q8_to_lloyd4(
+        &mut self, dst: &GpuTensor, src: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, n_positions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_transcode_v_q8_to_lloyd4",
+            kernels::KV_TRANSCODE_V_Q8_TO_LLOYD4_SRC,
+            "kv_transcode_v_q8_to_lloyd4",
+        )?;
+        let func = &self.functions["kv_transcode_v_q8_to_lloyd4"];
+        let mut dp = dst.buf.as_ptr();
+        let mut sp = src.buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut np = n_positions as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, n_positions as u32, 1], [32, 1, 1],
+                shared_mem, self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Adaptive-KV V transcode: re-quantize a lloyd-V cache (all positions of one
+    /// FA layer) from a higher lloyd tier to a lower one, within the 256-LUT
+    /// family. No FWHT (already rotated): reconstruct the rotated value
+    /// (cnorm * TURBO_C{src}_256[idx]) from `src`, re-quantize to the dst tier,
+    /// recompute cnorm, write to `dst`. Supports (src,dst) bits = (4,3),(3,2),
+    /// (4,2). The caller passes `src` = a scratch copy and `dst` = the layer
+    /// buffer (non-aliasing) for overlap safety.
+    pub fn transcode_v_lloyd_down(
+        &mut self, dst: &GpuTensor, src: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, n_positions: usize,
+        src_bits: i32, dst_bits: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_transcode_v_lloyd_down",
+            kernels::KV_TRANSCODE_V_LLOYD_DOWN_SRC,
+            "kv_transcode_v_lloyd_down",
+        )?;
+        let func = &self.functions["kv_transcode_v_lloyd_down"];
+        let mut dp = dst.buf.as_ptr();
+        let mut sp = src.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut np = n_positions as i32;
+        let mut sb = src_bits;
+        let mut db = dst_bits;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+            &mut sb as *mut _ as *mut c_void,
+            &mut db as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, n_positions as u32, 1], [32, 1, 1],
+                shared_mem, self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Batched variant: launch `kv_cache_write_fwht256_4bit_batched` on an arbitrary buffer.
     /// Used for V when v_mode == Lloyd4 in the batched write path.
     pub fn kv_cache_write_v256_4bit_vec_batched(
