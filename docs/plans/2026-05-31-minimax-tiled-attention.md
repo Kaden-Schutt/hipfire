@@ -5,8 +5,18 @@ hipfire — see LICENSE and NOTICE in the project root.
 -->
 # Task 2 — Tiled (online-softmax) attention for minimax's native context window
 
-**Status:** PLANNED, not started. Resume here after compaction.
+**Status:** IMPLEMENTED (2026-05-31). See "OUTCOME" at the bottom.
 **Branch:** `lfm2moe/impl` (PR #365), based on `minimax/m2.7-impl` (`edf922db`).
+
+> **OUTCOME (read first):** No new kernel was written. hipfire already ships a
+> production-validated two-stage online-softmax flash path —
+> `attention_flash_q8_0` (`attention_flash_q8_0_tile` + `_reduce`) — used as the
+> default decode/prefill attention by qwen35 and llama, with the *identical*
+> Q8_0 KV layout (34-byte blocks, GQA). Its LDS is `(128+head_dim)*4` ≈ const,
+> independent of seq_len. minimax was simply switched onto it via a hybrid
+> dispatch (mirroring qwen35). This is strictly lower-risk than a hand-written
+> kernel — see the OUTCOME section for the exact edits and validation. The
+> original from-scratch design below is kept for context.
 
 ## Why
 
@@ -118,3 +128,40 @@ acceptable — measure first.)
 - tool-call parsers (LFM2 `<|tool_call_start|>` + MiniMax `<minimax:tool_call>`) +
   tojson(ensure_ascii) fix — minimax/lfm2 tool-calls round-trip via serve.
 - Verified: hermes drives BOTH minimax + deepseek e2e (full tool loops) at ≤16K.
+
+## OUTCOME — implemented 2026-05-31 (reuse `attention_flash_q8_0`, no new kernel)
+
+**Approach.** The from-scratch tiled kernel above was unnecessary: the existing
+`attention_flash_q8_0` (tile + reduce, `kernels/src/attention_flash_q8_0_tile.hip`
++ `attention_flash_q8_0_reduce.hip`, dispatch `crates/rdna-compute/src/dispatch.rs`
+`attention_flash_q8_0`) is exactly an online-softmax flash path on the same Q8_0
+KV layout, already the default attention for qwen35/llama on gfx11/gfx12. Switched
+minimax onto it.
+
+**Edits (all minimax-local; no kernel/dispatch/shared changes):**
+1. `crates/hipfire-arch-minimax/src/minimax.rs`
+   - Fixed `flash_partials` sizing: was `tile=256`, `max_seq/256+1` (under-allocated
+     ~2×); now `TILE=128`, `ceil(physical_cap/128)` tiles × `n_heads × (2+head_dim)`
+     — matches the dispatch exactly.
+   - Added `flash_mode: u8` to `MiniMaxState` (env `HIPFIRE_ATTN_FLASH`, default 2
+     on gfx11/gfx12 so warmup-eager and captured-replay decode use the SAME kernel).
+2. `crates/hipfire-arch-minimax/src/forward.rs`
+   - `decode_step_body`: hybrid `use_flash = capture_mode || flash_mode==2 ||
+     (flash_mode==1 && seq_len>=2048) || seq_len>15000` → `attention_flash_q8_0`
+     else `attention_q8_0_kv`. Fixes graph-capture LDS over-request too (capture
+     forced the old kernel to size LDS to physical_cap → >64KB at ≳16K).
+   - `forward_batch` (batched prefill): when `max_ctx > 15000`, loop per row calling
+     single-position `attention_flash_q8_0` (reusing `state.flash_partials`); else
+     keep `attention_q8_0_kv_batched`. Mirrors qwen35:7173.
+3. `crates/hipfire-runtime/examples/test_q8kv.rs` — added flash-vs-baseline parity
+   (Test 5) + a >16K flash-only sanity check.
+
+**Validation.**
+- Local gfx1201 parity (`test_q8kv`, GQA head_dim=128): flash vs baseline
+  cosine=1.000000, max-abs-err ≤1.1e-6 at seq=4/64/512/2048; flash-only at
+  seq=20000 (baseline can't run) finite + correct (max|out−V|=3.9e-3, Q8 noise).
+- hipx gfx1151 on-model (86 GB MiniMax-M2.7.mq2-lloyd, serve, flash_mode=2 →
+  every decode step uses flash): coherent reasoning + correct answer
+  ("17 × 23 = 391"); no LDS/`invalid argument`/panic.
+- >16K context (needle-in-haystack, ~19K-token prompt → prefill-flash >15K
+  branch): _[fill result]_.

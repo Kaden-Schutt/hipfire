@@ -253,12 +253,37 @@ fn decode_step_body(
         gpu.kv_cache_write_q8_0(&state.kv.v_gpu[l], &state.fa_v, &state.pos_buf,
             cfg.num_key_value_heads, cfg.head_dim)
             .map_err(|e| format!("minimax L{l}: kv write v: {e:?}"))?;
-        gpu.attention_q8_0_kv(
-            &state.fa_q, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &state.fa_attn_out,
-            &state.pos_buf, seq_len, cfg.num_attention_heads, cfg.num_key_value_heads,
-            cfg.head_dim, state.kv.physical_cap,
-        )
-        .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
+        // Attention dispatch (hybrid, mirrors qwen35:9312):
+        //   - capture_mode (hipGraph): always flash — the single-workgroup
+        //     `attention_q8_0_kv` requests `(max_seq+block+head_dim)*4` LDS
+        //     under capture, which exceeds the 64 KB gfx11/gfx12 budget at
+        //     physical_cap ≳ 16K. The flash tile kernel's LDS is
+        //     `(128+head_dim)*4` ≈ const, independent of seq_len.
+        //   - flash_mode==2 (always, default on gfx11/gfx12): flash at any ctx.
+        //   - flash_mode==1 (auto): flash at ctx >= 2048.
+        //   - seq_len > 15000: forced flash regardless (the LDS-resident
+        //     kernel can't fit scores[seq_len] above ~16K).
+        // Below those thresholds the validated single-workgroup kernel stays
+        // the fast path for short contexts.
+        let use_flash = gpu.capture_mode
+            || state.flash_mode == 2
+            || (state.flash_mode == 1 && seq_len >= 2048)
+            || seq_len > 15000;
+        if use_flash {
+            gpu.attention_flash_q8_0(
+                &state.fa_q, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &state.fa_attn_out,
+                &state.pos_buf, seq_len, cfg.num_attention_heads, cfg.num_key_value_heads,
+                cfg.head_dim, state.kv.physical_cap, &state.flash_partials,
+            )
+            .map_err(|e| format!("minimax L{l}: flash attention: {e:?}"))?;
+        } else {
+            gpu.attention_q8_0_kv(
+                &state.fa_q, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &state.fa_attn_out,
+                &state.pos_buf, seq_len, cfg.num_attention_heads, cfg.num_key_value_heads,
+                cfg.head_dim, state.kv.physical_cap,
+            )
+            .map_err(|e| format!("minimax L{l}: attention: {e:?}"))?;
+        }
 
         // o_proj + residual: h += W_o · attn_out.
         weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
@@ -526,12 +551,44 @@ pub fn forward_batch(
             &state.kv.v_gpu[l], &fv, &pos_array, cfg.num_key_value_heads, cfg.head_dim, b,
         )
         .map_err(|e| format!("minimax L{l} batch kv write v: {e:?}"))?;
-        gpu.attention_q8_0_kv_batched(
-            &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
-            cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
-            max_seq, max_ctx, b,
-        )
-        .map_err(|e| format!("minimax L{l} batch attention: {e:?}"))?;
+        // The batched LDS-resident kernel materializes scores[max_ctx] in
+        // shared memory, so it caps at max_ctx ≲ 16K on gfx11/gfx12 (64 KB
+        // LDS). Above that, fall back to the per-row flash path (one
+        // single-position `attention_flash_q8_0` per batch row, serialized,
+        // reusing `state.flash_partials`) — mirrors qwen35:7173. Below the
+        // cap the batched kernel stays the fast prefill path.
+        const LDS_CTX_LIMIT: usize = 15000;
+        if max_ctx > LDS_CTX_LIMIT {
+            let pos_buf_tmp = gpu
+                .hip
+                .malloc(4)
+                .map_err(|e| format!("minimax L{l} batch flash pos malloc: {e:?}"))?;
+            for bi in 0..b {
+                let pos_bi = start_pos + bi;
+                let seq_len_bi = pos_bi + 1;
+                let pos_i32 = pos_bi as i32;
+                gpu.hip
+                    .memcpy_htod(&pos_buf_tmp, &pos_i32.to_ne_bytes())
+                    .map_err(|e| format!("minimax L{l} batch flash htod pos: {e:?}"))?;
+                let q_bi = fq.sub_offset(bi * q_dim, q_dim);
+                let out_bi = attn_out.sub_offset(bi * q_dim, q_dim);
+                gpu.attention_flash_q8_0(
+                    &q_bi, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &out_bi,
+                    &pos_buf_tmp, seq_len_bi, cfg.num_attention_heads,
+                    cfg.num_key_value_heads, cfg.head_dim, state.kv.physical_cap,
+                    &state.flash_partials,
+                )
+                .map_err(|e| format!("minimax L{l} batch flash attention: {e:?}"))?;
+            }
+            let _ = gpu.hip.free(pos_buf_tmp);
+        } else {
+            gpu.attention_q8_0_kv_batched(
+                &fq, &state.kv.k_gpu[l], &state.kv.v_gpu[l], &attn_out, &pos_array,
+                cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim,
+                max_seq, max_ctx, b,
+            )
+            .map_err(|e| format!("minimax L{l} batch attention: {e:?}"))?;
+        }
         gpu.gemm_q8_0_batched(&layer.wo.buf, &attn_out, &o, hidden, q_dim, b)
             .map_err(|e| format!("minimax L{l} batch o_proj: {e:?}"))?;
         gpu.add_inplace_f32(&x, &o)
