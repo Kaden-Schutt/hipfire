@@ -6293,6 +6293,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // turn (rare) the counter resets and the cap re-fires.
         let mut think_count: usize = 0;
         let mut prev_in_think: bool = false;
+        // Force-answer is a ONE-SHOT signal (check_force_answer clears on read),
+        // but 35b-a3b re-opens <think> after a forced close and then thinks
+        // unbounded until the client times out. Latch it for the rest of the
+        // turn: a re-opened <think> is re-closed, and (for single-token
+        // think-open vocabs) the open token is blocked outright so the model
+        // commits to its answer instead of looping back into thinking.
+        let mut force_answer_latched = false;
+        let think_open_tok = tokenizer.special_token_id("<think>");
+        // Hard bound on TOTAL thinking across the turn (re-arm-proof, unlike the
+        // per-block max_think_tokens which resets on each re-opened <think>).
+        // 0 = off. At the cap we force-close + block <think> (best effort to make
+        // the model answer); if it's STILL thinking a margin past the cap, we
+        // force EOS so the turn can't run unbounded — 35b-a3b re-opens <think>
+        // after the one-shot force-answer and out-thinks client timeouts.
+        let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+        let mut total_think_tokens: usize = 0;
 
         // N-gram loop detector: track 4-gram token sequences. When any
         // 4-gram repeats more than `ngram_loop_threshold` times in the
@@ -6397,7 +6414,10 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // running long → make the model commit to its answer instead of
             // the client timing out mid-think and terminating the stream).
             let force_answer_now = check_force_answer(id);
-            if max_think_tokens > 0 || force_answer_now {
+            // Latch: the CLI's force_answer is one-shot, so remember it for the
+            // rest of the turn to keep enforcing the commit on any <think> re-open.
+            if force_answer_now { force_answer_latched = true; }
+            if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let open_idx = raw_str.rfind("<think>");
@@ -6407,6 +6427,18 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     (Some(_), None) => true,
                     _ => false,
                 };
+                // Total-think bound (re-arm-proof). Count every think token; at the
+                // cap, latch force-answer (force-close + block <think>); a margin
+                // past the cap, hard-EOS so a model that keeps re-opening <think>
+                // can't run the turn out to the client timeout.
+                if in_think { total_think_tokens += 1; }
+                if max_total_think > 0 && total_think_tokens >= max_total_think {
+                    force_answer_latched = true;
+                }
+                if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
+                    eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                    break;
+                }
                 if max_think_tokens > 0 {
                     if in_think {
                         if !prev_in_think { think_count = 1; } else { think_count += 1; }
@@ -6417,9 +6449,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 }
                 let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
 
-                if in_think && (budget_hit || force_answer_now) {
+                if in_think && (budget_hit || force_answer_now || force_answer_latched) {
                     if force_answer_now {
                         eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                    } else if force_answer_latched {
+                        eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
                     }
                     // Force-close. Encode the continuation and run each token
                     // through the KV write + emit path the same way a normally-
@@ -6618,6 +6652,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 2,
                 &mut blocked,
             );
+            // Once force-answer has latched, forbid re-opening <think> so the
+            // model commits to its answer instead of thinking unbounded.
+            if force_answer_latched { if let Some(t) = think_open_tok { blocked.push(t); } }
             let cfg = SamplerConfig {
                 temperature: temp,
                 top_p,
