@@ -5404,6 +5404,45 @@ pub fn spec_step_ddtree_path_c(
 /// should skip this and just call `download_hidden_block(hidden_rb, len)`
 /// instead. For MVP we eat the redundant work because it's a one-shot
 /// cost at session start.
+/// Snapshot the DeltaNet recurrent state into a bounded ring `cks` (pairs of
+/// `(seq_pos, snapshot)`) when `interval` tokens have elapsed since the last
+/// one. Shared by BOTH the AR `generate` and the DFlash prompt-cache paths to
+/// enable resume-from-checkpoint on a divergent client render (see the daemon's
+/// `generate` divergence branch + `generate_dflash`). Oldest evicted at `cap`
+/// (buffers reused — no realloc churn after warmup). Cheap: one device-to-device
+/// memcpy of the recurrent S/scale/conv buffers; no KV copy (FullAttention KV is
+/// positional and stays resident, so resume only restores the recurrent state).
+/// Gating (resume enabled / no eviction) is the caller's responsibility.
+pub fn take_dn_checkpoint(
+    cks: &mut Vec<(usize, DeltaNetSnapshot)>,
+    dn: &DeltaNetState,
+    gpu: &mut Gpu,
+    pos: usize,
+    interval: usize,
+    cap: usize,
+) {
+    if pos == 0 || cap == 0 {
+        return;
+    }
+    match cks.last().map(|(p, _)| *p) {
+        Some(p) if pos < p + interval => return,
+        Some(p) if p == pos => return,
+        _ => {}
+    }
+    let mut snap = if cks.len() >= cap {
+        cks.remove(0).1
+    } else {
+        match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(s) => s,
+            Err(_) => return,
+        }
+    };
+    if snap.save_from(dn, gpu).is_err() {
+        return;
+    }
+    cks.push((pos, snap));
+}
+
 pub fn seed_target_hidden_from_prompt(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -5438,6 +5477,136 @@ pub fn seed_target_hidden_from_prompt(
     let block = download_hidden_block(gpu, hidden_rb, prompt_tokens.len())?;
     target_hidden_host.extend_from_slice(&block);
     Ok(())
+}
+
+/// Abortable variant of `seed_target_hidden_from_prompt`. Manually
+/// chunks the prefill at [`qwen35::PREFILL_MAX_BATCH`] boundaries and
+/// calls `abort_check` between chunks. Returns `Ok(true)` if aborted
+/// (state has been fully reset — caller should NOT continue with
+/// decode), `Ok(false)` on normal completion. The chunked path matches
+/// the kernel-internal sub-batch size, so per-chunk throughput is the
+/// same as the one-shot variant; the only overhead is one
+/// `download_hidden_block` per chunk (host-side memcpy of ~5 MB).
+///
+/// Used by the daemon's `generate_dflash` to honor client-side
+/// cancellation on long-context retries (cache-miss scenarios where
+/// the full conversation must be re-prefilled from scratch).
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_from_prompt_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    target_hidden_host: &mut Vec<f32>,
+    prompt_tokens: &[u32],
+    abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring for divergent-render resume. When
+    // `Some`, the recurrent state is snapshotted every `ckpt_interval` tokens
+    // (bounded at `ckpt_cap`). `None` ⇒ no checkpointing (zero overhead).
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    target.reset_state(gpu);
+    target_hidden_host.clear();
+    if let Some(cks) = checkpoints.as_deref_mut() {
+        cks.clear(); // fresh cold prefill ⇒ stale checkpoints no longer valid
+    }
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut seq_pos: usize = 0;
+    while seq_pos < prompt_tokens.len() {
+        if abort_check() {
+            target.reset_state(gpu);
+            target_hidden_host.clear();
+            if let Some(cks) = checkpoints.as_deref_mut() {
+                cks.clear();
+            }
+            return Ok(true);
+        }
+        let end = (seq_pos + chunk_max).min(prompt_tokens.len());
+        let chunk = &prompt_tokens[seq_pos..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            seq_pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None, None, None,
+        )?;
+        let block = download_hidden_block(gpu, hidden_rb, chunk.len())?;
+        target_hidden_host.extend_from_slice(&block);
+        seq_pos = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dn_checkpoint(cks, &target.dn_state, gpu, seq_pos, ckpt_interval, ckpt_cap);
+        }
+    }
+    Ok(false)
+}
+
+/// Incremental prompt seed for the DFlash prompt cache: prefill ONLY the
+/// `suffix` tokens starting at absolute position `start_pos`, WITHOUT resetting
+/// target KV / DeltaNet state. Used when a turn is a pure extension of the
+/// cached conversation (LCP == prior length) — the target KV[0..start_pos] and
+/// the recurrent DeltaNet state are already correct from the prior turn, so we
+/// only advance them through the new suffix. `hidden_rb` is left holding the
+/// suffix's extracted hidden rows so the caller can scatter them into the
+/// draft's cumulative `target_hidden` at row offset `start_pos` (the draft's
+/// projection cache, keyed on `draft_ctx_cached_rows`, then projects only the
+/// new rows — same delta path decode already uses).
+///
+/// Correctness rests on the same invariant the AR `generate` cache relies on:
+/// `forward_prefill_batch` at a nonzero `seq_pos` continues the hybrid
+/// (FullAttention KV + DeltaNet recurrent) forward exactly as if the prefix had
+/// just been prefilled, because the recurrent state is naturally at the end of
+/// the prior conversation (pure extension — no rewind). Returns `Ok(true)` if
+/// aborted mid-prefill (state left as-is; caller must full-reset & retry),
+/// `Ok(false)` on completion.
+#[allow(clippy::too_many_arguments)]
+pub fn seed_target_hidden_suffix_abortable(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    suffix: &[u32],
+    start_pos: usize,
+    abort_check: &dyn Fn() -> bool,
+    // Optional DeltaNet checkpoint ring (see from_prompt variant). Lets a HIT
+    // or a resume keep adding checkpoints as the conversation grows, so a later
+    // divergence resumes from a recent point rather than the initial prefill.
+    mut checkpoints: Option<&mut Vec<(usize, DeltaNetSnapshot)>>,
+    ckpt_interval: usize,
+    ckpt_cap: usize,
+) -> HipResult<bool> {
+    let chunk_max = qwen35::PREFILL_MAX_BATCH;
+    let mut off: usize = 0;
+    let mut pos = start_pos;
+    while off < suffix.len() {
+        if abort_check() {
+            return Ok(true);
+        }
+        let end = (off + chunk_max).min(suffix.len());
+        let chunk = &suffix[off..end];
+        qwen35::forward_prefill_batch(
+            gpu,
+            &target.weights,
+            &target.config,
+            chunk,
+            pos,
+            &mut target.kv_cache,
+            &mut target.dn_state,
+            &target.scratch,
+            Some(hidden_rb),
+            None, None, None,
+        )?;
+        pos += chunk.len();
+        off = end;
+        if let Some(cks) = checkpoints.as_deref_mut() {
+            take_dn_checkpoint(cks, &target.dn_state, gpu, pos, ckpt_interval, ckpt_cap);
+        }
+    }
+    Ok(false)
 }
 
 /// Mirror a TriAttention KV eviction into the DFlash draft's GPU-resident
