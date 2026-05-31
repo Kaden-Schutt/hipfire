@@ -1931,7 +1931,6 @@ async function serve(port: number, host: string) {
           modelHasVL = loadResult.vl === true;
           currentArch = typeof loadResult.arch === "string" ? loadResult.arch : null;
           currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
-        currentCacheCapable = typeof loadResult.cache_capable === "boolean" ? loadResult.cache_capable : null;
         }
 
         // Now that currentArch reflects the model we're ACTUALLY sending
