@@ -159,9 +159,24 @@ fwht2 is meaningfully worse (the 2-bit K is the lossy one).
 
 **Coherence:** gate exit 0; daemon runs on qwen3.6-27b.mq4 confirmed fluent + override-engaged for
 fwht3/lloyd4, fwht3/lloyd3, **fwht2/lloyd4, and fwht4/lloyd4** (no attractor/loop/special-token leak).
-**Perf:** the V-read mechanism (per-tile inverse) costs ~4.4% short-ctx decode regardless of K mode
-(measured on fwht3); long-ctx bandwidth win unmeasured; the per-tile→reduce-kernel inverse
-optimization (deferred) should recover most of it. Default stays Q8-V; all lloyd-V is opt-in.
+**Perf — measured, and a key negative result.** Warmed decode A/B (fwht3-K, 3.6-27b.mq4) across
+context: lloyd4-V is **slower than q8-V at *every* context, gap widening with length** —
+−4.9% @2k, −4.6% @8k, −6.9% @17k, −6.8% @33k. **The bandwidth-crossover hypothesis is DISPROVEN
+for V quant:** unlike asym-K-vs-q8-K (K feeds the bandwidth-bound score loop, so low-bit K wins
+long-ctx), the V-read is a *centroid-LUT decode* — more compute per byte than q8's int8 read — and
+that compute scales with tokens, so the 49% byte cut (272→132 B/head) never overcomes it on the
+7900 XTX. **lloyd-V is a VRAM/capacity lever, not a speed lever:** where q8-V fits it's faster, so
+use it; lloyd-V's value is reaching contexts q8-V *can't fit* (24 GB: q8-V OOMs ~327k, lloyd4-V
+fits ~525k) — where "5% slower" is moot because q8-V can't run at all.
+
+**2E (per-tile→reduce-kernel inverse) = null result, REVERT-recommended.** Built it (commit
+373d0f59) to recover the short-ctx cost; it didn't (the inverse was <2% of the V-phase — the
+LUT-decode read is the cost, at every context). Correct but no measured benefit + adds 2 reduce
+kernels + a ~+0.9% KLD FP-reassociation shift. The documented matrix above is the per-tile version;
+revert 2E to match it (or keep — minor). Default stays Q8-V; all lloyd-V is opt-in.
+
+**Direction (next): adaptive KV.** The capacity-not-speed result motivates a runtime
+VRAM-fit auto-select — see `docs/plans/...adaptive` / memory `project_hipfire_adaptive_kv`.
 
 ## 6. Decision rule & guardrails
 
