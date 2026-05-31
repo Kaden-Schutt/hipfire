@@ -718,37 +718,23 @@ pub(crate) fn linear_f16(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    // Intermediate transposed buffer is 1-D `[out_dim * n]` — that's
-    // exactly what `gemm_f16_wmma` writes ("Y[M, N]" with M=out_dim,
-    // N=n stored row-major). 2-D shape would imply batch semantics
-    // that don't apply to transposed-GEMM output.
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    // gfx1100+ (RDNA3 / RDNA3.5) — use the WMMA-accelerated variant.
-    // The naive `gemm_f16` launches grid `[M, N]` which for the dots.ocr
-    // smoke image (M=1536, N=19520) hits ~30M blocks; the WMMA variant
-    // tiles M and N in 16s, dropping the grid to ~117k blocks (and
-    // 2-3× faster on the math itself). The WMMA kernel handles
-    // K % 16 != 0 with bounds-checked padding to 0.0, so K=588
-    // (= 3 * 14 * 14 from `patch_embed`) is safe.
-    //
-    // Note: the upstream `gemm_f16_wmma.hip` shipped with a known
-    // correctness bug (each lane writing 256 elements into a 16-element
-    // half16_t vector → NaN output on dots.ocr's specific shapes). The
-    // 2c-5b investigation traced and fixed it — see the kernel file's
-    // header for the lane-cooperative WMMA layout details.
-    if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
-    } else {
-        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    }
     // Output as 2-D `[n, out_dim]`. The 2-D shape is load-bearing for
     // downstream `rmsnorm_f32`, which infers `batch = shape[0]` and
     // `n = shape.last()`. With a 1-D shape, rmsnorm interprets the
     // whole buffer as ONE row of length `n * out_dim` and reads the
-    // norm-weight (length out_dim) out of bounds → sticky HIP fault.
+    // norm-weight (length out_dim) out of bounds -> sticky HIP fault.
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    // gfx1100+ (RDNA3 / RDNA3.5) — use the fused-transpose WMMA variant.
+    // It writes row-major `[n, out_dim]` directly, dropping the separate
+    // transpose_f32 kernel that the older `gemm_f16_wmma` path required.
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     gpu.bias_add_f32(&y, bias, n, out_dim)?;
     Ok(y)
 }
@@ -769,18 +755,17 @@ pub(crate) fn linear_f16_no_bias(
     in_dim: usize,
     n: usize,
 ) -> HipResult<GpuTensor> {
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
-    // See [`linear_f16`] for the gemm_f16_wmma rationale and the
-    // 2-D output-shape requirement (the latter is load-bearing for
-    // downstream rmsnorm_f32 batch inference).
-    if gpu.arch_caps.has_wmma_w32() {
-        gpu.gemm_f16_wmma(w, x, &yt, out_dim, in_dim, n)?;
-    } else {
-        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
-    }
     let y = gpu.alloc_tensor(&[n, out_dim], DType::F32)?;
-    gpu.transpose_f32(&yt, &y, out_dim, n)?;
-    gpu.free_tensor(yt)?;
+    // See [`linear_f16`] for the fused-transpose WMMA rationale and the
+    // 2-D output-shape requirement.
+    if gpu.arch_caps.has_wmma_w32() {
+        gpu.gemm_f16_wmma_mb8(w, x, &y, out_dim, in_dim, n)?;
+    } else {
+        let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32)?;
+        gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)?;
+        gpu.transpose_f32(&yt, &y, out_dim, n)?;
+        gpu.free_tensor(yt)?;
+    }
     Ok(y)
 }
 
@@ -1122,19 +1107,15 @@ pub fn vision_forward(
         //   * `attention_dflash_wmma_f32` — M=16, 1 wave. hd ≤ 256.
         //   * `attention_dflash_f32` — scalar online-softmax fallback.
         //
-        // For dots.ocr (head_dim=128) we take the M=64 N=128 f16-K/V
-        // O-register-resident path (751 ms vs M=16's 3056 ms at vision
-        // shape — 4.07× speedup; see investigation doc §11). M=64
-        // halves the per-attention query-block count → halves K+V DRAM
-        // traffic. O lives in per-lane registers (8 float8_t = 64
-        // VGPRs/lane in WMMA frag_c layout) to free the LDS budget the
-        // doubled query rows would have eaten.
+        // For dots.ocr (head_dim=128) use the v5 M=64/V_tile=32 f16-K/V
+        // O-register-resident path. V_tile=32 keeps LDS small enough for
+        // 2 WG/CU at the smoke-image shape.
         if use_wmma && head_dim == 128 && n_patches >= 64 {
             let k_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             let v_f16 = gpu.alloc_tensor(&[n_patches, h], DType::F16)?;
             gpu.cast_f32_to_f16(&k_buf, &k_f16)?;
             gpu.cast_f32_to_f16(&v_buf, &v_f16)?;
-            gpu.attention_dflash_wmma_m64_n128_f16kv_v3_f32(
+            gpu.attention_dflash_wmma_m64_n32_f16kv_v5_f32(
                 &q_buf, &k_f16, &v_f16, &attn,
                 n_patches, n_patches, n_heads, n_heads, head_dim,
             )?;

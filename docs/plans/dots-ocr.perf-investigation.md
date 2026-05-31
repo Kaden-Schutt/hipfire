@@ -920,22 +920,200 @@ won't either.
 | §3.2 FP8 KV cache | Premature for decode. PMC shows bandwidth isn't the decode bottleneck on gfx1151 at seq=5100. F16 KV (§14.9) is the simpler first step. FP8 may matter on gfx1100 at long sequences — test F16 first. The text backbone currently uses F32 KV; F16 is the natural next step. |
 | §4 ranked action plan | Rankings mostly match our analysis. Prefetch/V-load overlap and QKV fusion are the top prefill levers. However the plan misses: (1) text prefill WMMA causal attention (§14.5, potentially the largest single win), (2) V_lds transpose (§14.2, simple LDS layout change), (3) HIP graph capture for decode (§14.6, bigger than persistent kernels for the dispatch floor). |
 
-### 14.11. Revised ranked action plan
+### 14.11. Revised ranked action plan (recalibrated 2026-05-28 for gfx1100)
 
-| Rank | Lever | Target | Expected impact | Complexity |
-|---:|---|---|---|---|
-| 1 | **Causal WMMA flash attention + GQA** for text prefill (§14.5) | Text prefill | **5-10× text-prefill attention** | Medium — extend vision kernel with causal mask |
-| 2 | **Async V-load overlapped with Phase A** via `global_load_lds` (§14.1) | Vision prefill | **+10-15% vision wall** | Medium — restructure outer loop |
-| 3 | **QKV-cast fusion** (§2.5 / §13.5) | Vision E2E | **+420 ms saved** | Medium — modify GEMM to output f16 K/V |
-| 4 | **V_lds transpose** for vectorized Phase C reads (§14.2) | Vision prefill | **+5-10% attention** | Low — LDS layout change |
-| 5 | **M=128 two-pass sub-tiling** (§14.4 option C) | Vision prefill | **+15-25% attention** | Medium — double QK+SV per block |
-| 6 | **HIP graph capture** for decode loop (§14.6) | Decode | **1.5-2× decode** | High — refactor decode loop |
-| 7 | **gfx1100 GQA chunk sweep** (§14.8) | Decode | **+5-15% decode on gfx1100** | Low — env var tuning |
-| 8 | **Fused attention-reduce + o_proj** (§14.7) | Decode | **+3-5% decode** | Low — merge two kernels |
-| 9 | **F16 KV cache for decode** (§14.9) | Decode (long seq) | **+0-10% decode** | Low — reuse existing F16 cast path |
-| 10 | **FP8 / MFP4 K/V** (§3.2) | Vision prefill | **+20-40% attention** | High — needs accuracy validation |
+The original projections below were calibrated on **Strix Halo gfx1151**
+(115 GB/s LPDDR5X). On **gfx1100** (960 GB/s GDDR6), DRAM-bound bottlenecks
+have less headroom because faster bandwidth means DRAM transfers complete
+sooner and compute becomes a larger fraction of wall time. Key recalibrations:
 
-Items 1-4 are independent and can be parallelized. Item 5 benefits from
-items 2 and 4 landing first (the sub-tile inherits the async load and
-transpose). Item 6 is the biggest decode lever but has the highest
-implementation risk. Items 7-9 are cheap experiments.
+- **DRAM traffic improvements scale sub-linearly with bandwidth ratio.**
+  Halving DRAM traffic on a compute-bound kernel gives ~1.5× at most, not 2×.
+  The formula is: `improvement = bw_saving × bw_fraction_of_total`.
+- **Per-tile fixed costs (sync barriers, alpha-scales) are tiny relative to
+  compute on gfx1100.** K-tile widening from 16→64 gave +7.2% on Strix Halo
+  and ~10% on gfx1100, not the predicted 2-4×.
+- **The compiler vectorizes LDS reads.** Source-level “hoisting” can be a
+  no-op at ISA level; always verify with `llvm-readelf --notes`.
+- **Occupancy changes dominate over micro-optimizations.** v4→v5 (V_tile
+  64→32, 1→2 WG/CU) gave 1.44× from occupancy alone — bigger than any
+  single micro-optimization in the entire investigation.
+- **Split-d attention is fundamentally unprofitable** for full-softmax.
+  Softmax requires the complete 128-dim dot product; each pass must
+  rescan the full K sequence. v6/v6b tried this and was 11.6× slower.
+
+| Rank | Lever | Target | Original projection | **Revised (gfx1100)** | Complexity | Why revised |
+|---:|---|---|---|---|---|---|
+| 1 | **QKV-cast fusion** (§2.5) | Vision E2E | +420 ms | **~420 ms (0.7% total)** | Medium | Unchanged; independent of attention kernel |
+| ~~2~~ | ~~**V_lds transpose** (§14.2)~~ | Vision attn | ~~+5-10%~~ | **+15.6% non-causal N=128; -6.5% vision** | Low | §15: helps non-causal N=128 (v4>v3), hurts V_tile=32 (v6<v5). v4_causal is bench-only after large-batch crash |
+| ~~3~~ | ~~**Async V-load** (§14.1)~~ | Vision attn | ~~+10-15%~~ | **BLOCKED — no `global_load_lds` on RDNA3** | ~~Medium~~ | §16: `vmem-to-lds-load-insts` is CDNA-only. All alternatives exceed LDS budget |
+| 4 | **FP8/MFP4 K/V** (§3.2) | Vision attn | +20-40% | **+20-40% attn (2.4-4.8s)** | High | Unchanged but needs accuracy validation |
+| ~~5~~ | ~~**M=128 sub-tiling** (§14.4C)~~ | Vision attn | ~~+5-15%~~ | **-10.9% (K-shared) / -2.4% (sequential)** | Medium | §17: VGPR spills from 2× state overwhelm K savings. No DRAM benefit without sharing |
+| 6 | **HIP graph capture** (§14.6) | Decode | 1.5-2× | **+3-5% decode (1-2s)** | High | **Down from 1.5-2×.** gfx1100 dispatch is ~340µs vs 7.5ms compute (4.5%); Strix Halo was 76% dispatch |
+| 7 | **Causal WMMA + GQA** (§14.5) | Text prefill | 5-10× | **<1% total (<0.5s)** | Medium | **Down from 5-10×.** Prefill already 1.0s; even 10× attention speedup saves <0.5s of 60s total |
+| 8 | **GQA chunk sweep** (§14.8) | Decode | +5-15% | **+0-5% decode** | Low | **Down from +15%.** Compute-dominated on gfx1100 with 96 CUs |
+| 9 | **Fused attn-reduce + o_proj** (§14.7) | Decode | +3-5% | **+1-3% decode** | Low | Marginal DRAM saving; tiny launch saving |
+| 10 | **F16 KV cache** (§14.9) | Decode (long seq) | +0-10% | **+0-5% decode** | Low | Dispatch-dominated at current seq lengths |
+
+### Projection audit: what actually happened vs what was predicted
+
+**§4.1 K-tile 16→64:** predicted 2-4× speedup. Actual +7.2% on Strix Halo,
++10.4% vs M=16 baseline. Per-tile fixed costs are tiny vs DRAM traffic on
+fast-BW hardware. The iteration-count model overstates by counting DRAM
+transfers that are pipelined and overlap with compute.
+
+**§4.2 f16 K/V:** predicted +30-100%. Actual +18% on Strix Halo (76% of
+theoretical ceiling). Upper bound assumed compute was zero; compute is
+non-trivial (~25% of wall time after the DRAM floor).
+
+**§4.3 Q in registers:** predicted +10-20%. Never measured independently
+(bundled into N=64 kernel). The Q_frags scratch trap showed that incorrect
+register allocation causes 19% regression. **Lesson: always verify VGPR
+allocation with `llvm-readelf --notes`.**
+
+**§8.4 K-tile widen to N=128:** predicted halving of K+V traffic.
+Actual +27% over N=64 f16-K/V on Strix Halo. LDS bandwidth bottleneck
+(V_lds + S_lds in f16) was an unexpected positive effect not in the model.
+
+**§11 M=64 query tile:** predicted ~2× from DRAM halving. Actual +53% over
+N=128 v1. DRAM halving gives 1.5× at most because compute doesn't shrink.
+
+**§12 S_lds bank conflict + cooperative softmax:** predicted moderate.
+Actual +31% on Strix Halo — the second-biggest single win after M=64.
+Bank conflicts were the real bottleneck (confirmed by rocprof: 66.5→3.3).
+
+**§13 v3 hoisted S_lds reads:** predicted 8× fewer reads. Actual +2.6%.
+Compiler had already vectorized into `ds_read_b128` instructions; source-level
+hoisting was a no-op.
+
+**§14.4 v5 V_tile=32:** not in original plan. Achieved 1.44× speedup from
+occupancy improvement alone (1→2 WG/CU). Occupancy changes dominate over
+micro-optimizations.
+
+**§14 (v6/v6b split d_half):** not in original plan. Negative result: 11.6×
+slower than v5. Splitting head_dim into multiple passes is fundamentally
+unprofitable for full-softmax attention.
+
+### Approaches proven not to work (do not revisit)
+
+- **Splitting head_dim** into d_half passes (v6/v6b): 4× total WMMA
+  iterations → 11.6× slower. Full-softmax requires complete 128-dim
+  dot product per pass.
+- **Reducing n_tile** to shrink accumulators (v6b): halves s_acc but
+  doubles K-tile iterations. Net loss.
+- **Persistent WMMA GEMM kernels**: 0.2-0.24 TFLOP/s — overhead dominates
+  for inference-sized batches.
+- **V-staging into LDS** (phase between QK and softmax): proven no-op on
+  this DRAM-bound workload; V_lds contains stale data that nobody reads.
+- **Source-level LDS read hoisting**: compiler vectorizes to `ds_read_b128`
+  regardless; measure before claiming improvement.
+- **n_tile > 128** without dropping V_lds: 4× per-wave V traffic increase
+  makes N=256 regress unless bundled with M=128 sub-tiling.
+
+### 15. V_lds transpose for Phase C reads (2026-05-29)
+
+§14.2 (V_lds transpose) implemented and benchmarked on gfx1100.
+
+Transposed V_lds from `[n_tile][head_dim]` to `[head_dim][V_T_STRIDE]`
+(padded stride for bank-conflict-free reads). Phase C `b_reg[j]` reads
+become 16 consecutive f16 values (vectorizable to `ds_read_b128`)
+instead of stride-128 scattered `ds_read_u16`.
+
+**gfx1100 benchmark results (B=L=19520, hd=128, n_heads=12):**
+
+| kernel | dur (ms) | vs baseline |
+|---|---:|---:|
+| v3 (M=64 N=128 f16 K/V) | 267 | — |
+| **v4 (M=64 N=128 V_lds_T)** | **226** | **+15.6%** |
+| v5 (M=64 V_tile=32) | 160 | — |
+| v6 (M=64 V_tile=32 V_lds_T) | 171 | -6.5% |
+
+**Why v6 regresses:** V_tile=32 stages V in 4 v_chunks per K-tile.
+Each v_chunk does 4096 scattered writes (de-vectorized from coalesced
+stores in v5) and only 256 vectorized reads. Write:read ratio is 16:1
+per v_chunk; de-vectorizing writes costs more than vectorizing reads.
+
+**Why v4 wins:** N=128 stages V once per K-tile. Single 16384-write
+staging amortized across 8 c-iterations of Phase C (1024 reads). Read
+vectorization dominates.
+
+**Outcome:**
+- v4_causal is bench-only until its large-batch crash is fixed
+  (2026-05-31 triage: `parity_causal_wmma 5095 1` and dots-ocr
+  5095-position prefill both reproduced the fault).
+- qwen2 text prefill remains on v3_causal.
+- v5 stays production for dots-ocr vision (v6 is slower).
+- v4 (non-causal) available for future threshold-attention use.
+
+### 16. Async V-load investigation — NOT FEASIBLE on gfx1100 (2026-05-29)
+
+§14.1 (async V-load) investigated and **blocked by hardware limitations**.
+
+**Finding:** `__builtin_amdgcn_global_load_lds` (direct global→LDS async copy)
+requires the `vmem-to-lds-load-insts` target feature, which is **CDNA-only**
+(MI300, MI250). gfx1100 (RDNA3 / RX 7900 XTX) does NOT have this feature.
+The compiler emits:
+
+```
+error: '__builtin_amdgcn_global_load_lds' needs target feature vmem-to-lds-load-insts
+```
+
+On RDNA3, all data must travel through VGPRs (global_load → VGPR → ds_write).
+There is no hardware DMA engine for global→LDS.
+
+**Alternative approaches evaluated:**
+
+1. **V_lds double-buffering**: Would require 2× V_lds (16 KB for v5, 64 KB
+   for v3/v4). v5's total LDS would be 25.6 + 8 = 33.6 KB, exceeding the
+   32 KB limit for 2 WG/CU. Drops to 1 WG/CU — net regression.
+
+2. **Interleaved V staging within Phase A**: v5 has V_lds=32 rows but needs
+   128 total V rows per K-tile (4 v_chunks × 32). Can't fit all rows in
+   V_lds simultaneously. Would require processing one v_chunk per Phase A
+   pass, tripling the Phase A cost.
+
+3. **Software pipelining across K-tiles**: Load V for tile N+1 during tile
+   N's Phase C. Requires double-buffered V_lds (same problem as #1).
+
+4. **Inter-wave pipelining**: Dedicate waves to V loading while others
+   compute. Reduces compute throughput (fewer waves for QK) without
+   guaranteed overlap benefit on RDNA3's single-issue scheduler.
+
+**Conclusion:** Async V-load is not actionable on gfx1100. The §14.1
+prediction assumed `__builtin_amdgcn_global_load_lds` availability on
+RDNA3, which was incorrect. This optimization IS viable on CDNA (MI300,
+MI250) and should be pursued for those targets.
+
+**Updated ranking:** Remove async V-load from gfx1100 action plan.
+Next actionable item for gfx1100 vision: §14.3 (N=256 with V from DRAM)
+or §14.4 (M=128 query tile), both higher complexity.
+
+### 17. M=128 sub-tiling — NOT BENEFICIAL on gfx1100 (2026-05-29)
+
+§14.4C (M=128 two-pass sub-tiling) implemented and benchmarked.
+
+Two variants tested on gfx1100:
+
+| kernel | ms | vs v5 |
+|---|---:|---:|
+| v5 (M=64 production) | 164 | — |
+| v7 (K-shared sub-tile) | 182 | -10.9% |
+| v7b (sequential, no share) | 168 | -2.4% |
+
+**v7 (K-shared):** Phase A loads K once, computes QK for both sub-tiles
+using shared b_reg. Requires Q_frags_0 + Q_frags_1 + O_frags_0 + O_frags_1
+= 256 VGPRs minimum. Compiler spills heavily (binary 34% larger). Spill
+traffic overwhelms K-load savings.
+
+**v7b (sequential):** Sub-tiles processed independently, same VGPR as v5.
+No K/V sharing. L2 warmth from halved block count doesn't help because
+K+V working set (~10 MB) exceeds gfx1100's 6 MB L2.
+
+**The §14.4C prediction of "halving K+V traffic" was unachievable:**
+sharing K+V between sub-tiles requires simultaneously holding both
+sub-tiles' Q_frags, O_frags, and softmax state, which exceeds RDNA3's
+256 VGPR limit. The register pressure bottleneck is fundamental to the
+two-pass sub-tiling approach on RDNA3's wave32 architecture.
+
+**Conclusion:** M=128 sub-tiling is not beneficial on gfx1100. The
+production v5 kernel (M=64, V_tile=32, 2 WG/CU) remains optimal.
