@@ -224,7 +224,7 @@ const CONFIG_DEFAULTS: HipfireConfig = {
 
 function validateConfigValue(key: string, value: any): boolean {
   switch (key) {
-    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
+    case "kv_cache": return ["auto", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo", "turbo4", "turbo3", "turbo2"].includes(value);
     case "flash_mode": return ["auto", "always", "never"].includes(value);
     case "temperature": return typeof value === "number" && value >= 0 && value <= 2;
     case "top_p": return typeof value === "number" && value > 0 && value <= 1;
@@ -777,30 +777,33 @@ interface ArchDefaults {
 }
 
 function archDefaults(arch: string): ArchDefaults {
-  // Default KV cache policy (RotorQuant asymmetric):
-  //   asym3 (K 3-bit rotated + V Q8) is the default across arches — 5.5×
-  //   compression vs fp32 with verbatim rare-token recall on head_dim=256
-  //   models (Qwen 3.5 family). Memory-tight cards get asym2 (6.0×, still
-  //   recall-safe for common tokens). Users can override to `q8` for
-  //   maximum quality or `asym4` for extra K precision headroom.
+  // Default KV cache policy (FWHT-rotated, DFlash-safe):
+  //   fwht3 (K 3-bit FWHT-rotated + V Q8) is the default across arches — same
+  //   ~5.5× compression and byte layout as asym3, but the K-rotation basis
+  //   matches the MQ4 weight/draft FWHT convention, so DFlash speculative
+  //   acceptance stays high. asym3/asym4 use a Givens basis the draft was not
+  //   calibrated against → degraded acceptance / attractors with DFlash (which
+  //   is default-on for the 27B). Memory-tight cards get fwht2 (the asym2 byte
+  //   tier, FWHT-rotated). Override to `q8` for byte-exact reference quality,
+  //   or the `asym*` modes for the legacy Givens behavior.
   switch (arch) {
-    // RDNA3 — asym3 everywhere; 24 GB cards fit full context easily.
-    case "gfx1100": return { kv_cache: "asym3", vram_gb: 24 };  // 7900 XTX
-    case "gfx1101": return { kv_cache: "asym3", vram_gb: 16 };  // 7900 XT
-    case "gfx1102": return { kv_cache: "asym3", vram_gb: 12 };  // 7800 XT
-    case "gfx1151": return { kv_cache: "asym2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
+    // RDNA3
+    case "gfx1100": return { kv_cache: "fwht3", vram_gb: 24 };  // 7900 XTX
+    case "gfx1101": return { kv_cache: "fwht3", vram_gb: 16 };  // 7900 XT
+    case "gfx1102": return { kv_cache: "fwht3", vram_gb: 12 };  // 7800 XT
+    case "gfx1151": return { kv_cache: "fwht2", vram_gb: 16 };  // Strix Halo APU (shared mem — tight)
     // RDNA4
     case "gfx1200": case "gfx1201":
-      return { kv_cache: "asym3", vram_gb: 16 };                // 9070 XT
+      return { kv_cache: "fwht3", vram_gb: 16 };                // 9070 XT
     // RDNA2
-    case "gfx1030": return { kv_cache: "asym3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
-    case "gfx1031": return { kv_cache: "asym3", vram_gb: 12 };  // 6700 XT
-    case "gfx1032": return { kv_cache: "asym2", vram_gb: 8 };   // 6600 XT (8 GB — asym2 for headroom)
+    case "gfx1030": return { kv_cache: "fwht3", vram_gb: 32 };  // V620 (32 GB — plenty of headroom)
+    case "gfx1031": return { kv_cache: "fwht3", vram_gb: 12 };  // 6700 XT
+    case "gfx1032": return { kv_cache: "fwht2", vram_gb: 8 };   // 6600 XT (8 GB — fwht2 for headroom)
     // RDNA1
-    case "gfx1010": return { kv_cache: "asym2", vram_gb: 8 };   // 5700 XT
-    case "gfx1013": return { kv_cache: "asym2", vram_gb: 14 };  // BC-250 APU
-    // Fallback — unknown arch, asym3 is the new safe default.
-    default: return { kv_cache: "asym3", vram_gb: 8 };
+    case "gfx1010": return { kv_cache: "fwht2", vram_gb: 8 };   // 5700 XT
+    case "gfx1013": return { kv_cache: "fwht2", vram_gb: 14 };  // BC-250 APU
+    // Fallback — unknown arch, fwht3 is the safe DFlash-compatible default.
+    default: return { kv_cache: "fwht3", vram_gb: 8 };
   }
 }
 
@@ -3795,8 +3798,8 @@ function configTui(cfg: HipfireConfig, scope?: string | null): Promise<TuiExit> 
   const meta: Record<string, FieldMeta> = {
     kv_cache: {
       label: "kv_cache",
-      desc: "KV cache quantization (more bits = higher quality, more VRAM)",
-      options: ["auto", "q8", "asym4", "asym3", "asym2"],
+      desc: "KV cache quant (fwht default: FWHT-rotated, more accurate than asym at equal VRAM; q8 = reference)",
+      options: ["auto", "q8", "fwht4", "fwht3", "fwht2", "asym4", "asym3", "asym2"],
     },
     flash_mode: {
       label: "flash_mode",
@@ -5803,7 +5806,7 @@ Examples:
       if (typeof defaultVal === "number" && isNaN(parsed as number)) { console.error(`${key} requires a number`); process.exit(1); }
       if (!validateConfigValue(key, parsed)) {
         const hints: Record<string, string> = {
-          kv_cache: "one of: auto, q8, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 aliases also accepted)",
+          kv_cache: "one of: auto, q8, fwht4, fwht3, fwht2, asym4, asym3, asym2 (turbo/turbo2/turbo3/turbo4 are legacy asym aliases)",
           flash_mode: "one of: auto, always, never (applies to Q8 path; asym modes are flash-only)",
           temperature: "number between 0 and 2",
           top_p: "number in (0, 1]",

@@ -2259,23 +2259,50 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // All allocators go through the `_capped` entry points with
         // physical_cap derived above. Without eviction, physical_cap==max_seq
         // and these match the back-compat wrappers byte-for-byte.
+        // Hybrid Qwen3.5/3.6 = 48 DeltaNet (LinearAttention) + 16 FullAttention
+        // layers out of 64; only the FullAttention layers need a KV slot. The
+        // `_filtered` allocators skip KV alloc for the rest (~75% saved on the
+        // 27B). Dense / all-FullAttention models yield an all-true mask, so
+        // filtered == unfiltered (allocation no-op, output unchanged).
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == LayerType::FullAttention)
+            .collect();
         let kv = match kv_mode.as_str() {
             "q8" => {
-                eprintln!("  KV cache: Q8");
-                llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_q8_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             "asym4" | "turbo4" => {
-                llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                // asym4/asym2/fwht4 have no _capped_filtered yet; physical_cap ==
+                // max_seq when CASK eviction is off (the default), so _filtered is
+                // exact. (Fully CASK-aware capped+filtered variants: follow-up.)
+                llama::KvCache::new_gpu_asym4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             "asym2" | "turbo2" => {
-                llama::KvCache::new_gpu_asym2_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym2_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            // FWHT-rotated KV: same byte layout as the matching asym tier, but
+            // the K-rotation basis matches the MQ4 weight/draft FWHT convention,
+            // so DFlash speculative acceptance stays high (asym's Givens basis
+            // does not — see CLAUDE.md: "DFlash perf gates must use q8 or FWHT").
+            "fwht3" => {
+                llama::KvCache::new_gpu_fwht3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            "fwht2" => {
+                llama::KvCache::new_gpu_fwht2_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            "fwht4" => {
+                // fwht4 has no _capped_filtered yet; physical_cap == max_seq when
+                // CASK eviction is off (the default), so _filtered is exact here.
+                llama::KvCache::new_gpu_fwht4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
         // Q8 DeltaNet state can accumulate quality drift on long generation.
@@ -2533,12 +2560,23 @@ fn load_model_safetensors(
     let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
         .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
 
-    // KV cache: default to asym3 (matches the main Qwen35 path)
+    // KV cache: filtered to FullAttention layers (hybrid Qwen3.5/3.6), mirroring
+    // the HFQ single-GPU path so AWQ/safetensors models also get the ~75% cut and
+    // honor the fwht* default. physical_cap == max_seq (no CASK on this path).
     let effective_max_seq = max_seq;
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
     let kv_cache = match kv_mode {
-        "q8" => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        _ => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "q8" => llama::KvCache::new_gpu_q8_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "fwht4" => llama::KvCache::new_gpu_fwht4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        _ => llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
     }.map_err(|e| format!("KvCache: {e}"))?;
     let dn_state = DeltaNetState::new(gpu, &config)
         .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
@@ -2661,17 +2699,24 @@ fn load_model_pp(
 
     // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
     // physical_cap == max_seq on this path — eviction is refused at load.
+    // Filtered to FullAttention layers (hybrid Qwen3.5/3.6): each KV slot lands
+    // on its layer's assigned device; non-KV layers get a 1-elem placeholder.
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
     let kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "q8" => llama::KvCache::new_gpu_q8_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
         }
     };
 
