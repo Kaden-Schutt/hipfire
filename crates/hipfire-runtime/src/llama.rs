@@ -3497,13 +3497,43 @@ impl KvCache {
     /// Reallocate the V buffers for a new V mode (used by eval/bench to set an
     /// independent V quant after construction). Re-sizes only real KV layers
     /// (placeholder 1-element buffers for non-KV layers are left as-is).
-    /// K buffers and rotation tables are untouched.
+    /// K buffers and rotation tables are untouched except when enabling lloyd-V
+    /// on fwht2/4-K caches (128-element signs → reallocated to 256; the 128-wide
+    /// K rotation reads only indices 0..127 so the LCG prefix is byte-identical).
     /// Note: single-GPU only; multi-GPU V-mode wiring is deferred (plan Task 9).
     pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
         assert!(
-            (self.quant_asym3 && self.quant_fwht) || matches!(v_mode, VMode::Q8),
-            "lloyd-V is 256-wide and requires fwht3 K (quant_asym3 && quant_fwht); got a different K mode — this would corrupt the V cache"
+            ((self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht)
+                || matches!(v_mode, VMode::Q8),
+            "lloyd-V is 256-wide and requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht); got a different K mode — would corrupt the V cache"
         );
+        if !matches!(v_mode, VMode::Q8) {
+            assert!(self.head_dim == 256, "lloyd-V requires head_dim == 256");
+        }
+        // For fwht2/4-K caches the sign tables are 128-element (the K rotation
+        // is 128-wide). Lloyd-V is 256-wide and needs 256-element tables.
+        // gen_fwht_signs is a pure LCG: gen_fwht_signs(seed,256)[0..128] ==
+        // gen_fwht_signs(seed,128), so the K path remains byte-identical after
+        // realloc. Skip when signs are already 256 (fwht3) or when givens_cos
+        // is None (multi-GPU cache — sign realloc deferred to Task 9).
+        if !matches!(v_mode, VMode::Q8) {
+            let need_realloc = self.givens_cos.as_ref().map_or(false, |t| t.numel() < 256);
+            if need_realloc {
+                let n = 256usize;
+                let s1v = Self::gen_fwht_signs(42, n);
+                let s2v = Self::gen_fwht_signs(1042, n);
+                let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+                let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
+                gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
+                gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+                if let Some(old) = self.givens_cos.take() { let _ = gpu.free_tensor(old); }
+                if let Some(old) = self.givens_sin.take() { let _ = gpu.free_tensor(old); }
+                self.givens_cos = Some(s1);
+                self.givens_sin = Some(s2);
+            }
+        }
         let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
         let v_elems = (self.physical_cap * v_bpp + 3) / 4;
         for t in self.v_gpu.iter_mut() {
