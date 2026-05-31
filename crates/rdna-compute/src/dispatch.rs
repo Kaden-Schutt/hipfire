@@ -34266,6 +34266,7 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
+    use super::DType;
 
     #[test]
     fn mq_signs_128_deterministic() {
@@ -34280,5 +34281,89 @@ mod tests {
         assert_eq!(gen_fwht_signs(1043, 128), s2);
         // Distinct from G256 seeds
         assert_ne!(gen_fwht_signs(42, 128), s1, "seed 43 should differ from seed 42");
+    }
+
+    // ── DType dispatch predicates ───────────────────────────────
+
+    #[test]
+    fn f32_size_is_4() {
+        assert_eq!(DType::F32.size(), 4);
+    }
+
+    #[test]
+    fn f16_size_is_2() {
+        assert_eq!(DType::F16.size(), 2);
+    }
+
+    #[test]
+    fn quantized_dtypes_all_have_size_1() {
+        let quants = [
+            DType::Q4K, DType::Q6K, DType::Q8_0,
+            DType::Q4F16G64, DType::Q4F16G32, DType::Q8HFQ,
+            DType::HFQ4G256, DType::HFQ4G128,
+            DType::PARO4G128, DType::PARO4G128T,
+            DType::HFQ3G256, DType::HFQ3G128,
+            DType::MQ4G256, DType::MQ4G128,
+            DType::MQ8G256, DType::MQ6G256,
+            DType::MQ3G256, DType::MQ2G256,
+            DType::MQ2G256Lloyd, DType::MQ3G256Lloyd, DType::MQ4G256Lloyd,
+            DType::HFP4G32, DType::MFP4G32,
+            DType::HFQ2G256, DType::HFQ2G128, DType::HFQ6G256,
+            DType::ParoQ4G128, DType::Raw,
+        ];
+        for dt in &quants {
+            assert_eq!(dt.size(), 1, "DType::{dt:?} should have size 1");
+        }
+    }
+
+    #[test]
+    fn awq_sidecar_supported_on_mq4_mq3() {
+        assert!(DType::MQ4G256.supports_awq_sidecar());
+        assert!(DType::MQ3G256.supports_awq_sidecar());
+    }
+
+    #[test]
+    fn awq_sidecar_not_supported_on_other_formats() {
+        let no_awq = [
+            DType::F32, DType::F16,
+            DType::Q4K, DType::Q6K, DType::Q8_0,
+            DType::Q4F16G64, DType::Q4F16G32, DType::Q8HFQ,
+            DType::HFQ4G256, DType::HFQ4G128,
+            DType::PARO4G128, DType::PARO4G128T,
+            DType::HFQ3G256, DType::HFQ3G128,
+            DType::MQ4G128, DType::MQ8G256, DType::MQ6G256,
+            DType::MQ2G256,
+            DType::MQ2G256Lloyd, DType::MQ3G256Lloyd, DType::MQ4G256Lloyd,
+            DType::HFP4G32, DType::MFP4G32,
+            DType::HFQ2G256, DType::HFQ2G128, DType::HFQ6G256,
+            DType::ParoQ4G128, DType::Raw,
+        ];
+        for dt in &no_awq {
+            assert!(!dt.supports_awq_sidecar(), "DType::{dt:?} should NOT support AWQ sidecar");
+        }
+    }
+
+    /// Ensure every DType variant is covered by size() (catches addition of
+    /// new variants without updating size).
+    #[test]
+    fn all_dtype_variants_have_size() {
+        let all = [
+            (DType::F32, 4), (DType::F16, 2),
+            (DType::Q4K, 1), (DType::Q6K, 1), (DType::Q8_0, 1),
+            (DType::Q4F16G64, 1), (DType::Q4F16G32, 1), (DType::Q8HFQ, 1),
+            (DType::HFQ4G256, 1), (DType::HFQ4G128, 1),
+            (DType::PARO4G128, 1), (DType::PARO4G128T, 1),
+            (DType::HFQ3G256, 1), (DType::HFQ3G128, 1),
+            (DType::MQ4G256, 1), (DType::MQ4G128, 1),
+            (DType::MQ8G256, 1), (DType::MQ6G256, 1),
+            (DType::MQ3G256, 1), (DType::MQ2G256, 1),
+            (DType::MQ2G256Lloyd, 1), (DType::MQ3G256Lloyd, 1), (DType::MQ4G256Lloyd, 1),
+            (DType::HFP4G32, 1), (DType::MFP4G32, 1),
+            (DType::HFQ2G256, 1), (DType::HFQ2G128, 1), (DType::HFQ6G256, 1),
+            (DType::ParoQ4G128, 1), (DType::Raw, 1),
+        ];
+        for (dt, expected_size) in &all {
+            assert_eq!(dt.size(), *expected_size, "DType::{dt:?} size mismatch");
+        }
     }
 }
