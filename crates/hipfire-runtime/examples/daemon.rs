@@ -4964,6 +4964,33 @@ fn generate_multi(
     let kv = m.kv_cache.as_mut().unwrap();
     let dn = m.dn_state.as_mut().unwrap();
     let gpus = m.pp_gpus.as_mut().unwrap();
+    let dn_la_to_device = m.pp_dn_la_to_device.as_ref().unwrap();
+
+    macro_rules! reset_pp_uncommitted_state {
+        () => {{
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.prefill_checkpoints.clear();
+            m.dflash_checkpoints.clear();
+            for (i, s) in dn.s_matrices.iter().enumerate() {
+                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.s_scales.iter().enumerate() {
+                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for (i, s) in dn.conv_states.iter().enumerate() {
+                let g = &mut gpus.devices[dn_la_to_device[i] as usize];
+                let _ = g.bind_thread();
+                let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            kv.compact_offset = 0;
+            if let Some(llkv) = m.llama_kv.as_mut() { llkv.compact_offset = 0; }
+        }};
+    }
 
     let dev_last = gpus.output_device;
     let vocab_size = config.vocab_size;
@@ -4978,6 +5005,14 @@ fn generate_multi(
     }
     m.seq_pos += new_tokens.len();
     m.conversation_tokens.extend_from_slice(&new_tokens);
+
+    if check_abort(id) {
+        reset_pp_uncommitted_state!();
+        let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+        let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
 
     // ngram scope: generated tokens only (matches pp=1).
     let ngram_scope_start = m.conversation_tokens.len();
@@ -5026,9 +5061,21 @@ fn generate_multi(
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
+    let mut force_answer_latched = false;
+    let think_open_tok = tokenizer.special_token_id("<think>");
+    let max_total_think: usize = std::env::var("HIPFIRE_MAX_TOTAL_THINK_TOKENS")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let mut total_think_tokens: usize = 0;
     let loop_guard = hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     while generated < max_tokens {
+        if check_abort(id) {
+            reset_pp_uncommitted_state!();
+            let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+            let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#, id, generated);
+            let _ = stdout.flush();
+            return;
+        }
         generated += 1;
         m.conversation_tokens.push(next_token);
         streamed_tokens.push(next_token);
@@ -5053,8 +5100,11 @@ fn generate_multi(
         if im_end_token == Some(next_token) { break; }
         if tokenizer.is_terminator(next_token) { break; }
 
-        // max_think_tokens enforcement: same decoded-text scan as pp=1.
-        if max_think_tokens > 0 {
+        // max_think_tokens / force-answer enforcement: same decoded-text scan
+        // as pp=1, but all recurrent-state writes route through *_multi.
+        let force_answer_now = check_force_answer(id);
+        if force_answer_now { force_answer_latched = true; }
+        if max_think_tokens > 0 || force_answer_now || force_answer_latched || max_total_think > 0 {
             let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
             let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
             let open_idx = raw_str.rfind("<think>");
@@ -5064,15 +5114,31 @@ fn generate_multi(
                 (Some(_), None) => true,
                 _ => false,
             };
-            if in_think {
-                if !prev_in_think { think_count = 1; } else { think_count += 1; }
-            } else {
-                think_count = 0;
+            if in_think { total_think_tokens += 1; }
+            if max_total_think > 0 && total_think_tokens >= max_total_think {
+                force_answer_latched = true;
             }
-            prev_in_think = in_think;
+            if max_total_think > 0 && in_think && total_think_tokens >= max_total_think + 256 {
+                eprintln!("[think-cap] id={} — total think {} exceeded cap {}+256 while still thinking; forcing EOS", id, total_think_tokens, max_total_think);
+                break;
+            }
+            if max_think_tokens > 0 {
+                if in_think {
+                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                } else {
+                    think_count = 0;
+                }
+                prev_in_think = in_think;
+            }
+            let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
 
-            if in_think && think_count >= max_think_tokens {
-                let close_tokens = tokenizer.encode("</think>\n");
+            if in_think && (budget_hit || force_answer_now || force_answer_latched) {
+                if force_answer_now {
+                    eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                } else if force_answer_latched {
+                    eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
+                }
+                let close_tokens = tokenizer.encode(&think_continuation());
                 let budget_left = max_tokens.saturating_sub(generated);
                 let take = close_tokens.len().min(budget_left);
                 for &t in &close_tokens[..take] {
@@ -5130,6 +5196,7 @@ fn generate_multi(
                 let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
                 let mut blocked: Vec<u32> = Vec::new();
                 sampler::collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
+                if force_answer_latched { if let Some(t) = think_open_tok { blocked.push(t); } }
                 let cfg = SamplerConfig {
                     temperature: temp, top_p, repeat_penalty,
                     repeat_window: repeat_buf_cap,
@@ -5180,6 +5247,7 @@ fn generate_multi(
         let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
         let mut blocked: Vec<u32> = Vec::new();
         sampler::collect_unclosed_attractor_blocks(ngram_scope, &attractor_pairs, 20, 2, &mut blocked);
+        if force_answer_latched { if let Some(t) = think_open_tok { blocked.push(t); } }
         let cfg = SamplerConfig {
             temperature: temp, top_p, repeat_penalty,
             repeat_window: repeat_buf_cap,
