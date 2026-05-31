@@ -128,14 +128,40 @@ local gfx1100 (7900 XTX) for internal consistency (all cells same machine/sessio
 | **lloyd3** | 3 | 100 | **200 (−46%)** | 12,800 B | **0.012120** | 3.4413 | +8.7% |
 | lloyd2 | 2 | 68 | **168 (−55%)** | 10,752 B | **0.014568** | 3.4525 | +30.7% |
 
-(The Q8-V cell at 0.01115 reproduces the historical fwht3 baseline ≈0.0112 — harness validated.
-4-chunk smoke earlier showed the same monotonic ordering, with lloyd4 ≈ q8 to 4 digits.)
+**FULL 12-cell matrix (Phase 2, 2026-05-31, 24-chunk, qwen3.6-27b.mq4, gfx1100).** Uniform
+256-wide V works under all fwht K modes (fwht2/4 via the signs-realloc + the verbatim 256-wide
+read branch). **KLD** (↓ better); total B/head = K+V in parens:
 
-**Read-out:** monotonic and physics-consistent (more V bits → lower KLD; a layout/inverse bug
-would have exploded KLD). **lloyd4-V is Q8-V-grade** (+3.0% KLD, PPL essentially unchanged) at
-**−38% total KV** — the FWHT rotation Gaussianizes V so 4-bit centroids are near-lossless.
-**lloyd3-V** trades +8.7% KLD for **−46% KV**. **lloyd2-V** (+30.7%) confirms V *is* bit-sensitive
-below 3 bits and is not default material (available for extreme-context users who accept the cost).
+| K ↓ \ V → | q8 (272) | lloyd4 (132) | lloyd3 (100) | lloyd2 (68) |
+|---|---|---|---|---|
+| **fwht2 (68)** | 0.01505 *(340)* | 0.01537 *(200)* | 0.01598 *(168)* | 0.01861 *(136)* |
+| **fwht3 (100)** | **0.01115** *(372)* ← today | **0.01149** *(232)* | **0.01212** *(200)* | 0.01457 *(168)* |
+| **fwht4 (132)** | 0.01064 *(404)* | **0.01109** *(264)* | 0.01156 *(232)* | 0.01424 *(200)* |
+
+**Equal-byte K/V-split comparison (which split is most accurate at a fixed byte budget?):**
+- **200 B/head:** fwht3/lloyd3 **0.01212** ≪ fwht2/lloyd4 0.01537 ≈ fwht4/lloyd2 0.01424 → **balanced 3K/3V wins** decisively over lopsided.
+- **232 B/head:** fwht3/lloyd4 **0.01149** ≈ fwht4/lloyd3 0.01156 → a tie (spend the extra bit on either K or V; V marginally better).
+- **168 B/head:** fwht3/lloyd2 0.01457 < fwht2/lloyd3 0.01598 → avoid 2-bit *K* more than 2-bit *V*.
+- **264 B/head:** fwht4/lloyd4 **0.01109** ≈ fwht3/q8 0.01115 → **lloyd4-V matches today's default accuracy at −29% bytes** (and fwht4/lloyd4 even edges it).
+
+**Read-outs:** (1) monotonic & physics-consistent everywhere — no layout/inverse bug. (2) Both
+axes show diminishing returns with a lossy **2-bit tier** (K2 alone is 0.0151; V2 adds the most);
+3–4 bits is the knee. (3) **Balanced K/V beats lopsided** at equal bytes — don't pair a 2-bit
+side with a 4-bit side. (4) The K-axis matters: fwht4/q8 (0.01064) is the most accurate cell;
+fwht2 is meaningfully worse (the 2-bit K is the lossy one).
+
+**Recommended configs:**
+- **fwht3 + lloyd4-V (232 B, 0.01149, +3% vs fwht3/q8)** — Q8-grade, −38% KV. The "free" pick.
+- **fwht3 + lloyd3-V (200 B, 0.01212, +8.7%)** — best *balanced* sweet spot, −46% KV.
+- **fwht4 + lloyd4-V (264 B, 0.01109)** — matches today's fwht3/q8 accuracy at −29% bytes if you
+  want max accuracy under quant.
+- lloyd2-V only under real VRAM pressure (the +24–30% KLD tier).
+
+**Coherence:** gate exit 0; daemon runs on qwen3.6-27b.mq4 confirmed fluent + override-engaged for
+fwht3/lloyd4, fwht3/lloyd3, **fwht2/lloyd4, and fwht4/lloyd4** (no attractor/loop/special-token leak).
+**Perf:** the V-read mechanism (per-tile inverse) costs ~4.4% short-ctx decode regardless of K mode
+(measured on fwht3); long-ctx bandwidth win unmeasured; the per-tile→reduce-kernel inverse
+optimization (deferred) should recover most of it. Default stays Q8-V; all lloyd-V is opt-in.
 
 ## 6. Decision rule & guardrails
 
