@@ -3290,7 +3290,7 @@ async function benchRun(e: Engine, prompt: string, maxTokens: number, timeoutMs 
 // Synthetic prefill measurement: runs `bench_prefill` on the daemon which
 // times forward_prefill_batch over N deterministic tokens from a zeroed
 // state. Returns tok/s and ms, or null on error (e.g. N > max_seq).
-async function benchPrefill(e: Engine, tokens: number, timeoutMs = 60_000): Promise<{ tokS: number; ms: number } | null> {
+async function benchPrefill(e: Engine, tokens: number, timeoutMs = Number(process.env.HIPFIRE_BENCH_PP_TIMEOUT_MS) || 60_000): Promise<{ tokS: number; ms: number } | null> {
   try {
     await withTimeout(e.send({ type: "bench_prefill", tokens }), 5_000, "bench_prefill send");
     const res = await withTimeout(e.recv(), timeoutMs, `bench_prefill (${tokens} tok)`);
@@ -3500,7 +3500,13 @@ async function bench(model: string, runs: number, experimental: boolean, prompt:
     // don't depend on prompt tokenization. Older daemons ignore the command
     // and return an error; we silently skip in that case. Each size is run
     // `runs` times so we can report variance.
-    const ppSizes = [128, 512, 1024, 2048].filter(n => n + 32 <= loadMsg.params.max_seq);
+    // Override the canonical pp ladder with HIPFIRE_BENCH_PP="128,512,1024,..."
+    // for incremental context ramps (e.g. validating a new attention path).
+    const ppDefault = [128, 512, 1024, 2048];
+    const ppSizes = (process.env.HIPFIRE_BENCH_PP
+      ? process.env.HIPFIRE_BENCH_PP.split(",").map(s => parseInt(s.trim(), 10)).filter(n => Number.isInteger(n) && n > 0)
+      : ppDefault
+    ).filter(n => n + 32 <= loadMsg.params.max_seq);
     const ppResults: { size: number; samples: number[]; ms: number[] }[] = [];
     if (ppSizes.length > 0) {
       process.stderr.write("  prefill: ");
