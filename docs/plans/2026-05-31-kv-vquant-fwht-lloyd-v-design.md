@@ -147,11 +147,13 @@ below 3 bits and is not default material (available for extreme-context users wh
   falsification log warn about. KLD parity is necessary, coherence is the gate.
 - New/changed kernels + dispatch ⇒ the pre-commit coherence hook applies.
 
-**Coherence result (2026-05-31, lloyd4-V):** `coherence-gate.sh` (HIPFIRE_KV_V=lloyd4) → exit 0,
-all 11 short-battery cases ran with no hard errors. Direct 27B check (qwen3.5-27b.mq3,
-fwht3-K + lloyd4-V) confirmed the override engaged (`[daemon] V-cache mode override → lloyd4`)
-and produced fluent, on-topic output with no attractor/loop/special-token leak. lloyd4-V is
-coherence-clean. (lloyd3-V / lloyd2-V coherence not yet gated — gate before defaulting either.)
+**Coherence result (2026-05-31):** `coherence-gate.sh` (HIPFIRE_KV_V=lloyd4) → exit 0, all 11
+short-battery cases ran with no hard errors. Direct checks on the **canonical qwen3.6-27b.mq4**
+(same model as the KLD sweep), fwht3-K, confirmed the override engaged for both
+(`[daemon] V-cache mode override → lloyd4` / `→ lloyd3`), daemon exit 0, no panic/NaN, and
+**both lloyd4-V and lloyd3-V produced fluent, on-topic output** (structured `<think>` reasoning,
+no attractor/loop/special-token leak). lloyd4-V and lloyd3-V are coherence-clean. (lloyd2-V not
+yet gated — gate before defaulting it.)
 
 ## 7. Open decisions
 
