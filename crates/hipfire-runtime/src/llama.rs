@@ -1532,9 +1532,6 @@ pub fn weight_gemv_swiglu_residual(
                 up: None,
             }).map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
         }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
-            gpu.gemv_paro4g128_swiglu_residual(&w_down.buf, gate, up, x, w_down.m, w_down.k)
-        }
         DType::PARO4G128T => {
             gpu.ensure_mq_signs()?;
             let xr = GpuTensor {
@@ -1612,9 +1609,6 @@ pub fn weight_gemv_swiglu_residual(
             };
             fused_silu_mul_rotate_mq_for(gpu, w_down, gate, up, &x_rot_alias, w_down.k)?;
             gpu.gemv_hfq6g256_residual(&w_down.buf, &x_rot_alias, x, w_down.m, w_down.k)
-        }
-        DType::PARO4G128 if std::env::var_os("HIPFIRE_PARO_SWIGLU_FUSED").is_some() => {
-            gpu.gemv_paro4g128_swiglu_residual(&w_down.buf, gate, up, x, w_down.m, w_down.k)
         }
         DType::PARO4G128T => {
             gpu.ensure_mq_signs()?;
