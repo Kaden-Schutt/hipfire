@@ -5833,6 +5833,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // no-eviction case — eviction remaps physical KV slots, which would
             // invalidate the resident prefix. `seq_pos < rendered.len()` on the
             // chosen checkpoint guarantees ≥1 token is re-prefilled.
+            //
+            // SAFETY INVARIANT (fix/deltanet-truncation-resume-guard): this
+            // restore-checkpoint-at-rpos + replay rendered[rpos..] is exact iff the
+            // checkpoint at rpos reflects the committed prefix rendered[..rpos].
+            // That holds because (a) rpos <= lcp => rendered[..rpos] ==
+            // conversation_tokens[..rpos] (lcp is their longest common prefix), and
+            // (b) ALL abort paths now full-reset, so a retained checkpoint can never
+            // carry UNCOMMITTED tokens — the poison that used to drift the
+            // non-reversible DeltaNet state into garbage. If you ever remove an
+            // abort-reset (or let conversation_tokens diverge from the forwarded
+            // stream), this resume becomes unsound: re-validate with a per-checkpoint
+            // prefix hash (llama.cpp's tokens_hash contract) or cold-recompute.
+            // Guarded by scripts/test-qwen35-abort-resume.sh.
             let evict_safe = m.pp <= 1
                 && m.eviction.is_none()
                 && m.kv_cache.as_ref().map(|k| k.compact_offset == 0).unwrap_or(true)
@@ -6426,6 +6439,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                             }
                         }
                         m.conversation_tokens.push(t);
+                        // Keep the grammar matcher in sync over force-closed tokens,
+                        // exactly as the normal sample path does (6253-6255). Without
+                        // this, a tools request that force-closes <think> leaves the
+                        // matcher in a stale state -> malformed/unparseable tool calls
+                        // after the forced close. llama.cpp forces the close via a
+                        // logit mask so the model SAMPLES the tag (matcher advances
+                        // naturally); injecting it + advancing here is state-identical
+                        // (the recurrent fwd over </think> is the same either way).
+                        if grammar_active { grammar_matcher.advance(&tokenizer.decode(&[t])); }
                         streamed_tokens.push(t);
                         emit_committed_event(stdout, id, t, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
