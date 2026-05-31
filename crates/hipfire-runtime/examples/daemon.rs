@@ -884,6 +884,11 @@ fn main() {
                 };
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
+                // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
+                // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
+                // advanced:k=..,v=.. — resolved in load_model (param > env > off).
+                let kv_adaptive_override = msg.get("params").and_then(|p| p.get("kv_adaptive")).and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
                 // MTP speculative decode config. `mtp_mode` gates weight
                 // discovery at load time (off=skip, on=error-if-missing,
@@ -1034,7 +1039,7 @@ fn main() {
                 let state_quant_override = msg.get("params").and_then(|p| p.get("state_quant")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
-                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
+                match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), kv_adaptive_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
                     Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
@@ -1900,13 +1905,76 @@ fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQua
     }
 }
 
-fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
+/// Parse a HIPFIRE_KV_ADAPTIVE-style string (env value OR per-load
+/// `params.kv_adaptive`) into `(named-preset, k_floor, v_floor)`.
+///
+/// Accepts: `""`/`"off"` (⇒ None, adaptive disabled),
+/// `conservative` | `balanced` | `aggressive` (named presets), and
+/// `advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>`.
+///
+/// Returns `None` for off/empty AND for malformed/unknown input (logging a
+/// diagnostic in the latter case). The named-preset slot is `Some(_)` only for
+/// the three named presets so the caller can preserve their named interleave
+/// via `KvAdaptive::from_preset`; `advanced` returns `None` there and the caller
+/// uses `KvAdaptive::new` with the explicit floors.
+///
+/// Both the per-load param and the env var feed this single helper (param wins;
+/// env is the fallback) so the resolution logic stays DRY.
+fn parse_kv_adaptive(
+    s: &str,
+) -> Option<(
+    Option<hipfire_runtime::kv_adaptive::Preset>,
+    hipfire_runtime::kv_adaptive::KMode,
+    llama::VMode,
+)> {
+    use hipfire_runtime::kv_adaptive::{KMode, Preset};
+    use llama::VMode;
+    match s {
+        "" | "off" => None,
+        "conservative" => Some((Some(Preset::Conservative), KMode::Fwht4, VMode::Lloyd4)),
+        "balanced" => Some((Some(Preset::Balanced), KMode::Fwht2, VMode::Lloyd2)),
+        "aggressive" => Some((Some(Preset::Aggressive), KMode::Fwht2, VMode::Lloyd2)),
+        other if other.starts_with("advanced:") => {
+            // advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>
+            let spec = &other["advanced:".len()..];
+            let mut k = None;
+            let mut v = None;
+            for kvp in spec.split(',') {
+                let mut it = kvp.splitn(2, '=');
+                match (it.next(), it.next()) {
+                    (Some("k"), Some("fwht4")) => k = Some(KMode::Fwht4),
+                    (Some("k"), Some("fwht3")) => k = Some(KMode::Fwht3),
+                    (Some("k"), Some("fwht2")) => k = Some(KMode::Fwht2),
+                    (Some("v"), Some("lloyd4")) => v = Some(VMode::Lloyd4),
+                    (Some("v"), Some("lloyd3")) => v = Some(VMode::Lloyd3),
+                    (Some("v"), Some("lloyd2")) => v = Some(VMode::Lloyd2),
+                    _ => {}
+                }
+            }
+            match (k, v) {
+                (Some(k), Some(v)) => Some((None, k, v)),
+                _ => {
+                    eprintln!("[daemon] kv_adaptive='{other}' malformed — expected advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>; ignoring");
+                    None
+                }
+            }
+        }
+        other => {
+            eprintln!("[daemon] kv_adaptive='{other}' unknown — expected off|conservative|balanced|aggressive|advanced:k=..,v=..; ignoring");
+            None
+        }
+    }
+}
+
+fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, kv_adaptive_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
         // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
         // the "load" event handler so the operator gets a structured error
         // before any HFQ open / weight allocation. By the time we get here
         // with pp>1, draft_path is None and cask.sidecar is None.
-        let _ = (draft_path, cask);
+        // Adaptive KV is Qwen3.5 single-process only (pp=1); not wired on the
+        // tensor-parallel path. Consume the override so it isn't silently dropped.
+        let _ = (draft_path, cask, kv_adaptive_override);
         return load_model_pp(path, max_seq, kv_mode_override, state_quant_override, pp, gpu);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
@@ -1917,6 +1985,14 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+    // Per-load kv_adaptive (sent in load message params) overrides the env var.
+    // Mirrors the kv_mode override above: param wins; HIPFIRE_KV_ADAPTIVE is the
+    // fallback; neither ⇒ off (opt-in default). The resolved string is parsed
+    // by `parse_kv_adaptive` below at the kv-cache construction site.
+    let kv_adaptive_spec = kv_adaptive_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default());
     // ─── ParoQuant / safetensors directory path ────────────────────────────
     // If the path is a directory with config.json, try loading as a
     // SafetensorsSource (ParoQuant, AWQ, etc.) instead of HFQ.
@@ -2331,74 +2407,28 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             }
         }
 
-        // Adaptive KV (HIPFIRE_KV_ADAPTIVE env). Runtime VRAM-fit downshift of
-        // K/V precision as context grows. Requires an FWHT K mode (reuse the
-        // lloyd-V guard). When engaged the V buffer is re-sized to the V FLOOR
-        // (the fixed buffer holds max_seq tokens at the floor; FEWER at the q8
-        // start tier) and the controller transcodes V down as seq_pos crosses
-        // capacity thresholds. K transcode is a later task (Task 6/7); the
-        // controller's K step errors loudly until then, so V-only floors
-        // (k=fwht4) are the only fully-wired adaptive configs this task.
+        // Adaptive KV. Runtime VRAM-fit downshift of K/V precision as context
+        // grows. Resolution (param wins; env is fallback; neither ⇒ off) happens
+        // at the top of `load_model` into `kv_adaptive_spec`; `parse_kv_adaptive`
+        // turns that string into a (named-preset, k_floor, v_floor). Requires an
+        // FWHT K mode (reuse the lloyd-V guard). When engaged the V buffer is
+        // re-sized to the V FLOOR (the fixed buffer holds max_seq tokens at the
+        // floor; FEWER at the q8 start tier) and the controller transcodes V down
+        // as seq_pos crosses capacity thresholds.
         // Format: off|conservative|balanced|aggressive|advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>.
         // See docs/plans/2026-05-31-adaptive-kv-design.md.
-        let kv_adaptive_env = std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default();
         let kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive> = {
-            use hipfire_runtime::kv_adaptive::{KMode, KvAdaptive, Preset};
-            use llama::VMode;
-            // Resolve the env value to (k_floor, v_floor), or None for off/unknown.
-            let floors: Option<(KMode, VMode)> = match kv_adaptive_env.as_str() {
-                "" | "off" => None,
-                "conservative" => Some((KMode::Fwht4, VMode::Lloyd4)),
-                "balanced" => Some((KMode::Fwht2, VMode::Lloyd2)),
-                "aggressive" => Some((KMode::Fwht2, VMode::Lloyd2)),
-                other if other.starts_with("advanced:") => {
-                    // advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>
-                    let spec = &other["advanced:".len()..];
-                    let mut k = None;
-                    let mut v = None;
-                    for kvp in spec.split(',') {
-                        let mut it = kvp.splitn(2, '=');
-                        match (it.next(), it.next()) {
-                            (Some("k"), Some("fwht4")) => k = Some(KMode::Fwht4),
-                            (Some("k"), Some("fwht3")) => k = Some(KMode::Fwht3),
-                            (Some("k"), Some("fwht2")) => k = Some(KMode::Fwht2),
-                            (Some("v"), Some("lloyd4")) => v = Some(VMode::Lloyd4),
-                            (Some("v"), Some("lloyd3")) => v = Some(VMode::Lloyd3),
-                            (Some("v"), Some("lloyd2")) => v = Some(VMode::Lloyd2),
-                            _ => {}
-                        }
-                    }
-                    match (k, v) {
-                        (Some(k), Some(v)) => Some((k, v)),
-                        _ => {
-                            eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE='{other}' malformed — expected advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>; ignoring");
-                            None
-                        }
-                    }
-                }
-                other => {
-                    eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE='{other}' unknown — expected off|conservative|balanced|aggressive|advanced:k=..,v=..; ignoring");
-                    None
-                }
-            };
-            // Preset name (for from_preset) so balanced/aggressive/conservative
-            // keep their named interleave; advanced uses ::new directly.
-            let preset = match kv_adaptive_env.as_str() {
-                "conservative" => Some(Preset::Conservative),
-                "balanced" => Some(Preset::Balanced),
-                "aggressive" => Some(Preset::Aggressive),
-                _ => None,
-            };
-            match floors {
+            use hipfire_runtime::kv_adaptive::KvAdaptive;
+            match parse_kv_adaptive(&kv_adaptive_spec) {
                 None => None,
-                Some((k_floor, v_floor)) => {
+                Some((preset, k_floor, v_floor)) => {
                     // Adaptive requires an FWHT K mode. Reuse the lloyd-V guard.
                     if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
                         // adaptive expects K=fwht4 at start; warn if the loaded K
                         // mode isn't fwht4 (full kv_mode-forcing is a later task —
                         // do NOT override the user's kv_mode here).
                         if !kv.quant_asym4 {
-                            eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4 — capacity thresholds assume the fwht4 start footprint");
+                            eprintln!("[daemon] kv_adaptive: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4 — capacity thresholds assume the fwht4 start footprint");
                         }
                         // Size the V buffer at the V floor + K buffer at the K
                         // floor (so balanced/aggressive actually save K VRAM and
@@ -2417,7 +2447,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                         );
                         Some(ad)
                     } else {
-                        eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE={kv_adaptive_env} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
+                        eprintln!("[daemon] kv_adaptive={kv_adaptive_spec} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
                         None
                     }
                 }
