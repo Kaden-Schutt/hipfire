@@ -480,6 +480,22 @@ impl<'a> JinjaChatFrame<'a> {
         env.add_function("raise_exception", |msg: String| -> Result<Value, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
+        // Some HF templates call `tojson(ensure_ascii=False)` (MiniMax-M2's tool
+        // block) or `tojson(indent=…)`. minijinja's builtin `tojson` rejects
+        // unknown kwargs, so the whole template fails to render and we silently
+        // fall back to the Plain frame — the model then never sees its native
+        // tool format (observed e2e on MiniMax-M2: template render failed on
+        // `ensure_ascii`, Plain fallback, model emitted a Qwen-ish `<tool_call>`
+        // instead of `<minimax:tool_call>`). Override `tojson` with a serde_json
+        // serializer that accepts + ignores those kwargs; serde_json emits raw
+        // UTF-8 (== ensure_ascii=False), which is what chat templates want.
+        env.add_filter("tojson", |value: Value, kwargs: minijinja::value::Kwargs| -> Result<Value, Error> {
+            let _ = kwargs.get::<Option<bool>>("ensure_ascii");
+            let _ = kwargs.get::<Option<i64>>("indent");
+            let s = serde_json::to_string(&value)
+                .map_err(|e| Error::new(ErrorKind::InvalidOperation, format!("tojson: {e}")))?;
+            Ok(Value::from_safe_string(s))
+        });
 
         // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
         // tags (and their whitespace-control `{%- … -%}` variants). minijinja
@@ -743,6 +759,29 @@ mod tests {
         let rendered = frame.render_messages(&msgs, None, None)
             .expect("template with generation tags must render after strip");
         assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n");
+    }
+
+    #[test]
+    fn jinja_tojson_accepts_ensure_ascii_kwarg() {
+        // MiniMax-M2's template calls `tojson(ensure_ascii=False)`; minijinja's
+        // builtin rejects the kwarg → render fails → silent Plain fallback (the
+        // model then never emits its native tool format). Our override must
+        // accept the kwarg and emit raw JSON.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}{{- m.content -}}{%- endfor -%}{{- tools | tojson(ensure_ascii=False) -}}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some(""),
+        };
+        let msgs = vec![Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None }];
+        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "get_weather"}})];
+        let rendered = frame.render_messages(&msgs, Some(&tools), None)
+            .expect("tojson(ensure_ascii=False) must render, not fall back");
+        assert!(rendered.contains("\"get_weather\""), "tool json missing: {rendered}");
     }
 
     #[test]
