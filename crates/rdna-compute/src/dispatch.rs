@@ -88,6 +88,9 @@ const FP8_WMMA_MIN_BATCH: usize = 1024;
 /// than uniformly applying FP8 everywhere.
 const FP8_GEMV_MIN_M: usize = 4096;
 
+/// V-cache mode kernarg: 8 = legacy Q8_0 V (see VMode::bits()).
+const V_MODE_Q8: i32 = 8;
+
 
 
 /// Tensor stored on the GPU. Tracks shape and element type.
@@ -24309,7 +24312,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym4_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, 8,
+            tree_bias, block_start, block_cols, V_MODE_Q8,
         )
     }
 
@@ -24354,7 +24357,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht4_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, 8,
+            tree_bias, block_start, block_cols, V_MODE_Q8,
         )
     }
 
@@ -24375,7 +24378,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym2_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0, 8,
+            None, 0, 0, V_MODE_Q8,
         )
     }
 
@@ -24396,7 +24399,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht2_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0, 8,
+            None, 0, 0, V_MODE_Q8,
         )
     }
 
@@ -24515,7 +24518,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym3_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, 8,
+            tree_bias, block_start, block_cols, V_MODE_Q8,
         )
     }
 
@@ -24533,7 +24536,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.attention_flash_fwht3_batched_masked(
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0, 8,
+            None, 0, 0, V_MODE_Q8,
         )
     }
 

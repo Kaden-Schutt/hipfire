@@ -57,11 +57,6 @@ __global__ void attention_flash_fwht3_tile_batched(
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
     const int k_head_off       = kv_h * k_bytes_per_head;
 
-    const int v_blocks_per_head = head_dim / 32;
-    const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
-    const int v_kv_head_blk     = kv_h * v_blocks_per_head;
-    const int v_row_stride      = v_total_blocks * 34;
-
     extern __shared__ float sdata[];
     float* scores = sdata;
 
@@ -123,6 +118,10 @@ __global__ void attention_flash_fwht3_tile_batched(
     float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
     if (v_mode == 8) {
         // Legacy Q8_0 V (normal space) — unchanged behavior.
+        const int v_blocks_per_head = head_dim / 32;
+        const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
+        const int v_kv_head_blk     = kv_h * v_blocks_per_head;
+        const int v_row_stride      = v_total_blocks * 34;
         for (int t_local = 0; t_local < tile_len; t_local++) {
             float w = scores[t_local];
             int t = tile_start + t_local;
