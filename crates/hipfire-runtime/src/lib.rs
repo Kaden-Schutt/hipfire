@@ -19,6 +19,7 @@ pub mod config;
 pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
+pub mod kv_adaptive;
 pub mod llama;
 pub mod model_source;
 pub mod safetensors_source;
@@ -31,8 +32,6 @@ pub mod dflash;
 pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
-#[cfg(feature = "deltanet")]
-pub mod kv_adaptive;
 #[cfg(feature = "deltanet")]
 pub mod cask;
 #[cfg(feature = "deltanet")]

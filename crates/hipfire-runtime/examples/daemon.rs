@@ -648,6 +648,13 @@ struct LoadedModel {
     /// and every decode-forward so the physical cache stays bounded by
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     eviction: Option<Eviction>,
+    /// When Some(_), the daemon calls `maybe_downshift` after every prefill-chunk
+    /// and every decode-forward (same site as eviction) so the KV cache
+    /// gracefully drops precision (V: q8→lloyd4→lloyd3→lloyd2; K later) as
+    /// `seq_pos` grows toward the floor-sized buffer ceiling. Enabled via
+    /// `HIPFIRE_KV_ADAPTIVE`; requires an FWHT K mode. See
+    /// docs/plans/2026-05-31-adaptive-kv-design.md.
+    kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
 
     /// Per-turn token cache for V4F prefix-cache stability.
@@ -2078,7 +2085,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
@@ -2124,7 +2131,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
@@ -2187,7 +2194,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
@@ -2323,6 +2330,95 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 eprintln!("[daemon] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires an FWHT K mode (fwht2/3/4); cache is a different mode");
             }
         }
+
+        // Adaptive KV (HIPFIRE_KV_ADAPTIVE env). Runtime VRAM-fit downshift of
+        // K/V precision as context grows. Requires an FWHT K mode (reuse the
+        // lloyd-V guard). When engaged the V buffer is re-sized to the V FLOOR
+        // (the fixed buffer holds max_seq tokens at the floor; FEWER at the q8
+        // start tier) and the controller transcodes V down as seq_pos crosses
+        // capacity thresholds. K transcode is a later task (Task 6/7); the
+        // controller's K step errors loudly until then, so V-only floors
+        // (k=fwht4) are the only fully-wired adaptive configs this task.
+        // Format: off|conservative|balanced|aggressive|advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>.
+        // See docs/plans/2026-05-31-adaptive-kv-design.md.
+        let kv_adaptive_env = std::env::var("HIPFIRE_KV_ADAPTIVE").unwrap_or_default();
+        let kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive> = {
+            use hipfire_runtime::kv_adaptive::{KMode, KvAdaptive, Preset};
+            use llama::VMode;
+            // Resolve the env value to (k_floor, v_floor), or None for off/unknown.
+            let floors: Option<(KMode, VMode)> = match kv_adaptive_env.as_str() {
+                "" | "off" => None,
+                "conservative" => Some((KMode::Fwht4, VMode::Lloyd4)),
+                "balanced" => Some((KMode::Fwht2, VMode::Lloyd2)),
+                "aggressive" => Some((KMode::Fwht2, VMode::Lloyd2)),
+                other if other.starts_with("advanced:") => {
+                    // advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>
+                    let spec = &other["advanced:".len()..];
+                    let mut k = None;
+                    let mut v = None;
+                    for kvp in spec.split(',') {
+                        let mut it = kvp.splitn(2, '=');
+                        match (it.next(), it.next()) {
+                            (Some("k"), Some("fwht4")) => k = Some(KMode::Fwht4),
+                            (Some("k"), Some("fwht3")) => k = Some(KMode::Fwht3),
+                            (Some("k"), Some("fwht2")) => k = Some(KMode::Fwht2),
+                            (Some("v"), Some("lloyd4")) => v = Some(VMode::Lloyd4),
+                            (Some("v"), Some("lloyd3")) => v = Some(VMode::Lloyd3),
+                            (Some("v"), Some("lloyd2")) => v = Some(VMode::Lloyd2),
+                            _ => {}
+                        }
+                    }
+                    match (k, v) {
+                        (Some(k), Some(v)) => Some((k, v)),
+                        _ => {
+                            eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE='{other}' malformed — expected advanced:k=<fwht4|fwht3|fwht2>,v=<lloyd4|lloyd3|lloyd2>; ignoring");
+                            None
+                        }
+                    }
+                }
+                other => {
+                    eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE='{other}' unknown — expected off|conservative|balanced|aggressive|advanced:k=..,v=..; ignoring");
+                    None
+                }
+            };
+            // Preset name (for from_preset) so balanced/aggressive/conservative
+            // keep their named interleave; advanced uses ::new directly.
+            let preset = match kv_adaptive_env.as_str() {
+                "conservative" => Some(Preset::Conservative),
+                "balanced" => Some(Preset::Balanced),
+                "aggressive" => Some(Preset::Aggressive),
+                _ => None,
+            };
+            match floors {
+                None => None,
+                Some((k_floor, v_floor)) => {
+                    // Adaptive requires an FWHT K mode. Reuse the lloyd-V guard.
+                    if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
+                        // adaptive expects K=fwht4 at start; warn if the loaded K
+                        // mode isn't fwht4 (full kv_mode-forcing is a later task —
+                        // do NOT override the user's kv_mode here).
+                        if !kv.quant_asym4 {
+                            eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE: adaptive works best with kv_mode=fwht4 (K starts at fwht4); current K mode is not fwht4 — capacity thresholds assume the fwht4 start footprint");
+                        }
+                        // Size the V buffer at the floor + upgrade signs to 256.
+                        kv.set_adaptive_floor_alloc(gpu, v_floor).map_err(|e| format!("{e}"))?;
+                        let ad = match preset {
+                            Some(p) => KvAdaptive::from_preset(p, max_seq, config.n_kv_heads, config.head_dim),
+                            None => KvAdaptive::new(max_seq, config.n_kv_heads, config.head_dim, k_floor, v_floor),
+                        };
+                        eprintln!(
+                            "[adaptive-kv] engaged: pattern={:?} k_floor={:?} v_floor={:?} thresholds={:?} (max_seq={}, V buffer sized at floor)",
+                            ad.steps, ad.k_floor, ad.v_floor, ad.thresholds, max_seq,
+                        );
+                        Some(ad)
+                    } else {
+                        eprintln!("[daemon] HIPFIRE_KV_ADAPTIVE={kv_adaptive_env} ignored — adaptive KV requires an FWHT K mode (fwht2/3/4); cache is a different mode");
+                        None
+                    }
+                }
+            }
+        };
+
         // Q8 DeltaNet state can accumulate quality drift on long generation.
         // The load-time override exists for coherence A/B probes.
         let dn_quant = parse_state_quant(state_quant_override)?;
@@ -2421,7 +2517,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap, eviction,
+            seq_pos: 0, max_seq, physical_cap, eviction, kv_adaptive,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
@@ -2455,7 +2551,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
             model_path: path.to_string(),
@@ -2555,6 +2651,7 @@ fn load_model_safetensors(
             max_seq,
             physical_cap: max_seq,
             eviction: None,
+            kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(),
             decoded_vocab: None,
@@ -2636,6 +2733,7 @@ fn load_model_safetensors(
         max_seq: effective_max_seq,
         physical_cap: effective_max_seq,
         eviction: None,
+        kv_adaptive: None,
         conversation_tokens: Vec::new(),
         asst_turn_cache: std::collections::HashMap::new(),
         decoded_vocab: None,
@@ -2776,7 +2874,7 @@ fn load_model_pp(
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
-            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None, kv_adaptive: None,
             conversation_tokens: Vec::new(),
             asst_turn_cache: std::collections::HashMap::new(), decoded_vocab: None,
         model_path: path.to_string(),
@@ -4592,6 +4690,16 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             ).unwrap();
             m.seq_pos += new_tokens.len();
         }
+        // Adaptive KV: after prefill, downshift any tiers whose threshold the
+        // prefill already crossed (so the q8/start buffer never overflows before
+        // decode starts). `kv` (=m.kv_cache) and m.kv_adaptive are distinct
+        // fields → NLL splits the borrow.
+        if let Some(ad) = m.kv_adaptive.as_mut() {
+            let applied = ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap();
+            for step in &applied {
+                eprintln!("[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})", m.seq_pos, step, ad.cur_k, ad.cur_v);
+            }
+        }
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
         // ngram scope for the repeat penalty: ONLY generated tokens (never the
@@ -4733,6 +4841,15 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
+                }
+            }
+            // Adaptive KV: downshift K/V precision as seq_pos crosses capacity
+            // thresholds. `kv` (=m.kv_cache) and m.kv_adaptive are distinct
+            // fields → NLL splits the borrow.
+            if let Some(ad) = m.kv_adaptive.as_mut() {
+                let applied = ad.maybe_downshift(gpu, kv, m.seq_pos).unwrap();
+                for step in &applied {
+                    eprintln!("[adaptive-kv] downshift @ pos {}: {:?} (K={:?} V={:?})", m.seq_pos, step, ad.cur_k, ad.cur_v);
                 }
             }
 

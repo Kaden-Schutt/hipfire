@@ -27,6 +27,8 @@ impl KMode {
     }
     /// FWHT rotation width.
     pub fn rot_width(self) -> usize { match self { KMode::Fwht3 => 256, _ => 128 } }
+    /// Quantization bit-width of the tier (Fwht4→4, Fwht3→3, Fwht2→2).
+    pub fn bits(self) -> u32 { match self { KMode::Fwht4 => 4, KMode::Fwht3 => 3, KMode::Fwht2 => 2 } }
 }
 
 /// V bytes-per-head (mirrors KvCache::v_bytes_per_pos per-head logic).
@@ -138,6 +140,26 @@ impl KvAdaptive {
             self.thresholds.push(cap.saturating_sub(self.margin));
             match *st { Step::V(nv) => v = nv, Step::K(nk) => k = nk }
         }
+    }
+
+    /// Apply ALL downshift steps whose threshold seq_pos has crossed (handles
+    /// coincident thresholds — e.g. V→lloyd3 and K→fwht2 sharing a binding
+    /// point). Called after each committed token write at the same site as
+    /// `maybe_evict`. The common case (no threshold crossed) is a single integer
+    /// compare returning an empty Vec. Returns the steps applied this call.
+    pub fn maybe_downshift(&mut self, gpu: &mut rdna_compute::Gpu,
+                           kv: &mut crate::llama::KvCache, seq_pos: usize)
+        -> hip_bridge::HipResult<Vec<Step>> {
+        let mut applied = Vec::new();
+        while self.next_step < self.steps.len() && seq_pos >= self.thresholds[self.next_step] {
+            match self.steps[self.next_step] {
+                Step::V(nv) => { kv.transcode_v_step(gpu, nv, seq_pos)?; self.cur_v = nv; }
+                Step::K(nk) => { kv.transcode_k_step(gpu, nk.bits(), seq_pos)?; self.cur_k = nk; }
+            }
+            applied.push(self.steps[self.next_step]);
+            self.next_step += 1;
+        }
+        Ok(applied)
     }
 }
 

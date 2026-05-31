@@ -3546,6 +3546,66 @@ impl KvCache {
         Ok(())
     }
 
+    /// Adaptive-KV load setup: size the V buffer at the V FLOOR (so the fixed
+    /// buffer holds `physical_cap` tokens at the floor; FEWER at higher tiers)
+    /// and ensure 256-wide FWHT signs (so the q8→lloyd4 transcode is safe).
+    /// `v_mode` STAYS Q8 — the fast, highest-precision start tier the controller
+    /// runs until the first threshold. K is untouched (the caller loads K at the
+    /// fwht4 footprint). Mirrors the sign-upgrade block of `set_v_mode_realloc`
+    /// but reallocs each real V layer to the FLOOR size, not the current mode's
+    /// size. Because the floor record (e.g. lloyd2 = 68 B/head) is smaller than
+    /// the q8 record (272 B/head), the q8 phase physically holds only
+    /// ~physical_cap*68/272 ≈ 0.25*physical_cap positions — exactly why the
+    /// controller transcodes before that cap. Single-GPU only (matches
+    /// set_v_mode_realloc).
+    pub fn set_adaptive_floor_alloc(&mut self, gpu: &mut Gpu, v_floor: VMode) -> HipResult<()> {
+        // Mirror the set_v_mode_realloc guard: lloyd-V is 256-wide and requires
+        // an FWHT K mode + head_dim == 256.
+        assert!(
+            (self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht,
+            "adaptive-KV requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht)"
+        );
+        assert!(self.head_dim == 256, "adaptive-KV requires head_dim == 256");
+        assert!(
+            !matches!(v_floor, VMode::Q8),
+            "adaptive-KV V floor must be a lloyd tier (got Q8); nothing to size down to"
+        );
+        // Upgrade the FWHT signs to 256-wide (copy of the need_realloc block from
+        // set_v_mode_realloc): fwht2/4-K caches allocate only 128-element sign
+        // tables; the q8→lloyd4 transcode runs fwht_shfl_forward_256 (reads
+        // signs[0..255]). gen_fwht_signs is a pure LCG, so the first 128 entries
+        // are byte-identical and the 128-wide K reads are unaffected.
+        let need_realloc = self.givens_cos.as_ref().map_or(false, |t| t.numel() < 256);
+        if need_realloc {
+            let n = 256usize;
+            let s1v = Self::gen_fwht_signs(42, n);
+            let s2v = Self::gen_fwht_signs(1042, n);
+            let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+            let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
+            gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
+            gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+            if let Some(old) = self.givens_cos.take() { let _ = gpu.free_tensor(old); }
+            if let Some(old) = self.givens_sin.take() { let _ = gpu.free_tensor(old); }
+            self.givens_cos = Some(s1);
+            self.givens_sin = Some(s2);
+        }
+        // Size V at the FLOOR tier (not the current v_mode). The q8 start phase
+        // simply fits fewer positions in this smaller buffer.
+        let v_bpp_floor = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_floor);
+        let v_elems = (self.physical_cap * v_bpp_floor + 3) / 4;
+        for t in self.v_gpu.iter_mut() {
+            // 1-element placeholder convention for non-KV layers: see alloc_k_v_filtered
+            if t.numel() > 1 {
+                *t = gpu.zeros(&[v_elems], DType::F32)?;
+            }
+        }
+        // v_mode STAYS at its current value (Q8 fast start tier); only the buffer
+        // size changed.
+        Ok(())
+    }
+
     /// Adaptive-KV: re-quantize the EXISTING V cache (all written positions of
     /// every real KV layer) from the current `v_mode` to a lower `target` tier,
     /// in place. No realloc — the V buffers are floor-sized (allocated at the V
@@ -3655,6 +3715,18 @@ impl KvCache {
         self.v_mode = target;
         gpu.invalidate_for_kv_mode_switch();
         Ok(())
+    }
+
+    /// Adaptive-KV: re-quantize the EXISTING K cache to a lower tier
+    /// (`target_bits` ∈ {2,3,4}). STUB until the K transcode kernels land (plan
+    /// Task 6/7). Errors loudly so the balanced preset's K step can't silently
+    /// no-op; the V-only adaptive path (k_floor=fwht4 ⇒ no K step) never calls
+    /// this.
+    pub fn transcode_k_step(&mut self, _gpu: &mut Gpu, target_bits: u32, _n_positions: usize) -> HipResult<()> {
+        Err(hip_bridge::HipError::new(
+            0,
+            &format!("transcode_k_step(target_bits={target_bits}) not implemented yet (plan Task 6/7)"),
+        ))
     }
 
     /// Q8_0 KV cache that skips allocation for layers flagged as non-KV.
