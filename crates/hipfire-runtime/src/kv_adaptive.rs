@@ -1,5 +1,14 @@
 //! Adaptive KV: runtime VRAM-fit downshift of K/V cache precision.
 //! See docs/plans/2026-05-31-adaptive-kv-design.md.
+//!
+//! Capacity model (corrected): K and V are SEPARATE fixed-size buffers, each
+//! sized at its own floor tier (`k_buf = max_seq * nkv * k_floor_bph`,
+//! `v_buf = max_seq * nkv * v_floor_bph`). The usable token capacity at a given
+//! (cur_k, cur_v) is `min` over the two buffers of how many positions each
+//! holds at its current stride — NOT a shared pool. The shared-pool formula
+//! over-estimates capacity in lopsided states (e.g. K=fwht4 while V=q8) and
+//! would let seq_pos overflow the binding buffer. n_kv_heads cancels in each
+//! per-buffer ratio, so the caps are `max_seq * floor_bph / cur_bph`.
 use crate::llama::VMode;
 
 /// K-cache tier. Mirrors VMode for the V side. fwht4/fwht2 rotate 128-wide,
@@ -28,17 +37,25 @@ pub fn v_bytes_per_head(v: VMode, head_dim: usize) -> usize {
     }
 }
 
-/// Token capacity of the floor-sized buffer at a given (K,V) tier.
-pub fn cap_tokens(budget_bytes_per_layer: usize, n_kv_heads: usize, head_dim: usize,
-                  k: KMode, v: VMode) -> usize {
-    let per_tok = n_kv_heads * (k.bytes_per_head(head_dim) + v_bytes_per_head(v, head_dim));
-    if per_tok == 0 { 0 } else { budget_bytes_per_layer / per_tok }
+/// Per-layer byte size of the K buffer (sized at the K floor for all max_seq).
+pub fn k_buf_bytes_per_layer(max_seq: usize, n_kv_heads: usize, head_dim: usize, k_floor: KMode) -> usize {
+    max_seq * n_kv_heads * k_floor.bytes_per_head(head_dim)
 }
 
-/// Floor-sized per-layer byte budget = capacity for `max_seq` tokens at the floor.
-pub fn budget_bytes_per_layer(max_seq: usize, n_kv_heads: usize, head_dim: usize,
-                              k_floor: KMode, v_floor: VMode) -> usize {
-    max_seq * n_kv_heads * (k_floor.bytes_per_head(head_dim) + v_bytes_per_head(v_floor, head_dim))
+/// Per-layer byte size of the V buffer (sized at the V floor for all max_seq).
+pub fn v_buf_bytes_per_layer(max_seq: usize, n_kv_heads: usize, head_dim: usize, v_floor: VMode) -> usize {
+    max_seq * n_kv_heads * v_bytes_per_head(v_floor, head_dim)
+}
+
+/// Usable token capacity at (cur_k, cur_v) = min of the two SEPARATE buffers.
+/// Each buffer is sized at its floor; `cap_buffer = max_seq * floor_bph / cur_bph`
+/// (n_kv_heads cancels). The binding (smaller) buffer determines when the next
+/// downshift must fire.
+pub fn cap_min(max_seq: usize, head_dim: usize, k_floor: KMode, v_floor: VMode,
+               cur_k: KMode, cur_v: VMode) -> usize {
+    let k_cap = max_seq * k_floor.bytes_per_head(head_dim) / cur_k.bytes_per_head(head_dim);
+    let v_cap = max_seq * v_bytes_per_head(v_floor, head_dim) / v_bytes_per_head(cur_v, head_dim);
+    k_cap.min(v_cap)
 }
 
 /// One downshift step: drop ONE cache by one tier.
@@ -51,7 +68,9 @@ pub enum Preset { Conservative, Balanced, Aggressive }
 pub struct KvAdaptive {
     pub n_kv_heads: usize,
     pub head_dim: usize,
-    pub budget_bytes_per_layer: usize,
+    pub max_seq: usize,
+    pub k_floor: KMode,
+    pub v_floor: VMode,
     pub cur_k: KMode,
     pub cur_v: VMode,
     pub steps: Vec<Step>,        // ordered remaining steps
@@ -68,7 +87,8 @@ impl KvAdaptive {
         // descend V to lloyd3 first (biggest byte win up front)
         if v_floor != VMode::Q8 { s.push(Step::V(VMode::Lloyd4)); }
         if matches!(v_floor, VMode::Lloyd3 | VMode::Lloyd2) { s.push(Step::V(VMode::Lloyd3)); }
-        // K step (cheap same-width fwht4→fwht2) once V is at lloyd3
+        // K step (cheap same-width fwht4→fwht2, or fwht4→fwht3 re-rotation) once
+        // V is at lloyd3. fwht4 floor ⇒ K never downshifts (no step).
         if k_floor == KMode::Fwht2 { s.push(Step::K(KMode::Fwht2)); }
         else if k_floor == KMode::Fwht3 { s.push(Step::K(KMode::Fwht3)); }
         // final V step to the floor
@@ -88,10 +108,9 @@ impl KvAdaptive {
     /// Advanced: caller picks K and V floors independently.
     pub fn new(max_seq: usize, n_kv_heads: usize, head_dim: usize,
                k_floor: KMode, v_floor: VMode) -> Self {
-        let budget = budget_bytes_per_layer(max_seq, n_kv_heads, head_dim, k_floor, v_floor);
         let steps = Self::balanced_steps(k_floor, v_floor);
         let mut s = Self {
-            n_kv_heads, head_dim, budget_bytes_per_layer: budget,
+            n_kv_heads, head_dim, max_seq, k_floor, v_floor,
             cur_k: KMode::Fwht4, cur_v: VMode::Q8, steps, next_step: 0,
             thresholds: Vec::new(), margin: 64,
         };
@@ -99,14 +118,23 @@ impl KvAdaptive {
         s
     }
 
-    /// threshold[i] = cap(state AFTER applying steps[0..=i-1]) - margin,
-    /// i.e. the seq_pos at which we must apply steps[i] before overflowing the
-    /// cap of the CURRENT (pre-step-i) tier.
+    /// Per-layer K / V buffer byte sizes (sized at the floors).
+    pub fn k_buf_bytes_per_layer(&self) -> usize {
+        k_buf_bytes_per_layer(self.max_seq, self.n_kv_heads, self.head_dim, self.k_floor)
+    }
+    pub fn v_buf_bytes_per_layer(&self) -> usize {
+        v_buf_bytes_per_layer(self.max_seq, self.n_kv_heads, self.head_dim, self.v_floor)
+    }
+
+    /// threshold[i] = cap(state BEFORE applying steps[i]) - margin: the seq_pos
+    /// at which we must apply steps[i] before the binding buffer overflows.
+    /// Thresholds are non-decreasing (coincident when two steps relax the same
+    /// binding point — `maybe_downshift` applies all crossed steps in one call).
     fn recompute_thresholds(&mut self) {
         let mut k = KMode::Fwht4; let mut v = VMode::Q8;
         self.thresholds.clear();
         for st in &self.steps {
-            let cap = cap_tokens(self.budget_bytes_per_layer, self.n_kv_heads, self.head_dim, k, v);
+            let cap = cap_min(self.max_seq, self.head_dim, self.k_floor, self.v_floor, k, v);
             self.thresholds.push(cap.saturating_sub(self.margin));
             match *st { Step::V(nv) => v = nv, Step::K(nk) => k = nk }
         }
@@ -128,29 +156,34 @@ mod tests {
         assert_eq!(v_bytes_per_head(VMode::Lloyd2, 256), 68);
     }
     #[test]
-    fn floor_budget_gives_max_seq_at_floor() {
-        let max_seq = 1000;
-        let b = budget_bytes_per_layer(max_seq, 4, 256, KMode::Fwht2, VMode::Lloyd2);
-        assert_eq!(cap_tokens(b, 4, 256, KMode::Fwht2, VMode::Lloyd2), max_seq);
+    fn cap_at_floor_is_max_seq() {
+        // At the floor (both buffers at their floor tier) capacity == max_seq:
+        // the "max_seq = floor-tier context guarantee" contract.
+        assert_eq!(cap_min(1000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht2, VMode::Lloyd2), 1000);
+        assert_eq!(cap_min(1000, 256, KMode::Fwht4, VMode::Lloyd4, KMode::Fwht4, VMode::Lloyd4), 1000);
     }
     #[test]
-    fn cap_grows_as_precision_drops() {
-        let b = budget_bytes_per_layer(1000, 4, 256, KMode::Fwht2, VMode::Lloyd2);
-        let c_start = cap_tokens(b, 4, 256, KMode::Fwht4, VMode::Q8);
-        let c_floor = cap_tokens(b, 4, 256, KMode::Fwht2, VMode::Lloyd2);
-        assert!(c_floor > c_start * 2, "floor should fit >2x start ({c_floor} vs {c_start})");
-        // design table: start K4/q8 ≈ 0.337*max_seq
-        assert!((330..=345).contains(&c_start), "start cap {c_start}");
+    fn cap_is_min_of_two_buffers_and_v_bound_at_start() {
+        // Balanced floors (K=fwht2=68, V=lloyd2=68). Start state K4(132)/q8(272):
+        // K buffer holds 1000*68/132 = 515 positions, V buffer holds
+        // 1000*68/272 = 250 → min = 250 (V is the binding constraint at start).
+        let c_start = cap_min(1000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht4, VMode::Q8);
+        assert_eq!(c_start, 250, "start cap is V-bound = 0.25*max_seq, not the shared-pool fiction");
+        let c_floor = cap_min(1000, 256, KMode::Fwht2, VMode::Lloyd2, KMode::Fwht2, VMode::Lloyd2);
+        assert!(c_floor > c_start * 2, "floor ({c_floor}) should fit >2x start ({c_start})");
     }
     #[test]
-    fn balanced_pattern_shape() {
+    fn balanced_pattern_shape_and_thresholds() {
         let a = KvAdaptive::from_preset(Preset::Balanced, 10_000, 4, 256);
         assert_eq!(a.steps, vec![
             Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3),
             Step::K(KMode::Fwht2), Step::V(VMode::Lloyd2),
         ]);
-        // thresholds strictly increasing (each tier fits more before the next shift)
-        for w in a.thresholds.windows(2) { assert!(w[1] > w[0], "thresholds {:?}", a.thresholds); }
+        // thresholds non-decreasing (coincident allowed when steps share a
+        // binding point — here V→l3 and K→f2 both at ~0.515*max_seq).
+        for w in a.thresholds.windows(2) { assert!(w[1] >= w[0], "thresholds {:?}", a.thresholds); }
+        // first threshold is V-bound (~0.25*max_seq - margin)
+        assert!((2400..=2500).contains(&a.thresholds[0]), "first threshold {:?}", a.thresholds[0]);
     }
     #[test]
     fn conservative_only_v_to_lloyd4() {
@@ -161,5 +194,12 @@ mod tests {
     fn advanced_k_fwht3_floor() {
         let a = KvAdaptive::new(10_000, 4, 256, KMode::Fwht3, VMode::Lloyd2);
         assert!(a.steps.contains(&Step::K(KMode::Fwht3)));
+    }
+    #[test]
+    fn advanced_v_only_floor_has_no_k_step() {
+        // k_floor = fwht4 ⇒ K never downshifts; pure V chain (used by Task 5
+        // end-to-end V-only proof: advanced k=fwht4,v=lloyd2).
+        let a = KvAdaptive::new(10_000, 4, 256, KMode::Fwht4, VMode::Lloyd2);
+        assert_eq!(a.steps, vec![Step::V(VMode::Lloyd4), Step::V(VMode::Lloyd3), Step::V(VMode::Lloyd2)]);
     }
 }

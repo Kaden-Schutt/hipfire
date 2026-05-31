@@ -44,10 +44,17 @@ Both buffers are **position-major, byte-strided by the current tier's
 bytes-per-head** (confirmed in `kv_cache_write_fwht256_*.hip`:
 `out = base + pos*bytes_per_pos + h*bytes_per_head`, with
 `bytes_per_head = 4 + head_dim*bits/8`; `physical_cap` does **not** appear in V
-indexing). Therefore the **token capacity at any tier is purely derived**:
+indexing). K and V are **separate fixed-size buffers**, each allocated at its
+own floor tier (`k_buf = max_seq·n_kv_heads·k_bph(K_floor)`,
+`v_buf = max_seq·n_kv_heads·v_bph(V_floor)`). The usable token capacity at any
+tier is the **min over the two buffers** of how many positions each holds at its
+current stride (NOT a shared pool — a shared-pool formula over-estimates capacity
+in lopsided states and would overflow the binding buffer). `n_kv_heads` cancels
+in each ratio:
 
 ```
-cap(K_tier, V_tier) = budget ÷ ( n_kv_heads × (k_bph(K_tier) + v_bph(V_tier)) )
+cap(K_tier, V_tier) = min( max_seq·k_bph(K_floor)/k_bph(K_tier),
+                           max_seq·v_bph(V_floor)/v_bph(V_tier) )
 ```
 
 Bytes-per-head at head_dim=256:
@@ -94,13 +101,23 @@ KLD/coherence sweep):** keep the K/V bit-depth gap ≤ 1 tier at each stage, per
 the validated "balanced K/V beats lopsided at equal bytes" finding, and
 front-load the biggest byte win:
 
-| step | action | state (K/V) | combined B/head | cap (× max_seq) |
+Capacities below are **min-of-two-buffers** at the balanced floors (K_floor=fwht2,
+V_floor=lloyd2 ⇒ both buffers `max_seq·n_kv_heads·68 B`). A step fires when
+`seq_pos` reaches the cap of the state *before* it (minus a margin):
+
+| step | action | state (K/V) | binding | fire-at cap (× max_seq) |
 |---|---|---|---|---|
-| start | — | fwht4 / q8 | 404 | 0.337 |
-| 1 | V q8→lloyd4 (FWHT) | fwht4 / lloyd4 | 264 | 0.515 |
-| 2 | V lloyd4→lloyd3 (remap) | fwht4 / lloyd3 | 232 | 0.586 |
-| 3 | K fwht4→fwht2 (remap) | fwht2 / lloyd3 | 168 | 0.810 |
-| 4 | V lloyd3→lloyd2 (remap) | fwht2 / lloyd2 | 136 | 1.000 (floor) |
+| start | — | fwht4 / q8 | V (272 B) | 0.250 |
+| 1 | V q8→lloyd4 (FWHT) | fwht4 / lloyd4 | K=V (132) | 0.515 |
+| 2 | V lloyd4→lloyd3 (remap) | fwht4 / lloyd3 | K (132) | 0.515 |
+| 3 | K fwht4→fwht2 (remap) | fwht2 / lloyd3 | V (100) | 0.680 |
+| 4 | V lloyd3→lloyd2 (remap) | fwht2 / lloyd2 | — | 1.000 (floor) |
+
+(Steps 2 and 3 share a fire-at point of ~0.515·max_seq because once V reaches
+lloyd3 the K buffer becomes binding; `maybe_downshift` applies all crossed steps
+in one call. The shared-pool idealization in earlier drafts gave a smoother
+0.337/0.515/0.586/0.810 curve, but min-of-two is the physically correct,
+overflow-safe model.)
 
 Thresholds fall out as `cap(state) − margin`. **Presets** select floor +
 interleave:
