@@ -178,6 +178,30 @@ opt-in (global default off, same as MiniMax); without it serve uses the Plain
 ChatFrame as before. Upstream template kept verbatim at
 `crates/hipfire-arch-lfm2moe/assets/chat_template.jinja`.
 
+### Tool calls — response parsing (request side via template, response side via CLI)
+
+Tool-call **request** rendering is handled by the embedded template (tools fold
+into the system block as `List of tools: […]`; assistant calls render as
+`<|tool_call_start|>[fn(k=v)]<|tool_call_end|>`). Verified e2e: with a `get_weather`
+tool the model emits `<|tool_call_start|>[get_weather(location="Paris")]<|tool_call_end|>`.
+
+The **response** parser (`cli/index.ts:parseToolCalls`) previously recognised only
+the Qwen/Llama `<tool_call>{json}</tool_call>` shape, so LFM2's bracket-call syntax
+(and MiniMax-M2's `<minimax:tool_call><invoke name>…` XML) were passed through as
+plain content — tool calls did NOT round-trip. DeepSeek V4's DSML is unaffected (it's
+parsed daemon-side into structured `tool_calls` events). Added two format-detecting
+parsers to `parseToolCalls`:
+- **LFM2.5** `<|tool_call_start|>[ name(k=v, …), … ]<|tool_call_end|>` — depth/quote-aware
+  split of the call list + args; `parsePyValue` maps `'s'`/`"s"`/ints/`True`/`False`/
+  `None`/JSON arrays.
+- **MiniMax-M2** `<minimax:tool_call><invoke name="fn"><parameter name="k">v</parameter>…` —
+  per-`<invoke>`/`<parameter>`; values JSON-parsed (typed) with raw-string fallback,
+  matching the template's `v | tojson if v is not string else v`.
+
+8 new cases in `cli/parse_tool_calls.test.ts` (incl. the exact e2e bytes); 26/26 pass.
+Positional args and nested single-quoted Python dicts are best-effort (keyword/scalar
+args — the trained/common shape — are exact).
+
 ## PERF TUNING (gfx1201)
 
 Warm decode baseline (fresh process, `HIPFIRE_DPM_WARMUP_SECS=10`, matched full

@@ -2108,6 +2108,11 @@ async function serve(port: number, host: string) {
         // tool-call samples weighted on structured tokens; tracked in
         // MANUAL_REVIEW.md against #111.
         function parseToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
+          // Non-Qwen tool-call syntaxes the `<tool_call>{json}` parser below can't
+          // see. DeepSeek V4's DSML is parsed daemon-side and arrives as structured
+          // `tool_calls` events, so only LFM2.5 + MiniMax-M2 are handled here.
+          if (text.includes("<|tool_call_start|>")) return parseBracketCallToolCalls(text); // LFM2.5 (arch 11)
+          if (text.includes("<minimax:tool_call>")) return parseXmlInvokeToolCalls(text);   // MiniMax-M2 (arch 10)
           if (!text.includes("<tool_call>")) return { content: text, tool_calls: null };
           const pattern = /<tool_call>\s*(.*?)\s*<\/tool_call>|<tool_call>\s*(.*)/gs;
           const matches = [...text.matchAll(pattern)];
@@ -2146,6 +2151,125 @@ async function serve(port: number, host: string) {
             console.error(`[hipfire] tool_call: repaired ${repaired} malformed block(s) (MQ4 #111 stopgap)`);
           }
           const before = text.slice(0, text.indexOf("<tool_call>")).trim();
+          return { content: before || null, tool_calls };
+        }
+
+        // ── Non-Qwen tool-call parsers (LFM2.5, MiniMax-M2) ──────────────────
+        function makeCallId(): string {
+          return `call_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
+        }
+
+        // Split `s` on top-level `sep` — chars not inside (), [], {} or a quoted
+        // string. Lets us separate calls / args without tripping on commas inside
+        // nested args or string literals.
+        function splitTopLevel(s: string, sep: string): string[] {
+          const out: string[] = [];
+          let depth = 0, q: string | null = null, esc = false, cur = "";
+          for (const ch of s) {
+            if (esc) { cur += ch; esc = false; continue; }
+            if (q) {
+              cur += ch;
+              if (ch === "\\") esc = true;
+              else if (ch === q) q = null;
+              continue;
+            }
+            if (ch === "'" || ch === '"') { q = ch; cur += ch; continue; }
+            if (ch === "(" || ch === "[" || ch === "{") { depth++; cur += ch; continue; }
+            if (ch === ")" || ch === "]" || ch === "}") { depth--; cur += ch; continue; }
+            if (ch === sep && depth === 0) { out.push(cur); cur = ""; continue; }
+            cur += ch;
+          }
+          if (cur.length) out.push(cur);
+          return out;
+        }
+
+        // Index of the first top-level `=` (key/value separator), -1 if none.
+        function topLevelEq(s: string): number {
+          let depth = 0, q: string | null = null, esc = false;
+          for (let i = 0; i < s.length; i++) {
+            const ch = s[i];
+            if (esc) { esc = false; continue; }
+            if (q) { if (ch === "\\") esc = true; else if (ch === q) q = null; continue; }
+            if (ch === "'" || ch === '"') { q = ch; continue; }
+            if (ch === "(" || ch === "[" || ch === "{") depth++;
+            else if (ch === ")" || ch === "]" || ch === "}") depth--;
+            else if (ch === "=" && depth === 0) return i;
+          }
+          return -1;
+        }
+
+        // Parse a Python-ish argument value (LFM2 emits `k='v'`, `k="v"`, `k=1`,
+        // `k=True`, `k=[...]`). Try JSON first; map Python literals; else raw str.
+        function parsePyValue(v: string): any {
+          v = v.trim();
+          if (v === "True") return true;
+          if (v === "False") return false;
+          if (v === "None") return null;
+          if (v.length >= 2 && v[0] === "'" && v[v.length - 1] === "'") {
+            const body = v.slice(1, -1).replace(/\\'/g, "'").replace(/(?<!\\)"/g, '\\"');
+            try { return JSON.parse('"' + body + '"'); } catch { return v.slice(1, -1); }
+          }
+          try { return JSON.parse(v); } catch { return v; }
+        }
+
+        // LFM2.5 (arch 11): <|tool_call_start|>[ name(k=v, ...), name2(...) ]<|tool_call_end|>
+        function parseBracketCallToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
+          const startTag = "<|tool_call_start|>", endTag = "<|tool_call_end|>";
+          const si = text.indexOf(startTag);
+          const before = text.slice(0, si).trim();
+          let inner = text.slice(si + startTag.length);
+          const ei = inner.indexOf(endTag);
+          if (ei >= 0) inner = inner.slice(0, ei);
+          inner = inner.trim();
+          if (inner.startsWith("[")) inner = inner.slice(1);
+          if (inner.endsWith("]")) inner = inner.slice(0, -1);
+          const tool_calls: any[] = [];
+          for (const callStr of splitTopLevel(inner, ",").map((s) => s.trim()).filter(Boolean)) {
+            const m = callStr.match(/^([A-Za-z_][\w.]*)\s*\(([\s\S]*)\)\s*$/);
+            if (!m) continue;
+            const name = m[1];
+            const argsStr = m[2].trim();
+            const args: Record<string, any> = {};
+            let pos = 0;
+            if (argsStr) {
+              for (const partRaw of splitTopLevel(argsStr, ",")) {
+                const part = partRaw.trim();
+                if (!part) continue;
+                const eq = topLevelEq(part);
+                if (eq < 0) { args[String(pos++)] = parsePyValue(part); continue; }
+                args[part.slice(0, eq).trim()] = parsePyValue(part.slice(eq + 1));
+              }
+            }
+            tool_calls.push({ id: makeCallId(), type: "function", function: { name, arguments: JSON.stringify(args) } });
+          }
+          if (!tool_calls.length) return { content: text, tool_calls: null };
+          return { content: before || null, tool_calls };
+        }
+
+        // MiniMax-M2 (arch 10): <minimax:tool_call><invoke name="fn">
+        //   <parameter name="k">v</parameter>...</invoke>...</minimax:tool_call>
+        function parseXmlInvokeToolCalls(text: string): { content: string | null; tool_calls: any[] | null } {
+          const startTag = "<minimax:tool_call>";
+          const si = text.indexOf(startTag);
+          const before = text.slice(0, si).trim();
+          let region = text.slice(si + startTag.length);
+          const ei = region.indexOf("</minimax:tool_call>");
+          if (ei >= 0) region = region.slice(0, ei);
+          const tool_calls: any[] = [];
+          const invokeRe = /<invoke\s+name="([^"]+)"\s*>([\s\S]*?)(?:<\/invoke>|$)/g;
+          for (const im of region.matchAll(invokeRe)) {
+            const name = im[1];
+            const args: Record<string, any> = {};
+            const paramRe = /<parameter\s+name="([^"]+)"\s*>([\s\S]*?)<\/parameter>/g;
+            for (const pm of im[2].matchAll(paramRe)) {
+              const raw = pm[2].replace(/^\s*\n/, "").replace(/\n\s*$/, "").trim();
+              let val: any;
+              try { val = JSON.parse(raw); } catch { val = raw; }
+              args[pm[1]] = val;
+            }
+            tool_calls.push({ id: makeCallId(), type: "function", function: { name, arguments: JSON.stringify(args) } });
+          }
+          if (!tool_calls.length) return { content: text, tool_calls: null };
           return { content: before || null, tool_calls };
         }
 
