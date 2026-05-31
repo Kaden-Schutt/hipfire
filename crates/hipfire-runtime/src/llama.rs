@@ -3500,6 +3500,10 @@ impl KvCache {
     /// K buffers and rotation tables are untouched.
     /// Note: single-GPU only; multi-GPU V-mode wiring is deferred (plan Task 9).
     pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
+        debug_assert!(
+            self.quant_fwht || matches!(v_mode, VMode::Q8),
+            "lloyd-V requires an FWHT K mode (quant_fwht); asym/Q8 K paths read V as Q8 regardless of v_mode"
+        );
         let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
         let v_elems = (self.physical_cap * v_bpp + 3) / 4;
         for t in self.v_gpu.iter_mut() {
