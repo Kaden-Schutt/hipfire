@@ -3844,9 +3844,23 @@ impl KvCache {
         gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_fwht3_capped_filtered(
+            gpu, is_kv_layer, n_kv_heads, head_dim, max_seq_len, max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht3 — layer-filtered (skips non-KV layers) with an
+    /// explicit `physical_cap` for TriAttention/CASK eviction. Default path has
+    /// `physical_cap == max_seq_len` (no eviction). Byte layout identical to
+    /// `asym3_capped_filtered`; rotation primitive is signed-FWHT-256.
+    pub fn new_gpu_fwht3_capped_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim == 256, "fwht3 currently requires head_dim=256 (Qwen 3.5)");
         assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + (head_dim * 3) / 8;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
@@ -3986,9 +4000,22 @@ impl KvCache {
         gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
         max_seq_len: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_fwht2_capped_filtered(
+            gpu, is_kv_layer, n_kv_heads, head_dim, max_seq_len, max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht2 — layer-filtered with explicit `physical_cap`
+    /// for TriAttention/CASK eviction. Byte layout identical to
+    /// `asym2_capped`; rotation primitive is signed-FWHT-128.
+    pub fn new_gpu_fwht2_capped_filtered(
+        gpu: &mut Gpu, is_kv_layer: &[bool], n_kv_heads: usize, head_dim: usize,
+        max_seq_len: usize, physical_cap: usize,
+    ) -> HipResult<Self> {
         assert!(head_dim == 128 || head_dim == 256, "fwht2 requires head_dim=128 or 256");
         assert!(head_dim % 32 == 0);
-        let physical_cap = max_seq_len;
+        assert!(physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]");
         let kv_dim = n_kv_heads * head_dim;
         let k_bph = 4 + head_dim / 4;
         let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
@@ -5524,11 +5551,15 @@ mod tests {
 
     #[test]
     fn is_batchable_la_mq3_wmma_only() {
-        // MQ3 only batchable on archs that have a WMMA family ported.
+        // MQ3 batchable on WMMA archs (gfx11/gfx12) via the WMMA path, and on
+        // gfx10 RDNA1/2 via the scalar path (PR #298, commit 4840f0b).
         for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
-            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch}");
+            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch} (WMMA)");
         }
-        for arch in ["gfx900", "gfx906", "gfx1010", "gfx1030", "gfx942"] {
+        for arch in ["gfx1010", "gfx1011", "gfx1012", "gfx1013", "gfx1030", "gfx1031", "gfx1032"] {
+            assert!(is_batchable_la(DType::MQ3G256, arch), "MQ3 should batch on {arch} (gfx10 scalar)");
+        }
+        for arch in ["gfx900", "gfx906", "gfx942"] {
             assert!(!is_batchable_la(DType::MQ3G256, arch), "MQ3 must fall back on {arch}");
         }
     }

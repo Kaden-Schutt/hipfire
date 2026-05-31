@@ -1161,11 +1161,34 @@ pub const GEMM_HFQ4G256_MOE_GROUPED_MMQ_K4_GFX11_DGPU_SRC: &str =
 pub const GEMM_Q8_0_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_q8_0_wmma.gfx12.hip");
 
+/// Non-residual WMMA Q8_0 GEMM (RDNA3+ / gfx1100+). Generic variant
+/// using the cross-RDNA `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32`
+/// intrinsic — works on gfx1100/gfx115x/gfx1200, distinct from the
+/// gfx12-specific intrinsic used by `GEMM_Q8_0_WMMA_GFX12_SRC`. Same
+/// shape contract (Y[N, M] = X[N, K] @ A_q8[M, K]^T, K % 32 == 0).
+/// Selected by `gemm_q8_0_wmma` dispatch when the runtime arch is
+/// not gfx12.
+pub const GEMM_Q8_0_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma.hip");
+
 /// Path 2 unscatter combine for gate_up: fans Y_grouped[m_total × 2*mi]
 /// back into per-token gate_batch[N × K_TOP × mi] + up_batch[N × K_TOP
 /// × mi] via the inverse permutation in sorted_slot_index.
 pub const MOE_GATE_UP_UNSCATTER_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_gate_up_unscatter_k8.hip");
+
+/// Phase D1 (2026-05-26): fused unscatter + SwiGLU + asymmetric clamp.
+/// Replaces `MOE_GATE_UP_UNSCATTER_K8_SRC` followed by
+/// `DEEPSEEK4_SILU_MUL_CLAMP_F32_SRC` (batched) — eliminates the
+/// `moe_up_batch` intermediate buffer and saves 1 launch per layer.
+pub const MOE_UNSCATTER_SILU_CLAMP_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_unscatter_silu_clamp_k8.hip");
+
+/// 4-warp 64×64 Q8 WMMA GEMM for gfx1151 (RDNA3.5). LDS-staged X.
+/// Follows the llama.cpp MMQ pattern (pedapudi #21284) for 4× weight
+/// reuse per block vs the single-warp 16×16 kernel.
+pub const GEMM_Q8_0_WMMA_4W_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma_4w.hip");
 
 /// Path 2 combine for down: per (token, m) iterates K_TOP slots via
 /// `inverse_perm[token*K_TOP + k]`, applies topk_weights, and += into
@@ -1234,6 +1257,7 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../
 // the residual-GEMM gap on 9B prefill (42% of decode-batch GEMM time was
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
 // Pre-quantizes activations to Q8_1 + uses i8 WMMA over 128×128 tiles. Targets
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
@@ -2457,6 +2481,14 @@ pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
 
+/// Single-row argmax that writes the selected token into an on-device MTP
+/// token chain, optionally remapping through a compressed-vocab sidecar.
+pub const ARGMAX_TOKEN_CHAIN_SRC: &str = include_str!("../../../kernels/src/argmax_token_chain.hip");
+
+/// Device-side greedy MTP accept prefix scan over verify argmaxes and draft
+/// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
+pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
+
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Vision encoder kernels (ViT: GEMM, LayerNorm, GELU, bias-add)
@@ -2562,6 +2594,465 @@ pub const PFLASH_SCORE_FWHT4_KV_SRC: &str = include_str!("../../../kernels/src/p
 /// centroids). May regress NIAH needle recovery at long ctx — shipped
 /// for ablation / lower-bound study.
 pub const PFLASH_SCORE_FWHT2_KV_SRC: &str = include_str!("../../../kernels/src/pflash/score_fwht2_kv.hip");
+
+
+// ─── DeepSeek V4 Flash (arch_id=9) — kernels ─────────────────────────────────
+// All kernel sources required by the deepseek-v4-flash.mq2lloyd serving path.
+// Registered as `pub const X_SRC: &str = include_str!(...)`.
+
+/// MQ2-Lloyd MoE indexed family: routed-experts gate_up + down with
+/// device-side topk routing + per-expert pointer table. Mirrors the HFQ4
+/// MoE indexed kernels. X must be FWHT-pre-rotated by the caller.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip");
+
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip");
+
+/// Strict superset of fused_rmsnorm_mq_rotate that ALSO writes the
+/// plain (non-FWHT) RMSNormed output to a second buffer. Eliminates the
+/// follow-up rmsnorm_f32 / rmsnorm_batched launch in call sites that
+/// consume both representations (Q8/F16 GEMV reads x_plain; MQ4 GEMV
+/// reads x_rot).
+pub const FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC: &str = include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_plain.hip");
+
+/// DeepSeek V4-asymmetric-clamped variant of `fused_silu_mul_mq_rotate`. Replaces
+/// the DeepSeek V4 decode pair `deepseek4_silu_mul_clamp_f32` + `rotate_x_mq` with one
+/// launch (saves 1 launch + 8 KB intermediate write/read per layer).
+pub const V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_fused_silu_mul_clamp_mq_rotate.hip");
+
+/// MQ2-Lloyd grouped GEMM with F16 WMMA — DeepSeek V4 MoE port of the
+/// HFQ4 grouped pattern. Same scatter pipeline, codebook-lookup decode.
+/// Gated by chunk_size ≥ 256 in DeepSeek V4 dispatch (per Gate 1: tile fill
+/// crosses 50 % only above that batch size).
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip");
+
+/// 4-warp MoE-grouped MQ2-Lloyd WMMA GEMM for gfx1151 (RDNA3.5). 64-row
+/// × 16-slot tile (vs 16×16 single-warp baseline), LDS-staged X shared
+/// across 4 warps for 4× less B-fragment memory traffic per FLOP. Slot
+/// dim stays at 16 due to expert-spanning constraint.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip");
+
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip");
+
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_CND_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd.hip");
+
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2.hip");
+
+/// F16-weight × F32-input GEMV. Used for full-precision MTP weights where
+/// the WMMA F16×F16 path's F32→F16 input conversion loses precision.
+pub const GEMV_F16_XF32_SRC: &str = include_str!("../../../kernels/src/gemv_f16_xf32.hip");
+
+/// DeepSeek V4 SwiGLU with swiglu_limit clamp: silu(min(gate, L)) * clamp(up, ±L)
+/// L = swiglu_limit (DeepSeek V4 config = 10.0).
+pub const V4F_SILU_MUL_CLAMP_SRC: &str = include_str!("../../../kernels/src/deepseek4_silu_mul_clamp.hip");
+
+/// DeepSeek V4 MoE router: bias-aware top-K + normalized scaled weights, fully
+/// GPU-side. Replaces the per-layer D2H/CPU/H2D round-trip.
+pub const V4F_MOE_TOPK_BIAS_AWARE_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_moe_topk_bias_aware.hip");
+
+// ─── DeepSeek V4 Flash (arch_id=7) — stub kernels ────────────────────────────
+// All five are functional-stub implementations whose API contract is the
+// signature; bodies are placeholder reference impls until DeepSeek V4 forward
+// bring-up lands optimised versions. See `docs/plans/deepseek4-phase{2,3,4}-*.md`.
+//
+// Phase 2 — Compressed-KV indexer:
+pub const INDEXER_COMPRESSED_K_SCORE_SRC: &str =
+    include_str!("../../../kernels/src/indexer_compressed_k_score.hip");
+
+pub const INDEXER_TOP_K_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k.hip");
+
+pub const INDEXER_TOP_K_BUF_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_buf.hip");
+
+pub const INDEXER_KV_GATHER_SRC: &str =
+    include_str!("../../../kernels/src/indexer_kv_gather.hip");
+
+// Phase 3 — Hyper-Connections:
+pub const HC_COMPUTE_CONTROL_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control.hip");
+
+pub const HC_SINKHORN_4X4_SRC: &str =
+    include_str!("../../../kernels/src/hc_sinkhorn_4x4.hip");
+
+pub const HC_MIX_4STREAM_SRC: &str =
+    include_str!("../../../kernels/src/hc_mix_4stream.hip");
+
+pub const HC_INPUT_MAP_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map.hip");
+
+pub const HC_APPLY_ALPHA_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha.hip");
+
+pub const SQRT_SOFTPLUS_F32_SRC: &str =
+    include_str!("../../../kernels/src/sqrt_softplus_f32.hip");
+
+pub const V4F_ATTN_POS0_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_pos0.hip");
+
+pub const V4F_ATTN_SWA_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa.hip");
+
+/// HIP-graphs-safe twin of `deepseek4_attn_swa`: reads `n_valid` from a
+/// device buffer instead of an i32 kernarg.
+pub const V4F_ATTN_SWA_BUF_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_buf.hip");
+
+/// DeepSeek V4 mHC pre+post sigmoid/scale fusion — replaces 3 element-wise
+/// launches (sigmoid(pre), sigmoid(post), scale(post)) with 1.
+pub const HC_PRE_POST_SIGMOID_SCALE_SRC: &str =
+    include_str!("../../../kernels/src/hc_pre_post_sigmoid_scale.hip");
+
+/// HIP-graphs-safe twin of compressor_softmax_pool_f32: reads
+/// destination slot from a device buffer; early-returns on slot < 0
+/// (so captured graph can include the commit kernels at every replay
+/// while host gates on `commit_slot >= 0` only at actual commit positions).
+pub const COMPRESSOR_SOFTMAX_POOL_BUF_SRC: &str =
+    include_str!("../../../kernels/src/compressor_softmax_pool_buf.hip");
+
+/// HIP-graphs-safe in-place RMSNorm at slot `slot_buf[0]` of a base
+/// buffer; -1 sentinel → no-op. Twin of `rmsnorm_f32(kv_cache.sub_offset(slot*n, n))`.
+pub const RMSNORM_AT_SLOT_BUF_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_at_slot_buf.hip");
+
+/// DeepSeek V4 hash-routed MoE: GPU-side tid2eid lookup + score normalize +
+/// route_scale multiply. Replaces the d2h+host+h2d round-trip in
+/// `ffn_hash_routed` for hash-layered MoE dispatch.
+pub const HASH_ROUTER_NORMALIZE_SRC: &str =
+    include_str!("../../../kernels/src/hash_router_normalize_f32.hip");
+
+/// HIP-graphs-safe twin of `HASH_ROUTER_NORMALIZE_SRC` — reads
+/// `token_id` from a device buffer so the captured graph re-reads
+/// it on every replay.
+pub const HASH_ROUTER_NORMALIZE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/hash_router_normalize_f32_buf.hip");
+
+/// Batched variant for the prefill `ffn_batched` hash-routed path:
+/// per-batch tid2eid lookup + score gather + normalize + route_scale,
+/// in one launch — eliminates the d2h(scores)+CPU+h2d round-trip per
+/// hash-routed layer per chunk.
+pub const HASH_ROUTER_NORMALIZE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hash_router_normalize_f32_batched.hip");
+
+/// HIP-graphs-safe in-place YaRN-aware tail RoPE at slot `slot_buf[0]` of a
+/// base buffer; -1 sentinel → no-op. Single-tensor (n_heads_q=1, n_heads_k=0).
+/// Pass freq_scale=1.0, ext_factor=0.0 to recover plain rope_tail_interleaved.
+pub const ROPE_TAIL_YARN_INTERLEAVED_AT_SLOT_BUF_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved_at_slot_buf.hip");
+
+/// HIP-graphs-safe ring write: src[proj_dim] → state[slot*proj_dim..]
+/// with slot from `ring_slot_buf[0]`. Twin of the per-position
+/// `memcpy_dtod_auto` writes in compressor_forward_impl.
+pub const STATE_RING_WRITE_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_ring_write_f32_buf.hip");
+
+/// HIP-graphs-safe overlap-shift: state[:ratio*proj_dim] = state[ratio*proj_dim:].
+/// Gated by `commit_slot_buf[0] >= 0` so captured graphs only fire it on
+/// commit positions. Twin of the post-commit memcpy_dtod_auto state shift.
+pub const STATE_OVERLAP_SHIFT_F32_BUF_SRC: &str =
+    include_str!("../../../kernels/src/state_overlap_shift_f32_buf.hip");
+
+/// HIP-graphs-safe twin of `deepseek4_attn_swa_topk_f32`: reads `n_valid_swa`
+/// + `n_active_topk` from device buffers.
+pub const V4F_ATTN_SWA_TOPK_BUF_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_buf.hip");
+
+/// HIP-graphs-safe twin of `deepseek4_topk_kv_gather_f32`: reads K + N_compressed
+/// from device buffers. Launch with fixed grid = MAX_K; lanes beyond K
+/// early-return.
+pub const V4F_TOPK_KV_GATHER_BUF_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_buf.hip");
+
+/// HIP-graphs-safe twin of `deepseek4_topk_kv_gather_identity_f32`.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_identity_buf.hip");
+
+/// HIP-graphs-safe variant of swa_ring_write_f32: reads `slot` from a
+/// device buffer instead of an i32 kernarg, so the captured kernel
+/// picks up new positions on each replay without re-capture.
+pub const SWA_RING_WRITE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write_buf.hip");
+
+/// Tail-only RoPE, INTERLEAVED pair convention (DeepSeek V4 upstream's
+/// `torch.view_as_complex` variant, distinct from HF rotate_half).
+pub const ROPE_TAIL_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved.hip");
+
+/// YaRN-aware tail-only RoPE for compressed-layer attention (DeepSeek V4).
+/// Adds per-call freq_scale / ext_factor / attn_factor / corr_dims to
+/// match antirez/ds4 rope_tail_ext_inplace. For dense (uncompressed)
+/// layers, caller passes ext_factor=0 to disable YaRN — math collapses
+/// to standard RoPE.
+pub const ROPE_TAIL_YARN_INTERLEAVED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved.hip");
+
+/// Tail-only RoPE — BATCHED (Phase B2, 2026-05-18). Per-batch positions
+/// from a device array; rotation on the LAST n_rot dims of each head.
+pub const ROPE_TAIL_INTERLEAVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_interleaved_batched.hip");
+
+/// YaRN-aware tail RoPE — BATCHED (Phase B2, 2026-05-18). Batched twin
+/// of ROPE_TAIL_YARN_INTERLEAVED_SRC.
+pub const ROPE_TAIL_YARN_INTERLEAVED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_tail_yarn_interleaved_batched.hip");
+
+/// HC control-vector — BATCHED (Phase B2, 2026-05-18). Per-batch dot
+/// of streams[b] against the shared `hc_fn` weight + rsqrt mean + base.
+pub const HC_COMPUTE_CONTROL_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_compute_control_batched.hip");
+
+/// HC α-scaling post-step — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// in-place rescale of c[b, 0..24] using the shared 3-segment α + base.
+pub const HC_APPLY_ALPHA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_apply_alpha_batched.hip");
+
+/// HC Sinkhorn 4×4 — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// independent Sinkhorn iterations on each 4×4 matrix slot.
+pub const HC_SINKHORN_4X4_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_sinkhorn_4x4_batched.hip");
+
+/// HC split/finalize — BATCHED (Phase B2, 2026-05-18). Splits the
+/// post-α-rescale c[B, 24] into contiguous pre/post/comb buffers with
+/// sigmoid + scale already applied. Avoids strided sigmoid_f32 calls.
+pub const HC_SPLIT_FINALIZE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_split_finalize_batched.hip");
+
+/// SWA visibility staging — BATCHED (Phase B2, 2026-05-18). Per batch
+/// position b at absolute position start_pos+b: builds the visibility
+/// window from the pre-chunk SWA ring + within-chunk KV. Output feeds
+/// deepseek4_attn_swa_topk_batched / deepseek4_attn_swa_batched.
+pub const SWA_VISIBILITY_STAGE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/swa_visibility_stage_batched.hip");
+
+/// DeepSeek V4 top-K K/V gather — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// top-K gather from the shared main compressed-K cache into a
+/// `[B, head_dim, out_stride]` buffer fed to deepseek4_attn_swa_topk_batched.
+pub const V4F_TOPK_KV_GATHER_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_batched.hip");
+
+/// DeepSeek V4 indexer score — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// score against the shared compressed-K cache.
+pub const INDEXER_RELU_SCORE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_batched.hip");
+
+/// DeepSeek V4 indexer score — WMMA-accelerated BATCHED (Phase C1,
+/// 2026-05-26). Replaces the F32 scalar one-thread-per-head baseline
+/// with a 16×16×16 WMMA tile of Q·K^T per warp; 4 warps cover the
+/// 64-head reduction in LDS.
+pub const INDEXER_RELU_SCORE_WMMA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_wmma_batched.hip");
+
+/// Wider-N Q8 WMMA: 16×64 output tile instead of 16×16, 4× weight
+/// reuse per block. Same single-warp wave32 structure as
+/// `gemm_q8_0_wmma`, but each K-step issues 4 back-to-back WMMA tiles
+/// sharing one A (weight) fragment. Lands the structural lever
+/// identified in llama.cpp issue 21284 (pedapudi) — the "wider tile"
+/// gfx1151 prefill optimisation.
+pub const GEMM_Q8_0_WMMA_X64_SRC: &str =
+    include_str!("../../../kernels/src/gemm_q8_0_wmma_x64.hip");
+
+/// SWA ring write — BATCHED (Phase B2, 2026-05-18). Advances the ring
+/// at chunk end to include all B positions. Slot = (start_pos+b) % win.
+pub const SWA_RING_WRITE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/swa_ring_write_batched.hip");
+
+/// DeepSeek V4 identity gather — BATCHED (Phase B2, 2026-05-18). For ratio=128
+/// layers that lack an indexer: copies kv_cache[0..K, :] into every
+/// batch row's slab.
+pub const V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_topk_kv_gather_identity_batched.hip");
+
+/// DeepSeek V4 per-group O-LoRA batched GEMV — F32 (Phase B2, 2026-05-18).
+/// Block-diagonal: wo_a[G, M, K] @ x_in[B, G, K] → y_out[B, G, M].
+pub const WO_PER_GROUP_BATCHED_F32_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_f32.hip");
+
+/// DeepSeek V4 per-group O-LoRA batched GEMV for HFQ4G256-packed wo_a.
+/// Single launch in place of B × G separate gemv_mq4g256_prerotated calls.
+/// Collapses ~11k dispatch calls/chunk down to 43 in the DeepSeek V4 prefill path.
+pub const WO_PER_GROUP_BATCHED_HFQ4G256_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_hfq4g256.hip");
+
+/// DeepSeek V4 per-group O-LoRA batched GEMV for Q8_0-packed wo_a (Phase D,
+/// 2026-05-21). Sibling of `wo_per_group_batched_hfq4g256` for the
+/// deepseek4-mq2lloyd-q8 build where wo_a is Q8_0. Single launch in place of
+/// B × G `gemv_q8_0` calls — collapses ~32k per-chunk dispatches.
+pub const WO_PER_GROUP_BATCHED_Q8_0_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0.hip");
+
+/// Multi-row Q8_0 variant (Lever 1). Same contract as the single-row
+/// `wo_per_group_batched_q8_0` but with block processing R output rows
+/// and hoisting x loads across rows. Grid = [ceil(M/R), B, G].
+pub const WO_PER_GROUP_BATCHED_Q8_0_MULTIROW_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_multirow.hip");
+
+/// MMQ-style preload variant of the 4-warp MoE grouped MQ2-Lloyd kernel.
+/// Pre-loads all 8 index packs per K-group before the inner loop so the
+/// hardware prefetcher starts on the second cache line earlier.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.hip");
+
+/// Barrier-free variant of the mmqload kernel. Eliminates __syncthreads()
+/// and LDS X staging. Each wave loads X directly from global memory.
+pub const GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip");
+
+/// WMMA Q8_0 GEMM for DeepSeek V4 O-LoRA's strided `[B, G, *]` layout.
+pub const WO_PER_GROUP_BATCHED_Q8_0_WMMA_4W_SRC: &str =
+    include_str!("../../../kernels/src/wo_per_group_batched_q8_0_wmma_4w.hip");
+
+/// DeepSeek V4 MoE router top-K — BATCHED (Phase B2, 2026-05-18). Per-batch
+/// bias-aware top-K + normalize + route_scale, one block per batch row.
+pub const V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_moe_topk_bias_aware_batched.hip");
+
+/// WMMA F16 × F16 → F32 GEMM with (B, M) output layout.
+/// Replaces gemm_f32_register_tiled for DeepSeek V4 compressor when weights
+/// stay F16 on device. Targets gfx1100+ wave32 WMMA.
+pub const GEMM_F16_X_F16_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f16_x_f16_wmma.hip");
+
+/// Bulk F32→F16 conversion for staging WMMA activations. Named
+/// `deepseek4_convert_f32_to_f16` to avoid collision with the embedded
+/// `convert_f32_to_f16` helper in `GEMM_HFQ4G256_RESIDUAL_FP16_SRC`
+/// (different ABI: block=256, int n). See `gpu.deepseek4_convert_f32_to_f16`
+/// for the DeepSeek V4 dispatcher.
+pub const V4F_CONVERT_F32_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_convert_f32_to_f16.hip");
+
+/// WMMA HFQ4G256 weight × F16 input → F32 output GEMM with (B, M)
+/// output layout. Drop-in for `gemm_hfq4g256` (scalar FMA path).
+pub const GEMM_HFQ4G256_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/gemm_hfq4g256_wmma.hip");
+
+/// DeepSeek V4 compressor batched ALIGNED compress events. Replaces the
+/// 3-kernel per-event chain (overlap_concat × 2 + softmax_pool)
+/// with a single launch over N_events. Handles both overlap=true
+/// (ratio=4) and overlap=false (ratio=128) cases.
+pub const COMPRESSOR_COMPRESS_ALIGNED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_compress_aligned_batched.hip");
+
+/// DeepSeek V4 compressor batched ring-buffer write. Replaces B per-position
+/// memcpy_dtod calls with a single scatter kernel.
+pub const COMPRESSOR_RING_WRITE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_ring_write_batched.hip");
+
+/// DeepSeek V4 compressor per-slot APE add over batched score buffer.
+/// Mirrors the per-position add inside `compressor_forward_impl` so that
+/// the batched-prefill compress path produces the same kv_cache entries
+/// as the sequential per-position path.
+pub const COMPRESSOR_ADD_APE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/compressor_add_ape_batched.hip");
+
+/// K4-unrolled batched MoE gate_up for MQ2-Lloyd (Phase 1, 2026-05-19).
+/// 4 independent accumulators per thread for ILP; mirrors qwen35's
+/// HFQ4 K4 unroll. Drop-in replacement for
+/// gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched with FMA-order
+/// epsilon drift.
+pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip");
+
+/// DeepSeek V4 MoE down — POSITION-BATCHED MQ2-Lloyd indexed GEMV with K4-unrolled
+/// accumulator and scaled residual atomicAdd. Sibling of qwen35's HFQ4 K4
+/// unroll. Drop-in replacement for
+/// gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_batched with
+/// FMA-order epsilon drift.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip");
+
+/// DeepSeek V4 head HC mix — compute per-stream pre weights for the final
+/// 4-stream → hidden projection before lm_head.
+pub const HC_HEAD_COMPUTE_PRE_SRC: &str =
+    include_str!("../../../kernels/src/hc_head_compute_pre.hip");
+
+/// DeepSeek V4 Compressor softmax-weighted pool along window dim.
+/// Used in Compressor.forward when should_compress fires every
+/// `ratio` steps, to produce a single compressed KV vector from
+/// T accumulated step values.
+pub const COMPRESSOR_SOFTMAX_POOL_SRC: &str =
+    include_str!("../../../kernels/src/compressor_softmax_pool.hip");
+
+/// DeepSeek V4 Compressor overlap-transform concat. Builds the [2*ratio,
+/// head_dim] view for compression from the [2*ratio, 2*head_dim]
+/// kv_state / score_state buffer (overlap=true, ratio=4 case).
+pub const COMPRESSOR_OVERLAP_CONCAT_SRC: &str =
+    include_str!("../../../kernels/src/compressor_overlap_concat.hip");
+
+pub const INDEXER_RELU_SCORE_BUF_SRC: &str =
+    include_str!("../../../kernels/src/indexer_relu_score_buf.hip");
+
+/// DeepSeek V4 batched indexer-extended SWA attention (Phase A1, 2026-05-18).
+/// Processes B query positions in parallel via grid dim Y. Each batch
+/// position has its own SWA / top-K K/V slices and valid-count scalars.
+pub const V4F_ATTN_SWA_TOPK_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_batched.hip");
+
+/// DeepSeek V4 SWA + indexer top-K attention, direct main-KV variant.
+pub const V4F_ATTN_SWA_TOPK_DIRECT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_topk_direct_batched.hip");
+
+/// DeepSeek V4 batched pure-SWA attention (Phase A2, 2026-05-18). Twin of
+/// `V4F_ATTN_SWA_TOPK_BATCHED_SRC` for layers without an indexer top-K
+/// path. Same launch shape and byte-equality contract at batch=1.
+pub const V4F_ATTN_SWA_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_batched.hip");
+
+/// DeepSeek V4 batched indexer top-K (Phase A3, 2026-05-18). Per (batch, head)
+/// pair selects the top-K position indices from a score array. Grid
+/// extends to `[n_idx_heads, batch, 1]`. Byte-identical to the
+/// sequential indexer_top_k at batch=1.
+pub const INDEXER_TOP_K_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/indexer_top_k_batched.hip");
+
+/// HC 4-stream residual mix — BATCHED (Phase A5, 2026-05-18). Twin of
+/// HC_MIX_4STREAM_SRC; batch dim parallelizes cleanly across blockIdx.z.
+pub const HC_MIX_4STREAM_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_mix_4stream_batched.hip");
+
+/// HC input mapping — BATCHED (Phase A5, 2026-05-18). Twin of
+/// HC_INPUT_MAP_SRC; batch dim parallelizes cleanly across blockIdx.y.
+pub const HC_INPUT_MAP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_input_map_batched.hip");
+
+/// Broadcast batched embedding rows into the 4 HC residual streams
+/// (Phase B2, 2026-05-18). Replaces the per-token loop of memcpys.
+pub const HC_STREAMS_INIT_FROM_EMBED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/hc_streams_init_from_embed_batched.hip");
+
+
+
+/// Debug-instrumented twin of deepseek4_attn_swa_batched. Same compute; also
+/// writes max_score / sum_exp per (h, b) into per-block scratch buffers
+/// for bisecting non-determinism inside the kernel.
+pub const V4F_ATTN_SWA_BATCHED_DEBUG_SRC: &str =
+    include_str!("../../../kernels/src/deepseek4_attn_swa_batched_debug.hip");
+
+/// Register-tiled F32 batched GEMM (Phase B2 perf, 2026-05-18).
+/// Each block holds BATCH_TILE=8 accumulators in registers and reuses
+/// each loaded weight tile across them — amortizes weight bandwidth.
+/// Replaces gemm_f32_batched for prefill paths.
+pub const GEMM_F32_REGISTER_TILED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_f32_register_tiled.hip");
+
+
+/// Atomic-free MQ2-Lloyd K4 MoE down kernel — writes [N × K_TOP × M]
+/// f32 with no atomicAdd contention. Pair with `moe_down_combine_k8_batched`
+/// to fold K_TOP outputs into x_residual deterministically. Required by
+/// the DeepSeek V4 MTP spec-decode draft/verify path: with the standard
+/// non-deterministic K4 MoE-down, atomicAdd FP-reduction-order variance
+/// between draft and verify passes makes top1 drift, causing spurious
+/// rejection (~38% accept). Deterministic path is bit-reproducible →
+/// matches memory-cited 84% accept on K=3.
+pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip");
 
 /// ParoQuant Givens rotation: apply learned pairwise rotations + channel scaling
 /// to activations in-place. Called before each ParoQ4G128 GEMV.

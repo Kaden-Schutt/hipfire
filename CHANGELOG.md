@@ -1,6 +1,41 @@
 # Changelog
 
-## v0.2.0 — tokenizer interned symbols + loud OOV at construction
+## v0.2.0 — DeepSeek V4 Flash + tokenizer diagnostics
+
+DeepSeek V4 Flash is now a first-class hipfire architecture (`arch_id=9`).
+The new `hipfire-arch-deepseek4` crate wires the production
+`deepseek-v4-flash.mq2lloyd` path through the canonical daemon and CLI
+surface: `hipfire-quantize` → `hipfire serve` → `hipfire run`, with no Python
+in the hot path.
+
+### DeepSeek V4 Flash
+
+- New architecture crate: config parsing, weight loading, runtime state,
+  prefill/decode, and MTP speculative decode live under
+  `crates/hipfire-arch-deepseek4/`.
+- New DeepSeek V4 kernel surface: sliding-window attention, compressed-KV
+  indexer, Hyper-Connections, compressor/indexer projections, MQ2-Lloyd MoE
+  GEMVs, tail-only YaRN RoPE, and glue kernels.
+- New quantizer formats for DeepSeek V4 source / Q8 / Q8+MTP packaging, plus
+  `hfq_split` for moving `mtp.0.*` tensors into an optional sidecar so normal
+  decode does not upload the extra MTP layer.
+- Daemon support for `arch_id=9` includes batched prefill, deterministic
+  routing defaults, plain decode, and MTP speculative decode controlled by
+  `HIPFIRE_DEEPSEEK4_SPEC_DECODE`, `HIPFIRE_DEEPSEEK4_SPEC_K`, and
+  `HIPFIRE_DEEPSEEK4_MTP_ADDON`.
+- Tool-call output works on both plain decode and the DeepSeek MTP path: the
+  daemon emits `tool_calls` events with `finish_reason: "tool_calls"` instead
+  of leaking raw DSML/tool-call text.
+
+Validated on gfx1151 / Radeon 8060S with `HIP_VISIBLE_DEVICES=1`:
+
+- `cargo test -p hipfire-arch-deepseek4 --lib`
+- `cargo check -p hipfire-arch-deepseek4 --examples`
+- `cargo check --workspace --examples`
+- `./scripts/coherence-gate.sh --full`
+- `./scripts/coherence-gate-deepseek4-mtp.sh --full`
+
+### Tokenizer interned symbols + loud OOV at construction
 
 `Tokenizer::from_*` constructors now return `Result<Self, TokenizerError>`
 instead of `Option<Self>`. Inconsistent vocab/merges pairs (e.g. truncated

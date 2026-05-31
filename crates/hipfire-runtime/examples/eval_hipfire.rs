@@ -76,8 +76,8 @@ fn main() {
             "--output" => { output = Some(PathBuf::from(&argv[i + 1])); i += 2; }
             "--kv-mode" => {
                 let v = argv[i + 1].clone();
-                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4") {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 (got {v})");
+                if !matches!(v.as_str(), "q8" | "asym2" | "asym3" | "asym4" | "fwht2" | "fwht3" | "fwht4") {
+                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -237,6 +237,13 @@ fn main() {
 
     // -------- KV cache + DeltaNet state + scratch --------
     let kv_max = n_ctx + 16;
+    // FWHT KV modes only have layer-filtered ctors; build the FA-layer mask
+    // from layer_types. Filtering is KLD-neutral (DeltaNet layers never read KV).
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == qwen35::LayerType::FullAttention)
+        .collect();
     let mut kv_cache = match args.kv_mode.as_str() {
         "q8" => KvCache::new_gpu_q8(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
@@ -249,6 +256,15 @@ fn main() {
         ).unwrap(),
         "asym2" => KvCache::new_gpu_asym2(
             &mut gpu, config.n_layers, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "fwht4" => KvCache::new_gpu_fwht4_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
+        ).unwrap(),
+        "fwht2" => KvCache::new_gpu_fwht2_filtered(
+            &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max
         ).unwrap(),
         other => panic!("unknown --kv-mode: {other}"),
     };

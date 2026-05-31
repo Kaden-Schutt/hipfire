@@ -11,6 +11,14 @@
 //!                 [--max 64] [--ctx 4096] [--temp 0.0] [--max-n 4]
 //!                 [--no-chatml]
 
+// MERGE-REVIEW(mtp_only_demo): took OUR multi-GPU/hetero demo wholesale for all 5
+// conflict hunks (adds --mtp-device, head_load_gpu, hetero drafter_state, and the
+// spec_step_mtp_compressed_serial_hetero dispatch — our unique value). #352 added a
+// `--trunk-spine` demo flag + spec_step_mtp_trunk_spine dispatch to THIS example;
+// that demo wiring is DROPPED here (the real spec_step_mtp_trunk_spine fn still
+// exists in mtp_spec.rs and is reachable via the daemon). Re-add the demo flag by
+// hand if the standalone example needs to exercise trunk-spine.
+
 #[cfg(not(feature = "deltanet"))]
 fn main() {
     eprintln!("build with --features deltanet");
