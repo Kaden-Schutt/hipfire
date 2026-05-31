@@ -23811,15 +23811,15 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
 
-    /// Fused K+V write for fwht4: K at signed-FWHT-rotated 4-bit, V at Q8_0.
-    /// Byte-identical storage to asym4_fused — only the K-write kernel differs.
+    /// Fused K+V write for fwht4: K at signed-FWHT-rotated 4-bit, V at Q8_0 or lloyd2/3/4.
     /// `signs1` and `signs2` are 128-element FP32 ±1 vectors (occupy the same
     /// `givens_cos`/`givens_sin` slots on KvCache when `quant_fwht == true`).
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht4_fused(
         &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
         signs1: &GpuTensor, signs2: &GpuTensor,
-        n_kv_heads: usize, head_dim: usize,
+        n_kv_heads: usize, head_dim: usize, v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -23853,8 +23853,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 )?;
             }
         }
-        // V: standard Q8_0 (same as asym4)
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_write_v_by_mode(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim, v_mode_bits)
     }
 
     /// Fused K+V write for asym3: K at 3-bit rotated (RotorQuant "planar3"), V at Q8_0.
@@ -23988,8 +23987,210 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
-    /// Fused K+V write for fwht3: K at signed-FWHT-256 rotated 3-bit, V at Q8_0 or lloyd3.
-    /// Pass v_mode_bits=3 to write V with the fwht3 kernel (lloyd3-V); otherwise V is Q8_0.
+    /// Launch the fwht2 rotated-centroid write kernel on an arbitrary KV buffer.
+    /// Used for K (always) and for V when v_mode == Lloyd2.
+    pub fn kv_cache_write_fwht2_vec(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht2",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_SRC,
+            "kv_cache_write_asym_k_fwht2",
+        )?;
+        let func = &self.functions["kv_cache_write_asym_k_fwht2"];
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+                self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Batched variant: launch `kv_cache_write_asym_k_fwht2_batched` on an arbitrary buffer.
+    /// Used for V when v_mode == Lloyd2 in the batched write path.
+    pub fn kv_cache_write_fwht2_vec_batched(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht2_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT2_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht2_batched",
+        )?;
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_asym_k_fwht2_batched",
+            [n_kv_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
+                b.push_ptr(s1p); b.push_ptr(s2p);
+                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    /// Launch the fwht4 rotated-centroid write kernel on an arbitrary KV buffer.
+    /// Used for K (always) and for V when v_mode == Lloyd4.
+    pub fn kv_cache_write_fwht4_vec(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht4",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_SRC,
+            "kv_cache_write_asym_k_fwht4",
+        )?;
+        let func = &self.functions["kv_cache_write_asym_k_fwht4"];
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = pos_buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, 1, 1], [32, 1, 1], shared_mem,
+                self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Batched variant: launch `kv_cache_write_asym_k_fwht4_batched` on an arbitrary buffer.
+    /// Used for V when v_mode == Lloyd4 in the batched write path.
+    pub fn kv_cache_write_fwht4_vec_batched(
+        &mut self, dst: &GpuTensor, src: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_cache_write_asym_k_fwht4_batched",
+            kernels::KV_CACHE_WRITE_ASYM_K_FWHT4_BATCHED_SRC,
+            "kv_cache_write_asym_k_fwht4_batched",
+        )?;
+        let mut kdp = dst.buf.as_ptr();
+        let mut ksp = src.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kdp as *mut _ as *mut c_void,
+            &mut ksp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        self.launch_maybe_blob(
+            "kv_cache_write_asym_k_fwht4_batched",
+            [n_kv_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kdp); b.push_ptr(ksp); b.push_ptr(pp);
+                b.push_ptr(s1p); b.push_ptr(s2p);
+                b.push_i32(nkv); b.push_i32(hd); b.push_i32(bs);
+                b
+            },
+        )
+    }
+
+    /// Write the V buffer in the layout selected by `v_mode_bits` (8 = Q8_0;
+    /// 2/3/4 = FWHT-rotated centroid, reusing the matching K fwht kernel).
+    fn kv_write_v_by_mode(
+        &mut self, v_dst: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize, v_mode_bits: i32,
+    ) -> HipResult<()> {
+        match v_mode_bits {
+            2 => self.kv_cache_write_fwht2_vec(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim),
+            3 => self.kv_cache_write_fwht3_vec(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim),
+            4 => self.kv_cache_write_fwht4_vec(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim),
+            _ => self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim),
+        }
+    }
+
+    /// Batched V-write selector: picks the batched V writer by `v_mode_bits`.
+    fn kv_write_v_by_mode_batched(
+        &mut self, v_dst: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor, n_kv_heads: usize, head_dim: usize,
+        batch_size: usize, v_mode_bits: i32,
+    ) -> HipResult<()> {
+        match v_mode_bits {
+            2 => self.kv_cache_write_fwht2_vec_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size),
+            3 => self.kv_cache_write_fwht3_vec_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size),
+            4 => self.kv_cache_write_fwht4_vec_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size),
+            _ => self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size),
+        }
+    }
+
+    /// Fused K+V write for fwht3: K at signed-FWHT-256 rotated 3-bit, V at Q8_0 or lloyd2/3/4.
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht3_fused(
         &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
@@ -23998,11 +24199,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.kv_cache_write_fwht3_vec(k_dst, k_src, pos_buf, signs1, signs2, n_kv_heads, head_dim)?;
-        if v_mode_bits == 3 {
-            self.kv_cache_write_fwht3_vec(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim)
-        } else {
-            self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
-        }
+        self.kv_write_v_by_mode(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim, v_mode_bits)
     }
 
     /// Shared helper: launch a batched K-only rotated write kernel.
@@ -24212,15 +24409,16 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
-    /// Batched K+V write for fwht4 (K FWHT-rotated 4-bit + V Q8_0).
+    /// Batched K+V write for fwht4 (K FWHT-rotated 4-bit + V Q8_0 or lloyd2/3/4).
     /// Same launch geometry as asym4_batched; only the kernel name + sign-vector
     /// param semantics differ.
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht4_batched(
         &mut self,
         k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
         signs1: &GpuTensor, signs2: &GpuTensor,
-        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize, v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_k_batched(
@@ -24230,7 +24428,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             k_dst, k_src, positions, signs1, signs2,
             n_kv_heads, head_dim, batch_size,
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_write_v_by_mode_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, v_mode_bits)
     }
 
     /// Batched K+V write for asym2 (K 2-bit rotated + V Q8_0).
@@ -24252,13 +24450,14 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
-    /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
+    /// Batched K+V write for fwht2 (K FWHT-rotated 2-bit + V Q8_0 or lloyd2/3/4).
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht2_batched(
         &mut self,
         k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, positions: &GpuTensor,
         signs1: &GpuTensor, signs2: &GpuTensor,
-        n_kv_heads: usize, head_dim: usize, batch_size: usize,
+        n_kv_heads: usize, head_dim: usize, batch_size: usize, v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_k_batched(
@@ -24268,7 +24467,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             k_dst, k_src, positions, signs1, signs2,
             n_kv_heads, head_dim, batch_size,
         )?;
-        self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
+        self.kv_write_v_by_mode_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, v_mode_bits)
     }
 
     /// Batched flash attention for asym4 (K 4-bit rotated + V Q8_0).
@@ -24458,8 +24657,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
-    /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0 or lloyd3).
-    /// Pass v_mode_bits=3 to write V with the fwht3 kernel (lloyd3-V); otherwise V is Q8_0.
+    /// Batched K+V write for fwht3 (K FWHT-rotated 3-bit + V Q8_0 or lloyd2/3/4).
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht3_batched(
         &mut self,
         k_dst: &GpuTensor, v_dst: &GpuTensor,
@@ -24469,11 +24668,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.kv_cache_write_fwht3_vec_batched(k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size)?;
-        if v_mode_bits == 3 {
-            self.kv_cache_write_fwht3_vec_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size)
-        } else {
-            self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
-        }
+        self.kv_write_v_by_mode_batched(v_dst, v_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, v_mode_bits)
     }
 
     /// Batched flash attention for asym3 KV.
@@ -24800,12 +24995,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
     }
 
-    /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0.
+    /// Fused K+V write for fwht2: K at FWHT-rotated 2-bit, V at Q8_0 or lloyd2/3/4.
+    /// v_mode_bits selects V layout: 8=Q8_0, 2/3/4=lloyd (FWHT-rotated centroid).
     pub fn kv_cache_write_fwht2_fused(
         &mut self, k_dst: &GpuTensor, v_dst: &GpuTensor,
         k_src: &GpuTensor, v_src: &GpuTensor, pos_buf: &DeviceBuffer,
         signs1: &GpuTensor, signs2: &GpuTensor,
-        n_kv_heads: usize, head_dim: usize,
+        n_kv_heads: usize, head_dim: usize, v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_givens4_kernel(
@@ -24839,7 +25035,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 )?;
             }
         }
-        self.kv_cache_write_q8_0(v_dst, v_src, pos_buf, n_kv_heads, head_dim)
+        self.kv_write_v_by_mode(v_dst, v_src, pos_buf, signs1, signs2, n_kv_heads, head_dim, v_mode_bits)
     }
 
     /// Flash attention for asym4 KV (K at rotated 4-bit, V at Q8_0 normal space).

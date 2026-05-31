@@ -1078,7 +1078,7 @@ pub fn mtp_head_forward_block_only(
             gpu.kv_cache_write_fwht4_fused(
                 &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
                 &scratch.k, &scratch.v, &scratch.pos_buf,
-                ct, st, cfg.n_head_kv, cfg.head_dim,
+                ct, st, cfg.n_head_kv, cfg.head_dim, kv.inner.v_mode_bits(),
             )?;
             gpu.attention_flash_fwht4(
                 &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
