@@ -3580,6 +3580,7 @@ impl KvCache {
         let head_dim = self.head_dim;
 
         // Determine the kernel for the (current → target) transition.
+        #[derive(Clone, Copy)]
         enum Op { Q8ToL4, Down(i32, i32) }
         let op = match (self.v_mode, target) {
             (VMode::Q8, VMode::Lloyd4) => Op::Q8ToL4,
@@ -3596,6 +3597,18 @@ impl KvCache {
             Op::Q8ToL4 => {
                 let s1 = self.givens_cos.as_ref().expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
                 let s2 = self.givens_sin.as_ref().expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
+                // The q8→lloyd4 kernel runs fwht_shfl_forward_256 → reads
+                // signs[0..255]. fwht2/fwht4 K caches allocate only 128-element
+                // sign tables; adaptive's load path MUST upgrade them to 256
+                // (LCG prefix keeps the K-side 128-wide reads byte-identical)
+                // before the first transcode. Fail loud rather than OOB-read
+                // phantom signs and silently corrupt every position's cnorm.
+                assert!(
+                    s1.numel() >= 256 && s2.numel() >= 256,
+                    "q8→lloyd4 transcode requires 256-wide FWHT signs (got {}); \
+                     upgrade fwht2/4 signs to 256 at adaptive load before transcode_v_step",
+                    s1.numel()
+                );
                 (Some(s1.sub_offset(0, s1.numel())), Some(s2.sub_offset(0, s2.numel())))
             }
             Op::Down(_, _) => (None, None),
@@ -3612,6 +3625,10 @@ impl KvCache {
             None => None,
         };
 
+        // Free the scratch on EVERY exit path (GpuTensor has no Drop): capture
+        // the first error, break, free, then propagate — a HIP failure mid-pass
+        // must not leak the per-layer scratch (multi-MB at long context).
+        let mut pending: HipResult<()> = Ok(());
         for t in self.v_gpu.iter() {
             // Skip 1-element placeholder buffers for non-KV layers.
             if t.numel() <= 1 { continue; }
@@ -3619,21 +3636,22 @@ impl KvCache {
             // Copy the live layer into scratch (device-to-device), then read
             // from scratch and write the compacted record back into the layer.
             let nbytes = t.byte_size();
-            gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes)?;
-            match op {
-                Op::Q8ToL4 => {
-                    gpu.transcode_v_q8_to_lloyd4(
-                        t, scratch, signs1.as_ref().unwrap(), signs2.as_ref().unwrap(),
-                        n_kv_heads, head_dim, n_positions,
-                    )?;
-                }
+            pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
+            if pending.is_err() { break; }
+            pending = match op {
+                Op::Q8ToL4 => gpu.transcode_v_q8_to_lloyd4(
+                    t, scratch, signs1.as_ref().unwrap(), signs2.as_ref().unwrap(),
+                    n_kv_heads, head_dim, n_positions,
+                ),
                 Op::Down(sb, db) => {
-                    gpu.transcode_v_lloyd_down(t, scratch, n_kv_heads, head_dim, n_positions, sb, db)?;
+                    gpu.transcode_v_lloyd_down(t, scratch, n_kv_heads, head_dim, n_positions, sb, db)
                 }
-            }
+            };
+            if pending.is_err() { break; }
         }
 
         if let Some(s) = scratch { let _ = gpu.free_tensor(s); }
+        pending?;
         self.v_mode = target;
         gpu.invalidate_for_kv_mode_switch();
         Ok(())
