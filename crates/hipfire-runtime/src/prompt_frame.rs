@@ -460,12 +460,21 @@ impl<'a> JinjaChatFrame<'a> {
         use minijinja::{Environment, Error, ErrorKind, Value};
         use minijinja_contrib::pycompat::unknown_method_callback;
 
+        // Chainable-undefined (NOT Strict): chat templates are authored for
+        // Jinja2's lenient semantics and routinely PROBE optional fields —
+        // `system_message.current_date`, `.current_location`, `tools`,
+        // `documents`, etc. Under Strict, probing a key a caller didn't set
+        // raises, and the whole render fails → silent Plain fallback. That's
+        // exactly what broke MiniMax-M2 under an agent (Hermes) that sends a
+        // system message without `current_date`: `{% if system_message and
+        // system_message.current_date %}` errored at template line 37. Chainable
+        // matches Jinja2 (missing keys → falsy/undefined, chained access on
+        // undefined stays undefined) while still surfacing hard render errors
+        // (raise_exception, syntax). The required context vars (messages, tools,
+        // add_generation_prompt, bos_token) are always provided below, so the
+        // PR #175 "missing required var" concern doesn't regress.
         let mut env = Environment::new();
-        // Strict-undefined: a missing context variable raises Err instead of
-        // silently rendering empty/partial output. Without this, malformed
-        // prompts could propagate to the model unnoticed (Codex review on
-        // PR #175 flagged this; we apply it here in the same port).
-        env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        env.set_undefined_behavior(minijinja::UndefinedBehavior::Chainable);
         // Make Python-style str/list/dict methods (`.startswith`,
         // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
         // ordinary Jinja values. Required by the Qwen3 family
@@ -782,6 +791,30 @@ mod tests {
         let rendered = frame.render_messages(&msgs, Some(&tools), None)
             .expect("tojson(ensure_ascii=False) must render, not fall back");
         assert!(rendered.contains("\"get_weather\""), "tool json missing: {rendered}");
+    }
+
+    #[test]
+    fn jinja_chainable_tolerates_missing_optional_field() {
+        // Chat templates probe optional message fields (e.g. MiniMax-M2's
+        // `system_message.current_date`). Under Strict-undefined that raised and
+        // forced a Plain fallback (broke MiniMax under Hermes); Chainable treats a
+        // missing key as falsy like Jinja2, so the probe is a no-op.
+        let t = make_tokenizer();
+        let template = "{%- for m in messages -%}\
+            {%- if m.current_date -%}D:{{ m.current_date }}{%- endif -%}\
+            {{- m.content -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t, template, system: None, user: "hi",
+            enable_thinking: false, bos_token: Some(""),
+        };
+        let msgs = vec![
+            Message { role: Role::System, content: "S".into(), tool_calls: vec![], tool_call_id: None },
+            Message { role: Role::User, content: "U".into(), tool_calls: vec![], tool_call_id: None },
+        ];
+        let rendered = frame.render_messages(&msgs, None, None)
+            .expect("probing a missing optional message field must not raise");
+        assert_eq!(rendered, "SU");
     }
 
     #[test]
