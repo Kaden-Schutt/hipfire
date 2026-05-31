@@ -3546,6 +3546,99 @@ impl KvCache {
         Ok(())
     }
 
+    /// Adaptive-KV: re-quantize the EXISTING V cache (all written positions of
+    /// every real KV layer) from the current `v_mode` to a lower `target` tier,
+    /// in place. No realloc — the V buffers are floor-sized (allocated at the V
+    /// floor) and the lloyd record is smaller than the q8/higher-lloyd record, so
+    /// the in-place ascending transcode is byte-safe (dst stride < src stride;
+    /// see the per-kernel headers).
+    ///
+    /// Supported transitions: Q8→Lloyd4 (FWHT), Lloyd4→Lloyd3, Lloyd4→Lloyd2,
+    /// Lloyd3→Lloyd2 (rotated-space remap, no FWHT). `n_positions` is the number
+    /// of token positions currently written (seq_pos+1, or physical_cap if
+    /// compacted). Reuses self.givens_cos/givens_sin (256-wide FWHT signs) for
+    /// the q8→lloyd4 FWHT.
+    pub fn transcode_v_step(
+        &mut self, gpu: &mut Gpu, target: VMode, n_positions: usize,
+    ) -> HipResult<()> {
+        // Mirror set_v_mode_realloc's guard: lloyd-V is 256-wide and needs an
+        // FWHT K mode + head_dim==256.
+        assert!(
+            (self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht,
+            "lloyd-V transcode requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht)"
+        );
+        assert!(self.head_dim == 256, "lloyd-V transcode requires head_dim == 256");
+        assert!(!matches!(target, VMode::Q8), "transcode_v_step only downshifts (target != Q8)");
+
+        if n_positions == 0 {
+            self.v_mode = target;
+            gpu.invalidate_for_kv_mode_switch();
+            return Ok(());
+        }
+
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+
+        // Determine the kernel for the (current → target) transition.
+        enum Op { Q8ToL4, Down(i32, i32) }
+        let op = match (self.v_mode, target) {
+            (VMode::Q8, VMode::Lloyd4) => Op::Q8ToL4,
+            (VMode::Lloyd4, VMode::Lloyd3) => Op::Down(4, 3),
+            (VMode::Lloyd4, VMode::Lloyd2) => Op::Down(4, 2),
+            (VMode::Lloyd3, VMode::Lloyd2) => Op::Down(3, 2),
+            (cur, tgt) => panic!("unsupported V transcode {cur:?} -> {tgt:?}"),
+        };
+
+        // q8→lloyd4 needs the 256-wide FWHT signs (already reallocated to 256 by
+        // set_v_mode_realloc when lloyd-V was enabled at load). Take non-owning
+        // views so we don't borrow `self` across the v_gpu iteration below.
+        let (signs1, signs2) = match op {
+            Op::Q8ToL4 => {
+                let s1 = self.givens_cos.as_ref().expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
+                let s2 = self.givens_sin.as_ref().expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
+                (Some(s1.sub_offset(0, s1.numel())), Some(s2.sub_offset(0, s2.numel())))
+            }
+            Op::Down(_, _) => (None, None),
+        };
+
+        // 1-layer scratch sized to the SOURCE layer's full element count (the
+        // source record is the larger one). We copy layer→scratch (d2d) then
+        // transcode scratch→layer (non-aliasing). Crash-safe (a HIP error never
+        // half-writes the live layer) and overlap-safe (the q8→lloyd4 kernel is
+        // NOT true-in-place safe — see its header). Sized once, reused per layer.
+        let src_elems = self.v_gpu.iter().map(|t| t.numel()).filter(|&n| n > 1).max();
+        let scratch = match src_elems {
+            Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
+            None => None,
+        };
+
+        for t in self.v_gpu.iter() {
+            // Skip 1-element placeholder buffers for non-KV layers.
+            if t.numel() <= 1 { continue; }
+            let scratch = scratch.as_ref().unwrap();
+            // Copy the live layer into scratch (device-to-device), then read
+            // from scratch and write the compacted record back into the layer.
+            let nbytes = t.byte_size();
+            gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes)?;
+            match op {
+                Op::Q8ToL4 => {
+                    gpu.transcode_v_q8_to_lloyd4(
+                        t, scratch, signs1.as_ref().unwrap(), signs2.as_ref().unwrap(),
+                        n_kv_heads, head_dim, n_positions,
+                    )?;
+                }
+                Op::Down(sb, db) => {
+                    gpu.transcode_v_lloyd_down(t, scratch, n_kv_heads, head_dim, n_positions, sb, db)?;
+                }
+            }
+        }
+
+        if let Some(s) = scratch { let _ = gpu.free_tensor(s); }
+        self.v_mode = target;
+        gpu.invalidate_for_kv_mode_switch();
+        Ok(())
+    }
+
     /// Q8_0 KV cache that skips allocation for layers flagged as non-KV.
     /// Each `is_kv_layer[i] == false` slot gets a 1-element placeholder
     /// (~4 bytes) instead of the full `cache_elems × 4` allocation.
