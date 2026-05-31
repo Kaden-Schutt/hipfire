@@ -388,6 +388,21 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Remove HF `{% generation %}` / `{% endgeneration %}` tags (with optional
+/// whitespace-control dashes and the line they sit on) from a chat template.
+/// These mark the assistant-token span for training-data masking and emit
+/// nothing, so dropping the markers keeps inference rendering byte-identical —
+/// while letting minijinja (which has no `generation` block tag) parse the
+/// template instead of erroring. No-op for templates without them.
+fn strip_generation_tags(template: &str) -> String {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"[ \t]*\{%-?\s*(?:end)?generation\s*-?%\}\n?").unwrap()
+    });
+    re.replace_all(template, "").into_owned()
+}
+
 impl<'a> JinjaChatFrame<'a> {
     /// Render the template and tokenize the result. Returns `Err` on
     /// any template-side failure so the caller can fall back to
@@ -466,7 +481,16 @@ impl<'a> JinjaChatFrame<'a> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
 
-        env.add_template("chat", self.template)
+        // Strip HF `{% generation %}` / `{% endgeneration %}` training-mask
+        // tags (and their whitespace-control `{%- … -%}` variants). minijinja
+        // has no `generation` block tag, so a template that uses them (e.g.
+        // LFM2.5) fails to parse and the caller silently falls back to Plain
+        // framing. These tags only delimit the assistant-token span for
+        // training-data masking — they emit nothing — so removing the markers
+        // (including their own line) leaves the rendered output byte-identical
+        // for inference. No-op for templates that don't use them (Qwen/MiniMax).
+        let sanitized = strip_generation_tags(self.template);
+        env.add_template_owned("chat", sanitized)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env.get_template("chat")
             .map_err(|e| format!("template lookup: {e}"))?;
@@ -676,6 +700,49 @@ mod tests {
         expected.extend_from_slice(&t.encode("assistant"));
         expected.extend_from_slice(&t.encode("\n"));
         assert_eq!(got, expected, "Plain assistant prefix layout mismatch");
+    }
+
+    #[test]
+    fn strip_generation_tags_removes_markers_keeps_body() {
+        // HF training-mask tags (and their whitespace-control variants) are
+        // dropped; the body between them and everything else is untouched.
+        let tpl = "a\n{%- generation -%}\nBODY\n{%- endgeneration -%}\nb\n{% generation %}X{% endgeneration %}c";
+        let got = strip_generation_tags(tpl);
+        assert!(!got.contains("generation"), "tags not stripped: {got:?}");
+        assert!(got.contains("BODY"), "inner body dropped: {got:?}");
+        assert!(got.contains('X') && got.contains('c'), "non-dashed body dropped: {got:?}");
+        // A template with no generation tags is returned unchanged.
+        let plain = "{{ bos_token }}{%- for m in messages -%}{{ m.role }}{%- endfor -%}";
+        assert_eq!(strip_generation_tags(plain), plain);
+    }
+
+    #[test]
+    fn jinja_render_tolerates_generation_tags() {
+        // A minimal template that uses `{% generation %}` around the assistant
+        // body — minijinja has no such tag, so without the strip this fails to
+        // parse. With the strip it renders the assistant body normally.
+        let t = make_tokenizer();
+        let template = "{%- for message in messages -%}\
+            {{- '<|im_start|>' + message.role + '\\n' -}}\
+            {%- if message.role == 'assistant' -%}{%- generation -%}{{- message.content -}}{%- endgeneration -%}\
+            {%- else -%}{{- message.content -}}{%- endif -%}\
+            {{- '<|im_end|>\\n' -}}\
+            {%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "hi",
+            enable_thinking: false,
+            bos_token: Some("<|im_start|>"),
+        };
+        let msgs = vec![
+            Message { role: Role::User, content: "hi".into(), tool_calls: vec![], tool_call_id: None },
+            Message { role: Role::Assistant, content: "yo".into(), tool_calls: vec![], tool_call_id: None },
+        ];
+        let rendered = frame.render_messages(&msgs, None, None)
+            .expect("template with generation tags must render after strip");
+        assert_eq!(rendered, "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\nyo<|im_end|>\n");
     }
 
     #[test]

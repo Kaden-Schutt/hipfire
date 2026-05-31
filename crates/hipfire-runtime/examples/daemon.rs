@@ -6941,7 +6941,12 @@ fn generate_lfm2moe(
                 system: system_prompt,
                 user: prompt,
                 enable_thinking: max_think_tokens != 1,
-                bos_token: None,
+                // LFM2.5's template prepends `{{ bos_token }}` = `<|startoftext|>`
+                // (config.json bos_token_id=124894), but our tokenizer's bos_id
+                // resolves to `<|endoftext|>` (124895) — so decode_bytes(bos_id)
+                // would render the WRONG special token. Pin the correct BOS here,
+                // mirroring the Gemma 4 precedent (see JinjaChatFrame::bos_token).
+                bos_token: Some("<|startoftext|>"),
             };
             let render_result = if tools.is_some() || messages_history.is_some() {
                 let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;

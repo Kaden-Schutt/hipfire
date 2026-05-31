@@ -147,6 +147,37 @@ for a *completion* prompt fed to an *instruct/thinking* model, NOT an arch bug
 (cosine ≥0.999 already proves the forward). The daemon's ChatFrame wraps the turn
 correctly. Use chat framing for this model.
 
+### Chat template — upstream jinja (embedded; `HIPFIRE_JINJA_CHAT=1`)
+
+LiquidAI ships a real `chat_template.jinja` (4621 B; ChatML turns with a leading
+`{{ bos_token }}` = `<|startoftext|>`, `<think>…</think>` reasoning, and a
+`<|tool_call_start|>[py_call(args)]<|tool_call_end|>` tool syntax). The original
+quant was produced from an incomplete HF download that lacked this file, so the
+`.hfq` carried no template and serve fell back to the hand-rolled ChatML `ChatFrame`
+— correct turn structure but (a) **no `<|startoftext|>` BOS** and (b) the wrong tool
+format. Fixed end-to-end (mirrors how MiniMax-M2 serves jinja):
+
+1. **Embedded** the upstream `chat_template.jinja` into every shipped variant
+   (`mq4`/`mq4p`/`mq6e`/`mq4-awq`) via `scripts/hfq_inject_chat_template.py` (no
+   re-quantize — only grows `tokenizer_config.chat_template` in the HFQ metadata).
+   A fresh quantize from a *complete* HF checkout embeds it automatically (the
+   quantizer already folds `chat_template.jinja`).
+2. **`{% generation %}` strip** — the template uses HF's training-mask
+   `{% generation %}…{% endgeneration %}` tags, which minijinja can't parse (would
+   fail → silent Plain fallback). `JinjaChatFrame` now strips these no-op markers
+   before parsing (`strip_generation_tags`, `prompt_frame.rs`) — render output is
+   byte-identical for inference, and it's a no-op for templates without them.
+3. **BOS fix** — `config.json bos_token_id=124894` (`<|startoftext|>`), but our
+   tokenizer's `bos_id` resolves to `<|endoftext|>` (124895). `generate_lfm2moe`
+   pins `JinjaChatFrame.bos_token = Some("<|startoftext|>")` so the template's
+   `{{ bos_token }}` renders the correct token (the Gemma 4 precedent).
+
+Verified: `[chat_template] using HFQ-embedded` fires at load, no render-fallback,
+coherent (Paris / 80 km/h, 244 tok/s) under `HIPFIRE_JINJA_CHAT=1`. The flag is
+opt-in (global default off, same as MiniMax); without it serve uses the Plain
+ChatFrame as before. Upstream template kept verbatim at
+`crates/hipfire-arch-lfm2moe/assets/chat_template.jinja`.
+
 ## PERF TUNING (gfx1201)
 
 Warm decode baseline (fresh process, `HIPFIRE_DPM_WARMUP_SECS=10`, matched full
