@@ -130,37 +130,73 @@ __global__ void attention_flash_fwht4_tile_batched(
     float tile_sum = local_sum;
     __syncthreads();
 
-    // Phase D: V (Q8_0 normal space, 2 halves for hd=256)
-    float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-        for (int half = 0; half < n_halves; half++) {
-            const int d_base = half * 128 + tid * 4;
-            const int v_bi       = d_base / 32;
-            const int v_bj_base  = d_base % 32;
-            const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
-            const unsigned char* vbh = vb + v_blk_off;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
-            out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
-            out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
-            out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
-        }
-    }
-
+    // Phase D: V-weighted accumulation
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
                         + tile_id * (2 + head_dim);
     if (tid == 0) {
         p[0] = tile_max;
         p[1] = tile_sum;
     }
-    for (int half = 0; half < n_halves; half++) {
-        const int d_base = half * 128 + tid * 4;
-        p[2 + d_base + 0] = out_vec[half * 4 + 0];
-        p[2 + d_base + 1] = out_vec[half * 4 + 1];
-        p[2 + d_base + 2] = out_vec[half * 4 + 2];
-        p[2 + d_base + 3] = out_vec[half * 4 + 3];
+
+    if (v_mode == 8) {
+        // ── Legacy Q8_0 V (normal space, per-half layout) — unchanged ──
+        float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+            for (int half = 0; half < n_halves; half++) {
+                const int d_base = half * 128 + tid * 4;
+                const int v_bi       = d_base / 32;
+                const int v_bj_base  = d_base % 32;
+                const int v_blk_off  = (v_kv_head_blk + v_bi) * 34;
+                const unsigned char* vbh = vb + v_blk_off;
+                float vs = (float)*((const _Float16*)vbh);
+                out_vec[half * 4 + 0] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 0]));
+                out_vec[half * 4 + 1] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 1]));
+                out_vec[half * 4 + 2] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 2]));
+                out_vec[half * 4 + 3] += w * (vs * (float)((signed char)vbh[2 + v_bj_base + 3]));
+            }
+        }
+        for (int half = 0; half < n_halves; half++) {
+            const int d_base = half * 128 + tid * 4;
+            p[2 + d_base + 0] = out_vec[half * 4 + 0];
+            p[2 + d_base + 1] = out_vec[half * 4 + 1];
+            p[2 + d_base + 2] = out_vec[half * 4 + 2];
+            p[2 + d_base + 3] = out_vec[half * 4 + 3];
+        }
+    } else {
+        // ── 256-wide lloyd2/3/4 V: FWHT-rotated centroid (head_dim==256 only).
+        // Own tid*8 contiguous layout — required by fwht_shfl_inverse_256.
+        const int d0 = tid * 8;
+        float ov[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        const int v_bytes_per_head = 4 + (head_dim * v_mode) / 8;
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            const unsigned char* base = vb + 4 + tid * v_mode;   // v_mode bytes/thread
+            unsigned int packed = (unsigned int)base[0];
+            if (v_mode >= 2) packed |= ((unsigned int)base[1] << 8);
+            if (v_mode >= 3) packed |= ((unsigned int)base[2] << 16);
+            if (v_mode >= 4) packed |= ((unsigned int)base[3] << 24);
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                float c;
+                if (v_mode == 2)      c = TURBO_C2_256[(packed >> (i * 2)) & 3];
+                else if (v_mode == 3) c = TURBO_C3_256[(packed >> (i * 3)) & 7];
+                else                  c = TURBO_C4_256[(packed >> (i * 4)) & 15];
+                ov[i] += w * (cnorm * c);
+            }
+        }
+        // V accumulated in rotated space (ov ≈ H·Σw·v). Undo once.
+        fwht_shfl_inverse_256(ov[0], ov[1], ov[2], ov[3],
+                              ov[4], ov[5], ov[6], ov[7],
+                              signs1, signs2, tid);
+        #pragma unroll
+        for (int i = 0; i < 8; i++) p[2 + d0 + i] = ov[i];
     }
 }

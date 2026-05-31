@@ -1084,7 +1084,7 @@ pub fn mtp_head_forward_block_only(
                 &scratch.q, &kv.inner.k_gpu[0], &kv.inner.v_gpu[0],
                 &scratch.attn_out, &scratch.pos_buf, ct, st, pos + 1,
                 cfg.n_head, cfg.n_head_kv, cfg.head_dim, kv.inner.physical_cap,
-                &scratch.flash_partials,
+                &scratch.flash_partials, kv.inner.v_mode_bits(),
             )?;
         }
     }

@@ -24531,12 +24531,14 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.attention_flash_fwht4_batched_masked(
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, V_MODE_Q8,
         )
     }
 
     /// Tree-mask variant of `attention_flash_fwht4_batched`. Mirrors the asym4
     /// path one-for-one; the FA tile kernel is the only difference.
+    /// `v_mode_bits` selects the V-cache layout read by the tile kernel:
+    /// 8 = legacy Q8_0 V, 2/3/4 = lloyd FWHT-rotated centroid V (tail-inverted per tile).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fwht4_batched_masked(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -24548,6 +24550,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -24556,7 +24559,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht4_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols, V_MODE_Q8,
+            tree_bias, block_start, block_cols, v_mode_bits,
         )
     }
 
@@ -24581,7 +24584,9 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
-    /// Batched flash attention for fwht2 (K FWHT-rotated 2-bit + V Q8_0).
+    /// Batched flash attention for fwht2 (K FWHT-rotated 2-bit + V Q8_0 or
+    /// lloyd FWHT-rotated centroid). `v_mode_bits` selects the V-cache layout
+    /// read by the tile kernel: 8 = legacy Q8_0 V, 2/3/4 = lloyd FWHT V.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fwht2_batched(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -24590,6 +24595,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         n_heads: usize, n_kv_heads: usize, head_dim: usize,
         max_seq: usize, max_ctx_len: usize, batch_size: usize,
         partials: &GpuTensor,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -24598,7 +24604,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht2_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0, V_MODE_Q8,
+            None, 0, 0, v_mode_bits,
         )
     }
 
@@ -25143,6 +25149,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         signs1: &GpuTensor, signs2: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -25169,6 +25176,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut vm = v_mode_bits;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -25184,6 +25192,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut vm as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
@@ -25239,6 +25248,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         signs1: &GpuTensor, signs2: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -25265,6 +25275,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut vm = v_mode_bits;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -25280,6 +25291,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut vm as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(
