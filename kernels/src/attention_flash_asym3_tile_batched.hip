@@ -41,7 +41,8 @@ __global__ void attention_flash_asym3_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
-    int block_cols                             // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int v_mode                                 // 8 = Q8_0 V (only mode for asym3)
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;

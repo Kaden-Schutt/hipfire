@@ -2,13 +2,15 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Flash attention tile — fwht3 KV: K at FWHT-256 rotated 3-bit, V at Q8_0 (normal space).
+// Flash attention tile — fwht3 KV: K at FWHT-256 rotated 3-bit; V at Q8_0 OR
+// lloyd3 FWHT-rotated centroid (normal space), gated by v_mode.
 //
 // Single-pass 256-element signed-FWHT on Q to match the K-write rotation.
 // K cache byte-identical to asym3 (4B cnorm + 32 threads × 3 bytes packed 3-bit).
 //
 // Tuned for head_dim=256 (Qwen 3.5): 32 threads × 8 values = 256 dims single pass.
-// Q8_0 V reduce works as-is (output in normal space).
+// Reduce works as-is for V at Q8_0 OR lloyd3 FWHT-rotated centroid, gated by
+// v_mode (lloyd3 V is tail-inverted per tile, so partials stay normal-space).
 //
 // Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1]. LDS: tile_size * 4.
 #include <hip/hip_runtime.h>

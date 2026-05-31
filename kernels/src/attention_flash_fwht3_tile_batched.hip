@@ -2,7 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched flash attention tile — fwht3 KV (K FWHT-rotated 3-bit, V Q8_0).
+// Batched flash attention tile — fwht3 KV (K FWHT-rotated 3-bit; V at Q8_0
+// OR lloyd3 FWHT-rotated centroid, gated by v_mode).
 // Single-pass 256-element signed-FWHT on Q to match the K-write rotation.
 // Partials layout: [sub_batch × n_heads × max_tiles × (2+head_dim)].
 //
@@ -31,7 +32,8 @@ __global__ void attention_flash_fwht3_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,
-    int block_cols
+    int block_cols,
+    int v_mode          // 8 = legacy Q8_0 V; 3 = lloyd3 FWHT-rotated centroid V
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
@@ -119,20 +121,50 @@ __global__ void attention_flash_fwht3_tile_batched(
     __syncthreads();
 
     float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const int d = d0 + i;
-            const int bi = d / 32;
-            const int bj = d % 32;
-            const int v_blk_off = (v_kv_head_blk + bi) * 34;
-            const unsigned char* vbh = vb + v_blk_off;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+    if (v_mode == 8) {
+        // Legacy Q8_0 V (normal space) — unchanged behavior.
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const int v_blk_off = (v_kv_head_blk + bi) * 34;
+                const unsigned char* vbh = vb + v_blk_off;
+                float vs = (float)*((const _Float16*)vbh);
+                out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+            }
         }
+    } else {
+        // lloyd3: FWHT-rotated centroid V — layout identical to fwht3 K.
+        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;   // 100 B at hd=256
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            const unsigned char* base = vb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            out_vec[0] += w * (cnorm * TURBO_C3_256[ packed        & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3_256[(packed >> 3)  & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3_256[(packed >> 6)  & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3_256[(packed >> 9)  & 7]);
+            out_vec[4] += w * (cnorm * TURBO_C3_256[(packed >> 12) & 7]);
+            out_vec[5] += w * (cnorm * TURBO_C3_256[(packed >> 15) & 7]);
+            out_vec[6] += w * (cnorm * TURBO_C3_256[(packed >> 18) & 7]);
+            out_vec[7] += w * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
+        // V accumulated in rotated space (out_vec ≈ H·Σw·v). Undo once.
+        fwht_shfl_inverse_256(out_vec[0], out_vec[1], out_vec[2], out_vec[3],
+                              out_vec[4], out_vec[5], out_vec[6], out_vec[7],
+                              signs1, signs2, tid);
     }
 
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)

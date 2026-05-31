@@ -24064,6 +24064,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        v_mode: i32,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
@@ -24107,6 +24108,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 let sc = scale; let ts = TILE_SIZE as i32;
                 let mt = max_tiles as i32; let bo = offset as i32;
                 let bs = block_start as i32; let bc = block_cols as i32;
+                let vm = v_mode;
                 let mut params: Vec<*mut c_void> = vec![
                     &q_ptr as *const _ as *mut c_void,
                     &k_ptr as *const _ as *mut c_void,
@@ -24126,6 +24128,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                     &bo as *const _ as *mut c_void,
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
+                    &vm as *const _ as *mut c_void,
                 ];
                 self.launch_maybe_blob(
                     tile_func_name,
@@ -24140,7 +24143,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                         b.push_ptr(ct_ptr); b.push_ptr(st_ptr); b.push_ptr(bias_ptr);
                         b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(ms);
                         b.push_f32(sc); b.push_i32(ts); b.push_i32(mt); b.push_i32(bo);
-                        b.push_i32(bs); b.push_i32(bc);
+                        b.push_i32(bs); b.push_i32(bc); b.push_i32(vm);
                         b
                     },
                 )?;
@@ -24306,7 +24309,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym4_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, 8,
         )
     }
 
@@ -24351,7 +24354,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht4_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, 8,
         )
     }
 
@@ -24372,7 +24375,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym2_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, 8,
         )
     }
 
@@ -24393,7 +24396,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht2_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, 8,
         )
     }
 
@@ -24512,7 +24515,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_asym3_tile_batched",
             q, k_cache, v_cache, out, positions, cos_theta, sin_theta,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, 8,
         )
     }
 
@@ -24530,11 +24533,13 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         self.attention_flash_fwht3_batched_masked(
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            None, 0, 0,
+            None, 0, 0, 8,
         )
     }
 
     /// Tree-mask variant of `attention_flash_fwht3_batched`.
+    /// `v_mode_bits` selects the V-cache layout read by the tile kernel:
+    /// 8 = legacy Q8_0 V, 3 = lloyd3 FWHT-rotated centroid V (tail-inverted per tile).
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fwht3_batched_masked(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
@@ -24546,6 +24551,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         tree_bias: Option<&GpuTensor>,
         block_start: usize,
         block_cols: usize,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.launch_asym_flash_batched(
@@ -24554,13 +24560,12 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             "attention_flash_fwht3_tile_batched",
             q, k_cache, v_cache, out, positions, signs1, signs2,
             n_heads, n_kv_heads, head_dim, max_seq, max_ctx_len, batch_size, partials,
-            tree_bias, block_start, block_cols,
+            tree_bias, block_start, block_cols, v_mode_bits,
         )
     }
 
-    /// Flash attention for asym3 KV (K at 3-bit rotated, V at Q8_0).
-    /// Reuses Q8_0 flash reduce (output in normal space — V was un-rotated).
-    /// Flash attention for fwht3 KV (K FWHT-rotated 3-bit, V at Q8_0).
+    /// Flash attention for fwht3 KV (K FWHT-rotated 3-bit, V at Q8_0 or lloyd3
+    /// FWHT-rotated centroid, gated by `v_mode_bits`).
     pub fn attention_flash_fwht3(
         &mut self, q: &GpuTensor, k_cache: &GpuTensor, v_cache: &GpuTensor,
         out: &GpuTensor, pos_buf: &DeviceBuffer,

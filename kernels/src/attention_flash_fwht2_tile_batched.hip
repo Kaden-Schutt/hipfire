@@ -28,7 +28,8 @@ __global__ void attention_flash_fwht2_tile_batched(
     int max_tiles,
     int batch_offset,
     int block_start,
-    int block_cols
+    int block_cols,
+    int v_mode                                 // 8 = Q8_0 V (only mode for fwht2; lloyd2 is Task 6)
 ) {
     const int h = blockIdx.x;
     const int tile_id = blockIdx.y;
