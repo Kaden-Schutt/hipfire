@@ -3613,10 +3613,13 @@ impl KvCache {
         // v_mode STAYS at its current value (Q8 fast start tier); only the buffer
         // size changed.
 
-        // Size K at the K FLOOR (fwht2) when the floor is below the current
-        // fwht4 footprint. K data is still WRITTEN at the fwht4 stride until the
-        // K→fwht2 transcode fires (~0.515*physical_cap positions in), exactly
-        // mirroring the V side. The K-mode booleans STAY at fwht4 (start tier).
+        // Size K at the K FLOOR (fwht2=68 or fwht3=100 @256) when the floor is
+        // below the current fwht4 footprint (132 @256). K data is still WRITTEN
+        // at the fwht4 stride until the K transcode fires (fwht4→fwht2 remap, or
+        // fwht4→fwht3 re-rotation for k_floor=fwht3), exactly mirroring the V
+        // side. The 256-wide sign upgrade above ALSO satisfies the fwht4→fwht3
+        // re-rotation's sign-width requirement (inverse-128 + forward-256). The
+        // K-mode booleans STAY at fwht4 (start tier).
         let k_bph_cur = 4 + self.head_dim / 2; // fwht4 footprint @ this head_dim
         if k_floor_bph < k_bph_cur {
             let k_bpp_floor = self.n_kv_heads * k_floor_bph;
@@ -3743,28 +3746,40 @@ impl KvCache {
     }
 
     /// Adaptive-KV: re-quantize the EXISTING K cache to a lower tier
-    /// (`target_bits` ∈ {2,3,4}). Only the SAME-WIDTH fwht4→fwht2 remap is
-    /// implemented (both 128-wide; the balanced/aggressive presets' only K
-    /// step). fwht3 involvement requires a 128↔256 re-rotation (Task 6b) and is
-    /// NOT implemented — this errors clearly for any non-(fwht4→fwht2) request.
+    /// (`target_bits` ∈ {2,3}). Two supported transitions, both from the fwht4
+    /// start tier:
+    ///   * fwht4 → fwht2 (`target_bits==2`): SAME-WIDTH 128-LUT remap (the
+    ///     balanced/aggressive presets' only K step). Reconstructs from the
+    ///     fwht4 record and re-quantizes each rotated dim at 2-bit (128-family);
+    ///     no FWHT.
+    ///   * fwht4 → fwht3 (`target_bits==3`): RE-ROTATION (128-wide → 256-wide).
+    ///     Reconstructs normal-space K (dequant + inverse-128), re-rotates
+    ///     256-wide, quantizes to TURBO_C3_256. Engaged only by the advanced
+    ///     selector with k_floor=fwht3. fwht3→fwht2 never occurs (K starts at
+    ///     fwht4 and balanced_steps adds at most one K step), so it is not
+    ///     implemented; any other request errors clearly.
     ///
     /// Per real KV layer: copy the K layer into a 1-layer scratch (d2d), then
     /// transcode scratch→layer (separate buffers, never aliased). cnorm is
-    /// recomputed per (head, pos). Then flips the K-mode booleans
-    /// (quant_asym4→quant_asym2, quant_fwht stays true) so the next forward
-    /// dispatches the fwht2 attention kernel, and invalidates captured graphs.
+    /// recomputed per (head, pos). Then flips the K-mode booleans (clears
+    /// quant_asym4; sets quant_asym2 OR quant_asym3; quant_fwht stays true) so
+    /// the next forward dispatches the right attention kernel, and invalidates
+    /// captured graphs.
     ///
-    /// Sign tables: fwht4 and fwht2 are both 128-wide and share the SAME signs
+    /// Sign tables: fwht4→fwht2 are both 128-wide and share the SAME signs
     /// (gen_fwht_signs(42/1042); the first 128 entries of a 256-wide table equal
-    /// the 128-wide table), so no sign realloc is needed.
+    /// the 128-wide table). fwht4→fwht3 RE-ROTATION needs 256-wide signs (the
+    /// inverse-128 reads [0..127], forward-256 reads [0..255]) — adaptive's load
+    /// path (set_adaptive_floor_alloc with k_floor=fwht3) upgrades them to 256.
     ///
     /// `n_positions` is the number of token positions currently written. The K
-    /// buffer is floor-sized to the fwht2 footprint at adaptive load, so the
-    /// fwht4 phase physically holds only ~physical_cap*68/132 ≈ 0.515*physical_cap
-    /// positions — the controller transcodes K→fwht2 before that cap.
+    /// buffer is floor-sized at adaptive load (fwht2=68 or fwht3=100 B/head), so
+    /// the fwht4 phase physically holds only ~physical_cap*floor_bph/132
+    /// positions — the controller transcodes K before that cap.
     pub fn transcode_k_step(&mut self, gpu: &mut Gpu, target_bits: u32, n_positions: usize) -> HipResult<()> {
         // Determine the current K mode. Adaptive starts at fwht4
-        // (quant_asym4 && quant_fwht). The only supported step is fwht4→fwht2.
+        // (quant_asym4 && quant_fwht). Supported steps: fwht4->fwht2 (remap),
+        // fwht4->fwht3 (re-rotation).
         let src_is_fwht4 = self.quant_asym4 && self.quant_fwht;
         let cur_label = if !self.quant_fwht {
             "non-fwht"
@@ -3777,20 +3792,24 @@ impl KvCache {
         } else {
             "unknown"
         };
-        if !(src_is_fwht4 && target_bits == 2) {
+        if !(src_is_fwht4 && (target_bits == 2 || target_bits == 3)) {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
                     "K transcode {cur_label}->fwht{target_bits} not implemented \
-                     (Task 6b: fwht3 re-rotation); only fwht4->fwht2 (same-width remap) is supported"
+                     (only fwht4->fwht2 same-width remap and fwht4->fwht3 re-rotation are supported)"
                 ),
             ));
         }
         assert!(self.head_dim % 128 == 0, "fwht K transcode requires head_dim multiple of 128");
+        // fwht4->fwht3 re-rotation is hard-wired to the 128↔256 width crossing.
+        if target_bits == 3 {
+            assert!(self.head_dim == 256, "fwht4->fwht3 re-rotation requires head_dim == 256");
+        }
 
         if n_positions == 0 {
             self.quant_asym4 = false;
-            self.quant_asym2 = true;
+            if target_bits == 3 { self.quant_asym3 = true; } else { self.quant_asym2 = true; }
             // quant_fwht stays true.
             gpu.invalidate_for_kv_mode_switch();
             return Ok(());
@@ -3799,10 +3818,34 @@ impl KvCache {
         let n_kv_heads = self.n_kv_heads;
         let head_dim = self.head_dim;
 
+        // For the re-rotation (fwht4->fwht3) the kernel runs fwht_shfl_inverse
+        // (128-wide, reads signs[0..127]) then fwht_shfl_forward_256 (reads
+        // signs[0..255]). The cache signs MUST be 256-wide — adaptive's load
+        // (set_adaptive_floor_alloc with k_floor=fwht3) upgrades them. Fail loud
+        // rather than OOB-read phantom signs and silently corrupt every record.
+        if target_bits == 3 {
+            let n1 = self.givens_cos.as_ref().map_or(0, |t| t.numel());
+            let n2 = self.givens_sin.as_ref().map_or(0, |t| t.numel());
+            assert!(
+                n1 >= 256 && n2 >= 256,
+                "fwht4->fwht3 transcode requires 256-wide FWHT signs (got {n1}); \
+                 set_adaptive_floor_alloc(k_floor=fwht3) must upgrade signs to 256 first"
+            );
+        }
+        // Take non-owning views of the 256-wide signs for the re-rotation so we
+        // don't borrow `self` across the k_gpu iteration below.
+        let signs = if target_bits == 3 {
+            let s1 = self.givens_cos.as_ref().unwrap();
+            let s2 = self.givens_sin.as_ref().unwrap();
+            Some((s1.sub_offset(0, s1.numel()), s2.sub_offset(0, s2.numel())))
+        } else {
+            None
+        };
+
         // 1-layer scratch sized to the max real K layer's element count (the K
-        // buffer is floor-sized to fwht2; the live fwht4 records occupy a prefix
-        // of it). Copy layer→scratch (d2d) then transcode scratch→layer
-        // (non-aliasing, crash-safe). Sized once, reused per layer.
+        // buffer is floor-sized; the live fwht4 records occupy a prefix of it).
+        // Copy layer→scratch (d2d) then transcode scratch→layer (non-aliasing,
+        // crash-safe). Sized once, reused per layer.
         let src_elems = self.k_gpu.iter().map(|t| t.numel()).filter(|&n| n > 1).max();
         let scratch = match src_elems {
             Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
@@ -3819,17 +3862,22 @@ impl KvCache {
             let nbytes = t.byte_size();
             pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
             if pending.is_err() { break; }
-            pending = gpu.transcode_k_fwht4_to_fwht2(t, scratch, n_kv_heads, head_dim, n_positions);
+            pending = if target_bits == 3 {
+                let (s1, s2) = signs.as_ref().unwrap();
+                gpu.transcode_k_fwht4_to_fwht3(t, scratch, s1, s2, n_kv_heads, head_dim, n_positions)
+            } else {
+                gpu.transcode_k_fwht4_to_fwht2(t, scratch, n_kv_heads, head_dim, n_positions)
+            };
             if pending.is_err() { break; }
         }
 
         if let Some(s) = scratch { let _ = gpu.free_tensor(s); }
         pending?;
 
-        // Flip the K-mode booleans so the next forward dispatches fwht2
-        // attention. quant_fwht stays true (still FWHT-rotated K).
+        // Flip the K-mode booleans so the next forward dispatches the target
+        // attention kernel. quant_fwht stays true (still FWHT-rotated K).
         self.quant_asym4 = false;
-        self.quant_asym2 = true;
+        if target_bits == 3 { self.quant_asym3 = true; } else { self.quant_asym2 = true; }
         gpu.invalidate_for_kv_mode_switch();
         Ok(())
     }

@@ -261,6 +261,26 @@ fn write_k_fwht(gpu: &mut Gpu, kv: &KvCache, bits: usize) {
     }
 }
 
+/// Write the deterministic source into every layer's K buffer via the DIRECT
+/// fwht3 (256-wide) write. Reference for the fwht4→fwht3 transcode. The cache
+/// must already carry 256-wide signs (new_gpu_fwht3_filtered does).
+fn write_k_fwht3(gpu: &mut Gpu, kv: &KvCache, n_layers: usize) {
+    let s1 = kv.givens_cos.as_ref().unwrap().sub_offset(0, kv.givens_cos.as_ref().unwrap().numel());
+    let s2 = kv.givens_sin.as_ref().unwrap().sub_offset(0, kv.givens_sin.as_ref().unwrap().numel());
+    for layer in 0..n_layers {
+        for p in 0..N_POS {
+            let src = build_pos_src(layer, p);
+            let kt = upload_src(gpu, &src);
+            let pb = pos_buf(gpu, p as i32);
+            gpu.kv_cache_write_fwht3_vec(&kv.k_gpu[layer], &kt, &pb, &s1, &s2, N_KV_HEADS, HEAD_DIM)
+                .unwrap();
+            gpu.hip.device_synchronize().unwrap();
+            let _ = gpu.free_tensor(kt);
+            gpu.hip.free(pb).unwrap();
+        }
+    }
+}
+
 /// Dequantize a fwht K buffer (one layer) at the given `bits` tier (4 or 2),
 /// using the 128-LUT family and the K record layout (per 128-wide half:
 /// 32 threads × 4 dims, slot half*4+{0..3}). Returns [pos][head*head_dim + slot]
@@ -319,6 +339,59 @@ fn dequant_k_layer(gpu: &Gpu, buf: &GpuTensor, bits: usize, n_pos: usize) -> Vec
         }
     }
     out
+}
+
+/// Dequantize a fwht3 K buffer (one layer): 256-wide layout, 8 dims/thread at
+/// out[4 + tid*3] (3-bit packed little-endian into 24 bits), TURBO_C3_256 LUT.
+/// The slot ordering is the forward-256 output ordering (dim tid*8 + i), which
+/// both the direct fwht3 write and the fwht4→fwht3 transcode produce — so
+/// transcoded-vs-direct compare element-wise. Returns [pos][head*head_dim + slot].
+fn dequant_k_fwht3_layer(gpu: &Gpu, buf: &GpuTensor, n_pos: usize) -> Vec<Vec<f32>> {
+    let byte_size = buf.byte_size();
+    let mut raw = vec![0u8; byte_size];
+    gpu.hip.memcpy_dtoh(&mut raw, &buf.buf).unwrap();
+
+    let bph = 4 + (HEAD_DIM * 3) / 8; // fwht3 = 100 @256
+    let bpp = N_KV_HEADS * bph;
+
+    let mut out = vec![vec![0.0f32; N_KV_HEADS * HEAD_DIM]; n_pos];
+    for p in 0..n_pos {
+        for h in 0..N_KV_HEADS {
+            let rec = p * bpp + h * bph;
+            let cnorm = f32::from_ne_bytes([raw[rec], raw[rec + 1], raw[rec + 2], raw[rec + 3]]);
+            // 32 threads × 8 dims; thread tid owns dims tid*8..tid*8+7, packed
+            // 3-bit into 3 bytes at rec+4+tid*3.
+            for tid in 0..32usize {
+                let b = rec + 4 + tid * 3;
+                let packed = (raw[b] as u32) | ((raw[b + 1] as u32) << 8) | ((raw[b + 2] as u32) << 16);
+                for i in 0..8usize {
+                    let idx = ((packed >> (i * 3)) & 7) as usize;
+                    out[p][h * HEAD_DIM + tid * 8 + i] = cnorm * TURBO_C3_256[idx];
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Max stored K cnorm across all (layer, pos, head) of a fwht3 K cache (100 B/head).
+fn max_k_fwht3_cnorm(gpu: &Gpu, kv: &KvCache, n_layers: usize) -> f32 {
+    let bph = 4 + (HEAD_DIM * 3) / 8;
+    let bpp = N_KV_HEADS * bph;
+    let mut cmax = 0.0f32;
+    for layer in 0..n_layers {
+        let buf = &kv.k_gpu[layer];
+        let mut raw = vec![0u8; buf.byte_size()];
+        gpu.hip.memcpy_dtoh(&mut raw, &buf.buf).unwrap();
+        for p in 0..N_POS {
+            for h in 0..N_KV_HEADS {
+                let rec = p * bpp + h * bph;
+                let c = f32::from_ne_bytes([raw[rec], raw[rec + 1], raw[rec + 2], raw[rec + 3]]);
+                cmax = cmax.max(c.abs());
+            }
+        }
+    }
+    cmax
 }
 
 /// Max stored K cnorm across all (layer, pos, head) of a fwht K cache.
@@ -556,6 +629,82 @@ fn main() {
         println!(
             "  [K mode flip]    quant_asym2={} quant_asym4={} quant_fwht={}  {}",
             trans.quant_asym2, trans.quant_asym4, trans.quant_fwht,
+            if flipped { "PASS" } else { "FAIL" }
+        );
+    }
+
+    // === Case 5: K fwht4 -> fwht3 (RE-ROTATION, 128-wide -> 256-wide) ===
+    {
+        let step3_256 = max_gap(&TURBO_C3_256);
+
+        // Transcode cache: write K directly at fwht4 (128-wide signs), then
+        // UPGRADE signs to 256-wide (mirrors set_adaptive_floor_alloc's sign
+        // upgrade for k_floor=fwht3), then transcode K -> fwht3 (re-rotation).
+        let mut trans = make_k_cache(&mut gpu);
+        write_k_fwht(&mut gpu, &trans, 4);
+        gpu.hip.device_synchronize().unwrap();
+        // Upgrade the cache's FWHT signs to 256-wide (gen_fwht_signs is a pure
+        // LCG; first 128 entries are byte-identical, so the inverse-128 matches
+        // fwht4's forward). The K buffer stays fwht4-sized — large enough to
+        // hold the smaller fwht3 record (production floor-sizes it to 100 B/head,
+        // also large enough).
+        {
+            let s1v = KvCache::gen_fwht_signs(42, 256);
+            let s2v = KvCache::gen_fwht_signs(1042, 256);
+            let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s1 = gpu.alloc_tensor(&[256], DType::F32).unwrap();
+            let s2 = gpu.alloc_tensor(&[256], DType::F32).unwrap();
+            gpu.hip.memcpy_htod(&s1.buf, &s1b).unwrap();
+            gpu.hip.memcpy_htod(&s2.buf, &s2b).unwrap();
+            if let Some(old) = trans.givens_cos.take() { let _ = gpu.free_tensor(old); }
+            if let Some(old) = trans.givens_sin.take() { let _ = gpu.free_tensor(old); }
+            trans.givens_cos = Some(s1);
+            trans.givens_sin = Some(s2);
+        }
+        trans.transcode_k_step(&mut gpu, 3, N_POS).unwrap();
+        gpu.hip.device_synchronize().unwrap();
+
+        // Reference cache: a fwht3 (256-wide) cache written DIRECTLY at fwht3
+        // over the same source.
+        let is_kv = vec![true; N_LAYERS];
+        let refc = KvCache::new_gpu_fwht3_filtered(&mut gpu, &is_kv, N_KV_HEADS, HEAD_DIM, MAX_SEQ).unwrap();
+        write_k_fwht3(&mut gpu, &refc, N_LAYERS);
+        gpu.hip.device_synchronize().unwrap();
+
+        let mut m = 0.0f32;
+        let mut mean = 0.0f32;
+        let mut frac = 0.0f32;
+        for layer in 0..N_LAYERS {
+            let a = dequant_k_fwht3_layer(&gpu, &trans.k_gpu[layer], N_POS);
+            let b = dequant_k_fwht3_layer(&gpu, &refc.k_gpu[layer], N_POS);
+            let (lm, lmean, lfrac) = diag(&a, &b);
+            m = m.max(lm);
+            mean = mean.max(lmean);
+            frac = frac.max(lfrac);
+        }
+        let cmax = max_k_fwht3_cnorm(&gpu, &refc, N_LAYERS);
+        // RE-ROTATION error budget: the transcode round-trips fwht4 -> dequant
+        // (4-bit, 128-family) -> inverse-128 -> forward-256 -> 3-bit quant
+        // (256-family). The direct fwht3 write quantizes the EXACT normal-space
+        // K at 3-bit. The extra 4-bit rounding before the inverse perturbs the
+        // 256-wide rotated coefficients, so many dims can land one (or near a
+        // boundary, occasionally two) 3-bit centroids off. Bound by a generous
+        // multiple of one 3-bit step × cnorm (re-rotation is the design's
+        // flagged-costly path; expect a larger spread than the same-width remap).
+        let step_full = step3_256 * cmax;
+        let pass = m <= step_full * 3.0 && mean <= step_full * 0.6;
+        all_pass &= pass;
+        println!(
+            "  [K fwht4->fwht3] max={m:.4e} mean={mean:.4e} frac_diff={frac:.4} (1step×cmax={step_full:.4e})  {}",
+            if pass { "PASS" } else { "FAIL" }
+        );
+        // Verify the K-mode booleans flipped to fwht3.
+        let flipped = trans.quant_asym3 && !trans.quant_asym4 && !trans.quant_asym2 && trans.quant_fwht;
+        all_pass &= flipped;
+        println!(
+            "  [K3 mode flip]   quant_asym3={} quant_asym4={} quant_asym2={} quant_fwht={}  {}",
+            trans.quant_asym3, trans.quant_asym4, trans.quant_asym2, trans.quant_fwht,
             if flipped { "PASS" } else { "FAIL" }
         );
     }

@@ -24258,6 +24258,51 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         Ok(())
     }
 
+    /// Adaptive-KV K transcode: re-quantize an existing fwht4 K cache (one FA
+    /// layer, `n_positions` written positions) to fwht3 — the RE-ROTATION case
+    /// (128-wide → 256-wide width change). Reconstructs normal-space K via a
+    /// 128-wide inverse FWHT, re-rotates 256-wide, quantizes to TURBO_C3_256 —
+    /// see kernels/src/kv_transcode_k_fwht4_to_fwht3.hip. `signs1`/`signs2` MUST
+    /// be 256-wide (inverse-128 reads [0..127], forward-256 reads [0..255]).
+    /// `dst`/`src` are SEPARATE buffers (the orchestrator uses a 1-layer scratch).
+    pub fn transcode_k_fwht4_to_fwht3(
+        &mut self, dst: &GpuTensor, src: &GpuTensor,
+        signs1: &GpuTensor, signs2: &GpuTensor,
+        n_kv_heads: usize, head_dim: usize, n_positions: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_givens4_kernel(
+            "kv_transcode_k_fwht4_to_fwht3",
+            kernels::KV_TRANSCODE_K_FWHT4_TO_FWHT3_SRC,
+            "kv_transcode_k_fwht4_to_fwht3",
+        )?;
+        let func = &self.functions["kv_transcode_k_fwht4_to_fwht3"];
+        let mut dp = dst.buf.as_ptr();
+        let mut sp = src.buf.as_ptr();
+        let mut s1p = signs1.buf.as_ptr();
+        let mut s2p = signs2.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut np = n_positions as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut s1p as *mut _ as *mut c_void,
+            &mut s2p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut np as *mut _ as *mut c_void,
+        ];
+        let shared_mem = ((head_dim + 32) * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_kv_heads as u32, n_positions as u32, 1], [32, 1, 1],
+                shared_mem, self.stream_ref(), &mut params,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Batched variant: launch `kv_cache_write_fwht256_4bit_batched` on an arbitrary buffer.
     /// Used for V when v_mode == Lloyd4 in the batched write path.
     pub fn kv_cache_write_v256_4bit_vec_batched(
