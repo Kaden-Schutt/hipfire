@@ -32,6 +32,8 @@ pub mod ddtree;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
 #[cfg(feature = "deltanet")]
+pub mod kv_adaptive;
+#[cfg(feature = "deltanet")]
 pub mod cask;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
