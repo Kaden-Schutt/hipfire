@@ -945,7 +945,7 @@ sooner and compute becomes a larger fraction of wall time. Key recalibrations:
 | Rank | Lever | Target | Original projection | **Revised (gfx1100)** | Complexity | Why revised |
 |---:|---|---|---|---|---|---|
 | 1 | **QKV-cast fusion** (§2.5) | Vision E2E | +420 ms | **~420 ms (0.7% total)** | Medium | Unchanged; independent of attention kernel |
-| ~~2~~ | ~~**V_lds transpose** (§14.2)~~ | Vision attn | ~~+5-10%~~ | **+15.6% text prefill; -6.5% vision** | Low | §15: helps N=128 (v4>v3), hurts V_tile=32 (v6<v5). Text prefill promoted to v4_causal |
+| ~~2~~ | ~~**V_lds transpose** (§14.2)~~ | Vision attn | ~~+5-10%~~ | **+15.6% non-causal N=128; -6.5% vision** | Low | §15: helps non-causal N=128 (v4>v3), hurts V_tile=32 (v6<v5). v4_causal is bench-only after large-batch crash |
 | ~~3~~ | ~~**Async V-load** (§14.1)~~ | Vision attn | ~~+10-15%~~ | **BLOCKED — no `global_load_lds` on RDNA3** | ~~Medium~~ | §16: `vmem-to-lds-load-insts` is CDNA-only. All alternatives exceed LDS budget |
 | 4 | **FP8/MFP4 K/V** (§3.2) | Vision attn | +20-40% | **+20-40% attn (2.4-4.8s)** | High | Unchanged but needs accuracy validation |
 | ~~5~~ | ~~**M=128 sub-tiling** (§14.4C)~~ | Vision attn | ~~+5-15%~~ | **-10.9% (K-shared) / -2.4% (sequential)** | Medium | §17: VGPR spills from 2× state overwhelm K savings. No DRAM benefit without sharing |
@@ -1038,7 +1038,10 @@ staging amortized across 8 c-iterations of Phase C (1024 reads). Read
 vectorization dominates.
 
 **Outcome:**
-- v4_causal replaces v3_causal in qwen2 text prefill (+15.6%).
+- v4_causal is bench-only until its large-batch crash is fixed
+  (2026-05-31 triage: `parity_causal_wmma 5095 1` and dots-ocr
+  5095-position prefill both reproduced the fault).
+- qwen2 text prefill remains on v3_causal.
 - v5 stays production for dots-ocr vision (v6 is slower).
 - v4 (non-causal) available for future threshold-attention use.
 

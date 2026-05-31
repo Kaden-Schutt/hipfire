@@ -108,6 +108,33 @@ fn main() {
     gpu.hip.device_synchronize().unwrap();
     eprintln!("attention_flash_gqa:{:.1} us/call (vs flash maxdiff={maxdiff:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
 
+    // attention_gqa_warp (warp-cooperative GQA, chunked partials + reduce)
+    let d_out4 = gpu.zeros(&[q_dim], DType::F32).unwrap();
+    gpu.attention_gqa_warp(&d_q, &d_k, &d_v, &d_out4, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let d = gpu.download_f32(&d_out4).unwrap();
+    let maxdiff4 = a.iter().zip(&d).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    let t = std::time::Instant::now();
+    for _ in 0..iters {
+        gpu.attention_gqa_warp(&d_q, &d_k, &d_v, &d_out4, &d_part, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();
+    }
+    gpu.hip.device_synchronize().unwrap();
+    eprintln!("attention_gqa_warp:{:.1} us/call (vs flash maxdiff={maxdiff4:.2e})", t.elapsed().as_secs_f64() * 1e6 / iters as f64);
+
+    // attention_gqa_warp_dv: same math, seq_len read from a device pointer
+    // for hipGraph capture paths.
+    let d_out5 = gpu.zeros(&[q_dim], DType::F32).unwrap();
+    let seq_i32 = seq_len as i32;
+    let seq_buf = gpu.hip.malloc(4).unwrap();
+    gpu.hip.memcpy_htod(&seq_buf, &seq_i32.to_ne_bytes()).unwrap();
+    let chunk_size = 128usize;
+    let n_chunks = (seq_len + chunk_size - 1) / chunk_size;
+    gpu.attention_gqa_warp_dv(&d_q, &d_k, &d_v, &d_out5, &d_part, &seq_buf, n_heads, n_kv_heads, head_dim, max_seq, chunk_size, n_chunks).unwrap();
+    gpu.hip.device_synchronize().unwrap();
+    let e = gpu.download_f32(&d_out5).unwrap();
+    let maxdiff5 = a.iter().zip(&e).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+    eprintln!("attention_gqa_warp_dv: smoke PASS (vs flash maxdiff={maxdiff5:.2e})");
+
     // attention_flash_gqa_fused (single launch, no partials/reduce)
     let d_out3 = gpu.zeros(&[q_dim], DType::F32).unwrap();
     gpu.attention_flash_gqa_fused(&d_q, &d_k, &d_v, &d_out3, seq_len, n_heads, n_kv_heads, head_dim, max_seq).unwrap();

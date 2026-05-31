@@ -875,7 +875,9 @@ Results on gfx1100 (RX 7900 XTX), B=L=19520, hd=128, n_heads=12:
 | v6 (M=64 V_tile=32 V_lds_T) | 171 | **-6.5% vs v5** |
 
 **v4 regresses v5 by 41%** (226 vs 160 ms), so v5 remains production
-for vision. v4_causal (text prefill) replaces v3_causal for +15.6%.
+for vision. v4_causal is kept as a bench kernel only: PR triage on
+2026-05-31 reproduced a large/odd-batch crash (`parity_causal_wmma 5095 1`,
+dots-ocr prefill 5095 positions), so text prefill stays on v3_causal.
 
 **Why v6 regresses:** V_tile=32 stages V in 4 v_chunks per K-tile. Each
 v_chunk does 4096 scattered writes (de-vectorized from 128-wide coalesced
@@ -885,9 +887,10 @@ costs more than vectorizing reads saves. For N=128 (single staging), the
 staging cost is amortized across 8 c-iterations, making the read win
 dominant.
 
-**Conclusion:** V_lds transpose is beneficial for N=128 (text prefill)
-but harmful for V_tile=32 (vision encoder). v5 remains production for
-dots-ocr; v4_causal replaces v3_causal for text prefill.
+**Conclusion:** V_lds transpose is beneficial for non-causal N=128 but
+harmful for V_tile=32 (vision encoder). v5 remains production for
+dots-ocr. The causal v4 sibling is not production until its large-batch
+crash is fixed; qwen2 text prefill remains on v3_causal.
 
 New kernels shipped:
 - `attention_dflash_wmma_m64_n128_f16kv_v4.hip` (non-causal)
@@ -898,7 +901,8 @@ Dispatch wired:
 - `Gpu::attention_dflash_wmma_m64_n128_f16kv_v4_f32`
 - `Gpu::attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32`
 - `Gpu::attention_dflash_wmma_m64_n32_f16kv_v6_f32`
-- `qwen2.rs` text prefill now calls `v4_causal` instead of `v3_causal`
+- `qwen2.rs` text prefill remains on `v3_causal`; `v4_causal` is bench-only
+  pending a large-batch correctness fix
 - dots-ocr vision remains on `v5` (v6 is slower)
 
 ### Async V-load investigation — blocked on RDNA3 (2026-05-29)

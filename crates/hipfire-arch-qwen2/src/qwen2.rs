@@ -880,6 +880,12 @@ fn forward_step_after_x(
                 &state.attn_out,
                 pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
             )?;
+        } else if n_kv_heads < n_heads && head_dim == 128 && pos + 1 >= 4096 {
+            gpu.attention_gqa_warp(
+                &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
+                &state.attn_out, &state.attn_partials,
+                pos + 1, n_heads, n_kv_heads, head_dim, state.max_seq,
+            )?;
         } else if n_kv_heads < n_heads && pos + 1 >= 4096 {
             Gpu::attention_flash_gqa(gpu,
                 &state.q, &state.k_cache[layer_idx], &state.v_cache[layer_idx],
@@ -902,8 +908,24 @@ fn forward_step_after_x(
         gpu.rmsnorm_f32(&state.x, &layer.ffn_norm, &state.tmp, cfg.rms_norm_eps)?;
 
         // (10) SwiGLU: gate = silu(w_gate(x)) * w_up(x); down(...).
-        weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
-        weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        if layer.w_gate.gpu_dtype == DType::Q8_0
+            && layer.w_up.gpu_dtype == DType::Q8_0
+            && layer.w_gate.k == layer.w_up.k
+        {
+            gpu.fused_gate_up_q8_0(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &state.tmp,
+                &state.gate,
+                &state.up,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+            )?;
+        } else {
+            weight_gemv(gpu, &layer.w_gate, &state.tmp, &state.gate)?;
+            weight_gemv(gpu, &layer.w_up, &state.tmp, &state.up)?;
+        }
         gpu.silu_mul_f32(&state.gate, &state.up, &state.ffn_hidden)?;
         weight_gemv(gpu, &layer.w_down, &state.ffn_hidden, &state.ffn_out)?;
 
@@ -1038,11 +1060,12 @@ pub fn forward_prefill_batch_embeds(
         // Attention: WMMA causal flash when head_dim=128 and batch is
         // large enough to fill the M=64 tile. gfx11 and gfx12 use separate
         // kernel siblings because their WMMA operand layouts differ.
-        // v4_causal uses V_lds transpose for contiguous Phase C reads (+15.6%).
+        // Keep v3-causal in production: the v4-causal V_lds transpose variant
+        // is bench-only until it is fixed for non-128-token prompt lengths.
         if let (Some(k16), Some(v16)) = (&k_f16_batch, &v_f16_batch) {
             gpu.cast_f32_to_f16(&k_batch, k16)?;
             gpu.cast_f32_to_f16(&v_batch, v16)?;
-            gpu.attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32(
+            gpu.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
                 &q_batch, k16, v16, &attn_out_batch,
                 batch, batch, n_heads, n_kv_heads, head_dim,
             )?;
