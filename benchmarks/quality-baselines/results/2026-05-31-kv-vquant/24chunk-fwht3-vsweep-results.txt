@@ -1,0 +1,5 @@
+fwht3-K / q8-V : KLD=0.011148 PPL=3.4366
+fwht3-K / lloyd4-V : KLD=0.011487 PPL=3.4374
+fwht3-K / lloyd3-V : KLD=0.012120 PPL=3.4413
+fwht3-K / lloyd2-V : KLD=0.014568 PPL=3.4525
+SWEEP_COMPLETE

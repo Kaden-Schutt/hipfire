@@ -101,18 +101,41 @@ Keep `--kv-mode` selecting **K** (already accepts `fwht2/3/4`); add **`--kv-v {q
 (default `q8` → byte-identical to today). This is the minimal surface needed to run all 12 cells.
 User-facing CLI naming (composite mode strings vs two flags) is a later cosmetic decision (§7).
 
-## 5. Validation — the KLD matrix
+## 5. Validation — the KLD sweep (RESULTS)
 
-**12 cells: K ∈ {fwht2, fwht3, fwht4} × V ∈ {q8, lloyd2, lloyd3, lloyd4}.**
+**Design change during implementation (build-time finding).** The original plan assumed the
+existing K fwht kernels could be reused for V to give a clean *independent* 3 K × 4 V matrix.
+They can't: the existing kernels **bundle rotation width with bit-count** — `fwht3` is a
+**256-wide** FWHT (8 dims/thread, `TURBO_C3_256`) while `fwht2`/`fwht4` are **128-wide** (per-half,
+`TURBO_C2`/`TURBO_C4`). The two layouts use different thread→dim mappings and do not interoperate,
+so an attention kernel can only un-rotate V written in *its own* layout. Rather than build a full
+set of dedicated cross-layout V kernels, we **fixed K = fwht3 (256-wide, the KLD-validated best K)
+and swept V at 2/3/4 bits all in the 256-wide layout** — two new 256-wide V writers
+(`kv_cache_write_fwht256_{2bit,4bit}`) plus the existing fwht3 writer for lloyd3. This directly
+answers Priority #1 ("how low can V go below Q8") and drops only the secondary K-axis (fwht3
+already won the K comparison). The full independent matrix is a deferred follow-up (§7).
 
-- **Harness:** `eval_hipfire --kv-mode <K> --kv-v <V>` → `.kldseq` → `kld_reduce.py`, paired
-  24-chunk method vs the bf16 reference `~/.hipfire/kldref/qwen3.6-27b-MASTER-small.kldref.bin`.
-  Run on **MI300X** (ssh mi300) for accuracy throughput. fwht3 K-only baseline ≈ 0.0112.
-- **Anchors:** the `V=q8` column is exactly today's `fwht2/3/4` (already measured) — re-run for
-  same-session comparability.
-- **Read-outs the matrix gives us:** (1) how low V can go while KLD ≈ Q8-V; (2) equal-byte K/V
-  split comparisons (e.g. `fwht3`-K/`lloyd4`-V vs `fwht4`-K/`lloyd3`-V, both 232 B); (3) whether
-  V is, as expected, more bit-sensitive than K (compare the V-bit gradient to the K-bit gradient).
+**Harness:** `eval_hipfire --kv-mode fwht3 --kv-v <V> --scoring-mode prefill --max-chunks 24`
+vs the bf16 ref `~/.hipfire/kldref/qwen3.6-27b-MASTER-small.kldref.bin` (qwen3.6-27b), run on
+local gfx1100 (7900 XTX) for internal consistency (all cells same machine/session).
+
+**Results (2026-05-31, 24-chunk, fwht3-K, qwen3.6-27b):**
+
+| V mode | bits | V B/head | total B/head | per-tok (27B) | **KLD** | PPL | vs Q8-V |
+|---|---|---|---|---|---|---|---|
+| q8 (today) | 8 | 272 | 372 | 23,808 B | **0.011148** | 3.4366 | baseline |
+| **lloyd4** | 4 | 132 | **232 (−38%)** | 14,848 B | **0.011487** | 3.4374 | **+3.0%** |
+| **lloyd3** | 3 | 100 | **200 (−46%)** | 12,800 B | **0.012120** | 3.4413 | +8.7% |
+| lloyd2 | 2 | 68 | **168 (−55%)** | 10,752 B | **0.014568** | 3.4525 | +30.7% |
+
+(The Q8-V cell at 0.01115 reproduces the historical fwht3 baseline ≈0.0112 — harness validated.
+4-chunk smoke earlier showed the same monotonic ordering, with lloyd4 ≈ q8 to 4 digits.)
+
+**Read-out:** monotonic and physics-consistent (more V bits → lower KLD; a layout/inverse bug
+would have exploded KLD). **lloyd4-V is Q8-V-grade** (+3.0% KLD, PPL essentially unchanged) at
+**−38% total KV** — the FWHT rotation Gaussianizes V so 4-bit centroids are near-lossless.
+**lloyd3-V** trades +8.7% KLD for **−46% KV**. **lloyd2-V** (+30.7%) confirms V *is* bit-sensitive
+below 3 bits and is not default material (available for extreme-context users who accept the cost).
 
 ## 6. Decision rule & guardrails
 
