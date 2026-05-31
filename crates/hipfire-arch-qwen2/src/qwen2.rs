@@ -1038,10 +1038,11 @@ pub fn forward_prefill_batch_embeds(
         // Attention: WMMA causal flash when head_dim=128 and batch is
         // large enough to fill the M=64 tile. gfx11 and gfx12 use separate
         // kernel siblings because their WMMA operand layouts differ.
+        // v4_causal uses V_lds transpose for contiguous Phase C reads (+15.6%).
         if let (Some(k16), Some(v16)) = (&k_f16_batch, &v_f16_batch) {
             gpu.cast_f32_to_f16(&k_batch, k16)?;
             gpu.cast_f32_to_f16(&v_batch, v16)?;
-            gpu.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
+            gpu.attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32(
                 &q_batch, k16, v16, &attn_out_batch,
                 batch, batch, n_heads, n_kv_heads, head_dim,
             )?;

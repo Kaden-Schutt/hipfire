@@ -2242,6 +2242,31 @@ pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_SRC: &str = include_str
 /// because gfx12 WMMA uses half8 operands and the `_w32_gfx12` builtin.
 pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V3_CAUSAL_GFX12_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v3_causal.gfx12.hip");
 
+/// V_lds transpose variant of v3 (M=64, N=128, f16 K/V). V_lds transposed
+/// from [n_tile][head_dim] to [head_dim][V_T_STRIDE] so Phase C b_reg reads
+/// are 16 consecutive f16 values (compiler-vectorizable) instead of
+/// stride-128 scattered. V_T_STRIDE=130 (padded) eliminates bank conflicts.
+/// LDS: V_lds_T[128][130] + S_lds[64][130] + m/l/alpha = 49.5 KB, 1 WG/CU.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v4.hip");
+
+/// V_lds transpose variant of v5 (M=64, V_tile=32, f16 K/V). Same
+/// transpose optimization: Phase C b_reg reads become contiguous,
+/// bank-conflict-free. V_T_STRIDE=34 (V_tile+2). LDS: 25.5 KB, 2 WG/CU.
+/// Negative result on vision shape (-6.5% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n32_f16kv_v6_f32.hip");
+
+/// v7: M=128 two-pass sub-tiling (§14.4C). K-shared sub-tiles.
+/// Negative result (-10.9% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m128_n32_f16kv_v7_f32.hip");
+
+/// v7b: M=128 sequential sub-tiling, no K-sharing. Tests L2 warmth only.
+/// Negative result (-2.4% vs v5). Kept for bench.
+pub const ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7B_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m128_n32_f16kv_v7b_f32.hip");
+
+/// V_lds transpose variant of v3-causal. Same as v4 but with causal mask
+/// and tile skip. V_T_STRIDE_CAUSAL=130 for bank-conflict-free reads.
+pub const ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_CAUSAL_SRC: &str = include_str!("../../../kernels/src/attention_dflash_wmma_m64_n128_f16kv_v4_causal.hip");
+
 /// Standalone f32 → f16 elementwise cast kernel. Block [256], grid
 /// `ceil(n / 256)`. See `kernels/src/cast_f32_to_f16.hip`.
 pub const CAST_F32_TO_F16_SRC: &str = include_str!("../../../kernels/src/cast_f32_to_f16.hip");

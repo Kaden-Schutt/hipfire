@@ -29335,6 +29335,228 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             )
         }
     }
+    /// V_lds transpose variant of v3 (M=64, N=128, f16 K/V). The V_lds layout
+    /// is transposed from [n_tile][head_dim] to [head_dim][V_T_STRIDE] so that
+    /// Phase C b_reg reads are 16 consecutive f16 values (vectorizable to
+    /// ds_read_b128) and bank-conflict-free. V_T_STRIDE=130 (padded).
+    /// LDS: 49.5 KB, 1 WG/CU.
+    pub fn attention_dflash_wmma_m64_n128_f16kv_v4_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v4_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v4_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n128_f16kv_v4_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n128_f16kv_v4_f32: out must be F32");
+        assert!(
+            head_dim == 128,
+            "attention_dflash_wmma_m64_n128_f16kv_v4_f32: head_dim={head_dim} but this kernel is \
+             hard-coded to head_dim==128.",
+        );
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(
+            n_heads % n_kv_heads == 0,
+            "attention_dflash_wmma_m64_n128_f16kv_v4_f32: n_heads={n_heads} must be divisible by n_kv_heads={n_kv_heads}",
+        );
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n128_f16kv_v4_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_SRC,
+            "attention_dflash_wmma_m64_n128_f16kv_v4_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v4_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let v_t_stride = 130usize;
+        let s_lds_stride = 130usize;
+        let m_tile = 64usize;
+        let v_lds_bytes = head_dim * v_t_stride * 2;
+        let s_lds_bytes = m_tile * s_lds_stride * 2;
+        let scaler_bytes = m_tile * 4 * 3;
+        let shared_mem = (v_lds_bytes + s_lds_bytes + scaler_bytes) as u32;
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, q_tiles as u32, 1],
+                [128, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    /// V_lds transpose variant of v5 (M=64, V_tile=32). Negative result.
+    /// Kept for bench only.
+    pub fn attention_dflash_wmma_m64_n32_f16kv_v6_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "attention_dflash_wmma_m64_n32_f16kv_v6_f32: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n32_f16kv_v6_f32: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "attention_dflash_wmma_m64_n32_f16kv_v6_f32: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "attention_dflash_wmma_m64_n32_f16kv_v6_f32: out must be F32");
+        assert!(head_dim == 128, "attention_dflash_wmma_m64_n32_f16kv_v6_f32: head_dim must be 128");
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(n_heads % n_kv_heads == 0, "v6: n_heads must be divisible by n_kv_heads");
+        self.ensure_kernel(
+            "attention_dflash_wmma_m64_n32_f16kv_v6_f32",
+            kernels::ATTENTION_DFLASH_WMMA_M64_N32_F16KV_V6_SRC,
+            "attention_dflash_wmma_m64_n32_f16kv_v6_f32",
+        )?;
+        let func = &self.functions["attention_dflash_wmma_m64_n32_f16kv_v6_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let shared_mem = 25600u32; // same as v5
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k_f16.buf.as_ptr();
+        let mut vp = v_f16.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut bi = b as i32;
+        let mut li = l as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(func, [n_heads as u32, q_tiles as u32, 1], [128, 1, 1], shared_mem, self.stream_ref(), &mut params)
+        }
+    }
+    /// v7: M=128 K-shared sub-tiling. Negative result. Kept for bench.
+    pub fn attention_dflash_wmma_m128_n32_f16kv_v7_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "v7: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "v7: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "v7: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "v7: out must be F32");
+        assert!(head_dim == 128, "v7: head_dim must be 128");
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(n_heads % n_kv_heads == 0, "v7: n_heads must be divisible by n_kv_heads");
+        self.ensure_kernel("attention_dflash_wmma_m128_n32_f16kv_v7_f32", kernels::ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7_SRC, "attention_dflash_wmma_m128_n32_f16kv_v7_f32")?;
+        let func = &self.functions["attention_dflash_wmma_m128_n32_f16kv_v7_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let shared_mem = 25600u32;
+        let mut qp = q.buf.as_ptr(); let mut kp = k_f16.buf.as_ptr(); let mut vp = v_f16.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut bi = b as i32; let mut li = l as i32; let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![&mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void, &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void, &mut li as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
+        let q_tiles_128 = (b + 127) / 128;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, q_tiles_128 as u32, 1], [128, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+    /// v7b: M=128 sequential sub-tiling, no K-sharing. Negative result. Bench only.
+    pub fn attention_dflash_wmma_m128_n32_f16kv_v7b_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(q.dtype, DType::F32, "v7b: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "v7b: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "v7b: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "v7b: out must be F32");
+        assert!(head_dim == 128, "v7b: head_dim must be 128");
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(n_heads % n_kv_heads == 0, "v7b: n_heads must be divisible by n_kv_heads");
+        self.ensure_kernel("attention_dflash_wmma_m128_n32_f16kv_v7b_f32", kernels::ATTENTION_DFLASH_WMMA_M128_N32_F16KV_V7B_SRC, "attention_dflash_wmma_m128_n32_f16kv_v7b_f32")?;
+        let func = &self.functions["attention_dflash_wmma_m128_n32_f16kv_v7b_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let shared_mem = 25600u32;
+        let mut qp = q.buf.as_ptr(); let mut kp = k_f16.buf.as_ptr(); let mut vp = v_f16.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut bi = b as i32; let mut li = l as i32; let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![&mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void, &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void, &mut bi as *mut _ as *mut c_void, &mut li as *mut _ as *mut c_void, &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void, &mut hd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void];
+        let q_tiles_128 = (b + 127) / 128;
+        unsafe { self.hip.launch_kernel(func, [n_heads as u32, q_tiles_128 as u32, 1], [128, 1, 1], shared_mem, self.stream_ref(), &mut params) }
+    }
+    /// V_lds transpose variant of v3-causal. gfx11-only; falls back to
+    /// v3-causal on gfx12 (which has its own WMMA operand layout).
+    pub fn attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32(
+        &mut self,
+        q: &GpuTensor, k_f16: &GpuTensor, v_f16: &GpuTensor, out: &GpuTensor,
+        b: usize, l: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // v4-causal (V_lds transpose) is gfx11-only. Fall back to v3-causal
+        // on gfx12 (no V_lds transpose port yet — v3-causal.gfx12 sibling
+        // handles gfx12 WMMA operand differences).
+        if self.arch_caps.has_wmma_w32_gfx12() {
+            return self.attention_dflash_wmma_m64_n128_f16kv_v3_causal_f32(
+                q, k_f16, v_f16, out, b, l, n_heads, n_kv_heads, head_dim);
+        }
+        if !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32 requires wave32 WMMA; \
+                     arch={} does not support it. Use attention_causal_batched for this arch.",
+                    self.arch
+                ),
+            ));
+        }
+        assert_eq!(q.dtype, DType::F32, "v4_causal: q must be F32");
+        assert_eq!(k_f16.dtype, DType::F16, "v4_causal: k must be F16");
+        assert_eq!(v_f16.dtype, DType::F16, "v4_causal: v must be F16");
+        assert_eq!(out.dtype, DType::F32, "v4_causal: out must be F32");
+        assert!(head_dim == 128, "v4_causal: head_dim must be 128");
+        assert!(b > 0 && l > 0 && n_heads > 0 && n_kv_heads > 0);
+        assert!(n_heads % n_kv_heads == 0, "v4_causal: n_heads must be divisible by n_kv_heads");
+        self.ensure_kernel("attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32", kernels::ATTENTION_DFLASH_WMMA_M64_N128_F16KV_V4_CAUSAL_SRC, "attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32")?;
+        let func = &self.functions["attention_dflash_wmma_m64_n128_f16kv_v4_causal_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let v_t_stride = 130usize;
+        let s_lds_stride = 130usize;
+        let m_tile = 64usize;
+        let v_lds_bytes = head_dim * v_t_stride * 2;
+        let s_lds_bytes = m_tile * s_lds_stride * 2;
+        let scaler_bytes = m_tile * 4 * 3;
+        let shared_mem = (v_lds_bytes + s_lds_bytes + scaler_bytes) as u32;
+        let mut qp = q.buf.as_ptr(); let mut kp = k_f16.buf.as_ptr(); let mut vp = v_f16.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut bi = b as i32; let mut li = l as i32; let mut nh = n_heads as i32; let mut nkv = n_kv_heads as i32; let mut hd = head_dim as i32; let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void, &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void, &mut li as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void, &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void, &mut sc as *mut _ as *mut c_void,
+        ];
+        let q_tiles = (b + 63) / 64;
+        unsafe {
+            self.hip.launch_kernel(func, [n_heads as u32, q_tiles as u32, 1], [128, 1, 1], shared_mem, self.stream_ref(), &mut params)
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // Batch precompilation — compile all kernels a model needs in parallel
