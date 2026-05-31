@@ -4,7 +4,7 @@
 
 //! Batched GEMM prefill methods for RDNA GPUs.
 
-use crate::dispatch::{Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES};
+use crate::dispatch::{DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES};
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
@@ -15020,5 +15020,737 @@ impl Gpu {
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
-}
 
+    pub fn gemm_hfq4g256_lmhead_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            kernels::GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC,
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_lmhead_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_q8_0_wmma_x64(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma_x64: K must be %32");
+        debug_assert_eq!(batch_size % 64, 0, "gemm_q8_0_wmma_x64: N must be %64");
+        self.ensure_kernel(
+            "gemm_q8_0_wmma_x64",
+            kernels::GEMM_Q8_0_WMMA_X64_SRC,
+            "gemm_q8_0_wmma_x64",
+        )?;
+        let xp_owned = x.buf.as_ptr();
+        let mut xp = if matches!(x.dtype, DType::F16) {
+            xp_owned
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+        let mut a_p = a.buf.as_ptr();
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles   = (m + 15) / 16;
+        let batch_tiles = (batch_size + 63) / 64;
+        let bytes = m * (k / 32) * 34
+                  + batch_size * k * 2
+                  + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", "gemm_q8_0_wmma_x64", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemm_q8_0_wmma_x64",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_p); b.push_ptr(xp); b.push_ptr(y_p);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_q8_0_wmma_4w(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(k % 32, 0, "gemm_q8_0_wmma_4w: K must be a multiple of 32");
+        debug_assert_eq!(m % 64, 0, "gemm_q8_0_wmma_4w: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(batch_size % 64, 0, "gemm_q8_0_wmma_4w: N must be a multiple of 64 (got {batch_size})");
+        self.ensure_kernel(
+            "gemm_q8_0_wmma_4w",
+            kernels::GEMM_Q8_0_WMMA_4W_SRC,
+            "gemm_q8_0_wmma_4w",
+        )?;
+        // Stage F32 → F16 input if needed.
+        let xp_owned = x.buf.as_ptr();
+        let mut xp = if matches!(x.dtype, DType::F16) {
+            xp_owned
+        } else {
+            self.ensure_fp16_x(x, batch_size * k)?
+        };
+
+        let mut a_p = a.buf.as_ptr();
+        let mut y_p = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_p as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut y_p as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 63) / 64;
+        let batch_tiles = (batch_size + 63) / 64;
+        let func = &self.functions["gemm_q8_0_wmma_4w"];
+        unsafe {
+            self.hip.launch_kernel(
+                func, [row_tiles as u32, batch_tiles as u32, 1],
+                [128, 1, 1], 0, self.stream_ref(), &mut params,
+            )
+        }
+    }
+    pub fn gemm_f16_x_f16_wmma(
+        &mut self,
+        a_f16: &GpuTensor, x_f16: &GpuTensor, y_f32: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_f16_x_f16_wmma",
+            kernels::GEMM_F16_X_F16_WMMA_SRC,
+            "gemm_f16_x_f16_wmma",
+        )?;
+        let func = &self.functions["gemm_f16_x_f16_wmma"];
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, grid_b, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+    pub fn gemm_f32_register_tiled(
+        &mut self,
+        a: &GpuTensor, x: &GpuTensor, y: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kname, src, batch_tile, block_x) = (
+            "gemm_f32_register_tiled",
+            kernels::GEMM_F32_REGISTER_TILED_SRC,
+            8u32, 32u32,
+        );
+        self.ensure_kernel(kname, src, kname)?;
+        let func = &self.functions[kname];
+        let mut ap = a.buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut yp = y.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_y = (batch_size as u32 + batch_tile - 1) / batch_tile;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, grid_y, 1],
+                [block_x, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    pub fn gemm_hfq4g256_wmma(
+        &mut self,
+        a_raw: &GpuTensor, x_f16: &GpuTensor, y_f32: &GpuTensor,
+        m: usize, k: usize, batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_wmma",
+            kernels::GEMM_HFQ4G256_WMMA_SRC,
+            "gemm_hfq4g256_wmma",
+        )?;
+        let func = &self.functions["gemm_hfq4g256_wmma"];
+        let ap = a_raw.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+        ];
+        let grid_m = ((m + 15) / 16) as u32;
+        let grid_b = ((batch_size + 15) / 16) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_m, grid_b, 1], [32, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_k2";
+        let kernel_src = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_K2_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW: MQ2-Lloyd weight is 72 B/group, half of HFQ4's 136 B/group.
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        // Row tiles widen 16 → 64; slot tiles unchanged at 16.
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        // BW unchanged from baseline: same total data movement, the
+        // win is in B-fragment cache reuse across warps.
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_MMQLOAD_NOSYNC_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_N32_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        // Each block handles TWO 16-slot tiles → halve the slot-tile grid dim.
+        let slot_tiles = (((m_total + 15) / 16 + 1) / 2) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_4W_K2_CND_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 63) / 64) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [128, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert_eq!(m % 64, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2: M must be a multiple of 64 (got {m})");
+        debug_assert_eq!(k % 256, 0, "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2: K must be a multiple of 256 (got {k})");
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2";
+        let kernel_src  = kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_WMMA_8W_K2_SRC;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_name)?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val   = m as i32;
+        let k_val   = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val  = m_total as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles  = ((m + 127) / 128) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + (m_total * m) * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "gemm", kernel_name, bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1], [256, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep); b.push_ptr(tp); b.push_ptr(sp);
+                b.push_ptr(xp); b.push_ptr(yp);
+                b.push_i32(m_val); b.push_i32(k_val);
+                b.push_i32(xrd_val); b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+}
+}

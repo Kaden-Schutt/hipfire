@@ -315,4 +315,112 @@ impl Gpu {
         };
         result
     }
+
+    pub fn argmax_token_chain_f32(
+        &mut self,
+        data: &GpuTensor,
+        argmax_out: &GpuTensor,
+        token_chain: &GpuTensor,
+        vocab_map: Option<&GpuTensor>,
+        n: usize,
+        dst_slot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "argmax_token_chain",
+            kernels::ARGMAX_TOKEN_CHAIN_SRC,
+            "argmax_token_chain_f32",
+        )?;
+
+        let mut dp = data.buf.as_ptr();
+        let mut ap = argmax_out.buf.as_ptr();
+        let mut cp = token_chain.buf.as_ptr();
+        let mut vp = vocab_map
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let mut nn = n as i32;
+        let mut ds = dst_slot as i32;
+        let mut use_map = i32::from(vocab_map.is_some());
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void,
+            &mut use_map as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8; // f32 + i32 per thread
+        self.launch_maybe_blob(
+            "argmax_token_chain_f32",
+            [1, 1, 1],
+            [block_size, 1, 1],
+            shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(vp);
+                b.push_i32(nn);
+                b.push_i32(ds);
+                b.push_i32(use_map);
+                b
+            },
+        )
+    }
+
+    /// Device-side greedy accept prefix scan over verify argmaxes and MTP
+    /// candidates. `result[0]` is accept_count; `result[1]` is the bonus
+    /// token, or -1 if an accepted candidate was EOS and no bonus is present.
+    pub fn greedy_accept_from_argmax_i32(
+        &mut self,
+        argmax_per_pos: &GpuTensor,
+        candidates: &GpuTensor,
+        result: &GpuTensor,
+        drafts_generated: usize,
+        eos_token_id: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "greedy_accept",
+            kernels::GREEDY_ACCEPT_SRC,
+            "greedy_accept_from_argmax_i32",
+        )?;
+
+        let mut ap = argmax_per_pos.buf.as_ptr();
+        let mut cp = candidates.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut dg = drafts_generated as i32;
+        let mut eos = eos_token_id as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut dg as *mut _ as *mut c_void,
+            &mut eos as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "greedy_accept_from_argmax_i32",
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(rp);
+                b.push_i32(dg);
+                b.push_i32(eos);
+                b
+            },
+        )
+    }
 }

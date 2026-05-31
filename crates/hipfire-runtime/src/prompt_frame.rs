@@ -201,6 +201,7 @@ struct ChatScaffold<'a> {
     system_role: Vec<u32>,
     user_role: Vec<u32>,
     assistant_role: Vec<u32>,
+    tool_role: Vec<u32>,
     /// `<think>` opener (if the tokenizer recognizes it as a single
     /// special token). When `None`, `OpenThink` falls back to `Plain`
     /// — see `append_assistant_prefix`.
@@ -221,6 +222,7 @@ impl<'a> ChatScaffold<'a> {
             system_role: t.encode("system"),
             user_role: t.encode("user"),
             assistant_role: t.encode("assistant"),
+            tool_role: t.encode("tool"),
             think_open: t.special_token_id("<think>"),
             think_close: t.special_token_id("</think>"),
         }
@@ -255,6 +257,30 @@ impl<'a> ChatScaffold<'a> {
         let body = self.tokenizer.encode(content);
         out.extend_from_slice(&self.im_start);
         out.extend_from_slice(&self.assistant_role);
+        out.extend_from_slice(&self.nl);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&self.im_end);
+        out.extend_from_slice(&self.nl);
+    }
+
+    /// Append an assistant turn where the body is already tokenized
+    /// (typically a verbatim replay from the daemon's
+    /// `asst_turn_cache`). Distinct from `append_assistant_turn` so
+    /// callers don't have to detour through a tokenizer round-trip
+    /// that BPE isn't bijective under for the model's emitted tokens.
+    fn append_assistant_turn_tokens(&self, out: &mut Vec<u32>, body: &[u32]) {
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.assistant_role);
+        out.extend_from_slice(&self.nl);
+        out.extend_from_slice(body);
+        out.extend_from_slice(&self.im_end);
+        out.extend_from_slice(&self.nl);
+    }
+
+    fn append_tool_turn(&self, out: &mut Vec<u32>, content: &str) {
+        let body = self.tokenizer.encode(content);
+        out.extend_from_slice(&self.im_start);
+        out.extend_from_slice(&self.tool_role);
         out.extend_from_slice(&self.nl);
         out.extend_from_slice(&body);
         out.extend_from_slice(&self.im_end);
@@ -297,6 +323,123 @@ impl<'a> ChatScaffold<'a> {
             AssistantPrefix::Plain => {}
         }
     }
+}
+
+/// Build a multi-turn token stream from structured history, splicing
+/// cached verbatim token sequences for any historical assistant turn
+/// that `cache_lookup` returns `Some` for. Used by the daemon's Qwen
+/// prompt-cache path so that the rendered prefix is byte-identical to
+/// what was written into KV by prior turns — required for an LCP-based
+/// suffix prefill to extend through historical assistant turns (BPE is
+/// not bijective; re-encoding `msg.content` may produce a different
+/// token sequence than the one the model actually emitted).
+///
+/// Format mirrors the inline ChatML format consumed by the daemon
+/// today (`<|im_start|>{role}\n{content}<|im_end|>\n`):
+///   - System turn emitted once at top when `system.is_some()`
+///   - User turn: `<|im_start|>user\n{content}<|im_end|>\n`
+///   - Tool turn: `<|im_start|>tool\n<tool_response>\n{content}\n</tool_response><|im_end|>\n`
+///   - Assistant turn: `<|im_start|>assistant\n{body}<|im_end|>\n` where
+///     `body` is either the cached verbatim sequence or
+///     `tokenizer.encode(msg.content) + tool_calls_as_text` on miss.
+///
+/// `live_user_tokens` is appended as the trailing user turn (the
+/// request's live prompt). `assistant_prefix` adds the
+/// `<|im_start|>assistant\n[<think>...]` trailer the model decodes from.
+pub fn build_cached_history(
+    tokenizer: &Tokenizer,
+    system: Option<&str>,
+    history: &[Message],
+    live_user_tokens: &[u32],
+    assistant_prefix: AssistantPrefix,
+    mut cache_lookup: impl FnMut(&Message) -> Option<Vec<u32>>,
+) -> Vec<u32> {
+    let scaffold = ChatScaffold::for_tokenizer(tokenizer);
+    let mut out: Vec<u32> = Vec::new();
+    if let Some(sys) = system {
+        scaffold.append_system(&mut out, sys);
+    }
+    // If the trailing history message is a User, treat its content as
+    // the live prompt and drop it here — caller already passes the
+    // live user via `live_user_tokens`. Without this trim, the live
+    // user turn gets rendered twice (once from history, once from
+    // `live_user_tokens`). Mirrors V4F's daemon-side renderer at
+    // `crates/hipfire-runtime/examples/daemon.rs:5163`.
+    let trim_end = if matches!(history.last().map(|m| &m.role), Some(Role::User)) {
+        1
+    } else {
+        0
+    };
+    let history = &history[..history.len().saturating_sub(trim_end)];
+    for msg in history {
+        match msg.role {
+            // System messages in history are emitted via the top-level
+            // `system` parameter above. Embedded system turns in
+            // `history` are ignored to avoid duplication.
+            Role::System => {}
+            Role::User => scaffold.append_user_turn(&mut out, &msg.content),
+            Role::Tool => {
+                let wrapped = format!("<tool_response>\n{}\n</tool_response>", msg.content);
+                scaffold.append_tool_turn(&mut out, &wrapped);
+            }
+            Role::Assistant => {
+                // Emit `<|im_start|>assistant\n` plus the same
+                // `assistant_prefix` scaffolding the daemon used as the
+                // prompt-side prefix when this turn was originally
+                // generated (e.g. `<think>\n\n</think>\n\n` for
+                // thinking-off `ClosedThink`). Without it the cached
+                // body sits at the wrong KV offset and LCP fails right
+                // at the assistant turn boundary. Assumes the
+                // assistant_prefix has stayed constant across the
+                // conversation — true for typical OpenAI clients that
+                // don't toggle `chat_template_kwargs.enable_thinking`
+                // mid-session; turns with a mid-session toggle simply
+                // degrade to cache miss (LCP detects the divergence).
+                scaffold.append_assistant_prefix(&mut out, assistant_prefix);
+                if let Some(cached) = cache_lookup(msg) {
+                    out.extend_from_slice(&cached);
+                } else {
+                    // Cache miss — render the turn via tokenizer.encode
+                    // of the content + tool_calls. The resulting token
+                    // sequence may diverge from what the model originally
+                    // emitted (BPE non-bijectivity for the boundaries),
+                    // which is fine: the LCP check downstream will
+                    // detect divergence and trigger a full reset.
+                    if !msg.content.is_empty() && msg.content != "null" {
+                        out.extend(tokenizer.encode(&msg.content));
+                    }
+                    for tc in &msg.tool_calls {
+                        let payload = serde_json::json!({
+                            "name": tc.name,
+                            "arguments": tc.arguments,
+                        });
+                        let rendered = format!(
+                            "\n<tool_call>\n{}\n</tool_call>",
+                            serde_json::to_string(&payload).unwrap_or_default(),
+                        );
+                        out.extend(tokenizer.encode(&rendered));
+                    }
+                }
+                out.extend_from_slice(&scaffold.im_end);
+                out.extend_from_slice(&scaffold.nl);
+            }
+        }
+    }
+    // Skip the trailing user turn when there's no live user content
+    // (happens when the agent loop is continuing after a tool result
+    // and the caller doesn't supply a new user message — OpenAI's
+    // tool-use flow lets the model decode directly from the tool
+    // response). Without this guard we emit an empty
+    // `<|im_start|>user\n<|im_end|>\n` wrap which (a) is off-distribution
+    // for the model and (b) gets baked into conversation_tokens,
+    // breaking the LCP on the NEXT turn because the renderer then
+    // includes that empty user in its historical replay while the
+    // newer turn's history doesn't have it.
+    if !live_user_tokens.is_empty() {
+        scaffold.append_user_turn_tokens(&mut out, live_user_tokens);
+    }
+    scaffold.append_assistant_prefix(&mut out, assistant_prefix);
+    out
 }
 
 // ─── Jinja path — render upstream HF chat_template ──────────────────────────

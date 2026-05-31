@@ -20,6 +20,7 @@ The shape of this file is lifted from
 | [llama.cpp](https://github.com/ggerganov/llama.cpp) | ggerganov + upstream contributors | GGUF format reference for the import path; the MQ4/MQ3/MQ2 family is a parallel Magnum Quants line, not a fork, but the GGUF reader cribs from llama.cpp's parser. Also our standing prefill/decode comparison baseline and the source of most of the "what does this RDNA card do under llama.cpp" intuition. |
 | [candle](https://github.com/huggingface/candle) | Hugging Face | Rust ML reference for tensor layout, safetensors import, and quantization-format plumbing. We do not depend on candle at runtime; it is the closest existing Rust-native reference for "what a clean inference engine looks like" and informs the engine crate's API shape. |
 | [Lucebox DFlash on ggml](https://www.lucebox.com/blog/dflash27b) | Lucebox | Standalone C++/ggml/CUDA DFlash for Qwen 3.5-27B on a single RTX 3090. Concrete published numbers to target, n_gen-aware bench methodology, and the shape of Path C (DDTree wire-up). |
+| [ds4](https://github.com/antirez/ds4) | antirez | Standalone C99 reference inference for DeepSeek V4 Flash. Source of truth for `crates/hipfire-arch-deepseek4`: MTP head wiring, Hyper-Connections head-reduction algebra, raw-SWA + compressed-KV cache layout, and the tail-only YaRN RoPE convention. Our forward pass matches its numeric outputs at temp=0 within FMA-order noise. |
 
 ## Rust Crates and Runtimes
 

@@ -27,6 +27,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::multi_gpu::Gpus;
+use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_llama::Llama;
 use hipfire_arch_qwen2::qwen2;
 use hipfire_arch_dots_ocr::dots_ocr;
@@ -43,7 +44,79 @@ use base64::Engine;
 use hip_bridge::HipResult;
 use std::io::{BufRead, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Instant;
+
+/// Abort-target request ID. Set asynchronously by the background
+/// stdin-reader thread when it sees `{type:"abort","id":"..."}`;
+/// consumed and cleared by `check_abort()` from the main thread's
+/// prefill chunk loop. Using an Option<String> rather than a bool
+/// makes the abort targeted — stale aborts from a prior request
+/// can't kill a new request that happens to be running by the time
+/// the message lands.
+fn abort_for_id() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// True if the in-flight request with `req_id` has been aborted.
+/// Clears the flag on match so the next request with the same ID
+/// (unlikely but possible — CLI generates request IDs) starts clean.
+fn check_abort(req_id: &str) -> bool {
+    let mut g = abort_for_id().lock().unwrap();
+    if g.as_deref() == Some(req_id) {
+        *g = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Force-answer target request ID, set by the stdin-reader thread on
+/// `{type:"force_answer","id":"..."}`. Unlike `abort` (which kills the
+/// turn), force-answer asks the decode loop to STOP THINKING and commit
+/// to the answer — the model's `<think>` span is force-closed (the same
+/// continuation the `max_think_tokens` budget splices) and generation
+/// continues. The CLI sends this when a turn is taking too long so the
+/// stream produces a real answer instead of the client timing out and
+/// terminating mid-think.
+fn force_answer_for_id() -> &'static Mutex<Option<String>> {
+    static CELL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// True if the in-flight request `req_id` was asked to force-answer.
+/// Clears on match (one-shot).
+fn check_force_answer(req_id: &str) -> bool {
+    let mut g = force_answer_for_id().lock().unwrap();
+    if g.as_deref() == Some(req_id) {
+        *g = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// The text spliced into the stream to force-close a `<think>` span (on
+/// either the `max_think_tokens` budget OR a CLI force-answer signal),
+/// making the model commit to its answer. Default closes the think tag
+/// per Qwen's trained post-think format; override with
+/// `HIPFIRE_THINK_CONTINUATION` to inject a richer "now produce the
+/// answer" nudge (keep it short — it's prepended to the visible answer).
+fn think_continuation() -> String {
+    std::env::var("HIPFIRE_THINK_CONTINUATION").unwrap_or_else(|_| "</think>\n\n".to_string())
+}
+
+/// Message types pushed from the stdin-reader thread to the main
+/// processing loop. Abort messages are NOT forwarded — they're
+/// handled inline in the reader thread by setting `abort_for_id()`.
+/// This is what lets the abort signal interrupt a mid-flight prefill;
+/// the main loop is blocked on prefill compute and would only see
+/// new stdin lines after that prefill completed.
+enum DaemonMsg {
+    Regular(serde_json::Value),
+    ParseError(String),
+}
 
 /// Eviction policy wrapper — dispatches to plain TriAttention or CASK m-folding.
 enum Eviction {
@@ -175,6 +248,628 @@ fn block_attractor_unclosed_cpu(
 // Off by default — env var read once on first call. The probe binary
 // (`examples/coherence_probe.rs`) sets the env on the daemon child it
 // spawns. Existing JSONL clients see no change.
+
+/// LRU-bounded fingerprint→tokens cache for assistant-turn replay
+/// (`asst_turn_cache`). Holds the verbatim token sequence each
+/// assistant turn emitted during decode, keyed by
+/// [`asst_turn_fingerprint`]. On the next request, the multi-turn
+/// renderer replays cached tokens at the same turn boundary so the
+/// rendered prefix is byte-identical to what was written into KV last
+/// turn — required for the LCP-based prompt cache to extend through
+/// historical assistant turns (BPE is not bijective; re-encoding a
+/// model's emission may produce a different token sequence).
+///
+/// Cap is configurable via `HIPFIRE_PROMPT_CACHE_CAP` (default 32);
+/// `HIPFIRE_PROMPT_CACHE_UNBOUNDED=1` removes the cap entirely. On
+/// `insert`, an existing key is moved to MRU; on `get`, the same. When
+/// at capacity, the LRU (oldest-touched) entry is evicted.
+struct AsstTurnCache {
+    cap: Option<usize>,
+    map: std::collections::HashMap<u64, Vec<u32>>,
+    order: std::collections::VecDeque<u64>,
+}
+
+impl AsstTurnCache {
+    fn new_from_env() -> Self {
+        let unbounded = std::env::var("HIPFIRE_PROMPT_CACHE_UNBOUNDED").ok().as_deref()
+            == Some("1");
+        let cap = if unbounded {
+            None
+        } else {
+            Some(
+                std::env::var("HIPFIRE_PROMPT_CACHE_CAP")
+                    .ok()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(32),
+            )
+        };
+        Self {
+            cap,
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn touch_mru(&mut self, fp: u64) {
+        // O(N) scan; N is bounded by `cap` (32 by default), so this is
+        // effectively constant-time for the configured size.
+        if let Some(pos) = self.order.iter().position(|k| *k == fp) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(fp);
+    }
+
+    fn contains_key(&self, fp: &u64) -> bool {
+        self.map.contains_key(fp)
+    }
+
+    fn get(&mut self, fp: &u64) -> Option<&Vec<u32>> {
+        if self.map.contains_key(fp) {
+            self.touch_mru(*fp);
+            self.map.get(fp)
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, fp: u64, tokens: Vec<u32>) {
+        if self.map.contains_key(&fp) {
+            self.map.insert(fp, tokens);
+            self.touch_mru(fp);
+            return;
+        }
+        // Evict oldest if we're at cap.
+        if let Some(c) = self.cap {
+            while self.order.len() >= c {
+                if let Some(old) = self.order.pop_front() {
+                    self.map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
+        self.map.insert(fp, tokens);
+        self.order.push_back(fp);
+    }
+
+    #[allow(dead_code)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// Stable fingerprint over an assistant turn — pair of (text content,
+/// tool_calls canonical JSON). Output is identical for two messages
+/// that have the same content+tool_calls regardless of how the
+/// surrounding bytes (e.g. whitespace inside JSON args) were rendered
+/// upstream. Used by the V4F prefix-cache to identify "this is the
+/// same assistant turn the model previously emitted, so reuse the
+/// emitted token IDs verbatim instead of re-encoding via the DSML
+/// renderer + BPE (which is not bijective)."
+fn asst_turn_fingerprint(
+    content: &str,
+    tool_calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    "assistant".hash(&mut h);
+    if tool_calls.is_empty() {
+        // Pure-text turn — content IS the message. Trim whitespace
+        // to absorb minor formatting drift between store (model's
+        // verbatim emission) and lookup (whatever the client preserved).
+        content.trim().hash(&mut h);
+    } else {
+        // Mixed turn (text + tool_calls) or pure tool_call. Hash ONLY
+        // the tool_calls — pi-coding-agent (and most OpenAI-compat
+        // clients) sends `content: null` on assistant messages that
+        // carry tool_calls, even when the model originally emitted
+        // prose ahead of the tool block (e.g. "Let me check the
+        // structure first.<｜DSML｜tool_calls>…"). The store-side
+        // sees the prose in `emit_text_buf`; the lookup-side sees
+        // content=`""`. Excluding content from the fingerprint when
+        // tool_calls is non-empty matches the client's effective
+        // identity for tool-call turns and lets the cache hit.
+        //
+        // Collision risk: two distinct turns with identical
+        // tool_calls hash to the same key; the later store wins,
+        // and a replay of the earlier turn replays the later turn's
+        // tokens. In practice this only matters when the model emits
+        // the SAME tool_call twice with different surrounding prose
+        // in the same conversation — uncommon for agent flows, and
+        // the worst-case effect is the model seeing slightly altered
+        // prose in its own history.
+    }
+    for tc in tool_calls {
+        tc.name.hash(&mut h);
+        // Serialize args in a CANONICAL form: walk the Value tree and
+        // emit objects with keys sorted lexically (recursively). The
+        // upstream `serde_json::Map` uses insertion order — fine for
+        // round-tripping a single payload, but two clients (or two
+        // parser passes on the same payload) can yield different
+        // insertion orders for the same logical args. Without
+        // canonicalization those two turns hash to DIFFERENT keys,
+        // dropping cache hit rate on otherwise-identical tool calls.
+        let args = canonical_json(&tc.arguments);
+        args.hash(&mut h);
+    }
+    h.finish()
+}
+
+/// Build the fingerprint-key string for an emitted assistant turn so
+/// it matches `msg.content` as the CLI sends it back next turn.
+/// Mirrors the *visible-content* transformation the bun CLI's HTTP
+/// serve applies between SSE-relay and `messages[].content`:
+///
+///   1. Strip paired `<think>…</think>` blocks plus any trailing
+///      whitespace (`cli/index.ts:1656-1658`).
+///   2. Strip an unclosed `<think>…$` tail (same site).
+///   3. Strip an orphan `</think>` opener — when the daemon's prompt
+///      ends with `<think>\n` the model resumes inside think mode and
+///      never emits an opening tag; the CLI's `inThink` state machine
+///      (`cli/index.ts:2334-2365`) treats every token until `</think>`
+///      as `reasoning_content` and only emits content from after the
+///      close. We match that by stripping `text-up-to-and-including-
+///      first-</think>` + trailing whitespace when no `<think>`
+///      preceded it.
+///   4. Strip the literal `<|im_end|>` substring (the CLI relay
+///      removes it at `cli/index.ts:2366`).
+///
+/// Without (3) and (4) the fingerprint stored after turn N would
+/// include reasoning + the ChatML terminator that the CLI strips
+/// before sending back as `msg.content` on turn N+1, dropping the
+/// cache hit rate to ~zero for thinking-on Qwen models.
+fn strip_think_for_fingerprint(s: &str) -> String {
+    let mut out = s.to_string();
+    // (1) + (2): paired/unclosed `<think>` blocks.
+    loop {
+        let open = match out.find("<think>") {
+            Some(i) => i,
+            None => break,
+        };
+        match out[open..].find("</think>") {
+            Some(close_rel) => {
+                let close_end = open + close_rel + "</think>".len();
+                let mut tail = close_end;
+                let bytes = out.as_bytes();
+                while tail < bytes.len() {
+                    let c = bytes[tail];
+                    if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+                        tail += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.replace_range(open..tail, "");
+            }
+            None => {
+                out.truncate(open);
+                break;
+            }
+        }
+    }
+    // (3): orphan `</think>` closer with no preceding opener (model
+    // resumed inside think mode from the prompt's `<think>\n` prefix).
+    if let Some(close_idx) = out.find("</think>") {
+        let after_close = close_idx + "</think>".len();
+        let mut tail = after_close;
+        let bytes = out.as_bytes();
+        while tail < bytes.len() {
+            let c = bytes[tail];
+            if c == b' ' || c == b'\n' || c == b'\t' || c == b'\r' {
+                tail += 1;
+            } else {
+                break;
+            }
+        }
+        out.replace_range(0..tail, "");
+    }
+    // (4): strip the literal `<|im_end|>` substring (CLI relay strips
+    // it from every chunk before forwarding as content).
+    while let Some(idx) = out.find("<|im_end|>") {
+        out.replace_range(idx..idx + "<|im_end|>".len(), "");
+    }
+    out
+}
+
+/// Extract `<tool_call>{json}</tool_call>` blocks from emitted assistant
+/// text. Mirrors `cli/index.ts:parseToolCalls` minus the MQ4 #111
+/// repair paths — we don't need round-tripping fidelity for malformed
+/// blocks since the fingerprint just needs to MATCH what the CLI sends
+/// back, and the CLI normalizes through the same parser.
+fn extract_tool_calls_from_text(
+    s: &str,
+) -> Vec<hipfire_runtime::prompt_frame::ToolCall> {
+    let mut out: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut search_pos = 0;
+    while let Some(open_rel) = s[search_pos..].find("<tool_call>") {
+        let body_start = search_pos + open_rel + "<tool_call>".len();
+        // Unclosed `<tool_call>` — model hit max_tokens or truncated;
+        // treat the rest of the string as the body. CLI parser does
+        // the same via the `<tool_call>\s*(.*)` regex branch. Without
+        // this, a truncated emit stores `tool_calls=0`, the CLI on the
+        // wire parses `tool_calls=1`, and the asst-turn fingerprint
+        // mismatches on echo-back → cache miss.
+        let (body_end, advance) = match s[body_start..].find("</tool_call>") {
+            Some(i) => (body_start + i, body_start + i + "</tool_call>".len()),
+            None => (s.len(), s.len()),
+        };
+        let body_raw = &s[body_start..body_end];
+        // Sanitize ChatML special-token leakage (mirrors CLI's
+        // parseOneToolCall: cli/index.ts:2273-2278). qwen3.6:27b
+        // occasionally glues `<|im_start|>` / `<|im_end|>` / etc. into
+        // the JSON body when the tokenizer's special-token boundary
+        // catches the JSON key opener.
+        let body_clean: String = body_raw
+            .replace("<|im_start|>", "")
+            .replace("<|im_end|>", "")
+            .replace("<|endoftext|>", "")
+            .replace("<|im_sep|>", "");
+        // Strip nested `<tool_call>` openers (MQ4 attractor: model
+        // stacks 1-2 nested openers before the JSON body lands).
+        let mut body_stripped = body_clean.trim_start();
+        while body_stripped.starts_with("<tool_call>") {
+            body_stripped = body_stripped["<tool_call>".len()..].trim_start();
+        }
+        let body = body_stripped.trim();
+        if !body.is_empty() {
+            // Form 1: strict JSON parse
+            let mut parsed: Option<(String, serde_json::Value)> = None;
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
+                let name = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if !name.is_empty() {
+                    let arguments = val
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                    parsed = Some((name, arguments));
+                }
+            }
+            // Form 4 (regex fallback): when JSON parse fails, recover
+            // name + arguments via a relaxed key-delimiter pattern.
+            // Mirrors cli/index.ts:2287-2295.
+            if parsed.is_none() {
+                if let Some(name) = extract_tool_call_name_fallback(body) {
+                    if let Some(arguments) = extract_tool_call_arguments_fallback(body) {
+                        // Recovered a complete, strict-valid args object.
+                        parsed = Some((name, arguments));
+                    } else if tool_call_args_object_complete(body) {
+                        // The args object is present and brace-balanced but not
+                        // strict JSON (trailing comma, unquoted key, …) — a
+                        // model formatting glitch, not a truncation. Preserve
+                        // the call by name with empty args (legacy behavior).
+                        parsed = Some((name, serde_json::Value::Object(Default::default())));
+                    }
+                    // else: NO balanced args object — the call was cut off
+                    // mid-value by `max_tokens` or a grammar force-close.
+                    // Dropping it (rather than fabricating empty `{}`) keeps a
+                    // broken call from being delivered as executable: the
+                    // client would otherwise invoke e.g. `write({})` and fail
+                    // schema validation (the write-tool empty-args incident).
+                    // The truncated emission instead surfaces as content +
+                    // finish_reason so the client retries.
+                }
+            }
+            if let Some((name, arguments)) = parsed {
+                out.push(hipfire_runtime::prompt_frame::ToolCall { name, arguments });
+            }
+        }
+        search_pos = advance;
+        if advance == s.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Relaxed name extraction: matches `"name": "X"` (or `'name': 'X'`,
+/// or with an opening quote replaced by a special-token boundary —
+/// `name": "X"`). Mirrors CLI Form 4 regex in `parseOneToolCall`.
+///
+/// Walks the string looking for `name` substring occurrences. For each,
+/// validates the byte before it is a JSON key-position char ({ , " ' or
+/// whitespace) — false matches like `firstname` get skipped and the
+/// walk continues. First valid `name: "value"` match wins.
+fn extract_tool_call_name_fallback(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut search_from = 0usize;
+    while let Some(idx_rel) = s[search_from..].find("name") {
+        let abs = search_from + idx_rel;
+        // Advance search anchor past this "name" regardless of outcome
+        // so the next iteration looks for the next occurrence.
+        let after_name = abs + "name".len();
+        search_from = after_name;
+        // Key-position check: byte before `name` must be a JSON key
+        // boundary char. Skips false matches like the `name` substring
+        // inside `firstname` / `lastname` / etc.
+        let pre = if abs == 0 { b' ' } else { bytes[abs - 1] };
+        let pre_ok = matches!(
+            pre,
+            b'{' | b',' | b' ' | b'\n' | b'\t' | b'"' | b'\''
+        );
+        if !pre_ok {
+            continue;
+        }
+        let mut j = after_name;
+        // Skip optional closing quote on the key.
+        if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+            j += 1;
+        }
+        // Skip whitespace before `:`.
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        // Require `:`.
+        if j >= bytes.len() || bytes[j] != b':' {
+            continue;
+        }
+        j += 1;
+        // Skip whitespace after `:`.
+        while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+            j += 1;
+        }
+        // Require opening quote for the value.
+        if j >= bytes.len() || (bytes[j] != b'"' && bytes[j] != b'\'') {
+            continue;
+        }
+        let q = bytes[j];
+        j += 1;
+        let val_start = j;
+        while j < bytes.len() && bytes[j] != q {
+            j += 1;
+        }
+        if j >= bytes.len() {
+            continue;
+        }
+        let name = &s[val_start..j];
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
+        {
+            continue;
+        }
+        return Some(name.to_string());
+    }
+    None
+}
+
+/// Best-effort `arguments` extraction: find the first balanced `{...}`
+/// after the `arguments`-style key, parse it as JSON. Returns None if
+/// no balanced object is found or the object isn't valid JSON.
+fn extract_tool_call_arguments_fallback(s: &str) -> Option<serde_json::Value> {
+    let key_idx = s.find("arguments")?;
+    let tail = &s[key_idx + "arguments".len()..];
+    // Skip key terminator + colon + whitespace
+    let mut chars = tail.char_indices().peekable();
+    while let Some(&(_, c)) = chars.peek() {
+        if c == '"' || c == '\'' || c == ':' || c.is_whitespace() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    let obj_rel_start = chars.next().map(|(i, _)| i)?;
+    let obj_start = key_idx + "arguments".len() + obj_rel_start;
+    let after_key = &s[obj_start..];
+    // Need to find the opening brace
+    let brace_off = after_key.find('{')?;
+    let abs_start = obj_start + brace_off;
+    // Walk to find the matching close brace
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut k = abs_start;
+    while k < bytes.len() {
+        let ch = bytes[k];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == b'\\' {
+                escape = true;
+            } else if ch == b'"' {
+                in_str = false;
+            }
+        } else if ch == b'"' {
+            in_str = true;
+        } else if ch == b'{' {
+            depth += 1;
+        } else if ch == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                let slice = &s[abs_start..=k];
+                return serde_json::from_str(slice).ok();
+            }
+        }
+        k += 1;
+    }
+    None
+}
+
+/// True iff a brace-balanced `{...}` object exists after the `arguments`
+/// key — i.e. the args object is COMPLETE (not truncated), regardless of
+/// whether it is strict-valid JSON. Distinguishes a model formatting glitch
+/// (trailing comma / unquoted key — keep the call) from a generation cut off
+/// mid-args (drop the call). Mirrors the brace walk in
+/// [`extract_tool_call_arguments_fallback`] but stops at the matching close
+/// brace without requiring valid JSON.
+fn tool_call_args_object_complete(s: &str) -> bool {
+    let key_idx = match s.find("arguments") {
+        Some(i) => i,
+        None => return false,
+    };
+    let after_key = &s[key_idx + "arguments".len()..];
+    let brace_off = match after_key.find('{') {
+        Some(i) => i,
+        None => return false,
+    };
+    let abs_start = key_idx + "arguments".len() + brace_off;
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut k = abs_start;
+    while k < bytes.len() {
+        let ch = bytes[k];
+        if in_str {
+            if escape {
+                escape = false;
+            } else if ch == b'\\' {
+                escape = true;
+            } else if ch == b'"' {
+                in_str = false;
+            }
+        } else if ch == b'"' {
+            in_str = true;
+        } else if ch == b'{' {
+            depth += 1;
+        } else if ch == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return true;
+            }
+        }
+        k += 1;
+    }
+    false
+}
+
+/// Walk a [`serde_json::Value`] and produce a canonical-key
+/// representation: objects emit keys in lexical order (recursively),
+/// arrays preserve order. Used by [`asst_turn_fingerprint`] so two
+/// messages with the same logical tool args hash identically
+/// regardless of source-side insertion order.
+fn canonical_json(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => {
+            out.push_str(&serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()))
+        }
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, item) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(item, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                write_canonical_json(&map[*k], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Safely emit a `{"type":"error", …}` JSONL line. Builds the envelope
+/// through `serde_json::json!` so embedded `"` / `\` / control chars in
+/// the message or `id` can't corrupt the line and trigger a client-side
+/// `JSON Parse error: Expected '}'` parse loop. Use this instead of
+/// `writeln!(stdout, r#"{{"type":"error",…}}"#, …)` with raw `{}` / `{:?}`
+/// interpolation of error values — Rust's `Display` will pass through
+/// a `"` unchanged, and `Debug` actively wraps strings in escaped quotes,
+/// both of which break the surrounding JSON.
+fn emit_error_with_id(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "id": id,
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+#[allow(dead_code)]
+fn emit_error_no_id(
+    stdout: &mut std::io::Stdout,
+    message: impl std::fmt::Display,
+) {
+    let envelope = serde_json::json!({
+        "type": "error",
+        "message": format!("{}", message),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+/// Emit a parsed `deepseek4::dsml::StreamEvent` to the JSONL stream.
+/// Maps:
+///   - Token(text)        → `{type:"token",   id, text}`
+///   - Reasoning(text)    → `{type:"reasoning", id, text}`
+///   - ToolCalls(calls)   → `{type:"tool_calls", id, calls:[{name, arguments}]}`
+///
+/// The CLI / OpenAI HTTP layer translates these into the corresponding
+/// SSE chunks (`content`, `reasoning_content`, `tool_calls.delta`).
+fn emit_stream_event(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    ev: hipfire_arch_deepseek4::dsml::StreamEvent,
+) {
+    use hipfire_arch_deepseek4::dsml::StreamEvent;
+    // The request id is user-supplied. Build the envelope through
+    // `serde_json` so any embedded `"` / `\` / control chars are
+    // escaped — otherwise a malformed id corrupts every subsequent
+    // line of the JSONL stream and the cli/serve loop dies with a
+    // `JSON Parse error: Expected '}'`.
+    let envelope = match ev {
+        StreamEvent::Token(text) => serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": text,
+        }),
+        StreamEvent::Reasoning(text) => serde_json::json!({
+            "type": "reasoning",
+            "id": id,
+            "text": text,
+        }),
+        StreamEvent::ToolCalls(calls) => {
+            let arr: Vec<serde_json::Value> = calls
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "name": c.name,
+                        "arguments": c.arguments,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "type": "tool_calls",
+                "id": id,
+                "calls": serde_json::Value::Array(arr),
+            })
+        }
+    };
+    let _ = writeln!(stdout, "{}", envelope);
+}
+
 fn emit_committed_event(
     stdout: &mut std::io::Stdout,
     id: &str,
@@ -190,11 +885,18 @@ fn emit_committed_event(
     if !on {
         return;
     }
-    let _ = writeln!(
-        stdout,
-        r#"{{"type":"committed","id":"{}","tok_id":{},"pos":{},"t_ms":{}}}"#,
-        id, tok_id, pos, t_ms
-    );
+    // Build through `serde_json::json!` for the same reason
+    // `emit_error_with_id` does: `id` is user-supplied and a single `"`
+    // or `\` in it would corrupt the line, breaking the client's JSONL
+    // parser for every subsequent event on the same connection.
+    let envelope = serde_json::json!({
+        "type": "committed",
+        "id": id,
+        "tok_id": tok_id,
+        "pos": pos,
+        "t_ms": t_ms,
+    });
+    let _ = writeln!(stdout, "{}", envelope);
 }
 
 #[allow(dead_code)]
@@ -394,6 +1096,32 @@ struct LoadedModel {
     qwen2_config: Option<qwen2::Qwen2Config>,
     qwen2_weights: Option<qwen2::Qwen2Weights>,
     qwen2_state: Option<qwen2::Qwen2State>,
+    // DeepSeek V4 Flash state (arch_id=9 — hipfire-arch-deepseek4).
+    // Hyper-Connections + compressed-KV indexer + tail-only RoPE + raw
+    // SWA cache. KV cache lives inside DeepseekV4State; no separate
+    // deepseek4_kv field. None on every other arch path.
+    deepseek4_config: Option<hipfire_arch_deepseek4::DeepseekV4Config>,
+    deepseek4_weights: Option<hipfire_arch_deepseek4::DeepseekV4Weights>,
+    deepseek4_state: Option<hipfire_arch_deepseek4::DeepseekV4State>,
+    /// Pre-allocated PrefillBatchScratch sized to `HIPFIRE_DEEPSEEK4_PP_BATCH`
+    /// (default 64). Used by both batched prefill and the MTP spec-decode
+    /// verify pass. Lazy-allocated on first arch_id=9 load — None on every
+    /// other arch path.
+    deepseek4_pbs: Option<hipfire_arch_deepseek4::forward::PrefillBatchScratch>,
+    /// Cached `<｜end▁of▁sentence｜>` token id resolved at load time.
+    /// Falls back to 1 (DeepSeek family default) if the tokenizer lacks
+    /// the special-token entry.
+    deepseek4_eos_tok: u32,
+    /// MTP config — parsed from load-message params, read at generate time.
+    /// Arch-agnostic: currently only DeepSeek V4 (arch_id=9) evaluates these,
+    /// but the namespace is intentionally not deepseek4-specific.
+    mtp_mode: String,
+    /// Draft tokens per spec-decode window (1-10, default 3).
+    mtp_k: usize,
+    /// Whether MTP head weights were found at load time. Set by the sibling-
+    /// file scan (e.g. `<stem>-mtp.*`) or bundled MTP detection. Used by
+    /// `mtp_mode = "auto"` to decide whether to enable spec-decode.
+    mtp_weights_present: bool,
     // dots.ocr state (arch_id=8 — Qwen2-VL family). The text decoder is
     // Qwen2: `dots_ocr_config.text` / `dots_ocr_weights.text` feed
     // `qwen2::forward_step*`, and the per-step decode state reuses the
@@ -426,6 +1154,57 @@ struct LoadedModel {
     /// `physical_cap` even when `max_seq` advertises a much larger window.
     eviction: Option<Eviction>,
     conversation_tokens: Vec<u32>, // full token history for repeat penalty
+
+    /// DeltaNet checkpoint ring for the AR `generate` path's divergent-render
+    /// resume. Pairs of `(seq_pos, recurrent-state snapshot)`, captured every
+    /// `HIPFIRE_CACHE_CKPT_INTERVAL` tokens during prefill/decode via the shared
+    /// `speculative::take_dn_checkpoint`. On a non-extension client render
+    /// (history dropped/edited so the prior conversation is no longer a prefix)
+    /// the cache resumes from the latest checkpoint ≤ lcp — re-prefilling only
+    /// the tail — instead of a full cold prefill. Bounded to
+    /// `HIPFIRE_CACHE_CKPT_MAX`. Only the recurrent state is snapshotted; the
+    /// FullAttention KV[0..seq_pos] stays resident (positional). Cleared on full
+    /// reset / unload (LoadedModel drop frees the GPU snapshots).
+    prefill_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
+
+    /// Same ring for the DFlash path (`generate_dflash`), captured during the
+    /// DFlash prompt seed. Active by default; disabled by
+    /// `HIPFIRE_DFLASH_CKPT_RESUME=0` or when eviction is configured.
+    dflash_checkpoints: Vec<(usize, speculative::DeltaNetSnapshot)>,
+
+    /// Per-turn token cache for V4F prefix-cache stability.
+    ///
+    /// Maps a stable fingerprint of an assistant message — `(role,
+    /// content_text, tool_calls_canonical_json)` — to the token IDs the
+    /// model ACTUALLY emitted for that turn. When the next request
+    /// replays the same assistant message in its `messages` history, the
+    /// V4F render loop uses these cached tokens verbatim instead of
+    /// re-encoding via `render_assistant_tool_calls` + tokenizer.encode.
+    ///
+    /// Why this matters: BPE is not bijective. The model can emit a
+    /// 2-token DSML tool_call (multi-char special tokens picked
+    /// greedily); our re-encode of the same text via Jinja-style
+    /// rendering may produce 67 tokens covering the same string. The
+    /// resulting prompt diverges from the prior turn's KV slots at
+    /// the assistant-turn boundary, capping the prefix-cache LCP at
+    /// the divergence point. Caching the emitted tokens restores
+    /// byte-identical replay and lets LCP extend through all prior
+    /// assistant turns.
+    ///
+    /// Cleared on model unload (LoadedModel destruction). LRU-bounded
+    /// at `HIPFIRE_PROMPT_CACHE_CAP` entries (default 32); set
+    /// `HIPFIRE_PROMPT_CACHE_UNBOUNDED=1` to remove the cap.
+    asst_turn_cache: AsstTurnCache,
+
+    /// Lazily-built decoded-vocab cache for grammar-guided sampling.
+    /// `tokenizer.decode(&[id])` for every id ∈ `0..vocab_size`. Built
+    /// once on first tool-using V4F request, reused for every subsequent
+    /// request on the same model. Without this cache, each generate
+    /// rebuilt all ~129k entries at request entry (one tokenizer.decode
+    /// allocation per id), adding tens of milliseconds of pure overhead
+    /// to every tool-using turn. `None` until first build; cleared by
+    /// `unload_model` via `LoadedModel` drop.
+    decoded_vocab: Option<std::sync::Arc<Vec<String>>>,
     // Target model file path — cached so the DFlash fast path can reopen the
     // HfqFile mmap to construct a transient ModelSlot without reloading
     // weights. `HfqFile::open` is a cheap mmap operation.
@@ -441,6 +1220,24 @@ struct LoadedModel {
     // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
     // VL paths still hit the Plain scaffold.
     chat_template: Option<String>,
+}
+
+fn ckpt_resume_enabled() -> bool {
+    std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
+}
+fn ckpt_interval() -> usize {
+    std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2048)
+        .max(256)
+}
+fn ckpt_max() -> usize {
+    std::env::var("HIPFIRE_CACHE_CKPT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8)
+        .max(1)
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -546,19 +1343,54 @@ fn main() {
     // None means the drafter shares the target gpu (single-card, unchanged).
     let mut pflash_drafter_gpu: Option<rdna_compute::Gpu> = None;
 
-    let stdin = std::io::stdin();
+    // Background stdin reader. Drains stdin into an mpsc channel so
+    // the main loop can pull non-blockingly between messages. Abort
+    // messages (`{type:"abort","id":"..."}`) are NOT forwarded; the
+    // reader handles them inline by setting `abort_for_id()`. This is
+    // the channel that makes client-side cancellation actually stop
+    // an in-flight prefill — without it, the main loop is blocked on
+    // GPU compute and wouldn't even read the abort line until after
+    // the prefill completed.
+    let (msg_tx, msg_rx) = mpsc::channel::<DaemonMsg>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let lock = stdin.lock();
+        for line in lock.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if line.trim().is_empty() { continue; }
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(msg) => {
+                    if msg.get("type").and_then(|v| v.as_str()) == Some("abort") {
+                        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            eprintln!("[daemon-abort] received abort for id={}", id);
+                            *abort_for_id().lock().unwrap() = Some(id.to_string());
+                        }
+                        continue;
+                    }
+                    if msg.get("type").and_then(|v| v.as_str()) == Some("force_answer") {
+                        if let Some(id) = msg.get("id").and_then(|v| v.as_str()) {
+                            eprintln!("[daemon-force-answer] received force_answer for id={}", id);
+                            *force_answer_for_id().lock().unwrap() = Some(id.to_string());
+                        }
+                        continue;
+                    }
+                    if msg_tx.send(DaemonMsg::Regular(msg)).is_err() { break; }
+                }
+                Err(e) => {
+                    if msg_tx.send(DaemonMsg::ParseError(e.to_string())).is_err() { break; }
+                }
+            }
+        }
+    });
     let mut stdout = std::io::stdout();
 
-    for line in stdin.lock().lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break,
-        };
-        if line.trim().is_empty() { continue; }
-
-        let msg: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
+    while let Ok(daemon_msg) = msg_rx.recv() {
+        let msg = match daemon_msg {
+            DaemonMsg::Regular(m) => m,
+            DaemonMsg::ParseError(e) => {
                 let _ = writeln!(stdout, r#"{{"type":"error","message":"invalid JSON: {}"}}"#, e);
                 let _ = stdout.flush();
                 continue;
@@ -618,6 +1450,14 @@ fn main() {
                 };
                 let kv_mode_override = msg.get("params").and_then(|p| p.get("kv_mode")).and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
+
+                // MTP speculative decode config. `mtp_mode` gates weight
+                // discovery at load time (off=skip, on=error-if-missing,
+                // auto=scan+log). `mtp_k` sets the draft window size.
+                let mtp_mode = msg.get("params").and_then(|p| p.get("mtp_mode"))
+                    .and_then(|v| v.as_str()).unwrap_or("auto").to_string();
+                let mtp_k: usize = msg.get("params").and_then(|p| p.get("mtp_k"))
+                    .and_then(|v| v.as_u64()).unwrap_or(3) as usize;
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
                 // `adaptive_b` matches dflash_spec_demo's --adaptive-b default.
@@ -761,12 +1601,13 @@ fn main() {
                     .filter(|s| !s.is_empty()).map(|s| s.to_string());
 
                 match load_model(path, max_seq, draft_path.as_deref(), kv_mode_override.as_deref(), state_quant_override.as_deref(), &cask, pp, &mut gpu) {
-                    Ok(m) => {
+                    Ok(mut m) => {
                         let arch = match m.arch_id {
                             5 => "qwen3_5",
                             6 => "qwen3_5_moe",
                             7 => "qwen2",
                             8 => "dots-ocr",
+                            9 => "deepseek4",
                             _ => "qwen3",
                         };
                         let vl = m.vision_config.is_some() || m.dots_ocr_config.is_some();
@@ -779,6 +1620,18 @@ fn main() {
                         } else if let Some(ref c) = m.dots_ocr_config {
                             (c.text.hidden_size, c.text.num_hidden_layers, c.text.vocab_size)
                         } else { (0, 0, 0) };
+
+                        // Apply MTP config from load-message params.
+                        m.mtp_mode = mtp_mode;
+                        m.mtp_k = mtp_k;
+                        // Detect whether MTP weights are present in the loaded
+                        // model (DeepSeek V4 only today). Used by mtp_mode=auto
+                        // to decide whether to enable spec-decode at generate time.
+                        m.mtp_weights_present = m.deepseek4_weights
+                            .as_ref()
+                            .and_then(|w| w.mtp_layer.as_ref())
+                            .is_some();
+
                         // ── Optional DPM stabilization (perf instrumentation) ──
                         //
                         // Pins the GPU at high sclk/mclk so the first `generate`
@@ -812,7 +1665,18 @@ fn main() {
                             }
                         }
 
-                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{}}}"#, arch, dim, layers, vocab, vl);
+                        // `cache_capable`: the daemon implements LCP prompt-cache
+                        // reuse for these arches' AR generate path (qwen3.5/3.6
+                        // = 5/6, deepseek4 = 9). The serve layer keys its
+                        // per-request `reset` decision off THIS flag rather than
+                        // a hardcoded arch-string allowlist, so a new
+                        // cache-capable arch (or an arch-string rename) can't
+                        // silently fall back to stateless reset-every-turn — the
+                        // exact failure that left the prompt cache dead when the
+                        // installed CLI predated the allowlist. Source of truth
+                        // lives here, next to the cache implementation.
+                        let cache_capable = matches!(m.arch_id, 5 | 6 | 9);
+                        let _ = writeln!(stdout, r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{}}}"#, arch, dim, layers, vocab, vl, cache_capable);
 
                         // ── PFlash drafter load (Phase 4.0) ──────────────
                         //
@@ -970,7 +1834,27 @@ fn main() {
                 };
                 let messages_history: Option<Vec<hipfire_runtime::prompt_frame::Message>> = match msg.get("messages") {
                     Some(v) => match serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone()) {
-                        Ok(m) => Some(m),
+                        Ok(mut m) => {
+                            // Apply the same normalization to each message's
+                            // content that the daemon applies to `prompt` at
+                            // line 1384 (`maybe_normalize_prompt`: strip
+                            // trailing whitespace before `\n`, collapse 3+
+                            // newlines to 2, etc.). Without this, turn N's
+                            // `prompt`-encoded user tokens diverge from turn
+                            // N+1's `messages[].content`-encoded history
+                            // tokens, breaking the LCP cache on any prompt
+                            // whose raw text has trailing whitespace or
+                            // run-of-newlines patterns.
+                            for entry in &mut m {
+                                if !entry.content.is_empty() {
+                                    let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&entry.content);
+                                    if matches!(normalized, std::borrow::Cow::Owned(_)) {
+                                        entry.content = normalized.into_owned();
+                                    }
+                                }
+                            }
+                            Some(m)
+                        }
                         Err(e) => {
                             let _ = writeln!(
                                 stdout,
@@ -983,9 +1867,22 @@ fn main() {
                     },
                     None => None,
                 };
-                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(0.3) as f32;
-                let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(0.8) as f32;
+                // Sampling defaults differ by arch: qwen35 family was tuned
+                // at `temp=0.3, top_p=0.8` (DFlash-friendly, instruct-stable);
+                // DeepSeek V4 Flash's HF card recommends `temp=1.0, top_p=1.0`
+                // for local deployment, and lower values consistently fall
+                // into block-level attractors on this quantized instruct
+                // model. Pick arch-shaped defaults so a vanilla
+                // `/v1/chat/completions` POST (no sampling fields) works on
+                // both. Explicit per-request values still override either.
+                let (default_temp, default_top_p) = if m.arch_id == 9 {
+                    (1.0_f64, 1.0_f64)
+                } else {
+                    (0.3_f64, 0.8_f64)
+                };
+                let temp = msg.get("temperature").and_then(|v| v.as_f64()).unwrap_or(default_temp) as f32;
+                let max_tokens = msg.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(4096) as usize;
+                let top_p = msg.get("top_p").and_then(|v| v.as_f64()).unwrap_or(default_top_p) as f32;
                 // Default 1.0 (off). Matches llama.cpp `--repeat-penalty 1.0`
                 // and HF transformers `generate(repetition_penalty=1.0)`
                 // defaults. The prior 1.3 default suppressed legitimately
@@ -998,6 +1895,15 @@ fn main() {
                 // and docs/investigations/2026-05-15-9b-reasoning-loop/.
                 // Clients can still opt in to a non-1.0 value per request.
                 let repeat_penalty = msg.get("repeat_penalty").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+                // OpenAI-compatible `reasoning_effort` (also accept our custom
+                // `thinking_mode` alias) — only consumed by arch_id=9 today.
+                // Default = NonThink, matching the safe HF chat frame.
+                let think_mode = msg
+                    .get("reasoning_effort")
+                    .or_else(|| msg.get("thinking_mode"))
+                    .and_then(|v| v.as_str())
+                    .map(ThinkMode::from_str)
+                    .unwrap_or(ThinkMode::NonThink);
                 let repeat_window = msg.get("repeat_window").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
                 // Experimental: inject a nudge string at a specific generated-
                 // token count. The nudge tokens get forward-fed through the KV
@@ -1155,6 +2061,7 @@ fn main() {
                         pf_cfg_owned.as_ref(),
                         tools_json.as_deref(),
                         messages_history.as_deref(),
+                        think_mode,
                     );
                 }
             }
@@ -1164,8 +2071,13 @@ fn main() {
                 // Under eviction, also zero the compact_offset so absolute
                 // RoPE phase restarts from zero for the fresh conversation.
                 if let Some(ref mut m) = model {
+                    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
+                    }
                     m.seq_pos = 0;
                     m.conversation_tokens.clear();
+                    m.prefill_checkpoints.clear();
+                    m.dflash_checkpoints.clear();
                     // Multi-GPU branch: route per-LA-layer memsets through
                     // pp_dn_la_to_device so each buffer is zeroed on its
                     // owning device. The single-GPU `gpu` parameter is left
@@ -1213,6 +2125,31 @@ fn main() {
                     // entries into attention for the new turn — fluent
                     // garbage, no panic. See `Qwen2State::reset` doc.
                     if let Some(ref mut s) = m.qwen2_state { s.reset(); }
+                    // arch_id=9: same rationale for DeepSeek V4. Prior to
+                    // 2026-05-24 the V4F state was NEVER reset, so
+                    // `state.n_tokens` accumulated across requests and
+                    // every new prefill wrote AFTER the previous turn's
+                    // KV residue — fitting symptom for the multi-turn
+                    // pi-coding-agent corruption (`CLion` for
+                    // `CLionProjects`, `/home/n/` for `/home/nick/`).
+                    // See `DeepseekV4State::reset` doc.
+                    if let Some(ref mut s) = m.deepseek4_state {
+                        s.reset();
+                        // Drop the captured V4F decode hipGraph alongside
+                        // the state. The captured kernarg blobs hold
+                        // session-1's device-buffer pointers; a fresh
+                        // capture on session-2 binds against session-2's
+                        // pointers and host scalars. Without this the
+                        // replay path crashes with "illegal memory access"
+                        // on the post-launch logits D2H — the captured
+                        // graph dispatched against a stale slot/n_valid
+                        // computation that mis-ordered against this
+                        // session's prefill state. The matching
+                        // `ar_forward_warmed_up = false` in `reset()`
+                        // ensures we retrace warmup → capture → replay
+                        // rather than jumping straight back to replay.
+                        gpu.invalidate_graph_state();
+                    }
                     let _ = writeln!(stdout, r#"{{"type":"reset","seq_pos":0}}"#);
                 } else {
                     let _ = writeln!(stdout, r#"{{"type":"error","message":"no model loaded"}}"#);
@@ -1259,6 +2196,7 @@ fn main() {
                     5 => "qwen3_5",
                     6 => "qwen3_5_moe",
                     7 => "qwen2",
+                    9 => "deepseek4",
                     _ => "qwen3",
                 }).unwrap_or("none");
                 // Count pre-compiled kernels
@@ -1359,6 +2297,26 @@ fn main() {
                     let mut ok = true;
                     for &tok in &synthetic {
                         if qwen2::forward_step(&mut gpu, weights, config, state, tok).is_err() {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    ok
+                } else if m.arch_id == 9 {
+                    // DeepSeek V4 warm-pass: per-token decode_step. Saturates
+                    // the kernel cache (HC, indexer, compressor,
+                    // attention, MoE) on a short synthetic prompt
+                    // before any user-facing generate. Not the
+                    // production prefill path (that's
+                    // forward_prefill_batch_chunked in `generate`).
+                    let config = m.deepseek4_config.as_ref().unwrap();
+                    let weights = m.deepseek4_weights.as_ref().unwrap();
+                    let state = m.deepseek4_state.as_mut().unwrap();
+                    let mut ok = true;
+                    for (i, &tok) in synthetic.iter().enumerate() {
+                        if deepseek4::forward::decode_step(
+                            config, weights, state, &mut gpu, tok, i as u32,
+                        ).is_err() {
                             ok = false;
                             break;
                         }
@@ -1724,11 +2682,14 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: Some(config), qwen2_weights: Some(weights), qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1767,11 +2728,77 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: Some(state),
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: Some(config), dots_ocr_weights: Some(weights),
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
+            model_path: path.to_string(),
+            dflash: None,
+            chat_template,
+        });
+    }
+
+    if hfq.arch_id == 9 {
+        // DeepSeek V4 Flash (hipfire-arch-deepseek4). Standalone bring-up —
+        // no eviction, no DFlash drafter, no PFlash, no VL. The
+        // Architecture trait gives us config + weights + state in three
+        // calls; forward goes through `deepseek4::forward::forward_prefill_*` /
+        // `decode_step` in the generate hot path.
+        if draft_path.is_some() {
+            return Err("DFlash not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without a draft.".to_string());
+        }
+        if cask.sidecar.is_some() {
+            return Err("CASK eviction not supported on arch_id=9 (DeepSeek V4 Flash). \
+                       Reload without --cask-sidecar.".to_string());
+        }
+        let _ = kv_mode;
+        let _ = state_quant_override;
+        use hipfire_runtime::arch::Architecture;
+        let config = <deepseek4::DeepseekV4 as Architecture>::config_from_hfq(&hfq)?;
+        let weights = <deepseek4::DeepseekV4 as Architecture>::load_weights(&mut hfq, &config, gpu)?;
+        let state = deepseek4::DeepseekV4State::new(&config)?;
+        // Pre-allocate PrefillBatchScratch. Default B=1024 (bumped from 64
+        // on 2026-05-26). PP_BATCH sweep on the 2.1k-tok bench (3 trials/cell):
+        //   PP=256: 46.4 tps   PP=512: 48.3 tps
+        //   PP=1024: 49.3 tps  PP=2048: 49.0 tps
+        // 1024 captures the L2-amortization peak; 2048 plateaus from PBS
+        // memory footprint exceeding effective L2/Inf-cache reuse window.
+        // PBS sits in (UMA) GPU memory for the model's lifetime — ~600 MB
+        // at B=1024 on V4-Flash, well within 128 GB. Override via
+        // HIPFIRE_DEEPSEEK4_PP_BATCH.
+        let pbs_max_batch: usize = std::env::var("HIPFIRE_DEEPSEEK4_PP_BATCH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024);
+        let pbs = deepseek4::forward::PrefillBatchScratch::new(gpu, &config, pbs_max_batch)?;
+        // Cache EOS token id. DeepSeek family uses `<｜end▁of▁sentence｜>`;
+        // fall back to 1 if tokenizer lacks the entry.
+        let eos_tok: u32 = {
+            let ids = tokenizer.encode("<｜end▁of▁sentence｜>");
+            if ids.len() == 1 { ids[0] } else { 1 }
+        };
+        let chat_template = resolve_chat_template(&hfq, path);
+        return Ok(LoadedModel {
+            arch_id: hfq.arch_id,
+            pp: 1, pp_gpus: None, pp_scratch_set: None, pp_dn_la_to_device: None,
+            q35_config: None, q35_weights: None, q35_scratch: None,
+            kv_cache: None, dn_state: None,
+            llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
+            qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: Some(config), deepseek4_weights: Some(weights), deepseek4_state: Some(state),
+            deepseek4_pbs: Some(pbs), deepseek4_eos_tok: eos_tok,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
+            dots_ocr_config: None, dots_ocr_weights: None,
+            vision_config: None, vision_weights: None,
+            tokenizer: Some(tokenizer),
+            seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
+            conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -1841,23 +2868,50 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
         // All allocators go through the `_capped` entry points with
         // physical_cap derived above. Without eviction, physical_cap==max_seq
         // and these match the back-compat wrappers byte-for-byte.
+        // Hybrid Qwen3.5/3.6 = 48 DeltaNet (LinearAttention) + 16 FullAttention
+        // layers out of 64; only the FullAttention layers need a KV slot. The
+        // `_filtered` allocators skip KV alloc for the rest (~75% saved on the
+        // 27B). Dense / all-FullAttention models yield an all-true mask, so
+        // filtered == unfiltered (allocation no-op, output unchanged).
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == LayerType::FullAttention)
+            .collect();
         let kv = match kv_mode.as_str() {
             "q8" => {
-                eprintln!("  KV cache: Q8");
-                llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_q8_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
             "asym4" | "turbo4" => {
-                llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                // asym4/asym2/fwht4 have no _capped_filtered yet; physical_cap ==
+                // max_seq when CASK eviction is off (the default), so _filtered is
+                // exact. (Fully CASK-aware capped+filtered variants: follow-up.)
+                llama::KvCache::new_gpu_asym4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             "asym2" | "turbo2" => {
-                llama::KvCache::new_gpu_asym2_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym2_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             "asym3" | "turbo3" | "turbo" | "auto" | "" => {
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            // FWHT-rotated KV: same byte layout as the matching asym tier, but
+            // the K-rotation basis matches the MQ4 weight/draft FWHT convention,
+            // so DFlash speculative acceptance stays high (asym's Givens basis
+            // does not — see CLAUDE.md: "DFlash perf gates must use q8 or FWHT").
+            "fwht3" => {
+                llama::KvCache::new_gpu_fwht3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            "fwht2" => {
+                llama::KvCache::new_gpu_fwht2_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+            }
+            "fwht4" => {
+                // fwht4 has no _capped_filtered yet; physical_cap == max_seq when
+                // CASK eviction is off (the default), so _filtered is exact here.
+                llama::KvCache::new_gpu_fwht4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq).map_err(|e| format!("{e}"))?
             }
             other => {
                 eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-                llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
+                llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
         // Q8 DeltaNet state can accumulate quality drift on long generation.
@@ -1953,11 +3007,14 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: Some(kv), dn_state: Some(dn),
             llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config, vision_weights,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap, eviction,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash,
             chat_template,
@@ -1984,11 +3041,14 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             kv_cache: None, dn_state: None,
             llama_config: Some(config), llama_weights: Some(weights), llama_scratch: Some(scratch), llama_kv: Some(kv),
             qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+            deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
             dots_ocr_config: None, dots_ocr_weights: None,
             vision_config: None, vision_weights: None,
             tokenizer: Some(tokenizer),
             seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2071,6 +3131,14 @@ fn load_model_safetensors(
             llama_weights: Some(weights),
             llama_scratch: Some(scratch),
             llama_kv: Some(kv),
+            deepseek4_config: None,
+            deepseek4_weights: None,
+            deepseek4_state: None,
+            deepseek4_pbs: None,
+            deepseek4_eos_tok: 0,
+            mtp_mode: "auto".to_string(),
+            mtp_k: 3,
+            mtp_weights_present: false,
             vision_config: None,
             vision_weights: None,
             tokenizer: Some(tokenizer),
@@ -2079,6 +3147,8 @@ fn load_model_safetensors(
             physical_cap: max_seq,
             eviction: None,
             conversation_tokens: Vec::new(),
+            asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+            decoded_vocab: None,
             model_path: path.to_string(),
             dflash: None,
             chat_template,
@@ -2099,12 +3169,23 @@ fn load_model_safetensors(
     let weights = qwen35::load_weights_paroquant(&source, &config, gpu)
         .map_err(|e| format!("load_weights_paroquant: {e:?}"))?;
 
-    // KV cache: default to asym3 (matches the main Qwen35 path)
+    // KV cache: filtered to FullAttention layers (hybrid Qwen3.5/3.6), mirroring
+    // the HFQ single-GPU path so AWQ/safetensors models also get the ~75% cut and
+    // honor the fwht* default. physical_cap == max_seq (no CASK on this path).
     let effective_max_seq = max_seq;
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
     let kv_cache = match kv_mode {
-        "q8" => llama::KvCache::new_gpu_q8_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
-        _ => llama::KvCache::new_gpu_asym3_capped(gpu, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "q8" => llama::KvCache::new_gpu_q8_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "fwht4" => llama::KvCache::new_gpu_fwht4_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq),
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
+        _ => llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq),
     }.map_err(|e| format!("KvCache: {e}"))?;
     let dn_state = DeltaNetState::new(gpu, &config)
         .map_err(|e| format!("DeltaNetState::new: {e:?}"))?;
@@ -2131,6 +3212,14 @@ fn load_model_safetensors(
         llama_weights: None,
         llama_scratch: None,
         llama_kv: None,
+        deepseek4_config: None,
+        deepseek4_weights: None,
+        deepseek4_state: None,
+        deepseek4_pbs: None,
+        deepseek4_eos_tok: 0,
+        mtp_mode: "auto".to_string(),
+        mtp_k: 3,
+        mtp_weights_present: false,
         vision_config: None,
         vision_weights: None,
         tokenizer: Some(tokenizer),
@@ -2139,6 +3228,8 @@ fn load_model_safetensors(
         physical_cap: effective_max_seq,
         eviction: None,
         conversation_tokens: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(),
+        decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template,
@@ -2217,17 +3308,24 @@ fn load_model_pp(
 
     // KV cache (asym3 default, q8/asym4/asym2/fwht{4,3,2} selectable).
     // physical_cap == max_seq on this path — eviction is refused at load.
+    // Filtered to FullAttention layers (hybrid Qwen3.5/3.6): each KV slot lands
+    // on its layer's assigned device; non-KV layers get a 1-elem placeholder.
+    let is_kv_layer: Vec<bool> = config
+        .layer_types
+        .iter()
+        .map(|t| *t == LayerType::FullAttention)
+        .collect();
     let kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "q8" => llama::KvCache::new_gpu_q8_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_multi(&mut gpus, config.n_layers, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
         }
     };
 
@@ -2264,11 +3362,14 @@ fn load_model_pp(
         dn_state: Some(dn),
         llama_config: None, llama_weights: None, llama_scratch: None, llama_kv: None,
         qwen2_config: None, qwen2_weights: None, qwen2_state: None,
+        deepseek4_config: None, deepseek4_weights: None, deepseek4_state: None, deepseek4_pbs: None, deepseek4_eos_tok: 0,
+        mtp_mode: "auto".to_string(), mtp_k: 3, mtp_weights_present: false,
         dots_ocr_config: None, dots_ocr_weights: None,
         vision_config: None, vision_weights: None,
         tokenizer: Some(tokenizer),
         seq_pos: 0, max_seq, physical_cap: max_seq, eviction: None,
         conversation_tokens: Vec::new(),
+        asst_turn_cache: AsstTurnCache::new_from_env(), prefill_checkpoints: Vec::new(), dflash_checkpoints: Vec::new(), decoded_vocab: None,
         model_path: path.to_string(),
         dflash: None,
         chat_template: resolve_chat_template(&hfq, path),
@@ -2370,12 +3471,19 @@ fn unload_model(m: LoadedModel, gpu: &mut rdna_compute::Gpu) {
     // free_gpu call handles both. (Compare LLaMA where ForwardScratch and
     // KvCache are separate fields.)
     if let Some(s) = m.qwen2_state { s.free_gpu(gpu); }
+    // V4F (arch_id=9) per-session scratch + per-layer SWA/indexer/
+    // compressor caches. Without these `unload_model` would leak ~tens
+    // of MB of state buffers per load/unload cycle, defeating idle
+    // eviction.
+    if let Some(s) = m.deepseek4_state { s.free_gpu(gpu); }
+    if let Some(pbs) = m.deepseek4_pbs { pbs.free_gpu(gpu); }
     // Weights are the bulk of VRAM (~80%). Free them too so idle eviction
     // actually returns VRAM to the system, not just the cache.
     if let Some(w) = m.q35_weights { w.free_gpu(gpu); }
     if let Some(w) = m.llama_weights { w.free_gpu(gpu); }
     if let Some(w) = m.qwen2_weights { w.free_gpu(gpu); }
     if let Some(w) = m.vision_weights { w.free_gpu(gpu); }
+    if let Some(w) = m.deepseek4_weights { w.free_gpu(gpu); }
     // Drop pointer-keyed caches whose keys point at weight buffers that are
     // about to be returned to the pool. Without this, the next model loaded
     // can land at the same device address and silently inherit stale
@@ -2586,16 +3694,151 @@ fn load_dflash_state(
     })
 }
 
+/// Outcome of the LCP prompt-cache decision (see [`plan_prompt_cache`]).
+struct PromptCachePlan {
+    /// Full canonical conversation tokens (system + history + live user +
+    /// assistant prefix). Stored as `conversation_tokens` after generation so
+    /// the next turn can LCP against it.
+    rendered: Vec<u32>,
+    /// Tokens to actually prefill: the suffix `rendered[start_pos..]` on a hit,
+    /// the whole `rendered` on a miss.
+    new_tokens: Vec<u32>,
+    /// Absolute position the prefill starts at (the reused-prefix length on a
+    /// hit, 0 on a miss).
+    start_pos: usize,
+    /// `cached_tokens` for OpenAI usage reporting (== start_pos).
+    cached_tokens: usize,
+    /// True ⇒ reuse existing KV/DeltaNet[0..start_pos]; prefill only the suffix.
+    /// False ⇒ caller must full-reset and prefill the whole conversation.
+    cache_hit: bool,
+    /// `Some(ckpt)` ⇒ this is a divergent-render RESUME (not a pure extension):
+    /// the caller must restore the DeltaNet recurrent state from the checkpoint
+    /// at `ckpt`, rewind seq_pos/conversation_tokens to `ckpt`, then treat the
+    /// turn like a HIT with `start_pos == ckpt` (re-prefill only the tail) and
+    /// drop `draft_ctx_cached_rows` to `ckpt`. `None` on a normal hit/miss.
+    resume_from: Option<usize>,
+}
+
+/// Pure LCP prompt-cache decision shared in spirit with the AR `generate`
+/// path's inline block — but side-effect-free (touches no GPU/seq_pos state),
+/// so the DFlash path can use it too. Renders the canonical conversation via
+/// `build_cached_history` (verbatim assistant-turn replay through
+/// `asst_turn_cache`, which is what makes the LCP byte-exact across turns), then
+/// compares against `m.conversation_tokens`. Reports a HIT only on a strict
+/// forward extension (`lcp == prior_len && lcp < rendered.len()`), which keeps
+/// the recurrent DeltaNet state valid by construction (the prior turn left it at
+/// exactly `prior_len`, so prefilling the suffix advances it correctly with no
+/// rewind). The exact-match edge (`lcp == rendered.len()`) degrades to a miss to
+/// avoid a 1-token DeltaNet over-advance. Caller must be in the
+/// `messages_history.is_some()` case.
+#[allow(clippy::too_many_arguments)]
+fn plan_prompt_cache(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    asst_turn_cache: &mut AsstTurnCache,
+    conversation_tokens: &[u32],
+    eviction_is_none: bool,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    messages_history: &[hipfire_runtime::prompt_frame::Message],
+    cache_disabled: bool,
+    // Ascending DeltaNet checkpoint positions (from `m.dflash_checkpoints`) and
+    // whether resume-from-checkpoint is enabled. On a divergence the plan picks
+    // the latest checkpoint `<= lcp && < rendered.len()` to resume from.
+    dflash_ckpt_positions: &[usize],
+    resume_enabled: bool,
+) -> PromptCachePlan {
+    let q_tokens = tokenizer.encode(prompt);
+    let rendered = hipfire_runtime::prompt_frame::build_cached_history(
+        tokenizer,
+        system_prompt,
+        messages_history,
+        &q_tokens,
+        assistant_prefix,
+        |msg| {
+            let stripped = strip_think_for_fingerprint(&msg.content);
+            let normalized =
+                hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
+            let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+            asst_turn_cache.get(&fp).cloned()
+        },
+    );
+    let cache_eligible =
+        !cache_disabled && eviction_is_none && !conversation_tokens.is_empty();
+    if cache_eligible {
+        let prior_len = conversation_tokens.len();
+        let max_match = prior_len.min(rendered.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && conversation_tokens[lcp] == rendered[lcp] {
+            lcp += 1;
+        }
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache lcp dflash] prior_len={} rendered_len={} lcp={}",
+                prior_len,
+                rendered.len(),
+                lcp
+            );
+        }
+        if lcp == prior_len && lcp < rendered.len() && lcp > 0 {
+            return PromptCachePlan {
+                new_tokens: rendered[lcp..].to_vec(),
+                start_pos: lcp,
+                cached_tokens: lcp,
+                cache_hit: true,
+                resume_from: None,
+                rendered,
+            };
+        }
+        // Divergent render (lcp < prior_len, or the exact-match edge): not a
+        // pure extension, so the recurrent state at the end is stale. If resume
+        // is enabled, rewind to the latest checkpoint at-or-before lcp that
+        // still leaves ≥1 token to re-prefill, and resume from there instead of
+        // cold-prefilling the whole conversation.
+        if resume_enabled {
+            if let Some(&ckpt) = dflash_ckpt_positions
+                .iter()
+                .filter(|&&p| p <= lcp && p < rendered.len())
+                .max()
+            {
+                eprintln!(
+                    "[qwen-cache resume dflash] checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                    ckpt, lcp, prior_len, rendered.len(), rendered.len() - ckpt, rendered.len(),
+                );
+                return PromptCachePlan {
+                    new_tokens: rendered[ckpt..].to_vec(),
+                    start_pos: ckpt,
+                    cached_tokens: ckpt,
+                    cache_hit: true,
+                    resume_from: Some(ckpt),
+                    rendered,
+                };
+            }
+        }
+    }
+    PromptCachePlan {
+        new_tokens: rendered.clone(),
+        start_pos: 0,
+        cached_tokens: 0,
+        cache_hit: false,
+        resume_from: None,
+        rendered,
+    }
+}
+
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
 /// token-streaming output but replaces the AR sample loop with
 /// `spec_step_dflash` cycles — each cycle drafts B tokens via the diffusion
 /// model and verifies them in one target forward, committing accept_len+1
 /// at a time.
 ///
-/// Single-turn: this path always resets target state at entry, matching the
-/// stateless OpenAI chat-completions contract. Multi-turn callers that
-/// persist KV across HTTP requests are out of scope for this integration —
-/// they can keep using the AR path.
+/// Prompt cache: for `messages_history`-bearing chat requests this path now
+/// reuses the target KV + DeltaNet prefix on a pure conversation extension
+/// (via [`plan_prompt_cache`] + `seed_target_hidden_suffix_abortable`), and the
+/// draft's cumulative `target_hidden` is extended by scattering only the suffix
+/// rows — so DFlash keeps its decode speedup AND skips re-prefilling the cached
+/// prefix. A divergent / first / raw-prompt turn full-resets and prefills the
+/// whole conversation as before.
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn generate_dflash(
@@ -2698,19 +3941,102 @@ fn generate_dflash(
     let im_end = tokenizer.encode("<|im_end|>");
     let im_end_token = if im_end.len() == 1 { Some(im_end[0]) } else { None };
 
-    // Fresh target state — DFlash seed_target_hidden_from_prompt does its own
-    // full prefill, so we reset first to avoid double-accounting.
-    m.seq_pos = 0;
-    m.conversation_tokens.clear();
-    {
-        let dn = m.dn_state.as_ref().unwrap();
-        for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
-        for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+    // Prompt-cache plan (native DFlash reuse). For non-jinja chat with history,
+    // decide whether this turn is a pure extension of the cached conversation.
+    // On a HIT we reuse target KV + DeltaNet[0..start_pos] and the draft's
+    // cumulative target_hidden, prefilling only the suffix; on a MISS we
+    // full-reset and prefill the whole conversation (legacy behaviour).
+    let cache_disabled = try_jinja
+        || std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    // DFlash divergent-render resume (default ON; opt out with
+    // HIPFIRE_DFLASH_CKPT_RESUME=0). Requires no eviction (resume rewinds the
+    // resident KV prefix). When on, the recurrent state is checkpointed during
+    // the prompt seed and a divergent render resumes from the latest checkpoint
+    // ≤ lcp — byte-identical to a cold prefill of the same render (verified),
+    // so worst case equals the legacy cold-reset path. Off ⇒ no checkpoints
+    // (zero overhead) + legacy cold-reset-on-divergence.
+    let dflash_resume_enabled = std::env::var("HIPFIRE_DFLASH_CKPT_RESUME").ok().as_deref() != Some("0")
+        && m.eviction.is_none();
+    let dflash_ckpt_positions: Vec<usize> = m.dflash_checkpoints.iter().map(|(p, _)| *p).collect();
+    let cache_plan: Option<PromptCachePlan> = if !try_jinja {
+        messages_history.map(|hist| {
+            let tok = m.tokenizer.as_ref().unwrap();
+            plan_prompt_cache(
+                tok,
+                &mut m.asst_turn_cache,
+                &m.conversation_tokens,
+                m.eviction.is_none(),
+                system_prompt,
+                prompt,
+                assistant_prefix,
+                hist,
+                cache_disabled,
+                &dflash_ckpt_positions,
+                dflash_resume_enabled,
+            )
+        })
+    } else {
+        None
+    };
+    let resume_from: Option<usize> = cache_plan.as_ref().and_then(|p| p.resume_from);
+    // `prompt_tokens` becomes the full canonical conversation when the cache
+    // plan rendered it (keeps the end-of-turn `conversation_tokens` bake and the
+    // next turn's LCP byte-consistent). Otherwise keep the jinja/ChatFrame build.
+    let prompt_tokens: Vec<u32> = match &cache_plan {
+        Some(p) => p.rendered.clone(),
+        None => prompt_tokens,
+    };
+    let (prefill_tokens, prefill_start, cache_hit, cached_tokens_dflash): (Vec<u32>, usize, bool, usize) =
+        match &cache_plan {
+            Some(p) => (p.new_tokens.clone(), p.start_pos, p.cache_hit, p.cached_tokens),
+            None => (prompt_tokens.clone(), 0, false, 0),
+        };
+
+    // Divergent-render RESUME: restore the DeltaNet recurrent state to the
+    // checkpoint and rewind seq_pos/conversation_tokens/checkpoints to it. The
+    // turn then proceeds exactly like a HIT with start_pos == ckpt (the cache
+    // plan already set cache_hit=true + start_pos=ckpt), re-prefilling only the
+    // tail. The FullAttention KV[0..ckpt] is still resident (positional), and
+    // the draft's target_hidden[0..ckpt] is preserved from the prior turn.
+    if let Some(ckpt) = resume_from {
+        if let Some(idx) = m.dflash_checkpoints.iter().rposition(|(p, _)| *p == ckpt) {
+            if let (Some(dn), Some((_, snap))) =
+                (m.dn_state.as_mut(), m.dflash_checkpoints.get(idx))
+            {
+                let _ = snap.restore_to(dn, gpu);
+            }
+            m.seq_pos = ckpt;
+            m.conversation_tokens.truncate(ckpt);
+            m.dflash_checkpoints.truncate(idx + 1);
+        }
+    }
+
+    if !cache_hit {
+        // Fresh target state — full prefill from position 0.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        {
+            let dn = m.dn_state.as_ref().unwrap();
+            for s in &dn.s_matrices { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.s_scales { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+            for s in &dn.conv_states { let _ = gpu.hip.memset(&s.buf, 0, s.buf.size()); }
+        }
+    } else if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[qwen-cache HIT dflash] reuse prefix={} suffix={} (no reset)",
+            prefill_start,
+            prefill_tokens.len()
+        );
     }
     let df = m.dflash.as_mut().unwrap();
     df.target_hidden_host.clear();
-    df.draft_scratch.reset_upload_tracking();
+    if !cache_hit {
+        // Reset the draft's upload/projection tracking only on a full prefill.
+        // On a hit we PRESERVE uploaded_target_hidden_rows / draft_ctx_cached_rows
+        // / target_hidden_abs_positions from the prior turn so the draft reuses
+        // the cached [0..start_pos] projections and only projects the suffix.
+        df.draft_scratch.reset_upload_tracking();
+    }
 
     // Assemble a transient ModelSlot for the spec helpers — they both take
     // `&mut ModelSlot`. We own the pieces on LoadedModel individually, so
@@ -2782,32 +4108,97 @@ fn generate_dflash(
         return;
     }
 
-    // Seed target_hidden via the demo's helper — runs a per-token prefill
-    // with hidden extraction into hidden_rb, then downloads prompt-length
-    // worth of rows into target_hidden_host. The draft's first forward
-    // uses these as context.
-    if let Err(e) = speculative::seed_target_hidden_from_prompt(
-        gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
-    ) {
-        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
-        let _ = stdout.flush();
+    // Seed target_hidden via the demo's helper — runs a chunked prefill
+    // with hidden extraction into hidden_rb, then downloads chunk-by-chunk
+    // into target_hidden_host. The draft's first forward uses these as
+    // context.
+    //
+    // Abortable variant: the prefill chunks at PREFILL_MAX_BATCH (256)
+    // boundaries and checks `abort_for_id()` between chunks. On client
+    // cancellation, state is fully reset (DeltaNet non-reversible) and
+    // we return early — no decode, no tokens emitted to the wire.
+    let id_for_abort = id.to_string();
+    // DeltaNet checkpoint ring (divergent-render resume). `Some` only when
+    // HIPFIRE_DFLASH_CKPT_RESUME=1 + no eviction; the seed snapshots the
+    // recurrent state every ck_int tokens so a future divergent render resumes
+    // from a checkpoint instead of cold-prefilling.
+    let (ck_int, ck_cap) = (ckpt_interval(), ckpt_max());
+    let ckpt_sink: Option<&mut Vec<(usize, speculative::DeltaNetSnapshot)>> =
+        if dflash_resume_enabled { Some(&mut m.dflash_checkpoints) } else { None };
+    let seed_result = if cache_hit {
+        // Incremental: prefill only the suffix, continuing from start_pos with
+        // the reused target KV + DeltaNet state (no reset).
+        speculative::seed_target_hidden_suffix_abortable(
+            gpu, &mut target, &mut df.hidden_rb, &prefill_tokens, prefill_start,
+            &|| check_abort(&id_for_abort), ckpt_sink, ck_int, ck_cap,
+        )
+    } else {
+        speculative::seed_target_hidden_from_prompt_abortable(
+            gpu, &mut target, &mut df.hidden_rb, &mut df.target_hidden_host, &prompt_tokens,
+            &|| check_abort(&id_for_abort), ckpt_sink, ck_int, ck_cap,
+        )
+    };
+    let aborted = match seed_result {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"prefill: {}"}}"#, id, e);
+            let _ = stdout.flush();
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            return;
+        }
+    };
+    if aborted {
+        // Full state reset on abort. Return target's reset state to m
+        // and emit aborted+done events for the CLI's drain loop.
+        m.seq_pos = 0;
+        m.conversation_tokens.clear();
+        m.dflash_checkpoints.clear();
         m.q35_weights = Some(target.weights);
         m.kv_cache = Some(target.kv_cache);
         m.dn_state = Some(target.dn_state);
         m.q35_scratch = Some(target.scratch);
+        let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+        let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
+        let _ = stdout.flush();
         return;
     }
-    // Prime the draft's GPU target_hidden buffer from the prompt rows so the
-    // first spec step can skip the CPU→GPU upload of the whole context.
-    if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
-        gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
-        0, prompt_tokens.len(), prompt_tokens.len(),
-    ) {
-        eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+    // Prime/extend the draft's GPU target_hidden buffer.
+    if cache_hit {
+        // Scatter ONLY the suffix rows at offset start_pos; the [0..start_pos]
+        // rows are preserved from the prior turn. The cumulative abs-positions
+        // extend to the full conversation length. `draft_ctx_cached_rows` is
+        // left untouched (still == start_pos), so the first spec step projects
+        // only [start_pos..position) — the same delta path decode uses.
+        let suffix_len = prefill_tokens.len();
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+            prefill_start, suffix_len, suffix_len,
+        ) {
+            eprintln!("[dflash] suffix scatter failed: {e}");
+        }
+    } else {
+        // Full prefill: scatter all prompt rows from offset 0.
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            gpu, &df.hidden_rb, &df.draft_scratch.target_hidden,
+            0, prompt_tokens.len(), prompt_tokens.len(),
+        ) {
+            eprintln!("[dflash] scatter failed: {e} — falling back to per-cycle upload");
+        }
     }
     df.draft_scratch.uploaded_target_hidden_rows = prompt_tokens.len();
     df.draft_scratch.target_hidden_abs_positions =
         (0..prompt_tokens.len() as i32).collect();
+    if let Some(ckpt) = resume_from {
+        // Rows [ckpt..len) of target_hidden were just overwritten with the new
+        // (divergent) content, so the draft's projection cache for them is
+        // stale. Drop the cursor to ckpt; the first spec step re-projects
+        // [ckpt..position) from the fresh rows (the same delta path a HIT uses,
+        // just from ckpt instead of the prior length).
+        df.draft_scratch.draft_ctx_cached_rows = ckpt;
+    }
 
     // First emit = target's argmax at the final prompt position. seed_target_hidden
     // already ran the per-token forward for every prompt token; its scratch.logits
@@ -2830,6 +4221,73 @@ fn generate_dflash(
         }).0;
 
     let t_prefill = Instant::now();
+
+    // ── Grammar-guided decoding setup (dflash path) ─────────────
+    //
+    // Same matcher used by the qwen35 non-dflash path (see
+    // generate() in this file). Approach for dflash differs because
+    // spec_step writes KV for ALL committed tokens before we can
+    // mask anything — we can't easily reach into the verifier's
+    // logits. Strategy: POST-acceptance validation. After each
+    // spec_step commits a batch, walk committed tokens through the
+    // matcher; if any token violates the grammar (e.g. the Pi
+    // turn-12 attractor `<|im_start|>` after `<tool_call>`), stop
+    // accepting from that point, treat as EOS, and force a full
+    // KV/DN reset before next turn so the polluted slots don't
+    // contaminate subsequent generation.
+    //
+    // The trade-off vs the non-dflash CPU-mask-then-sample path is
+    // throughput: dflash with grammar OFF keeps full spec-decode
+    // speedup; the rare grammar-violation case terminates the turn
+    // early, requiring the client to retry. In production this
+    // should be rare — the matcher only constrains during
+    // tool_call header emission (~30-50 tokens).
+    //
+    // Disable with `HIPFIRE_QWEN35_GRAMMAR=0`.
+    let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let tool_schemas_dflash: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
+        tools
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())?
+                            .to_string();
+                        // Required-field list from JSON schema's
+                        // `parameters.required`. Empty if the tool
+                        // declares no required args. See V4F's
+                        // identical extraction in spec_decode wiring.
+                        let required: Vec<String> = func
+                            .get("parameters")
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Some(hipfire_arch_qwen35::grammar::ToolSchema {
+                            name,
+                            required,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let grammar_active = !tool_schemas_dflash.is_empty();
+    let mut grammar_matcher =
+        hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_dflash);
+    let mut grammar_violated = false;
 
     // Decode loop — spec_step_dflash returns a committed batch per cycle.
     let mut emitted: Vec<u32> = vec![first_token];
@@ -2883,6 +4341,13 @@ fn generate_dflash(
         let _ = stdout.flush();
     }
     generated += 1;
+    // Seed the grammar matcher with the first token's text so its rolling
+    // partial-buf catches an opening `<tool_call>` if the model emitted
+    // it as the very first decoded token.
+    if grammar_active {
+        let text = tokenizer.decode(&[first_token]);
+        grammar_matcher.advance(&text);
+    }
 
     let mut rng_state: u64 = 0x13579BDFu64;
 
@@ -2915,6 +4380,29 @@ fn generate_dflash(
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while generated < max_tokens {
+        // Decode-side abort (dflash path). See the matching block in
+        // `generate()` for rationale. Without this, a Pi cancel
+        // mid-decode leaves the spec-decode loop running for max_tokens
+        // worth of wasted work.
+        if check_abort(id) {
+            // Restore the borrowed slot before returning, then full-reset the
+            // conversation. The mid-decode KV/DeltaNet are advanced past the
+            // (un-baked) conversation_tokens, so the next turn must cold-start
+            // (which re-seeds + resets the recurrent state). CRITICAL: without
+            // putting the slot fields back, m.dn_state/kv_cache stay None and the
+            // NEXT request panics at the cold-reset unwrap (daemon.rs ~4031).
+            m.q35_weights = Some(target.weights);
+            m.kv_cache = Some(target.kv_cache);
+            m.dn_state = Some(target.dn_state);
+            m.q35_scratch = Some(target.scratch);
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.dflash_checkpoints.clear();
+            let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+            let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0,"dflash":true}}"#, id, generated);
+            let _ = stdout.flush();
+            return;
+        }
         if position + df.block_size >= ctx_capacity { break; }
 
         // Dispatch: when DDTree is configured (HIPFIRE_DDTREE_BUDGET set
@@ -2990,6 +4478,33 @@ fn generate_dflash(
         let mut think_cap_hit = false;
         for &tok in &committed_tail {
             if generated >= max_tokens { break; }
+            // Grammar pre-check (dflash path). Reject committed tokens
+            // that would put the matcher into an invalid state — e.g.
+            // `<|im_start|>` immediately after `<tool_call>` (Pi turn-12
+            // attractor). Treat rejection as EOS for this turn; the
+            // post-loop full-reset below clears the polluted KV slots
+            // that spec_step already wrote for the rejected tokens, so
+            // the next turn starts from a clean baseline.
+            if grammar_active {
+                let text = tokenizer.decode(&[tok]);
+                if !grammar_matcher.is_token_allowed(&text) {
+                    eprintln!(
+                        "[grammar-dflash] rejected token id={} text={:?} (matcher.state={:?}) — forcing EOS | {}",
+                        tok, text, grammar_matcher.state(), grammar_matcher.debug_close_reject(),
+                    );
+                    grammar_violated = true;
+                    hit_eos = true;
+                    break;
+                }
+                let was_detected = grammar_matcher.attractor_detected();
+                grammar_matcher.advance(&text);
+                if !was_detected && grammar_matcher.attractor_detected() {
+                    eprintln!(
+                        "[grammar-dflash-ngram] attractor detected in tool_call args at gen={} — forcing close",
+                        generated,
+                    );
+                }
+            }
             emitted.push(tok);
             streamed_tokens.push(tok);
             emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1, t0.elapsed().as_millis() as u64);
@@ -3060,7 +4575,106 @@ fn generate_dflash(
     m.dn_state = Some(target.dn_state);
     m.q35_scratch = Some(target.scratch);
     m.seq_pos = position;
-    m.conversation_tokens = emitted.clone();
+    // Bake the FULL conversation (prefill + decode) into conversation_tokens
+    // so subsequent turns can compute LCP against it. Previously this stored
+    // only the decoded portion (`emitted`), making the next non-dflash turn
+    // full-reset because no system/user prefix was present.
+    m.conversation_tokens = {
+        let mut v = Vec::with_capacity(prompt_tokens.len() + emitted.len());
+        v.extend_from_slice(&prompt_tokens);
+        v.extend_from_slice(&emitted);
+        v
+    };
+
+    // Grammar-violation cleanup: spec_step wrote KV + DN state for the
+    // rejected token(s) before the post-acceptance grammar check saw
+    // them. Those slots are now poisoned — leaving them in place would
+    // cause the next turn's forward to read corrupt context. Force a
+    // full reset so the next request starts from a clean baseline. The
+    // user pays the prefill cost on the retry but never sees the bad
+    // tokens; see Pi turn-12 incident for why we'd rather reset than
+    // emit garbage.
+    if grammar_violated {
+        eprintln!("[grammar-dflash] grammar violation — forcing full KV/DN reset for next turn");
+        m.conversation_tokens.clear();
+        m.dflash_checkpoints.clear();
+        m.seq_pos = 0;
+        if let Some(ref dn) = m.dn_state {
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+        }
+        if let Some(kv) = m.kv_cache.as_mut() {
+            kv.compact_offset = 0;
+        }
+    }
+
+    // ── parse tool_calls + populate asst_turn_cache ──────────────
+    //
+    // Mirror the qwen35 non-dflash path so a dflash-emitted asst turn
+    // is reusable on the next request via verbatim token replay.
+    // Without this, every turn after a dflash decode full-resets in
+    // the qwen35 cache machinery (fingerprint never stored).
+    let decoded_full = tokenizer.decode(&streamed_tokens);
+    let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+
+    if !emit_tool_calls.is_empty() {
+        let calls_json: Vec<serde_json::Value> = emit_tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "name": tc.name,
+                    "arguments": tc.arguments,
+                })
+            })
+            .collect();
+        let calls_str = serde_json::to_string(&calls_json).unwrap_or_else(|_| "[]".to_string());
+        let _ = writeln!(
+            stdout,
+            r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+            id, calls_str,
+        );
+    }
+
+    // Trim trailing `<|im_end|>` + newline from streamed_tokens so the
+    // cached body slots cleanly between the assistant_prefix and the
+    // im_end+nl trailer that `build_cached_history` re-adds on replay
+    // (mirrors qwen35 cache writer).
+    let nl_token = tokenizer.encode("\n");
+    let nl_set: std::collections::HashSet<u32> = nl_token.iter().copied().collect();
+    let mut cached_seq: Vec<u32> = streamed_tokens.clone();
+    while let Some(&last) = cached_seq.last() {
+        if nl_set.contains(&last) {
+            cached_seq.pop();
+        } else {
+            break;
+        }
+    }
+    if let Some(&last) = cached_seq.last() {
+        if im_end_token == Some(last) {
+            cached_seq.pop();
+        }
+    }
+    if !cached_seq.is_empty() {
+        let stripped = strip_think_for_fingerprint(&decoded_full);
+        let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped)
+            .into_owned();
+        let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+        if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            eprintln!(
+                "[qwen-cache store dflash] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+                fp, cached_seq.len(), emit_text.len(), emit_tool_calls.len(),
+                emit_text.chars().take(60).collect::<String>(),
+            );
+        }
+        m.asst_turn_cache.insert(fp, cached_seq);
+    }
 
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
@@ -3068,7 +4682,9 @@ fn generate_dflash(
     let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
     let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
     let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
-    let prefill_tok_s = if prefill_s > 0.0 { prompt_tokens.len() as f64 / prefill_s } else { 0.0 };
+    // New-token count (not full rendered length) so the prefill rate reflects
+    // actual work on a cache HIT/resume — matches every other path's numerator.
+    let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens.len() as f64 / prefill_s } else { 0.0 };
     let tau = if stats.cycles > 0 { stats.accepted_tokens as f64 / stats.cycles as f64 } else { 0.0 };
     // Per PRD §3.1, when PFlash bypassed (e.g. dflash_decode_active for
     // this branch) the `done` object must surface the bypass reason and
@@ -3081,12 +4697,28 @@ fn generate_dflash(
         ),
         _ => String::new(),
     };
+    // Length-cap detection — see qwen35 path for rationale.
+    let hit_length_cap = generated >= max_tokens;
+    let finish_reason = if hit_length_cap {
+        "length"
+    } else if !emit_tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
     let _ = writeln!(
         stdout,
-        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{}{}}}"#,
-        id, generated, tok_s, prompt_tokens.len(),
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"dflash":true,"tau":{:.2},"cycles":{},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
+        // `prefill_tokens` is the NEWLY-prefilled count (the suffix actually fed
+        // through the model), NOT the full rendered length — the CLI computes
+        // `prompt_tokens = cached + prefill`, so reporting the full length here
+        // double-counted the cached prefix on every HIT/resume. `prefill_tokens`
+        // (= p.new_tokens) is already the suffix; `cached_tokens_dflash` is the
+        // reused prefix, so cached + new == full rendered length. Matches the AR
+        // path (6754) which reports its `prefill_tokens` (new_tokens.len()).
+        id, generated, tok_s, prefill_tokens.len(),
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
-        tau, stats.cycles, pflash_done_field,
+        tau, stats.cycles, cached_tokens_dflash, finish_reason, pflash_done_field,
     );
     let _ = stdout.flush();
 }
@@ -3589,7 +5221,7 @@ fn generate_multi(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>) {
+fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Option<&mut rdna_compute::Gpu>, stdout: &mut std::io::Stdout, id: &str, prompt: &str, system_prompt: Option<&str>, temp: f32, top_p: f32, max_tokens: usize, repeat_penalty: f32, repeat_window: usize, budget_alert_at_tok: usize, budget_alert_text: &str, max_think_tokens: usize, assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix, pflash_state: Option<&mut hipfire_arch_qwen35::pflash::PflashState>, pflash_cfg: Option<&hipfire_arch_qwen35::pflash::PflashConfig>, tools: Option<&[serde_json::Value]>, messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>, think_mode: ThinkMode) {
     // Compress runs on the PFlash drafter handle when one is set (hetero
     // sibling device), else on the target gpu. The handle is consumed at
     // the seq_pos==0 compress site; decode always uses `gpu`.
@@ -3609,6 +5241,23 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         generate_qwen2(
             m, gpu, stdout, id, prompt, system_prompt,
             temp, top_p, max_tokens, repeat_penalty, repeat_window,
+        );
+        return;
+    }
+    if m.arch_id == 9 {
+        // arch_id=9 (DeepSeek V4 Flash). Standalone bring-up — same
+        // shape as the qwen2 short-circuit above. PFlash / DFlash / VL
+        // / multi-GPU / sampler-budget / ChatML scaffolding all bypass.
+        // We honour `system_prompt`, `temp`, `top_p`, `tools`, and
+        // `messages_history` per HF V4 chat template + sampling
+        // recommendations; everything else routes through future
+        // follow-ups.
+        let _ = (budget_alert_at_tok, budget_alert_text, max_think_tokens,
+                 assistant_prefix, pflash_state, pflash_cfg);
+        let _ = (repeat_penalty, repeat_window);
+        generate_deepseek4(
+            m, gpu, stdout, id, prompt, system_prompt,
+            temp, top_p, max_tokens, think_mode, tools, messages_history,
         );
         return;
     }
@@ -3636,7 +5285,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // thinking requests there until DFlash continuation is implemented.
     let budgeted_thinking_needs_ar = max_think_tokens > 0
         && !matches!(assistant_prefix, hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
-    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar {
+    // Prompt-cache routing (2026-05-30, native-reuse update). `generate_dflash`
+    // now implements LCP prompt-cache reuse natively: on a pure conversation
+    // extension it reuses the target KV + DeltaNet prefix and extends the
+    // draft's cumulative `target_hidden` by only the suffix — verified
+    // byte-identical to a full prefill. So the DFlash path now gives BOTH a warm
+    // prefill on agentic turns AND its ~2× decode speedup, strictly better than
+    // the AR cache path for greedy chat. (Earlier this same routing site sent
+    // chat to AR as a stopgap because DFlash re-prefilled cold every turn — that
+    // reason is gone.) DFlash is the default for greedy chat on qwen3.5/3.6;
+    // opt out to the simpler AR path (e.g. to avoid spec-decode) with
+    // `HIPFIRE_DFLASH_CHAT=0`.
+    let force_ar_chat = std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0");
+    if m.dflash.is_some() && temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6) && !budgeted_thinking_needs_ar && !force_ar_chat {
         // PFlash + DFlash decode path is not yet wired -- the DFlash spec
         // loop builds its own prompt token stream internally, so the
         // generate() PFlash block below never runs. Surface this loud so
@@ -3676,6 +5337,9 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
+    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!("[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}", m.conversation_tokens.len(), m.seq_pos);
+    }
     if m.eviction.is_none() && m.seq_pos + prompt_est + max_tokens > m.max_seq {
         eprintln!("[daemon] context full ({}/{}) — resetting conversation", m.seq_pos, m.max_seq);
         m.seq_pos = 0;
@@ -3952,6 +5616,310 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         .build_with_user_tokens(&q_tokens)
     };
 
+    // ── Prompt cache (LCP-based) — Qwen3.5/3.6 only ──────────────────────
+    //
+    // Mirrors V4F's prefix-cache (daemon.rs ~5390). Eligible when:
+    //   - HIPFIRE_QWEN_PROMPT_CACHE != "0"  (default on)
+    //   - messages_history is provided (full-conversation context)
+    //   - eviction not active (compact_offset > 0 invalidates the
+    //     "conversation_tokens mirrors KV" invariant the cache relies on)
+    //   - PFlash compression not enabled this session (compression
+    //     changes the KV's token IDs relative to msg.content from history)
+    //   - prior conversation_tokens non-empty (first turn = nothing to LCP)
+    //
+    // On HIT we set `m.seq_pos = LCP` and override `new_tokens` to the
+    // suffix slice [LCP..] so the prefill below only writes new tokens.
+    // DeltaNet state at position LCP is already correct (cumulative from
+    // prior decode). On MISS (divergence in the middle) we full-reset
+    // (seq_pos=0, conversation_tokens.clear(), zero DeltaNet, KV
+    // compact_offset=0) and prefill the FULL rendered prompt — DeltaNet
+    // is not reversible to position M<N so partial rollback is unsafe.
+    let cache_kill_switch = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref()
+        == Some("0");
+    let pflash_active = pflash_cfg
+        .map(|c| !matches!(c.mode, hipfire_arch_qwen35::pflash::PflashMode::Off))
+        .unwrap_or(false);
+    // Jinja-on disqualification: when `HIPFIRE_JINJA_CHAT=1` the first
+    // turn renders through the upstream HF chat template (which the
+    // model was actually trained on — emits default system prompts,
+    // Hermes XML tool-call format on Qwen3.5/3.6, etc.). The cache
+    // path uses scaffold-style rendering (`ChatScaffold`) which
+    // produces a DIFFERENT byte sequence for the same logical content.
+    // Mixing the two within a session would degrade output quality
+    // (the model sees a different input distribution than it was
+    // trained for after turn 1). Skip the cache when Jinja is active
+    // so the operator gets consistent rendering across all turns.
+    // Cache-with-Jinja is a future project (would require Jinja-side
+    // assistant-turn replay).
+    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+        && m.chat_template.is_some();
+    let cache_eligible = !cache_kill_switch
+        && messages_history.is_some()
+        && m.eviction.is_none()
+        && !pflash_active
+        && !jinja_active
+        && !m.conversation_tokens.is_empty();
+    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        eprintln!(
+            "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} !jinja={} conv_tok={}",
+            cache_eligible, cache_kill_switch, messages_history.is_some(),
+            m.eviction.is_none(), !pflash_active, !jinja_active, m.conversation_tokens.len(),
+        );
+    }
+    let mut cached_tokens_count: usize = 0;
+    let new_tokens: Vec<u32> = if cache_eligible {
+        let history = messages_history.unwrap();
+        let trace_cache = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+            == Some("1");
+        // Build the canonical full-conversation token stream, replaying
+        // any historical assistant turn whose fingerprint matches a
+        // cached emission (BPE-bijective replacement).
+        let rendered = {
+            let cache_ref = &mut m.asst_turn_cache;
+            hipfire_runtime::prompt_frame::build_cached_history(
+                tokenizer,
+                system_prompt,
+                history,
+                &q_tokens,
+                assistant_prefix,
+                |msg| {
+                    // Match the store side's stripping. The store applies
+                    // `strip_think_for_fingerprint` then `maybe_normalize_prompt`
+                    // to the model's emitted text before hashing. The CLI
+                    // is SUPPOSED to strip `<think>...</think>` from the
+                    // visible content before forwarding to clients, but
+                    // the inThink state machine only handles paired blocks;
+                    // when non-thinking mode prefills `<think>\n\n</think>\n\n`
+                    // the model often resumes by emitting another orphan
+                    // `</think>\n\n` (training-distribution artifact),
+                    // which leaks through to the client's msg.content
+                    // verbatim. Apply the same strip here so the lookup
+                    // hash matches the store hash regardless of whether
+                    // the client preserved the orphan.
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped)
+                        .into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    let hit = cache_ref.get(&fp).cloned();
+                    if trace_cache {
+                        eprintln!(
+                            "[qwen-cache lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} tool_calls={} hit={}",
+                            fp, msg.role, msg.content.len(), normalized.len(),
+                            msg.tool_calls.len(), hit.is_some(),
+                        );
+                    }
+                    hit
+                },
+            )
+        };
+        // LCP detection vs m.conversation_tokens.
+        let prior_len = m.conversation_tokens.len();
+        let max_match = prior_len.min(rendered.len());
+        let mut lcp = 0usize;
+        while lcp < max_match && m.conversation_tokens[lcp] == rendered[lcp] {
+            lcp += 1;
+        }
+        if trace_cache {
+            eprintln!(
+                "[qwen-cache lcp] prior_len={} rendered_len={} lcp={}",
+                prior_len, rendered.len(), lcp,
+            );
+            if lcp < prior_len || lcp < rendered.len() {
+                // Print full token-ID context on each side past lcp,
+                // not just the symmetric overlap window. Lets us see
+                // BPE drift cases (same decoded bytes, different ids)
+                // and "one side ran out" cases (rendered_len == lcp).
+                let pre = lcp.saturating_sub(6);
+                let prior_post = (lcp + 16).min(prior_len);
+                let rend_post = (lcp + 16).min(rendered.len());
+                if lcp > pre {
+                    eprintln!(
+                        "  common[{}..{}] ids={:?} dec={:?}",
+                        pre, lcp,
+                        &m.conversation_tokens[pre..lcp],
+                        tokenizer.decode(&m.conversation_tokens[pre..lcp]),
+                    );
+                }
+                if prior_post > lcp {
+                    eprintln!(
+                        "  prior_past[{}..{}] ids={:?} dec={:?}",
+                        lcp, prior_post,
+                        &m.conversation_tokens[lcp..prior_post],
+                        tokenizer.decode(&m.conversation_tokens[lcp..prior_post]),
+                    );
+                }
+                if rend_post > lcp {
+                    eprintln!(
+                        "  rend_past[{}..{}] ids={:?} dec={:?}",
+                        lcp, rend_post,
+                        &rendered[lcp..rend_post],
+                        tokenizer.decode(&rendered[lcp..rend_post]),
+                    );
+                }
+            }
+        } else if lcp < prior_len && prior_len > 50 {
+            // Production-visible cache-miss log. Only fires when LCP
+            // detected a real divergence (not the first-turn or
+            // small-context case). Helps diagnose Pi-style "single-turn
+            // cache invalidation" patterns without requiring the
+            // operator to reproduce with HIPFIRE_QWEN_CACHE_TRACE=1.
+            // Cheap (one eprintln per miss, not per turn).
+            //
+            // Three windows printed (each clipped to 60 chars):
+            //  - common@lcp-4..lcp  — shared tail before divergence
+            //  - prior@lcp..lcp+12  — what prior had past lcp (empty if rendered is longer)
+            //  - rendered@lcp..lcp+12 — what rendered had past lcp (empty if prior is longer)
+            // Plus prior_tail / rendered_tail (last 4 tokens) so we
+            // know what each side ends with.
+            let pre = lcp.saturating_sub(4);
+            let common_dec = if lcp > pre {
+                tokenizer.decode(&m.conversation_tokens[pre..lcp])
+            } else {
+                String::new()
+            };
+            let prior_post = (lcp + 12).min(prior_len);
+            let prior_past_dec = if prior_post > lcp {
+                tokenizer.decode(&m.conversation_tokens[lcp..prior_post])
+            } else {
+                String::new()
+            };
+            let rend_post = (lcp + 12).min(rendered.len());
+            let rend_past_dec = if rend_post > lcp {
+                tokenizer.decode(&rendered[lcp..rend_post])
+            } else {
+                String::new()
+            };
+            let prior_tail = if prior_len >= 4 {
+                tokenizer.decode(&m.conversation_tokens[prior_len - 4..])
+            } else {
+                tokenizer.decode(&m.conversation_tokens[..])
+            };
+            let rend_tail = if rendered.len() >= 4 {
+                tokenizer.decode(&rendered[rendered.len() - 4..])
+            } else {
+                tokenizer.decode(&rendered[..])
+            };
+            eprintln!(
+                "[qwen-cache miss] lcp={} prior_len={} rendered_len={}",
+                lcp, prior_len, rendered.len(),
+            );
+            eprintln!(
+                "  common@{}..{}={:?}",
+                pre, lcp,
+                common_dec.chars().take(60).collect::<String>(),
+            );
+            eprintln!(
+                "  prior_past@{}..{}={:?} rendered_past@{}..{}={:?}",
+                lcp, prior_post,
+                prior_past_dec.chars().take(60).collect::<String>(),
+                lcp, rend_post,
+                rend_past_dec.chars().take(60).collect::<String>(),
+            );
+            eprintln!(
+                "  prior_tail={:?} rendered_tail={:?}",
+                prior_tail.chars().take(60).collect::<String>(),
+                rend_tail.chars().take(60).collect::<String>(),
+            );
+        }
+        if lcp < prior_len {
+            // Divergence: the client sent a non-extension render (it dropped or
+            // edited earlier history, so the prior conversation is no longer a
+            // prefix of this prompt). Rather than cold-prefill the whole thing,
+            // try to RESUME from the latest prefill checkpoint at or before
+            // `lcp`: restore the DeltaNet recurrent state captured there, rewind
+            // seq_pos + the KV write head, and re-prefill only
+            // [resume_pos..rendered.len()). KV for [0..resume_pos] is still
+            // resident (positional, never overwritten). Gated to the single-GPU,
+            // no-eviction case — eviction remaps physical KV slots, which would
+            // invalidate the resident prefix. `seq_pos < rendered.len()` on the
+            // chosen checkpoint guarantees ≥1 token is re-prefilled.
+            let evict_safe = m.pp <= 1
+                && m.eviction.is_none()
+                && m.kv_cache.as_ref().map(|k| k.compact_offset == 0).unwrap_or(true)
+                && m.llama_kv.as_ref().map(|k| k.compact_offset == 0).unwrap_or(true);
+            let resume_idx = if ckpt_resume_enabled() && evict_safe && m.dn_state.is_some() {
+                m.prefill_checkpoints
+                    .iter()
+                    .rposition(|(p, _)| *p <= lcp && *p < rendered.len())
+            } else {
+                None
+            };
+            let resumed = if let Some(idx) = resume_idx {
+                let rpos = m.prefill_checkpoints[idx].0;
+                let ok = if let (Some(ck), Some(dn)) =
+                    (m.prefill_checkpoints.get(idx), m.dn_state.as_mut())
+                {
+                    ck.1.restore_to(dn, gpu).is_ok()
+                } else {
+                    false
+                };
+                if ok {
+                    m.seq_pos = rpos;
+                    // `evict_safe` guarantees compact_offset == 0, so setting
+                    // seq_pos already points the KV write head at rpos — nothing
+                    // to restore (checkpoints are only captured with offset 0).
+                    m.conversation_tokens.truncate(rpos);
+                    m.prefill_checkpoints.truncate(idx + 1);
+                    cached_tokens_count = rpos;
+                    eprintln!(
+                        "[qwen-cache resume] rewound to checkpoint pos={} (lcp={}, prior_len={}, rendered_len={}) — replaying {} tokens vs cold-prefilling {}",
+                        rpos, lcp, prior_len, rendered.len(), rendered.len() - rpos, rendered.len(),
+                    );
+                    Some(rendered[rpos..].to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match resumed {
+                Some(tail) => tail,
+                None => {
+                    // No usable checkpoint — full cold reset. DeltaNet recurrent
+                    // state is non-reversible; treat as a miss. Inlined (not
+                    // `full_reset_cold`) because a `&tokenizer` borrow of `m` is
+                    // live here; these are disjoint field accesses.
+                    m.seq_pos = 0;
+                    m.conversation_tokens.clear();
+                    m.prefill_checkpoints.clear();
+                    if let Some(ref dn) = m.dn_state {
+                        for s in &dn.s_matrices {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.s_scales {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                        for s in &dn.conv_states {
+                            let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+                        }
+                    }
+                    if let Some(kv) = m.kv_cache.as_mut() {
+                        kv.compact_offset = 0;
+                    }
+                    if let Some(kv) = m.llama_kv.as_mut() {
+                        kv.compact_offset = 0;
+                    }
+                    rendered
+                }
+            }
+        } else {
+            // Pure extension or exact-match edge case. Adjust LCP back
+            // by one if the new prompt is byte-identical to the cached
+            // conversation so we always prefill ≥1 token (mirrors V4F's
+            // edge handling).
+            let lcp_adj = if lcp == rendered.len() && lcp > 0 {
+                lcp - 1
+            } else {
+                lcp
+            };
+            m.seq_pos = lcp_adj;
+            cached_tokens_count = lcp_adj;
+            rendered[lcp_adj..].to_vec()
+        }
+    } else {
+        new_tokens
+    };
+
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
     // eviction, physical is bounded by physical_cap regardless of total tokens
@@ -4034,10 +6002,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // physical_cap. Chunk size caps out at physical capacity available —
         // when physical is at post-evict `budget`, a full `beta`-sized chunk
         // can run before the next eviction fires.
+        // Prefill loop with abort support. The CLI sends
+        // `{type:"abort","id":"..."}` when the HTTP client closes the
+        // connection (curl `-m` timeout, Pi/opencode response timer
+        // fired, etc.); the stdin reader thread sets the abort flag
+        // and the chunk loop below picks it up. The no-eviction path
+        // is manually chunked at PREFILL_MAX_BATCH so abort latency
+        // is bounded to one chunk (~5 s on gfx1151 at 50 tps).
+        //
+        // On abort, DeltaNet's non-reversible state means we can't
+        // rewind to the pre-prefill position — full reset (seq_pos=0,
+        // conversation_tokens cleared, DN s/conv buffers zeroed,
+        // KV compact_offset=0). Next request hits cache miss and
+        // does a full re-prefill from scratch, which is the same cost
+        // as letting the abandoned prefill drain — but the client
+        // gets control back immediately instead of waiting.
+        let mut prefill_aborted = false;
         if let Some(ref ev) = m.eviction {
             let window = ev.budget() + ev.beta();
             let mut remaining: &[u32] = &new_tokens;
             while !remaining.is_empty() {
+                if check_abort(id) { prefill_aborted = true; break; }
                 let space = window.saturating_sub(m.seq_pos).max(1);
                 let chunk_len = remaining.len().min(space);
                 let (chunk, rest) = remaining.split_at(chunk_len);
@@ -4052,11 +6037,48 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 remaining = rest;
             }
         } else {
-            qwen35::forward_prefill_batch(
-                gpu, weights, config, &new_tokens, m.seq_pos, kv, dn, scratch,
-                None, None, None, None,
-            ).unwrap();
-            m.seq_pos += new_tokens.len();
+            // Manually chunk the no-eviction prefill so the abort
+            // check fires between batches. PREFILL_MAX_BATCH (256)
+            // is the same boundary the kernel uses internally so
+            // chunking here doesn't change the GPU-side work.
+            let chunk_max = qwen35::PREFILL_MAX_BATCH;
+            let mut start = 0usize;
+            while start < new_tokens.len() {
+                if check_abort(id) { prefill_aborted = true; break; }
+                let end = (start + chunk_max).min(new_tokens.len());
+                let chunk = &new_tokens[start..end];
+                qwen35::forward_prefill_batch(
+                    gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch,
+                    None, None, None, None,
+                ).unwrap();
+                m.seq_pos += chunk.len();
+                // Snapshot the recurrent state every ckpt_interval() tokens so a
+                // later divergent render can resume here instead of cold. `dn`
+                // (&mut m.dn_state) and &mut m.prefill_checkpoints are disjoint
+                // fields, so this composes with the live kv/dn borrows.
+                if ckpt_resume_enabled() { speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, ckpt_interval(), ckpt_max()); }
+                start = end;
+            }
+        }
+        if prefill_aborted {
+            // Full state reset (see comment above the prefill loop).
+            for s in &dn.s_matrices {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.s_scales {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            for s in &dn.conv_states {
+                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            }
+            kv.compact_offset = 0;
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            m.prefill_checkpoints.clear();
+            let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+            let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":0,"prefill_ms":0,"decode_ms":0}}"#, id);
+            let _ = stdout.flush();
+            return;
         }
         m.conversation_tokens.extend_from_slice(&new_tokens);
 
@@ -4067,6 +6089,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // RP-sensitive than llama.cpp's Q4_K. First sample: empty scope (no
         // generated tokens yet); subsequent samples: generated-so-far only.
         let ngram_scope_start = m.conversation_tokens.len();
+        // Boundary marker for the prompt-cache: the model's verbatim
+        // emitted tokens start here. Used after the decode loop to
+        // slice out cached_seq for `asst_turn_cache`. Equal to
+        // ngram_scope_start by construction; aliased for readability.
+        let decode_start_tokens_idx = ngram_scope_start;
 
         // Generate. GPU-side sampling eliminates per-token logits download +
         // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
@@ -4088,6 +6115,82 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             .into_iter()
             .chain(think_pair.into_iter())
             .collect();
+
+        // ── Grammar-guided decoding setup ───────────────────────────
+        //
+        // When the request carries tools, build a qwen35 grammar matcher
+        // and pin a vocab-sized decoded-text vector for mask construction.
+        // The matcher constrains sample-time logits the moment the model
+        // commits to `<tool_call>` — preventing the qwen3.6:27b "ChatML
+        // noise as tool_call body" attractor observed in Pi turn 12 (the
+        // model emitted `<|im_start|>assistant "..."}}` between the open
+        // and close tags, breaking JSON parse → daemon emitted
+        // `finish_reason: "stop"` with garbage content → Pi agent loop
+        // terminated). See `crates/hipfire-arch-qwen35/src/grammar.rs`
+        // for the state machine and the V4F path
+        // (`crates/hipfire-arch-deepseek4/src/grammar.rs`) for the
+        // structurally-similar DSML grammar.
+        //
+        // Disable with `HIPFIRE_QWEN35_GRAMMAR=0` for A/B comparison.
+        let grammar_enabled = std::env::var("HIPFIRE_QWEN35_GRAMMAR")
+            .ok()
+            .as_deref()
+            != Some("0");
+        let tool_schemas_qwen: Vec<hipfire_arch_qwen35::grammar::ToolSchema> = if grammar_enabled {
+            tools
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|t| {
+                            let func = t.get("function").unwrap_or(t);
+                            let name = func
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())?
+                                .to_string();
+                            let required: Vec<String> = func
+                                .get("parameters")
+                                .and_then(|p| p.get("required"))
+                                .and_then(|r| r.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            Some(hipfire_arch_qwen35::grammar::ToolSchema {
+                                name,
+                                required,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let grammar_active = !tool_schemas_qwen.is_empty();
+        let mut grammar_matcher =
+            hipfire_arch_qwen35::grammar::Matcher::new(tool_schemas_qwen);
+        // One-time vocab decode for token mask construction. Reuses the
+        // model-level cache so subsequent requests on the same model skip
+        // the ~150k-entry decode.
+        let qwen_grammar_vocab: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let grammar_vocab: &[String] = qwen_grammar_vocab
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; grammar_vocab.len()];
 
         // First sample: use conversation so far as scope.
         let ngram_scope = &m.conversation_tokens[ngram_scope_start..];
@@ -4117,16 +6220,36 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             repeat_window: repeat_buf_cap,
             blocked_tokens: blocked0,
         };
-        let tok0 = sampler::sample(
-            gpu,
-            &scratch.logits,
-            &scratch.sample_buf,
-            &scratch.repeat_buf,
-            vocab_size,
-            ngram_scope,
-            &cfg0,
-            &mut rng_state,
-        );
+        // Grammar-gated sample: GPU fast path when the matcher is free
+        // (the common case — no tool_call mid-flight); CPU slow path when
+        // the matcher is constraining, so we can apply the token mask to
+        // the logits before sampling. See setup block above for rationale.
+        let tok0 = if grammar_active && !grammar_matcher.is_free() {
+            let mut logits = gpu
+                .download_f32(&scratch.logits)
+                .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+            grammar_matcher.token_mask(grammar_vocab, &mut grammar_mask);
+            hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
+                &grammar_mask,
+                &mut logits,
+            );
+            sampler::sample_cpu(&mut logits, ngram_scope, &cfg0)
+        } else {
+            sampler::sample(
+                gpu,
+                &scratch.logits,
+                &scratch.sample_buf,
+                &scratch.repeat_buf,
+                vocab_size,
+                ngram_scope,
+                &cfg0,
+                &mut rng_state,
+            )
+        };
+        if grammar_active {
+            let text = tokenizer.decode(&[tok0]);
+            grammar_matcher.advance(&text);
+        }
         // First token is ready (sample_top_p's D2H forces GPU sync). This is
         // the user-observable "time to first token" boundary — prefill above,
         // decode loop below.
@@ -4168,6 +6291,19 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         // (which increments `generated` beyond the iteration count) can't
         // push generated past max_tokens: each loop start rechecks the cap.
         while generated < max_tokens {
+            // Decode-side abort check. Client cancel (Pi 4-min idle
+            // timeout firing while the CLI buffers tokens for tool-call
+            // detection — wire shows zero output until `done`) sends
+            // `{type:"abort","id":"..."}` over stdin; the reader thread
+            // sets `abort_for_id()` and we bail at the next iteration.
+            // Emit aborted+done so the CLI's drain loop terminates
+            // cleanly without an extra max_tokens worth of wasted decode.
+            if check_abort(id) {
+                let _ = writeln!(stdout, r#"{{"type":"aborted","id":"{}","reason":"client_cancelled"}}"#, id);
+                let _ = writeln!(stdout, r#"{{"type":"done","id":"{}","finish_reason":"aborted","prompt_tokens":0,"completion_tokens":{},"prefill_ms":0,"decode_ms":0}}"#, id, generated);
+                let _ = stdout.flush();
+                return;
+            }
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
@@ -4196,6 +6332,11 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // the cache itself keeps RoPE phase correct across evictions.
             qwen35::forward_scratch(gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch).unwrap();
             m.seq_pos += 1;
+            // Checkpoint during decode too, so a long generated turn (e.g. a
+            // big code emission) can be resumed mid-region if the NEXT turn's
+            // render diverges within it — without replaying the whole
+            // generation. No-op under eviction (compact_offset != 0).
+            if ckpt_resume_enabled() { speculative::take_dn_checkpoint(&mut m.prefill_checkpoints, dn, gpu, m.seq_pos, ckpt_interval(), ckpt_max()); }
             if let Some(ref ev) = m.eviction {
                 if let Some(hipfire_runtime::triattn::EvictionResult { new_physical: new_phys, .. }) = ev.maybe_evict(gpu, kv, m.seq_pos).unwrap() {
                     m.seq_pos = new_phys;
@@ -4213,7 +6354,12 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             // the model commits to an answer with the remaining budget.
             // Same decoded-text scan budget_alert uses; counter is
             // incremented per-iteration only when we're still inside.
-            if max_think_tokens > 0 {
+            // Force-close the <think> span when EITHER the max_think_tokens
+            // budget is hit OR the CLI sent a `force_answer` signal (a turn
+            // running long → make the model commit to its answer instead of
+            // the client timing out mid-think and terminating the stream).
+            let force_answer_now = check_force_answer(id);
+            if max_think_tokens > 0 || force_answer_now {
                 let raw_so_far = tokenizer.decode_bytes(&streamed_tokens);
                 let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
                 let open_idx = raw_str.rfind("<think>");
@@ -4223,22 +6369,27 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                     (Some(_), None) => true,
                     _ => false,
                 };
-                if in_think {
-                    if !prev_in_think { think_count = 1; } else { think_count += 1; }
-                } else {
-                    think_count = 0;
+                if max_think_tokens > 0 {
+                    if in_think {
+                        if !prev_in_think { think_count = 1; } else { think_count += 1; }
+                    } else {
+                        think_count = 0;
+                    }
+                    prev_in_think = in_think;
                 }
-                prev_in_think = in_think;
+                let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
 
-                if in_think && think_count >= max_think_tokens {
-                    // Force-close. Encode the close sequence and run each
-                    // token through the KV write + emit path the same way
-                    // a normally-sampled token does. This ensures the
-                    // model's next sample is conditioned on having "said"
-                    // </think>\n itself, instead of seeing a hidden-state
-                    // discontinuity. Respect max_tokens — clip the close
-                    // sequence if not enough room remains and bail.
-                    let close_tokens = tokenizer.encode("</think>\n");
+                if in_think && (budget_hit || force_answer_now) {
+                    if force_answer_now {
+                        eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
+                    }
+                    // Force-close. Encode the continuation and run each token
+                    // through the KV write + emit path the same way a normally-
+                    // sampled token does, so the model's next sample is
+                    // conditioned on having "said" it (no hidden-state
+                    // discontinuity). Respect max_tokens — clip if not enough
+                    // room remains and bail.
+                    let close_tokens = tokenizer.encode(&think_continuation());
                     let budget_left = max_tokens.saturating_sub(generated);
                     let take = close_tokens.len().min(budget_left);
                     for &t in &close_tokens[..take] {
@@ -4330,16 +6481,32 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                         repeat_window: repeat_buf_cap,
                         blocked_tokens: blocked,
                     };
-                    next_token = sampler::sample(
-                        gpu,
-                        &scratch.logits,
-                        &scratch.sample_buf,
-                        &scratch.repeat_buf,
-                        vocab_size,
-                        ngram_scope,
-                        &cfg,
-                        &mut rng_state,
-                    );
+                    next_token = if grammar_active && !grammar_matcher.is_free() {
+                        let mut logits = gpu
+                            .download_f32(&scratch.logits)
+                            .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+                        grammar_matcher.token_mask(grammar_vocab, &mut grammar_mask);
+                        hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
+                            &grammar_mask,
+                            &mut logits,
+                        );
+                        sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+                    } else {
+                        sampler::sample(
+                            gpu,
+                            &scratch.logits,
+                            &scratch.sample_buf,
+                            &scratch.repeat_buf,
+                            vocab_size,
+                            ngram_scope,
+                            &cfg,
+                            &mut rng_state,
+                        )
+                    };
+                    if grammar_active {
+                        let text = tokenizer.decode(&[next_token]);
+                        grammar_matcher.advance(&text);
+                    }
                     continue;
                 }
                 let nudge_tokens = tokenizer.encode(budget_alert_text);
@@ -4411,19 +6578,43 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
                 repeat_window: repeat_buf_cap,
                 blocked_tokens: blocked,
             };
-            // GPU sample: reads scratch.logits (already on GPU), writes
-            // token+rng to scratch.sample_buf. Blocks only on the 8-byte
-            // D2H readback inside sampler::sample.
-            next_token = sampler::sample(
-                gpu,
-                &scratch.logits,
-                &scratch.sample_buf,
-                &scratch.repeat_buf,
-                vocab_size,
-                ngram_scope,
-                &cfg,
-                &mut rng_state,
-            );
+            // Grammar-gated sample (see setup block + tok0 site above).
+            // GPU sample is the fast path; CPU mask-then-sample is the
+            // constrained slow path that prevents the Pi turn-12
+            // ChatML-noise-in-tool_call-body attractor.
+            next_token = if grammar_active && !grammar_matcher.is_free() {
+                let mut logits = gpu
+                    .download_f32(&scratch.logits)
+                    .unwrap_or_else(|_| vec![0.0f32; vocab_size]);
+                grammar_matcher.token_mask(grammar_vocab, &mut grammar_mask);
+                hipfire_arch_qwen35::grammar::Matcher::apply_mask_to_logits(
+                    &grammar_mask,
+                    &mut logits,
+                );
+                sampler::sample_cpu(&mut logits, ngram_scope, &cfg)
+            } else {
+                sampler::sample(
+                    gpu,
+                    &scratch.logits,
+                    &scratch.sample_buf,
+                    &scratch.repeat_buf,
+                    vocab_size,
+                    ngram_scope,
+                    &cfg,
+                    &mut rng_state,
+                )
+            };
+            if grammar_active {
+                let text = tokenizer.decode(&[next_token]);
+                let was_detected = grammar_matcher.attractor_detected();
+                grammar_matcher.advance(&text);
+                if !was_detected && grammar_matcher.attractor_detected() {
+                    eprintln!(
+                        "[grammar-ngram] attractor detected in tool_call args at gen={} — forcing close",
+                        generated,
+                    );
+                }
+            }
         }
         // m.seq_pos is already the "next physical write slot" — advanced
         // per-token in the decode loop above, and evicted back down to
@@ -4444,6 +6635,101 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
             }
         }
 
+        // ── parse tool_calls + content once ────────────────────────
+        //
+        // Single source of truth for tool_calls extraction: parse here
+        // ONCE, emit structured `tool_calls` event for the CLI to use,
+        // AND hash for the asst-turn cache fingerprint. Previously the
+        // CLI ran its own `parseToolCalls` over the streamed tokens and
+        // emitted a different structure than the daemon hashed —
+        // diverging the parsers and breaking the cache on every
+        // malformed model emission (qwen3.6:27b unclosed `<tool_call>`,
+        // ChatML token leakage, MQ4 #111 nested openers, etc.). With a
+        // single parser run, the structured form Pi echoes back next
+        // turn is byte-identical to what we hashed → cache hit.
+        let decoded_full = tokenizer.decode(&streamed_tokens);
+        let emit_tool_calls = extract_tool_calls_from_text(&decoded_full);
+
+        // Emit structured tool_calls event BEFORE done so the CLI can
+        // forward them to the client as `tool_calls` SSE chunks (same
+        // pattern V4F uses via its DSML StreamParser). The CLI sets
+        // `structuredToolCallsEmitted = true` on receipt, which then
+        // suppresses its legacy text-buffer parsing path.
+        if !emit_tool_calls.is_empty() {
+            let calls_json: Vec<serde_json::Value> = emit_tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "name": tc.name,
+                        "arguments": tc.arguments,
+                    })
+                })
+                .collect();
+            let calls_str = serde_json::to_string(&calls_json).unwrap_or_else(|_| "[]".to_string());
+            let _ = writeln!(
+                stdout,
+                r#"{{"type":"tool_calls","id":"{}","calls":{}}}"#,
+                id, calls_str,
+            );
+        }
+
+        // ── asst_turn_cache write ────────────────────────────────────
+        //
+        // Store the model's verbatim emitted token sequence under a
+        // fingerprint over (stripped_text, parsed_tool_calls) so the
+        // next turn's prompt-cache renderer can replay the exact bytes
+        // the model wrote into KV instead of re-encoding via
+        // `tokenizer.encode(msg.content)` (BPE non-bijective).
+        //
+        // Always populates (regardless of `cache_eligible` for THIS
+        // request) so a first turn primes the cache for turn 2's
+        // lookup. Trims trailing `<|im_end|>` + newline trailer so
+        // `append_assistant_turn_tokens` can re-add them around the
+        // body on replay.
+        {
+            let mut cached_seq: Vec<u32> =
+                m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            // Trim trailing `\n` newline tokens from the forced trailer.
+            while let Some(&last) = cached_seq.last() {
+                if nl.contains(&last) {
+                    cached_seq.pop();
+                } else {
+                    break;
+                }
+            }
+            // Trim a single trailing `<|im_end|>` (if the tokenizer
+            // registered it as one token id).
+            if let Some(&last) = cached_seq.last() {
+                if im_end_token == Some(last) {
+                    cached_seq.pop();
+                }
+            }
+            if !cached_seq.is_empty() {
+                let stripped = strip_think_for_fingerprint(&decoded_full);
+                // Normalize symmetrically with the lookup-side msg.content
+                // normalization (done at message-parse time). Without this,
+                // the store-side fp from a raw-text emission diverges from
+                // the lookup-side fp computed on the normalized msg.content
+                // the CLI sends back next turn.
+                let emit_text = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped)
+                    .into_owned();
+                let fp = asst_turn_fingerprint(&emit_text, &emit_tool_calls);
+                if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref()
+                    == Some("1")
+                {
+                    eprintln!(
+                        "[qwen-cache store] fp={:#018x} cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
+                        fp,
+                        cached_seq.len(),
+                        emit_text.len(),
+                        emit_tool_calls.len(),
+                        emit_text.chars().take(60).collect::<String>(),
+                    );
+                }
+                m.asst_turn_cache.insert(fp, cached_seq);
+            }
+        }
+
         let t_end = Instant::now();
         let total_s = t_end.duration_since(t0).as_secs_f64();
         let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
@@ -4451,11 +6737,34 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
         let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
         let prefill_tok_s = if prefill_s > 0.0 { prefill_tokens as f64 / prefill_s } else { 0.0 };
         let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+        // finish_reason carried in `done` so the CLI doesn't have to
+        // infer it from whether tool_calls were emitted (matches V4F).
+        //
+        // Length-cap wins over tool_calls: if the model hit max_tokens
+        // mid-tool-call, the tool_call body is truncated (daemon's
+        // unclosed-block fallback still extracts a name + partial args
+        // so structured tool_calls is non-empty). Signalling "length"
+        // here lets the client distinguish this from a complete call
+        // and retry with a larger budget. Detection: the decode loop
+        // exits at `generated == max_tokens` only when no natural stop
+        // (eos / im_end / terminator) fired — those break BEFORE the
+        // next iteration's `generated += 1`. So `generated >=
+        // max_tokens` is a reliable "no natural stop" signal.
+        let hit_length_cap = generated >= max_tokens;
+        let finish_reason = if hit_length_cap {
+            "length"
+        } else if !emit_tool_calls.is_empty() {
+            "tool_calls"
+        } else {
+            "stop"
+        };
         let _ = writeln!(
             stdout,
-            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1}{}}}"#,
+            r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.1},"prefill_tokens":{},"prefill_ms":{:.1},"prefill_tok_s":{:.1},"decode_tok_s":{:.1},"ttft_ms":{:.1},"cached_tokens":{},"finish_reason":"{}"{}}}"#,
             id, generated, tok_s, prefill_tokens,
             prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0,
+            cached_tokens_count,
+            finish_reason,
             pflash_done_fragment(&pflash_summary, &pflash_bypass_reason, pflash_alpha),
         );
         let _ = stdout.flush();
@@ -4562,6 +6871,1032 @@ fn generate(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, drafter_gpu: Optio
     }
 }
 
+/// DeepSeek V4 Flash generate path (arch_id=9, hipfire-arch-deepseek4).
+///
+/// Parity with `deepseek4_chat`: batched chunked prefill +
+/// optional MTP spec-decode + greedy argmax sampler. PBS is pre-allocated
+/// once at load time (`m.deepseek4_pbs`), reused across every turn.
+///
+/// Env knobs (read fresh per generate call so they can be toggled
+/// without daemon restart):
+///   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1     opt-in MTP speculative decode
+///   HIPFIRE_DEEPSEEK4_SPEC_K=N          drafts per spec-decode window (default 3)
+///   HIPFIRE_DEEPSEEK4_TOP_K=N           top-k filter (default 0 = off; HF rec)
+///   HIPFIRE_DEEPSEEK4_SEED=N            PRNG seed (default: time-based)
+///
+/// Sampling defaults follow the HF model card for `deepseek-ai/DeepSeek-V4-Flash`:
+/// `temperature = 1.0, top_p = 1.0`. Pure greedy (`temp ≤ 1e-6`) is
+/// supported but actively dangerous on this quantized instruct model —
+/// once a code fence opens, `import X\n` self-reinforces into a block-
+/// level token loop. Use `temp = 1.0` (HF default) to avoid the attractor.
+///
+/// Chat template (per HF `encoding/README.md` for V4): non-thinking-mode
+/// frame `<｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>`.
+/// The model expects the `</think>` immediately after `<｜Assistant｜>` in
+/// non-thinking mode, even though no thinking block was generated — this
+/// signals "skip reasoning, go straight to response." Omitting it leaves
+/// the model in undefined-behavior territory.
+///
+/// Deliberately bypasses qwen35/llama machinery — no PFlash, no DFlash,
+/// no CASK eviction, no ChatML scaffolding, no tool-use, no `<think>` /
+/// `max_think_tokens`, no repeat penalty, no VL, no multi-GPU
+/// pipeline-parallel.
+///
+/// On context overflow the DeepSeek V4 state is hard-reset — DeepSeek V4 has no
+/// eviction path of its own and the SWA cache wraps automatically below
+/// the sliding-window bound.
+/// HuggingFace DeepSeek V4 thinking modes (per `encoding/README.md`).
+///
+/// The chat template choice changes the open-token after `<｜Assistant｜>`
+/// and (for `Max`) prepends an extended reasoning instruction.
+#[derive(Copy, Clone, Debug)]
+pub enum ThinkMode {
+    /// Non-thinking. Frame: `<｜Assistant｜></think>{response}`.
+    /// Model skips reasoning, replies directly. HF default for chat.
+    NonThink,
+    /// Thinking-high. Frame: `<｜Assistant｜><think>{reasoning}</think>{response}`.
+    /// Model produces a `<think>` block before responding.
+    High,
+    /// Thinking-max. Same frame as `High`, plus prepended
+    /// "Reasoning Effort: Absolute maximum..." system instruction.
+    /// HF recommends context ≥ 384K for this mode.
+    Max,
+}
+
+impl ThinkMode {
+    /// Map a JSONL field value (OpenAI-compatible `reasoning_effort` or
+    /// project-custom `thinking_mode`) to a mode.
+    /// Accepted: "none|off|chat|minimal" → NonThink;
+    ///           "low|medium|high|thinking" → High;
+    ///           "max" → Max. Anything else → NonThink (safe default).
+    pub fn from_str(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "max" => Self::Max,
+            "high" | "thinking" | "low" | "medium" => Self::High,
+            _ => Self::NonThink,
+        }
+    }
+}
+
+fn generate_deepseek4(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    think_mode: ThinkMode,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"tokenizer not loaded"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let cfg = match m.deepseek4_config.as_ref() {
+        Some(c) => c,
+        None => {
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"deepseek4_config missing on arch_id=9 generate"}}"#, id);
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    let weights = m.deepseek4_weights.as_ref().expect("deepseek4_weights missing on arch_id=9 generate");
+    let pbs = m.deepseek4_pbs.as_ref().expect("deepseek4_pbs missing on arch_id=9 generate");
+    let state = m.deepseek4_state.as_mut().expect("deepseek4_state missing on arch_id=9 generate");
+    let eos_tok = m.deepseek4_eos_tok;
+
+    // DeepSeek V4 non-thinking chat template (per HF encoding/README.md):
+    //   <｜begin▁of▁sentence｜>{system?}<｜User｜>{msg}<｜Assistant｜></think>
+    //
+    // The `</think>` immediately after `<｜Assistant｜>` is REQUIRED in
+    // non-thinking mode — it tells the model "skip the reasoning block,
+    // go straight to the response." Without it the model is in
+    // undefined-behavior territory. Raw prompts (no chat-template wrap)
+    // also collapse to attractor garbage on this quantized instruct
+    // model. Multi-turn / thinking-mode plumbing is a follow-up; this
+    // emits a single non-thinking turn per /generate call.
+    let lookup = |s: &str| -> Option<u32> {
+        let ids = tokenizer.encode(s);
+        if ids.len() == 1 { Some(ids[0]) } else { None }
+    };
+    let bos_tok = lookup("<｜begin▁of▁sentence｜>");
+    let user_tok = lookup("<｜User｜>");
+    let asst_tok = lookup("<｜Assistant｜>");
+
+    // HF "Reasoning Effort: Absolute maximum..." preamble for `Max` mode.
+    // Quoted from the model card's encoding/README.md.
+    const MAX_THINK_PREAMBLE: &str = "Reasoning Effort: Absolute maximum with no shortcuts permitted. \
+You MUST be very thorough in your thinking and comprehensively decompose the problem.";
+
+    // Build the effective system message: optional user-supplied system
+    // text + (if request has tools) the DSML "## Tools" preamble.
+    //
+    // HF reference render: the system role is rendered as `{content}`
+    // (raw, no role prefix), then appended with `"\n\n" + render_tools`
+    // when tools are present. For an empty system + tools this becomes
+    // `"" + "\n\n" + tools_block` = `"\n\n" + tools_block` — the model
+    // was trained to see two newlines BEFORE `## Tools` even with no
+    // system content. Omitting them puts the model in off-distribution
+    // territory; observed 2026-05-23 to drive the V4F MQ2-Lloyd
+    // checkpoint into `<｜DSML｜tool_cin> / <｜DSML｜-cin>` attractor
+    // loops on no-system + 4-tools requests. The leading `\n\n` is
+    // load-bearing — do not drop.
+    let tools_block: Option<String> = tools
+        .filter(|t| !t.is_empty())
+        .map(|t| deepseek4::dsml::tools_prompt_block(t));
+    let effective_system: Option<String> = match (system_prompt.filter(|s| !s.is_empty()), tools_block.as_deref()) {
+        (Some(sys), Some(tb)) => Some(format!("{sys}\n\n{tb}")),
+        (Some(sys), None) => Some(sys.to_string()),
+        (None, Some(tb)) => Some(format!("\n\n{tb}")),
+        (None, None) => None,
+    };
+
+    let mut prompt_ids: Vec<u32> = Vec::new();
+    if let Some(b) = bos_tok { prompt_ids.push(b); }
+    if matches!(think_mode, ThinkMode::Max) {
+        prompt_ids.extend(tokenizer.encode(MAX_THINK_PREAMBLE));
+    }
+    if let Some(ref sys) = effective_system {
+        prompt_ids.extend(tokenizer.encode(sys));
+    }
+
+    // Multi-turn history. Each prior message gets rendered as a turn:
+    //   user → `<｜User｜>{content}{tool_results?}`
+    //   assistant → `<｜Assistant｜>{content_or_dsml}<｜end▁of▁sentence｜>`
+    // Tool result messages (role=tool) attach to the previous user turn
+    // wrapped in `<tool_result>…</tool_result>` per HF encoding/README.md.
+    // The CURRENT user prompt is appended last (outside this loop).
+    if let Some(history) = messages_history {
+        // Skip the leading system message (if any) — already handled.
+        // Skip the trailing user prompt — we add it explicitly after.
+        // Heuristic: if last message is role=user, treat its content as
+        // the live prompt and drop it here.
+        use hipfire_runtime::prompt_frame::Role;
+        let trim_end = if matches!(history.last().map(|m| m.role), Some(Role::User)) { 1 } else { 0 };
+        let end = history.len().saturating_sub(trim_end);
+        // Track whether the previous emission was already a tool_result
+        // wrapped in a user turn — when YES, the next consecutive tool
+        // message MUST NOT open a new `<｜User｜>` marker; instead it
+        // stacks its `<tool_result>` body into the existing user turn.
+        // Matches the reference imatrix dataset renderer in
+        // `gguf-tools/imatrix/dataset/build_ds4_imatrix_dataset.py:196-201`
+        // — OpenAI's parallel-tool-call flow produces consecutive tool
+        // messages (one per parallel call), and a fresh `<｜User｜>`
+        // between them isn't what V4F was trained on.
+        let mut pending_tool_result = false;
+        for msg in &history[..end] {
+            match msg.role {
+                Role::System => {
+                    // Already handled via effective_system; skip.
+                }
+                Role::User => {
+                    if let Some(u) = user_tok { prompt_ids.push(u); }
+                    prompt_ids.extend(tokenizer.encode(&msg.content));
+                    pending_tool_result = false;
+                }
+                Role::Tool => {
+                    // Wrap as `<tool_result>{escaped}</tool_result>`. Open
+                    // a new user turn ONLY if the prior message wasn't
+                    // already a tool_result.
+                    if !pending_tool_result {
+                        if let Some(u) = user_tok { prompt_ids.push(u); }
+                    }
+                    prompt_ids.extend(
+                        tokenizer.encode(&deepseek4::dsml::render_tool_result(&msg.content))
+                    );
+                    pending_tool_result = true;
+                }
+                Role::Assistant => {
+                    // Daemon-emitted surround tokens that bracket every
+                    // assistant turn in V4F format:
+                    //   <｜Assistant｜>{</think> when not in think-replay}
+                    //     {turn body — content + tool_calls}
+                    //   <｜end▁of▁sentence｜>
+                    //
+                    // The cache stores ONLY the inner turn body (the
+                    // tokens the model itself emitted during decode).
+                    // The surround tokens are deterministic functions
+                    // of `msg.content` and `think_mode` and must be
+                    // emitted IDENTICALLY on both hit and miss paths so
+                    // the prompt-cache LCP can extend through every
+                    // prior assistant turn.
+                    if let Some(a) = asst_tok { prompt_ids.push(a); }
+                    let starts_with_think_tag = msg.content.starts_with("<think>")
+                        || msg.content.starts_with("</think>");
+                    if !starts_with_think_tag {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
+
+                    // Prefix-cache fast path: if we previously emitted
+                    // this exact assistant turn, replay the model's
+                    // verbatim token sequence instead of re-rendering
+                    // via DSML + BPE encode (which is not bijective —
+                    // multi-char DSML special tokens picked greedily
+                    // during decode can come back out of
+                    // `tokenizer.encode(render(...))` as a longer
+                    // sequence with different boundaries, capping the
+                    // LCP at the assistant-turn boundary).
+                    // Match store-side stripping (see qwen35 path comment).
+                    let stripped = strip_think_for_fingerprint(&msg.content);
+                    let normalized = hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped)
+                        .into_owned();
+                    let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
+                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                        eprintln!(
+                            "[asst-cache lookup] fp={:#018x} content.len={}/stripped.len={} tool_calls={} hit={}",
+                            fp, msg.content.len(), normalized.len(),
+                            msg.tool_calls.len(),
+                            m.asst_turn_cache.contains_key(&fp),
+                        );
+                    }
+                    if let Some(cached) = m.asst_turn_cache.get(&fp) {
+                        prompt_ids.extend_from_slice(cached);
+                    } else {
+                        // Cache miss — render the turn the long way.
+                        if !msg.content.is_empty() && msg.content != "null" {
+                            prompt_ids.extend(tokenizer.encode(&msg.content));
+                        }
+                        if !msg.tool_calls.is_empty() {
+                            let dsml_calls: Vec<hipfire_arch_deepseek4::dsml::ToolCall> = msg
+                                .tool_calls
+                                .iter()
+                                .map(|c| hipfire_arch_deepseek4::dsml::ToolCall {
+                                    name: c.name.clone(),
+                                    arguments: c.arguments.clone(),
+                                })
+                                .collect();
+                            let dsml = hipfire_arch_deepseek4::dsml::render_assistant_tool_calls(
+                                &dsml_calls,
+                            );
+                            prompt_ids.extend(tokenizer.encode(&dsml));
+                        }
+                    }
+
+                    // Close the assistant turn with the EOS marker so
+                    // the next turn starts cleanly.
+                    prompt_ids.push(m.deepseek4_eos_tok);
+                    pending_tool_result = false;
+                }
+            }
+        }
+    }
+
+    // Append the live user turn ONLY when `prompt` carries one. When the
+    // serve has handed us a structured `messages` history that already
+    // ends in a tool result (mid-conversation, model is meant to continue
+    // generating the next assistant turn) it sends `prompt=""` — in that
+    // case we MUST NOT emit an empty `<｜User｜><｜Assistant｜>` wrapper,
+    // because the empty-user turn is off-distribution and the V4F MQ2-
+    // Lloyd checkpoint drifts into invented paths / repeated wrong tool
+    // calls when fed one.
+    if !prompt.is_empty() {
+        if let Some(u) = user_tok { prompt_ids.push(u); }
+        prompt_ids.extend(tokenizer.encode(prompt));
+    }
+    if let Some(a) = asst_tok { prompt_ids.push(a); }
+    // Thinking-mode signal token immediately after `<｜Assistant｜>`:
+    //   NonThink → `</think>`   (skip reasoning, respond directly)
+    //   High|Max → `<think>`    (open a reasoning block)
+    match think_mode {
+        ThinkMode::NonThink => prompt_ids.extend(tokenizer.encode("</think>")),
+        ThinkMode::High | ThinkMode::Max => prompt_ids.extend(tokenizer.encode("<think>")),
+    }
+
+    if prompt_ids.is_empty() {
+        let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"empty prompt after tokenize"}}"#, id);
+        let _ = stdout.flush();
+        return;
+    }
+
+    if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT").ok().as_deref() == Some("1") {
+        let rendered = tokenizer.decode(&prompt_ids);
+        let path = format!("/tmp/hipfire-prompt-{}.txt", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+        let _ = std::fs::write(&path, format!("# tokens: {}\n{}\n", prompt_ids.len(), rendered));
+        eprintln!("[v4f prompt dump] tokens={} → {}", prompt_ids.len(), path);
+    }
+
+    // Triaged config resolution for MTP speculative decode.
+    // Priority: 1. legacy env var → 2. generic env var → 3. stored config → default.
+    let spec_mode = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_DECODE")
+        .ok()
+        .map(|v| v == "1")
+        .unwrap_or_else(|| {
+            match std::env::var("HIPFIRE_MTP_MODE").ok().as_deref() {
+                Some("on") => true,
+                Some("off") => false,
+                _ => {
+                    m.mtp_mode == "on" || (m.mtp_mode == "auto" && m.mtp_weights_present)
+                }
+            }
+        });
+    let spec_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            std::env::var("HIPFIRE_MTP_K")
+                .ok()
+                .and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(m.mtp_k);
+
+    let t0 = Instant::now();
+
+    // ── Prefix-cache LCP detection ──────────────────────────────────
+    //
+    // Reasonix's prompt-caching model (`tmp/reasonix_arch.md` Pillar 1):
+    // construct prompts as `immutable_prefix + append_only_log` so the
+    // backend's prefix cache hits on every turn. Reasonix is a CLIENT
+    // that targets DeepSeek's server-side cache; for LOCAL inference we
+    // implement the server side here.
+    //
+    // Compare the freshly-tokenized prompt against the tokens we know
+    // are already resident in the V4F KV / SWA / compressed-KV rings
+    // from the prior request (`m.conversation_tokens`). If the new
+    // prompt FULLY EXTENDS the prior conversation — i.e., starts with
+    // the entire `conversation_tokens` — we can skip prefill for those
+    // tokens and only prefill the suffix.
+    //
+    // SWA-safety analysis for partial LCP (lcp < prior.len()):
+    //
+    // Suppose prior wrote positions [0..prior_max_pos], turn 2's suffix
+    // writes [lcp..prompt_ids.len()-1]. After turn 2's prefill the new
+    // max position is `prompt_ids.len() - 1`. The model's first decode
+    // attends to a window of `min(prompt_ids.len(), 128)` positions
+    // ending at `prompt_ids.len() - 1`. Each window position maps to a
+    // unique ring slot via `pos % 128`. For correctness, every slot in
+    // that window must currently hold K_rotated for the matching
+    // position:
+    //
+    //   * For positions in `[0..lcp-1]` — turn 1 wrote them, content
+    //     matches by LCP definition. Untouched since.
+    //   * For positions in `[lcp..prompt_ids.len()-1]` — turn 2's suffix
+    //     prefill just wrote them. Content matches the new prompt.
+    //
+    // Stale-slot risk: if turn 1 had written a slot at some position
+    // `P_late ∈ [lcp..prior_max_pos]` AND turn 2 doesn't overwrite that
+    // slot, the slot holds K_rotated for P_late, not the new prompt's
+    // token at that position. The window read returns wrong content.
+    //
+    // Turn 2's suffix prefill covers positions [lcp..prompt_ids.len()-1].
+    // To overwrite every slot turn 1 wrote in `[lcp..prior_max_pos]`,
+    // we need `prompt_ids.len() - 1 ≥ prior_max_pos`, i.e.
+    // `prompt_ids.len() ≥ prior.len()`. Equivalently: the new prompt
+    // must be at least as long as the cached conversation.
+    //
+    // We additionally guard `lcp == prior.len() && prompt_ids.len() ==
+    // prior.len()` (full match, nothing to do) with a noop check
+    // downstream (suffix_tokens is empty).
+    //
+    // After the daemon's `reset` handler clears `m.conversation_tokens`
+    // (legacy stateless path), `prior` is empty and `lcp = 0` → full
+    // prefill. For prefix-cache mode the serve stops calling reset for
+    // V4F and lets this LCP detection drive cache-hit accounting.
+    let lcp: usize = {
+        let prior = &m.conversation_tokens;
+        if prior.is_empty() || prompt_ids.len() < prior.len() {
+            0
+        } else {
+            let mut n = 0usize;
+            while n < prior.len() && prior[n] == prompt_ids[n] {
+                n += 1;
+            }
+            // Edge case: new prompt is byte-identical to the cached
+            // conversation. Suffix would be empty and
+            // `forward_prefill_batch_chunked` errors on that. Step the
+            // LCP back one so we always prefill ≥ 1 token (and the
+            // post-prefill logits are well-defined for the first
+            // decode step). Costs us one token of cache credit on
+            // exact-repeat prompts — rare in practice.
+            if n == prompt_ids.len() && n > 0 {
+                n - 1
+            } else {
+                n
+            }
+        }
+    };
+
+    if lcp == 0 {
+        // Cache miss — start a fresh conversation in V4F's state.
+        state.reset();
+        m.conversation_tokens.clear();
+        // Tear down the captured V4F decode hipGraph alongside the
+        // state, same rationale as the daemon's `"reset"` handler:
+        // a fresh-context turn invalidates every device-buffer pointer
+        // and host scalar the captured graph baked in at capture time
+        // (state.attn_state_buf slot/n_valid/k_active values derived
+        // from the prior n_tokens, compressor ring/commit slots, etc.).
+        // Without this, the warmup-then-replay state machine fires
+        // warmup on the first decode (because `state.reset()` clears
+        // `ar_forward_warmed_up`), then immediately replays the STALE
+        // graph on the second decode and crashes with the same
+        // "download logits (graph path): illegal memory access" we
+        // saw on multi-turn pi sessions before the explicit-reset fix.
+        gpu.invalidate_graph_state();
+    }
+    let start_pos: u32 = lcp as u32;
+
+    // Slice off the suffix — the only tokens we actually need to prefill.
+    // For lcp=0 this is the full prompt; for a full cache hit on a turn
+    // that adds N new tokens this is just those N.
+    let suffix_tokens: &[u32] = &prompt_ids[lcp..];
+
+    // Prefill: batched chunked through PBS. If spec_mode, also fill the
+    // MTP layer's SWA cache (prefill_with_mtp_fill) so the first
+    // draft step sees a populated MTP history.
+    let prefill_result = if spec_mode {
+        deepseek4::forward::prefill_with_mtp_fill(cfg, weights, state, gpu, pbs, suffix_tokens, start_pos)
+    } else {
+        deepseek4::forward::forward_prefill_batch_chunked(cfg, weights, state, gpu, suffix_tokens, start_pos, pbs)
+    };
+    let last_logits = match prefill_result {
+        Ok(l) => l,
+        Err(e) => {
+            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
+            return;
+        }
+    };
+    // `forward_prefill_batch_chunked` does NOT advance `state.n_tokens`.
+    // Callers are responsible for it (mirrors deepseek4_chat's explicit
+    // `state.n_tokens = pos as u64;` at deepseek4_chat.rs:324). Without this,
+    // the next decode_step queries the SWA cache at the BOS position
+    // instead of the next-prediction position and the model emits
+    // attractor garbage at greedy temp=0. The MTP-fill prefill DOES
+    // advance internally (forward.rs:7453), so we only need to update
+    // for the plain-prefill branch.
+    if !spec_mode {
+        state.n_tokens = (start_pos as usize + suffix_tokens.len()) as u64;
+    }
+    // Keep `m.conversation_tokens` in lockstep with what's actually
+    // resident in the KV/SWA/compressed-KV rings:
+    //   - On a CACHE MISS (lcp==0): replace with prompt_ids (we just
+    //     full-prefilled the whole prompt).
+    //   - On a CACHE HIT (lcp>0): truncate the prior tracker down to
+    //     `lcp` before appending the suffix. For partial LCP this
+    //     matters — tokens in the prior tracker beyond `lcp` came
+    //     from a previous turn's decode but the slots they lived in
+    //     have just been overwritten by the suffix prefill. Leaving
+    //     them in the tracker would let the NEXT request's LCP
+    //     comparison run off the end of what's actually cached and
+    //     make divergent assumptions about ring contents.
+    if lcp == 0 {
+        m.conversation_tokens.clear();
+        m.conversation_tokens.extend_from_slice(&prompt_ids);
+    } else {
+        m.conversation_tokens.truncate(lcp);
+        m.conversation_tokens.extend_from_slice(suffix_tokens);
+    }
+    let cached_tokens: usize = lcp;
+
+    // Sync to ensure all prefill kernels have completed before stopping
+    // the timer (head's download_f32 already syncs but defensive).
+    let _ = gpu.hip.device_synchronize();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    let pos_after_prefill = state.n_tokens as u32;
+    let mut spec_windows: u64 = 0;
+    let mut spec_drafts_offered: u64 = 0;
+    let mut spec_drafts_accepted: u64 = 0;
+
+    // Sampler. HF DeepSeek-V4-Flash card recommends temp=1.0, top_p=1.0
+    // for local deployment; we honor that as the default. Pure greedy
+    // (temp <= 1e-6) is supported but enters block-level attractors on
+    // structured prompts.
+    let top_k: usize = std::env::var("HIPFIRE_DEEPSEEK4_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let seed: u64 = std::env::var("HIPFIRE_DEEPSEEK4_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x9E3779B97F4A7C15)
+        });
+    let mut rng = deepseek4::sampling::Xorshift::new(seed);
+
+    // Track whether the decode loop saw a complete
+    // `<｜DSML｜tool_calls>` block close. Drives `finish_reason` in the
+    // `done` envelope below.
+    let mut tool_calls_parsed_count: usize = 0;
+    if spec_mode {
+        // Spec-decode loop. The verifier picks argmax (greedy) so accept
+        // semantics stay deterministic. When tools are present, thread
+        // the same DSML grammar matcher through the MTP draft and main
+        // verifier logits, then parse the emitted stream into tool_calls
+        // events just like the plain decode loop.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            if let StreamEvent::ToolCalls(calls) = ev {
+                for c in calls {
+                    emit_tool_calls_buf.push(
+                        hipfire_runtime::prompt_frame::ToolCall {
+                            name: c.name.clone(),
+                            arguments: c.arguments.clone(),
+                        }
+                    );
+                }
+            }
+        };
+
+        let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
+        let mut spec_last_position = pos_after_prefill;
+        let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        'outer: while generated_count < max_tokens {
+            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
+                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+            };
+            let r = match if grammar_active {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs_grammar(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                    &mut matcher,
+                    decoded_vocab,
+                    &mut grammar_mask,
+                )
+            } else {
+                deepseek4::spec_decode::speculative_decode_step_with_pbs(
+                    cfg,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    spec_last_token,
+                    spec_last_position,
+                    lh,
+                    spec_k,
+                )
+            } {
+                Ok(r) => r,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("deepseek4spec-decode failed: {e:?}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            };
+            spec_windows += 1;
+            spec_drafts_offered += spec_k as u64;
+            spec_drafts_accepted += r.n_accepted as u64;
+
+            for &t in &r.accepted_tokens {
+                if generated_count >= max_tokens || t == eos_tok {
+                    break 'outer;
+                }
+                let frag = tokenizer.decode(&[t]);
+                if grammar_active {
+                    for ev in parser.feed(&frag) {
+                        absorb_event(&ev);
+                        emit_stream_event(stdout, id, ev);
+                    }
+                } else {
+                    // Build through serde_json so `id` (user-supplied) and
+                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
+                    // can't corrupt the JSONL line.
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                }
+                emit_committed_event(stdout, id, t, generated_count, decode_t0.elapsed().as_millis() as u64);
+                let _ = stdout.flush();
+                m.conversation_tokens.push(t);
+                generated_count += 1;
+            }
+            if let Some(&t) = r.accepted_tokens.last() {
+                spec_last_position += r.accepted_tokens.len() as u32;
+                spec_last_token = t;
+            }
+            last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        }
+        if grammar_active {
+            for ev in parser.finish() {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            let _ = stdout.flush();
+            drop(absorb_event);
+            tool_calls_parsed_count = emit_tool_calls_buf.len();
+        }
+    } else {
+        // Plain decode loop. Sampler honours `temp` + `top_p` from the
+        // request; HF default is temp=1.0, top_p=1.0 (multinomial across
+        // the full vocab, no nucleus cut). Greedy (temp <= 1e-6) is
+        // dangerous — see fn doc.
+        //
+        // Tokens are fed through a DSML stream parser that recognises
+        // `<think>…</think>` reasoning blocks and
+        // `<｜DSML｜tool_calls>…</｜DSML｜tool_calls>` tool-call blocks. The
+        // parser emits:
+        //   - StreamEvent::Token(text)       → JSONL `{type:"token"}`
+        //   - StreamEvent::Reasoning(text)   → JSONL `{type:"reasoning"}`
+        //   - StreamEvent::ToolCalls(calls)  → JSONL `{type:"tool_calls"}`
+        // Markers split across token boundaries are buffered until they
+        // resolve. The CLI / HTTP layer maps these to OpenAI SSE chunks.
+        // Prime the parser's initial state to match the bootstrap tag
+        // we appended to `prompt_ids`. In High/Max think modes the
+        // prompt ends with `<think>` and the model's first generated
+        // token is the body of that thinking block — without
+        // `new_in_think()` the parser would sit in `Normal` and
+        // misclassify every reasoning token as plain content,
+        // including the trailing `</think>` which then leaks into
+        // `message.content`. NonThink mode appends `</think>` (closing
+        // a zero-length think block) so the response starts in Normal.
+        let mut parser = match think_mode {
+            ThinkMode::High | ThinkMode::Max => deepseek4::dsml::StreamParser::new_in_think(),
+            ThinkMode::NonThink => deepseek4::dsml::StreamParser::new(),
+        };
+
+        // Grammar-guided decoding setup. When tools are present, we mask
+        // the logits against a small state machine that mirrors the DSML
+        // format — inside a `<｜DSML｜tool_calls>` block the model can
+        // only emit token IDs whose decoded text is a prefix of a legal
+        // continuation (e.g. `<｜DSML｜invoke name="` or a schema-defined
+        // tool name). In free-emission states (`Out`, `InParamBody`,
+        // and any time tools is None / empty) the mask is all-true and
+        // the mask compute is skipped.
+        //
+        // Why this exists: V4F MQ2-Lloyd has damaged logit precision on
+        // format-structural tokens — even with the byte-identical HF
+        // system prompt at temp=1.0 it deterministically emits invented
+        // variants like `<｜DSML｜tool_cbl>`, `<｜DSML｜calling>`,
+        // `</｜DSML｜paper>` that no parser can recover. The mask makes
+        // those tokens unreachable at the sampler level.
+        let tool_schemas: Vec<deepseek4::grammar::ToolSchema> = tools
+            .map(|arr| {
+                arr.iter()
+                    .map(|t| {
+                        let func = t.get("function").unwrap_or(t);
+                        let name = func
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let parameters = func.get("parameters");
+                        let params: Vec<String> = parameters
+                            .and_then(|p| p.get("properties"))
+                            .and_then(|p| p.as_object())
+                            .map(|m| m.keys().cloned().collect())
+                            .unwrap_or_default();
+                        let required: Vec<String> = parameters
+                            .and_then(|p| p.get("required"))
+                            .and_then(|r| r.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        deepseek4::grammar::ToolSchema {
+                            name,
+                            params,
+                            required,
+                        }
+                    })
+                    .filter(|s: &deepseek4::grammar::ToolSchema| !s.name.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let grammar_active = !tool_schemas.is_empty();
+        let mut matcher = deepseek4::grammar::Matcher::new(tool_schemas);
+        // Precompute (or fetch the cached) decoded vocab. `tokenizer.decode`
+        // per id over ~129k ids is allocator-heavy enough that doing it
+        // per-request adds tens of ms of pure overhead to every tool-
+        // using V4F turn. The cache lives on `LoadedModel.decoded_vocab`
+        // as an `Arc<Vec<String>>` and is cleared on model unload.
+        //
+        // Borrow note: `m.decoded_vocab` is a disjoint field from
+        // `m.deepseek4_state` (which `state` holds `&mut` to) and from
+        // `m.tokenizer` (which `tokenizer` holds `&` to), so the
+        // assignment compiles under Rust's split-borrows.
+        let decoded_vocab_arc: Option<std::sync::Arc<Vec<String>>> = if grammar_active {
+            if m.decoded_vocab.is_none() {
+                let n = tokenizer.vocab_size();
+                let v: Vec<String> =
+                    (0..n).map(|id| tokenizer.decode(&[id as u32])).collect();
+                m.decoded_vocab = Some(std::sync::Arc::new(v));
+            }
+            m.decoded_vocab.clone()
+        } else {
+            None
+        };
+        let empty_vocab: Vec<String> = Vec::new();
+        let decoded_vocab: &[String] = decoded_vocab_arc
+            .as_deref()
+            .map(|v| v.as_slice())
+            .unwrap_or(&empty_vocab);
+        let mut grammar_mask: Vec<bool> = vec![true; decoded_vocab.len()];
+
+        // Apply mask to the prefill-returned logits before the first
+        // sample (matcher is in `Out` here so this is a no-op, but the
+        // codepath stays uniform).
+        let mut first_logits = last_logits;
+        if grammar_active && !matcher.is_free() {
+            matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+            deepseek4::grammar::Matcher::apply_mask_to_logits(&grammar_mask, &mut first_logits);
+        }
+        let mut next_tok: u32 =
+            deepseek4::sampling::sample_token(&first_logits, temp, top_k, top_p, &mut rng);
+        let mut pos = pos_after_prefill;
+        // Token-cache capture for the prefix-cache replay path. We
+        // mirror the parser events into local accumulators so that —
+        // after decode completes — we can fingerprint the just-emitted
+        // assistant turn by (content_text, tool_calls) and store the
+        // exact token IDs that the model emitted at
+        // `conversation_tokens[decode_start..decode_end]`.
+        //
+        // Why mirror rather than re-parse: the streamed events from
+        // `parser.feed` carry the parser's reconstructed structure
+        // (Reasoning fragments split off from Token, ToolCalls
+        // assembled from `<｜DSML｜tool_calls>` blocks). Replaying that
+        // here once captures all the logical structure without a
+        // second tokenizer pass.
+        let decode_start_tokens_idx = m.conversation_tokens.len();
+        let mut emit_text_buf = String::new();
+        let mut emit_tool_calls_buf: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+        use hipfire_arch_deepseek4::dsml::StreamEvent;
+        let mut absorb_event = |ev: &StreamEvent| {
+            match ev {
+                StreamEvent::Token(t) => emit_text_buf.push_str(t),
+                // Reasoning fragments are NOT replayed in the next
+                // turn (the daemon's history loop emits a fresh
+                // `</think>` after `<｜Assistant｜>` based on the
+                // current `think_mode`; the prior `<think>…</think>`
+                // body is dropped). So we don't include reasoning in
+                // the fingerprint either — two turns that produced
+                // the same content + tool_calls but different
+                // reasoning hash to the same key and reuse the same
+                // cached tokens, which is correct because what we
+                // CACHE excludes the reasoning span (it lives BEFORE
+                // the daemon-emitted `</think>` in the cached tokens
+                // — see below).
+                StreamEvent::Reasoning(_) => {}
+                StreamEvent::ToolCalls(calls) => {
+                    for c in calls {
+                        emit_tool_calls_buf.push(
+                            hipfire_runtime::prompt_frame::ToolCall {
+                                name: c.name.clone(),
+                                arguments: c.arguments.clone(),
+                            }
+                        );
+                    }
+                }
+            }
+        };
+
+        while generated_count < max_tokens && next_tok != eos_tok {
+            let frag = tokenizer.decode(&[next_tok]);
+            for ev in parser.feed(&frag) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            emit_committed_event(stdout, id, next_tok, generated_count, decode_t0.elapsed().as_millis() as u64);
+            let _ = stdout.flush();
+            m.conversation_tokens.push(next_tok);
+            if grammar_active {
+                matcher.advance(&frag);
+            }
+            generated_count += 1;
+            match deepseek4::forward::decode_step_with_graph(cfg, weights, state, gpu, next_tok, pos) {
+                Ok(mut logits) => {
+                    if grammar_active && !matcher.is_free() {
+                        matcher.token_mask(&decoded_vocab, &mut grammar_mask);
+                        deepseek4::grammar::Matcher::apply_mask_to_logits(
+                            &grammar_mask,
+                            &mut logits,
+                        );
+                    }
+                    next_tok =
+                        deepseek4::sampling::sample_token(&logits, temp, top_k, top_p, &mut rng);
+                    pos += 1;
+                }
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        }
+        // Flush any buffered partial markers / content.
+        for ev in parser.finish() {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
+        }
+        let _ = stdout.flush();
+
+        // Cache the just-emitted token sequence under its (content,
+        // tool_calls) fingerprint so the next request's V4F history
+        // render can replay verbatim and avoid BPE re-encode drift.
+        // Trim leading EOS/zero residue defensively (the loop never
+        // pushes EOS, but a future model that emits EOS mid-stream
+        // shouldn't end up with EOS landing in the cached tokens).
+        drop(absorb_event); // release the &mut emit_*_buf borrow
+        // Now that the closure is dropped, we can read the buffers
+        // immutably. Snapshot the tool_calls count so the `done`
+        // envelope below can carry `finish_reason: "tool_calls"`.
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
+        // Skip caching when the turn produced no replay-able payload —
+        // empty trimmed content AND no tool_calls. The fingerprint for
+        // such turns collides on the hash of `("assistant", "")` so
+        // any subsequent empty-emission turn (the model giving up with
+        // a trailing whitespace fragment) overwrites the prior entry.
+        // Pi typically doesn't replay empty assistant turns at all, so
+        // the cache entry is dead weight at best and a subtle
+        // mis-replay risk at worst (Pi sends content="" + tool_calls=[]
+        // for a different reason and our cache hands back the wrong
+        // tokens). Two write conditions to satisfy: at least one
+        // visible event (text OR tool_calls) AND at least one raw
+        // token actually emitted.
+        let have_replayable_payload =
+            !emit_text_buf.trim().is_empty() || !emit_tool_calls_buf.is_empty();
+        if have_replayable_payload
+            && generated_count > 0
+            && m.conversation_tokens.len() > decode_start_tokens_idx
+        {
+            let cached_seq: Vec<u32> =
+                m.conversation_tokens[decode_start_tokens_idx..].to_vec();
+            let fp = asst_turn_fingerprint(&emit_text_buf, &emit_tool_calls_buf);
+            if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE").ok().as_deref() == Some("1") {
+                eprintln!(
+                    "[asst-cache store] fp={:#018x} content.len={} tool_calls={} tokens={}",
+                    fp, emit_text_buf.len(), emit_tool_calls_buf.len(), cached_seq.len(),
+                );
+            }
+            m.asst_turn_cache.insert(fp, cached_seq);
+        }
+    }
+
+    m.seq_pos = state.n_tokens as usize;
+
+    let _ = gpu.hip.device_synchronize();
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 && decode_ms > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+
+    // Build the done envelope through serde_json so the new
+    // `cached_tokens` field (V4F prefix-cache LCP hit count) interleaves
+    // cleanly with the legacy `prefill_tokens` / `prefill_ms` / spec
+    // counters. The TTL of stale {} interpolation here is exactly the
+    // surface area we just fixed in `emit_error_with_id` — same risk
+    // class.
+    //
+    // `prefill_tokens` semantics: number of tokens actually FED to the
+    // forward path this turn (i.e., suffix_tokens.len(), == total
+    // prompt minus cached prefix). Cache-hit accounting:
+    //   prompt_tokens (sent by client)       = prompt_ids.len()
+    //   cached_tokens (prefix-cache hit)     = cached_tokens (= lcp)
+    //   prefill_tokens (actually prefilled)  = suffix_tokens.len()
+    // Sum: cached + prefill == prompt_tokens. The CLI's OpenAI-compat
+    // layer maps `cached_tokens` → `usage.prompt_tokens_details.cached_tokens`.
+    let prompt_tokens_total = prompt_ids.len();
+    let prefill_tokens_actual = suffix_tokens.len();
+    // Tell the OpenAI-compat layer how the decode loop exited. Without
+    // this the CLI fell back to "stop" for every non-tool-call turn,
+    // hiding `max_tokens` truncation behind a natural-completion signal
+    // — strict clients use `finish_reason: "length"` to decide whether
+    // to retry with a longer budget.
+    //
+    //   tool_calls — at least one complete `<｜DSML｜tool_calls>` block
+    //                was parsed (`tool_calls_parsed_count > 0`). Wins
+    //                over "length" even when max_tokens hit after the
+    //                block closed.
+    //   length     — generated_count reached max_tokens with no
+    //                completed tool_calls block.
+    //   stop       — model emitted EOS, or generated_count is < max
+    //                because the spec-decode loop accepted EOS in the
+    //                middle of an accepted-tokens chunk.
+    //
+    // `tool_calls_parsed_count` is set inside the non-spec branch
+    // immediately after parser.finish(); spec_mode leaves it at 0.
+    let finish_reason: &'static str = if tool_calls_parsed_count > 0 {
+        "tool_calls"
+    } else if generated_count >= max_tokens {
+        "length"
+    } else {
+        "stop"
+    };
+    let done_envelope = if spec_mode {
+        let accept_pct = if spec_drafts_offered > 0 {
+            spec_drafts_accepted as f64 / spec_drafts_offered as f64 * 100.0
+        } else {
+            0.0
+        };
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "finish_reason": finish_reason,
+            "spec_k": spec_k,
+            "spec_windows": spec_windows,
+            "spec_accept_pct": accept_pct,
+        })
+    } else {
+        serde_json::json!({
+            "type": "done",
+            "id": id,
+            "tokens": generated_count,
+            "tok_s": tok_s,
+            "prompt_tokens": prompt_tokens_total,
+            "prefill_tokens": prefill_tokens_actual,
+            "cached_tokens": cached_tokens,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "finish_reason": finish_reason,
+        })
+    };
+    let _ = writeln!(stdout, "{}", done_envelope);
+    let _ = stdout.flush();
+}
+
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
 ///
 /// Phase-1 bring-up scope: encode prompt → prefill → greedy decode loop
@@ -4637,7 +7972,7 @@ fn generate_qwen2(
     // first generated token.
     for &tok in &prompt_ids {
         if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"qwen2 prefill failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -4655,7 +7990,7 @@ fn generate_qwen2(
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"argmax failed: {:?}"}}"#, id, e);
+            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
             let _ = stdout.flush();
             return;
         }
@@ -4670,16 +8005,17 @@ fn generate_qwen2(
         }
         // Emit text fragment for this token. Tokenizer.decode handles
         // BPE byte-fragment reassembly; for special tokens that decode
-        // to an empty string we still advance the loop. JSON-escape the
-        // chunk so embedded quotes / control chars don't break the
-        // wire format.
+        // to an empty string we still advance the loop. Build through
+        // serde_json so `id` (user-supplied) and `frag` (arbitrary
+        // UTF-8 with possible `"` / `\` / control chars) can't corrupt
+        // the JSONL line.
         let frag = tokenizer.decode(&[next_tok]);
-        let frag_escaped = json_escape(&frag);
-        let _ = writeln!(
-            stdout,
-            r#"{{"type":"token","id":"{}","text":"{}"}}"#,
-            id, frag_escaped,
-        );
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+        });
+        let _ = writeln!(stdout, "{}", envelope);
         let _ = stdout.flush();
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
@@ -4687,7 +8023,7 @@ fn generate_qwen2(
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":"forward_step_greedy failed: {:?}"}}"#, id, e);
+                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
                 let _ = stdout.flush();
                 return;
             }
@@ -4710,30 +8046,6 @@ fn generate_qwen2(
         id, generated_count, tok_s, prefill_ms, total_ms,
     );
     let _ = stdout.flush();
-}
-
-/// Minimal JSON string escaper for the daemon's token-stream emit
-/// path. We have full control of the alphabet (BPE-decoded UTF-8)
-/// and only need to escape: backslash, double-quote, and control
-/// chars < 0x20. Non-ASCII bytes pass through as-is (the daemon
-/// client parses with serde_json which accepts UTF-8 verbatim).
-fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                use std::fmt::Write;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 fn generate_vl(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout: &mut std::io::Stdout, params: &GenerateVLParams) {
@@ -5315,4 +8627,142 @@ fn generate_vl_dots_ocr(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu, stdout
         prefill_s * 1000.0, prefill_tok_s, decode_tok_s, prefill_s * 1000.0
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tool_call_parser_tests {
+    use super::extract_tool_calls_from_text;
+
+    #[test]
+    fn parses_valid_block() {
+        let s = r#"prelude<tool_call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}
+</tool_call>tail"#;
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["path"], "/etc/hostname");
+    }
+
+    #[test]
+    fn handles_unclosed_tool_call() {
+        // Model truncated at max_tokens before emitting </tool_call>.
+        // OLD parser broke out of the loop; NEW parser treats rest of
+        // string as body and recovers the call. This was the Pi-session
+        // call-9 failure mode that flipped the asst-cache fingerprint
+        // from tool_calls=1 (CLI) to tool_calls=0 (daemon) → full reset.
+        let s = r#"prelude<tool_call>
+{"name": "read", "arguments": {"path": "/etc/hostname"}}"#;
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1, "unclosed block dropped — should recover");
+        assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn truncated_args_not_emitted_as_empty() {
+        // A `write` cut off mid-`content` (max_tokens / grammar force-close):
+        // the args object never closes, so no balanced object is recoverable.
+        // The OLD fallback fabricated empty `{}` args, presenting write({}) to
+        // the client as executable (the write-tool empty-args incident). NEW:
+        // drop the call entirely so the emission surfaces as content +
+        // finish_reason for the client to retry. Distinct from
+        // `handles_unclosed_tool_call`, where the args ARE complete and only
+        // the `</tool_call>` marker is missing.
+        let s = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"path\": \"/tmp/big.zig\", \"content\": \"const std = @im";
+        let calls = extract_tool_calls_from_text(s);
+        assert!(
+            calls.is_empty(),
+            "truncated args must NOT emit a fabricated-empty call"
+        );
+    }
+
+    #[test]
+    fn loose_json_with_complete_args_still_recovered() {
+        // Broken outer JSON (leading `{` lost to special-token leakage) but a
+        // COMPLETE balanced args object — the fallback still recovers it,
+        // distinguishing real recovery from the truncation case above.
+        let s = "<tool_call>\nname\": \"read\", \"arguments\": {\"path\": \"/tmp/x\"}\n</tool_call>";
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arguments["path"], "/tmp/x");
+    }
+
+    #[test]
+    fn strips_chatml_special_tokens_in_body() {
+        let s = "<tool_call>\n<|im_start|>{\"name\": \"read\", \"arguments\": {\"path\": \"/x\"}}<|im_end|>\n</tool_call>";
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1, "ChatML token leakage broke JSON parse");
+        assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn nested_opener_stripped() {
+        let s = r#"<tool_call>
+<tool_call>
+{"name": "read", "arguments": {"path": "/x"}}
+</tool_call>"#;
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1, "nested opener dropped");
+        assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn no_block_no_calls() {
+        let calls = extract_tool_calls_from_text("just text, no tool call");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn form4_skips_name_substring_in_other_key() {
+        // `firstname` contains `name` — the fallback used to bail when
+        // it saw an invalid pre-byte for the first match. Should now
+        // skip and find the real `name` key on the next occurrence.
+        // (Strict JSON parse handles this trivially; this test exercises
+        // the fallback path by wrapping in <tool_call> with off-spec
+        // shape that triggers fallback.)
+        let body = r#"{"firstname":"X","name":"read","arguments":{"path":"/x"}}"#;
+        assert_eq!(super::extract_tool_call_name_fallback(body), Some("read".to_string()));
+    }
+
+    #[test]
+    fn form4_handles_trailing_comma() {
+        // serde_json rejects trailing commas; the fallback should
+        // still find name + arguments.
+        let s = r#"<tool_call>
+{"name": "read", "arguments": {"path": "/x",},}
+</tool_call>"#;
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 1, "trailing-comma JSON dropped");
+        assert_eq!(calls[0].name, "read");
+    }
+
+    #[test]
+    fn form4_handles_unquoted_key() {
+        // Off-spec JSON with unquoted key.
+        let body = r#"{name: "read"}"#;
+        assert_eq!(super::extract_tool_call_name_fallback(body), Some("read".to_string()));
+    }
+
+    #[test]
+    fn empty_body_no_call() {
+        // Empty `<tool_call></tool_call>` shouldn't produce a call.
+        let s = "<tool_call></tool_call>";
+        let calls = extract_tool_calls_from_text(s);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn multiple_blocks_extract_all() {
+        // Two valid tool_call blocks in one emission should yield two calls.
+        let s = r#"<tool_call>
+{"name":"a","arguments":{}}
+</tool_call>prose<tool_call>
+{"name":"b","arguments":{}}
+</tool_call>"#;
+        let calls = extract_tool_calls_from_text(s);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "a");
+        assert_eq!(calls[1].name, "b");
+    }
 }

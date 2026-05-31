@@ -59,6 +59,26 @@ function parseOneToolCall(raw: string): { name: string; arguments: any; repaired
     if (args !== null) return { name: nm[1], arguments: args, repaired: true };
     return { name: nm[1], arguments: {}, repaired: true };
   }
+  // Form 4: last-resort field-level extraction (broken/truncated JSON).
+  // Keep in sync with cli/index.ts:parseOneToolCall Form 4.
+  const nameMatch = raw.match(/(?<![A-Za-z_])["']?name["']?\s*:\s*["']([A-Za-z_][\w.-]*)["']/);
+  if (nameMatch) {
+    const fname = nameMatch[1];
+    const argsLeader = raw.match(/["']arguments["']\s*:\s*/);
+    let args: any = null;
+    if (argsLeader && argsLeader.index !== undefined) {
+      args = extractFirstJsonObject(raw.slice(argsLeader.index + argsLeader[0].length));
+    }
+    if (args === null) args = extractFirstJsonObject(raw);
+    if (args === null) {
+      // Balanced-but-off-spec object (trailing comma, …) → keep call, empty
+      // args. Truncated (no balanced object) → drop so it surfaces as content
+      // + finish_reason, not a phantom write({}).
+      if (jsonObjectIsComplete(raw)) return { name: fname, arguments: {}, repaired: true };
+      return null;
+    }
+    return { name: fname, arguments: args, repaired: true };
+  }
   return null;
 }
 
@@ -100,6 +120,25 @@ function extractFirstJsonObject(s: string): any | null {
     }
   }
   return null;
+}
+
+function jsonObjectIsComplete(s: string): boolean {
+  const start = s.indexOf("{");
+  if (start < 0) return false;
+  let depth = 0, inStr = false, escape = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inStr) {
+      if (escape) { escape = false; continue; }
+      if (ch === "\\") { escape = true; continue; }
+      if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return true; }
+  }
+  return false;
 }
 
 test("strict OpenAI form parses without repair flag", () => {
@@ -303,4 +342,36 @@ test("<function=NAME>{JSON} (MQ4 corruption shape) still parses via probe-(2)", 
   expect(r!.name).toBe("read");
   expect(r!.arguments).toEqual({ path: "/etc/passwd" });
   expect(r!.repaired).toBe(true);
+});
+
+test("truncated tool call (unterminated arguments) returns null — no fabricated empty args", () => {
+  // A `write` cut off mid-`content` (by max_tokens or a grammar force-close).
+  // The args object never closes, so no balanced object is recoverable. Must
+  // NOT fabricate `{}` and present write({}) to the client as executable —
+  // that fails schema validation (the write-tool empty-args incident). The
+  // call is dropped so the emission surfaces as content + finish_reason.
+  const r = parseOneToolCall('{"name": "write", "arguments": {"path": "/tmp/big.zig", "content": "const std = @im');
+  expect(r).toBeNull();
+});
+
+test("broken outer JSON but a COMPLETE arguments object still parses via Form 4", () => {
+  // Special-token leakage corrupted the outer structure (leading `{` lost),
+  // but the args object is balanced — Form 4 must still recover name + args,
+  // distinguishing real recovery from the truncation case above.
+  const r = parseOneToolCall('name": "read", "arguments": {"path": "/tmp/x"}');
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("read");
+  expect(r!.arguments).toEqual({ path: "/tmp/x" });
+});
+
+test("complete-but-off-spec args (trailing comma) keeps the call with empty args", () => {
+  // Brace-balanced but invalid JSON (trailing comma) — a model formatting
+  // glitch, NOT truncation. The call is preserved by name (mirrors the
+  // daemon's form4_handles_trailing_comma); only genuinely truncated calls
+  // are dropped. Keeps daemon/CLI parsers in agreement so the asst-turn
+  // cache fingerprint doesn't diverge.
+  const r = parseOneToolCall('{"name": "read", "arguments": {"path": "/x",},}');
+  expect(r).not.toBeNull();
+  expect(r!.name).toBe("read");
+  expect(r!.arguments).toEqual({});
 });

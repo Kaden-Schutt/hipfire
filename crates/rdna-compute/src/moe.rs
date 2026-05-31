@@ -397,4 +397,481 @@ impl Gpu {
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }
+
+    pub fn moe_unscatter_silu_clamp_k8(
+        &mut self,
+        y_grouped: &GpuTensor,         // [m_total × (2*mi)] f32
+        sorted_slot_index: &GpuTensor, // [m_total] i32
+        moe_gate_batch: &GpuTensor,    // [N × K_TOP × mi] f32, written
+        mi: usize,
+        k_top: usize,
+        m_total: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_unscatter_silu_clamp_k8",
+            kernels::MOE_UNSCATTER_SILU_CLAMP_K8_SRC,
+            "moe_unscatter_silu_clamp_k8",
+        )?;
+        let yp = y_grouped.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let gp = moe_gate_batch.buf.as_ptr();
+        let mi_val = mi as i32;
+        let kt_val = k_top as i32;
+        let mt_val = m_total as i32;
+        let mut swiglu_lim = swiglu_limit;
+        let mut params: Vec<*mut c_void> = vec![
+            &yp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &mi_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+            &mut swiglu_lim as *mut _ as *mut c_void,
+        ];
+        let block: u32 = 256;
+        let grid_x = (mi as u32 + block - 1) / block;
+        // BW: Y_grouped read (m_total*2*mi*4) + moe_gate_batch write
+        // (m_total*mi*4) + sorted_slot_index (m_total*4).  Half the
+        // write traffic vs the unfused path (no y_up output).
+        let bytes = (m_total * 2 * mi + m_total * mi + m_total) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "moe_unscatter_silu_clamp_k8", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "moe_unscatter_silu_clamp_k8",
+            [grid_x, m_total as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(yp); b.push_ptr(sp); b.push_ptr(gp);
+                b.push_i32(mi_val); b.push_i32(kt_val); b.push_i32(mt_val);
+                b.push_f32(swiglu_lim);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn hash_router_normalize_f32(
+        &mut self,
+        tid2eid: &GpuTensor,
+        scores: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        token_id: i32,
+        n_exp: i32,
+        k: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hash_router_normalize_f32",
+            kernels::HASH_ROUTER_NORMALIZE_SRC,
+            "hash_router_normalize_f32",
+        )?;
+        let tp = tid2eid.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let mut tid = token_id;
+        let mut ne = n_exp;
+        let mut kv = k;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(ip); b.push_ptr(wp);
+            b.push_i32(tid); b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b
+        };
+        self.launch_maybe_blob(
+            "hash_router_normalize_f32",
+            [1, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+    pub fn hash_router_normalize_f32_batched(
+        &mut self,
+        tid2eid: &GpuTensor,
+        scores: &GpuTensor,
+        token_ids: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: i32,
+        k: i32,
+        route_scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hash_router_normalize_f32_batched",
+            kernels::HASH_ROUTER_NORMALIZE_BATCHED_SRC,
+            "hash_router_normalize_f32_batched",
+        )?;
+        let tp = tid2eid.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let tb = token_ids.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kv = k;
+        let mut rs = route_scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tb as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(tb);
+            b.push_ptr(ip); b.push_ptr(wp);
+            b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b.push_i32(bs);
+            b
+        };
+        self.launch_maybe_blob(
+            "hash_router_normalize_f32_batched",
+            [batch_size as u32, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+    pub fn hash_router_normalize_f32_buf(
+        &mut self,
+        tid2eid: &GpuTensor,
+        scores: &GpuTensor,
+        token_id_buf: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        n_exp: i32,
+        k: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "hash_router_normalize_f32_buf",
+            kernels::HASH_ROUTER_NORMALIZE_BUF_SRC,
+            "hash_router_normalize_f32_buf",
+        )?;
+        let tp = tid2eid.buf.as_ptr();
+        let sp = scores.buf.as_ptr();
+        let tb = token_id_buf.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kv = k;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tb as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(tp); b.push_ptr(sp); b.push_ptr(tb);
+            b.push_ptr(ip); b.push_ptr(wp);
+            b.push_i32(ne); b.push_i32(kv); b.push_f32(rs);
+            b
+        };
+        self.launch_maybe_blob(
+            "hash_router_normalize_f32_buf",
+            [1, 1, 1], [1, 1, 1], 0, &mut params, blob_builder,
+        )
+    }
+    pub fn deepseek4_moe_topk_bias_aware_batched_f32(
+        &mut self,
+        scores: &GpuTensor,    // [B, n_exp]
+        bias: &GpuTensor,      // [n_exp]
+        indices: &GpuTensor,   // [B, k_top]
+        weights: &GpuTensor,   // [B, k_top]
+        n_exp: i32,
+        k_top: i32,
+        route_scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_moe_topk_bias_aware_batched",
+            kernels::V4F_MOE_TOPK_BIAS_AWARE_BATCHED_SRC,
+            "deepseek4_moe_topk_bias_aware_batched_f32",
+        )?;
+        let func = &self.functions["deepseek4_moe_topk_bias_aware_batched_f32"];
+        let sp = scores.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let ip = indices.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kt = k_top;
+        let mut rs = route_scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [batch_size as u32, 1, 1],
+                [n_exp as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    pub fn deepseek4_moe_topk_bias_aware_f32(
+        &mut self,
+        scores: &GpuTensor,    // [n_exp] fp32
+        bias: &GpuTensor,      // [n_exp] fp32 (zero if hash-routed)
+        indices: &GpuTensor,   // [k_top] i32 (typed as F32; raw bytes)
+        weights: &GpuTensor,   // [k_top] fp32
+        n_exp: i32,
+        k_top: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_moe_topk_bias_aware",
+            kernels::V4F_MOE_TOPK_BIAS_AWARE_SRC,
+            "deepseek4_moe_topk_bias_aware_f32",
+        )?;
+        let func = &self.functions["deepseek4_moe_topk_bias_aware_f32"];
+        let sp = scores.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let ip = indices.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kt = k_top;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [n_exp as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    pub fn deepseek4_topk_kv_gather_batched_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
+        topk_idx: &GpuTensor,    // [B, K] i32
+        out: &GpuTensor,         // [B, head_dim, out_stride]
+        k_active: i32,
+        head_dim: i32,
+        n_compressed: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_topk_kv_gather_batched",
+            kernels::V4F_TOPK_KV_GATHER_BATCHED_SRC,
+            "deepseek4_topk_kv_gather_batched_f32",
+        )?;
+        let func = &self.functions["deepseek4_topk_kv_gather_batched_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut nc = n_compressed;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nc as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    pub fn deepseek4_topk_kv_gather_f32_buf(
+        &mut self,
+        kv_cache: &GpuTensor,
+        topk_idx: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        n_compressed_buf: &GpuTensor,
+        max_k: i32,         // upper bound on K — sets the captured grid size
+        head_dim: i32,
+        out_stride: i32,
+        col_offset: i32,
+        scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_topk_kv_gather_f32_buf",
+            kernels::V4F_TOPK_KV_GATHER_BUF_SRC,
+            "deepseek4_topk_kv_gather_f32_buf",
+        )?;
+        let cp = kv_cache.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let ncp = n_compressed_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut co = col_offset;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &ncp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut co as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp); b.push_ptr(ip); b.push_ptr(op);
+            b.push_ptr(kbp); b.push_ptr(ncp);
+            b.push_i32(hd); b.push_i32(os); b.push_i32(co); b.push_f32(sc);
+            b
+        };
+        self.launch_maybe_blob(
+            "deepseek4_topk_kv_gather_f32_buf",
+            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+    pub fn deepseek4_topk_kv_gather_identity_batched_f32(
+        &mut self,
+        kv_cache: &GpuTensor,    // [N_compressed, head_dim] shared
+        out: &GpuTensor,         // [B, head_dim, out_stride]
+        k_active: i32,
+        head_dim: i32,
+        out_stride: i32,
+        batch_size: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_topk_kv_gather_identity_batched",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_BATCHED_SRC,
+            "deepseek4_topk_kv_gather_identity_batched_f32",
+        )?;
+        let func = &self.functions["deepseek4_topk_kv_gather_identity_batched_f32"];
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut k = k_active;
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut bs = batch_size;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [k_active as u32, batch_size as u32, 1],
+                [head_dim as u32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+    pub fn deepseek4_topk_kv_gather_identity_f32_buf(
+        &mut self,
+        kv_cache: &GpuTensor,
+        out: &GpuTensor,
+        k_buf: &GpuTensor,
+        max_k: i32,
+        head_dim: i32,
+        out_stride: i32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_topk_kv_gather_identity_f32_buf",
+            kernels::V4F_TOPK_KV_GATHER_IDENTITY_BUF_SRC,
+            "deepseek4_topk_kv_gather_identity_f32_buf",
+        )?;
+        let cp = kv_cache.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let kbp = k_buf.buf.as_ptr();
+        let mut hd = head_dim;
+        let mut os = out_stride;
+        let mut params: Vec<*mut c_void> = vec![
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &kbp as *const _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut os as *mut _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(cp); b.push_ptr(op); b.push_ptr(kbp);
+            b.push_i32(hd); b.push_i32(os);
+            b
+        };
+        self.launch_maybe_blob(
+            "deepseek4_topk_kv_gather_identity_f32_buf",
+            [max_k as u32, 1, 1], [head_dim as u32, 1, 1], 0,
+            &mut params, blob_builder,
+        )
+    }
+
 }
