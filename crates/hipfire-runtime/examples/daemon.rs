@@ -2269,7 +2269,7 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             .iter()
             .map(|t| *t == LayerType::FullAttention)
             .collect();
-        let kv = match kv_mode.as_str() {
+        let mut kv = match kv_mode.as_str() {
             "q8" => {
                 llama::KvCache::new_gpu_q8_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
@@ -2305,6 +2305,24 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
                 llama::KvCache::new_gpu_asym3_capped_filtered(gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, physical_cap).map_err(|e| format!("{e}"))?
             }
         };
+        // V-cache mode override (HIPFIRE_KV_V env). lloyd-V is 256-wide and
+        // requires fwht3 K; ignored otherwise. (Per-load params.kv_v wiring is a follow-up.)
+        let kv_v_env = std::env::var("HIPFIRE_KV_V").unwrap_or_default();
+        let v_mode_override = match kv_v_env.as_str() {
+            "lloyd2" => Some(llama::VMode::Lloyd2),
+            "lloyd3" => Some(llama::VMode::Lloyd3),
+            "lloyd4" => Some(llama::VMode::Lloyd4),
+            "q8" | "" => None,
+            other => { eprintln!("[daemon] HIPFIRE_KV_V='{other}' unknown — ignoring (expected q8|lloyd2|lloyd3|lloyd4)"); None }
+        };
+        if let Some(vm) = v_mode_override {
+            if kv.quant_asym3 && kv.quant_fwht {
+                kv.set_v_mode_realloc(gpu, vm).map_err(|e| format!("{e}"))?;
+                eprintln!("[daemon] V-cache mode override → {kv_v_env} (256-wide lloyd-V on fwht3 K)");
+            } else {
+                eprintln!("[daemon] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires fwht3 K (256-wide); cache is a different mode");
+            }
+        }
         // Q8 DeltaNet state can accumulate quality drift on long generation.
         // The load-time override exists for coherence A/B probes.
         let dn_quant = parse_state_quant(state_quant_override)?;
