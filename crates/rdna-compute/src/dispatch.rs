@@ -24567,6 +24567,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         signs1: &GpuTensor, signs2: &GpuTensor,
         seq_len_hint: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, max_seq: usize,
         partials: &GpuTensor,
+        v_mode_bits: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
@@ -24593,6 +24594,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
             let mut hd = head_dim as i32; let mut ms = max_seq as i32;
             let mut sc = scale; let mut ts = TILE_SIZE as i32;
             let mut mt = max_tiles as i32;
+            let mut vm = v_mode_bits;
             let mut params: Vec<*mut c_void> = vec![
                 &mut q_ptr as *mut _ as *mut c_void,
                 &mut k_ptr as *mut _ as *mut c_void,
@@ -24608,6 +24610,7 @@ self.flags.rocblas_min_batch.unwrap_or(4)
                 &mut sc as *mut _ as *mut c_void,
                 &mut ts as *mut _ as *mut c_void,
                 &mut mt as *mut _ as *mut c_void,
+                &mut vm as *mut _ as *mut c_void,
             ];
             unsafe {
                 self.hip.launch_kernel(

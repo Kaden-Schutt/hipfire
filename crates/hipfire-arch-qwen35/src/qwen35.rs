@@ -8443,6 +8443,7 @@ fn run_fa_layer_body(
                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                 config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                 &s.flash_partials,
+                kv_cache.v_mode_bits(),
             )?;
         } else {
             gpu.kv_cache_write_asym3_fused(
@@ -9264,6 +9265,7 @@ fn forward_scratch_layers(
                             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
+                            kv_cache.v_mode_bits(),
                         )?;
                     } else {
                         gpu.kv_cache_write_asym3_fused(
@@ -9781,6 +9783,7 @@ fn forward_scratch_layers(
                             &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                             config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                             &s.flash_partials,
+                            kv_cache.v_mode_bits(),
                         )?;
                     } else {
                         gpu.kv_cache_write_asym3_fused(
@@ -10260,6 +10263,7 @@ fn forward_scratch_layers_multi(
                                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                                 config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                                 &s.flash_partials,
+                                kv_cache.v_mode_bits(),
                             )?;
                         } else {
                             gpu.kv_cache_write_asym3_fused(
@@ -10650,6 +10654,7 @@ fn forward_scratch_layers_multi(
                                 &s.fa_attn_out, &s.pos_buf, ct, st, pos + 1,
                                 config.n_heads, config.n_kv_heads, config.head_dim, kv_cache.physical_cap,
                                 &s.flash_partials,
+                                kv_cache.v_mode_bits(),
                             )?;
                         } else {
                             gpu.kv_cache_write_asym3_fused(

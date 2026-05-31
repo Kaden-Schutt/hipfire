@@ -29,7 +29,8 @@ __global__ void attention_flash_fwht3_tile(
     int max_seq,
     float scale_attn,
     int tile_size,
-    int max_tiles
+    int max_tiles,
+    int v_mode          // 8 = legacy Q8_0 V; 3 = lloyd3 FWHT-rotated centroid V
 ) {
     const int seq_len = pos_buf[0] + 1;
     const int h = blockIdx.x;
@@ -47,11 +48,6 @@ __global__ void attention_flash_fwht3_tile(
     const int k_bytes_per_head = 4 + (head_dim * 3) / 8;
     const int k_bytes_per_pos  = n_kv_heads * k_bytes_per_head;
     const int k_head_off       = kv_h * k_bytes_per_head;
-
-    const int v_blocks_per_head = head_dim / 32;
-    const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
-    const int v_kv_head_blk     = kv_h * v_blocks_per_head;
-    const int v_row_stride      = v_total_blocks * 34;
 
     extern __shared__ float sdata[];
     float* scores = sdata;
@@ -110,22 +106,56 @@ __global__ void attention_flash_fwht3_tile(
     float tile_sum = local_sum;
     __syncthreads();
 
-    // Phase D: V (Q8_0 normal space) — 8 output dims per thread.
+    // Phase D: V — 8 output dims per thread (thread tid owns dims d0..d0+7).
     float out_vec[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        float w = scores[t_local];
-        int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
-        #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            const int d = d0 + i;
-            const int bi       = d / 32;
-            const int bj       = d % 32;
-            const int v_blk_off = (v_kv_head_blk + bi) * 34;
-            const unsigned char* vbh = vb + v_blk_off;
-            float vs = (float)*((const _Float16*)vbh);
-            out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+    if (v_mode == 8) {
+        // Legacy Q8_0 V (normal space) — unchanged behavior.
+        const int v_blocks_per_head = head_dim / 32;
+        const int v_total_blocks    = n_kv_heads * v_blocks_per_head;
+        const int v_kv_head_blk     = kv_h * v_blocks_per_head;
+        const int v_row_stride      = v_total_blocks * 34;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                const int d = d0 + i;
+                const int bi = d / 32;
+                const int bj = d % 32;
+                const int v_blk_off = (v_kv_head_blk + bi) * 34;
+                const unsigned char* vbh = vb + v_blk_off;
+                float vs = (float)*((const _Float16*)vbh);
+                out_vec[i] += w * (vs * (float)((signed char)vbh[2 + bj]));
+            }
         }
+    } else {
+        // lloyd3: FWHT-rotated centroid V — layout identical to fwht3 K.
+        const int v_bytes_per_head = 4 + (head_dim * 3) / 8;   // 100 B at hd=256
+        const int v_bytes_per_pos  = n_kv_heads * v_bytes_per_head;
+        const int v_head_off       = kv_h * v_bytes_per_head;
+        for (int t_local = 0; t_local < tile_len; t_local++) {
+            float w = scores[t_local];
+            int t = tile_start + t_local;
+            const unsigned char* vb = v_cache + (size_t)t * v_bytes_per_pos + v_head_off;
+            float cnorm = *(const float*)vb;
+            const unsigned char* base = vb + 4 + tid * 3;
+            unsigned int packed = (unsigned int)base[0]
+                                | ((unsigned int)base[1] << 8)
+                                | ((unsigned int)base[2] << 16);
+            out_vec[0] += w * (cnorm * TURBO_C3_256[ packed        & 7]);
+            out_vec[1] += w * (cnorm * TURBO_C3_256[(packed >> 3)  & 7]);
+            out_vec[2] += w * (cnorm * TURBO_C3_256[(packed >> 6)  & 7]);
+            out_vec[3] += w * (cnorm * TURBO_C3_256[(packed >> 9)  & 7]);
+            out_vec[4] += w * (cnorm * TURBO_C3_256[(packed >> 12) & 7]);
+            out_vec[5] += w * (cnorm * TURBO_C3_256[(packed >> 15) & 7]);
+            out_vec[6] += w * (cnorm * TURBO_C3_256[(packed >> 18) & 7]);
+            out_vec[7] += w * (cnorm * TURBO_C3_256[(packed >> 21) & 7]);
+        }
+        // V accumulated in rotated space (out_vec ≈ H·Σw·v). Undo once.
+        fwht_shfl_inverse_256(out_vec[0], out_vec[1], out_vec[2], out_vec[3],
+                              out_vec[4], out_vec[5], out_vec[6], out_vec[7],
+                              signs1, signs2, tid);
     }
 
     float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
