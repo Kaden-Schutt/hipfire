@@ -59,6 +59,10 @@ pub struct PerBGraphCache {
     /// Size being captured right now (between begin_* and end_*). None outside
     /// that window.
     pub capturing: Option<usize>,
+    /// Subset of cache entries whose captured region also includes the
+    /// DFlash verify lm_head + argmax tail. Callers check this before
+    /// deciding whether to enqueue lm_head outside the graph.
+    pub lmhead_argmax: HashSet<usize>,
 }
 
 /// Graph-capture state split across AR forward, DFlash verify, and DeltaNet replay.
@@ -251,6 +255,16 @@ impl GraphState {
         self.verify.cache.len()
     }
 
+    /// Does the captured verify graph for `b` include the lm_head + argmax tail?
+    pub fn verify_graph_has_lmhead_argmax(&self, b: usize) -> bool {
+        self.verify.lmhead_argmax.contains(&b)
+    }
+
+    /// Mark the captured verify graph for `b` as including lm_head + argmax.
+    pub fn verify_mark_graph_lmhead_argmax(&mut self, b: usize) {
+        self.verify.lmhead_argmax.insert(b);
+    }
+
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
         bind_thread_or_warn(hip, device_id);
@@ -259,6 +273,7 @@ impl GraphState {
             let _ = hip.graph_destroy(graph);
         }
         self.verify.warmed_up.clear();
+        self.verify.lmhead_argmax.clear();
         self.verify.capturing = None;
     }
 

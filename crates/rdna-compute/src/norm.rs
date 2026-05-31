@@ -133,6 +133,39 @@ impl Gpu {
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
     }
 
+    /// HIP-graphs-safe variant of `add_f32`. Uses `launch_maybe_blob` instead of
+    /// raw `launch_kernel` so kernarg pointers survive stream capture.
+    pub fn add_f32_graph_safe(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
+
+        let n = a.numel() as i32;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b.buf.as_ptr();
+        let mut c_ptr = c.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "add_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_ptr(c_ptr);
+                bb.push_i32(n_val);
+                bb
+            },
+        )
+    }
+
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -2005,4 +2038,352 @@ impl Gpu {
             )
         }
     }
+
+    pub fn deepseek4_convert_f32_to_f16(
+        &mut self, src: &GpuTensor, dst: &GpuTensor, n: i64,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_convert_f32_to_f16",
+            kernels::V4F_CONVERT_F32_TO_F16_SRC,
+            "deepseek4_convert_f32_to_f16",
+        )?;
+        let func = &self.functions["deepseek4_convert_f32_to_f16"];
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        let mut nn = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+        ];
+        let n_wgs = ((n + 127) / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [n_wgs, 1, 1], [128, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+    pub fn fused_rmsnorm_rotate_mq_plain(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_plain",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
+            "fused_rmsnorm_mq_rotate_plain",
+        )?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let xp = x.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let xpp = x_plain.buf.as_ptr();
+        let s1 = s1_ptr;
+        let s2 = s2_ptr;
+        let kv = k as i32;
+        let eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &s1 as *const _ as *mut c_void,
+            &s2 as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &xpp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &eps_v as *const _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = k * 4 * 4 + 2 * 256 * 4; // +1 K*4 for x_plain write
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_rmsnorm_mq_rotate_plain", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_plain", [1, 1, 1], [block_size, 1, 1],
+            shared_mem, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp); b.push_ptr(xpp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.scratch.invalidate_x_caches_for(xrp);
+        self.scratch.invalidate_x_caches_for(xpp);
+        result
+    }
+    pub fn fused_rmsnorm_rotate_mq_plain_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        x_rot: &GpuTensor,
+        x_plain: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "fused_rmsnorm_mq_rotate_plain",
+            kernels::FUSED_RMSNORM_MQ_ROTATE_PLAIN_SRC,
+            "fused_rmsnorm_mq_rotate_plain",
+        )?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut xpp = x_plain.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut xpp as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+        ];
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let bytes = (k * 4 * 4 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "fused_rmsnorm_mq_rotate_plain_batched", bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "fused_rmsnorm_mq_rotate_plain",
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp); b.push_ptr(wp);
+                b.push_ptr(s1); b.push_ptr(s2);
+                b.push_ptr(xrp); b.push_ptr(xpp);
+                b.push_i32(kv); b.push_f32(eps_v);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.scratch.invalidate_x_caches_for(xrp);
+        self.scratch.invalidate_x_caches_for(xpp);
+        result
+    }
+    pub fn rmsnorm_f32_at_slot_buf(
+        &mut self,
+        base: &GpuTensor,
+        weight: &GpuTensor,
+        slot_buf: &GpuTensor,
+        n: i32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rmsnorm_f32_at_slot_buf",
+            kernels::RMSNORM_AT_SLOT_BUF_SRC,
+            "rmsnorm_f32_at_slot_buf",
+        )?;
+        let bp = base.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sb = slot_buf.buf.as_ptr();
+        let mut nv = n;
+        let mut ev = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sb as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+            &mut ev as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(n as u32).next_power_of_two().max(32);
+        let shared = block * 4;
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(bp); b.push_ptr(wp); b.push_ptr(sb);
+            b.push_i32(nv); b.push_f32(ev);
+            b
+        };
+        self.launch_maybe_blob(
+            "rmsnorm_f32_at_slot_buf",
+            [1, 1, 1], [block, 1, 1], shared, &mut params, blob_builder,
+        )
+    }
+    pub fn sqrt_softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("sqrt_softplus_f32",
+            kernels::SQRT_SOFTPLUS_F32_SRC, "sqrt_softplus_f32")?;
+        let func = &self.functions["sqrt_softplus_f32"];
+        let n = x.numel() as i32;
+        let xp = x.buf.as_ptr();
+        let mut nv = n;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let grid_x = ((n + 255) / 256) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func, [grid_x, 1, 1], [256, 1, 1], 0,
+                self.stream_ref(), &mut params,
+            )
+        }
+    }
+    pub fn deepseek4_fused_silu_mul_clamp_mq_rotate(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        x_rot: &GpuTensor,
+        k: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "deepseek4_fused_silu_mul_clamp_mq_rotate",
+            kernels::V4F_FUSED_SILU_MUL_CLAMP_MQ_ROTATE_SRC,
+            "deepseek4_fused_silu_mul_clamp_mq_rotate",
+        )?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let gp = gate.buf.as_ptr();
+        let up_p = up.buf.as_ptr();
+        let xrp = x_rot.buf.as_ptr();
+        let kv = k as i32;
+        let lim = swiglu_limit;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &up_p as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &xrp as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &lim as *const _ as *mut c_void,
+        ];
+        let bytes = k * 4 * 3 + 2 * 256 * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "fused", "deepseek4_fused_silu_mul_clamp_mq_rotate", bytes);
+        let result = self.launch_maybe_blob(
+            "deepseek4_fused_silu_mul_clamp_mq_rotate",
+            [n_groups, 1, 1], [32, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp); b.push_ptr(up_p);
+                b.push_ptr(s1_ptr); b.push_ptr(s2_ptr); b.push_ptr(xrp);
+                b.push_i32(kv); b.push_f32(lim);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        self.scratch.invalidate_x_caches_for(xrp);
+        result
+    }
+    pub fn deepseek4_silu_mul_clamp_f32(
+        &mut self, gate: &GpuTensor, up: &GpuTensor, out: &GpuTensor, swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("deepseek4_silu_mul_clamp",
+            kernels::V4F_SILU_MUL_CLAMP_SRC, "deepseek4_silu_mul_clamp_f32")?;
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+        let mut limit_val = swiglu_limit;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut limit_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "deepseek4_silu_mul_clamp_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "deepseek4_silu_mul_clamp_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(limit_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+    pub fn deepseek4_silu_mul_clamp_f32_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        batch: usize,
+        swiglu_limit: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("deepseek4_silu_mul_clamp",
+            kernels::V4F_SILU_MUL_CLAMP_SRC, "deepseek4_silu_mul_clamp_f32")?;
+
+        let n_i32 = n as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n_i32;
+        let mut limit_val = swiglu_limit;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut limit_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n_i32 as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n) * batch;
+        let timer = crate::profile::begin_timer(
+            &self.hip, "elementwise", "deepseek4_silu_mul_clamp_f32_batched", bytes);
+        let result = self.launch_maybe_blob(
+            "deepseek4_silu_mul_clamp_f32",
+            [grid, batch as u32, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr); b.push_ptr(up_ptr); b.push_ptr(out_ptr);
+                b.push_i32(n_val); b.push_f32(limit_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
 }

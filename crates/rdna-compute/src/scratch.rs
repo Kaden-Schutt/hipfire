@@ -279,6 +279,75 @@ impl ScratchState {
         Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Convert F32 to F16 without caching. Used when the same x tensor
+    /// pointer is reused with different contents across layers (e.g.
+    /// DeepSeek V4 prefill reuses the same x_in pointer with new contents
+    /// every layer), where pointer-keyed caching would read stale FP16.
+    pub fn convert_fp16_x_uncached(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        x: &GpuTensor,
+        n_elems: usize,
+    ) -> HipResult<*mut c_void> {
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            "convert_f32_to_f16",
+            kernels::GEMM_HFQ4G256_RESIDUAL_FP16_SRC,
+            "convert_f32_to_f16",
+        )?;
+
+        let needed = n_elems * 2;
+        if self.fp16_x_scratch_bytes < needed {
+            self.fp16_x_scratch = Some(hip.malloc(needed)?);
+            self.fp16_x_scratch_bytes = needed;
+            self.fp16_x_source_ptr = std::ptr::null_mut();
+        }
+
+        let in_ptr = x.buf.as_ptr();
+        let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
+        let n_val = n_elems as i32;
+        let mut in_ptr_m = in_ptr;
+        let mut out_ptr_m = out_ptr;
+        let mut n_val_m = n_val;
+        let mut conv_params: Vec<*mut c_void> = vec![
+            &mut in_ptr_m as *mut _ as *mut c_void,
+            &mut out_ptr_m as *mut _ as *mut c_void,
+            &mut n_val_m as *mut _ as *mut c_void,
+        ];
+        let grid = ((n_elems + 255) / 256) as u32;
+        launch_maybe_blob(
+            hip,
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            "convert_f32_to_f16",
+            [grid, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut conv_params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(in_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        Ok(self.fp16_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
     /// Ensure the FP8 (E4M3) X scratch contains the conversion of `x`
     /// (an F32 GpuTensor). Returns the FP8 device pointer. gfx12 only —
     /// uses cvt_pk_fp8_f32. Caches by `x.buf.as_ptr()` like its FP16

@@ -484,11 +484,13 @@ impl Gpu {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),
                     capturing: None,
+                    lmhead_argmax: std::collections::HashSet::new(),
                 },
                 replay: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),
                     capturing: None,
+                    lmhead_argmax: std::collections::HashSet::new(),
                 },
             },
             rocblas: None,
@@ -716,6 +718,24 @@ impl Gpu {
     /// Returns the FP16 device pointer.
     pub(crate) fn ensure_fp16_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
         self.scratch.ensure_fp16_x(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            self.graphs.capture_mode,
+            self.flags.force_blob_path,
+            x,
+            n_elems,
+        )
+    }
+
+    /// Convert F32 to F16 without caching. Used when the same x tensor
+    /// pointer is reused with different contents across layers, where
+    /// pointer-keyed caching would read stale FP16.
+    pub(crate) fn convert_fp16_x_uncached(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
+        self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
             &mut self.modules,
