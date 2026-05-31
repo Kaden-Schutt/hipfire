@@ -413,6 +413,11 @@ pub struct Gpu {
     /// graph_destroy + re-capture every oscillation, which was wiping out the
     /// hipGraph replay gain entirely.
     pub verify_graph_cache: HashMap<usize, (hip_bridge::Graph, hip_bridge::GraphExec, Vec<Vec<u8>>)>,
+    /// Subset of `verify_graph_cache` whose captured region also includes the
+    /// DFlash verify lm_head + argmax tail. Forward-only and extended verify
+    /// graphs share the same per-B cache, so callers need this side metadata
+    /// before deciding whether to enqueue lm_head outside the graph.
+    pub verify_graph_lmhead_argmax: HashSet<usize>,
     /// Set of B values that have completed the once-per-B JIT/scratch warmup.
     /// Capture can safely begin only after warmup — see graph_verify_warmup doc.
     pub verify_warmed_up: HashSet<usize>,
@@ -648,6 +653,7 @@ impl Gpu {
             ar_forward_kernel_dirty: true,
             ar_forward_replay_enabled: false,
             verify_graph_cache: HashMap::new(),
+            verify_graph_lmhead_argmax: HashSet::new(),
             verify_warmed_up: HashSet::new(),
             verify_capturing_b: None,
             replay_graph_cache: HashMap::new(),
@@ -907,6 +913,16 @@ impl Gpu {
         self.verify_graph_cache.contains_key(&b)
     }
 
+    pub fn verify_graph_has_lmhead_argmax(&self, b: usize) -> bool {
+        // bind_thread: skip — pure state query
+        self.verify_graph_lmhead_argmax.contains(&b)
+    }
+
+    pub fn verify_mark_graph_lmhead_argmax(&mut self, b: usize) {
+        // bind_thread: skip — pure state update
+        self.verify_graph_lmhead_argmax.insert(b);
+    }
+
     pub fn verify_needs_warmup(&self, b: usize) -> bool {
         // bind_thread: skip — pure state query
         !self.verify_warmed_up.contains(&b)
@@ -972,6 +988,7 @@ impl Gpu {
             let _ = self.hip.graph_exec_destroy(exec);
             let _ = self.hip.graph_destroy(graph);
         }
+        self.verify_graph_lmhead_argmax.clear();
         self.verify_warmed_up.clear();
         self.verify_capturing_b = None;
     }
@@ -13569,6 +13586,66 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         result
     }
 
+    /// gfx12 lm_head sibling of `gemm_hfq4g256_residual_wmma_gfx12`.
+    /// Uses the same WMMA tile mapping but overwrites Y instead of reading
+    /// and adding to it, so lm_head callers can skip a full-vocab zero-fill.
+    pub fn gemm_hfq4g256_lmhead_wmma_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            kernels::GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC,
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k)
+            + batch_size * k * 2
+            + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_hfq4g256_lmhead_wmma_gfx12", bytes);
+        let result = self.launch_maybe_blob(
+            "gemm_hfq4g256_lmhead_wmma_gfx12",
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+                b.push_i32(m_val); b.push_i32(k_val); b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
     /// Same math as `gemv_hfq4g256` but the final write accumulates into `y`
     /// instead of overwriting. Used for wo / w_down projections where the
@@ -19256,6 +19333,8 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     /// WMMA lm_head fast path for DFlash. Computes y = A @ x at batch>1 via
     /// the residual-WMMA kernel on pre-zeroed y — 8-10× faster than the
     /// scalar `gemm_hfq4g256` on 9B lm_head (batch=16, vocab=248K, k=2560).
+    /// HIPFIRE_LM_HEAD_OVERWRITE=1 opts into a gfx12 overwrite sibling that
+    /// skips the zero-fill; measured as a small win but not enough to default.
     ///
     /// NOT numerically identical to `gemm_hfq4g256`. Uses FP16 tensor cores
     /// with the accumulators in FP32 the residual kernel ships. On the
@@ -19291,22 +19370,27 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         // ~26.68% of composition cycle wall in this scalar path).
         let arch = self.arch.as_str();
         let wmma_eligible = batch_size > 1
-            && self.arch_caps.has_wmma_w32()
+            && (self.arch_caps.has_wmma_w32() || self.arch_caps.has_wmma_w32_gfx12())
             && !self.flags.fp16_disabled
             && !self.flags.lm_head_wmma_disabled;
         if wmma_eligible {
             self.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
-                Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
-            }
-            return if arch.starts_with("gfx12") {
-                self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+            if arch.starts_with("gfx12") && self.flags.lm_head_overwrite {
+                self.gemm_hfq4g256_lmhead_wmma_gfx12(a_raw, x, y, m, k, batch_size)
             } else {
-                self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
-            };
+                match self.active_stream.as_ref() {
+                    Some(stream) => self.hip.memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                    None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+                }
+                if arch.starts_with("gfx12") {
+                    self.gemm_hfq4g256_residual_wmma_gfx12(a_raw, x, y, m, k, batch_size)
+                } else {
+                    self.gemm_hfq4g256_residual_wmma(a_raw, x, y, m, k, batch_size)
+                }
+            }
+        } else {
+            self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
         }
-        self.gemm_hfq4g256(a_raw, x, y, m, k, batch_size)
     }
 
     /// HFQ6-G256 sister of `gemm_hfq4g256_batched_lmhead`. Phase A.4
@@ -22413,6 +22497,118 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         )
     }
 
+    /// GPU-side single-row argmax that writes directly into an MTP token
+    /// chain. If `vocab_map` is present, the argmax index is treated as a
+    /// compressed-vocab row and remapped to the full-vocab token id before
+    /// storing `token_chain[dst_slot]`.
+    pub fn argmax_token_chain_f32(
+        &mut self,
+        data: &GpuTensor,
+        argmax_out: &GpuTensor,
+        token_chain: &GpuTensor,
+        vocab_map: Option<&GpuTensor>,
+        n: usize,
+        dst_slot: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "argmax_token_chain",
+            kernels::ARGMAX_TOKEN_CHAIN_SRC,
+            "argmax_token_chain_f32",
+        )?;
+
+        let mut dp = data.buf.as_ptr();
+        let mut ap = argmax_out.buf.as_ptr();
+        let mut cp = token_chain.buf.as_ptr();
+        let mut vp = vocab_map
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut::<c_void>());
+        let mut nn = n as i32;
+        let mut ds = dst_slot as i32;
+        let mut use_map = i32::from(vocab_map.is_some());
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut dp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ds as *mut _ as *mut c_void,
+            &mut use_map as *mut _ as *mut c_void,
+        ];
+
+        let block_size = 256u32;
+        let shared = block_size * 8; // f32 + i32 per thread
+        self.launch_maybe_blob(
+            "argmax_token_chain_f32",
+            [1, 1, 1],
+            [block_size, 1, 1],
+            shared,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(vp);
+                b.push_i32(nn);
+                b.push_i32(ds);
+                b.push_i32(use_map);
+                b
+            },
+        )
+    }
+
+    /// Device-side greedy accept prefix scan over verify argmaxes and MTP
+    /// candidates. `result[0]` is accept_count; `result[1]` is the bonus
+    /// token, or -1 if an accepted candidate was EOS and no bonus is present.
+    pub fn greedy_accept_from_argmax_i32(
+        &mut self,
+        argmax_per_pos: &GpuTensor,
+        candidates: &GpuTensor,
+        result: &GpuTensor,
+        drafts_generated: usize,
+        eos_token_id: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "greedy_accept",
+            kernels::GREEDY_ACCEPT_SRC,
+            "greedy_accept_from_argmax_i32",
+        )?;
+
+        let mut ap = argmax_per_pos.buf.as_ptr();
+        let mut cp = candidates.buf.as_ptr();
+        let mut rp = result.buf.as_ptr();
+        let mut dg = drafts_generated as i32;
+        let mut eos = eos_token_id as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut dg as *mut _ as *mut c_void,
+            &mut eos as *mut _ as *mut c_void,
+        ];
+
+        self.launch_maybe_blob(
+            "greedy_accept_from_argmax_i32",
+            [1, 1, 1],
+            [1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(cp);
+                b.push_ptr(rp);
+                b.push_i32(dg);
+                b.push_i32(eos);
+                b
+            },
+        )
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;
@@ -22628,6 +22824,40 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
         unsafe { self.hip.launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params) }
+    }
+
+    /// c = a + b (element-wise), graph-capture-safe launch path. Keep the
+    /// legacy `add_f32` path unchanged for non-captured callers; use this in
+    /// subgraphs where stack-backed kernelParams would dangle on replay.
+    pub fn add_f32_graph_safe(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
+
+        let n = a.numel() as i32;
+        let mut a_ptr = a.buf.as_ptr();
+        let mut b_ptr = b.buf.as_ptr();
+        let mut c_ptr = c.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut b_ptr as *mut _ as *mut c_void,
+            &mut c_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "add_f32",
+            [grid, 1, 1], [block, 1, 1], 0, &mut params,
+            || {
+                let mut bb = hip_bridge::KernargBlob::new();
+                bb.push_ptr(a_ptr); bb.push_ptr(b_ptr); bb.push_ptr(c_ptr);
+                bb.push_i32(n_val);
+                bb
+            },
+        )
     }
 
     /// a += b (in-place element-wise add)
@@ -25257,7 +25487,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("attention_q8_0_kv", kernels::ATTENTION_Q8_0_KV_SRC, "attention_q8_0_kv")?;
-        let func = &self.functions["attention_q8_0_kv"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = q.buf.as_ptr(); let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr(); let mut out_ptr = out.buf.as_ptr();
@@ -25289,7 +25518,27 @@ self.flags.rocblas_min_batch.unwrap_or(4)
         let shared_mem = ((sizing_seq + block_size as usize + head_dim) * 4) as u32;
         let bytes = crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, seq_len_hint);
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
-        let result = unsafe { self.hip.launch_kernel(func, [n_heads as u32, 1, 1], [block_size, 1, 1], shared_mem, self.stream_ref(), &mut params) };
+        let result = self.launch_maybe_blob(
+            "attention_q8_0_kv",
+            [n_heads as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
         if let Some(t) = timer { t.finish(&self.hip); }
         result
     }

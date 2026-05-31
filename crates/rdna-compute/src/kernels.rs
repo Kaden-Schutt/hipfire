@@ -1265,6 +1265,7 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str = include_str!("../../../
 // the residual-GEMM gap on 9B prefill (42% of decode-batch GEMM time was
 // stuck on the dot2 fp16 fallback before this).
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
+pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
 // Pre-quantizes activations to Q8_1 + uses i8 WMMA over 128×128 tiles. Targets
 // the Strix Halo prefill gap vs llama.cpp (#60); also wins ~+20% on gfx1100
@@ -2490,6 +2491,14 @@ pub const ARGMAX_SRC: &str = include_str!("../../../kernels/src/argmax.hip");
 /// Batched argmax: one block per row, writes B indices with one kernel launch.
 /// Used by DFlash verify to collapse the B × [vocab] logit download to B × 4 bytes.
 pub const ARGMAX_BATCHED_SRC: &str = include_str!("../../../kernels/src/argmax_batched.hip");
+
+/// Single-row argmax that writes the selected token into an on-device MTP
+/// token chain, optionally remapping through a compressed-vocab sidecar.
+pub const ARGMAX_TOKEN_CHAIN_SRC: &str = include_str!("../../../kernels/src/argmax_token_chain.hip");
+
+/// Device-side greedy MTP accept prefix scan over verify argmaxes and draft
+/// candidates. Writes compact `[accept_count, bonus_or_minus_one]` result.
+pub const GREEDY_ACCEPT_SRC: &str = include_str!("../../../kernels/src/greedy_accept.hip");
 
 
 // ═══════════════════════════════════════════════════════════════════════════
