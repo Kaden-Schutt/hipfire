@@ -4458,8 +4458,9 @@ pub struct PrefillBatchScratch {
 
     // Path 2 (SGLang-style scatter + grouped-WMMA-GEMM) scratch. All
     // allocated when num_experts > 0; gated at runtime by
-    // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max = max_batch * k_top +
-    // num_experts * (BLOCK_M - 1) with BLOCK_M=16.
+    // HIPFIRE_MOE_GROUPED_GEMM=1. m_total_max is tile-aligned:
+    // align_up(max_batch * k_top + num_experts * (BLOCK_M - 1), BLOCK_M)
+    // with BLOCK_M=16.
     //
     //   moe_expert_token_counts: [num_experts] i32 (raw → padded)
     //   moe_expert_offsets:      [num_experts + 1] i32 (exclusive prefix)
@@ -4575,7 +4576,11 @@ impl PrefillBatchScratch {
                 Some(gpu.alloc_tensor(&[(config.num_experts + 1) * 4], DType::Raw)?)
             } else { None },
             moe_sorted_slot_index: if config.num_experts > 0 {
-                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                let m_total_max = moe_grouped_m_total_max(
+                    max_batch,
+                    config.num_experts_per_tok,
+                    config.num_experts,
+                );
                 Some(gpu.alloc_tensor(&[m_total_max * 4], DType::Raw)?)
             } else { None },
             moe_inverse_perm: if config.num_experts > 0 {
@@ -4583,15 +4588,27 @@ impl PrefillBatchScratch {
                 Some(gpu.alloc_tensor(&[total_slots_max * 4], DType::Raw)?)
             } else { None },
             moe_expert_tile_ids: if config.num_experts > 0 {
-                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
-                Some(gpu.alloc_tensor(&[(m_total_max / 16 + 1) * 4], DType::Raw)?)
+                let m_total_max = moe_grouped_m_total_max(
+                    max_batch,
+                    config.num_experts_per_tok,
+                    config.num_experts,
+                );
+                Some(gpu.alloc_tensor(&[(m_total_max / MOE_GROUPED_BLOCK_M) * 4], DType::Raw)?)
             } else { None },
             moe_y_gate_up_grouped: if config.num_experts > 0 {
-                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                let m_total_max = moe_grouped_m_total_max(
+                    max_batch,
+                    config.num_experts_per_tok,
+                    config.num_experts,
+                );
                 Some(gpu.alloc_tensor(&[m_total_max * 2 * config.moe_intermediate_size], DType::F32)?)
             } else { None },
             moe_y_down_grouped: if config.num_experts > 0 {
-                let m_total_max = max_batch * config.num_experts_per_tok + config.num_experts * 15;
+                let m_total_max = moe_grouped_m_total_max(
+                    max_batch,
+                    config.num_experts_per_tok,
+                    config.num_experts,
+                );
                 Some(gpu.alloc_tensor(&[m_total_max * config.dim], DType::F32)?)
             } else { None },
             dn_s_tape_q8: if config.linear_num_value_heads > 0 {
@@ -4681,6 +4698,46 @@ impl PrefillBatchScratch {
 /// on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+const MOE_GROUPED_BLOCK_M: usize = 16;
+
+#[inline]
+fn prefill_should_emit_last_token_logits(
+    has_per_token_hidden_out: bool,
+    needs_last_token_logits: bool,
+) -> bool {
+    !has_per_token_hidden_out || needs_last_token_logits
+}
+
+#[inline]
+fn align_up_usize(x: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (x + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn moe_grouped_m_total_max(max_batch: usize, k_top: usize, n_exp: usize) -> usize {
+    // Every grouped-GEMM tile consumes 16 sorted slots. The scatter kernel
+    // initializes sentinel tile ids up to this bound, so the bound itself must
+    // be tile-aligned; otherwise the final launched tile can read an
+    // uninitialized expert id.
+    align_up_usize(
+        max_batch * k_top + n_exp * (MOE_GROUPED_BLOCK_M - 1),
+        MOE_GROUPED_BLOCK_M,
+    )
+}
+
+#[inline]
+fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
+    // Actual grouped rows are sum_e align_up(count_e, BLOCK_M). Only experts
+    // that receive at least one slot can contribute padding, so small verify
+    // batches do not need to launch the full all-experts worst case.
+    let live_expert_bound = total_slots.min(n_exp);
+    align_up_usize(
+        total_slots + live_expert_bound * (MOE_GROUPED_BLOCK_M - 1),
+        MOE_GROUPED_BLOCK_M,
+    )
+}
+
 /// Host-side helper: upload token ids and positions to a `PrefillBatchScratch`
 /// via sync `memcpy_htod`. Call this BEFORE entering a hipGraph capture to
 /// pre-populate `pbs.tokens` and `pbs.positions`, then pass `pre_uploaded:
@@ -4733,6 +4790,41 @@ pub fn forward_prefill_batch_single_chunk_captured(
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
+) -> HipResult<()> {
+    forward_prefill_batch_single_chunk_captured_opts(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        pbs,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_batch_single_chunk_captured_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    hidden_rb: Option<&HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    needs_last_token_logits: bool,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0 && n <= pbs.max_batch,
@@ -4904,6 +4996,7 @@ pub fn forward_prefill_batch_single_chunk_captured(
         true, // pre_uploaded: caller must have run upload_prefill_batch_inputs
         None, // band: full-stack single-GPU path
         None, // mask_override: captured-prefill caller does not use the MTP probe hook
+        needs_last_token_logits,
         None, // max_layer: single-chunk captured path always runs the full stack
     )
 }
@@ -4930,6 +5023,43 @@ pub fn forward_prefill_batch(
     )
 }
 
+pub fn forward_prefill_batch_with_pbs(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens: &[u32],
+    start_pos: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    scratch: &Qwen35Scratch,
+    hidden_rb: Option<&mut HiddenStateRingBuffer>,
+    per_token_hidden_out: Option<&GpuTensor>,
+    gdn_tape: Option<&mut crate::speculative::GdnTape>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    pbs_in: Option<&PrefillBatchScratch>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    max_layer: Option<usize>,
+) -> HipResult<()> {
+    forward_prefill_batch_with_pbs_opts(
+        gpu,
+        weights,
+        config,
+        tokens,
+        start_pos,
+        kv_cache,
+        dn_state,
+        scratch,
+        hidden_rb,
+        per_token_hidden_out,
+        gdn_tape,
+        tree_verify,
+        pbs_in,
+        mask_override,
+        max_layer,
+        true, // preserve legacy post-condition: scratch.logits is last-token logits
+    )
+}
+
 /// Like `forward_prefill_batch`, but accepts a caller-owned `PrefillBatchScratch`
 /// so the ~25 per-cycle tensor allocations can be amortized across many calls.
 ///
@@ -4939,7 +5069,12 @@ pub fn forward_prefill_batch(
 /// up to `pbs.max_batch`. Callers driving DFlash verify should size `pbs`
 /// to the maximum block size they'll ever request (e.g. `block_size` or
 /// `1 + tree_budget`) so everything fits in one chunk.
-pub fn forward_prefill_batch_with_pbs(
+///
+/// `needs_last_token_logits = false` is only for callers that pass
+/// `per_token_hidden_out` and compute their own logits from those hidden rows.
+/// The default wrapper keeps this true to protect existing callers that rely on
+/// `scratch.logits` being populated with the last token's logits.
+pub fn forward_prefill_batch_with_pbs_opts(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -4955,6 +5090,7 @@ pub fn forward_prefill_batch_with_pbs(
     pbs_in: Option<&PrefillBatchScratch>,
     mask_override: Option<MaskEmbedOverride<'_>>,
     max_layer: Option<usize>,
+    needs_last_token_logits: bool,
 ) -> HipResult<()> {
     // Upper bound on the PrefillBatchScratch — large prompts get split
     // into chunks of this size and processed in a loop.
@@ -5176,6 +5312,7 @@ pub fn forward_prefill_batch_with_pbs(
                 false, // pre_uploaded: default path uploads inside
                 None,  // band: full-stack single-GPU path
                 mo_for_chunk,
+                needs_last_token_logits,
                 max_layer,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
@@ -5401,11 +5538,6 @@ fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
     value != Some("0")
 }
 
-/// MQ6 admit is gated behind `HIPFIRE_MOE_MQ6_ADMIT=1` because of a
-/// known correctness regression on AWQ A3B (token attractor `!!!!!`)
-/// when the new MQ6 dispatch path is exercised — the 4 new MQ6 kernels
-/// pass synthetic channel tests at FP16 ULP precision but produce
-/// garbage activations in production. Bisection of the offending
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
@@ -5433,6 +5565,10 @@ pub fn prefill_batch_pbs_eligible(
     // MoE batched path requires K_TOP=8 (hard-coded in the indexed kernels) and
     // num_experts ≤ 1024 (bound of the batched top-K shared mem).
     let moe_topk_ok = config.num_experts_per_tok == 8 && config.num_experts <= 1024;
+    let admit_mq6 = mq6_batched_admit_enabled_from_env(
+        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").ok().as_deref(),
+        arch,
+    );
     !force_fallback
         && n >= MIN_BATCH
         && dn_state.quant == StateQuant::Q8
@@ -5461,7 +5597,7 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.w_beta.gpu_dtype, arch)
                     && is_batchable_la(l.w_alpha.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6),
             LayerWeights::FullAttnMoe(l) =>
                 moe_topk_ok
                     && moe_router_logits_present
@@ -5469,13 +5605,24 @@ pub fn prefill_batch_pbs_eligible(
                     && is_batchable_la(l.wk.gpu_dtype, arch)
                     && is_batchable_la(l.wv.gpu_dtype, arch)
                     && is_batchable_la(l.wo.gpu_dtype, arch)
-                    && moe_ffn_batched_admissible(&l.ffn),
+                    && moe_ffn_batched_admissible(&l.ffn, admit_mq6),
         })
 }
 
-/// dispatch site is pending. Default-off preserves the pre-fan-out
-/// behavior (AWQ A3B → per-token fallback, coherent at ~53 tok/s).
-fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
+/// Whether MQ6 MoE FFN projections can enter batched prefill. After the
+/// grouped tile-bound fix, gfx12 defaults to admit because its HFQ6
+/// grouped-WMMA path is present and production-smoked; gfx11 and older stay
+/// default-off because the MQ6 grouped sister is not implemented there and the
+/// indexed fallback still lacks an MQ6 gate_up batched kernel.
+fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => arch.starts_with("gfx12"),
+    }
+}
+
+fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
     // F32 router/shared_gate admit (PARO checkpoints — router is FP16-dense,
     // expanded to F32 on GPU; shared_expert_gate likewise. See
     // load_fp16_weight_from_source at qwen35.rs:1177). The dispatch arms in
@@ -5506,12 +5653,6 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights) -> bool {
             return true;
         }
     }
-
-    // MQ6 admit env gate (default off — see comment above)
-    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let admit_mq6 = *MQ6_ADMIT.get_or_init(|| {
-        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() == Ok("1")
-    });
 
     if admit_mq6 {
         // Per-projection MQ4 OR MQ6 admit.
@@ -5807,9 +5948,9 @@ fn prefill_moe_ffn_body_batched(
     let mut path2_m_total: usize = 0;
     if path2_eligible {
         // Stage 1 scatter pipeline. The scratch buffers are sized for
-        // m_total_max = max_batch * k_top + n_exp * 15; here m_total ≤
-        // n * k_top + n_exp * 15. Block size 16 (the WMMA tile row count).
-        const BLOCK_M: usize = 16;
+        // worst-case max_batch. Runtime launch bounds use the tighter live
+        // slot upper bound below. Block size 16 (the WMMA tile row count).
+        const BLOCK_M: usize = MOE_GROUPED_BLOCK_M;
         let counts = pbs.moe_expert_token_counts.as_ref().expect("path2 scratch");
         let offsets = pbs.moe_expert_offsets.as_ref().expect("path2 scratch");
         let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
@@ -5817,12 +5958,13 @@ fn prefill_moe_ffn_body_batched(
         let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
         let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
         let total_slots = n * k_top;
-        // m_total upper bound — sized in PrefillBatchScratch::new with
-        // max_batch * k_top + n_exp * (BLOCK_M - 1). The scatter fused
-        // kernel pre-fills expert_tile_ids[0..m_total_max/16] with -1;
-        // the grouped GEMM and unscatter early-return on those tiles, so
-        // we can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
-        let m_total_max = n * k_top + n_exp * (BLOCK_M - 1);
+        // m_total upper bound — scratch is sized in PrefillBatchScratch::new
+        // with the all-experts worst case, while this launch only needs slots
+        // plus padding for experts that can be non-empty at this N.
+        // The scatter fused kernel pre-fills every tile id in this aligned
+        // bound with -1; grouped GEMM early-returns on sentinel tiles, so we
+        // can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
+        let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
 
         // Fused scatter pipeline: one launch replaces histogram + offsets
         // + permute. Saves 2 launches × ~75µs × MoE layers.
@@ -6137,6 +6279,7 @@ fn forward_prefill_chunk(
     pre_uploaded: bool,
     band: Option<&PrefillBandCtx<'_>>,
     mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
     max_layer: Option<usize>,
 ) -> HipResult<()> {
     let n = tokens.len();
@@ -8236,11 +8379,13 @@ fn forward_prefill_chunk(
                 &pbs.x_batch, &weights.output_norm, &dst_view,
                 n, dim, config.norm_eps,
             )?;
-            // Still populate s.logits with the last-token logits for callers
-            // that rely on it (the legacy prefill path's post-condition).
-            let last = n - 1;
-            let last_view = dst.sub_offset((offset_rows + last) * dim, dim);
-            weight_gemv(gpu, &weights.output, &last_view, &s.logits)?;
+            if prefill_should_emit_last_token_logits(true, needs_last_token_logits) {
+                // Still populate s.logits with the last-token logits for
+                // callers that rely on it (the legacy prefill post-condition).
+                let last = n - 1;
+                let last_view = dst.sub_offset((offset_rows + last) * dim, dim);
+                weight_gemv(gpu, &weights.output, &last_view, &s.logits)?;
+            }
         } else {
             // Legacy path: only last-token logits.
             // Use _auto so the D→D copy routes through the active stream
@@ -10990,6 +11135,7 @@ pub fn forward_prefill_batch_multi(
                         false, // pre_uploaded
                         Some(&band_ctx),
                         None, // mask_override: multi-GPU PP path doesn't use the MTP probe hook
+                        true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
                     )?;
                 }
@@ -11093,5 +11239,51 @@ mod tests {
         assert!(paro_batched_admit_enabled_from_env(Some("1")));
         assert!(paro_batched_admit_enabled_from_env(Some("surprise")));
         assert!(!paro_batched_admit_enabled_from_env(Some("0")));
+    }
+
+    #[test]
+    fn mq6_batched_admit_defaults_to_gfx12_only() {
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1201"));
+        assert!(mq6_batched_admit_enabled_from_env(None, "gfx1200"));
+        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx1100"));
+        assert!(!mq6_batched_admit_enabled_from_env(None, "gfx942"));
+        assert!(mq6_batched_admit_enabled_from_env(Some("1"), "gfx1100"));
+        assert!(!mq6_batched_admit_enabled_from_env(Some("0"), "gfx1201"));
+    }
+
+    #[test]
+    fn prefill_last_token_logits_policy_requires_explicit_opt_out() {
+        assert!(prefill_should_emit_last_token_logits(false, true));
+        assert!(prefill_should_emit_last_token_logits(true, true));
+        assert!(prefill_should_emit_last_token_logits(false, false));
+        assert!(!prefill_should_emit_last_token_logits(true, false));
+    }
+
+    #[test]
+    fn moe_grouped_m_total_max_is_tile_aligned() {
+        let small_verify = moe_grouped_m_total_max(3, 8, 256);
+        assert_eq!(small_verify % MOE_GROUPED_BLOCK_M, 0);
+        assert_eq!(small_verify, 3872);
+
+        let prompt_prefill = moe_grouped_m_total_max(27, 8, 256);
+        assert_eq!(prompt_prefill % MOE_GROUPED_BLOCK_M, 0);
+        assert_eq!(prompt_prefill, 4064);
+
+        let full_chunk = moe_grouped_m_total_max(256, 8, 256);
+        assert_eq!(full_chunk, 5888);
+    }
+
+    #[test]
+    fn moe_grouped_m_total_bound_is_tight_for_small_batches() {
+        let small_verify = moe_grouped_m_total_bound(24, 256);
+        assert_eq!(small_verify % MOE_GROUPED_BLOCK_M, 0);
+        assert_eq!(small_verify, 384);
+
+        let prompt_prefill = moe_grouped_m_total_bound(216, 256);
+        assert_eq!(prompt_prefill % MOE_GROUPED_BLOCK_M, 0);
+        assert_eq!(prompt_prefill, 3456);
+
+        let full_chunk = moe_grouped_m_total_bound(2048, 256);
+        assert_eq!(full_chunk, 5888);
     }
 }
