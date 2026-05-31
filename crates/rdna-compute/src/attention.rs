@@ -11,6 +11,27 @@ use crate::Gpu;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 
+/// Opt-in gate for the WMMA flash-attention prefill path.
+fn is_wmma_fa_enabled() -> bool {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<bool> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1")
+    })
+}
+
+/// Minimum chunk size to engage the WMMA-FA route.
+fn wmma_fa_min_batch() -> usize {
+    use std::sync::OnceLock;
+    static GATE: OnceLock<usize> = OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_WMMA_FA_MIN_BATCH")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(16)
+    })
+}
+
 impl Gpu {
     /// accs_count: [n_layers * n_heads * n_bands] u64 sample counters.
     /// All accs_* buffers persist across calls; the kernel ADDS into them.
@@ -1140,6 +1161,7 @@ impl Gpu {
         block_cols: usize,
     ) -> HipResult<()> {
         const TILE_SIZE: usize = 128;
+        const WMMA_BLOCK_M: usize = 16;
         let max_tiles = (max_ctx_len + TILE_SIZE - 1) / TILE_SIZE;
         let stride = 2 + head_dim;
         let per_pos_bytes = n_heads * max_tiles * stride * 4;
@@ -1150,7 +1172,37 @@ impl Gpu {
             batch_size
         };
 
-        self.ensure_givens4_kernel(tile_key, tile_src, tile_func_name)?;
+        let wmma_fa_kernel = if self.arch_caps.has_wmma_w32_gfx12() {
+            Some((
+                "attention_flash_asym4_wmma_tile_batched_gfx12",
+                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_GFX12_SRC,
+                "attention_flash_asym4_wmma_tile_batched_gfx12",
+            ))
+        } else if self.arch_caps.has_wmma_w32() {
+            Some((
+                "attention_flash_asym4_wmma_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM4_WMMA_TILE_BATCHED_SRC,
+                "attention_flash_asym4_wmma_tile_batched",
+            ))
+        } else {
+            None
+        };
+        let wmma_ok = is_wmma_fa_enabled()
+            && wmma_fa_kernel.is_some()
+            && (head_dim == 128 || head_dim == 256)
+            && tree_bias.is_none()
+            && tile_func_name == "attention_flash_asym4_tile_batched"
+            && batch_size >= wmma_fa_min_batch()
+            && batch_size % WMMA_BLOCK_M == 0
+            && sub_batch % WMMA_BLOCK_M == 0;
+        let (eff_tile_key, eff_tile_src, eff_tile_func): (&'static str, &'static str, &'static str) =
+            if wmma_ok {
+                wmma_fa_kernel.expect("wmma_ok requires a selected WMMA-FA kernel")
+            } else {
+                (tile_key, tile_src, tile_func_name)
+            };
+
+        self.ensure_givens4_kernel(eff_tile_key, eff_tile_src, eff_tile_func)?;
         self.ensure_kernel(
             "attention_flash_asym_reduce_batched",
             kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
@@ -1201,11 +1253,18 @@ impl Gpu {
                     &bs as *const _ as *mut c_void,
                     &bc as *const _ as *mut c_void,
                 ];
+                let (grid, lds_bytes): ([u32; 3], u32) = if wmma_ok {
+                    let m_tiles = (chunk + WMMA_BLOCK_M - 1) / WMMA_BLOCK_M;
+                    ([n_heads as u32, m_tiles as u32, max_tiles as u32], 0)
+                } else {
+                    ([n_heads as u32, max_tiles as u32, chunk as u32],
+                     (TILE_SIZE * 4) as u32)
+                };
                 self.launch_maybe_blob(
-                    tile_func_name,
-                    [n_heads as u32, max_tiles as u32, chunk as u32],
+                    eff_tile_func,
+                    grid,
                     [32, 1, 1],
-                    (TILE_SIZE * 4) as u32,
+                    lds_bytes,
                     &mut params,
                     || {
                         let mut b = hip_bridge::KernargBlob::new();
