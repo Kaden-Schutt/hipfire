@@ -2316,11 +2316,11 @@ fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_over
             other => { eprintln!("[daemon] HIPFIRE_KV_V='{other}' unknown — ignoring (expected q8|lloyd2|lloyd3|lloyd4)"); None }
         };
         if let Some(vm) = v_mode_override {
-            if kv.quant_asym3 && kv.quant_fwht {
+            if (kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) && kv.quant_fwht {
                 kv.set_v_mode_realloc(gpu, vm).map_err(|e| format!("{e}"))?;
-                eprintln!("[daemon] V-cache mode override → {kv_v_env} (256-wide lloyd-V on fwht3 K)");
+                eprintln!("[daemon] V-cache mode override → {kv_v_env} (256-wide lloyd-V on fwht K)");
             } else {
-                eprintln!("[daemon] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires fwht3 K (256-wide); cache is a different mode");
+                eprintln!("[daemon] HIPFIRE_KV_V={kv_v_env} ignored — lloyd-V requires an FWHT K mode (fwht2/3/4); cache is a different mode");
             }
         }
         // Q8 DeltaNet state can accumulate quality drift on long generation.
