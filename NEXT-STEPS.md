@@ -57,6 +57,13 @@ gfx1201. This file lists the deliberate follow-ups.
    (pre-existing, not adaptive-KV): these two keys lack `meta` entries and would
    crash the config TUI if navigated to. Two-line fix in `cli/index.ts`.
 
+9. **Revert 2E (carried over from the V-quant line).** Commit 373d0f59
+   (per-tile→reduce-kernel lloyd-V inverse) was a null result (no perf gain at any
+   ctx, +0.9% KLD FP-reassociation). It is still in the branch; the documented
+   KLD matrix reflects the per-tile version. Revert was deferred here to avoid
+   re-validating the adaptive coherence runs (all validated against the current
+   kernel state). Revert + re-run the lloyd-V matrix as its own change.
+
 ## Validation status at ship (gfx1100, qwen3.6-27b.mq4)
 
 - All four transcodes (V q8→lloyd4, V lloyd-down, K fwht4→fwht2, K fwht4→fwht3)
