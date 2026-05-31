@@ -2707,16 +2707,16 @@ fn load_model_pp(
         .map(|t| *t == LayerType::FullAttention)
         .collect();
     let kv = match kv_mode.as_str() {
-        "q8" => llama::KvCache::new_gpu_q8_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
-        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "q8" => llama::KvCache::new_gpu_q8_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym4" | "turbo4" => llama::KvCache::new_gpu_asym4_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym2" | "turbo2" => llama::KvCache::new_gpu_asym2_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "asym3" | "turbo3" | "turbo" | "auto" | "" => llama::KvCache::new_gpu_asym3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht4" => llama::KvCache::new_gpu_fwht4_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht3" => llama::KvCache::new_gpu_fwht3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
+        "fwht2" => llama::KvCache::new_gpu_fwht2_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?,
         other => {
             eprintln!("  KV cache: unrecognized '{other}', defaulting to asym3");
-            llama::KvCache::new_gpu_asym3_capped_multi_filtered(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
+            llama::KvCache::new_gpu_asym3_capped_filtered_multi(&mut gpus, &is_kv_layer, config.n_kv_heads, config.head_dim, max_seq, max_seq).map_err(|e| format!("{e}"))?
         }
     };
 

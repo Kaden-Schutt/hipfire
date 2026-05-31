@@ -1588,6 +1588,15 @@ fn mtp_head_block_post_embedding(
     let n_embd = cfg.n_embd;
     let dim_bytes = n_embd * 4;
 
+    // Self-contained position handling: the merged single-GPU MTP head
+    // reads its position scalar from `scratch.pos_buf` (uploaded by the
+    // caller before invoking this helper) and derives the attention
+    // sequence length from `pos`. (#352's *_with_pos_buf entry threads a
+    // device-resident pos_buf for graph capture; this helper serves both
+    // that entry and our hetero entry, so it stays scratch-relative.)
+    let pos_buf = &scratch.pos_buf;
+    let seq_len_hint = pos + 1;
+
     // ── 2. RMSNorm both inputs to the NextN projection ───────────────────
     gpu.rmsnorm_f32(
         &scratch.tok_embd,

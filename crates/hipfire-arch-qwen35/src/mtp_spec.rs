@@ -2898,8 +2898,11 @@ pub fn spec_step_mtp_compressed_serial(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
     if cur_pos < 1000 {
         if std::env::var("HIPFIRE_HETERO_DIFF").is_ok() {
+            // NOTE: argmax_per_pos is now scoped to the host-accept branch
+            // above (#352's GPU greedy-accept path doesn't materialize it),
+            // so it's dropped from this hetero-diff diagnostic.
             eprintln!(
-                "[single-diff] cycle@cur_pos={cur_pos} candidates={candidates:?} argmax_per_pos={argmax_per_pos:?} accept={accept_count} commit={committed:?}"
+                "[single-diff] cycle@cur_pos={cur_pos} candidates={candidates:?} accept={accept_count} commit={committed:?}"
             );
         }
     }
