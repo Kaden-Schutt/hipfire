@@ -146,6 +146,7 @@ below 3 bits and is not default material (available for extreme-context users wh
   regression" territory — exactly the failure mode CLAUDE.md's perf rule and the memory
   falsification log warn about. KLD parity is necessary, coherence is the gate.
 - New/changed kernels + dispatch ⇒ the pre-commit coherence hook applies.
+- **Pairing guard in `set_v_mode_realloc`:** the "lloyd-V requires fwht3 K" invariant is enforced by an always-on `assert!` (was a `debug_assert!` — stripped in release). A non-fwht3 K + lloyd-V pairing now panics loudly rather than silently corrupting the V cache. The daemon's own runtime `if`-check runs before calling `set_v_mode_realloc` and is unaffected; this protects `eval_hipfire`, bench paths, and any future caller. A graceful `Result`-returning variant is a possible future refinement.
 
 **Coherence result (2026-05-31):** `coherence-gate.sh` (HIPFIRE_KV_V=lloyd4) → exit 0, all 11
 short-battery cases ran with no hard errors. Direct checks on the **canonical qwen3.6-27b.mq4**
