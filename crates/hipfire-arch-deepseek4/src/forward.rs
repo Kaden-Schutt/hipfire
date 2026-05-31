@@ -147,13 +147,17 @@ fn gemv_auto(
     m: usize,
     k: usize,
 ) -> Result<(), String> {
-    use crate::forward_dispatch::ForwardDispatch;
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
     use std::sync::OnceLock;
 
-    static FD: OnceLock<ForwardDispatch> = OnceLock::new();
-    let fd = FD.get_or_init(|| ForwardDispatch::new(gpu));
+    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
+    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) { x_rotated } else { x_plain };
-    fd.dispatch_gemv(gpu, weight, x, y, m, k)
+    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k };
+    gemv.run_auto(&ctx, gpu, &wr, x, y)
+        .map_err(|e| format!("gemv dispatch: {e}"))
 }
 
 /// Batched twin of `gemv_auto` for Phase B2 chunk forward.
@@ -212,15 +216,19 @@ fn gemv_auto_batched(
     y: &GpuTensor,
     m: usize,
     k: usize,
-    batch_size: usize,
+    _batch_size: usize,
 ) -> Result<(), String> {
-    use crate::forward_dispatch::ForwardDispatch;
+    use hipfire_dispatch::context::DispatchCtx;
+    use hipfire_dispatch::families::gemv::{GemvFamily, WeightRef};
     use std::sync::OnceLock;
 
-    static FD: OnceLock<ForwardDispatch> = OnceLock::new();
-    let fd = FD.get_or_init(|| ForwardDispatch::new(gpu));
+    static GEMV: OnceLock<GemvFamily> = OnceLock::new();
+    let gemv = GEMV.get_or_init(|| GemvFamily::new());
+    let ctx = DispatchCtx::new(gpu);
     let x = if weight_needs_fwht(weight) { x_rotated_batch } else { x_plain_batch };
-    fd.dispatch_gemv_batched(gpu, weight, x, y, batch_size, m, k)
+    let wr = WeightRef { buf: weight, dtype: weight.dtype, m, k };
+    gemv.run_auto(&ctx, gpu, &wr, x, y)
+        .map_err(|e| format!("gemv batched dispatch: {e}"))
 }
 
 /// `gemv_auto_batched` plus an opt-in WMMA path. When `x_f16_scratch`

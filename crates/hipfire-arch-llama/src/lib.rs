@@ -49,11 +49,6 @@
 
 pub mod arch;
 
-/// Dispatch-based forward pass — proof of concept for the RotationFamily.
-/// See `forward_dispatch` module docs for details.
-#[cfg(feature = "new-dispatch")]
-pub mod forward_dispatch;
-
 /// Re-export the LLaMA-family model module so callers can write
 /// `hipfire_arch_llama::llama::forward_scratch(...)` etc., matching the
 /// PR 8 idiom of `hipfire_arch_qwen35::qwen35::forward_prefill_batch(...)`.

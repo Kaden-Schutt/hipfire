@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
+pub mod gemm_table;
 pub mod gemv_table;
+pub mod moe_table;
 pub mod rotation_table;
+pub mod attention_table;
+pub mod fused_qkv_table;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

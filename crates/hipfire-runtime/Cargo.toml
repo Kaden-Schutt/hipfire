@@ -48,11 +48,13 @@ arch-llama = []
 arch-qwen2 = []
 arch-deepseek4 = []
 arch-dots-ocr = []
+new-dispatch = ["hipfire-dispatch"]
 
 # New dispatch layer — opt in via this feature. Removes old inline dispatch.
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch", optional = true }
 memmap2 = "0.9"
 byteorder = "1"
 serde = { version = "1", features = ["derive"] }

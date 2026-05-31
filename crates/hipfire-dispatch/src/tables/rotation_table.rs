@@ -16,8 +16,10 @@ pub fn populate(registry: &KernelRegistry) {
         };
     }
 
-    // RotateMq — plain FWHT rotation
+    // RotateMq — plain FWHT rotation (G256)
     reg!(RotateMq, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
+    // RotateMqG128 — plain FWHT rotation with G128 sign tables
+    reg!(RotateMqG128, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
     reg!(RotateMqAwq, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
     reg!(RotateMqBatched, ArchPredicate::Always, &[PipelineOp::RotateFwht], false);
     reg!(RotateMqAwqBatched, ArchPredicate::Always, &[PipelineOp::AwqDivide, PipelineOp::RotateFwht], true);
