@@ -3440,51 +3440,6 @@ self.flags.rocblas_min_batch.unwrap_or(4)
     }
 
     /// PARO4-G128 rotate-once wrapper used for env-gated runtime probes.
-    pub fn gemv_paro4g128_with_prerotate(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        x_rot: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — delegates to `paro4g128_rotate` which binds
-        self.paro4g128_rotate(a_raw, x, x_rot, m, k)?;
-        self.gemv_paro4g128_prerotated(a_raw, x_rot, y, m, k)
-    }
-
-    /// PARO4-G128 rotate-once residual wrapper used for env-gated runtime probes.
-    pub fn gemv_paro4g128_residual_with_prerotate(
-        &mut self,
-        a_raw: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        x_rot: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — delegates to `paro4g128_rotate` which binds
-        self.paro4g128_rotate(a_raw, x, x_rot, m, k)?;
-        self.gemv_paro4g128_prerotated_residual(a_raw, x_rot, y, m, k)
-    }
-
-    /// PARO4-G128 fused SwiGLU rotate-once down projection.
-    pub fn gemv_paro4g128_swiglu_residual_with_prerotate(
-        &mut self,
-        a_raw: &GpuTensor,
-        gate: &GpuTensor,
-        up: &GpuTensor,
-        y: &GpuTensor,
-        x_rot: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<()> {
-        // bind_thread: skip — delegates to `paro4g128_swiglu_rotate` which binds
-        self.paro4g128_swiglu_rotate(a_raw, gate, up, x_rot, m, k)?;
-        self.gemv_paro4g128_prerotated_residual(a_raw, x_rot, y, m, k)
-    }
-
     /// PARO4-G128T rotate-once wrapper for engine-tiled qweight payloads.
     pub fn gemv_paro4g128t_with_prerotate(
         &mut self,
