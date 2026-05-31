@@ -893,6 +893,21 @@ impl Gpu {
         self.ar_forward_replay_enabled = false;
     }
 
+    /// Drop ALL captured / replayed graph state so the next forward re-captures
+    /// with the CURRENT KV tier. Adaptive KV (and any mid-stream KV-mode switch)
+    /// must call this after re-quantizing the cache, because a captured AR
+    /// forward graph bakes `v_mode_bits()` into a kernarg blob
+    /// (dispatch.rs `launch_asym_flash_batched`) and freezes the lloyd-vs-asym
+    /// reduce-kernel selection at capture time. It is a near-no-op today
+    /// (`use_graph == false` on the AR forward path) but keeps adaptive KV
+    /// correct-by-construction if the forward graph is re-enabled. Mirrors the
+    /// invalidation the in-place eviction path *should* do on `physical_cap`
+    /// change but currently omits.
+    pub fn invalidate_for_kv_mode_switch(&mut self) {
+        self.graph_destroy();          // AR forward single-slot graph + dirty flags
+        self.replay_graph_destroy_all(); // GDN tape replay cache (keyed by n_steps)
+    }
+
     // ── Per-B verify-forward graph cache ─────────────────────────────────
     //
     // DFlash's PLD intermittently changes b (e.g. 16 → 8 on short self-match
